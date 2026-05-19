@@ -352,14 +352,16 @@ example-specific summaries/assertions that still need to become generic before
 Report-facing summaries have also started moving behind generic storage
 projection helpers. TodoMVC summary rows are now projected from generic keyed
 list storage, and Cells summary fields such as address, formula text, editing
-text, and editing state use the same generic row projection. Formula values,
-errors, dependencies, and several assertions are still adapter-owned derived
-caches.
+text, editing state, formula value, formula error, and dependency projection use
+generic row fields. The Cells formula evaluator still uses a runtime cache for
+parsing, dependency fanout, cycle detection, and recompute metrics, but scenario
+assertions and report summaries no longer read value/error directly from that
+cache.
 Scenario assertions are following the same path: TodoMVC title/filter/count/edit
 checks now call generic root/list assertion helpers, and Cells formula/editing
-checks use generic row-field assertions. Assertions that depend on formula
-evaluation results, recomputation sets, or current surface-specific cache
-details remain adapter-owned for now.
+and value/error checks use generic row-field assertions. Assertions that depend
+on recomputation sets or current surface-specific cache details remain
+adapter-owned for now.
 The row source paths themselves are compiled from typed IR source ports and the
 list's row scope into a generic `ListSourceBindingPlan`; runtime surface
 validation now checks TodoMVC and Cells row-source requirements against that

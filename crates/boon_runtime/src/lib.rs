@@ -3270,6 +3270,17 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
     }
 
+    fn list_row_textlike_opt(&self, list: &str, index: usize, field: &str) -> Option<&str> {
+        self.lists
+            .get(list)?
+            .rows
+            .get(index)?
+            .value
+            .fields
+            .get(field)?
+            .as_textlike()
+    }
+
     fn list_row_bool(&self, list: &str, index: usize, field: &str) -> RuntimeResult<bool> {
         self.list_row_field(list, index, field)?
             .as_bool()
@@ -3296,6 +3307,31 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<()> {
         self.list_row_field_mut(list, index, field)?
             .set_textlike(value)
+    }
+
+    fn set_or_insert_list_row_textlike(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+        value: &str,
+    ) -> RuntimeResult<()> {
+        let row = self
+            .lists
+            .get_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .rows
+            .get_mut(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
+        match row.value.fields.get_mut(field) {
+            Some(slot) => slot.set_textlike(value),
+            None => {
+                row.value
+                    .fields
+                    .insert(field.to_owned(), RuntimeValue::Text(value.to_owned()));
+                Ok(())
+            }
+        }
     }
 
     fn set_list_row_bool(
@@ -7641,9 +7677,13 @@ impl CellsRuntime {
     fn assert_step(&self, step: &ScenarioStep, recomputed: &[usize]) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
             let index = self.cell_index(&expect.address)?;
-            let cell = &self.cells[index];
             if let Some(value) = &expect.value {
-                assert_eq_report(&step.id, "cell.value", value, &cell.value)?;
+                let actual = self
+                    .generic
+                    .list_row_textlike_opt("cells", index, "value")
+                    .unwrap_or("");
+                let expected = value.as_str();
+                assert_eq_report(&step.id, "cell.value", &expected, &actual)?;
             }
             if let Some(formula) = &expect.formula {
                 self.generic.assert_list_row_textlike(
@@ -7677,12 +7717,16 @@ impl CellsRuntime {
             }
         }
         if let Some(expect) = &step.expect_error {
-            let cell = self.cell(&expect.address)?;
+            let index = self.cell_index(&expect.address)?;
+            let actual = self
+                .generic
+                .list_row_textlike_opt("cells", index, "error")
+                .filter(|error| !error.is_empty());
             assert_eq_report(
                 &step.id,
                 "cell.error",
                 &Some(expect.error.as_str()),
-                &cell.error,
+                &actual,
             )?;
         }
         if let Some(expected) = &step.expect_recomputed {
@@ -7824,31 +7868,57 @@ impl CellsRuntime {
         for offset in 0..self.affected.len() {
             let index = self.affected[offset];
             let result = self.eval_cache[index].unwrap_or(Ok(0));
-            let cell = &mut self.cells[index];
-            let previous_value = cell.value_number;
-            let previous_error = cell.error;
-            match result {
-                Ok(value) => {
-                    cell.value_number = Some(value);
-                    cell.error = None;
-                    cell.value.clear();
-                    write!(&mut cell.value, "{value}")?;
+            let changed = {
+                let cell = &mut self.cells[index];
+                let previous_value = cell.value_number;
+                let previous_error = cell.error;
+                match result {
+                    Ok(value) => {
+                        cell.value_number = Some(value);
+                        cell.error = None;
+                        cell.value.clear();
+                        write!(&mut cell.value, "{value}")?;
+                    }
+                    Err(error) => {
+                        cell.value_number = None;
+                        cell.error = Some(error);
+                        cell.value.clear();
+                    }
                 }
-                Err(error) => {
-                    cell.value_number = None;
-                    cell.error = Some(error);
-                    cell.value.clear();
-                }
-            }
-            let changed = index == changed_index
-                || cell.value_number != previous_value
-                || cell.error != previous_error;
+                index == changed_index
+                    || cell.value_number != previous_value
+                    || cell.error != previous_error
+            };
             if changed {
+                self.sync_cell_derived_fields(index)?;
                 recomputed.push(index);
             }
         }
         recomputed.sort_unstable();
         Ok(())
+    }
+
+    fn sync_cell_derived_fields(&mut self, index: usize) -> RuntimeResult<()> {
+        let dependencies = self.cells[index]
+            .deps
+            .iter()
+            .map(|dependency| self.address_for(*dependency))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.generic.set_or_insert_list_row_textlike(
+            "cells",
+            index,
+            "value",
+            &self.cells[index].value,
+        )?;
+        self.generic.set_or_insert_list_row_textlike(
+            "cells",
+            index,
+            "error",
+            self.cells[index].error.unwrap_or_default(),
+        )?;
+        self.generic
+            .set_or_insert_list_row_textlike("cells", index, "dependencies", &dependencies)
     }
 
     fn collect_affected(&mut self, changed_index: usize) {
@@ -7905,6 +7975,7 @@ impl CellsRuntime {
         }
     }
 
+    #[cfg(test)]
     fn cell(&self, address: &str) -> RuntimeResult<&Cell> {
         let index = self.cell_index(address)?;
         Ok(&self.cells[index])
@@ -8011,20 +8082,35 @@ impl CellsRuntime {
         json!({
             "cells": interesting.iter().map(|address| {
                 let index = self.cell_index(address).unwrap_or_default();
-                let cell = self.cell(address).cloned().unwrap_or_default();
                 let (key, generation) = self.cell_key_generation(index);
                 let mut row = self
                     .generic
                     .list_row_fields_json("cells", index, &["address", "formula_text", "editing_text", "editing"])
                     .unwrap_or_default();
+                let value = self
+                    .generic
+                    .list_row_textlike_opt("cells", index, "value")
+                    .unwrap_or("");
+                let error = self
+                    .generic
+                    .list_row_textlike_opt("cells", index, "error")
+                    .filter(|error| !error.is_empty());
+                let dependencies = self
+                    .generic
+                    .list_row_textlike_opt("cells", index, "dependencies")
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|dependency| !dependency.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
                 json!({
                     "address": row.remove("address").unwrap_or_else(|| json!(address)),
                     "formula": row.remove("formula_text").unwrap_or_else(|| json!("")),
                     "editing_text": row.remove("editing_text").unwrap_or_else(|| json!("")),
-                    "value": cell.value,
-                    "error": cell.error,
+                    "value": value,
+                    "error": error,
                     "editing": row.remove("editing").unwrap_or_else(|| json!(false)),
-                    "dependencies": cell.deps.iter().map(|index| self.address_for(*index)).collect::<Vec<_>>(),
+                    "dependencies": dependencies,
                     "hidden_key": key,
                     "hidden_generation": generation,
                 })

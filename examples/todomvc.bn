@@ -1,0 +1,167 @@
+# Boon Circuit executable example: TodoMVC
+#
+# This source intentionally keeps the local field-equation shape from the
+# architecture docs. The first interpreter parses and validates this source,
+# lowers it to a static equation IR, and executes the declared example profile.
+
+EXAMPLE TodoMVC
+
+store: [
+    sources: [
+        new_todo_input: [
+            change: SOURCE
+            key_down: SOURCE
+        ]
+        toggle_all_checkbox: [click: SOURCE]
+        clear_completed_button: [press: SOURCE]
+        filter_all: [press: SOURCE]
+        filter_active: [press: SOURCE]
+        filter_completed: [press: SOURCE]
+    ]
+
+    new_todo_text:
+        Text/empty |> HOLD text {
+            LATEST {
+                sources.new_todo_input.change.text
+                title_to_add |> THEN { Text/empty }
+            }
+        }
+
+    title_to_add:
+        sources.new_todo_input.key_down |> WHEN {
+            [key: Enter, text: text] =>
+                text |> Text/trim |> WHEN {
+                    TEXT {} => SKIP
+                    title => title
+                }
+            __ => SKIP
+        }
+
+    selected_filter:
+        All |> HOLD filter {
+            LATEST {
+                sources.filter_all.press |> THEN { All }
+                sources.filter_active.press |> THEN { Active }
+                sources.filter_completed.press |> THEN { Completed }
+            }
+        }
+
+    todos:
+        LIST {
+            [title: TEXT { Buy groceries }]
+            [title: TEXT { Clean room }]
+        }
+        |> List/append(item: title_to_add |> THEN {
+            [title: title_to_add]
+        })
+        |> List/remove(todo, when:
+            LATEST {
+                todo.sources.remove_todo_button.press |> THEN { True }
+                sources.clear_completed_button.press |> THEN { todo.completed }
+            }
+        )
+        |> List/map(seed, new: new_todo(seed: seed, store: store))
+
+    visible_todos:
+        todos
+        |> List/retain(todo, if:
+            selected_filter |> WHEN {
+                All => True
+                Active => todo.completed |> Bool/not
+                Completed => todo.completed
+            }
+        )
+
+    active_count:
+        todos
+        |> List/retain(todo, if: todo.completed |> Bool/not)
+        |> List/count
+
+    completed_count:
+        todos
+        |> List/retain(todo, if: todo.completed)
+        |> List/count
+
+    all_completed:
+        active_count == 0 |> Bool/and(completed_count > 0)
+]
+
+FUNCTION new_todo(seed, store) {
+    sources: [
+        remove_todo_button: [press: SOURCE]
+        editing_todo_title_element: [
+            change: SOURCE
+            key_down: SOURCE
+            blur: SOURCE
+        ]
+        todo_title_element: [double_click: SOURCE]
+        todo_checkbox: [click: SOURCE]
+    ]
+
+    [
+        title:
+            seed.title |> HOLD title {
+                LATEST {
+                    sources.editing_todo_title_element.key_down |> WHEN {
+                        [key: Enter, text: text] =>
+                            text |> Text/trim |> WHEN {
+                                TEXT {} => title
+                                trimmed => trimmed
+                            }
+                        __ => SKIP
+                    }
+                    sources.editing_todo_title_element.blur |> THEN {
+                        edit_text |> Text/trim |> WHEN {
+                            TEXT {} => title
+                            trimmed => trimmed
+                        }
+                    }
+                }
+            }
+
+        edit_text:
+            seed.title |> HOLD draft {
+                LATEST {
+                    sources.todo_title_element.double_click |> THEN {
+                        title
+                    }
+                    sources.editing_todo_title_element.change.text |> WHEN {
+                        changed =>
+                            changed |> Text/trim |> WHEN {
+                                TEXT {} => draft
+                                trimmed => trimmed
+                            }
+                    }
+                    sources.editing_todo_title_element.key_down.key |> WHEN {
+                        Escape => title
+                        __ => SKIP
+                    }
+                }
+            }
+
+        completed:
+            False |> HOLD completed {
+                LATEST {
+                    sources.todo_checkbox.click |> THEN {
+                        completed |> Bool/not
+                    }
+                    store.sources.toggle_all_checkbox.click |> THEN {
+                        store.all_completed |> Bool/not
+                    }
+                }
+            }
+
+        editing:
+            False |> HOLD editing {
+                LATEST {
+                    sources.todo_title_element.double_click |> THEN { True }
+                    sources.editing_todo_title_element.key_down.key |> WHEN {
+                        Enter => False
+                        Escape => False
+                        __ => SKIP
+                    }
+                    sources.editing_todo_title_element.blur |> THEN { False }
+                }
+            }
+    ]
+}

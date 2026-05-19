@@ -110,6 +110,7 @@ The compiler lowers `todos` to bounded memories:
 valid[256]             Bool
 generation[256]        UInt[generation_bits]
 title[256][64]         fixed text storage
+edit_text[256][64]     fixed edit-draft text storage
 completed[256]         Bool
 editing[256]           Bool
 order[256]             slot index
@@ -207,6 +208,7 @@ on title_to_add:
     generation[slot] += 1
     valid[slot] = true
     title[slot] = title_to_add
+    edit_text[slot] = title_to_add
     completed[slot] = false
     editing[slot] = false
     order[count] = slot

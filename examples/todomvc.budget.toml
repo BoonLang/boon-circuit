@@ -1,0 +1,19 @@
+[latency_ms]
+single_row_toggle_input_to_idle_p95 = 3.0
+add_todo_input_to_idle_p95 = 3.0
+edit_commit_input_to_idle_p95 = 3.0
+filter_change_input_to_idle_p95 = 3.0
+clear_completed_normal_input_to_idle_p95 = 4.0
+max_single_step = 8.0
+
+[memory]
+normal_steady_rss_delta_mib = 64
+normal_peak_rss_delta_mib = 96
+large_list_steady_rss_delta_mib = 128
+large_list_peak_rss_delta_mib = 192
+steady_vram_delta_mib = 64
+peak_vram_delta_mib = 96
+
+[allocations]
+bounded_profile_allocs_after_warmup = 0
+graph_rebuilds_per_interaction = 0

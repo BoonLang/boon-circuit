@@ -1,0 +1,117 @@
+name = "cells"
+source = "examples/cells.bn"
+
+[[step]]
+id = "initial"
+expect_cell = { address = "A1", value = "", formula = "" }
+
+[[step]]
+id = "edit-a1-literal"
+user_action = { kind = "type_text", target = "A1 editor", text = "41" }
+expected_source_event = { source = "cell.sources.editor.change", address = "A1", text = "41" }
+expect_cell = { address = "A1", editing_text = "41", editing = true }
+expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
+expect_render_delta_contains = ["SetCellEditor"]
+
+[[step]]
+id = "commit-a1-literal"
+user_action = { kind = "key_down", target = "A1 editor", key = "Enter" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "41" }
+expect_cell = { address = "A1", value = "41", formula = "41", editing = false }
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "edit-a1-cancel-draft"
+user_action = { kind = "type_text", target = "A1 editor", text = "123" }
+expected_source_event = { source = "cell.sources.editor.change", address = "A1", text = "123" }
+expect_cell = { address = "A1", value = "41", formula = "41", editing_text = "123", editing = true }
+expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
+expect_render_delta_contains = ["SetCellEditor"]
+
+[[step]]
+id = "cancel-a1-draft"
+user_action = { kind = "key_down", target = "A1 editor", key = "Escape" }
+expected_source_event = { source = "cell.sources.editor.cancel", address = "A1" }
+expect_cell = { address = "A1", value = "41", formula = "41", editing_text = "41", editing = false }
+expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "commit-b1-formula"
+user_action = { kind = "key_down", target = "B1 editor", key = "Enter", text = "=A1+1" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "B1", text = "=A1+1" }
+expect_cell = { address = "B1", value = "42", formula = "=A1+1" }
+expect_recomputed = ["B1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "change-a1-updates-b1"
+user_action = { kind = "key_down", target = "A1 editor", key = "Enter", text = "99" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "99" }
+expect_cell = { address = "B1", value = "100" }
+expect_recomputed = ["A1", "B1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "cycle-error"
+user_action = { kind = "key_down", target = "A1 editor", key = "Enter", text = "=B1+1" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "=B1+1" }
+expect_error = { address = "A1", error = "cycle_error" }
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value", "FieldSet:error"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "replace-b1-formula-removes-stale-cycle-edge"
+user_action = { kind = "key_down", target = "B1 editor", key = "Enter", text = "5" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "B1", text = "5" }
+expect_cell = { address = "B1", value = "5", formula = "5", editing = false }
+expect_recomputed = ["A1", "B1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "a1-recomputes-after-cycle-break"
+expect_cell = { address = "A1", value = "6", formula = "=B1+1", editing = false }
+
+[[step]]
+id = "change-a1-after-edge-replacement-does-not-recompute-b1"
+user_action = { kind = "key_down", target = "A1 editor", key = "Enter", text = "10" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "10" }
+expect_cell = { address = "A1", value = "10", formula = "10", editing = false }
+expect_recomputed = ["A1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "commit-c1-fanout-formula"
+user_action = { kind = "key_down", target = "C1 editor", key = "Enter", text = "=A1+1" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "C1", text = "=A1+1" }
+expect_cell = { address = "C1", value = "11", formula = "=A1+1", editing = false }
+expect_recomputed = ["C1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "commit-d1-fanout-formula"
+user_action = { kind = "key_down", target = "D1 editor", key = "Enter", text = "=A1+2" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "D1", text = "=A1+2" }
+expect_cell = { address = "D1", value = "12", formula = "=A1+2", editing = false }
+expect_recomputed = ["D1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "change-a1-fanout-recomputes-dependents-only"
+user_action = { kind = "key_down", target = "A1 editor", key = "Enter", text = "20" }
+expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "20" }
+expect_cell = { address = "C1", value = "21" }
+expect_recomputed = ["A1", "C1", "D1"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
+expect_render_delta_contains = ["SetCellText"]
+
+[[step]]
+id = "d1-updated-by-fanout"
+expect_cell = { address = "D1", value = "22" }

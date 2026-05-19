@@ -129,6 +129,23 @@ for the current item key, compare it, or store it as app state.
 If input data contains a field named `id`, it remains ordinary data. Equality on
 that field compares data, not references or hidden runtime identity.
 
+Implementation note: the current verifier has an explicit duplicate-title test.
+Two todos may have the same visible title, and a host action can still route to
+the second physical row through the hidden render/source binding. The Boon
+source still sees only `[title, completed, editing]`; the hidden key appears only
+in semantic deltas, source bindings, stale-event guards, and debug/protocol data.
+There is also a stale-generation test: an event addressed to a deleted row's old
+`(key, generation)` is ignored before any Boon equation runs.
+
+Implementation note: the runtime now has a reusable `KeyedList<T>` primitive for
+hidden keys, generations, append/remove/move, and bound source lookup. TodoMVC
+stores only todo field data in its row value; key/generation mechanics are owned
+by the list memory layer. Row source bindings are derived from parsed `SOURCE`
+ports in the Boon row template, not from a fixed Rust list of TodoMVC element
+names. Cells uses the same hidden grid slots for protocol deltas; visible
+spreadsheet addresses such as `A1` remain ordinary domain data and are not hashed
+into runtime identity.
+
 ## D6. SOURCE Is Canonical
 
 Decision: new examples should use `SOURCE` as explicit input ports. Legacy
@@ -182,6 +199,10 @@ PASSED.clk |> THEN { next_register_value }
 Clocked hardware lowering treats an impulse source as an edge trigger. The same
 semantic operator can remain valid in software.
 
+Implementation note: the runtime has an `EventPulse`/`then_value` primitive.
+TodoMVC uses it for Enter-triggered input reset and filter button updates, and
+tests cover present-event candidate creation and absent-event `SKIP`.
+
 ## D9. LATEST Is A Deterministic Merge
 
 Decision: `LATEST` merges candidate updates by event presence and monotonic
@@ -195,6 +216,11 @@ Rules:
 - if two candidates have the same greatest sequence, fail unless the source uses
   explicit `PRIORITY` or proven `EXCLUSIVE`.
 - ambiguous same-tick writes are errors, not warnings.
+
+Implementation note: the runtime has a `LatestCandidate<T>` primitive carrying a
+monotonic `TickSeq`. Runtime tests cover greatest-sequence selection and
+equal-sequence conflict rejection, and TodoMVC uses it for `new_todo_text` and
+`selected_filter` `HOLD` updates.
 
 Potential future forms:
 
@@ -211,6 +237,10 @@ Decision: `WHILE` is a continuous combinational gate/mux. It is not a loop.
 It chooses an output while a condition or selected arm is true, and it recomputes
 when dependencies change. Cycles through `WHILE` or pure expressions are errors
 unless broken by `HOLD`.
+
+Implementation note: the runtime has a `while_value` primitive and tests cover
+conditional selection. The current TodoMVC and Cells examples do not use `WHILE`
+directly.
 
 ## D11. LIST Deltas Are First-Class
 
@@ -233,6 +263,96 @@ layer should need a full DOM or list diff to know what changed.
 
 Every keyed fact also carries generation/bind-epoch data as defined in the delta
 protocol. The key is a protocol/runtime fact, not a Boon value.
+
+Current reports expose the compiled source/state/list/dependency tables under
+`ir_debug_tables`. That table is the beginning of the debugger contract: it
+shows which source ports can write each `HOLD` cell without making runtime keys
+or source ids into Boon values. The native Ply playground's `Causes` panel reads
+that same `possible_causes` table so the visible debugger surface is backed by
+the IR, not by separate UI text.
+
+`ir_debug_tables.update_branches` is the more executable form of that same
+contract. It records source-derived update branches for state cells, including
+whether the branch is indexed and whether the expression is a source payload,
+constant, previous value, `Bool/not`, or still an unknown expression summary.
+`ir_debug_tables.list_operations` does the same for list append/remove/view/count
+operators. `ir_debug_tables.formula_operations` records the Cells formula
+pipeline as `Formula/parse`, `Formula/dependencies`, `Formula/eval`, and
+`Formula/error` operators. `ir_debug_tables.state_cells` now includes
+source-derived initial values for `HOLD` cells, `ir_debug_tables.lists` includes
+record-literal and `Grid/cells` initializers plus optional `LIST[n]` capacity,
+and `ir_debug_tables.derived_values` records non-state values such as
+`store.title_to_add`, aggregate counts, list views, and formula projections.
+These tables are not enough to claim the generic interpreter is complete, but
+they are the handoff artifacts the runtime should consume while replacing the
+current TodoMVC/Cells adapters.
+
+Current implementation note: TodoMVC root scalar `HOLD` fields such as
+`store.new_todo_text` and `store.selected_filter` now execute through those
+source-derived update branches. TodoMVC `todo.title` uses IR-derived
+trim-or-previous branches for Enter and blur commits. TodoMVC `todo.completed`
+also uses IR-derived boolean `Bool/not` branches for row checkbox and toggle-all
+sources, and `todo.editing` uses IR-derived constant branches for double-click,
+Enter, Escape, and blur sources. TodoMVC `todo.edit_text` uses IR-derived source
+payload and previous-title branches for opening an editor, editing the draft,
+and cancelling with Escape. TodoMVC append, row delete, and clear-completed
+remove operations are checked against IR-derived `List/append` and `List/remove`
+operators, including renamed source ports and renamed local append triggers.
+TodoMVC active/completed counts and selected-filter visibility are evaluated
+through IR-derived `List/count` and `List/retain` predicates.
+Cells edit-state `HOLD` fields such as
+`cell.editing_text`, `cell.formula_text`, and `cell.editing` use the same branch
+table for change/commit/cancel handling. The Cells formula evaluator checks the
+IR-derived formula-operation pipeline before parsing, dependency extraction,
+evaluation, and error projection. The evaluator itself is still a generic Rust
+primitive inside the current runtime, so reports keep
+`example_behavior_adapter: true` and the readiness audit still fails.
+
+Implementation note: a generic initialization runtime now materializes root
+state cells and keyed list rows from `TypedProgram` initializers. TodoMVC seed
+titles, `store.new_todo_text`, and `store.selected_filter` are initialized from
+that generic storage rather than by reparsing the source text in the runtime,
+and TodoMVC row fields now write that storage first while the Todo mirror is
+kept as a checked render/test cache. Cells now uses the same generic keyed list
+storage for `cell.formula_text`, `cell.editing_text`, and `cell.editing`; the
+formula/value/dependency vectors are derived caches. Root text `HOLD` commits
+and indexed text/bool `HOLD` field commits now go through generic runtime commit
+helpers before mirrors are updated. TodoMVC list append/remove operations now
+also enter through generic runtime structural helpers that check the IR-derived
+append trigger and remove predicates before the render/test mirror is updated.
+Scenario `expected_source_event` records are now normalized into a generic
+source-event object before TodoMVC or Cells consumes source path, text, key,
+address, or target row data. The per-step execution loop for timing, allocation
+measurement, delta expectation checks, dirty-key counting, and report row
+generation is also shared; the remaining example-specific boundary is the
+equation-application method behind that loop. Indexed text/bool branch
+evaluation for row-scoped `HOLD` fields now goes through generic runtime helpers
+for `SourceText`, `PreviousValue`, `TextTrimOrPrevious`, constants, and
+`Bool/not`. Hidden row source bindings, source ids, bind epochs, and stale
+binding checks now live in `GenericCircuitRuntime`; TodoMVC only reads them back
+to emit current protocol/render deltas. Generic runtime helpers now construct
+the keyed semantic facts for field, list, and source changes; example-specific
+code still lowers those facts into current TodoMVC/Cells render patches. Example
+runtimes only mirror committed values for render/test checks. TodoMVC
+`List/count`, `List/retain`, completed-title projections, editing-row lookups,
+and whole-title projections now execute through generic list scan helpers over
+IR-derived predicates instead of Todo-specific loops. Both example runtimes
+assert that their mirrors stay synchronized with the generic storage after
+scenario steps.
+Executable reports also include `compiled_schedule`, a typed-IR-derived schedule
+summary that rejects unknown initializers, unsupported update branches,
+unsupported list predicates, and per-row graph clones before the example runtime
+starts. The tick executor remains adapter-backed until all source events execute
+through one generic schedule without the TodoMVC/Cells driver layer.
+
+Implementation note: the current IR cause table is source-derived, not a
+TodoMVC/Cells-specific Rust lookup table. It derives row scopes from
+`List/map(... new: function(...))`, then scans field equation bodies and local
+derived-field references such as `new_todo_text -> title_to_add` to build
+`possible_causes`. Runtime execution still has example adapters and remains a
+known blocker before the full "no hardcoded app behavior" criterion is met.
+Executable reports include `runtime_execution` metadata so this blocker is
+visible in verification artifacts.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

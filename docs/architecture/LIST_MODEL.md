@@ -132,6 +132,9 @@ Tick behavior:
 6. bind row sources after commit; they cannot fire until the next tick.
 
 No graph nodes are allocated.
+The row source bindings come from the row template's parsed `SOURCE` ports. If a
+row element source is renamed in Boon source, the hidden source binding path and
+render binding follow that source name.
 
 ## Remove
 
@@ -149,6 +152,9 @@ Tick behavior:
 Stale source events must include generation and be ignored if the generation no
 longer matches. The runtime should count and report stale-event drops so tests
 can prove stale UI/network events did not mutate reused storage.
+The current TodoMVC verifier reports `stale_source_drop_count` in per-step
+reports and state summaries, and runtime tests cover stale generation and stale
+bind-epoch rejection.
 
 ## Move
 

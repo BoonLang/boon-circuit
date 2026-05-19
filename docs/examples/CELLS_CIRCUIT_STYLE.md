@@ -109,6 +109,11 @@ style. The important boundary is that parsing/evaluation are generic primitives,
 while edit state, commit/cancel behavior, and cell display state are expressed in
 Boon.
 
+Runtime validation derives cell source ports from this Boon row template. The
+checked example uses `change`, `commit`, and `cancel`, but hidden source routing
+should follow parsed `SOURCE` ports rather than a separate Rust list of editor
+event names.
+
 `Grid/cells` produces domain coordinates and display addresses, for example:
 
 ```text
@@ -132,6 +137,11 @@ functions: SUM(range) can be added after the base proof
 errors: parse_error, cycle_error, missing_ref, type_error, div_by_zero
 ```
 
+Current implementation note: numeric literals, A1 references, single binary
+`+`, `-`, `*`, and `/` expressions, dependency-edge replacement, `parse_error`,
+`cycle_error`, and `div_by_zero` are covered by runtime tests. Range functions
+such as `SUM` remain future work.
+
 `Formula/parse(text)` returns a small formula AST or a deterministic error.
 `Formula/dependencies(ast)` returns a set of domain cell addresses. `Formula/eval`
 reads values by domain address through the runtime's dependency-aware reader and
@@ -148,7 +158,7 @@ When `formula_text[A1]` changes:
 4. topologically recompute affected `value[*]`.
 5. emit `FieldSet` deltas for changed displayed values/errors.
 
-The runtime may use an adjacency index:
+The runtime uses an adjacency index:
 
 ```text
 dependents[from_address] -> Set<CellAddress>
@@ -157,6 +167,9 @@ dependencies[to_address] -> Set<CellAddress>
 
 This is not the same as Differential Dataflow. It is a purpose-built dependency
 index owned by the static runtime.
+Verification reports include `dependency_edge_walk_count` for Cells steps, so an
+edit with small fanout can prove it walks reverse dependency edges instead of
+scanning the whole grid.
 
 ## Cycle Handling
 

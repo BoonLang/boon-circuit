@@ -1,0 +1,58 @@
+# Boon Circuit executable example: 7GUIs Cells
+
+EXAMPLE Cells
+
+cells:
+    Grid/cells(columns: 26, rows: 100)
+    |> List/map(seed, new: new_cell(seed: seed))
+
+FUNCTION new_cell(seed) {
+    sources: [
+        editor: [
+            change: SOURCE
+            commit: SOURCE
+            cancel: SOURCE
+        ]
+    ]
+
+    [
+        address: seed.address
+
+        editing_text:
+            TEXT {} |> HOLD draft {
+                LATEST {
+                    sources.editor.change.text
+                    sources.editor.cancel |> THEN { formula_text }
+                    sources.editor.commit.text
+                }
+            }
+
+        formula_text:
+            TEXT {} |> HOLD formula_text {
+                LATEST {
+                    sources.editor.commit.text
+                }
+            }
+
+        editing:
+            False |> HOLD editing {
+                LATEST {
+                    sources.editor.change |> THEN { True }
+                    sources.editor.commit |> THEN { False }
+                    sources.editor.cancel |> THEN { False }
+                }
+            }
+
+        parsed_formula:
+            Formula/parse(formula_text)
+
+        dependencies:
+            Formula/dependencies(parsed_formula)
+
+        value:
+            Formula/eval(formula: parsed_formula, read: cell_value_reader)
+
+        error:
+            Formula/error(parsed_formula, value)
+    ]
+}

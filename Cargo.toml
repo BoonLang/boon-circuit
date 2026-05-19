@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/boon_parser",
+    "crates/boon_ir",
+    "crates/boon_runtime",
+    "crates/boon_cli",
+    "crates/boon_ply_playground",
+    "crates/xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+boon_parser = { path = "crates/boon_parser" }
+boon_ir = { path = "crates/boon_ir" }
+boon_runtime = { path = "crates/boon_runtime" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+sha2 = "0.10"
+ply-engine = { version = "1.1.1", default-features = false }

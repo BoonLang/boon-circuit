@@ -1,0 +1,19 @@
+[latency_ms]
+literal_edit_input_to_idle_p95 = 3.0
+formula_edit_input_to_idle_p95 = 3.0
+single_dependency_update_p95 = 3.0
+fanout_100_update_p95 = 4.0
+cycle_detection_p95 = 4.0
+max_single_step = 8.0
+
+[memory]
+grid_26x100_steady_rss_delta_mib = 64
+grid_26x100_peak_rss_delta_mib = 96
+grid_stress_steady_rss_delta_mib = 128
+grid_stress_peak_rss_delta_mib = 192
+steady_vram_delta_mib = 64
+peak_vram_delta_mib = 96
+
+[allocations]
+bounded_profile_allocs_after_warmup = 0
+graph_rebuilds_per_interaction = 0

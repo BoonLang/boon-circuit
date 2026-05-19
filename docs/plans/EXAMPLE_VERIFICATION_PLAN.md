@@ -57,6 +57,7 @@ cargo xtask verify-example-all <name>
 cargo xtask verify-examples-all
 cargo xtask bench-example <name>
 cargo xtask verify-report-schema
+cargo xtask audit-goal-readiness
 ```
 
 Example-specific aliases such as `verify-todomvc-headed-ply` or
@@ -74,6 +75,12 @@ speed/resource gate
 negative harness verification
 report schema validation
 ```
+
+`audit-goal-readiness` is stricter than schema validation. It scans the current
+reports and fails if the repo is not actually ready for final handoff. A report
+that is shape-valid but still says the runtime is adapter-backed, a headed replay
+that still carries `os_input_limitation`, or a missing fresh human report remains
+a blocker.
 
 ## Human-Like Input
 
@@ -93,6 +100,12 @@ expected_source_event    what the runtime should receive after hit testing
 semantic_assertion       expected Boon state/delta after the tick
 render_assertion         expected render patch/pixel consequence
 ```
+
+Current scenario files use explicit `expect_semantic_delta_contains` and
+`expect_render_delta_contains` fields for key interactions. The runner fails if
+an expected semantic delta or render patch kind is absent from that step's trace,
+so state-only success cannot hide a missing keyed delta, source binding, or
+renderer patch.
 
 Headed replay fails if it injects `expected_source_event` directly instead of
 creating it through the visible window and input backend.
@@ -131,6 +144,8 @@ presentation_budget_ms = 16.7
 The important target is that normal interactions complete in a couple of
 milliseconds. `input_to_idle_p95` is the main pass/fail value. Debug builds may
 emit performance reports, but release builds are the authoritative speed gate.
+The xtask speed aliases must therefore re-exec into a release xtask binary and
+reject speed reports whose `build_profile` is not `release`.
 
 Every speed report must include:
 
@@ -235,12 +250,32 @@ budget_hash
 artifact_sha256s
 ```
 
+Executable example reports for semantic, headless Ply, headed Ply, and speed
+layers must also include `runtime_execution` metadata:
+
+```text
+implementation
+source_loaded_from_boon
+typed_ir_loaded
+static_schedule_verified
+generic_interpreter_complete
+example_behavior_adapter
+```
+
+This is an honesty field, not decorative metadata. During the prototype it may
+say that the run is still adapter-backed, but that must remain visible in the
+report until the generic static-graph interpreter executes the source equations
+directly.
+
 If VRAM cannot be read on a platform, the report must say so explicitly and the
 headed/manual visual pass still remains required.
 
 Manual reports must additionally include `manual_observer`, display/backend
 metadata, checklist pass/fail per label, screenshot/video artifact hashes, and a
 freshness limit. The checker form should reject stale reports:
+The listed checkpoint paths must be screenshot/video artifacts and must also be
+present in `artifact_sha256s`; hashing an unrelated file is not accepted as a
+manual visual pass.
 
 ```bash
 cargo xtask verify-example-human <name> --check --max-age 24h
@@ -249,6 +284,20 @@ cargo xtask verify-example-human <name> --check --max-age 24h
 Headed replay reports must include `window_pid`, `window_title`, display socket
 or compositor connection, input backend, capture backend, focused-window proof,
 nonblank screenshot hashes, and per-step pointer/keyboard routes.
+For a report to claim `input_injection_method:
+os_pointer_keyboard_to_visible_window`, it must also include `os_input_steps`
+covering every scenario label in order. Each step must record a visible target
+element id, nonzero bounds from the Ply layout, the OS action route, the
+observed source event for source-producing actions, and a screenshot/video
+checkpoint path that is present in `artifact_sha256s`.
+If a headed verifier proves only part of the OS-input path, it must include an
+`os_input_limitation` field and still fail negative fixtures that omit that
+limitation. A hybrid report is useful evidence, but it is not the final
+per-step OS hit-testing contract.
+
+Headed checks must run serially on a developer desktop. They open real windows
+and send real OS input to the focused Ply surface, so parallel headed runs can
+steal focus from each other and must be treated as invalid, not flaky success.
 
 ## Bulk Operations
 

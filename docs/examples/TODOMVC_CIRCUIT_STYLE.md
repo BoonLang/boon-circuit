@@ -94,12 +94,43 @@ FUNCTION new_todo(seed) {
         title:
             seed.title |> HOLD title {
                 LATEST {
-                    sources.editing_todo_title_element.change.text |> WHEN {
-                        changed =>
-                            changed |> Text/trim() |> WHEN {
+                    sources.editing_todo_title_element.key_down |> WHEN {
+                        [key: Enter, text: text] =>
+                            text |> Text/trim() |> WHEN {
                                 "" => title
                                 trimmed => trimmed
                             }
+
+                        __ => SKIP
+                    }
+
+                    sources.editing_todo_title_element.blur |> THEN {
+                        edit_text |> Text/trim() |> WHEN {
+                            "" => title
+                            trimmed => trimmed
+                        }
+                    }
+                }
+            }
+
+        edit_text:
+            seed.title |> HOLD draft {
+                LATEST {
+                    sources.todo_title_element.double_click |> THEN {
+                        title
+                    }
+
+                    sources.editing_todo_title_element.change.text |> WHEN {
+                        changed =>
+                            changed |> Text/trim() |> WHEN {
+                                "" => draft
+                                trimmed => trimmed
+                            }
+                    }
+
+                    sources.editing_todo_title_element.key_down.key |> WHEN {
+                        Escape => title
+                        __ => SKIP
                     }
                 }
             }
@@ -187,6 +218,7 @@ selected_filter_next
 todos_append
 todos_remove[key]
 todo_title_next[key]
+todo_edit_text_next[key]
 todo_completed_next[key]
 todo_editing_next[key]
 visible_todos_view

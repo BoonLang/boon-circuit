@@ -31,6 +31,7 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
 - [Example verification plan](docs/plans/EXAMPLE_VERIFICATION_PLAN.md)
 - [TodoMVC e2e test plan](docs/plans/TODOMVC_E2E_TEST_PLAN.md)
+- [`/goal` prompt](docs/plans/GOAL_PROMPT.md)
 
 ## Non-Goals For The First Pass
 
@@ -59,3 +60,62 @@ The first implementation is only convincing if these are true:
    verification contract.
 10. Normal interactions complete in a couple of milliseconds in release mode
     without excessive RAM or VRAM growth.
+
+## Current Verification Shape
+
+The repo intentionally keeps the final aggregate gate honest. Semantic,
+headless, headed Ply, speed, negative, and report-schema checks can be generated
+by automation, but `verify-*-all` must still fail until a real human fills a
+fresh manual report from a visible headed session.
+
+Useful commands while iterating:
+
+```bash
+cargo test --workspace
+cargo run -p boon_cli -- dump-ir examples/todomvc.bn
+cargo run -p boon_cli -- dump-ir examples/cells.bn
+cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
+cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
+cargo xtask verify-todomvc-headed-ply
+cargo xtask verify-cells-headed-ply
+cargo xtask verify-todomvc-speed
+cargo xtask verify-cells-speed
+cargo xtask verify-report-schema
+cargo xtask audit-goal-readiness
+cargo xtask verify-todomvc-human --write-template
+cargo xtask verify-cells-human --write-template
+```
+
+The speed aliases re-exec themselves through `cargo run --release -p xtask` and
+reports must contain `build_profile: "release"`.
+Executable reports contain `runtime_execution` metadata. At the current
+prototype stage it explicitly records that source and typed IR are loaded, but
+that runtime behavior is still adapter-backed until the generic static-graph
+interpreter replaces the TodoMVC/Cells execution adapters.
+The native playground sidebar shows the scenario checklist labels used by the
+manual-report templates.
+The current headed Ply verifier proves a real OS keyboard event reaches the Ply
+window, captures nonblank screenshots, and then routes scenario `user_action`
+records through the runtime. It intentionally records this as an
+`os_input_limitation` until every scenario step is driven by real OS
+pointer/keyboard hit testing.
+
+`cargo xtask audit-goal-readiness` is the strict handoff gate. It writes
+`target/reports/debug/goal-readiness.json` and exits non-zero while any final
+acceptance blocker remains, including adapter-backed runtime execution, hybrid
+headed input, missing aggregate reports, or missing fresh human reports.
+
+After a real manual pass, fill:
+
+```text
+target/reports/todomvc-human.json
+target/reports/cells-human.json
+```
+
+and check them with:
+
+```bash
+cargo xtask verify-todomvc-human --check --report target/reports/todomvc-human.json
+cargo xtask verify-cells-human --check --report target/reports/cells-human.json
+cargo xtask verify-examples-all
+```

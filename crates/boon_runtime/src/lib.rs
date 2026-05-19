@@ -1754,6 +1754,7 @@ fn base_example_report(
                 "generic_loaded_runtime_shell": true,
                 "generic_root_text_tick_executor": true,
                 "generic_indexed_hold_commit_executor": true,
+                "generic_indexed_bulk_bool_commit_executor": true,
                 "generic_list_append_source_binding_executor": true,
                 "generic_list_remove_source_unbinding_executor": true,
                 "generic_list_count_retain_executor": true,
@@ -2764,6 +2765,37 @@ impl GenericCircuitRuntime {
             field,
             value,
         })
+    }
+
+    fn commit_each_indexed_bool_source(
+        &mut self,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        target: &'static str,
+        source: &str,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        mut observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
+    ) -> RuntimeResult<usize> {
+        let len = self.list_len(list)?;
+        for index in 0..len {
+            let value = self.eval_indexed_bool_source(
+                equations,
+                list,
+                index,
+                target,
+                source,
+                read_extra_bool,
+            )?;
+            let field = row_field_name(target);
+            let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
+            observe(GenericBoolFieldCommit {
+                key,
+                generation,
+                field,
+                value,
+            })?;
+        }
+        Ok(len)
     }
 
     fn eval_indexed_text_source<'a>(
@@ -4331,16 +4363,30 @@ impl TodoRuntime {
             }
             TodoEvent::ToggleAll { source, target } => {
                 let all_completed = self.all_completed();
-                for index in 0..self.generic.list_len("todos")? {
-                    self.set_completed_from_source(
-                        target,
-                        index,
-                        source,
-                        all_completed,
-                        &mut deltas,
-                        &mut patches,
-                    )?;
-                }
+                self.generic.commit_each_indexed_bool_source(
+                    &self.scalar_equations,
+                    "todos",
+                    target,
+                    source,
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |completed| {
+                        deltas.push(field_delta(
+                            Some(completed.key),
+                            Some(completed.generation),
+                            completed.field,
+                            ProtocolValue::Bool(completed.value),
+                        ));
+                        patches.push(patch(
+                            "SetProperty",
+                            RenderTarget::TodoCheckbox(completed.key),
+                            ProtocolValue::CheckedProperty(completed.value),
+                        ));
+                        Ok(())
+                    },
+                )?;
             }
             TodoEvent::TodoCheckbox {
                 source,

@@ -351,7 +351,10 @@ for `SourceText`, `PreviousValue`, `TextTrimOrPrevious`, constants, and
 `Bool/not`. Generic runtime helpers now also commit indexed text/bool scalar
 branches into keyed storage and return the committed key, generation, field, and
 value as one fact; TodoMVC and Cells no longer split branch evaluation from the
-state write for normal indexed scalar updates. TodoMVC draft editing now lowers
+state write for normal indexed scalar updates. The toggle-all path now uses a
+generic bulk indexed-bool commit helper that applies one compiled row equation
+across the static list and streams the resulting keyed commits back to the
+TodoMVC renderer adapter. TodoMVC draft editing now lowers
 the `changed |> Text/trim |> WHEN { TEXT {} => draft; trimmed => trimmed }`
 shape into the same `TextTrimOrPrevious` IR as title commit/blur, so draft text
 updates no longer need a Todo-only trim/write path. Hidden row source bindings,

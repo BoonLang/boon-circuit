@@ -328,7 +328,18 @@ Root text `HOLD` commits and indexed text/bool `HOLD` field commits now go
 through generic runtime commit helpers. TodoMVC list append/remove operations
 now also enter through generic runtime structural helpers that check the
 IR-derived append trigger and remove predicates before emitting current
-protocol/render deltas.
+protocol/render deltas. Appending a keyed row and binding that row's source
+ports now happens in one generic list/source-store helper, so row-local source
+identity is attached at the same runtime boundary as the structural insert
+instead of in the TodoMVC adapter.
+The row source paths themselves are compiled from typed IR source ports and the
+list's row scope into a generic `ListSourceBindingPlan`; runtime surface
+validation now checks TodoMVC and Cells row-source requirements against that
+compiled plan instead of re-scanning parsed source text.
+Removing a keyed row and unbinding its source ports now follows the same
+boundary: generic storage checks the IR-derived predicate, removes the row,
+exposes each bound source for protocol/render lowering, and then unbinds those
+sources before returning the removed row for storage reuse.
 Scenario `expected_source_event` records are now normalized into a generic
 source-event object before TodoMVC or Cells consumes source path, text, key,
 address, or target row data. The per-step execution loop for timing, allocation
@@ -337,11 +348,18 @@ generation is also shared; the remaining example-specific boundary is the
 equation-application method behind that loop. Indexed text/bool branch
 evaluation for row-scoped `HOLD` fields now goes through generic runtime helpers
 for `SourceText`, `PreviousValue`, `TextTrimOrPrevious`, constants, and
-`Bool/not`. Hidden row source bindings, source ids, bind epochs, and stale
-binding checks now live in `GenericCircuitRuntime`; TodoMVC only reads them back
-to emit current protocol/render deltas. Generic runtime helpers now construct
-the keyed semantic facts for field, list, and source changes; example-specific
-code still lowers those facts into current TodoMVC/Cells render patches. TodoMVC
+`Bool/not`. Generic runtime helpers now also commit indexed text/bool scalar
+branches into keyed storage and return the committed key, generation, field, and
+value as one fact; TodoMVC and Cells no longer split branch evaluation from the
+state write for normal indexed scalar updates. TodoMVC draft editing now lowers
+the `changed |> Text/trim |> WHEN { TEXT {} => draft; trimmed => trimmed }`
+shape into the same `TextTrimOrPrevious` IR as title commit/blur, so draft text
+updates no longer need a Todo-only trim/write path. Hidden row source bindings,
+source ids, bind epochs, and stale binding checks now live in
+`GenericCircuitRuntime`; TodoMVC only reads them back to emit current
+protocol/render deltas. Generic runtime helpers now construct the keyed semantic
+facts for field, list, and source changes; example-specific code still lowers
+those facts into current TodoMVC/Cells render patches. TodoMVC
 root `SOURCE` events are dispatched through the generic branch table to the
 single root `HOLD` target they are allowed to drive, so the adapter no longer
 names `store.new_todo_text` or `store.selected_filter` at the event dispatch

@@ -1204,6 +1204,7 @@ struct CompiledProgram {
     list_equations: ListEquationPlan,
     formula_equations: FormulaEquationPlan,
     source_routes: SourceRoutePlan,
+    list_source_bindings: ListSourceBindingPlan,
     schedule_node_count: usize,
     state_initializer_count: usize,
     list_initializer_count: usize,
@@ -1298,6 +1299,7 @@ impl CompiledProgram {
             &root_targets,
         );
         let source_route_count = source_routes.routes.len();
+        let list_source_bindings = ListSourceBindingPlan::from_ir(ir);
         Ok(Self {
             surface,
             scalar_equations,
@@ -1305,6 +1307,7 @@ impl CompiledProgram {
             list_equations,
             formula_equations,
             source_routes,
+            list_source_bindings,
             schedule_node_count: ir.nodes.len(),
             state_initializer_count: ir.state_cells.len(),
             list_initializer_count: ir.lists.len(),
@@ -1333,6 +1336,7 @@ impl CompiledProgram {
             "list_operation_count": self.list_operation_count,
             "formula_operation_count": self.formula_operation_count,
             "source_route_count": self.source_route_count,
+            "list_source_binding_count": self.list_source_bindings.bindings.len(),
             "unsupported_update_branch_count": self.unsupported_update_branch_count,
             "unsupported_list_operation_count": self.unsupported_list_operation_count,
             "graph_clones_per_item": 0
@@ -1422,7 +1426,7 @@ fn validate_executable_surface(
                     "store.sources.filter_completed.press",
                 ],
             )?;
-            require_todo_row_sources(parsed, 6)?;
+            require_scoped_list_sources(&compiled.list_source_bindings, "todos", 6)?;
             require_lists(ir, &["todos"])?;
             require_operators(
                 parsed,
@@ -1446,7 +1450,7 @@ fn validate_executable_surface(
                 ir,
                 &["cell.editing_text", "cell.formula_text", "cell.editing"],
             )?;
-            require_cell_row_sources(parsed, 3)?;
+            require_scoped_list_sources(&compiled.list_source_bindings, "cells", 3)?;
             require_lists(ir, &["cells"])?;
             require_operators(parsed, &["SOURCE", "HOLD", "LATEST", "List/map"])?;
             for primitive in [
@@ -1482,27 +1486,15 @@ fn require_sources(ir: &TypedProgram, required: &[&str]) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn require_todo_row_sources(parsed: &ParsedProgram, minimum: usize) -> RuntimeResult<()> {
-    let paths = todo_row_source_paths(parsed)?;
-    if paths.len() < minimum {
-        return Err(format!(
-            "executable TodoMVC source has only {} row source ports; expected at least {minimum}",
-            paths.len()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn require_cell_row_sources(parsed: &ParsedProgram, minimum: usize) -> RuntimeResult<()> {
-    let count = parsed
-        .source_ports
-        .iter()
-        .filter(|port| port.path.starts_with("cell.sources."))
-        .count();
+fn require_scoped_list_sources(
+    bindings: &ListSourceBindingPlan,
+    list: &str,
+    minimum: usize,
+) -> RuntimeResult<()> {
+    let count = bindings.source_count(list)?;
     if count < minimum {
         return Err(format!(
-            "executable Cells source has only {count} row source ports; expected at least {minimum}"
+            "executable source list `{list}` has only {count} scoped row source ports; expected at least {minimum}"
         )
         .into());
     }
@@ -1757,10 +1749,13 @@ fn base_example_report(
                 "generic_source_event_ingest": true,
                 "generic_source_binding_store": true,
                 "generic_indexed_branch_evaluator": true,
+                "generic_indexed_scalar_commit_executor": true,
                 "generic_semantic_delta_emitter": true,
                 "generic_loaded_runtime_shell": true,
                 "generic_root_text_tick_executor": true,
                 "generic_indexed_hold_commit_executor": true,
+                "generic_list_append_source_binding_executor": true,
+                "generic_list_remove_source_unbinding_executor": true,
                 "generic_list_count_retain_executor": true,
                 "generic_todomvc_summary_reads_authoritative_storage": true,
                 "generic_todomvc_root_holds_no_mirror": is_todomvc,
@@ -2711,6 +2706,66 @@ impl GenericCircuitRuntime {
         self.row_identity(list, index)
     }
 
+    fn commit_indexed_text_source<'a>(
+        &mut self,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        target: &'static str,
+        source: &str,
+        payload_text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        let value = match self.eval_indexed_text_source(
+            equations,
+            list,
+            index,
+            target,
+            source,
+            payload_text,
+        )? {
+            IndexedTextCandidate::SourceText(value) | IndexedTextCandidate::PreviousText(value) => {
+                value
+            }
+            IndexedTextCandidate::TrimmedOrSkip(Some(value)) => value,
+            IndexedTextCandidate::TrimmedOrSkip(None) => return Ok(None),
+            IndexedTextCandidate::PreviousField(path) => {
+                return Err(format!(
+                    "text update `{target}` from `{source}` needs previous field `{path}` without payload"
+                )
+                .into());
+            }
+        };
+        let field = row_field_name(target);
+        let (key, generation) = self.commit_indexed_text_field(list, index, field, value)?;
+        Ok(Some(GenericTextFieldCommit {
+            key,
+            generation,
+            field,
+            value,
+        }))
+    }
+
+    fn commit_indexed_bool_source(
+        &mut self,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        target: &'static str,
+        source: &str,
+        read_extra_bool: impl Fn(&str) -> Option<bool>,
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        let value =
+            self.eval_indexed_bool_source(equations, list, index, target, source, read_extra_bool)?;
+        let field = row_field_name(target);
+        let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
+        Ok(GenericBoolFieldCommit {
+            key,
+            generation,
+            field,
+            value,
+        })
+    }
+
     fn eval_indexed_text_source<'a>(
         &self,
         equations: &ScalarEquationPlan,
@@ -2819,6 +2874,19 @@ impl GenericCircuitRuntime {
         self.append_row(list, row)
     }
 
+    fn append_row_for_trigger_and_bind_sources(
+        &mut self,
+        equations: &ListEquationPlan,
+        list: &'static str,
+        trigger: &str,
+        row: GenericRow,
+        source_paths: &[&'static str],
+    ) -> RuntimeResult<GenericListRowCommit> {
+        let (key, generation) = self.append_row_for_trigger(equations, list, trigger, row)?;
+        self.bind_row_sources(list, key, generation, source_paths);
+        Ok(GenericListRowCommit { key, generation })
+    }
+
     fn remove_row_for_predicate(
         &mut self,
         list: &str,
@@ -2834,6 +2902,38 @@ impl GenericCircuitRuntime {
             return Ok(None);
         }
         self.remove_row(list, index).map(Some)
+    }
+
+    fn remove_row_for_predicate_and_unbind_sources(
+        &mut self,
+        list: &'static str,
+        predicate: RuntimeListPredicate,
+        index: usize,
+        mut observe_binding: impl FnMut(&SourceBinding),
+    ) -> RuntimeResult<Option<KeyedRow<GenericRow>>> {
+        let Some(row) = self.remove_row_for_predicate(list, predicate, index)? else {
+            return Ok(None);
+        };
+        for binding in self.row_source_bindings(list, row.key, row.generation) {
+            observe_binding(binding);
+        }
+        self.unbind_row_sources(list, row.key, row.generation);
+        Ok(Some(row))
+    }
+
+    #[cfg(test)]
+    fn remove_row_and_unbind_sources(
+        &mut self,
+        list: &'static str,
+        index: usize,
+        mut observe_binding: impl FnMut(&SourceBinding),
+    ) -> RuntimeResult<KeyedRow<GenericRow>> {
+        let row = self.remove_row(list, index)?;
+        for binding in self.row_source_bindings(list, row.key, row.generation) {
+            observe_binding(binding);
+        }
+        self.unbind_row_sources(list, row.key, row.generation);
+        Ok(row)
     }
 
     fn append_row(&mut self, list: &str, row: GenericRow) -> RuntimeResult<(u64, u64)> {
@@ -3311,6 +3411,28 @@ enum IndexedTextCandidate<'a> {
     TrimmedOrSkip(Option<&'a str>),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GenericTextFieldCommit<'a> {
+    key: u64,
+    generation: u64,
+    field: &'static str,
+    value: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenericBoolFieldCommit {
+    key: u64,
+    generation: u64,
+    field: &'static str,
+    value: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenericListRowCommit {
+    key: u64,
+    generation: u64,
+}
+
 #[derive(Clone, Debug)]
 struct DerivedEquationPlan {
     text_transforms: Vec<RuntimeDerivedTextTransform>,
@@ -3332,6 +3454,17 @@ enum RuntimeDerivedTextExpression {
 #[derive(Clone, Debug, Default)]
 struct SourceRoutePlan {
     routes: Vec<SourceRoute>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ListSourceBindingPlan {
+    bindings: Vec<ListSourceBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct ListSourceBinding {
+    list: &'static str,
+    source_paths: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3649,6 +3782,40 @@ impl SourceRoutePlan {
     }
 }
 
+impl ListSourceBindingPlan {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let mut bindings = Vec::new();
+        for list in &ir.lists {
+            let row_scope = row_scope_name(&list.name);
+            let prefix = format!("{row_scope}.sources.");
+            let source_paths = ir
+                .sources
+                .iter()
+                .filter(|source| source.scoped && source.path.starts_with(&prefix))
+                .map(|source| leak_runtime_path(source.path.clone()))
+                .collect::<Vec<_>>();
+            if !source_paths.is_empty() {
+                bindings.push(ListSourceBinding {
+                    list: leak_runtime_path(list.name.clone()),
+                    source_paths,
+                });
+            }
+        }
+        Self { bindings }
+    }
+
+    fn source_paths(&self, list: &str) -> RuntimeResult<&[&'static str]> {
+        self.bindings
+            .iter()
+            .find_map(|binding| (binding.list == list).then_some(binding.source_paths.as_slice()))
+            .ok_or_else(|| format!("list `{list}` has no scoped source binding plan").into())
+    }
+
+    fn source_count(&self, list: &str) -> RuntimeResult<usize> {
+        self.source_paths(list).map(<[_]>::len)
+    }
+}
+
 impl SourceRoute {
     fn has_scalar_target(&self, target: &str) -> bool {
         self.scalar_targets
@@ -3683,22 +3850,16 @@ impl SourceRoute {
         Ok(target)
     }
 
-    fn has_non_root_scalar_expression(
-        &self,
-        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
-    ) -> bool {
-        self.scalar_targets.iter().any(|candidate| {
-            !self
-                .root_scalar_targets
-                .iter()
-                .any(|root| root.target == candidate.target)
-                && matches_expression(candidate.expression)
-        })
-    }
-
     fn single_non_root_scalar_target_matching(
         &self,
         matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        self.single_non_root_scalar_target_where(|_, expression| matches_expression(expression))
+    }
+
+    fn single_non_root_scalar_target_where(
+        &self,
+        matches_target: impl Fn(&'static str, ScalarUpdateExpression) -> bool,
     ) -> RuntimeResult<Option<&'static str>> {
         let mut target = None;
         for candidate in &self.scalar_targets {
@@ -3706,7 +3867,7 @@ impl SourceRoute {
                 .root_scalar_targets
                 .iter()
                 .any(|root| root.target == candidate.target)
-                || !matches_expression(candidate.expression)
+                || !matches_target(candidate.target, candidate.expression)
             {
                 continue;
             }
@@ -3871,7 +4032,7 @@ struct TodoRuntime {
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     source_routes: SourceRoutePlan,
-    row_source_paths: Vec<&'static str>,
+    list_source_bindings: ListSourceBindingPlan,
     spare_generic_todos: Vec<GenericRow>,
     next_source_seq: u64,
     stale_source_drop_count: u64,
@@ -3951,17 +4112,18 @@ enum TodoEvent<'a> {
 
 impl TodoRuntime {
     fn new(
-        parsed: &ParsedProgram,
+        _parsed: &ParsedProgram,
         ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<Self> {
         let mut generic = GenericCircuitRuntime::new(ir)?;
         let todo_count = generic.list_len("todos")?;
-        let row_source_paths = todo_row_source_paths(parsed)?;
+        let list_source_bindings = compiled.list_source_bindings.clone();
+        let row_source_paths = list_source_bindings.source_paths("todos")?;
         generic.reserve_source_bindings(todo_count * row_source_paths.len());
         for index in 0..todo_count {
             let (key, generation) = generic.row_identity("todos", index)?;
-            generic.bind_row_sources("todos", key, generation, &row_source_paths);
+            generic.bind_row_sources("todos", key, generation, row_source_paths);
         }
         Self {
             generic,
@@ -3969,7 +4131,7 @@ impl TodoRuntime {
             derived_equations: compiled.derived_equations.clone(),
             list_equations: compiled.list_equations.clone(),
             source_routes: compiled.source_routes.clone(),
-            row_source_paths,
+            list_source_bindings,
             spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
@@ -3991,7 +4153,10 @@ impl TodoRuntime {
     }
 
     fn seeded(count: usize) -> Self {
-        let row_source_paths = default_todo_row_source_paths();
+        let list_source_bindings = default_todo_list_source_bindings();
+        let row_source_paths = list_source_bindings
+            .source_paths("todos")
+            .expect("checked-in TodoMVC should have row sources");
         let generic_rows = (0..count).map(|index| todo_generic_row(&format!("Todo {index}")));
         let mut generic = GenericCircuitRuntime::default();
         generic.root.insert(
@@ -4010,7 +4175,7 @@ impl TodoRuntime {
             let (key, generation) = generic
                 .row_identity("todos", index)
                 .expect("seeded TodoMVC row exists");
-            generic.bind_row_sources("todos", key, generation, &row_source_paths);
+            generic.bind_row_sources("todos", key, generation, row_source_paths);
         }
         Self {
             generic,
@@ -4018,7 +4183,7 @@ impl TodoRuntime {
             derived_equations: DerivedEquationPlan::empty(),
             list_equations: ListEquationPlan::empty(),
             source_routes: SourceRoutePlan::default(),
-            row_source_paths,
+            list_source_bindings,
             spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
@@ -4068,8 +4233,12 @@ impl TodoRuntime {
         self.generic
             .reserve_list("todos", append_count)
             .expect("TodoMVC generic runtime has todos list");
+        let row_source_count = self
+            .list_source_bindings
+            .source_count("todos")
+            .expect("TodoMVC compiled runtime has row source bindings");
         self.generic
-            .reserve_source_bindings(append_count * self.row_source_paths.len());
+            .reserve_source_bindings(append_count * row_source_count);
         self.spare_generic_todos.reserve(append_count);
         self.generic
             .reserve_list_row_textlike_fields("todos", "title", |_, current| {
@@ -4163,9 +4332,14 @@ impl TodoRuntime {
             TodoEvent::ToggleAll { source, target } => {
                 let all_completed = self.all_completed();
                 for index in 0..self.generic.list_len("todos")? {
-                    let next_completed =
-                        self.todo_bool_update_with_snapshot(index, target, source, all_completed)?;
-                    self.set_completed(target, index, next_completed, &mut deltas, &mut patches)?;
+                    self.set_completed_from_source(
+                        target,
+                        index,
+                        source,
+                        all_completed,
+                        &mut deltas,
+                        &mut patches,
+                    )?;
                 }
             }
             TodoEvent::TodoCheckbox {
@@ -4175,13 +4349,15 @@ impl TodoRuntime {
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let next_completed = self.todo_bool_update_with_snapshot(
-                    index,
+                let all_completed = self.all_completed();
+                self.set_completed_from_source(
                     target,
+                    index,
                     source,
-                    self.all_completed(),
+                    all_completed,
+                    &mut deltas,
+                    &mut patches,
                 )?;
-                self.set_completed(target, index, next_completed, &mut deltas, &mut patches)?;
             }
             TodoEvent::TodoTitleDoubleClick {
                 source,
@@ -4191,35 +4367,40 @@ impl TodoRuntime {
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let edit_text =
-                    self.todo_text_update(index, edit_text_target, source, Some(target_text))?;
-                let editing = self.todo_bool_update_with_snapshot(
-                    index,
-                    editing_target,
-                    source,
-                    self.all_completed(),
-                )?;
-                let editing_field = row_field_name(editing_target);
-                let edit_text_field = row_field_name(edit_text_target);
-                self.set_todo_bool_field(index, editing_field, editing)?;
-                self.set_todo_text_field(index, edit_text_field, edit_text)?;
-                let (key, generation) = self.todo_row_identity(index)?;
+                let edit_text = self
+                    .generic
+                    .commit_indexed_text_source(
+                        &self.scalar_equations,
+                        "todos",
+                        index,
+                        edit_text_target,
+                        source,
+                        Some(target_text),
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "text update `{edit_text_target}` from `{source}` produced no change"
+                        )
+                    })?;
+                let all_completed = self.all_completed();
+                let editing =
+                    self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
                 deltas.push(field_delta(
-                    Some(key),
-                    Some(generation),
-                    editing_field,
-                    ProtocolValue::Bool(editing),
+                    Some(editing.key),
+                    Some(editing.generation),
+                    editing.field,
+                    ProtocolValue::Bool(editing.value),
                 ));
                 deltas.push(field_delta(
-                    Some(key),
-                    Some(generation),
-                    edit_text_field,
-                    ProtocolValue::Text(Cow::Borrowed(edit_text)),
+                    Some(edit_text.key),
+                    Some(edit_text.generation),
+                    edit_text.field,
+                    ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                 ));
                 patches.push(patch(
                     "ShowEditInput",
-                    RenderTarget::TodoEdit(key),
-                    ProtocolValue::Text(Cow::Borrowed(edit_text)),
+                    RenderTarget::TodoEdit(editing.key),
+                    ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                 ));
             }
             TodoEvent::EditingTitleChange {
@@ -4231,22 +4412,24 @@ impl TodoRuntime {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
-                if let Some(edit_text) =
-                    self.todo_text_payload_update(index, edit_text_target, source, Some(text))?
-                {
-                    let edit_text_field = row_field_name(edit_text_target);
-                    self.set_todo_text_field(index, edit_text_field, edit_text)?;
-                    let (key, generation) = self.todo_row_identity(index)?;
+                if let Some(edit_text) = self.generic.commit_indexed_text_source(
+                    &self.scalar_equations,
+                    "todos",
+                    index,
+                    edit_text_target,
+                    source,
+                    Some(text),
+                )? {
                     deltas.push(field_delta(
-                        Some(key),
-                        Some(generation),
-                        edit_text_field,
-                        ProtocolValue::Text(Cow::Borrowed(edit_text)),
+                        Some(edit_text.key),
+                        Some(edit_text.generation),
+                        edit_text.field,
+                        ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                     ));
                     patches.push(patch(
                         "SetEditInput",
-                        RenderTarget::TodoEdit(key),
-                        ProtocolValue::Text(Cow::Borrowed(edit_text)),
+                        RenderTarget::TodoEdit(edit_text.key),
+                        ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                     ));
                 }
             }
@@ -4263,65 +4446,70 @@ impl TodoRuntime {
                     let index = self
                         .find_index(target_text)
                         .or_else(|_| self.find_editing_index())?;
-                    let (row_key, row_generation) = self.todo_row_identity(index)?;
+                    let (row_key, _) = self.todo_row_identity(index)?;
                     if key == "Enter" {
                         let title_target = title_target.ok_or_else(|| {
                             format!("source `{source}` Enter route has no title target")
                         })?;
-                        if let Some(title) =
-                            self.todo_title_update(index, title_target, source, text, None)?
-                        {
-                            let title_field = row_field_name(title_target);
-                            self.set_todo_text_field(index, title_field, title)?;
+                        if let Some(title) = self.generic.commit_indexed_text_source(
+                            &self.scalar_equations,
+                            "todos",
+                            index,
+                            title_target,
+                            source,
+                            text,
+                        )? {
                             deltas.push(field_delta(
-                                Some(row_key),
-                                Some(row_generation),
-                                title_field,
-                                ProtocolValue::Text(Cow::Borrowed(title)),
+                                Some(title.key),
+                                Some(title.generation),
+                                title.field,
+                                ProtocolValue::Text(Cow::Borrowed(title.value)),
                             ));
                             patches.push(patch(
                                 "SetText",
                                 RenderTarget::TodoTitle(row_key),
-                                ProtocolValue::Text(Cow::Borrowed(title)),
+                                ProtocolValue::Text(Cow::Borrowed(title.value)),
                             ));
                         }
                     } else {
                         let edit_text_target = edit_text_target.ok_or_else(|| {
                             format!("source `{source}` Escape route has no edit-text target")
                         })?;
-                        let edit_text = self.todo_text_update(
-                            index,
-                            edit_text_target,
-                            source,
-                            Some(target_text),
-                        )?;
-                        let edit_text_field = row_field_name(edit_text_target);
-                        self.set_todo_text_field(index, edit_text_field, edit_text)?;
+                        let edit_text = self
+                            .generic
+                            .commit_indexed_text_source(
+                                &self.scalar_equations,
+                                "todos",
+                                index,
+                                edit_text_target,
+                                source,
+                                Some(target_text),
+                            )?
+                            .ok_or_else(|| {
+                                format!(
+                                    "text update `{edit_text_target}` from `{source}` produced no change"
+                                )
+                            })?;
                         deltas.push(field_delta(
-                            Some(row_key),
-                            Some(row_generation),
-                            edit_text_field,
-                            ProtocolValue::Text(Cow::Borrowed(edit_text)),
+                            Some(edit_text.key),
+                            Some(edit_text.generation),
+                            edit_text.field,
+                            ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                         ));
                     }
-                    let editing = self.todo_bool_update_with_snapshot(
-                        index,
-                        editing_target,
-                        source,
-                        self.all_completed(),
-                    )?;
-                    let editing_field = row_field_name(editing_target);
-                    self.set_todo_bool_field(index, editing_field, editing)?;
+                    let all_completed = self.all_completed();
+                    let editing =
+                        self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
                     deltas.push(field_delta(
-                        Some(row_key),
-                        Some(row_generation),
-                        editing_field,
-                        ProtocolValue::Bool(editing),
+                        Some(editing.key),
+                        Some(editing.generation),
+                        editing.field,
+                        ProtocolValue::Bool(editing.value),
                     ));
                     patches.push(patch(
                         "HideEditInput",
                         RenderTarget::TodoEdit(row_key),
-                        ProtocolValue::Bool(editing),
+                        ProtocolValue::Bool(editing.value),
                     ));
                 }
             }
@@ -4335,46 +4523,40 @@ impl TodoRuntime {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
-                let (row_key, row_generation) = self.todo_row_identity(index)?;
-                if let Some(title) = self.todo_title_update(
+                let (row_key, _) = self.todo_row_identity(index)?;
+                if let Some(title) = self.generic.commit_indexed_text_source(
+                    &self.scalar_equations,
+                    "todos",
                     index,
                     title_target,
                     source,
-                    None,
                     text.or(Some(target_text)),
                 )? {
-                    let title_field = row_field_name(title_target);
-                    self.set_todo_text_field(index, title_field, title)?;
                     deltas.push(field_delta(
-                        Some(row_key),
-                        Some(row_generation),
-                        title_field,
-                        ProtocolValue::Text(Cow::Borrowed(title)),
+                        Some(title.key),
+                        Some(title.generation),
+                        title.field,
+                        ProtocolValue::Text(Cow::Borrowed(title.value)),
                     ));
                     patches.push(patch(
                         "SetText",
                         RenderTarget::TodoTitle(row_key),
-                        ProtocolValue::Text(Cow::Borrowed(title)),
+                        ProtocolValue::Text(Cow::Borrowed(title.value)),
                     ));
                 }
-                let editing = self.todo_bool_update_with_snapshot(
-                    index,
-                    editing_target,
-                    source,
-                    self.all_completed(),
-                )?;
-                let editing_field = row_field_name(editing_target);
-                self.set_todo_bool_field(index, editing_field, editing)?;
+                let all_completed = self.all_completed();
+                let editing =
+                    self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
                 deltas.push(field_delta(
-                    Some(row_key),
-                    Some(row_generation),
-                    editing_field,
-                    ProtocolValue::Bool(editing),
+                    Some(editing.key),
+                    Some(editing.generation),
+                    editing.field,
+                    ProtocolValue::Bool(editing.value),
                 ));
                 patches.push(patch(
                     "HideEditInput",
                     RenderTarget::TodoEdit(row_key),
-                    ProtocolValue::Bool(editing),
+                    ProtocolValue::Bool(editing.value),
                 ));
             }
             TodoEvent::HoverDelete {
@@ -4506,21 +4688,26 @@ impl TodoRuntime {
             route.single_non_root_scalar_target_matching(|expression| {
                 matches!(expression, ScalarUpdateExpression::BoolNot(_))
             })?;
-        let updates_title = route.has_non_root_scalar_expression(|expression| {
-            matches!(
-                expression,
-                ScalarUpdateExpression::TextTrimOrPrevious { .. }
-            )
-        });
-        let title_target = route.single_non_root_scalar_target_matching(|expression| {
-            matches!(
-                expression,
-                ScalarUpdateExpression::TextTrimOrPrevious { .. }
-            )
+        let title_target = route.single_non_root_scalar_target_where(|target, expression| {
+            row_field_name(target) == "title"
+                && matches!(
+                    expression,
+                    ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                )
         })?;
+        let trim_text_target =
+            route.single_non_root_scalar_target_where(|target, expression| {
+                row_field_name(target) != "title"
+                    && matches!(
+                        expression,
+                        ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                    )
+            })?;
         let source_text_target = route.single_non_root_scalar_target_matching(|expression| {
             matches!(expression, ScalarUpdateExpression::SourceText)
         })?;
+        let edit_text_change_target = source_text_target.or(trim_text_target);
+        let updates_title = title_target.is_some();
         let previous_text_target = route.single_non_root_scalar_target_matching(|expression| {
             matches!(expression, ScalarUpdateExpression::PreviousValue(_))
         })?;
@@ -4582,8 +4769,8 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleChange {
                 source,
-                edit_text_target: source_text_target.ok_or_else(|| {
-                    format!("{} source `{source}` has no source-text target", step.id)
+                edit_text_target: edit_text_change_target.ok_or_else(|| {
+                    format!("{} source `{source}` has no edit-text target", step.id)
                 })?,
                 target_text,
                 text: source_event.text.unwrap_or_default(),
@@ -4682,22 +4869,18 @@ impl TodoRuntime {
             .unwrap_or_else(|| todo_generic_row(title));
         reset_todo_generic_row(&mut generic_todo, title)?;
         let append_trigger = self.list_equations.append_trigger("todos")?;
-        let (generic_key, generic_generation) = self.generic.append_row_for_trigger(
+        let row_source_paths = self.list_source_bindings.source_paths("todos")?;
+        let insert = self.generic.append_row_for_trigger_and_bind_sources(
             &self.list_equations,
             "todos",
             append_trigger,
             generic_todo,
+            row_source_paths,
         )?;
-        self.generic.bind_row_sources(
-            "todos",
-            generic_key,
-            generic_generation,
-            &self.row_source_paths,
-        );
         deltas.push(list_delta(
             "ListInsert",
-            generic_key,
-            generic_generation,
+            insert.key,
+            insert.generation,
             ProtocolValue::TodoRow {
                 title: Cow::Borrowed(title),
                 completed: false,
@@ -4706,41 +4889,61 @@ impl TodoRuntime {
         ));
         patches.push(patch(
             "InsertElement",
-            RenderTarget::TodoRow(generic_key),
+            RenderTarget::TodoRow(insert.key),
             ProtocolValue::Text(Cow::Borrowed(title)),
         ));
-        push_source_binding_deltas_for_row(&self.generic, generic_key, generic_generation, deltas);
-        push_source_binding_patches_for_row(
-            &self.generic,
-            generic_key,
-            generic_generation,
-            patches,
-        );
+        push_source_binding_deltas_for_row(&self.generic, insert.key, insert.generation, deltas);
+        push_source_binding_patches_for_row(&self.generic, insert.key, insert.generation, patches);
         Ok(())
     }
 
-    fn set_completed(
+    fn set_completed_from_source(
         &mut self,
         target: &'static str,
         index: usize,
-        completed: bool,
+        source: &str,
+        all_completed_snapshot: bool,
+        deltas: &mut Vec<SemanticDelta<'_>>,
+        patches: &mut Vec<RenderPatch<'_>>,
+    ) -> RuntimeResult<()> {
+        let completed =
+            self.commit_todo_bool_source(index, target, source, all_completed_snapshot)?;
+        deltas.push(field_delta(
+            Some(completed.key),
+            Some(completed.generation),
+            completed.field,
+            ProtocolValue::Bool(completed.value),
+        ));
+        patches.push(patch(
+            "SetProperty",
+            RenderTarget::TodoCheckbox(completed.key),
+            ProtocolValue::CheckedProperty(completed.value),
+        ));
+        Ok(())
+    }
+
+    fn set_completed_value(
+        &mut self,
+        target: &'static str,
+        index: usize,
+        value: bool,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
         let field = row_field_name(target);
-        self.set_todo_bool_field(index, field, completed)?;
-        let (key, generation) = self.todo_row_identity(index)?;
-        let completed = self.generic.list_row_bool("todos", index, field)?;
+        let (key, generation) = self
+            .generic
+            .commit_indexed_bool_field("todos", index, field, value)?;
         deltas.push(field_delta(
             Some(key),
             Some(generation),
             field,
-            ProtocolValue::Bool(completed),
+            ProtocolValue::Bool(value),
         ));
         patches.push(patch(
             "SetProperty",
             RenderTarget::TodoCheckbox(key),
-            ProtocolValue::CheckedProperty(completed),
+            ProtocolValue::CheckedProperty(value),
         ));
         Ok(())
     }
@@ -4753,18 +4956,25 @@ impl TodoRuntime {
     ) -> RuntimeResult<()> {
         let mut index = 0;
         while index < self.generic.list_len("todos")? {
-            let Some(generic_row) = self
-                .generic
-                .remove_row_for_predicate("todos", predicate, index)?
+            let Some(generic_row) = self.generic.remove_row_for_predicate_and_unbind_sources(
+                "todos",
+                predicate,
+                index,
+                |binding| {
+                    deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
+                    patches.push(patch(
+                        "UnbindSource",
+                        RenderTarget::TodoSource(binding.key, binding.source_path),
+                        source_binding_value(binding),
+                    ));
+                },
+            )?
             else {
                 index += 1;
                 continue;
             };
             let (key, generation) = (generic_row.key, generic_row.generation);
             self.spare_generic_todos.push(generic_row.value);
-            push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
-            push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
-            self.generic.unbind_row_sources("todos", key, generation);
             deltas.push(list_delta(
                 "ListRemove",
                 key,
@@ -4787,17 +4997,24 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<bool> {
-        let Some(generic_row) = self
-            .generic
-            .remove_row_for_predicate("todos", predicate, index)?
+        let Some(generic_row) = self.generic.remove_row_for_predicate_and_unbind_sources(
+            "todos",
+            predicate,
+            index,
+            |binding| {
+                deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
+                patches.push(patch(
+                    "UnbindSource",
+                    RenderTarget::TodoSource(binding.key, binding.source_path),
+                    source_binding_value(binding),
+                ));
+            },
+        )?
         else {
             return Ok(false);
         };
         let (key, generation) = (generic_row.key, generic_row.generation);
         self.spare_generic_todos.push(generic_row.value);
-        push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
-        push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
-        self.generic.unbind_row_sources("todos", key, generation);
         deltas.push(list_delta(
             "ListRemove",
             key,
@@ -4819,12 +5036,18 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let generic_row = self.generic.remove_row("todos", index)?;
+        let generic_row =
+            self.generic
+                .remove_row_and_unbind_sources("todos", index, |binding| {
+                    deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
+                    patches.push(patch(
+                        "UnbindSource",
+                        RenderTarget::TodoSource(binding.key, binding.source_path),
+                        source_binding_value(binding),
+                    ));
+                })?;
         let (key, generation) = (generic_row.key, generic_row.generation);
         self.spare_generic_todos.push(generic_row.value);
-        push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
-        push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
-        self.generic.unbind_row_sources("todos", key, generation);
         deltas.push(list_delta(
             "ListRemove",
             key,
@@ -4862,18 +5085,6 @@ impl TodoRuntime {
             RenderTarget::TodoPosition(key),
             ProtocolValue::NumberText(to as i64),
         ));
-        Ok(())
-    }
-
-    fn set_todo_text_field(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
-        self.generic
-            .commit_indexed_text_field("todos", index, field, value)?;
-        Ok(())
-    }
-
-    fn set_todo_bool_field(&mut self, index: usize, field: &str, value: bool) -> RuntimeResult<()> {
-        self.generic
-            .commit_indexed_bool_field("todos", index, field, value)?;
         Ok(())
     }
 
@@ -5010,14 +5221,14 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn todo_bool_update_with_snapshot(
-        &self,
+    fn commit_todo_bool_source(
+        &mut self,
         index: usize,
-        target: &str,
+        target: &'static str,
         source: &str,
         all_completed_snapshot: bool,
-    ) -> RuntimeResult<bool> {
-        self.generic.eval_indexed_bool_source(
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        self.generic.commit_indexed_bool_source(
             &self.scalar_equations,
             "todos",
             index,
@@ -5028,85 +5239,6 @@ impl TodoRuntime {
                 _ => None,
             },
         )
-    }
-
-    fn todo_title_update<'a>(
-        &self,
-        index: usize,
-        target: &str,
-        source: &str,
-        source_text: Option<&'a str>,
-        visible_edit_text: Option<&'a str>,
-    ) -> RuntimeResult<Option<&'a str>> {
-        match self.generic.eval_indexed_text_source(
-            &self.scalar_equations,
-            "todos",
-            index,
-            target,
-            source,
-            source_text.or(visible_edit_text),
-        )? {
-            IndexedTextCandidate::TrimmedOrSkip(value) => Ok(value),
-            _ => Err(format!(
-                "title branch for `{target}` from `{source}` is not a trim-or-previous expression"
-            )
-            .into()),
-        }
-    }
-
-    fn todo_text_payload_update<'a>(
-        &self,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_text: Option<&'a str>,
-    ) -> RuntimeResult<Option<&'a str>> {
-        match self.generic.eval_indexed_text_source(
-            &self.scalar_equations,
-            "todos",
-            index,
-            target,
-            source,
-            payload_text,
-        )? {
-            IndexedTextCandidate::SourceText(value) => {
-                let trimmed = value.trim();
-                Ok((!trimmed.is_empty()).then_some(trimmed))
-            }
-            IndexedTextCandidate::PreviousText(value) => Ok(Some(value)),
-            IndexedTextCandidate::PreviousField(path) => {
-                Err(format!("text update `{target}` from `{source}` needs previous field `{path}` without payload").into())
-            }
-            IndexedTextCandidate::TrimmedOrSkip(value) => Ok(value),
-        }
-    }
-
-    fn todo_text_update<'a>(
-        &self,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_text: Option<&'a str>,
-    ) -> RuntimeResult<&'a str> {
-        match self.generic.eval_indexed_text_source(
-            &self.scalar_equations,
-            "todos",
-            index,
-            target,
-            source,
-            payload_text,
-        )? {
-            IndexedTextCandidate::SourceText(value) | IndexedTextCandidate::PreviousText(value) => {
-                Ok(value)
-            }
-            IndexedTextCandidate::PreviousField(path) => {
-                Err(format!("text update `{target}` from `{source}` needs previous field `{path}` without payload").into())
-            }
-            IndexedTextCandidate::TrimmedOrSkip(Some(value)) => Ok(value),
-            IndexedTextCandidate::TrimmedOrSkip(None) => {
-                Err(format!("text update `{target}` from `{source}` produced no change").into())
-            }
-        }
     }
 
     fn find_index(&self, title: &str) -> RuntimeResult<usize> {
@@ -5351,7 +5483,7 @@ fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
     runtime
-        .set_completed("todo.completed", index, true, &mut deltas, &mut patches)
+        .set_completed_value("todo.completed", index, true, &mut deltas, &mut patches)
         .expect("stress toggle index is in range");
     let alloc_delta = allocation_delta(allocations_before);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -5841,28 +5973,45 @@ impl CellsRuntime {
                 text,
             } => {
                 let index = self.cell_index(address)?;
-                let (key, generation) = self.cell_key_generation(index);
-                let editing_text =
-                    self.cell_text_payload_update(editing_text_target, source, Some(text))?;
-                let editing = self.cell_bool_update(editing_target, source)?;
-                self.set_cell_text_field(index, "editing_text", editing_text)?;
-                self.set_cell_bool_field(index, "editing", editing)?;
+                let editing_text = self
+                    .generic
+                    .commit_indexed_text_source(
+                        &self.scalar_equations,
+                        "cells",
+                        index,
+                        editing_text_target,
+                        source,
+                        Some(text),
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "text update `{editing_text_target}` from `{source}` produced no change"
+                        )
+                    })?;
+                let editing = self.generic.commit_indexed_bool_source(
+                    &self.scalar_equations,
+                    "cells",
+                    index,
+                    editing_target,
+                    source,
+                    |_| None,
+                )?;
                 deltas.push(cell_field_delta(
-                    key,
-                    generation,
-                    "editing_text",
-                    ProtocolValue::Text(Cow::Borrowed(editing_text)),
+                    editing_text.key,
+                    editing_text.generation,
+                    editing_text.field,
+                    ProtocolValue::Text(Cow::Borrowed(editing_text.value)),
                 ));
                 deltas.push(cell_field_delta(
-                    key,
-                    generation,
-                    "editing",
-                    ProtocolValue::Bool(editing),
+                    editing.key,
+                    editing.generation,
+                    editing.field,
+                    ProtocolValue::Bool(editing.value),
                 ));
                 patches.push(patch(
                     "SetCellEditor",
                     RenderTarget::Borrowed(Cow::Borrowed(address)),
-                    ProtocolValue::Text(Cow::Borrowed(editing_text)),
+                    ProtocolValue::Text(Cow::Borrowed(editing_text.value)),
                 ));
             }
             CellEvent::Commit {
@@ -5896,14 +6045,20 @@ impl CellsRuntime {
                 let index = self.cell_index(address)?;
                 let (key, generation) = self.cell_key_generation(index);
                 let previous_path = self.cell_previous_text_path(editing_text_target, source)?;
-                let editing = self.cell_bool_update(editing_target, source)?;
                 if previous_path != "formula_text" {
                     return Err(
                         format!("unsupported Cells previous text field `{previous_path}`").into(),
                     );
                 }
                 self.copy_cell_formula_to_editing_text(index)?;
-                self.set_cell_bool_field(index, "editing", editing)?;
+                let editing = self.generic.commit_indexed_bool_source(
+                    &self.scalar_equations,
+                    "cells",
+                    index,
+                    editing_target,
+                    source,
+                    |_| None,
+                )?;
                 let editing_text = self.cell_text_field(index, "editing_text")?;
                 deltas.push(cell_field_delta(
                     key,
@@ -5912,10 +6067,10 @@ impl CellsRuntime {
                     self.protocol_text(editing_text),
                 ));
                 deltas.push(cell_field_delta(
-                    key,
-                    generation,
-                    "editing",
-                    ProtocolValue::Bool(false),
+                    editing.key,
+                    editing.generation,
+                    editing.field,
+                    ProtocolValue::Bool(editing.value),
                 ));
                 patches.push(patch(
                     "SetCellText",
@@ -6031,35 +6186,6 @@ impl CellsRuntime {
             .map_err(|error| format!("{} generic storage mismatch: {error}", step.id).into())
     }
 
-    fn cell_text_payload_update<'a>(
-        &self,
-        target: &str,
-        source: &str,
-        payload_text: Option<&'a str>,
-    ) -> RuntimeResult<&'a str> {
-        let index = 0;
-        match self.generic.eval_indexed_text_source(
-            &self.scalar_equations,
-            "cells",
-            index,
-            target,
-            source,
-            payload_text,
-        )? {
-            IndexedTextCandidate::SourceText(value) | IndexedTextCandidate::PreviousText(value) => {
-                Ok(value)
-            }
-            IndexedTextCandidate::PreviousField(path) => Err(format!(
-                "text update `{target}` from `{source}` needs previous field `{path}`, not payload text"
-            )
-            .into()),
-            IndexedTextCandidate::TrimmedOrSkip(_) => Err(format!(
-                "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
-            )
-            .into()),
-        }
-    }
-
     fn cell_previous_text_path(&self, target: &str, source: &str) -> RuntimeResult<&'static str> {
         let index = 0;
         match self.generic.eval_indexed_text_source(
@@ -6080,17 +6206,6 @@ impl CellsRuntime {
             )
             .into()),
         }
-    }
-
-    fn cell_bool_update(&self, target: &str, source: &str) -> RuntimeResult<bool> {
-        self.generic.eval_indexed_bool_source(
-            &self.scalar_equations,
-            "cells",
-            0,
-            target,
-            source,
-            |_| None,
-        )
     }
 
     fn commit<'a>(
@@ -6132,30 +6247,80 @@ impl CellsRuntime {
     ) -> RuntimeResult<()> {
         self.formula_equations.expect_cells_pipeline()?;
         let committed_index = self.cell_index(address)?;
-        let (key, generation) = self.cell_key_generation(committed_index);
-        let formula = self.cell_text_payload_update(targets.formula, source, Some(formula))?;
-        let editing_text =
-            self.cell_text_payload_update(targets.editing_text, source, Some(formula))?;
-        let editing = self.cell_bool_update(targets.editing, source)?;
-        self.set_cell_text_field(committed_index, "formula_text", formula)?;
-        self.set_cell_text_field(committed_index, "editing_text", editing_text)?;
-        self.set_cell_bool_field(committed_index, "editing", editing)?;
-        self.cells[committed_index].parsed = parse_formula_ast(formula, self.columns, self.rows);
-        self.replace_cell_dependencies(committed_index, formula);
+        let formula = self
+            .generic
+            .commit_indexed_text_source(
+                &self.scalar_equations,
+                "cells",
+                committed_index,
+                targets.formula,
+                source,
+                Some(formula),
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "formula update `{}` from `{source}` produced no change",
+                    targets.formula
+                )
+            })?;
+        let editing_text = self
+            .generic
+            .commit_indexed_text_source(
+                &self.scalar_equations,
+                "cells",
+                committed_index,
+                targets.editing_text,
+                source,
+                Some(formula.value),
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "editing text update `{}` from `{source}` produced no change",
+                    targets.editing_text
+                )
+            })?;
+        let editing = self.generic.commit_indexed_bool_source(
+            &self.scalar_equations,
+            "cells",
+            committed_index,
+            targets.editing,
+            source,
+            |_| None,
+        )?;
+        self.cells[committed_index].parsed =
+            parse_formula_ast(formula.value, self.columns, self.rows);
+        self.replace_cell_dependencies(committed_index, formula.value);
         self.recompute_affected(address, recomputed)?;
         let cell = &self.cells[committed_index];
         let value = protocol_cell_value(cell);
         deltas.push(cell_field_delta(
-            key,
-            generation,
-            "formula_text",
-            ProtocolValue::Text(Cow::Borrowed(formula)),
+            formula.key,
+            formula.generation,
+            formula.field,
+            ProtocolValue::Text(Cow::Borrowed(formula.value)),
         ));
-        deltas.push(cell_field_delta(key, generation, "value", value.clone()));
+        deltas.push(cell_field_delta(
+            editing_text.key,
+            editing_text.generation,
+            editing_text.field,
+            ProtocolValue::Text(Cow::Borrowed(editing_text.value)),
+        ));
+        deltas.push(cell_field_delta(
+            editing.key,
+            editing.generation,
+            editing.field,
+            ProtocolValue::Bool(editing.value),
+        ));
+        deltas.push(cell_field_delta(
+            formula.key,
+            formula.generation,
+            "value",
+            value.clone(),
+        ));
         if let Some(error) = cell.error {
             deltas.push(cell_field_delta(
-                key,
-                generation,
+                formula.key,
+                formula.generation,
                 "error",
                 ProtocolValue::Text(Cow::Borrowed(error)),
             ));
@@ -6292,31 +6457,9 @@ impl CellsRuntime {
         self.generic.list_row_bool("cells", index, field)
     }
 
-    fn set_cell_text_field(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
-        match field {
-            "formula_text" | "editing_text" => {
-                self.generic
-                    .commit_indexed_text_field("cells", index, field, value)?;
-            }
-            _ => return Err(format!("unsupported Cells text field `{field}`").into()),
-        }
-        Ok(())
-    }
-
     fn copy_cell_formula_to_editing_text(&mut self, index: usize) -> RuntimeResult<()> {
         self.generic
             .copy_list_row_textlike_field("cells", index, "formula_text", "editing_text")
-    }
-
-    fn set_cell_bool_field(&mut self, index: usize, field: &str, value: bool) -> RuntimeResult<()> {
-        match field {
-            "editing" => {
-                self.generic
-                    .commit_indexed_bool_field("cells", index, field, value)?;
-            }
-            _ => return Err(format!("unsupported Cells bool field `{field}`").into()),
-        }
-        Ok(())
     }
 
     fn assert_generic_mirror_in_sync(&self) -> RuntimeResult<()> {
@@ -6647,26 +6790,14 @@ fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> 
         .collect()
 }
 
-fn todo_row_source_paths(parsed: &ParsedProgram) -> RuntimeResult<Vec<&'static str>> {
-    let mut paths = Vec::new();
-    for port in &parsed.source_ports {
-        if is_todo_row_source_path(&port.path) && !paths.iter().any(|path| *path == port.path) {
-            paths.push(leak_runtime_path(port.path.clone()));
-        }
-    }
-    if paths.is_empty() {
-        return Err("TodoMVC source has no row-local todo source ports".into());
-    }
-    Ok(paths)
-}
-
-fn default_todo_row_source_paths() -> Vec<&'static str> {
+fn default_todo_list_source_bindings() -> ListSourceBindingPlan {
     let parsed = parse_source(
         "examples/todomvc.bn",
         include_str!("../../../examples/todomvc.bn"),
     )
     .expect("checked-in TodoMVC source should parse");
-    todo_row_source_paths(&parsed).expect("checked-in TodoMVC should have row sources")
+    let ir = lower(&parsed).expect("checked-in TodoMVC source should lower");
+    ListSourceBindingPlan::from_ir(&ir)
 }
 
 fn default_cells_scalar_equations() -> ScalarEquationPlan {
@@ -6677,10 +6808,6 @@ fn default_cells_scalar_equations() -> ScalarEquationPlan {
     .expect("checked-in Cells source should parse");
     let ir = lower(&parsed).expect("checked-in Cells source should lower");
     ScalarEquationPlan::from_ir(&ir)
-}
-
-fn is_todo_row_source_path(path: &str) -> bool {
-    path.starts_with("todo.sources.")
 }
 
 fn leak_runtime_path(path: String) -> &'static str {
@@ -6879,17 +7006,6 @@ fn push_source_binding_deltas_for_row<'a>(
     }
 }
 
-fn push_source_unbinding_deltas_for_row<'a>(
-    runtime: &GenericCircuitRuntime,
-    key: u64,
-    generation: u64,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-) {
-    for binding in runtime.row_source_bindings("todos", key, generation) {
-        deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
-    }
-}
-
 fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
     ProtocolValue::SourceBinding {
         source_path: binding.source_path,
@@ -6907,21 +7023,6 @@ fn push_source_binding_patches_for_row<'a>(
     for binding in runtime.row_source_bindings("todos", key, generation) {
         patches.push(patch(
             "BindSource",
-            RenderTarget::TodoSource(binding.key, binding.source_path),
-            source_binding_value(binding),
-        ));
-    }
-}
-
-fn push_source_unbinding_patches_for_row<'a>(
-    runtime: &GenericCircuitRuntime,
-    key: u64,
-    generation: u64,
-    patches: &mut Vec<RenderPatch<'a>>,
-) {
-    for binding in runtime.row_source_bindings("todos", key, generation) {
-        patches.push(patch(
-            "UnbindSource",
             RenderTarget::TodoSource(binding.key, binding.source_path),
             source_binding_value(binding),
         ));
@@ -7314,7 +7415,7 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let row_source_count = runtime.row_source_paths.len();
+        let row_source_count = runtime.list_source_bindings.source_count("todos").unwrap();
         assert_eq!(
             runtime.generic.source_binding_count(),
             runtime.todo_len() * row_source_count
@@ -7378,16 +7479,9 @@ mod tests {
             include_str!("../../../examples/todomvc.bn").replace("todo_checkbox", "done_checkbox");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
         let runtime = todo_runtime_from_parsed(&parsed);
-        assert!(
-            runtime
-                .row_source_paths
-                .contains(&"todo.sources.done_checkbox.click")
-        );
-        assert!(
-            !runtime
-                .row_source_paths
-                .contains(&"todo.sources.todo_checkbox.click")
-        );
+        let row_source_paths = runtime.list_source_bindings.source_paths("todos").unwrap();
+        assert!(row_source_paths.contains(&"todo.sources.done_checkbox.click"));
+        assert!(!row_source_paths.contains(&"todo.sources.todo_checkbox.click"));
         let (key, generation) = runtime.todo_row_identity(0).unwrap();
         assert!(
             runtime
@@ -8109,7 +8203,7 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let row_source_count = runtime.row_source_paths.len();
+        let row_source_count = runtime.list_source_bindings.source_count("todos").unwrap();
         let removed_key = runtime.todo_key(0);
         let removed_generation = runtime.todo_generation(0);
         let mut deltas = Vec::new();

@@ -928,22 +928,29 @@ fn update_expression_for_source(target: &str, body: &str, source: &str) -> Updat
 }
 
 fn text_trim_or_previous_expression(target: &str, branch: &str) -> Option<UpdateExpression> {
-    if target != "todo.title" || !branch.contains("|> Text/trim") {
+    if !target.starts_with("todo.") || !branch.contains("|> Text/trim") {
         return None;
     }
     let (_, after_empty) = branch.split_once("TEXT {} =>")?;
-    let previous = after_empty
+    let mut previous = after_empty
         .split_whitespace()
         .next()
         .map(|value| value.trim_matches(|ch| ch == '}' || ch == ','))
         .filter(|value| !value.is_empty())?;
     let (before_trim, _) = branch.split_once("|> Text/trim")?;
-    let path = before_trim
+    let mut path = before_trim
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|part| !part.is_empty())
         .next_back()?;
     if !value_starts_lowercase_identifier(path) || !value_starts_lowercase_identifier(previous) {
         return None;
+    }
+    let target_field = target.rsplit_once('.').map(|(_, field)| field)?;
+    if previous != target_field && !branch.contains(&format!("{previous}:")) {
+        previous = target_field;
+    }
+    if path != "text" && !branch.contains(&format!("{path}:")) && branch.contains(".text") {
+        path = "text";
     }
     Some(UpdateExpression::TextTrimOrPrevious {
         path: path.to_owned(),
@@ -1401,6 +1408,16 @@ mod tests {
                     == UpdateExpression::TextTrimOrPrevious {
                         path: "edit_text".to_owned(),
                         previous: "title".to_owned(),
+                    }
+                && branch.indexed
+        }));
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "todo.edit_text"
+                && branch.source == "todo.sources.editing_todo_title_element.change"
+                && branch.expression
+                    == UpdateExpression::TextTrimOrPrevious {
+                        path: "text".to_owned(),
+                        previous: "edit_text".to_owned(),
                     }
                 && branch.indexed
         }));

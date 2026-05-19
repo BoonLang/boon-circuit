@@ -1160,16 +1160,15 @@ enum LoadedRuntime {
 
 impl LoadedRuntime {
     fn new(
-        parsed: &ParsedProgram,
+        _parsed: &ParsedProgram,
         ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<Self> {
+        let generic = GenericScheduledRuntime::new(ir, compiled)?;
         match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => {
-                Ok(Self::Todo(TodoRuntime::new(parsed, ir, compiled)?))
-            }
+            ExecutableSurfaceKind::TodoMvc => Ok(Self::Todo(TodoRuntime::from_generic(generic)?)),
             ExecutableSurfaceKind::Cells => {
-                Ok(Self::Cells(CellsRuntime::new(parsed, ir, compiled)?))
+                Ok(Self::Cells(CellsRuntime::from_generic(generic, ir)?))
             }
         }
     }
@@ -1738,7 +1737,7 @@ fn base_example_report(
             "generic_interpreter_complete": false,
             "example_behavior_adapter": true,
             "adapter_kind": compiled.surface.kind.as_str(),
-            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime by inferred executable surface instead of instantiating one complete generic equation schedule",
+            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime drivers by inferred executable surface after constructing the generic schedule",
             "not_final_architecture_acceptance": true,
             "generic_runtime_slices": {
                 "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
@@ -1746,6 +1745,7 @@ fn base_example_report(
                 "update_branch_count": ir.update_branches.len(),
                 "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
                 "generic_scenario_loop_executor": true,
+                "generic_schedule_instantiated_before_adapter": true,
                 "generic_source_event_ingest": true,
                 "generic_source_binding_store": true,
                 "generic_indexed_branch_evaluator": true,
@@ -5275,12 +5275,7 @@ enum TodoEvent<'a> {
 }
 
 impl TodoRuntime {
-    fn new(
-        _parsed: &ParsedProgram,
-        ir: &TypedProgram,
-        compiled: &CompiledProgram,
-    ) -> RuntimeResult<Self> {
-        let mut generic = GenericScheduledRuntime::new(ir, compiled)?;
+    fn from_generic(mut generic: GenericScheduledRuntime) -> RuntimeResult<Self> {
         let todo_count = generic.list_len("todos")?;
         let row_source_paths = generic.row_source_paths("todos")?.to_vec();
         generic.reserve_source_bindings(todo_count * row_source_paths.len());
@@ -6858,12 +6853,7 @@ enum CellEvent<'a> {
 }
 
 impl CellsRuntime {
-    fn new(
-        _parsed: &ParsedProgram,
-        ir: &TypedProgram,
-        compiled: &CompiledProgram,
-    ) -> RuntimeResult<Self> {
-        let generic = GenericScheduledRuntime::new(ir, compiled)?;
+    fn from_generic(generic: GenericScheduledRuntime, ir: &TypedProgram) -> RuntimeResult<Self> {
         let (columns, rows) = cells_grid_dimensions_from_ir(ir)
             .ok_or("Cells IR has no Grid/cells list initializer")?;
         let expected_len = columns.saturating_mul(rows);
@@ -8177,7 +8167,8 @@ mod tests {
     fn todo_runtime_from_parsed(parsed: &ParsedProgram) -> TodoRuntime {
         let ir = lower(parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        TodoRuntime::new(parsed, &ir, &compiled).unwrap()
+        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        TodoRuntime::from_generic(generic).unwrap()
     }
 
     #[test]
@@ -9388,7 +9379,8 @@ mod tests {
         let parsed = parse_source("examples/cells.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let mut runtime = CellsRuntime::new(&parsed, &ir, &compiled).unwrap();
+        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = CellsRuntime::from_generic(generic, &ir).unwrap();
         runtime.reserve_cell_storage("123".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();

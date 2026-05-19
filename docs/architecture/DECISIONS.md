@@ -358,18 +358,20 @@ expression, so TodoMVC route classification can ask for non-root `Bool/not`,
 text-trim, constant, or previous-value branches instead of recognizing toggle or
 edit events by field names. Toggle-all and row-checkbox events now carry the
 matched bool target into application instead of applying through a fixed
-`todo.completed` target. Root scalar `HOLD` dispatch also uses that same
-compiled route index to find the single root target for a source, and routed
-TodoMVC source events carry that root target into the application phase instead
-of looking it up again there. `List/remove` predicates for clear-completed and
-row delete are carried on the same source-route entries, so row removal uses the
-compiled predicate directly instead of looking it up by source during the row
-scan. Cells edit, commit, and cancel events now carry the indexed `HOLD` targets
-selected by their compiled source route (`cell.editing_text`,
-`cell.formula_text`, `cell.editing`, or renamed equivalents) into the
-application phase, so the application boundary does not choose those fields by
-hardcoded event kind. Example runtimes only mirror committed values for
-render/test checks.
+`todo.completed` target. Todo edit-open/change/Enter/Escape/blur events now
+carry the matched title, edit-text, and editing targets into application instead
+of choosing `todo.title`, `todo.edit_text`, or `todo.editing` by event kind.
+Root scalar `HOLD` dispatch also uses that same compiled route index to find the
+single root target for a source, and routed TodoMVC source events carry that
+root target into the application phase instead of looking it up again there.
+`List/remove` predicates for clear-completed and row delete are carried on the
+same source-route entries, so row removal uses the compiled predicate directly
+instead of looking it up by source during the row scan. Cells edit, commit, and
+cancel events now carry the indexed `HOLD` targets selected by their compiled
+source route (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or
+renamed equivalents) into the application phase, so the application boundary
+does not choose those fields by hardcoded event kind. Example runtimes only
+mirror committed values for render/test checks.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

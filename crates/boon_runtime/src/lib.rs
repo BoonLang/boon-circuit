@@ -1773,6 +1773,7 @@ fn base_example_report(
                 "generic_routed_root_target_application": true,
                 "generic_routed_indexed_target_application": true,
                 "generic_routed_todo_bool_target_application": true,
+                "generic_routed_todo_edit_text_target_application": true,
                 "ir_list_operation_table_loaded": true,
                 "list_operation_count": ir.list_operations.len(),
                 "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -3874,22 +3875,30 @@ enum TodoEvent<'a> {
     },
     TodoTitleDoubleClick {
         source: &'a str,
+        edit_text_target: &'static str,
+        editing_target: &'static str,
         target_text: &'a str,
         target_occurrence: usize,
     },
     EditingTitleChange {
         source: &'a str,
+        edit_text_target: &'static str,
         target_text: &'a str,
         text: &'a str,
     },
     EditingTitleKeyDown {
         source: &'a str,
+        title_target: Option<&'static str>,
+        edit_text_target: Option<&'static str>,
+        editing_target: &'static str,
         target_text: &'a str,
         key: &'a str,
         text: Option<&'a str>,
     },
     EditingTitleBlur {
         source: &'a str,
+        title_target: &'static str,
+        editing_target: &'static str,
         target_text: &'a str,
         text: Option<&'a str>,
     },
@@ -4189,31 +4198,35 @@ impl TodoRuntime {
             }
             TodoEvent::TodoTitleDoubleClick {
                 source,
+                edit_text_target,
+                editing_target,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let edit_text =
-                    self.todo_text_update(index, "todo.edit_text", source, Some(target_text))?;
+                    self.todo_text_update(index, edit_text_target, source, Some(target_text))?;
                 let editing = self.todo_bool_update_with_snapshot(
                     index,
-                    "todo.editing",
+                    editing_target,
                     source,
                     self.all_completed(),
                 )?;
-                self.set_todo_bool_field(index, "editing", editing)?;
-                self.set_todo_text_field(index, "edit_text", edit_text)?;
+                let editing_field = row_field_name(editing_target);
+                let edit_text_field = row_field_name(edit_text_target);
+                self.set_todo_bool_field(index, editing_field, editing)?;
+                self.set_todo_text_field(index, edit_text_field, edit_text)?;
                 let todo = &self.todos[index];
                 deltas.push(field_delta(
                     Some(todo.key),
                     Some(todo.generation),
-                    "editing",
+                    editing_field,
                     ProtocolValue::Bool(editing),
                 ));
                 deltas.push(field_delta(
                     Some(todo.key),
                     Some(todo.generation),
-                    "edit_text",
+                    edit_text_field,
                     ProtocolValue::Text(Cow::Borrowed(edit_text)),
                 ));
                 patches.push(patch(
@@ -4224,6 +4237,7 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleChange {
                 source,
+                edit_text_target,
                 target_text,
                 text,
             } => {
@@ -4231,14 +4245,15 @@ impl TodoRuntime {
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 if let Some(edit_text) =
-                    self.todo_text_payload_update(index, "todo.edit_text", source, Some(text))?
+                    self.todo_text_payload_update(index, edit_text_target, source, Some(text))?
                 {
-                    self.set_todo_text_field(index, "edit_text", edit_text)?;
+                    let edit_text_field = row_field_name(edit_text_target);
+                    self.set_todo_text_field(index, edit_text_field, edit_text)?;
                     let todo = &self.todos[index];
                     deltas.push(field_delta(
                         Some(todo.key),
                         Some(todo.generation),
-                        "edit_text",
+                        edit_text_field,
                         ProtocolValue::Text(Cow::Borrowed(edit_text)),
                     ));
                     patches.push(patch(
@@ -4250,6 +4265,9 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleKeyDown {
                 source,
+                title_target,
+                edit_text_target,
+                editing_target,
                 target_text,
                 key,
                 text,
@@ -4261,12 +4279,18 @@ impl TodoRuntime {
                     let row_key = self.todos[index].key;
                     let row_generation = self.todos[index].generation;
                     if key == "Enter" {
-                        if let Some(title) = self.todo_title_update(index, source, text, None)? {
-                            self.set_todo_text_field(index, "title", title)?;
+                        let title_target = title_target.ok_or_else(|| {
+                            format!("source `{source}` Enter route has no title target")
+                        })?;
+                        if let Some(title) =
+                            self.todo_title_update(index, title_target, source, text, None)?
+                        {
+                            let title_field = row_field_name(title_target);
+                            self.set_todo_text_field(index, title_field, title)?;
                             deltas.push(field_delta(
                                 Some(row_key),
                                 Some(row_generation),
-                                "title",
+                                title_field,
                                 ProtocolValue::Text(Cow::Borrowed(title)),
                             ));
                             patches.push(patch(
@@ -4276,32 +4300,37 @@ impl TodoRuntime {
                             ));
                         }
                     } else {
+                        let edit_text_target = edit_text_target.ok_or_else(|| {
+                            format!("source `{source}` Escape route has no edit-text target")
+                        })?;
                         let edit_text = self.todo_text_update(
                             index,
-                            "todo.edit_text",
+                            edit_text_target,
                             source,
                             Some(target_text),
                         )?;
-                        self.set_todo_text_field(index, "edit_text", edit_text)?;
+                        let edit_text_field = row_field_name(edit_text_target);
+                        self.set_todo_text_field(index, edit_text_field, edit_text)?;
                         deltas.push(field_delta(
                             Some(row_key),
                             Some(row_generation),
-                            "edit_text",
+                            edit_text_field,
                             ProtocolValue::Text(Cow::Borrowed(edit_text)),
                         ));
                     }
                     let editing = self.todo_bool_update_with_snapshot(
                         index,
-                        "todo.editing",
+                        editing_target,
                         source,
                         self.all_completed(),
                     )?;
-                    self.set_todo_bool_field(index, "editing", editing)?;
+                    let editing_field = row_field_name(editing_target);
+                    self.set_todo_bool_field(index, editing_field, editing)?;
                     let todo = &self.todos[index];
                     deltas.push(field_delta(
                         Some(todo.key),
                         Some(todo.generation),
-                        "editing",
+                        editing_field,
                         ProtocolValue::Bool(editing),
                     ));
                     patches.push(patch(
@@ -4313,6 +4342,8 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleBlur {
                 source,
+                title_target,
+                editing_target,
                 target_text,
                 text,
             } => {
@@ -4321,14 +4352,19 @@ impl TodoRuntime {
                     .or_else(|_| self.find_editing_index())?;
                 let row_key = self.todos[index].key;
                 let row_generation = self.todos[index].generation;
-                if let Some(title) =
-                    self.todo_title_update(index, source, None, text.or(Some(target_text)))?
-                {
-                    self.set_todo_text_field(index, "title", title)?;
+                if let Some(title) = self.todo_title_update(
+                    index,
+                    title_target,
+                    source,
+                    None,
+                    text.or(Some(target_text)),
+                )? {
+                    let title_field = row_field_name(title_target);
+                    self.set_todo_text_field(index, title_field, title)?;
                     deltas.push(field_delta(
                         Some(row_key),
                         Some(row_generation),
-                        "title",
+                        title_field,
                         ProtocolValue::Text(Cow::Borrowed(title)),
                     ));
                     patches.push(patch(
@@ -4339,16 +4375,17 @@ impl TodoRuntime {
                 }
                 let editing = self.todo_bool_update_with_snapshot(
                     index,
-                    "todo.editing",
+                    editing_target,
                     source,
                     self.all_completed(),
                 )?;
-                self.set_todo_bool_field(index, "editing", editing)?;
+                let editing_field = row_field_name(editing_target);
+                self.set_todo_bool_field(index, editing_field, editing)?;
                 let todo = &self.todos[index];
                 deltas.push(field_delta(
                     Some(todo.key),
                     Some(todo.generation),
-                    "editing",
+                    editing_field,
                     ProtocolValue::Bool(editing),
                 ));
                 patches.push(patch(
@@ -4492,12 +4529,24 @@ impl TodoRuntime {
                 ScalarUpdateExpression::TextTrimOrPrevious { .. }
             )
         });
-        let opens_or_restores_edit_state = route.has_non_root_scalar_expression(|expression| {
+        let title_target = route.single_non_root_scalar_target_matching(|expression| {
             matches!(
                 expression,
-                ScalarUpdateExpression::Const("True") | ScalarUpdateExpression::PreviousValue(_)
+                ScalarUpdateExpression::TextTrimOrPrevious { .. }
             )
-        });
+        })?;
+        let source_text_target = route.single_non_root_scalar_target_matching(|expression| {
+            matches!(expression, ScalarUpdateExpression::SourceText)
+        })?;
+        let previous_text_target = route.single_non_root_scalar_target_matching(|expression| {
+            matches!(expression, ScalarUpdateExpression::PreviousValue(_))
+        })?;
+        let edit_open_target = route.single_non_root_scalar_target_matching(|expression| {
+            matches!(expression, ScalarUpdateExpression::Const("True"))
+        })?;
+        let edit_close_target = route.single_non_root_scalar_target_matching(|expression| {
+            matches!(expression, ScalarUpdateExpression::Const("False"))
+        })?;
         let Some(target_occurrence) =
             self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
         else {
@@ -4523,6 +4572,11 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleKeyDown {
                 source,
+                title_target,
+                edit_text_target: previous_text_target,
+                editing_target: edit_close_target.ok_or_else(|| {
+                    format!("{} source `{source}` has no edit-close target", step.id)
+                })?,
                 target_text,
                 key: source_event.key.unwrap_or_default(),
                 text: source_event.text,
@@ -4532,6 +4586,11 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleBlur {
                 source,
+                title_target: title_target
+                    .ok_or_else(|| format!("{} source `{source}` has no title target", step.id))?,
+                editing_target: edit_close_target.ok_or_else(|| {
+                    format!("{} source `{source}` has no edit-close target", step.id)
+                })?,
                 target_text,
                 text: source_event.text.or(Some(target_text)),
             }));
@@ -4540,13 +4599,20 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleChange {
                 source,
+                edit_text_target: source_text_target.ok_or_else(|| {
+                    format!("{} source `{source}` has no source-text target", step.id)
+                })?,
                 target_text,
                 text: source_event.text.unwrap_or_default(),
             }));
         }
-        if opens_or_restores_edit_state {
+        if let (Some(edit_text_target), Some(editing_target)) =
+            (previous_text_target, edit_open_target)
+        {
             return Ok(Some(TodoEvent::TodoTitleDoubleClick {
                 source,
+                edit_text_target,
+                editing_target,
                 target_text,
                 target_occurrence,
             }));
@@ -5098,6 +5164,7 @@ impl TodoRuntime {
     fn todo_title_update<'a>(
         &self,
         index: usize,
+        target: &str,
         source: &str,
         source_text: Option<&'a str>,
         visible_edit_text: Option<&'a str>,
@@ -5106,13 +5173,13 @@ impl TodoRuntime {
             &self.scalar_equations,
             "todos",
             index,
-            "todo.title",
+            target,
             source,
             source_text.or(visible_edit_text),
         )? {
             IndexedTextCandidate::TrimmedOrSkip(value) => Ok(value),
             _ => Err(format!(
-                "title branch for `todo.title` from `{source}` is not a trim-or-previous expression"
+                "title branch for `{target}` from `{source}` is not a trim-or-previous expression"
             )
             .into()),
         }

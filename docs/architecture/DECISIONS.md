@@ -506,15 +506,17 @@ text/submit workflow (`add-test-todo-type` plus `add-test-todo-submit`, or
 `edit-a1-literal` plus `commit-a1-literal`) and the headed report records those
 observed source events. TodoMVC also has keyboard-activatable visible controls
 for toggle-all, the first row checkbox, filters, and a delete button; those
-controls emit matching observed `SOURCE` events in the headed report. Third, it
-focuses the visible Step control, sends real OS keyboard activation, advances
-each scenario prefix through the playground, captures per-step screenshots, and
-stores the Step control bounds in the headed report. This does not satisfy the
-final e2e gate yet because the full scenario is still replayed through scenario
-user actions after the visible-control probes, and the observed source-event
-probe is not yet the runtime mutation path; the report keeps
-`os_input_limitation` until every TodoMVC/Cells scenario step is driven by
-actual visible app controls and observed source events.
+controls emit matching observed `SOURCE` events in the headed report. Covered
+observed source events are now also applied through `boon_runtime::LiveRuntime`,
+which wraps the same loaded runtime and source route executor used by semantic
+scenario replay. Third, it focuses the visible Step control, sends real OS
+keyboard activation, advances each scenario prefix through the playground,
+captures per-step screenshots, and stores the Step control bounds in the headed
+report. This does not satisfy the final e2e gate yet because the complete
+scenario is still replayed through scenario user actions after the
+visible-control probes; the report keeps `os_input_limitation` until every
+TodoMVC/Cells scenario step is driven by actual visible app controls and
+observed source events.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

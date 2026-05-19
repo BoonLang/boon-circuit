@@ -1,6 +1,6 @@
 use boon_runtime::{
-    RunOutput, VerificationLayer, example_paths, parse_scenario, run_scenario,
-    run_scenario_source_with_step_limit, sha256_file, write_json,
+    LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer, example_paths, parse_scenario,
+    run_scenario, run_scenario_source_with_step_limit, sha256_file, write_json,
 };
 use ply_engine::prelude::*;
 use serde_json::json;
@@ -54,6 +54,12 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         drive_visible_app_control_probe(&mut ply, &mut state, &report, &example).await;
     let source_event_observations =
         drive_visible_source_event_probe(&mut ply, &mut state, &report, &example).await;
+    state.reset_to_initial(&ply);
+    ply.clear_focus();
+    for _ in 0..3 {
+        draw_frame(&mut ply, &state).await;
+        next_frame().await;
+    }
     let step_observations = drive_visible_step_control_sequence(
         &mut ply,
         &mut state,
@@ -204,7 +210,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "os_input_limitation".to_owned(),
-            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches one real visible application text control for the selected example, emits a matching observed Boon SOURCE event for the first text/submit workflow, and can activate the visible Ply Step control for each scenario transition. It then replays scenario user_action records through the runtime route. It does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing, and the observed source-event probe is not yet the runtime mutation path."),
+            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches visible application controls, emits matching observed Boon SOURCE events for the covered workflow, and applies those observed SOURCE events through boon_runtime::LiveRuntime. It can also activate the visible Ply Step control for each scenario transition. It still replays the complete scenario through scenario user_action records after the visible-control probes, so it does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
         );
         object.insert("os_input_probe".to_owned(), headed_os_probe);
         object.insert(
@@ -643,6 +649,15 @@ async fn drive_visible_source_press_event_probe(
         }
         next_frame().await;
     }
+    let mut runtime_mutation_error = None;
+    if let Some(event) = observed_event
+        .as_ref()
+        .and_then(live_source_event_from_json)
+    {
+        if let Err(error) = state.apply_live_source_event(event) {
+            runtime_mutation_error = Some(error);
+        }
+    }
     draw_frame(ply, state).await;
     let image = get_screen_data();
     let pixel_stats = image_stats(&image.bytes);
@@ -671,6 +686,9 @@ async fn drive_visible_source_press_event_probe(
             "target_text": probe.target_text
         },
         "source_event_observed": observed_event,
+        "runtime_mutation_path": "observed visible SOURCE event -> boon_runtime::LiveRuntime::apply_source_event",
+        "runtime_mutation_observed": runtime_mutation_error.is_none() && observed_event.is_some(),
+        "runtime_mutation_error": runtime_mutation_error,
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
@@ -680,13 +698,22 @@ async fn drive_visible_source_press_event_probe(
 
 async fn capture_visible_source_probe_result(
     ply: &mut Ply<()>,
-    state: &PlaygroundState,
+    state: &mut PlaygroundState,
     probe: VisibleSourceTextProbe,
     input_sent: bool,
     send_error: Option<String>,
     observed_event: Option<serde_json::Value>,
     bounds: serde_json::Value,
 ) -> serde_json::Value {
+    let mut runtime_mutation_error = None;
+    if let Some(event) = observed_event
+        .as_ref()
+        .and_then(live_source_event_from_json)
+    {
+        if let Err(error) = state.apply_live_source_event(event) {
+            runtime_mutation_error = Some(error);
+        }
+    }
     draw_frame(ply, state).await;
     let image = get_screen_data();
     let pixel_stats = image_stats(&image.bytes);
@@ -717,6 +744,9 @@ async fn capture_visible_source_probe_result(
             "address": probe.address
         },
         "source_event_observed": observed_event,
+        "runtime_mutation_path": "observed visible SOURCE event -> boon_runtime::LiveRuntime::apply_source_event",
+        "runtime_mutation_observed": runtime_mutation_error.is_none() && observed_event.is_some(),
+        "runtime_mutation_error": runtime_mutation_error,
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
@@ -977,6 +1007,28 @@ fn matching_ui_source_observation(
     })
 }
 
+fn live_source_event_from_json(event: &serde_json::Value) -> Option<LiveSourceEvent> {
+    Some(LiveSourceEvent {
+        source: event.get("source")?.as_str()?.to_owned(),
+        text: event
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        key: event
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        address: event
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        target_text: event
+            .get("target_text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 fn reverse_text(value: &str) -> String {
     value.chars().rev().collect()
 }
@@ -1083,7 +1135,6 @@ async fn draw_os_input_probe_frame(ply: &mut Ply<()>, token: &str, frame: usize)
     ply.show(|_| {}).await;
 }
 
-#[derive(Clone, Debug)]
 struct PlaygroundState {
     selected: String,
     scenario_path: PathBuf,
@@ -1091,6 +1142,7 @@ struct PlaygroundState {
     scenario_steps: Vec<String>,
     step_limit: Option<usize>,
     output: Option<RunOutput>,
+    live_runtime: Option<LiveRuntime>,
     last_error: Option<String>,
 }
 
@@ -1103,6 +1155,7 @@ impl PlaygroundState {
             scenario_steps: Vec::new(),
             step_limit: None,
             output: None,
+            live_runtime: None,
             last_error: None,
         };
         state.load_example(example, ply)?;
@@ -1122,6 +1175,7 @@ impl PlaygroundState {
             scenario_steps: Vec::new(),
             step_limit: None,
             output: Some(output),
+            live_runtime: None,
             last_error: None,
         }
     }
@@ -1183,12 +1237,41 @@ impl PlaygroundState {
         ) {
             Ok(output) => {
                 self.output = Some(output);
+                self.live_runtime = if self.step_limit == Some(1) {
+                    LiveRuntime::new(
+                        &format!("playground-live:{}", self.selected),
+                        source_text,
+                        &self.scenario_path,
+                    )
+                    .ok()
+                } else {
+                    None
+                };
                 self.last_error = None;
             }
             Err(error) => {
                 self.output = None;
+                self.live_runtime = None;
                 self.last_error = Some(error.to_string());
             }
+        }
+    }
+
+    fn apply_live_source_event(&mut self, event: LiveSourceEvent) -> Result<(), String> {
+        let live_runtime = self
+            .live_runtime
+            .as_mut()
+            .ok_or_else(|| "playground live runtime is not initialized".to_owned())?;
+        let step = live_runtime
+            .apply_source_event(event)
+            .map_err(|error| error.to_string())?;
+        if let Some(output) = &mut self.output {
+            output.semantic_deltas.extend(step.semantic_deltas);
+            output.render_patches.extend(step.render_patches);
+            output.state_summary = step.state_summary;
+            Ok(())
+        } else {
+            Err("playground output is not initialized".to_owned())
         }
     }
 }

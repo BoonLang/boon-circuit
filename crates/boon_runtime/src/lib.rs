@@ -206,6 +206,22 @@ pub struct RunOutput {
     pub state_summary: JsonValue,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LiveSourceEvent {
+    pub source: String,
+    pub text: Option<String>,
+    pub key: Option<String>,
+    pub address: Option<String>,
+    pub target_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveStepOutput {
+    pub semantic_deltas: Vec<SemanticDelta<'static>>,
+    pub render_patches: Vec<RenderPatch<'static>>,
+    pub state_summary: JsonValue,
+}
+
 #[derive(Clone, Debug)]
 pub struct SemanticDelta<'a> {
     pub kind: &'static str,
@@ -529,6 +545,88 @@ pub fn run_scenario_source_with_step_limit(
         elapsed.as_secs_f64() * 1000.0,
     )?;
     Ok(RunOutput { report, ..output })
+}
+
+pub struct LiveRuntime {
+    runtime: LoadedRuntime,
+    next_step: usize,
+}
+
+impl LiveRuntime {
+    pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
+        let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+        let ir = lower(&parsed)?;
+        verify_hidden_identity(&ir)?;
+        let scenario = parse_scenario(scenario_path)?;
+        if parsed.kind.as_str() != scenario.name {
+            return Err(format!(
+                "scenario `{}` does not match source kind `{}`",
+                scenario.name,
+                parsed.kind.as_str()
+            )
+            .into());
+        }
+        let compiled = CompiledProgram::from_ir(&ir)?;
+        validate_executable_surface(&parsed, &ir, &compiled)?;
+        let mut runtime = LoadedRuntime::new(&parsed, &ir, &compiled)?;
+        runtime.prepare_for_scenario(&scenario);
+        Ok(Self {
+            runtime,
+            next_step: 1,
+        })
+    }
+
+    pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
+        let step = event.into_step(self.next_step);
+        self.next_step = self.next_step.saturating_add(1);
+        let mut semantic_deltas = Vec::new();
+        let mut render_patches = Vec::new();
+        self.runtime
+            .apply_step(&step, &mut semantic_deltas, &mut render_patches)?;
+        Ok(LiveStepOutput {
+            semantic_deltas: semantic_deltas
+                .iter()
+                .map(SemanticDelta::to_static)
+                .collect(),
+            render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
+            state_summary: self.runtime.state_summary(),
+        })
+    }
+
+    pub fn state_summary(&self) -> JsonValue {
+        self.runtime.state_summary()
+    }
+}
+
+impl LiveSourceEvent {
+    fn into_step(self, sequence: usize) -> ScenarioStep {
+        let mut expected_source_event = BTreeMap::new();
+        expected_source_event.insert("source".to_owned(), toml::Value::String(self.source));
+        if let Some(text) = self.text {
+            expected_source_event.insert("text".to_owned(), toml::Value::String(text));
+        }
+        if let Some(key) = self.key {
+            expected_source_event.insert("key".to_owned(), toml::Value::String(key));
+        }
+        if let Some(address) = self.address {
+            expected_source_event.insert("address".to_owned(), toml::Value::String(address));
+        }
+        if let Some(target_text) = self.target_text {
+            expected_source_event
+                .insert("target_text".to_owned(), toml::Value::String(target_text));
+        }
+        let mut user_action = BTreeMap::new();
+        user_action.insert(
+            "kind".to_owned(),
+            toml::Value::String("live_source_event".to_owned()),
+        );
+        ScenarioStep {
+            id: format!("live-source-event-{sequence}"),
+            user_action: Some(user_action),
+            expected_source_event: Some(expected_source_event),
+            ..ScenarioStep::default()
+        }
+    }
 }
 
 pub fn write_json(path: &Path, value: &JsonValue) -> RuntimeResult<()> {
@@ -8180,6 +8278,67 @@ mod tests {
         .unwrap();
         assert_eq!(output.report["total_ticks"], 3);
         assert_eq!(output.state_summary["active_count"], 3);
+    }
+
+    #[test]
+    fn live_runtime_applies_observed_todomvc_source_events() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:todomvc",
+            source,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .unwrap();
+        let change = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.sources.new_todo_input.change".to_owned(),
+                text: Some("Test todo".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(change.state_summary["new_todo_text"], "Test todo");
+        let submit = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.sources.new_todo_input.key_down".to_owned(),
+                text: Some("Test todo".to_owned()),
+                key: Some("Enter".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(submit.state_summary["todos"].as_array().unwrap().len(), 3);
+        assert!(
+            submit
+                .semantic_deltas
+                .iter()
+                .any(|delta| delta.kind == "ListInsert")
+        );
+    }
+
+    #[test]
+    fn live_runtime_applies_observed_cells_source_events() {
+        let source = include_str!("../../../examples/cells.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:cells",
+            source,
+            Path::new("../../examples/cells.scn"),
+        )
+        .unwrap();
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some("41".to_owned()),
+                key: Some("Enter".to_owned()),
+                address: Some("A1".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        assert_eq!(output.state_summary["cells"][0]["value"], "41");
+        assert!(
+            output
+                .semantic_deltas
+                .iter()
+                .any(|delta| delta.field_path == Some("value"))
+        );
     }
 
     #[test]

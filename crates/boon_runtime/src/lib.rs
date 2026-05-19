@@ -1766,6 +1766,7 @@ fn base_example_report(
                 "generic_todomvc_root_holds_no_mirror": is_todomvc,
                 "generic_todomvc_rows_hold_no_mirror": is_todomvc,
                 "generic_todomvc_delta_identities_from_authoritative_storage": true,
+                "generic_cells_committed_fields_hold_no_mirror": is_cells,
                 "generic_root_source_dispatch": true,
                 "generic_derived_text_transform_executor": true,
                 "generic_source_event_route_executor": true,
@@ -2599,6 +2600,49 @@ impl GenericCircuitRuntime {
             value.reserve_textlike(additional_by_row(index, current))?;
         }
         Ok(())
+    }
+
+    fn copy_list_row_textlike_field(
+        &mut self,
+        list: &str,
+        index: usize,
+        source_field: &str,
+        target_field: &str,
+    ) -> RuntimeResult<()> {
+        if source_field == target_field {
+            return Ok(());
+        }
+        let row = self
+            .lists
+            .get_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .rows
+            .get_mut(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
+        let source =
+            row.value.fields.get(source_field).ok_or_else(|| {
+                format!("generic list `{list}` row missing field `{source_field}`")
+            })? as *const RuntimeValue;
+        let target =
+            row.value.fields.get_mut(target_field).ok_or_else(|| {
+                format!("generic list `{list}` row missing field `{target_field}`")
+            })? as *mut RuntimeValue;
+        // BTreeMap nodes are not structurally changed here, and source/target
+        // fields were checked to be distinct before creating both pointers.
+        unsafe {
+            match &*source {
+                RuntimeValue::Text(source) | RuntimeValue::Enum(source) => {
+                    (*target).set_textlike(source).map_err(|_| {
+                        format!("generic list `{list}` field `{target_field}` is not text-like")
+                            .into()
+                    })
+                }
+                RuntimeValue::Bool(_) => Err(format!(
+                    "generic list `{list}` field `{source_field}` is not text-like"
+                )
+                .into()),
+            }
+        }
     }
 
     fn list_row_textlike(&self, list: &str, index: usize, field: &str) -> RuntimeResult<&str> {
@@ -5354,12 +5398,9 @@ fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
 
 #[derive(Clone, Debug, Default)]
 struct Cell {
-    formula: String,
-    editing_text: String,
     value: String,
     value_number: Option<i64>,
     error: Option<&'static str>,
-    editing: bool,
     deps: Vec<usize>,
     parsed: FormulaAst,
 }
@@ -5761,8 +5802,6 @@ impl CellsRuntime {
 
     fn reserve_cell_storage(&mut self, max_text_len: usize, max_deps: usize) {
         for cell in &mut self.cells {
-            cell.formula.reserve(max_text_len);
-            cell.editing_text.reserve(max_text_len);
             cell.value.reserve(max_text_len);
             cell.deps.reserve(max_deps);
         }
@@ -5865,12 +5904,12 @@ impl CellsRuntime {
                 }
                 self.copy_cell_formula_to_editing_text(index)?;
                 self.set_cell_bool_field(index, "editing", editing)?;
-                let cell = &self.cells[index];
+                let editing_text = self.cell_text_field(index, "editing_text")?;
                 deltas.push(cell_field_delta(
                     key,
                     generation,
                     "editing_text",
-                    self.protocol_text(&cell.editing_text),
+                    self.protocol_text(editing_text),
                 ));
                 deltas.push(cell_field_delta(
                     key,
@@ -5881,7 +5920,7 @@ impl CellsRuntime {
                 patches.push(patch(
                     "SetCellText",
                     RenderTarget::Borrowed(Cow::Borrowed(address)),
-                    self.protocol_text(&cell.value),
+                    self.protocol_text(&self.cells[index].value),
                 ));
             }
         }
@@ -5942,23 +5981,34 @@ impl CellsRuntime {
 
     fn assert_step(&self, step: &ScenarioStep, recomputed: &[usize]) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
-            let cell = self.cell(&expect.address)?;
+            let index = self.cell_index(&expect.address)?;
+            let cell = &self.cells[index];
             if let Some(value) = &expect.value {
                 assert_eq_report(&step.id, "cell.value", value, &cell.value)?;
             }
             if let Some(formula) = &expect.formula {
-                assert_eq_report(&step.id, "cell.formula", formula, &cell.formula)?;
+                assert_eq_report(
+                    &step.id,
+                    "cell.formula",
+                    &formula.as_str(),
+                    &self.cell_text_field(index, "formula_text")?,
+                )?;
             }
             if let Some(editing_text) = &expect.editing_text {
                 assert_eq_report(
                     &step.id,
                     "cell.editing_text",
-                    editing_text,
-                    &cell.editing_text,
+                    &editing_text.as_str(),
+                    &self.cell_text_field(index, "editing_text")?,
                 )?;
             }
             if let Some(editing) = expect.editing {
-                assert_eq_report(&step.id, "cell.editing", &editing, &cell.editing)?;
+                assert_eq_report(
+                    &step.id,
+                    "cell.editing",
+                    &editing,
+                    &self.cell_bool_field(index, "editing")?,
+                )?;
             }
         }
         if let Some(expect) = &step.expect_error {
@@ -6234,39 +6284,36 @@ impl CellsRuntime {
             .expect("Cells generic runtime has matching cell row")
     }
 
+    fn cell_text_field(&self, index: usize, field: &str) -> RuntimeResult<&str> {
+        self.generic.list_row_textlike("cells", index, field)
+    }
+
+    fn cell_bool_field(&self, index: usize, field: &str) -> RuntimeResult<bool> {
+        self.generic.list_row_bool("cells", index, field)
+    }
+
     fn set_cell_text_field(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
-        self.generic
-            .commit_indexed_text_field("cells", index, field, value)?;
-        let cell = &mut self.cells[index];
-        let target = match field {
-            "formula_text" => &mut cell.formula,
-            "editing_text" => &mut cell.editing_text,
+        match field {
+            "formula_text" | "editing_text" => {
+                self.generic
+                    .commit_indexed_text_field("cells", index, field, value)?;
+            }
             _ => return Err(format!("unsupported Cells text field `{field}`").into()),
-        };
-        target.clear();
-        target.push_str(value);
+        }
         Ok(())
     }
 
     fn copy_cell_formula_to_editing_text(&mut self, index: usize) -> RuntimeResult<()> {
-        let cell = &mut self.cells[index];
-        self.generic.commit_indexed_text_field(
-            "cells",
-            index,
-            "editing_text",
-            cell.formula.as_str(),
-        )?;
-        cell.editing_text.clear();
-        cell.editing_text.push_str(&cell.formula);
-        Ok(())
+        self.generic
+            .copy_list_row_textlike_field("cells", index, "formula_text", "editing_text")
     }
 
     fn set_cell_bool_field(&mut self, index: usize, field: &str, value: bool) -> RuntimeResult<()> {
-        self.generic
-            .commit_indexed_bool_field("cells", index, field, value)?;
-        let cell = &mut self.cells[index];
         match field {
-            "editing" => cell.editing = value,
+            "editing" => {
+                self.generic
+                    .commit_indexed_bool_field("cells", index, field, value)?;
+            }
             _ => return Err(format!("unsupported Cells bool field `{field}`").into()),
         }
         Ok(())
@@ -6282,7 +6329,6 @@ impl CellsRuntime {
             .into());
         }
         for index in 0..self.cells.len() {
-            let cell = &self.cells[index];
             let address = self.address_for(index);
             let generic_address = self.generic.list_row_textlike("cells", index, "address")?;
             if generic_address != address {
@@ -6291,26 +6337,11 @@ impl CellsRuntime {
                 )
                 .into());
             }
-            for (field, mirror) in [
-                ("formula_text", cell.formula.as_str()),
-                ("editing_text", cell.editing_text.as_str()),
-            ] {
-                let generic = self.generic.list_row_textlike("cells", index, field)?;
-                if generic != mirror {
-                    return Err(format!(
-                        "row {index} field `{field}` generic `{generic}` != mirror `{mirror}`"
-                    )
-                    .into());
-                }
-            }
-            let generic_editing = self.generic.list_row_bool("cells", index, "editing")?;
-            if generic_editing != cell.editing {
-                return Err(format!(
-                    "row {index} field `editing` generic {generic_editing} != mirror {}",
-                    cell.editing
-                )
-                .into());
-            }
+            self.generic
+                .list_row_textlike("cells", index, "formula_text")?;
+            self.generic
+                .list_row_textlike("cells", index, "editing_text")?;
+            self.generic.list_row_bool("cells", index, "editing")?;
         }
         Ok(())
     }
@@ -8306,10 +8337,11 @@ mod tests {
                 &mut recomputed,
             )
             .unwrap();
-        assert_eq!(runtime.cell("A1").unwrap().formula, "123");
-        assert_eq!(runtime.cell("A1").unwrap().editing_text, "123");
+        let a1 = runtime.cell_index("A1").unwrap();
+        assert_eq!(runtime.cell_text_field(a1, "formula_text").unwrap(), "123");
+        assert_eq!(runtime.cell_text_field(a1, "editing_text").unwrap(), "123");
         assert_eq!(runtime.cell("A1").unwrap().value, "123");
-        assert!(!runtime.cell("A1").unwrap().editing);
+        assert!(!runtime.cell_bool_field(a1, "editing").unwrap());
 
         let mut action = BTreeMap::new();
         action.insert(
@@ -8339,8 +8371,8 @@ mod tests {
         runtime
             .apply_step_into(&step, &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert_eq!(runtime.cell("A1").unwrap().editing_text, "123");
-        assert!(!runtime.cell("A1").unwrap().editing);
+        assert_eq!(runtime.cell_text_field(a1, "editing_text").unwrap(), "123");
+        assert!(!runtime.cell_bool_field(a1, "editing").unwrap());
     }
 
     #[test]

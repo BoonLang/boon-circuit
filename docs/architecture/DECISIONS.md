@@ -319,9 +319,11 @@ scenario assertions, and state summaries read those facts back from the generic
 runtime instead of from a Todo row cache. TodoMVC field deltas and render
 targets now also read row key/generation identity from generic storage for
 normal row updates. Cells now uses the same generic keyed list storage for
-`cell.formula_text`, `cell.editing_text`, and `cell.editing`; Cells state
-summaries read those fields and hidden key/generation facts from generic
-storage, while formula value/error/dependency vectors remain derived caches.
+`cell.formula_text`, `cell.editing_text`, and `cell.editing`; those committed
+Cells fields are no longer mirrored in the `Cell` cache. Cells state summaries
+and scenario assertions read those fields and hidden key/generation facts from
+generic storage, while formula value/error/dependency vectors remain derived
+caches.
 Root text `HOLD` commits and indexed text/bool `HOLD` field commits now go
 through generic runtime commit helpers. TodoMVC list append/remove operations
 now also enter through generic runtime structural helpers that check the
@@ -375,7 +377,8 @@ source route (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or
 renamed equivalents) into the application phase, so the application boundary
 does not choose those fields by hardcoded event kind. Example runtimes still
 adapt generic facts into their current protocol/render outputs; TodoMVC no
-longer mirrors committed row or root values for render/test checks.
+longer mirrors committed row or root values for render/test checks, and Cells
+no longer mirrors committed formula/editing fields.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

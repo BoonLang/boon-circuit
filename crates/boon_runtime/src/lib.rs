@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::ops::{Index, IndexMut};
+use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -2350,6 +2350,283 @@ struct GenericCircuitRuntime {
     sources: SourceStore,
 }
 
+#[derive(Clone, Debug)]
+struct GenericScheduledRuntime {
+    storage: GenericCircuitRuntime,
+    scalar_equations: ScalarEquationPlan,
+    derived_equations: DerivedEquationPlan,
+    list_equations: ListEquationPlan,
+    formula_equations: FormulaEquationPlan,
+    source_routes: SourceRoutePlan,
+    list_source_bindings: ListSourceBindingPlan,
+}
+
+impl GenericScheduledRuntime {
+    fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
+        Ok(Self {
+            storage: GenericCircuitRuntime::new(ir)?,
+            scalar_equations: compiled.scalar_equations.clone(),
+            derived_equations: compiled.derived_equations.clone(),
+            list_equations: compiled.list_equations.clone(),
+            formula_equations: compiled.formula_equations.clone(),
+            source_routes: compiled.source_routes.clone(),
+            list_source_bindings: compiled.list_source_bindings.clone(),
+        })
+    }
+
+    fn from_parts(
+        storage: GenericCircuitRuntime,
+        scalar_equations: ScalarEquationPlan,
+        derived_equations: DerivedEquationPlan,
+        list_equations: ListEquationPlan,
+        formula_equations: FormulaEquationPlan,
+        source_routes: SourceRoutePlan,
+        list_source_bindings: ListSourceBindingPlan,
+    ) -> Self {
+        Self {
+            storage,
+            scalar_equations,
+            derived_equations,
+            list_equations,
+            formula_equations,
+            source_routes,
+            list_source_bindings,
+        }
+    }
+
+    fn row_source_paths(&self, list: &str) -> RuntimeResult<&[&'static str]> {
+        self.list_source_bindings.source_paths(list)
+    }
+
+    fn reserve_spare_rows_for_list_append_text(
+        &mut self,
+        list: &str,
+        count: usize,
+        text_capacity: usize,
+    ) -> RuntimeResult<()> {
+        let append_trigger = self.list_equations.append_trigger(list)?;
+        self.storage.reserve_spare_rows_for_trigger_text(
+            &self.list_equations,
+            list,
+            append_trigger,
+            count,
+            text_capacity,
+        )
+    }
+
+    fn apply_root_text_action_source<'a>(
+        &mut self,
+        source: &str,
+        payload_text: Option<&'a str>,
+        seq: TickSeq,
+    ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
+        self.storage.apply_root_text_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            source,
+            payload_text,
+            seq,
+        )
+    }
+
+    fn append_text_row_source_action_and_bind_sources<'a>(
+        &mut self,
+        list: &'static str,
+        source: &str,
+        key: Option<&str>,
+        text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
+        let source_paths = self.list_source_bindings.source_paths(list)?;
+        self.storage.append_text_row_source_action_and_bind_sources(
+            &self.source_routes,
+            &self.derived_equations,
+            &self.list_equations,
+            list,
+            source,
+            key,
+            text,
+            source_paths,
+        )
+    }
+
+    fn commit_indexed_text_action_source<'a>(
+        &mut self,
+        list: &str,
+        index: usize,
+        source: &str,
+        kind: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+        payload_text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        self.storage.commit_indexed_text_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            index,
+            source,
+            kind,
+            matches_target,
+            payload_text,
+        )
+    }
+
+    fn commit_indexed_text_action_any_source<'a>(
+        &mut self,
+        list: &str,
+        index: usize,
+        source: &str,
+        kinds: &[SourceRouteTextAction],
+        matches_target: impl Fn(&'static str) -> bool,
+        payload_text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        self.storage.commit_indexed_text_action_any_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            index,
+            source,
+            kinds,
+            matches_target,
+            payload_text,
+        )
+    }
+
+    fn commit_indexed_previous_text_action_source(
+        &mut self,
+        list: &str,
+        index: usize,
+        source: &str,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<GenericTextFieldIdentity> {
+        self.storage.commit_indexed_previous_text_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            index,
+            source,
+            matches_target,
+        )
+    }
+
+    fn commit_cells_text_source_actions<'a>(
+        &mut self,
+        list: &str,
+        index: usize,
+        source: &str,
+        formula_text: &'a str,
+        matches_formula_target: impl Fn(&'static str) -> bool,
+        matches_editing_text_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<GenericCellsTextCommit<'a>> {
+        self.storage.commit_cells_text_source_actions(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            index,
+            source,
+            formula_text,
+            matches_formula_target,
+            matches_editing_text_target,
+        )
+    }
+
+    fn commit_indexed_bool_action_source(
+        &mut self,
+        list: &str,
+        index: usize,
+        source: &str,
+        kind: SourceRouteBoolAction,
+        read_extra_bool: impl Fn(&str) -> Option<bool>,
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        self.storage.commit_indexed_bool_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            index,
+            source,
+            kind,
+            read_extra_bool,
+        )
+    }
+
+    fn commit_each_indexed_bool_action_source(
+        &mut self,
+        list: &str,
+        source: &str,
+        kind: SourceRouteBoolAction,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
+    ) -> RuntimeResult<usize> {
+        self.storage.commit_each_indexed_bool_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            list,
+            source,
+            kind,
+            read_extra_bool,
+            observe,
+        )
+    }
+
+    fn remove_where_source_action_and_unbind_sources(
+        &mut self,
+        list: &'static str,
+        source: &str,
+        observe: impl FnMut(GenericListRemoveObservation<'_>),
+    ) -> RuntimeResult<()> {
+        self.storage.remove_where_source_action_and_unbind_sources(
+            &self.source_routes,
+            list,
+            source,
+            observe,
+        )
+    }
+
+    fn remove_index_source_action_and_unbind_sources(
+        &mut self,
+        list: &'static str,
+        source: &str,
+        index: usize,
+        observe_binding: impl FnMut(&SourceBinding),
+    ) -> RuntimeResult<Option<(u64, u64)>> {
+        self.storage.remove_index_source_action_and_unbind_sources(
+            &self.source_routes,
+            list,
+            source,
+            index,
+            observe_binding,
+        )
+    }
+
+    fn collect_list_textlike_for_retain(
+        &self,
+        list: &str,
+        target: &str,
+        field: &str,
+    ) -> RuntimeResult<Vec<String>> {
+        self.storage
+            .collect_list_textlike_for_retain(&self.list_equations, list, target, field)
+    }
+
+    fn count_list_rows_for_target(&self, list: &str, target: &str) -> RuntimeResult<usize> {
+        self.storage
+            .count_list_rows_for_target(&self.list_equations, list, target)
+    }
+}
+
+impl Deref for GenericScheduledRuntime {
+    type Target = GenericCircuitRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl DerefMut for GenericScheduledRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+
 impl GenericCircuitRuntime {
     fn new(ir: &TypedProgram) -> RuntimeResult<Self> {
         let mut runtime = Self::default();
@@ -2450,6 +2727,25 @@ impl GenericCircuitRuntime {
             return Ok(None);
         };
         self.commit_root_text_candidate(target, candidate)
+    }
+
+    fn apply_root_text_action_source<'a>(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        source: &str,
+        payload_text: Option<&'a str>,
+        seq: TickSeq,
+    ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
+        let Some(target) = routes.single_root_scalar_target(source)? else {
+            return Ok(None);
+        };
+        let Some(value) =
+            self.apply_root_text_source(equations, target, source, payload_text, seq)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GenericRootTextCommit { target, value }))
     }
 
     fn eval_derived_text_transform<'a>(
@@ -2826,6 +3122,100 @@ impl GenericCircuitRuntime {
         self.commit_indexed_text_source(equations, list, index, target, source, payload_text)
     }
 
+    fn commit_indexed_previous_text_action_source(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        source: &str,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<GenericTextFieldIdentity> {
+        let Some(target) = routes.single_indexed_text_action_target_where(
+            source,
+            SourceRouteTextAction::PreviousValue,
+            matches_target,
+        )?
+        else {
+            return Err(format!("source `{source}` has no previous-text indexed action").into());
+        };
+        let previous =
+            match self.eval_indexed_text_source(equations, list, index, target, source, None)? {
+                IndexedTextCandidate::PreviousField(path) => path,
+                IndexedTextCandidate::SourceText(_) | IndexedTextCandidate::PreviousText(_) => {
+                    return Err(format!(
+                        "text update `{target}` from `{source}` is not a previous-field update"
+                    )
+                    .into());
+                }
+                IndexedTextCandidate::TrimmedOrSkip(_) => {
+                    return Err(format!(
+                        "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
+                    )
+                    .into());
+                }
+            };
+        let field = row_field_name(target);
+        self.copy_list_row_textlike_field(list, index, previous, field)?;
+        let (key, generation) = self.row_identity(list, index)?;
+        Ok(GenericTextFieldIdentity {
+            key,
+            generation,
+            field,
+        })
+    }
+
+    fn commit_cells_text_source_actions<'a>(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        source: &str,
+        formula_text: &'a str,
+        matches_formula_target: impl Fn(&'static str) -> bool,
+        matches_editing_text_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<GenericCellsTextCommit<'a>> {
+        let formula = self
+            .commit_indexed_text_action_source(
+                routes,
+                equations,
+                list,
+                index,
+                source,
+                SourceRouteTextAction::SourceText,
+                matches_formula_target,
+                Some(formula_text),
+            )?
+            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
+        let editing_text = self
+            .commit_indexed_text_action_source(
+                routes,
+                equations,
+                list,
+                index,
+                source,
+                SourceRouteTextAction::SourceText,
+                matches_editing_text_target,
+                Some(formula.value),
+            )?
+            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
+        let editing = self.commit_indexed_bool_action_source(
+            routes,
+            equations,
+            list,
+            index,
+            source,
+            SourceRouteBoolAction::ConstFalse,
+            |_| None,
+        )?;
+        Ok(GenericCellsTextCommit {
+            formula,
+            editing_text,
+            editing,
+        })
+    }
+
     fn commit_indexed_bool_action_source(
         &mut self,
         routes: &SourceRoutePlan,
@@ -3076,6 +3466,36 @@ impl GenericCircuitRuntime {
         Ok(GenericListRowCommit { key, generation })
     }
 
+    fn append_text_row_source_action_and_bind_sources<'a>(
+        &mut self,
+        routes: &SourceRoutePlan,
+        derived: &DerivedEquationPlan,
+        lists: &ListEquationPlan,
+        list: &'static str,
+        source: &str,
+        key: Option<&str>,
+        text: Option<&'a str>,
+        source_paths: &[&'static str],
+    ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
+        let trigger = routes.list_append_trigger(source, list)?;
+        let Some(value) = self.eval_derived_text_transform(derived, trigger, source, key, text)?
+        else {
+            return Ok(None);
+        };
+        let insert = self.append_row_for_trigger_text_and_bind_sources(
+            lists,
+            list,
+            trigger,
+            value,
+            source_paths,
+        )?;
+        Ok(Some(GenericTextListAppendCommit {
+            key: insert.key,
+            generation: insert.generation,
+            value,
+        }))
+    }
+
     fn spare_row(&mut self, list: &'static str, row: GenericRow) {
         if let Some(rows) = self.spare_rows.get_mut(list) {
             rows.push(row);
@@ -3116,6 +3536,56 @@ impl GenericCircuitRuntime {
         }
         self.unbind_row_sources(list, row.key, row.generation);
         Ok(Some(row))
+    }
+
+    fn remove_where_source_action_and_unbind_sources(
+        &mut self,
+        routes: &SourceRoutePlan,
+        list: &'static str,
+        source: &str,
+        mut observe: impl FnMut(GenericListRemoveObservation<'_>),
+    ) -> RuntimeResult<()> {
+        let predicate = routes.list_remove_predicate(source, list)?;
+        let mut index = 0;
+        while index < self.list_len(list)? {
+            let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
+                list,
+                predicate,
+                index,
+                |binding| observe(GenericListRemoveObservation::SourceUnbind(binding)),
+            )?
+            else {
+                index += 1;
+                continue;
+            };
+            let (key, generation) = (row.key, row.generation);
+            observe(GenericListRemoveObservation::RowRemoved { key, generation });
+            self.spare_row(list, row.value);
+        }
+        Ok(())
+    }
+
+    fn remove_index_source_action_and_unbind_sources(
+        &mut self,
+        routes: &SourceRoutePlan,
+        list: &'static str,
+        source: &str,
+        index: usize,
+        observe_binding: impl FnMut(&SourceBinding),
+    ) -> RuntimeResult<Option<(u64, u64)>> {
+        let predicate = routes.list_remove_predicate(source, list)?;
+        let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
+            list,
+            predicate,
+            index,
+            observe_binding,
+        )?
+        else {
+            return Ok(None);
+        };
+        let identity = (row.key, row.generation);
+        self.spare_row(list, row.value);
+        Ok(Some(identity))
     }
 
     #[cfg(test)]
@@ -3650,6 +4120,13 @@ struct GenericTextFieldCommit<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct GenericTextFieldIdentity {
+    key: u64,
+    generation: u64,
+    field: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct GenericBoolFieldCommit {
     key: u64,
     generation: u64,
@@ -3661,6 +4138,28 @@ struct GenericBoolFieldCommit {
 struct GenericListRowCommit {
     key: u64,
     generation: u64,
+}
+
+struct GenericTextListAppendCommit<'a> {
+    key: u64,
+    generation: u64,
+    value: &'a str,
+}
+
+struct GenericCellsTextCommit<'a> {
+    formula: GenericTextFieldCommit<'a>,
+    editing_text: GenericTextFieldCommit<'a>,
+    editing: GenericBoolFieldCommit,
+}
+
+struct GenericRootTextCommit<'a> {
+    target: &'static str,
+    value: Cow<'a, str>,
+}
+
+enum GenericListRemoveObservation<'a> {
+    SourceUnbind(&'a SourceBinding),
+    RowRemoved { key: u64, generation: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -4663,12 +5162,7 @@ fn row_field_name(path: &str) -> &str {
 
 #[derive(Clone, Debug)]
 struct TodoRuntime {
-    generic: GenericCircuitRuntime,
-    scalar_equations: ScalarEquationPlan,
-    derived_equations: DerivedEquationPlan,
-    list_equations: ListEquationPlan,
-    source_routes: SourceRoutePlan,
-    list_source_bindings: ListSourceBindingPlan,
+    generic: GenericScheduledRuntime,
     next_source_seq: u64,
     stale_source_drop_count: u64,
 }
@@ -4736,22 +5230,16 @@ impl TodoRuntime {
         ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<Self> {
-        let mut generic = GenericCircuitRuntime::new(ir)?;
+        let mut generic = GenericScheduledRuntime::new(ir, compiled)?;
         let todo_count = generic.list_len("todos")?;
-        let list_source_bindings = compiled.list_source_bindings.clone();
-        let row_source_paths = list_source_bindings.source_paths("todos")?;
+        let row_source_paths = generic.row_source_paths("todos")?.to_vec();
         generic.reserve_source_bindings(todo_count * row_source_paths.len());
         for index in 0..todo_count {
             let (key, generation) = generic.row_identity("todos", index)?;
-            generic.bind_row_sources("todos", key, generation, row_source_paths);
+            generic.bind_row_sources("todos", key, generation, &row_source_paths);
         }
         Self {
             generic,
-            scalar_equations: compiled.scalar_equations.clone(),
-            derived_equations: compiled.derived_equations.clone(),
-            list_equations: compiled.list_equations.clone(),
-            source_routes: compiled.source_routes.clone(),
-            list_source_bindings,
             next_source_seq: 1,
             stale_source_drop_count: 0,
         }
@@ -4796,13 +5284,17 @@ impl TodoRuntime {
                 .expect("seeded TodoMVC row exists");
             generic.bind_row_sources("todos", key, generation, row_source_paths);
         }
+        let generic = GenericScheduledRuntime::from_parts(
+            generic,
+            ScalarEquationPlan::empty(),
+            DerivedEquationPlan::empty(),
+            ListEquationPlan::empty(),
+            FormulaEquationPlan::empty(),
+            SourceRoutePlan::default(),
+            list_source_bindings,
+        );
         Self {
             generic,
-            scalar_equations: ScalarEquationPlan::empty(),
-            derived_equations: DerivedEquationPlan::empty(),
-            list_equations: ListEquationPlan::empty(),
-            source_routes: SourceRoutePlan::default(),
-            list_source_bindings,
             next_source_seq: 1,
             stale_source_drop_count: 0,
         }
@@ -4852,24 +5344,15 @@ impl TodoRuntime {
             .reserve_list("todos", append_count)
             .expect("TodoMVC generic runtime has todos list");
         let row_source_count = self
+            .generic
             .list_source_bindings
             .source_count("todos")
             .expect("TodoMVC compiled runtime has row source bindings");
         self.generic
             .reserve_source_bindings(append_count * row_source_count);
         if append_count > 0 {
-            let append_trigger = self
-                .list_equations
-                .append_trigger("todos")
-                .expect("TodoMVC compiled runtime has append trigger");
             self.generic
-                .reserve_spare_rows_for_trigger_text(
-                    &self.list_equations,
-                    "todos",
-                    append_trigger,
-                    append_count,
-                    max_text_len,
-                )
+                .reserve_spare_rows_for_list_append_text("todos", append_count, max_text_len)
                 .expect("TodoMVC generic runtime can reserve append rows");
         }
         self.generic
@@ -4904,16 +5387,16 @@ impl TodoRuntime {
             TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
-                    let append_trigger = self.source_routes.list_append_trigger(source, "todos")?;
-                    let title_to_add = self.generic.eval_derived_text_transform(
-                        &self.derived_equations,
-                        append_trigger,
-                        source,
-                        Some(key),
-                        Some(text),
-                    )?;
-                    if let Some(title) = title_to_add {
-                        self.append_todo(source, title, &mut deltas, &mut patches)?;
+                    if let Some(insert) = self
+                        .generic
+                        .append_text_row_source_action_and_bind_sources(
+                            "todos",
+                            source,
+                            Some(key),
+                            Some(text),
+                        )?
+                    {
+                        self.emit_todo_insert(insert, &mut deltas, &mut patches);
                         self.apply_root_text_source(
                             source,
                             Some(text),
@@ -4929,14 +5412,11 @@ impl TodoRuntime {
                 self.apply_root_text_source(source, None, seq, &mut deltas, &mut patches)?;
             }
             TodoEvent::ClearCompleted { source } => {
-                let predicate = self.todo_remove_predicate(source)?;
-                self.remove_where_predicate(predicate, &mut deltas, &mut patches)?;
+                self.remove_where_source(source, &mut deltas, &mut patches)?;
             }
             TodoEvent::ToggleAll { source } => {
                 let all_completed = self.all_completed();
                 self.generic.commit_each_indexed_bool_action_source(
-                    &self.source_routes,
-                    &self.scalar_equations,
                     "todos",
                     source,
                     SourceRouteBoolAction::BoolNot,
@@ -4984,8 +5464,6 @@ impl TodoRuntime {
                 let edit_text = self
                     .generic
                     .commit_indexed_text_action_source(
-                        &self.source_routes,
-                        &self.scalar_equations,
                         "todos",
                         index,
                         source,
@@ -5030,8 +5508,6 @@ impl TodoRuntime {
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 if let Some(edit_text) = self.generic.commit_indexed_text_action_any_source(
-                    &self.source_routes,
-                    &self.scalar_equations,
                     "todos",
                     index,
                     source,
@@ -5068,8 +5544,6 @@ impl TodoRuntime {
                     let (row_key, _) = self.todo_row_identity(index)?;
                     if key == "Enter" {
                         if let Some(title) = self.generic.commit_indexed_text_action_source(
-                            &self.source_routes,
-                            &self.scalar_equations,
                             "todos",
                             index,
                             source,
@@ -5093,8 +5567,6 @@ impl TodoRuntime {
                         let edit_text = self
                             .generic
                             .commit_indexed_text_action_source(
-                                &self.source_routes,
-                                &self.scalar_equations,
                                 "todos",
                                 index,
                                 source,
@@ -5142,8 +5614,6 @@ impl TodoRuntime {
                     .or_else(|_| self.find_editing_index())?;
                 let (row_key, _) = self.todo_row_identity(index)?;
                 if let Some(title) = self.generic.commit_indexed_text_action_source(
-                    &self.source_routes,
-                    &self.scalar_equations,
                     "todos",
                     index,
                     source,
@@ -5200,8 +5670,7 @@ impl TodoRuntime {
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let predicate = self.todo_remove_predicate(source)?;
-                if !self.remove_index_for_predicate(index, predicate, &mut deltas, &mut patches)? {
+                if !self.remove_index_source(index, source, &mut deltas, &mut patches)? {
                     return Err(format!(
                         "remove source `{source}` predicate does not match todo `{target_text}`"
                     )
@@ -5259,11 +5728,16 @@ impl TodoRuntime {
         fallback_occurrence: usize,
     ) -> RuntimeResult<Option<TodoEvent<'a>>> {
         let source = source_event.source;
-        self.source_routes
+        self.generic
+            .source_routes
             .require_source(source)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
-            if self.source_routes.has_list_append_target(source, "todos")? {
+            if self
+                .generic
+                .source_routes
+                .has_list_append_target(source, "todos")?
+            {
                 return Ok(Some(TodoEvent::NewInputKeyDown {
                     source,
                     key: source_event.key.unwrap_or_default(),
@@ -5271,7 +5745,8 @@ impl TodoRuntime {
                 }));
             }
             if source_event.text.is_some() {
-                self.source_routes
+                self.generic
+                    .source_routes
                     .single_root_scalar_target(source)?
                     .ok_or_else(|| {
                         format!("{} source `{source}` has no root text target", step.id)
@@ -5281,16 +5756,21 @@ impl TodoRuntime {
                     text: source_event.text.unwrap_or_default(),
                 }));
             }
-            if self.source_routes.has_list_remove_target(source, "todos")? {
+            if self
+                .generic
+                .source_routes
+                .has_list_remove_target(source, "todos")?
+            {
                 return Ok(Some(TodoEvent::ClearCompleted { source }));
             }
             if self
+                .generic
                 .source_routes
                 .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
             {
                 return Ok(Some(TodoEvent::ToggleAll { source }));
             }
-            if self.source_routes.has_root_scalar_action(source)? {
+            if self.generic.source_routes.has_root_scalar_action(source)? {
                 return Ok(Some(TodoEvent::Filter { source }));
             }
             return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
@@ -5299,19 +5779,25 @@ impl TodoRuntime {
         let target_text = source_event
             .target_text
             .expect("checked target_text presence above");
-        let removes_todos = self.source_routes.has_list_remove_target(source, "todos")?;
+        let removes_todos = self
+            .generic
+            .source_routes
+            .has_list_remove_target(source, "todos")?;
         let toggles_completed = self
+            .generic
             .source_routes
             .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?;
-        let updates_title = self.source_routes.has_indexed_text_action_where(
+        let updates_title = self.generic.source_routes.has_indexed_text_action_where(
             source,
             SourceRouteTextAction::TextTrimOrPrevious,
             |target| row_field_name(target) == "title",
         )?;
         let has_previous_text = self
+            .generic
             .source_routes
             .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
         let opens_edit = self
+            .generic
             .source_routes
             .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?;
         let Some(target_occurrence) =
@@ -5432,31 +5918,42 @@ impl TodoRuntime {
             .max(1)
     }
 
-    fn append_todo<'a>(
+    #[cfg(test)]
+    fn append_todo_from_source<'a>(
         &mut self,
         source: &str,
+        key: &str,
         title: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
-        if title.is_empty() {
+        let Some(insert) = self
+            .generic
+            .append_text_row_source_action_and_bind_sources(
+                "todos",
+                source,
+                Some(key),
+                Some(title),
+            )?
+        else {
             return Ok(());
-        }
-        let append_trigger = self.source_routes.list_append_trigger(source, "todos")?;
-        let row_source_paths = self.list_source_bindings.source_paths("todos")?;
-        let insert = self.generic.append_row_for_trigger_text_and_bind_sources(
-            &self.list_equations,
-            "todos",
-            append_trigger,
-            title,
-            row_source_paths,
-        )?;
+        };
+        self.emit_todo_insert(insert, deltas, patches);
+        Ok(())
+    }
+
+    fn emit_todo_insert<'a>(
+        &self,
+        insert: GenericTextListAppendCommit<'a>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) {
         deltas.push(list_delta(
             "ListInsert",
             insert.key,
             insert.generation,
             ProtocolValue::TodoRow {
-                title: Cow::Borrowed(title),
+                title: Cow::Borrowed(insert.value),
                 completed: false,
                 editing: false,
             },
@@ -5464,11 +5961,10 @@ impl TodoRuntime {
         patches.push(patch(
             "InsertElement",
             RenderTarget::TodoRow(insert.key),
-            ProtocolValue::Text(Cow::Borrowed(title)),
+            ProtocolValue::Text(Cow::Borrowed(insert.value)),
         ));
         push_source_binding_deltas_for_row(&self.generic, insert.key, insert.generation, deltas);
         push_source_binding_patches_for_row(&self.generic, insert.key, insert.generation, patches);
-        Ok(())
     }
 
     fn set_completed_from_source(
@@ -5480,8 +5976,6 @@ impl TodoRuntime {
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
         let completed = self.generic.commit_indexed_bool_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
             "todos",
             index,
             source,
@@ -5503,10 +5997,6 @@ impl TodoRuntime {
             ProtocolValue::CheckedProperty(completed.value),
         ));
         Ok(())
-    }
-
-    fn todo_remove_predicate(&self, source: &str) -> RuntimeResult<RuntimeListPredicate> {
-        self.source_routes.list_remove_predicate(source, "todos")
     }
 
     fn set_completed_value(
@@ -5535,58 +6025,50 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn remove_where_predicate(
+    fn remove_where_source(
         &mut self,
-        predicate: RuntimeListPredicate,
+        source: &str,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let mut index = 0;
-        while index < self.generic.list_len("todos")? {
-            let Some(generic_row) = self.generic.remove_row_for_predicate_and_unbind_sources(
-                "todos",
-                predicate,
-                index,
-                |binding| {
-                    deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
-                    patches.push(patch(
-                        "UnbindSource",
-                        RenderTarget::TodoSource(binding.key, binding.source_path),
-                        source_binding_value(binding),
-                    ));
-                },
-            )?
-            else {
-                index += 1;
-                continue;
-            };
-            let (key, generation) = (generic_row.key, generic_row.generation);
-            self.generic.spare_row("todos", generic_row.value);
-            deltas.push(list_delta(
-                "ListRemove",
-                key,
-                generation,
-                ProtocolValue::Null,
-            ));
-            patches.push(patch(
-                "RemoveElement",
-                RenderTarget::TodoRow(key),
-                ProtocolValue::Null,
-            ));
-        }
-        Ok(())
+        self.generic
+            .remove_where_source_action_and_unbind_sources("todos", source, |observation| {
+                match observation {
+                    GenericListRemoveObservation::SourceUnbind(binding) => {
+                        deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
+                        patches.push(patch(
+                            "UnbindSource",
+                            RenderTarget::TodoSource(binding.key, binding.source_path),
+                            source_binding_value(binding),
+                        ));
+                    }
+                    GenericListRemoveObservation::RowRemoved { key, generation } => {
+                        deltas.push(list_delta(
+                            "ListRemove",
+                            key,
+                            generation,
+                            ProtocolValue::Null,
+                        ));
+                        patches.push(patch(
+                            "RemoveElement",
+                            RenderTarget::TodoRow(key),
+                            ProtocolValue::Null,
+                        ));
+                    }
+                }
+            })
     }
 
-    fn remove_index_for_predicate(
+    fn remove_index_source(
         &mut self,
         index: usize,
-        predicate: RuntimeListPredicate,
+        source: &str,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<bool> {
-        let Some(generic_row) = self.generic.remove_row_for_predicate_and_unbind_sources(
+        let Some((key, generation)) = self.generic.remove_index_source_action_and_unbind_sources(
             "todos",
-            predicate,
+            source,
             index,
             |binding| {
                 deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
@@ -5600,8 +6082,6 @@ impl TodoRuntime {
         else {
             return Ok(false);
         };
-        let (key, generation) = (generic_row.key, generic_row.generation);
-        self.generic.spare_row("todos", generic_row.value);
         deltas.push(list_delta(
             "ListRemove",
             key,
@@ -5756,17 +6236,11 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
-        let Some(target) = self.source_routes.single_root_scalar_target(source)? else {
-            return Ok(());
-        };
-        if let Some(value) = self.generic.apply_root_text_source(
-            &self.scalar_equations,
-            target,
-            source,
-            payload_text,
-            seq,
-        )? {
-            self.emit_root_text_commit(target, value, deltas, patches)?;
+        if let Some(commit) =
+            self.generic
+                .apply_root_text_action_source(source, payload_text, seq)?
+        {
+            self.emit_root_text_commit(commit.target, commit.value, deltas, patches)?;
         }
         Ok(())
     }
@@ -5817,18 +6291,11 @@ impl TodoRuntime {
         kind: SourceRouteBoolAction,
         all_completed_snapshot: bool,
     ) -> RuntimeResult<GenericBoolFieldCommit> {
-        self.generic.commit_indexed_bool_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
-            "todos",
-            index,
-            source,
-            kind,
-            |path| match path {
+        self.generic
+            .commit_indexed_bool_action_source("todos", index, source, kind, |path| match path {
                 "store.all_completed" => Some(all_completed_snapshot),
                 _ => None,
-            },
-        )
+            })
     }
 
     fn find_index(&self, title: &str) -> RuntimeResult<usize> {
@@ -5926,17 +6393,12 @@ impl TodoRuntime {
     }
 
     fn visible_titles(&self) -> RuntimeResult<Vec<String>> {
-        self.generic.collect_list_textlike_for_retain(
-            &self.list_equations,
-            "todos",
-            "store.visible_todos",
-            "title",
-        )
+        self.generic
+            .collect_list_textlike_for_retain("todos", "store.visible_todos", "title")
     }
 
     fn count_todos_for_target(&self, target: &str) -> RuntimeResult<usize> {
-        self.generic
-            .count_list_rows_for_target(&self.list_equations, "todos", target)
+        self.generic.count_list_rows_for_target("todos", target)
     }
 
     fn all_todo_titles(&self) -> RuntimeResult<Vec<String>> {
@@ -6214,6 +6676,12 @@ impl FormulaEquationPlan {
         Self { operations }
     }
 
+    fn empty() -> Self {
+        Self {
+            operations: Vec::new(),
+        }
+    }
+
     fn default_cells() -> Self {
         Self {
             operations: vec![
@@ -6322,11 +6790,8 @@ impl FormulaEquationPlan {
 
 #[derive(Clone, Debug)]
 struct CellsRuntime {
-    generic: GenericCircuitRuntime,
+    generic: GenericScheduledRuntime,
     cells: Vec<Cell>,
-    scalar_equations: ScalarEquationPlan,
-    formula_equations: FormulaEquationPlan,
-    source_routes: SourceRoutePlan,
     reverse_deps: Vec<Vec<usize>>,
     columns: usize,
     rows: usize,
@@ -6365,7 +6830,7 @@ impl CellsRuntime {
         ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<Self> {
-        let generic = GenericCircuitRuntime::new(ir)?;
+        let generic = GenericScheduledRuntime::new(ir, compiled)?;
         let (columns, rows) = cells_grid_dimensions_from_ir(ir)
             .ok_or("Cells IR has no Grid/cells list initializer")?;
         let expected_len = columns.saturating_mul(rows);
@@ -6376,14 +6841,7 @@ impl CellsRuntime {
             )
             .into());
         }
-        Ok(Self::with_dimensions_and_equations(
-            generic,
-            columns,
-            rows,
-            compiled.scalar_equations.clone(),
-            compiled.formula_equations.clone(),
-            compiled.source_routes.clone(),
-        ))
+        Ok(Self::with_dimensions_and_equations(generic, columns, rows))
     }
 
     fn with_dimensions(columns: usize, rows: usize) -> Self {
@@ -6395,22 +6853,24 @@ impl CellsRuntime {
             &BTreeSet::new(),
         );
         Self::with_dimensions_and_equations(
-            generic_cells_runtime(columns, rows),
+            GenericScheduledRuntime::from_parts(
+                generic_cells_runtime(columns, rows),
+                scalar_equations,
+                DerivedEquationPlan::empty(),
+                ListEquationPlan::empty(),
+                FormulaEquationPlan::default_cells(),
+                source_routes,
+                ListSourceBindingPlan::default(),
+            ),
             columns,
             rows,
-            scalar_equations,
-            FormulaEquationPlan::default_cells(),
-            source_routes,
         )
     }
 
     fn with_dimensions_and_equations(
-        generic: GenericCircuitRuntime,
+        generic: GenericScheduledRuntime,
         columns: usize,
         rows: usize,
-        scalar_equations: ScalarEquationPlan,
-        formula_equations: FormulaEquationPlan,
-        source_routes: SourceRoutePlan,
     ) -> Self {
         let cell_count = columns.saturating_mul(rows);
         let mut cells = Vec::with_capacity(cell_count);
@@ -6418,9 +6878,6 @@ impl CellsRuntime {
         Self {
             generic,
             cells,
-            scalar_equations,
-            formula_equations,
-            source_routes,
             reverse_deps: vec![Vec::new(); cell_count],
             columns,
             rows,
@@ -6550,8 +7007,6 @@ impl CellsRuntime {
                 let editing_text = self
                     .generic
                     .commit_indexed_text_action_source(
-                        &self.source_routes,
-                        &self.scalar_equations,
                         "cells",
                         index,
                         source,
@@ -6563,8 +7018,6 @@ impl CellsRuntime {
                         format!("editing-text update from `{source}` produced no change")
                     })?;
                 let editing = self.generic.commit_indexed_bool_action_source(
-                    &self.source_routes,
-                    &self.scalar_equations,
                     "cells",
                     index,
                     source,
@@ -6598,39 +7051,25 @@ impl CellsRuntime {
             }
             CellEvent::Cancel { source, address } => {
                 let index = self.cell_index(address)?;
-                let (key, generation) = self.cell_key_generation(index);
-                let editing_text_target = self
-                    .source_routes
-                    .single_indexed_text_action_target_where(
-                        source,
-                        SourceRouteTextAction::PreviousValue,
-                        |target| target == "cell.editing_text",
-                    )?
-                    .ok_or_else(|| {
-                        format!("source `{source}` has no Cells editing-text previous action")
-                    })?;
-                let previous_path = self.cell_previous_text_path(editing_text_target, source)?;
-                if previous_path != "formula_text" {
-                    return Err(
-                        format!("unsupported Cells previous text field `{previous_path}`").into(),
-                    );
-                }
-                self.copy_cell_formula_to_editing_text(index)?;
+                let editing_text = self.generic.commit_indexed_previous_text_action_source(
+                    "cells",
+                    index,
+                    source,
+                    |target| target == "cell.editing_text",
+                )?;
                 let editing = self.generic.commit_indexed_bool_action_source(
-                    &self.source_routes,
-                    &self.scalar_equations,
                     "cells",
                     index,
                     source,
                     SourceRouteBoolAction::ConstFalse,
                     |_| None,
                 )?;
-                let editing_text = self.cell_text_field(index, "editing_text")?;
+                let value = self.cell_text_field(index, editing_text.field)?;
                 deltas.push(cell_field_delta(
-                    key,
-                    generation,
-                    "editing_text",
-                    self.protocol_text(editing_text),
+                    editing_text.key,
+                    editing_text.generation,
+                    editing_text.field,
+                    self.protocol_text(value),
                 ));
                 deltas.push(cell_field_delta(
                     editing.key,
@@ -6662,7 +7101,8 @@ impl CellsRuntime {
         source_event: GenericSourceEvent<'a>,
     ) -> RuntimeResult<Option<CellEvent<'a>>> {
         let source = source_event.source;
-        self.source_routes
+        self.generic
+            .source_routes
             .require_source(source)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         let address = source_event
@@ -6670,6 +7110,7 @@ impl CellsRuntime {
             .filter(|candidate| is_cell_address(candidate))
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
         if self
+            .generic
             .source_routes
             .has_indexed_text_target(source, "cell.formula_text")?
         {
@@ -6744,28 +7185,6 @@ impl CellsRuntime {
             .map_err(|error| format!("{} generic storage mismatch: {error}", step.id).into())
     }
 
-    fn cell_previous_text_path(&self, target: &str, source: &str) -> RuntimeResult<&'static str> {
-        let index = 0;
-        match self.generic.eval_indexed_text_source(
-            &self.scalar_equations,
-            "cells",
-            index,
-            target,
-            source,
-            None,
-        )? {
-            IndexedTextCandidate::PreviousField(path) => Ok(path),
-            IndexedTextCandidate::SourceText(_) | IndexedTextCandidate::PreviousText(_) => Err(
-                format!("text update `{target}` from `{source}` is not a previous-field update")
-                    .into(),
-            ),
-            IndexedTextCandidate::TrimmedOrSkip(_) => Err(format!(
-                "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
-            )
-            .into()),
-        }
-    }
-
     fn commit<'a>(
         &mut self,
         address: &'a str,
@@ -6793,43 +7212,19 @@ impl CellsRuntime {
         patches: &mut Vec<RenderPatch<'a>>,
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
-        self.formula_equations.expect_cells_pipeline()?;
+        self.generic.formula_equations.expect_cells_pipeline()?;
         let committed_index = self.cell_index(address)?;
-        let formula = self
-            .generic
-            .commit_indexed_text_action_source(
-                &self.source_routes,
-                &self.scalar_equations,
-                "cells",
-                committed_index,
-                source,
-                SourceRouteTextAction::SourceText,
-                |target| target == "cell.formula_text",
-                Some(formula),
-            )?
-            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
-        let editing_text = self
-            .generic
-            .commit_indexed_text_action_source(
-                &self.source_routes,
-                &self.scalar_equations,
-                "cells",
-                committed_index,
-                source,
-                SourceRouteTextAction::SourceText,
-                |target| target == "cell.editing_text",
-                Some(formula.value),
-            )?
-            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
-        let editing = self.generic.commit_indexed_bool_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
+        let commit = self.generic.commit_cells_text_source_actions(
             "cells",
             committed_index,
             source,
-            SourceRouteBoolAction::ConstFalse,
-            |_| None,
+            formula,
+            |target| target == "cell.formula_text",
+            |target| target == "cell.editing_text",
         )?;
+        let formula = commit.formula;
+        let editing_text = commit.editing_text;
+        let editing = commit.editing;
         self.cells[committed_index].parsed =
             parse_formula_ast(formula.value, self.columns, self.rows);
         self.replace_cell_dependencies(committed_index, formula.value);
@@ -6998,11 +7393,6 @@ impl CellsRuntime {
 
     fn cell_bool_field(&self, index: usize, field: &str) -> RuntimeResult<bool> {
         self.generic.list_row_bool("cells", index, field)
-    }
-
-    fn copy_cell_formula_to_editing_text(&mut self, index: usize) -> RuntimeResult<()> {
-        self.generic
-            .copy_list_row_textlike_field("cells", index, "formula_text", "editing_text")
     }
 
     fn assert_generic_mirror_in_sync(&self) -> RuntimeResult<()> {
@@ -7958,7 +8348,11 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let row_source_count = runtime.list_source_bindings.source_count("todos").unwrap();
+        let row_source_count = runtime
+            .generic
+            .list_source_bindings
+            .source_count("todos")
+            .unwrap();
         assert_eq!(
             runtime.generic.source_binding_count(),
             runtime.todo_len() * row_source_count
@@ -7976,8 +8370,9 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime
-            .append_todo(
+            .append_todo_from_source(
                 "store.sources.new_todo_input.key_down",
+                "Enter",
                 "New source row",
                 &mut deltas,
                 &mut patches,
@@ -8027,7 +8422,11 @@ mod tests {
             include_str!("../../../examples/todomvc.bn").replace("todo_checkbox", "done_checkbox");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
         let runtime = todo_runtime_from_parsed(&parsed);
-        let row_source_paths = runtime.list_source_bindings.source_paths("todos").unwrap();
+        let row_source_paths = runtime
+            .generic
+            .list_source_bindings
+            .source_paths("todos")
+            .unwrap();
         assert!(row_source_paths.contains(&"todo.sources.done_checkbox.click"));
         assert!(!row_source_paths.contains(&"todo.sources.todo_checkbox.click"));
         let (key, generation) = runtime.todo_row_identity(0).unwrap();
@@ -8751,7 +9150,11 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let row_source_count = runtime.list_source_bindings.source_count("todos").unwrap();
+        let row_source_count = runtime
+            .generic
+            .list_source_bindings
+            .source_count("todos")
+            .unwrap();
         let removed_key = runtime.todo_key(0);
         let removed_generation = runtime.todo_generation(0);
         let mut deltas = Vec::new();

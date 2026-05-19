@@ -397,8 +397,14 @@ the compiled source route instead of applying through fixed `todo.title`,
 `todo.edit_text`, or `todo.editing` paths.
 Root scalar `HOLD` dispatch also uses that same compiled route index to find the
 single root target for a source. TodoMVC root events now carry only source
-payload data; a generic route-selected root commit applies the `HOLD` branch
-and returns the committed root target/value fact to the renderer adapter.
+payload data; `GenericCircuitRuntime` applies the route-selected root `HOLD`
+branch and returns the committed root target/value fact to the renderer adapter.
+The runtime object used by TodoMVC and Cells is now a scheduled generic runtime:
+it owns generic storage plus the compiled scalar, derived, list, formula,
+source-route, and list-source-binding tables together. Adapters no longer carry
+parallel copies of those plan tables or pass them back into generic storage on
+every commit; they ask the scheduled runtime to apply a source action and then
+translate the resulting generic facts into the current semantic/render protocol.
 Route target selection is exposed through `SourceRoutePlan` helpers rather than
 through example-specific direct reads of route internals. Generic runtime
 helpers now accept source route actions for indexed text and bool commits, so
@@ -413,16 +419,23 @@ precomputed route capabilities instead of repeatedly inspecting scalar
 expression lists.
 `List/remove` predicates for clear-completed and row delete are carried on the
 same source-route entries. TodoMVC remove events now carry only source and row
-selection data; row removal selects the compiled predicate at application time
-instead of carrying the predicate in the event enum. Cells edit, commit, and
-cancel events now carry only source payload and grid address data.
+selection data; generic source-routed list removal selects the compiled
+predicate inside `GenericCircuitRuntime`, unbinds row sources, recycles the row
+through the generic spare-row pool, and reports the removed key/generation back
+to the renderer adapter. Cells edit, commit, and cancel events now carry only
+source payload and grid address data.
 Route-selected indexed text/bool commits choose the compiled `HOLD` targets
 (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or renamed
 equivalents) at the application boundary instead of carrying those targets in
-the event enum. Example runtimes still
-adapt generic facts into their current protocol/render outputs; TodoMVC no
-longer mirrors committed row or root values for render/test checks, and Cells
-no longer mirrors committed formula/editing fields.
+the event enum. Cells commit now groups the formula text, editing text, and
+editing bool writes through one generic source-routed helper before the Cells
+adapter updates the formula dependency cache. Cells cancel now uses the same
+generic indexed text action path: the `PreviousValue` expression copies the
+compiled previous field into the target field inside `GenericCircuitRuntime`,
+instead of hardcoding `formula_text -> editing_text` in the Cells adapter.
+Example runtimes still adapt generic facts into their current protocol/render
+outputs; TodoMVC no longer mirrors committed row or root values for render/test
+checks, and Cells no longer mirrors committed formula/editing fields.
 `List/append` row construction now lowers the `THEN { [field: source] }` record
 into typed append seed fields. `GenericCircuitRuntime` stores a row template per
 list from indexed `HOLD` initializers and materializes appended rows from that
@@ -432,6 +445,9 @@ seed fields, preserving the zero-allocation speed budget after warmup without a
 Todo-specific pool. Append routing is also part of the source-route action
 table: the TodoMVC key-down path asks the compiled route for its `ListAppend`
 trigger instead of comparing derived text target names outside the route plan.
+The append text transform and row insertion now run as one generic source-routed
+list append helper, returning only the inserted key/generation and trigger text
+for the renderer adapter.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

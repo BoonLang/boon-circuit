@@ -1770,6 +1770,7 @@ fn base_example_report(
                 "generic_source_route_scalar_expression_index": true,
                 "generic_indexed_text_route_index": true,
                 "generic_indexed_bool_route_index": true,
+                "generic_cells_editor_route_uses_indexed_targets": true,
                 "generic_root_source_route_index": true,
                 "generic_list_remove_predicate_route": true,
                 "generic_routed_root_target_application": true,
@@ -3879,12 +3880,46 @@ impl SourceRoute {
             .any(|candidate| candidate.target == target)
     }
 
+    fn has_indexed_text_target(&self, target: &str) -> bool {
+        self.indexed_text_targets
+            .iter()
+            .any(|candidate| candidate.target == target)
+    }
+
     fn scalar_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
         self.has_scalar_target(target)
             .then_some(target)
             .ok_or_else(|| {
                 format!(
                     "source `{}` has no compiled scalar target `{target}`",
+                    self.source
+                )
+                .into()
+            })
+    }
+
+    fn indexed_text_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
+        self.indexed_text_targets
+            .iter()
+            .any(|candidate| candidate.target == target)
+            .then_some(target)
+            .ok_or_else(|| {
+                format!(
+                    "source `{}` has no compiled indexed text target `{target}`",
+                    self.source
+                )
+                .into()
+            })
+    }
+
+    fn indexed_bool_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
+        self.indexed_bool_targets
+            .iter()
+            .any(|candidate| candidate.target == target)
+            .then_some(target)
+            .ok_or_else(|| {
+                format!(
+                    "source `{}` has no compiled indexed bool target `{target}`",
                     self.source
                 )
                 .into()
@@ -6185,15 +6220,15 @@ impl CellsRuntime {
             .address
             .filter(|candidate| is_cell_address(candidate))
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
-        if route.has_scalar_target("cell.formula_text") {
+        if route.has_indexed_text_target("cell.formula_text") {
             let text = source_event
                 .text
                 .ok_or_else(|| format!("{} Cells commit source event missing text", step.id))?;
             return Ok(Some(CellEvent::Commit {
                 source,
-                formula_target: route.scalar_target("cell.formula_text")?,
-                editing_text_target: route.scalar_target("cell.editing_text")?,
-                editing_target: route.scalar_target("cell.editing")?,
+                formula_target: route.indexed_text_target("cell.formula_text")?,
+                editing_text_target: route.indexed_text_target("cell.editing_text")?,
+                editing_target: route.indexed_bool_target("cell.editing")?,
                 address,
                 text,
             }));
@@ -6201,16 +6236,16 @@ impl CellsRuntime {
         if let Some(text) = source_event.text {
             return Ok(Some(CellEvent::Change {
                 source,
-                editing_text_target: route.scalar_target("cell.editing_text")?,
-                editing_target: route.scalar_target("cell.editing")?,
+                editing_text_target: route.indexed_text_target("cell.editing_text")?,
+                editing_target: route.indexed_bool_target("cell.editing")?,
                 address,
                 text,
             }));
         }
         Ok(Some(CellEvent::Cancel {
             source,
-            editing_text_target: route.scalar_target("cell.editing_text")?,
-            editing_target: route.scalar_target("cell.editing")?,
+            editing_text_target: route.indexed_text_target("cell.editing_text")?,
+            editing_target: route.indexed_bool_target("cell.editing")?,
             address,
         }))
     }

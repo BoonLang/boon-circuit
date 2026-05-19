@@ -384,7 +384,9 @@ expression, so TodoMVC route classification can ask for non-root `Bool/not`,
 text-trim, constant, or previous-value branches instead of recognizing toggle or
 edit events by field names. The compiled route table now stores separate
 indexed-text and indexed-bool target indexes, so row-scoped route classification
-does not rescan all scalar targets to find the relevant equation family.
+does not rescan all scalar targets to find the relevant equation family. Cells
+editor routes use the same indexed target partitions for `editing_text`,
+`formula_text`, and `editing` commits.
 Toggle-all and row-checkbox events now carry the
 matched bool target into application instead of applying through a fixed
 `todo.completed` target. Todo edit-open/change/Enter/Escape/blur events now

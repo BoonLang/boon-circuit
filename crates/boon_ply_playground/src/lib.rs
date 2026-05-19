@@ -16,6 +16,13 @@ static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
 
 thread_local! {
     static UI_SOURCE_OBSERVATIONS: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
+    static LAST_FOCUSED_TODO_EDIT: RefCell<Option<FocusedTodoEdit>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct FocusedTodoEdit {
+    index: u32,
+    target_text: String,
 }
 
 pub async fn run_app_from_args() -> Result<(), Box<dyn std::error::Error>> {
@@ -399,11 +406,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-a1-literal",
-                    element_id: "cell_editor_A1",
+                    element_id: Id::new("cell_editor_A1"),
+                    element_label: "cell_editor_A1",
                     text: "41",
+                    expected_text: Some("41"),
                     source: "cell.sources.editor.change",
                     key: None,
                     address: Some("A1"),
+                    target_text: None,
                     screenshot: edit_screenshot,
                     scenario_step: scenario_step_by_id(scenario, "edit-a1-literal"),
                 },
@@ -414,11 +424,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "commit-a1-literal",
-                    element_id: "cell_editor_A1",
+                    element_id: Id::new("cell_editor_A1"),
+                    element_label: "cell_editor_A1",
                     text: "41",
+                    expected_text: Some("41"),
                     source: "cell.sources.editor.commit",
                     key: Some("Enter"),
                     address: Some("A1"),
+                    target_text: None,
                     screenshot: commit_screenshot,
                     scenario_step: scenario_step_by_id(scenario, "commit-a1-literal"),
                 },
@@ -429,11 +442,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-a1-cancel-draft",
-                    element_id: "cell_editor_A1",
+                    element_id: Id::new("cell_editor_A1"),
+                    element_label: "cell_editor_A1",
                     text: "123",
+                    expected_text: Some("123"),
                     source: "cell.sources.editor.change",
                     key: None,
                     address: Some("A1"),
+                    target_text: None,
                     screenshot: draft_screenshot,
                     scenario_step: scenario_step_by_id(scenario, "edit-a1-cancel-draft"),
                 },
@@ -447,11 +463,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "add-test-todo-type",
-                    element_id: "todo_new_input",
+                    element_id: Id::new("todo_new_input"),
+                    element_label: "todo_new_input",
                     text: "Test todo",
+                    expected_text: Some("Test todo"),
                     source: "store.sources.new_todo_input.change",
                     key: None,
                     address: None,
+                    target_text: None,
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-add-test-todo-type.png"),
                     scenario_step: scenario_step_by_id(scenario, "add-test-todo-type"),
@@ -463,11 +482,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "add-test-todo-submit",
-                    element_id: "todo_new_input",
+                    element_id: Id::new("todo_new_input"),
+                    element_label: "todo_new_input",
                     text: "Test todo",
+                    expected_text: Some("Test todo"),
                     source: "store.sources.new_todo_input.key_down",
                     key: Some("Enter"),
                     address: None,
+                    target_text: None,
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-add-test-todo-submit.png"),
                     scenario_step: scenario_step_by_id(scenario, "add-test-todo-submit"),
@@ -479,11 +501,14 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "reject-empty-todo",
-                    element_id: "todo_new_input",
+                    element_id: Id::new("todo_new_input"),
+                    element_label: "todo_new_input",
                     text: "   ",
+                    expected_text: Some("   "),
                     source: "store.sources.new_todo_input.key_down",
                     key: Some("Enter"),
                     address: None,
+                    target_text: None,
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-reject-empty-todo.png"),
                     scenario_step: scenario_step_by_id(scenario, "reject-empty-todo"),
@@ -551,16 +576,174 @@ async fn drive_visible_source_event_probe(
                 scenario_step: scenario_step_by_id(scenario, "filter-all"),
             },
             VisibleSourcePressProbe {
-                id: "delete-clean-room",
-                element_id: Id::new_index("todo_row_delete", 1),
-                element_label: "todo_row_delete[1]",
-                source: "todo.sources.remove_todo_button.press",
-                target_text: Some("Clean room"),
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
-                scenario_step: None,
+                id: "edit-test-todo",
+                element_id: Id::new_index("todo_row_title", 2),
+                element_label: "todo_row_title[2]",
+                source: "todo.sources.todo_title_element.double_click",
+                target_text: Some("Test todo"),
+                screenshot: report.with_file_name("todomvc-headed-source-event-edit-open.png"),
+                scenario_step: scenario_step_by_id(scenario, "edit-test-todo"),
             },
         ] {
+            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
+        }
+        observations.push(
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-change",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Test todo edited",
+                    expected_text: Some("Test todo edited"),
+                    source: "todo.sources.editing_todo_title_element.change",
+                    key: None,
+                    address: None,
+                    target_text: Some("Test todo"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-change.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-change"),
+                },
+            )
+            .await,
+        );
+        observations.push(
+            drive_visible_source_submit_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-commit",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Test todo edited",
+                    expected_text: Some("Test todo edited"),
+                    source: "todo.sources.editing_todo_title_element.key_down",
+                    key: Some("Enter"),
+                    address: None,
+                    target_text: Some("Test todo"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-commit.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-commit"),
+                },
+            )
+            .await,
+        );
+        for probe in [VisibleSourcePressProbe {
+            id: "edit-test-todo-cancel-open",
+            element_id: Id::new_index("todo_row_title", 2),
+            element_label: "todo_row_title[2]",
+            source: "todo.sources.todo_title_element.double_click",
+            target_text: Some("Test todo edited"),
+            screenshot: report.with_file_name("todomvc-headed-source-event-edit-cancel-open.png"),
+            scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-open"),
+        }] {
+            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
+        }
+        observations.push(
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-cancel-change",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Cancelled title",
+                    expected_text: Some("Cancelled title"),
+                    source: "todo.sources.editing_todo_title_element.change",
+                    key: None,
+                    address: None,
+                    target_text: Some("Test todo edited"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-cancel-change.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-change"),
+                },
+            )
+            .await,
+        );
+        observations.push(
+            drive_visible_source_submit_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-cancel-escape",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Cancelled title",
+                    expected_text: None,
+                    source: "todo.sources.editing_todo_title_element.key_down",
+                    key: Some("Escape"),
+                    address: None,
+                    target_text: Some("Test todo edited"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-cancel-escape.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-escape"),
+                },
+            )
+            .await,
+        );
+        for probe in [VisibleSourcePressProbe {
+            id: "edit-test-todo-blur-open",
+            element_id: Id::new_index("todo_row_title", 2),
+            element_label: "todo_row_title[2]",
+            source: "todo.sources.todo_title_element.double_click",
+            target_text: Some("Test todo edited"),
+            screenshot: report.with_file_name("todomvc-headed-source-event-edit-blur-open.png"),
+            scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-open"),
+        }] {
+            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
+        }
+        observations.push(
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-blur-change",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Blur saved title",
+                    expected_text: Some("Blur saved title"),
+                    source: "todo.sources.editing_todo_title_element.change",
+                    key: None,
+                    address: None,
+                    target_text: Some("Test todo edited"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-blur-change.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-change"),
+                },
+            )
+            .await,
+        );
+        observations.push(
+            drive_visible_source_blur_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-test-todo-blur-commit",
+                    element_id: Id::new_index("todo_row_edit", 2),
+                    element_label: "todo_row_edit[2]",
+                    text: "Blur saved title",
+                    expected_text: Some("Blur saved title"),
+                    source: "todo.sources.editing_todo_title_element.blur",
+                    key: None,
+                    address: None,
+                    target_text: Some("Test todo edited"),
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-edit-blur-commit.png"),
+                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-commit"),
+                },
+            )
+            .await,
+        );
+        for probe in [VisibleSourcePressProbe {
+            id: "delete-clean-room",
+            element_id: Id::new_index("todo_row_delete", 1),
+            element_label: "todo_row_delete[1]",
+            source: "todo.sources.remove_todo_button.press",
+            target_text: Some("Clean room"),
+            screenshot: report.with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
+            scenario_step: None,
+        }] {
             observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
         }
         observations
@@ -569,11 +752,14 @@ async fn drive_visible_source_event_probe(
 
 struct VisibleSourceTextProbe {
     id: &'static str,
-    element_id: &'static str,
+    element_id: Id,
+    element_label: &'static str,
     text: &'static str,
+    expected_text: Option<&'static str>,
     source: &'static str,
     key: Option<&'static str>,
     address: Option<&'static str>,
+    target_text: Option<&'static str>,
     screenshot: PathBuf,
     scenario_step: Option<ScenarioStep>,
 }
@@ -594,18 +780,18 @@ async fn drive_visible_source_text_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
-    ply.set_text_value(probe.element_id, "");
+    ply.set_text_value(probe.element_id.clone(), "");
     let text_to_send = reverse_text(probe.text);
     let mut typed = false;
     let mut send_error = None;
     let mut observed_event = None;
     let mut bounds = serde_json::Value::Null;
     for frame in 0..140 {
+        ply.set_focus(probe.element_id.clone());
         draw_frame(ply, state).await;
-        if let Some(element_bounds) = ply.bounding_box(probe.element_id) {
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
             bounds = bounds_json(element_bounds);
         }
-        ply.set_focus(probe.element_id);
         if frame == 8 && !typed {
             typed = true;
             if let Err(error) = send_real_keyboard_text(&text_to_send) {
@@ -614,10 +800,10 @@ async fn drive_visible_source_text_event_probe(
         }
         if let Some(event) = matching_ui_source_observation(
             probe.source,
-            Some(probe.text),
+            probe.expected_text,
             probe.key,
             probe.address,
-            None,
+            probe.target_text,
         ) {
             observed_event = Some(event);
             break;
@@ -642,17 +828,17 @@ async fn drive_visible_source_submit_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
-    ply.set_text_value(probe.element_id, probe.text);
+    ply.set_text_value(probe.element_id.clone(), probe.text);
     let mut key_sent = false;
     let mut send_error = None;
     let mut observed_event = None;
     let mut bounds = serde_json::Value::Null;
     for frame in 0..100 {
+        ply.set_focus(probe.element_id.clone());
         draw_frame(ply, state).await;
-        if let Some(element_bounds) = ply.bounding_box(probe.element_id) {
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
             bounds = bounds_json(element_bounds);
         }
-        ply.set_focus(probe.element_id);
         if frame == 8 && !key_sent {
             key_sent = true;
             if let Some(key) = probe.key {
@@ -663,10 +849,10 @@ async fn drive_visible_source_submit_event_probe(
         }
         if let Some(event) = matching_ui_source_observation(
             probe.source,
-            Some(probe.text),
+            probe.expected_text,
             probe.key,
             probe.address,
-            None,
+            probe.target_text,
         ) {
             observed_event = Some(event);
             break;
@@ -683,6 +869,41 @@ async fn drive_visible_source_submit_event_probe(
         bounds,
     )
     .await
+}
+
+async fn drive_visible_source_blur_event_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    probe: VisibleSourceTextProbe,
+) -> serde_json::Value {
+    clear_ui_source_observations();
+    ply.set_text_value(probe.element_id.clone(), probe.text);
+    ply.set_focus(probe.element_id.clone());
+    let mut bounds = serde_json::Value::Null;
+    for _ in 0..4 {
+        draw_frame(ply, state).await;
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
+            bounds = bounds_json(element_bounds);
+        }
+        next_frame().await;
+    }
+    ply.clear_focus();
+    let mut observed_event = None;
+    for _ in 0..60 {
+        draw_frame(ply, state).await;
+        if let Some(event) = matching_ui_source_observation(
+            probe.source,
+            probe.expected_text,
+            probe.key,
+            probe.address,
+            probe.target_text,
+        ) {
+            observed_event = Some(event);
+            break;
+        }
+        next_frame().await;
+    }
+    capture_visible_source_probe_result(ply, state, probe, true, None, observed_event, bounds).await
 }
 
 async fn drive_visible_source_press_event_probe(
@@ -803,7 +1024,7 @@ async fn capture_visible_source_probe_result(
     json!({
         "id": probe.id,
         "pass": pass,
-        "target_element_id": probe.element_id,
+        "target_element_id": probe.element_label,
         "visible_bounds": bounds,
         "input_route_contract": "real OS keyboard input reached a visible app control and the control emitted the expected Boon SOURCE event observation",
         "keyboard_tool": "wtype",
@@ -814,7 +1035,8 @@ async fn capture_visible_source_probe_result(
             "source": probe.source,
             "text": probe.text,
             "key": probe.key,
-            "address": probe.address
+            "address": probe.address,
+            "target_text": probe.target_text
         },
         "source_event_observed": observed_event,
         "runtime_mutation_path": "observed visible SOURCE event -> boon_runtime::LiveRuntime::apply_source_event",
@@ -1376,11 +1598,101 @@ impl PlaygroundState {
 
 async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     clear_background(MacroquadColor::from_rgba(238, 241, 245, 255));
+    sync_visible_todo_edit_inputs(ply, state);
     {
         let mut ui = ply.begin();
         build_ui(&mut ui, state);
     }
+    observe_todo_edit_input_escape(ply, state);
     ply.show(|_| {}).await;
+    observe_todo_edit_input_keys_and_blur(ply, state);
+}
+
+fn sync_visible_todo_edit_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
+    let Some(todos) = todo_state_array(state) else {
+        return;
+    };
+    let focused = ply.focused_element();
+    for (index, todo) in todos.iter().enumerate() {
+        if !todo["editing"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let edit_id = Id::new_index("todo_row_edit", index as u32);
+        if focused.as_ref() == Some(&edit_id) {
+            continue;
+        }
+        let edit_text = todo["edit_text"]
+            .as_str()
+            .or_else(|| todo["title"].as_str())
+            .unwrap_or("");
+        if ply.get_text_value(edit_id.clone()) != edit_text {
+            ply.set_text_value(edit_id, edit_text);
+        }
+    }
+}
+
+fn observe_todo_edit_input_escape(ply: &Ply<()>, state: &PlaygroundState) {
+    let current = focused_todo_edit(ply, state);
+    if let Some(edit) = &current
+        && is_key_pressed(KeyCode::Escape)
+    {
+        record_ui_source_observation(json!({
+            "source": "todo.sources.editing_todo_title_element.key_down",
+            "target_text": edit.target_text,
+            "key": "Escape"
+        }));
+    }
+}
+
+fn observe_todo_edit_input_keys_and_blur(ply: &Ply<()>, state: &PlaygroundState) {
+    let current = focused_todo_edit(ply, state);
+    LAST_FOCUSED_TODO_EDIT.with(|last| {
+        let previous = last.borrow().clone();
+        if let Some(previous) = previous {
+            let focus_changed = current
+                .as_ref()
+                .is_none_or(|current| current.index != previous.index);
+            if focus_changed {
+                if is_key_pressed(KeyCode::Escape) || is_key_down(KeyCode::Escape) {
+                    record_ui_source_observation(json!({
+                        "source": "todo.sources.editing_todo_title_element.key_down",
+                        "target_text": previous.target_text,
+                        "key": "Escape"
+                    }));
+                }
+                let edit_id = Id::new_index("todo_row_edit", previous.index);
+                record_ui_source_observation(json!({
+                    "source": "todo.sources.editing_todo_title_element.blur",
+                    "target_text": previous.target_text,
+                    "text": ply.get_text_value(edit_id)
+                }));
+            }
+        }
+        *last.borrow_mut() = current;
+    });
+}
+
+fn focused_todo_edit(ply: &Ply<()>, state: &PlaygroundState) -> Option<FocusedTodoEdit> {
+    let focused = ply.focused_element()?;
+    let todos = todo_state_array(state)?;
+    for (index, todo) in todos.iter().enumerate() {
+        if focused == Id::new_index("todo_row_edit", index as u32) {
+            return Some(FocusedTodoEdit {
+                index: index as u32,
+                target_text: todo["title"].as_str().unwrap_or("").to_owned(),
+            });
+        }
+    }
+    None
+}
+
+fn todo_state_array(state: &PlaygroundState) -> Option<&Vec<serde_json::Value>> {
+    state
+        .output
+        .as_ref()?
+        .state_summary
+        .get("todos")?
+        .as_array()
 }
 
 fn build_ui(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
@@ -1784,6 +2096,8 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
     if let Some(todos) = state["todos"].as_array() {
         for (index, todo) in todos.iter().enumerate() {
             let title = todo["title"].as_str().unwrap_or("");
+            let edit_text = todo["edit_text"].as_str().unwrap_or(title);
+            let editing = todo["editing"].as_bool().unwrap_or(false);
             let checked = if todo["completed"].as_bool().unwrap_or(false) {
                 "[x]"
             } else {
@@ -1814,23 +2128,65 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                         .children(|ui| {
                             ui.text(checked, |text| text.font_size(14).color(0x1F2630));
                         });
-                    ui.element()
-                        .id(("todo_row_title", index as u32))
-                        .width(grow!())
-                        .height(fixed!(24.0))
-                        .layout(|layout| layout.align(Left, CenterY))
-                        .on_press({
-                            let title = title.to_owned();
-                            move |_, _| {
-                                record_ui_source_observation(json!({
-                                    "source": "todo.sources.todo_title_element.double_click",
-                                    "target_text": title
-                                }));
-                            }
-                        })
-                        .children(|ui| {
-                            ui.text(title, |text| text.font_size(16).color(0x1F2630));
-                        });
+                    if editing {
+                        ui.element()
+                            .id(("todo_row_edit", index as u32))
+                            .width(grow!())
+                            .height(fixed!(26.0))
+                            .background_color(0xFFFDF7)
+                            .border(|border| border.color(0xD9A441).all(1))
+                            .layout(|layout| layout.padding((8, 8, 4, 4)).align(Left, CenterY))
+                            .text_input(|input| {
+                                input
+                                    .placeholder(edit_text)
+                                    .font(&DEFAULT_FONT)
+                                    .font_size(16)
+                                    .text_color(0x1F2630)
+                                    .placeholder_color(0x596579)
+                                    .cursor_color(0x2F6FB8)
+                                    .selection_color(0xF5D990)
+                                    .on_changed({
+                                        let title = title.to_owned();
+                                        move |text| {
+                                            record_ui_source_observation(json!({
+                                                "source": "todo.sources.editing_todo_title_element.change",
+                                                "target_text": title,
+                                                "text": text
+                                            }));
+                                        }
+                                    })
+                                    .on_submit({
+                                        let title = title.to_owned();
+                                        move |text| {
+                                            record_ui_source_observation(json!({
+                                                "source": "todo.sources.editing_todo_title_element.key_down",
+                                                "target_text": title,
+                                                "key": "Enter",
+                                                "text": text
+                                            }));
+                                        }
+                                    })
+                            })
+                            .empty();
+                    } else {
+                        ui.element()
+                            .id(("todo_row_title", index as u32))
+                            .width(grow!())
+                            .height(fixed!(24.0))
+                            .layout(|layout| layout.align(Left, CenterY))
+                            .on_press({
+                                let title = title.to_owned();
+                                move |_, _| {
+                                    record_ui_source_observation(json!({
+                                        "source": "todo.sources.todo_title_element.double_click",
+                                        "target_text": title
+                                    }));
+                                }
+                            })
+                            .children(|ui| {
+                                ui.text(title, |text| text.font_size(16).color(0x1F2630));
+                            });
+                    }
                     ui.element()
                         .id(("todo_row_delete", index as u32))
                         .width(fixed!(28.0))

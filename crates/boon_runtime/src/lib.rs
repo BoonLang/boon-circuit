@@ -1766,6 +1766,7 @@ fn base_example_report(
                 "generic_derived_text_transform_executor": true,
                 "generic_source_event_route_executor": true,
                 "generic_compiled_source_route_index": true,
+                "generic_source_route_scalar_expression_index": true,
                 "generic_root_source_route_index": true,
                 "generic_list_remove_predicate_route": true,
                 "generic_routed_root_target_application": true,
@@ -3228,7 +3229,7 @@ struct ScalarUpdateBranch {
     expression: ScalarUpdateExpression,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScalarUpdateExpression {
     SourceText,
     Const(&'static str),
@@ -3281,10 +3282,16 @@ struct SourceRoutePlan {
 #[derive(Clone, Debug, Default)]
 struct SourceRoute {
     source: &'static str,
-    scalar_targets: Vec<&'static str>,
-    root_scalar_targets: Vec<&'static str>,
+    scalar_targets: Vec<SourceRouteScalarTarget>,
+    root_scalar_targets: Vec<SourceRouteScalarTarget>,
     derived_text_targets: Vec<&'static str>,
     list_remove_targets: Vec<SourceRouteListRemove>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceRouteScalarTarget {
+    target: &'static str,
+    expression: ScalarUpdateExpression,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3540,9 +3547,13 @@ impl SourceRoutePlan {
         let mut routes = Self::default();
         for branch in &scalar.branches {
             let route = routes.route_mut(branch.source);
-            route.scalar_targets.push(branch.target);
+            let scalar_target = SourceRouteScalarTarget {
+                target: branch.target,
+                expression: branch.expression,
+            };
+            route.scalar_targets.push(scalar_target);
             if root_targets.contains(branch.target) {
-                route.root_scalar_targets.push(branch.target);
+                route.root_scalar_targets.push(scalar_target);
             }
         }
         for transform in &derived.text_transforms {
@@ -3587,7 +3598,7 @@ impl SourceRoute {
     fn has_scalar_target(&self, target: &str) -> bool {
         self.scalar_targets
             .iter()
-            .any(|candidate| *candidate == target)
+            .any(|candidate| candidate.target == target)
     }
 
     fn scalar_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
@@ -3605,16 +3616,29 @@ impl SourceRoute {
     fn single_root_scalar_target(&self) -> RuntimeResult<Option<&'static str>> {
         let mut target = None;
         for candidate in &self.root_scalar_targets {
-            if target.is_some_and(|current| current != *candidate) {
+            if target.is_some_and(|current| current != candidate.target) {
                 return Err(format!(
                     "source `{}` drives multiple root scalar targets in this runtime slice",
                     self.source
                 )
                 .into());
             }
-            target = Some(*candidate);
+            target = Some(candidate.target);
         }
         Ok(target)
+    }
+
+    fn has_non_root_scalar_expression(
+        &self,
+        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
+    ) -> bool {
+        self.scalar_targets.iter().any(|candidate| {
+            !self
+                .root_scalar_targets
+                .iter()
+                .any(|root| root.target == candidate.target)
+                && matches_expression(candidate.expression)
+        })
     }
 
     fn has_derived_text_target(&self, target: &str) -> bool {
@@ -4400,7 +4424,9 @@ impl TodoRuntime {
                     predicate: route.list_remove_predicate("todos")?,
                 }));
             }
-            if route.has_scalar_target("todo.completed") {
+            if route.has_non_root_scalar_expression(|expression| {
+                matches!(expression, ScalarUpdateExpression::BoolNot(_))
+            }) {
                 return Ok(Some(TodoEvent::ToggleAll { source }));
             }
             if let Some(target) = route.single_root_scalar_target()? {
@@ -4416,10 +4442,21 @@ impl TodoRuntime {
         let remove_predicate = removes_todos
             .then(|| route.list_remove_predicate("todos"))
             .transpose()?;
-        let toggles_completed = route.has_scalar_target("todo.completed");
-        let updates_title = route.has_scalar_target("todo.title");
-        let updates_editing_or_edit_text =
-            route.has_scalar_target("todo.editing") || route.has_scalar_target("todo.edit_text");
+        let toggles_completed = route.has_non_root_scalar_expression(|expression| {
+            matches!(expression, ScalarUpdateExpression::BoolNot(_))
+        });
+        let updates_title = route.has_non_root_scalar_expression(|expression| {
+            matches!(
+                expression,
+                ScalarUpdateExpression::TextTrimOrPrevious { .. }
+            )
+        });
+        let opens_or_restores_edit_state = route.has_non_root_scalar_expression(|expression| {
+            matches!(
+                expression,
+                ScalarUpdateExpression::Const("True") | ScalarUpdateExpression::PreviousValue(_)
+            )
+        });
         let Some(target_occurrence) =
             self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
         else {
@@ -4465,7 +4502,7 @@ impl TodoRuntime {
                 text: source_event.text.unwrap_or_default(),
             }));
         }
-        if updates_editing_or_edit_text {
+        if opens_or_restores_edit_state {
             return Ok(Some(TodoEvent::TodoTitleDoubleClick {
                 source,
                 target_text,

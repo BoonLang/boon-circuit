@@ -1762,6 +1762,7 @@ fn base_example_report(
                 "generic_root_text_tick_executor": true,
                 "generic_indexed_hold_commit_executor": true,
                 "generic_list_count_retain_executor": true,
+                "generic_todomvc_summary_reads_authoritative_storage": true,
                 "generic_root_source_dispatch": true,
                 "generic_derived_text_transform_executor": true,
                 "generic_source_event_route_executor": true,
@@ -2843,6 +2844,18 @@ impl GenericCircuitRuntime {
             .get(list)
             .map(KeyedList::len)
             .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
+    }
+
+    fn list_identities(&self, list: &str) -> RuntimeResult<Vec<(u64, u64)>> {
+        let rows = self
+            .lists
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|row| (row.key, row.generation))
+            .collect())
     }
 
     fn list_row_matches_predicate(
@@ -4876,10 +4889,12 @@ impl TodoRuntime {
             )?;
         }
         if let Some(expected) = &step.expect_filter {
-            assert_eq_report(&step.id, "filter", expected, &self.selected_filter)?;
+            let filter = self.generic.root_textlike("store.selected_filter")?;
+            assert_eq_report(&step.id, "filter", expected, &filter)?;
         }
         if let Some(expected) = &step.expect_new_text {
-            assert_eq_report(&step.id, "new_todo_text", expected, &self.new_todo_text)?;
+            let new_text = self.generic.root_textlike("store.new_todo_text")?;
+            assert_eq_report(&step.id, "new_todo_text", expected, &new_text)?;
         }
         if let Some(expected) = &step.expect_editing_title {
             let editing = self
@@ -5201,10 +5216,18 @@ impl TodoRuntime {
     }
 
     fn summary(&self) -> JsonValue {
+        let todo_len = self.generic.list_len("todos").unwrap_or(0);
+        let hidden_keys = self
+            .generic
+            .list_identities("todos")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, generation)| json!({"key": key, "generation": generation}))
+            .collect::<Vec<_>>();
         json!({
             "new_todo_text": self.generic.root_textlike_ref("store.new_todo_text").unwrap_or(""),
             "selected_filter": self.generic.root_textlike_ref("store.selected_filter").unwrap_or(""),
-            "todos": self.todos.iter().enumerate().map(|(index, _)| json!({
+            "todos": (0..todo_len).map(|index| json!({
                 "title": self.generic.list_row_textlike("todos", index, "title").unwrap_or(""),
                 "edit_text": self.generic.list_row_textlike("todos", index, "edit_text").unwrap_or(""),
                 "completed": self.generic.list_row_bool("todos", index, "completed").unwrap_or(false),
@@ -5213,7 +5236,7 @@ impl TodoRuntime {
             "active_count": self.active_count(),
             "completed_count": self.completed_count(),
             "all_completed": self.all_completed(),
-            "hidden_keys": self.todos.iter().map(|todo| json!({"key": todo.key, "generation": todo.generation})).collect::<Vec<_>>(),
+            "hidden_keys": hidden_keys,
             "source_binding_count": self.generic.source_binding_count(),
             "stale_source_drop_count": self.stale_source_drop_count
         })

@@ -363,9 +363,12 @@ mirror committed values for render/test checks.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
-IR-derived predicates instead of Todo-specific loops. Both example runtimes
-assert that their mirrors stay synchronized with the generic storage after
-scenario steps.
+IR-derived predicates instead of Todo-specific loops. Those runtime predicates
+now carry the IR selector and row-field paths as data (`FieldBool`,
+`FieldBoolNot`, `SelectorVisibility`) instead of using Rust enum variants like
+"row completed" or "row active"; row paths are resolved to the current list row
+field at evaluation time. Both example runtimes assert that their mirrors stay
+synchronized with the generic storage after scenario steps.
 Executable reports also include `compiled_schedule`, a typed-IR-derived schedule
 summary that rejects unknown initializers, unsupported update branches,
 unsupported list predicates, and per-row graph clones before the example runtime

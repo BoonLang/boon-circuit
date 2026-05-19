@@ -2852,13 +2852,20 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<bool> {
         match predicate {
             RuntimeListPredicate::AlwaysTrue => Ok(true),
-            RuntimeListPredicate::RowCompleted => self.list_row_bool(list, index, "completed"),
-            RuntimeListPredicate::RowActive => Ok(!self.list_row_bool(list, index, "completed")?),
-            RuntimeListPredicate::SelectedFilterVisibility => {
-                let completed = self.list_row_bool(list, index, "completed")?;
-                Ok(match self.root_textlike_ref("store.selected_filter")? {
-                    "Active" => !completed,
-                    "Completed" => completed,
+            RuntimeListPredicate::FieldBool { path } => {
+                self.list_row_bool(list, index, row_field_name(path))
+            }
+            RuntimeListPredicate::FieldBoolNot { path } => {
+                Ok(!self.list_row_bool(list, index, row_field_name(path))?)
+            }
+            RuntimeListPredicate::SelectorVisibility {
+                selector,
+                row_field,
+            } => {
+                let row_value = self.list_row_bool(list, index, row_field_name(row_field))?;
+                Ok(match self.root_textlike_ref(selector)? {
+                    "Active" => !row_value,
+                    "Completed" => row_value,
                     _ => true,
                 })
             }
@@ -3319,9 +3326,16 @@ enum RuntimeListOperationKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeListPredicate {
     AlwaysTrue,
-    RowCompleted,
-    RowActive,
-    SelectedFilterVisibility,
+    FieldBool {
+        path: &'static str,
+    },
+    FieldBoolNot {
+        path: &'static str,
+    },
+    SelectorVisibility {
+        selector: &'static str,
+        row_field: &'static str,
+    },
     Unsupported,
 }
 
@@ -3722,20 +3736,27 @@ impl ListEquationPlan {
 fn runtime_list_predicate(predicate: &ListPredicate) -> RuntimeListPredicate {
     match predicate {
         ListPredicate::AlwaysTrue => RuntimeListPredicate::AlwaysTrue,
-        ListPredicate::RowFieldBool { path } if path == "todo.completed" => {
-            RuntimeListPredicate::RowCompleted
-        }
-        ListPredicate::RowFieldBoolNot { path } if path == "todo.completed" => {
-            RuntimeListPredicate::RowActive
-        }
+        ListPredicate::RowFieldBool { path } => RuntimeListPredicate::FieldBool {
+            path: leak_runtime_path(path.clone()),
+        },
+        ListPredicate::RowFieldBoolNot { path } => RuntimeListPredicate::FieldBoolNot {
+            path: leak_runtime_path(path.clone()),
+        },
         ListPredicate::SelectedFilterVisibility {
             selector,
             row_field,
-        } if selector == "store.selected_filter" && row_field == "todo.completed" => {
-            RuntimeListPredicate::SelectedFilterVisibility
-        }
+        } => RuntimeListPredicate::SelectorVisibility {
+            selector: leak_runtime_path(selector.clone()),
+            row_field: leak_runtime_path(row_field.clone()),
+        },
         _ => RuntimeListPredicate::Unsupported,
     }
+}
+
+fn row_field_name(path: &str) -> &str {
+    path.rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(path)
 }
 
 #[derive(Clone, Debug)]
@@ -7940,6 +7961,32 @@ mod tests {
             .expect("completed row should match the IR-derived remove predicate");
         assert_eq!(removed.key, 1);
         assert_eq!(generic.list_len("todos").unwrap(), 1);
+    }
+
+    #[test]
+    fn list_predicates_preserve_ir_paths_without_todo_aliases() {
+        assert!(matches!(
+            runtime_list_predicate(&ListPredicate::RowFieldBool {
+                path: "task.done".to_owned()
+            }),
+            RuntimeListPredicate::FieldBool { path } if path == "task.done"
+        ));
+        assert!(matches!(
+            runtime_list_predicate(&ListPredicate::RowFieldBoolNot {
+                path: "task.done".to_owned()
+            }),
+            RuntimeListPredicate::FieldBoolNot { path } if path == "task.done"
+        ));
+        assert!(matches!(
+            runtime_list_predicate(&ListPredicate::SelectedFilterVisibility {
+                selector: "store.filter".to_owned(),
+                row_field: "task.done".to_owned(),
+            }),
+            RuntimeListPredicate::SelectorVisibility {
+                selector,
+                row_field,
+            } if selector == "store.filter" && row_field == "task.done"
+        ));
     }
 
     #[test]

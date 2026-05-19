@@ -1753,7 +1753,12 @@ fn base_example_report(
                 "generic_semantic_delta_emitter": true,
                 "generic_loaded_runtime_shell": true,
                 "generic_root_text_tick_executor": true,
+                "generic_route_selected_root_hold_commit_executor": true,
                 "generic_indexed_hold_commit_executor": true,
+                "generic_route_selected_indexed_bool_commit_executor": true,
+                "generic_route_selected_todo_edit_text_commit_executor": true,
+                "generic_route_selected_todo_title_commit_executor": true,
+                "generic_route_selected_todo_editing_commit_executor": true,
                 "generic_indexed_bulk_bool_commit_executor": true,
                 "generic_list_append_source_binding_executor": true,
                 "generic_list_remove_source_unbinding_executor": true,
@@ -2770,6 +2775,83 @@ impl GenericCircuitRuntime {
         })
     }
 
+    fn commit_indexed_text_action_source<'a>(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        source: &str,
+        kind: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+        payload_text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        let Some(target) =
+            routes.single_indexed_text_action_target_where(source, kind, matches_target)?
+        else {
+            return Err(format!("source `{source}` has no indexed text action `{kind:?}`").into());
+        };
+        self.commit_indexed_text_source(equations, list, index, target, source, payload_text)
+    }
+
+    fn commit_indexed_text_action_any_source<'a>(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        source: &str,
+        kinds: &[SourceRouteTextAction],
+        matches_target: impl Fn(&'static str) -> bool,
+        payload_text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        let Some(target) =
+            routes.single_indexed_text_action_target_any_where(source, kinds, matches_target)?
+        else {
+            return Err(format!("source `{source}` has no matching indexed text action").into());
+        };
+        self.commit_indexed_text_source(equations, list, index, target, source, payload_text)
+    }
+
+    fn commit_indexed_bool_action_source(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        index: usize,
+        source: &str,
+        kind: SourceRouteBoolAction,
+        read_extra_bool: impl Fn(&str) -> Option<bool>,
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        let Some(target) = routes.single_indexed_bool_action_target(source, kind)? else {
+            return Err(format!("source `{source}` has no indexed bool action `{kind:?}`").into());
+        };
+        self.commit_indexed_bool_source(equations, list, index, target, source, read_extra_bool)
+    }
+
+    fn commit_each_indexed_bool_action_source(
+        &mut self,
+        routes: &SourceRoutePlan,
+        equations: &ScalarEquationPlan,
+        list: &str,
+        source: &str,
+        kind: SourceRouteBoolAction,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
+    ) -> RuntimeResult<usize> {
+        let Some(target) = routes.single_indexed_bool_action_target(source, kind)? else {
+            return Err(format!("source `{source}` has no indexed bool action `{kind:?}`").into());
+        };
+        self.commit_each_indexed_bool_source(
+            equations,
+            list,
+            target,
+            source,
+            read_extra_bool,
+            observe,
+        )
+    }
+
     fn commit_each_indexed_bool_source(
         &mut self,
         equations: &ScalarEquationPlan,
@@ -3526,6 +3608,7 @@ struct SourceRoute {
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
     derived_text_targets: Vec<&'static str>,
     list_remove_targets: Vec<SourceRouteListRemove>,
+    actions: Vec<SourceRouteAction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3538,6 +3621,39 @@ struct SourceRouteScalarTarget {
 struct SourceRouteListRemove {
     list: &'static str,
     predicate: RuntimeListPredicate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRouteAction {
+    RootScalar,
+    DerivedText {
+        target: &'static str,
+    },
+    ListRemove {
+        list: &'static str,
+    },
+    IndexedText {
+        kind: SourceRouteTextAction,
+        target: &'static str,
+    },
+    IndexedBool {
+        kind: SourceRouteBoolAction,
+        target: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRouteTextAction {
+    SourceText,
+    PreviousValue,
+    TextTrimOrPrevious,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRouteBoolAction {
+    BoolNot,
+    ConstTrue,
+    ConstFalse,
 }
 
 #[derive(Clone, Debug)]
@@ -3816,11 +3932,103 @@ impl SourceRoutePlan {
                     });
             }
         }
+        for route in &mut routes.routes {
+            route.rebuild_actions();
+        }
         routes
     }
 
     fn for_source(&self, source: &str) -> Option<&SourceRoute> {
         self.routes.iter().find(|route| route.source == source)
+    }
+
+    fn require_source(&self, source: &str) -> RuntimeResult<&SourceRoute> {
+        self.for_source(source)
+            .ok_or_else(|| format!("source `{source}` has no compiled route").into())
+    }
+
+    fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
+        self.require_source(source)?.single_root_scalar_target()
+    }
+
+    fn single_indexed_bool_action_target(
+        &self,
+        source: &str,
+        kind: SourceRouteBoolAction,
+    ) -> RuntimeResult<Option<&'static str>> {
+        self.require_source(source)?
+            .single_indexed_bool_action_target(kind)
+    }
+
+    fn single_indexed_text_action_target_where(
+        &self,
+        source: &str,
+        kind: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        self.require_source(source)?
+            .single_indexed_text_action_target_where(kind, matches_target)
+    }
+
+    fn single_indexed_text_action_target_any_where(
+        &self,
+        source: &str,
+        kinds: &[SourceRouteTextAction],
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        self.require_source(source)?
+            .single_indexed_text_action_target_any_where(kinds, matches_target)
+    }
+
+    fn has_indexed_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_indexed_text_target(target))
+    }
+
+    fn has_derived_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_derived_text_target(target))
+    }
+
+    fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_list_remove_target(list))
+    }
+
+    fn has_root_scalar_action(&self, source: &str) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_root_scalar_action())
+    }
+
+    fn has_indexed_text_action(
+        &self,
+        source: &str,
+        kind: SourceRouteTextAction,
+    ) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_indexed_text_action(kind))
+    }
+
+    fn has_indexed_text_action_where(
+        &self,
+        source: &str,
+        kind: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<bool> {
+        Ok(self
+            .require_source(source)?
+            .has_indexed_text_action_where(kind, matches_target))
+    }
+
+    fn has_indexed_bool_action(
+        &self,
+        source: &str,
+        kind: SourceRouteBoolAction,
+    ) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_indexed_bool_action(kind))
+    }
+
+    fn list_remove_predicate(
+        &self,
+        source: &str,
+        list: &str,
+    ) -> RuntimeResult<RuntimeListPredicate> {
+        self.require_source(source)?.list_remove_predicate(list)
     }
 
     fn route_mut(&mut self, source: &'static str) -> &mut SourceRoute {
@@ -3872,38 +4080,167 @@ impl ListSourceBindingPlan {
 }
 
 impl SourceRoute {
+    fn rebuild_actions(&mut self) {
+        self.actions.clear();
+        self.actions.extend(
+            self.root_scalar_targets
+                .iter()
+                .map(|_| SourceRouteAction::RootScalar),
+        );
+        self.actions.extend(
+            self.derived_text_targets
+                .iter()
+                .copied()
+                .map(|target| SourceRouteAction::DerivedText { target }),
+        );
+        self.actions.extend(
+            self.list_remove_targets
+                .iter()
+                .map(|target| SourceRouteAction::ListRemove { list: target.list }),
+        );
+        self.actions
+            .extend(self.indexed_text_targets.iter().filter_map(|target| {
+                let kind = match target.expression {
+                    ScalarUpdateExpression::SourceText => SourceRouteTextAction::SourceText,
+                    ScalarUpdateExpression::PreviousValue(_) => {
+                        SourceRouteTextAction::PreviousValue
+                    }
+                    ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
+                        SourceRouteTextAction::TextTrimOrPrevious
+                    }
+                    ScalarUpdateExpression::Const(_)
+                    | ScalarUpdateExpression::BoolNot(_)
+                    | ScalarUpdateExpression::Unsupported => return None,
+                };
+                Some(SourceRouteAction::IndexedText {
+                    kind,
+                    target: target.target,
+                })
+            }));
+        self.actions
+            .extend(self.indexed_bool_targets.iter().filter_map(|target| {
+                let kind = match target.expression {
+                    ScalarUpdateExpression::BoolNot(_) => SourceRouteBoolAction::BoolNot,
+                    ScalarUpdateExpression::Const("True") => SourceRouteBoolAction::ConstTrue,
+                    ScalarUpdateExpression::Const("False") => SourceRouteBoolAction::ConstFalse,
+                    ScalarUpdateExpression::SourceText
+                    | ScalarUpdateExpression::Const(_)
+                    | ScalarUpdateExpression::PreviousValue(_)
+                    | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                    | ScalarUpdateExpression::Unsupported => return None,
+                };
+                Some(SourceRouteAction::IndexedBool {
+                    kind,
+                    target: target.target,
+                })
+            }));
+    }
+
+    fn has_action(&self, matches: impl Fn(SourceRouteAction) -> bool) -> bool {
+        self.actions.iter().copied().any(matches)
+    }
+
+    fn has_root_scalar_action(&self) -> bool {
+        self.has_action(|action| matches!(action, SourceRouteAction::RootScalar))
+    }
+
+    fn has_indexed_text_action(&self, expected: SourceRouteTextAction) -> bool {
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::IndexedText { kind, .. } if kind == expected
+            )
+        })
+    }
+
+    fn has_indexed_text_action_where(
+        &self,
+        expected: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> bool {
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::IndexedText { kind, target }
+                    if kind == expected && matches_target(target)
+            )
+        })
+    }
+
+    fn single_indexed_text_action_target_where(
+        &self,
+        expected: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        single_route_action_target_where(
+            self.source,
+            "indexed text action",
+            &self.actions,
+            |action| match action {
+                SourceRouteAction::IndexedText { kind, target }
+                    if kind == expected && matches_target(target) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    fn single_indexed_text_action_target_any_where(
+        &self,
+        expected: &[SourceRouteTextAction],
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        single_route_action_target_where(
+            self.source,
+            "indexed text action",
+            &self.actions,
+            |action| match action {
+                SourceRouteAction::IndexedText { kind, target }
+                    if expected.contains(&kind) && matches_target(target) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    fn has_indexed_bool_action(&self, expected: SourceRouteBoolAction) -> bool {
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::IndexedBool { kind, .. } if kind == expected
+            )
+        })
+    }
+
+    fn single_indexed_bool_action_target(
+        &self,
+        expected: SourceRouteBoolAction,
+    ) -> RuntimeResult<Option<&'static str>> {
+        single_route_action_target_where(
+            self.source,
+            "indexed bool action",
+            &self.actions,
+            |action| match action {
+                SourceRouteAction::IndexedBool { kind, target } if kind == expected => Some(target),
+                _ => None,
+            },
+        )
+    }
+
     fn has_indexed_text_target(&self, target: &str) -> bool {
-        self.indexed_text_targets
-            .iter()
-            .any(|candidate| candidate.target == target)
-    }
-
-    fn indexed_text_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
-        self.indexed_text_targets
-            .iter()
-            .any(|candidate| candidate.target == target)
-            .then_some(target)
-            .ok_or_else(|| {
-                format!(
-                    "source `{}` has no compiled indexed text target `{target}`",
-                    self.source
-                )
-                .into()
-            })
-    }
-
-    fn indexed_bool_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
-        self.indexed_bool_targets
-            .iter()
-            .any(|candidate| candidate.target == target)
-            .then_some(target)
-            .ok_or_else(|| {
-                format!(
-                    "source `{}` has no compiled indexed bool target `{target}`",
-                    self.source
-                )
-                .into()
-            })
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::IndexedText {
+                    target: candidate,
+                    ..
+                } if candidate == target
+            )
+        })
     }
 
     fn single_root_scalar_target(&self) -> RuntimeResult<Option<&'static str>> {
@@ -3921,40 +4258,22 @@ impl SourceRoute {
         Ok(target)
     }
 
-    fn single_indexed_text_target_where(
-        &self,
-        matches_target: impl Fn(&'static str, ScalarUpdateExpression) -> bool,
-    ) -> RuntimeResult<Option<&'static str>> {
-        single_route_target_where(
-            self.source,
-            "indexed text",
-            &self.indexed_text_targets,
-            matches_target,
-        )
-    }
-
-    fn single_indexed_bool_target_matching(
-        &self,
-        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
-    ) -> RuntimeResult<Option<&'static str>> {
-        single_route_target_where(
-            self.source,
-            "indexed bool",
-            &self.indexed_bool_targets,
-            |_, expression| matches_expression(expression),
-        )
-    }
-
     fn has_derived_text_target(&self, target: &str) -> bool {
-        self.derived_text_targets
-            .iter()
-            .any(|candidate| *candidate == target)
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::DerivedText { target: candidate } if candidate == target
+            )
+        })
     }
 
     fn has_list_remove_target(&self, list: &str) -> bool {
-        self.list_remove_targets
-            .iter()
-            .any(|candidate| candidate.list == list)
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::ListRemove { list: candidate } if candidate == list
+            )
+        })
     }
 
     fn list_remove_predicate(&self, list: &str) -> RuntimeResult<RuntimeListPredicate> {
@@ -3971,24 +4290,23 @@ impl SourceRoute {
     }
 }
 
-fn single_route_target_where(
+fn single_route_action_target_where(
     source: &str,
     index_name: &str,
-    targets: &[SourceRouteScalarTarget],
-    matches_target: impl Fn(&'static str, ScalarUpdateExpression) -> bool,
+    actions: &[SourceRouteAction],
+    select_target: impl Fn(SourceRouteAction) -> Option<&'static str>,
 ) -> RuntimeResult<Option<&'static str>> {
     let mut target = None;
-    for candidate in targets {
-        if !matches_target(candidate.target, candidate.expression) {
+    for action in actions.iter().copied() {
+        let Some(candidate) = select_target(action) else {
             continue;
+        };
+        if target.is_some_and(|current| current != candidate) {
+            return Err(
+                format!("source `{source}` has multiple matching {index_name} targets").into(),
+            );
         }
-        if target.is_some_and(|current| current != candidate.target) {
-            return Err(format!(
-                "source `{source}` has multiple matching {index_name} scalar targets"
-            )
-            .into());
-        }
-        target = Some(candidate.target);
+        target = Some(candidate);
     }
     Ok(target)
 }
@@ -4126,59 +4444,45 @@ struct TodoRuntime {
 enum TodoEvent<'a> {
     NewInputChange {
         source: &'a str,
-        target: &'static str,
         text: &'a str,
     },
     NewInputKeyDown {
         source: &'a str,
-        reset_target: Option<&'static str>,
         key: &'a str,
         text: &'a str,
     },
     Filter {
         source: &'a str,
-        target: &'static str,
     },
     ClearCompleted {
         source: &'a str,
-        predicate: RuntimeListPredicate,
     },
     ToggleAll {
         source: &'a str,
-        target: &'static str,
     },
     TodoCheckbox {
         source: &'a str,
-        target: &'static str,
         target_text: &'a str,
         target_occurrence: usize,
     },
     TodoTitleDoubleClick {
         source: &'a str,
-        edit_text_target: &'static str,
-        editing_target: &'static str,
         target_text: &'a str,
         target_occurrence: usize,
     },
     EditingTitleChange {
         source: &'a str,
-        edit_text_target: &'static str,
         target_text: &'a str,
         text: &'a str,
     },
     EditingTitleKeyDown {
         source: &'a str,
-        title_target: Option<&'static str>,
-        edit_text_target: Option<&'static str>,
-        editing_target: &'static str,
         target_text: &'a str,
         key: &'a str,
         text: Option<&'a str>,
     },
     EditingTitleBlur {
         source: &'a str,
-        title_target: &'static str,
-        editing_target: &'static str,
         target_text: &'a str,
         text: Option<&'a str>,
     },
@@ -4188,7 +4492,6 @@ enum TodoEvent<'a> {
     },
     RemoveTodo {
         source: &'a str,
-        predicate: RuntimeListPredicate,
         target_text: &'a str,
         target_occurrence: usize,
     },
@@ -4353,27 +4656,11 @@ impl TodoRuntime {
             assert_todo_event_matches(step, &event)?;
         }
         match event {
-            TodoEvent::NewInputChange {
-                source,
-                target,
-                text,
-            } => {
+            TodoEvent::NewInputChange { source, text } => {
                 let seq = self.next_source_seq();
-                self.apply_scalar_text_source(
-                    target,
-                    source,
-                    Some(text),
-                    seq,
-                    &mut deltas,
-                    &mut patches,
-                )?;
+                self.apply_root_text_source(source, Some(text), seq, &mut deltas, &mut patches)?;
             }
-            TodoEvent::NewInputKeyDown {
-                source,
-                reset_target,
-                key,
-                text,
-            } => {
+            TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
                     let append_trigger = self.list_equations.append_trigger("todos")?;
@@ -4386,40 +4673,32 @@ impl TodoRuntime {
                     )?;
                     if let Some(title) = title_to_add {
                         self.append_todo(title, &mut deltas, &mut patches)?;
-                        if let Some(reset_target) = reset_target {
-                            self.apply_scalar_text_source(
-                                reset_target,
-                                source,
-                                Some(text),
-                                seq,
-                                &mut deltas,
-                                &mut patches,
-                            )?;
-                        }
+                        self.apply_root_text_source(
+                            source,
+                            Some(text),
+                            seq,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                     }
                 }
             }
-            TodoEvent::Filter { source, target } => {
+            TodoEvent::Filter { source } => {
                 let seq = self.next_source_seq();
-                self.apply_scalar_text_source(
-                    target,
-                    source,
-                    None,
-                    seq,
-                    &mut deltas,
-                    &mut patches,
-                )?;
+                self.apply_root_text_source(source, None, seq, &mut deltas, &mut patches)?;
             }
-            TodoEvent::ClearCompleted { predicate, .. } => {
+            TodoEvent::ClearCompleted { source } => {
+                let predicate = self.todo_remove_predicate(source)?;
                 self.remove_where_predicate(predicate, &mut deltas, &mut patches)?;
             }
-            TodoEvent::ToggleAll { source, target } => {
+            TodoEvent::ToggleAll { source } => {
                 let all_completed = self.all_completed();
-                self.generic.commit_each_indexed_bool_source(
+                self.generic.commit_each_indexed_bool_action_source(
+                    &self.source_routes,
                     &self.scalar_equations,
                     "todos",
-                    target,
                     source,
+                    SourceRouteBoolAction::BoolNot,
                     |path| match path {
                         "store.all_completed" => Some(all_completed),
                         _ => None,
@@ -4442,14 +4721,12 @@ impl TodoRuntime {
             }
             TodoEvent::TodoCheckbox {
                 source,
-                target,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
                 self.set_completed_from_source(
-                    target,
                     index,
                     source,
                     all_completed,
@@ -4459,30 +4736,32 @@ impl TodoRuntime {
             }
             TodoEvent::TodoTitleDoubleClick {
                 source,
-                edit_text_target,
-                editing_target,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let edit_text = self
                     .generic
-                    .commit_indexed_text_source(
+                    .commit_indexed_text_action_source(
+                        &self.source_routes,
                         &self.scalar_equations,
                         "todos",
                         index,
-                        edit_text_target,
                         source,
+                        SourceRouteTextAction::PreviousValue,
+                        |_| true,
                         Some(target_text),
                     )?
                     .ok_or_else(|| {
-                        format!(
-                            "text update `{edit_text_target}` from `{source}` produced no change"
-                        )
+                        format!("previous-text update from `{source}` produced no change")
                     })?;
                 let all_completed = self.all_completed();
-                let editing =
-                    self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
+                let editing = self.commit_todo_bool_source(
+                    index,
+                    source,
+                    SourceRouteBoolAction::ConstTrue,
+                    all_completed,
+                )?;
                 deltas.push(field_delta(
                     Some(editing.key),
                     Some(editing.generation),
@@ -4503,19 +4782,23 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleChange {
                 source,
-                edit_text_target,
                 target_text,
                 text,
             } => {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
-                if let Some(edit_text) = self.generic.commit_indexed_text_source(
+                if let Some(edit_text) = self.generic.commit_indexed_text_action_any_source(
+                    &self.source_routes,
                     &self.scalar_equations,
                     "todos",
                     index,
-                    edit_text_target,
                     source,
+                    &[
+                        SourceRouteTextAction::SourceText,
+                        SourceRouteTextAction::TextTrimOrPrevious,
+                    ],
+                    |_| true,
                     Some(text),
                 )? {
                     deltas.push(field_delta(
@@ -4533,9 +4816,6 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleKeyDown {
                 source,
-                title_target,
-                edit_text_target,
-                editing_target,
                 target_text,
                 key,
                 text,
@@ -4546,15 +4826,14 @@ impl TodoRuntime {
                         .or_else(|_| self.find_editing_index())?;
                     let (row_key, _) = self.todo_row_identity(index)?;
                     if key == "Enter" {
-                        let title_target = title_target.ok_or_else(|| {
-                            format!("source `{source}` Enter route has no title target")
-                        })?;
-                        if let Some(title) = self.generic.commit_indexed_text_source(
+                        if let Some(title) = self.generic.commit_indexed_text_action_source(
+                            &self.source_routes,
                             &self.scalar_equations,
                             "todos",
                             index,
-                            title_target,
                             source,
+                            SourceRouteTextAction::TextTrimOrPrevious,
+                            |target| row_field_name(target) == "title",
                             text,
                         )? {
                             deltas.push(field_delta(
@@ -4570,23 +4849,20 @@ impl TodoRuntime {
                             ));
                         }
                     } else {
-                        let edit_text_target = edit_text_target.ok_or_else(|| {
-                            format!("source `{source}` Escape route has no edit-text target")
-                        })?;
                         let edit_text = self
                             .generic
-                            .commit_indexed_text_source(
+                            .commit_indexed_text_action_source(
+                                &self.source_routes,
                                 &self.scalar_equations,
                                 "todos",
                                 index,
-                                edit_text_target,
                                 source,
+                                SourceRouteTextAction::PreviousValue,
+                                |_| true,
                                 Some(target_text),
                             )?
                             .ok_or_else(|| {
-                                format!(
-                                    "text update `{edit_text_target}` from `{source}` produced no change"
-                                )
+                                format!("previous-text update from `{source}` produced no change")
                             })?;
                         deltas.push(field_delta(
                             Some(edit_text.key),
@@ -4596,8 +4872,12 @@ impl TodoRuntime {
                         ));
                     }
                     let all_completed = self.all_completed();
-                    let editing =
-                        self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
+                    let editing = self.commit_todo_bool_source(
+                        index,
+                        source,
+                        SourceRouteBoolAction::ConstFalse,
+                        all_completed,
+                    )?;
                     deltas.push(field_delta(
                         Some(editing.key),
                         Some(editing.generation),
@@ -4613,8 +4893,6 @@ impl TodoRuntime {
             }
             TodoEvent::EditingTitleBlur {
                 source,
-                title_target,
-                editing_target,
                 target_text,
                 text,
             } => {
@@ -4622,12 +4900,14 @@ impl TodoRuntime {
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 let (row_key, _) = self.todo_row_identity(index)?;
-                if let Some(title) = self.generic.commit_indexed_text_source(
+                if let Some(title) = self.generic.commit_indexed_text_action_source(
+                    &self.source_routes,
                     &self.scalar_equations,
                     "todos",
                     index,
-                    title_target,
                     source,
+                    SourceRouteTextAction::TextTrimOrPrevious,
+                    |target| row_field_name(target) == "title",
                     text.or(Some(target_text)),
                 )? {
                     deltas.push(field_delta(
@@ -4643,8 +4923,12 @@ impl TodoRuntime {
                     ));
                 }
                 let all_completed = self.all_completed();
-                let editing =
-                    self.commit_todo_bool_source(index, editing_target, source, all_completed)?;
+                let editing = self.commit_todo_bool_source(
+                    index,
+                    source,
+                    SourceRouteBoolAction::ConstFalse,
+                    all_completed,
+                )?;
                 deltas.push(field_delta(
                     Some(editing.key),
                     Some(editing.generation),
@@ -4671,11 +4955,11 @@ impl TodoRuntime {
             }
             TodoEvent::RemoveTodo {
                 source,
-                predicate,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
+                let predicate = self.todo_remove_predicate(source)?;
                 if !self.remove_index_for_predicate(index, predicate, &mut deltas, &mut patches)? {
                     return Err(format!(
                         "remove source `{source}` predicate does not match todo `{target_text}`"
@@ -4735,42 +5019,42 @@ impl TodoRuntime {
     ) -> RuntimeResult<Option<TodoEvent<'a>>> {
         let source = source_event.source;
         let append_trigger = self.list_equations.append_trigger("todos")?;
-        let route = self
-            .source_routes
-            .for_source(source)
-            .ok_or_else(|| format!("{} source `{source}` has no compiled route", step.id))?;
+        self.source_routes
+            .require_source(source)
+            .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
-            if route.has_derived_text_target(append_trigger) {
+            if self
+                .source_routes
+                .has_derived_text_target(source, append_trigger)?
+            {
                 return Ok(Some(TodoEvent::NewInputKeyDown {
                     source,
-                    reset_target: route.single_root_scalar_target()?,
                     key: source_event.key.unwrap_or_default(),
                     text: source_event.text.unwrap_or_default(),
                 }));
             }
             if source_event.text.is_some() {
-                let target = route.single_root_scalar_target()?.ok_or_else(|| {
-                    format!("{} source `{source}` has no root text target", step.id)
-                })?;
+                self.source_routes
+                    .single_root_scalar_target(source)?
+                    .ok_or_else(|| {
+                        format!("{} source `{source}` has no root text target", step.id)
+                    })?;
                 return Ok(Some(TodoEvent::NewInputChange {
                     source,
-                    target,
                     text: source_event.text.unwrap_or_default(),
                 }));
             }
-            if route.has_list_remove_target("todos") {
-                return Ok(Some(TodoEvent::ClearCompleted {
-                    source,
-                    predicate: route.list_remove_predicate("todos")?,
-                }));
+            if self.source_routes.has_list_remove_target(source, "todos")? {
+                return Ok(Some(TodoEvent::ClearCompleted { source }));
             }
-            if let Some(target) = route.single_indexed_bool_target_matching(|expression| {
-                matches!(expression, ScalarUpdateExpression::BoolNot(_))
-            })? {
-                return Ok(Some(TodoEvent::ToggleAll { source, target }));
+            if self
+                .source_routes
+                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
+            {
+                return Ok(Some(TodoEvent::ToggleAll { source }));
             }
-            if let Some(target) = route.single_root_scalar_target()? {
-                return Ok(Some(TodoEvent::Filter { source, target }));
+            if self.source_routes.has_root_scalar_action(source)? {
+                return Ok(Some(TodoEvent::Filter { source }));
             }
             return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
         }
@@ -4778,41 +5062,21 @@ impl TodoRuntime {
         let target_text = source_event
             .target_text
             .expect("checked target_text presence above");
-        let removes_todos = route.has_list_remove_target("todos");
-        let remove_predicate = removes_todos
-            .then(|| route.list_remove_predicate("todos"))
-            .transpose()?;
-        let toggles_completed_target = route.single_indexed_bool_target_matching(|expression| {
-            matches!(expression, ScalarUpdateExpression::BoolNot(_))
-        })?;
-        let title_target = route.single_indexed_text_target_where(|target, expression| {
-            row_field_name(target) == "title"
-                && matches!(
-                    expression,
-                    ScalarUpdateExpression::TextTrimOrPrevious { .. }
-                )
-        })?;
-        let trim_text_target = route.single_indexed_text_target_where(|target, expression| {
-            row_field_name(target) != "title"
-                && matches!(
-                    expression,
-                    ScalarUpdateExpression::TextTrimOrPrevious { .. }
-                )
-        })?;
-        let source_text_target = route.single_indexed_text_target_where(|_, expression| {
-            matches!(expression, ScalarUpdateExpression::SourceText)
-        })?;
-        let edit_text_change_target = source_text_target.or(trim_text_target);
-        let updates_title = title_target.is_some();
-        let previous_text_target = route.single_indexed_text_target_where(|_, expression| {
-            matches!(expression, ScalarUpdateExpression::PreviousValue(_))
-        })?;
-        let edit_open_target = route.single_indexed_bool_target_matching(|expression| {
-            matches!(expression, ScalarUpdateExpression::Const("True"))
-        })?;
-        let edit_close_target = route.single_indexed_bool_target_matching(|expression| {
-            matches!(expression, ScalarUpdateExpression::Const("False"))
-        })?;
+        let removes_todos = self.source_routes.has_list_remove_target(source, "todos")?;
+        let toggles_completed = self
+            .source_routes
+            .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?;
+        let updates_title = self.source_routes.has_indexed_text_action_where(
+            source,
+            SourceRouteTextAction::TextTrimOrPrevious,
+            |target| row_field_name(target) == "title",
+        )?;
+        let has_previous_text = self
+            .source_routes
+            .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
+        let opens_edit = self
+            .source_routes
+            .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?;
         let Some(target_occurrence) =
             self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
         else {
@@ -4821,15 +5085,13 @@ impl TodoRuntime {
         if removes_todos {
             return Ok(Some(TodoEvent::RemoveTodo {
                 source,
-                predicate: remove_predicate.expect("remove predicate was resolved above"),
                 target_text,
                 target_occurrence,
             }));
         }
-        if let Some(target) = toggles_completed_target {
+        if toggles_completed {
             return Ok(Some(TodoEvent::TodoCheckbox {
                 source,
-                target,
                 target_text,
                 target_occurrence,
             }));
@@ -4838,11 +5100,6 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleKeyDown {
                 source,
-                title_target,
-                edit_text_target: previous_text_target,
-                editing_target: edit_close_target.ok_or_else(|| {
-                    format!("{} source `{source}` has no edit-close target", step.id)
-                })?,
                 target_text,
                 key: source_event.key.unwrap_or_default(),
                 text: source_event.text,
@@ -4852,11 +5109,6 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleBlur {
                 source,
-                title_target: title_target
-                    .ok_or_else(|| format!("{} source `{source}` has no title target", step.id))?,
-                editing_target: edit_close_target.ok_or_else(|| {
-                    format!("{} source `{source}` has no edit-close target", step.id)
-                })?,
                 target_text,
                 text: source_event.text.or(Some(target_text)),
             }));
@@ -4865,20 +5117,13 @@ impl TodoRuntime {
             self.editing_title()?;
             return Ok(Some(TodoEvent::EditingTitleChange {
                 source,
-                edit_text_target: edit_text_change_target.ok_or_else(|| {
-                    format!("{} source `{source}` has no edit-text target", step.id)
-                })?,
                 target_text,
                 text: source_event.text.unwrap_or_default(),
             }));
         }
-        if let (Some(edit_text_target), Some(editing_target)) =
-            (previous_text_target, edit_open_target)
-        {
+        if has_previous_text && opens_edit {
             return Ok(Some(TodoEvent::TodoTitleDoubleClick {
                 source,
-                edit_text_target,
-                editing_target,
                 target_text,
                 target_occurrence,
             }));
@@ -4995,15 +5240,24 @@ impl TodoRuntime {
 
     fn set_completed_from_source(
         &mut self,
-        target: &'static str,
         index: usize,
         source: &str,
         all_completed_snapshot: bool,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let completed =
-            self.commit_todo_bool_source(index, target, source, all_completed_snapshot)?;
+        let completed = self.generic.commit_indexed_bool_action_source(
+            &self.source_routes,
+            &self.scalar_equations,
+            "todos",
+            index,
+            source,
+            SourceRouteBoolAction::BoolNot,
+            |path| match path {
+                "store.all_completed" => Some(all_completed_snapshot),
+                _ => None,
+            },
+        )?;
         deltas.push(field_delta(
             Some(completed.key),
             Some(completed.generation),
@@ -5016,6 +5270,10 @@ impl TodoRuntime {
             ProtocolValue::CheckedProperty(completed.value),
         ));
         Ok(())
+    }
+
+    fn todo_remove_predicate(&self, source: &str) -> RuntimeResult<RuntimeListPredicate> {
+        self.source_routes.list_remove_predicate(source, "todos")
     }
 
     fn set_completed_value(
@@ -5257,15 +5515,17 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn apply_scalar_text_source<'a>(
+    fn apply_root_text_source<'a>(
         &mut self,
-        target: &'static str,
         source: &str,
         payload_text: Option<&'a str>,
         seq: TickSeq,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
+        let Some(target) = self.source_routes.single_root_scalar_target(source)? else {
+            return Ok(());
+        };
         if let Some(value) = self.generic.apply_root_text_source(
             &self.scalar_equations,
             target,
@@ -5320,16 +5580,17 @@ impl TodoRuntime {
     fn commit_todo_bool_source(
         &mut self,
         index: usize,
-        target: &'static str,
         source: &str,
+        kind: SourceRouteBoolAction,
         all_completed_snapshot: bool,
     ) -> RuntimeResult<GenericBoolFieldCommit> {
-        self.generic.commit_indexed_bool_source(
+        self.generic.commit_indexed_bool_action_source(
+            &self.source_routes,
             &self.scalar_equations,
             "todos",
             index,
-            target,
             source,
+            kind,
             |path| match path {
                 "store.all_completed" => Some(all_completed_snapshot),
                 _ => None,
@@ -5851,32 +6112,18 @@ struct CellsRuntime {
 enum CellEvent<'a> {
     Change {
         source: &'a str,
-        editing_text_target: &'static str,
-        editing_target: &'static str,
         address: &'a str,
         text: &'a str,
     },
     Commit {
         source: &'a str,
-        formula_target: &'static str,
-        editing_text_target: &'static str,
-        editing_target: &'static str,
         address: &'a str,
         text: &'a str,
     },
     Cancel {
         source: &'a str,
-        editing_text_target: &'static str,
-        editing_target: &'static str,
         address: &'a str,
     },
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CellCommitTargets {
-    formula: &'static str,
-    editing_text: &'static str,
-    editing: &'static str,
 }
 
 impl CellsRuntime {
@@ -6063,33 +6310,32 @@ impl CellsRuntime {
         match event {
             CellEvent::Change {
                 source,
-                editing_text_target,
-                editing_target,
                 address,
                 text,
             } => {
                 let index = self.cell_index(address)?;
                 let editing_text = self
                     .generic
-                    .commit_indexed_text_source(
+                    .commit_indexed_text_action_source(
+                        &self.source_routes,
                         &self.scalar_equations,
                         "cells",
                         index,
-                        editing_text_target,
                         source,
+                        SourceRouteTextAction::SourceText,
+                        |target| target == "cell.editing_text",
                         Some(text),
                     )?
                     .ok_or_else(|| {
-                        format!(
-                            "text update `{editing_text_target}` from `{source}` produced no change"
-                        )
+                        format!("editing-text update from `{source}` produced no change")
                     })?;
-                let editing = self.generic.commit_indexed_bool_source(
+                let editing = self.generic.commit_indexed_bool_action_source(
+                    &self.source_routes,
                     &self.scalar_equations,
                     "cells",
                     index,
-                    editing_target,
                     source,
+                    SourceRouteBoolAction::ConstTrue,
                     |_| None,
                 )?;
                 deltas.push(cell_field_delta(
@@ -6112,34 +6358,24 @@ impl CellsRuntime {
             }
             CellEvent::Commit {
                 source,
-                formula_target,
-                editing_text_target,
-                editing_target,
                 address,
                 text,
             } => {
-                self.commit_from_source(
-                    source,
-                    CellCommitTargets {
-                        formula: formula_target,
-                        editing_text: editing_text_target,
-                        editing: editing_target,
-                    },
-                    address,
-                    text,
-                    deltas,
-                    patches,
-                    recomputed,
-                )?;
+                self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
             }
-            CellEvent::Cancel {
-                source,
-                editing_text_target,
-                editing_target,
-                address,
-            } => {
+            CellEvent::Cancel { source, address } => {
                 let index = self.cell_index(address)?;
                 let (key, generation) = self.cell_key_generation(index);
+                let editing_text_target = self
+                    .source_routes
+                    .single_indexed_text_action_target_where(
+                        source,
+                        SourceRouteTextAction::PreviousValue,
+                        |target| target == "cell.editing_text",
+                    )?
+                    .ok_or_else(|| {
+                        format!("source `{source}` has no Cells editing-text previous action")
+                    })?;
                 let previous_path = self.cell_previous_text_path(editing_text_target, source)?;
                 if previous_path != "formula_text" {
                     return Err(
@@ -6147,12 +6383,13 @@ impl CellsRuntime {
                     );
                 }
                 self.copy_cell_formula_to_editing_text(index)?;
-                let editing = self.generic.commit_indexed_bool_source(
+                let editing = self.generic.commit_indexed_bool_action_source(
+                    &self.source_routes,
                     &self.scalar_equations,
                     "cells",
                     index,
-                    editing_target,
                     source,
+                    SourceRouteBoolAction::ConstFalse,
                     |_| None,
                 )?;
                 let editing_text = self.cell_text_field(index, "editing_text")?;
@@ -6192,23 +6429,22 @@ impl CellsRuntime {
         source_event: GenericSourceEvent<'a>,
     ) -> RuntimeResult<Option<CellEvent<'a>>> {
         let source = source_event.source;
-        let route = self
-            .source_routes
-            .for_source(source)
-            .ok_or_else(|| format!("{} source `{source}` has no compiled route", step.id))?;
+        self.source_routes
+            .require_source(source)
+            .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         let address = source_event
             .address
             .filter(|candidate| is_cell_address(candidate))
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
-        if route.has_indexed_text_target("cell.formula_text") {
+        if self
+            .source_routes
+            .has_indexed_text_target(source, "cell.formula_text")?
+        {
             let text = source_event
                 .text
                 .ok_or_else(|| format!("{} Cells commit source event missing text", step.id))?;
             return Ok(Some(CellEvent::Commit {
                 source,
-                formula_target: route.indexed_text_target("cell.formula_text")?,
-                editing_text_target: route.indexed_text_target("cell.editing_text")?,
-                editing_target: route.indexed_bool_target("cell.editing")?,
                 address,
                 text,
             }));
@@ -6216,18 +6452,11 @@ impl CellsRuntime {
         if let Some(text) = source_event.text {
             return Ok(Some(CellEvent::Change {
                 source,
-                editing_text_target: route.indexed_text_target("cell.editing_text")?,
-                editing_target: route.indexed_bool_target("cell.editing")?,
                 address,
                 text,
             }));
         }
-        Ok(Some(CellEvent::Cancel {
-            source,
-            editing_text_target: route.indexed_text_target("cell.editing_text")?,
-            editing_target: route.indexed_bool_target("cell.editing")?,
-            address,
-        }))
+        Ok(Some(CellEvent::Cancel { source, address }))
     }
 
     fn assert_step(&self, step: &ScenarioStep, recomputed: &[usize]) -> RuntimeResult<()> {
@@ -6312,17 +6541,8 @@ impl CellsRuntime {
         patches: &mut Vec<RenderPatch<'a>>,
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
-        let route = self
-            .source_routes
-            .for_source("cell.sources.editor.commit")
-            .ok_or("default Cells commit source has no compiled route")?;
         self.commit_from_source(
             "cell.sources.editor.commit",
-            CellCommitTargets {
-                formula: route.indexed_text_target("cell.formula_text")?,
-                editing_text: route.indexed_text_target("cell.editing_text")?,
-                editing: route.indexed_bool_target("cell.editing")?,
-            },
             address,
             formula,
             deltas,
@@ -6334,7 +6554,6 @@ impl CellsRuntime {
     fn commit_from_source<'a>(
         &mut self,
         source: &'a str,
-        targets: CellCommitTargets,
         address: &'a str,
         formula: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
@@ -6345,42 +6564,37 @@ impl CellsRuntime {
         let committed_index = self.cell_index(address)?;
         let formula = self
             .generic
-            .commit_indexed_text_source(
+            .commit_indexed_text_action_source(
+                &self.source_routes,
                 &self.scalar_equations,
                 "cells",
                 committed_index,
-                targets.formula,
                 source,
+                SourceRouteTextAction::SourceText,
+                |target| target == "cell.formula_text",
                 Some(formula),
             )?
-            .ok_or_else(|| {
-                format!(
-                    "formula update `{}` from `{source}` produced no change",
-                    targets.formula
-                )
-            })?;
+            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
         let editing_text = self
             .generic
-            .commit_indexed_text_source(
+            .commit_indexed_text_action_source(
+                &self.source_routes,
                 &self.scalar_equations,
                 "cells",
                 committed_index,
-                targets.editing_text,
                 source,
+                SourceRouteTextAction::SourceText,
+                |target| target == "cell.editing_text",
                 Some(formula.value),
             )?
-            .ok_or_else(|| {
-                format!(
-                    "editing text update `{}` from `{source}` produced no change",
-                    targets.editing_text
-                )
-            })?;
-        let editing = self.generic.commit_indexed_bool_source(
+            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
+        let editing = self.generic.commit_indexed_bool_action_source(
+            &self.source_routes,
             &self.scalar_equations,
             "cells",
             committed_index,
-            targets.editing,
             source,
+            SourceRouteBoolAction::ConstFalse,
             |_| None,
         )?;
         self.cells[committed_index].parsed =
@@ -8507,23 +8721,9 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
-        let commit_route = compiled
-            .source_routes
-            .for_source("cell.sources.editor.apply")
-            .unwrap();
-
         runtime
             .commit_from_source(
                 "cell.sources.editor.apply",
-                CellCommitTargets {
-                    formula: commit_route
-                        .indexed_text_target("cell.formula_text")
-                        .unwrap(),
-                    editing_text: commit_route
-                        .indexed_text_target("cell.editing_text")
-                        .unwrap(),
-                    editing: commit_route.indexed_bool_target("cell.editing").unwrap(),
-                },
                 "A1",
                 "123",
                 &mut deltas,

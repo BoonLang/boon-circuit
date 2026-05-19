@@ -388,20 +388,37 @@ does not rescan all scalar targets to find the relevant equation family. Cells
 editor routes use the same indexed target partitions for `editing_text`,
 `formula_text`, and `editing` commits.
 Toggle-all and row-checkbox events now carry the
-matched bool target into application instead of applying through a fixed
-`todo.completed` target. Todo edit-open/change/Enter/Escape/blur events now
-carry the matched title, edit-text, and editing targets into application instead
-of choosing `todo.title`, `todo.edit_text`, or `todo.editing` by event kind.
+source and row selection only; a route-selected indexed bool commit chooses the
+matched `Bool/not` target at application time instead of applying through a
+fixed `todo.completed` target. Todo edit-open/change/Enter/Escape/blur events now
+carry only source payload and row selection data. Route-selected indexed text
+and bool commits choose the matched title, edit-text, and editing targets from
+the compiled source route instead of applying through fixed `todo.title`,
+`todo.edit_text`, or `todo.editing` paths.
 Root scalar `HOLD` dispatch also uses that same compiled route index to find the
-single root target for a source, and routed TodoMVC source events carry that
-root target into the application phase instead of looking it up again there.
+single root target for a source. TodoMVC root events now carry only source
+payload data; a generic route-selected root commit applies the `HOLD` branch
+and returns the committed root target/value fact to the renderer adapter.
+Route target selection is exposed through `SourceRoutePlan` helpers rather than
+through example-specific direct reads of route internals. Generic runtime
+helpers now accept source route actions for indexed text and bool commits, so
+TodoMVC and Cells pass source plus row/address/payload and the helper selects
+the compiled `HOLD` target before evaluating the branch. The remaining adapters
+still interpret committed facts into example-specific render patches, and list
+removal still asks the route plan for its compiled predicate. The source route
+plan now also materializes route capability actions (`RootScalar`,
+`DerivedText`, `ListRemove`, `IndexedText`, `IndexedBool`) from the compiled
+target tables, so adapters can classify source events by precomputed route
+capabilities instead of repeatedly inspecting scalar expression lists.
 `List/remove` predicates for clear-completed and row delete are carried on the
-same source-route entries, so row removal uses the compiled predicate directly
-instead of looking it up by source during the row scan. Cells edit, commit, and
-cancel events now carry the indexed `HOLD` targets selected by their compiled
-source route (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or
-renamed equivalents) into the application phase, so the application boundary
-does not choose those fields by hardcoded event kind. Example runtimes still
+same source-route entries. TodoMVC remove events now carry only source and row
+selection data; row removal selects the compiled predicate at application time
+instead of carrying the predicate in the event enum. Cells edit, commit, and
+cancel events now carry only source payload and grid address data.
+Route-selected indexed text/bool commits choose the compiled `HOLD` targets
+(`cell.editing_text`, `cell.formula_text`, `cell.editing`, or renamed
+equivalents) at the application boundary instead of carrying those targets in
+the event enum. Example runtimes still
 adapt generic facts into their current protocol/render outputs; TodoMVC no
 longer mirrors committed row or root values for render/test checks, and Cells
 no longer mirrors committed formula/editing fields.

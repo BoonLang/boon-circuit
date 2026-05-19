@@ -4,7 +4,7 @@ use boon_ir::{
     DerivedValueKind, FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind,
     ListPredicate, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
 };
-use boon_parser::{ParsedProgram, ProgramKind, parse_source};
+use boon_parser::{ParsedProgram, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
@@ -1147,8 +1147,8 @@ fn run_loaded_scenario(
     scenario: &Scenario,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
-    validate_executable_surface(parsed, ir)?;
     let compiled = CompiledProgram::from_ir(ir)?;
+    validate_executable_surface(parsed, ir, &compiled)?;
     let runtime = LoadedRuntime::new(parsed, ir, &compiled)?;
     run_generic_scenario(runtime, parsed, ir, &compiled, scenario, layer)
 }
@@ -1164,15 +1164,41 @@ impl LoadedRuntime {
         ir: &TypedProgram,
         compiled: &CompiledProgram,
     ) -> RuntimeResult<Self> {
-        match parsed.kind {
-            ProgramKind::TodoMvc => Ok(Self::Todo(TodoRuntime::new(parsed, ir, compiled)?)),
-            ProgramKind::Cells => Ok(Self::Cells(CellsRuntime::new(parsed, ir, compiled)?)),
+        match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => {
+                Ok(Self::Todo(TodoRuntime::new(parsed, ir, compiled)?))
+            }
+            ExecutableSurfaceKind::Cells => {
+                Ok(Self::Cells(CellsRuntime::new(parsed, ir, compiled)?))
+            }
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableSurfaceKind {
+    TodoMvc,
+    Cells,
+}
+
+impl ExecutableSurfaceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TodoMvc => "todomvc",
+            Self::Cells => "cells",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExecutableSurfaceProfile {
+    kind: ExecutableSurfaceKind,
+    inferred_from_ir: bool,
+}
+
 #[derive(Clone, Debug)]
 struct CompiledProgram {
+    surface: ExecutableSurfaceProfile,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
@@ -1193,6 +1219,7 @@ struct CompiledProgram {
 
 impl CompiledProgram {
     fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
+        let surface = ExecutableSurfaceProfile::infer(ir)?;
         for cell in &ir.state_cells {
             if let InitialValue::Unknown { summary } = &cell.initial_value {
                 return Err(format!(
@@ -1272,6 +1299,7 @@ impl CompiledProgram {
         );
         let source_route_count = source_routes.routes.len();
         Ok(Self {
+            surface,
             scalar_equations,
             derived_equations,
             list_equations,
@@ -1294,6 +1322,8 @@ impl CompiledProgram {
     fn report(&self) -> JsonValue {
         json!({
             "compiled_from_typed_ir": true,
+            "executable_surface": self.surface.kind.as_str(),
+            "executable_surface_inferred_from_ir": self.surface.inferred_from_ir,
             "schedule_node_count": self.schedule_node_count,
             "state_initializer_count": self.state_initializer_count,
             "list_initializer_count": self.list_initializer_count,
@@ -1310,6 +1340,47 @@ impl CompiledProgram {
     }
 }
 
+impl ExecutableSurfaceProfile {
+    fn infer(ir: &TypedProgram) -> RuntimeResult<Self> {
+        let has_todomvc_shape = ir_has_list(ir, "todos")
+            && ir_has_state(ir, "store.new_todo_text")
+            && ir_has_state(ir, "store.selected_filter")
+            && ir_has_state(ir, "todo.title")
+            && ir_has_state(ir, "todo.edit_text")
+            && ir_has_state(ir, "todo.completed")
+            && ir_has_state(ir, "todo.editing");
+        let has_cells_shape = ir_has_list(ir, "cells")
+            && ir_has_state(ir, "cell.editing_text")
+            && ir_has_state(ir, "cell.formula_text")
+            && ir_has_state(ir, "cell.editing")
+            && !ir.formula_operations.is_empty();
+        match (has_todomvc_shape, has_cells_shape) {
+            (true, false) => Ok(Self {
+                kind: ExecutableSurfaceKind::TodoMvc,
+                inferred_from_ir: true,
+            }),
+            (false, true) => Ok(Self {
+                kind: ExecutableSurfaceKind::Cells,
+                inferred_from_ir: true,
+            }),
+            (true, true) => {
+                Err("typed IR matches both TodoMVC and Cells executable surface profiles".into())
+            }
+            (false, false) => {
+                Err("typed IR does not match a supported executable surface profile".into())
+            }
+        }
+    }
+}
+
+fn ir_has_state(ir: &TypedProgram, path: &str) -> bool {
+    ir.state_cells.iter().any(|cell| cell.path == path)
+}
+
+fn ir_has_list(ir: &TypedProgram, name: &str) -> bool {
+    ir.lists.iter().any(|list| list.name == name)
+}
+
 fn list_operation_has_unknown_predicate(operation: &boon_ir::ListOperation) -> bool {
     match &operation.kind {
         ListOperationKind::Append { .. } => false,
@@ -1321,9 +1392,13 @@ fn list_operation_has_unknown_predicate(operation: &boon_ir::ListOperation) -> b
     }
 }
 
-fn validate_executable_surface(parsed: &ParsedProgram, ir: &TypedProgram) -> RuntimeResult<()> {
-    match parsed.kind {
-        ProgramKind::TodoMvc => {
+fn validate_executable_surface(
+    parsed: &ParsedProgram,
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+) -> RuntimeResult<()> {
+    match compiled.surface.kind {
+        ExecutableSurfaceKind::TodoMvc => {
             require_state_cells(
                 ir,
                 &[
@@ -1366,7 +1441,7 @@ fn validate_executable_surface(parsed: &ParsedProgram, ir: &TypedProgram) -> Run
                 ],
             )?;
         }
-        ProgramKind::Cells => {
+        ExecutableSurfaceKind::Cells => {
             require_state_cells(
                 ir,
                 &["cell.editing_text", "cell.formula_text", "cell.editing"],
@@ -1655,6 +1730,8 @@ fn base_example_report(
         .unwrap_or(0);
     let total_alloc_count: u64 = allocation_deltas.iter().map(|delta| delta.count).sum();
     let total_alloc_bytes: u64 = allocation_deltas.iter().map(|delta| delta.bytes).sum();
+    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
+    let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
     json!({
         "status": "pass",
         "command": layer.as_str(),
@@ -1668,10 +1745,11 @@ fn base_example_report(
             "static_schedule_verified": ir.static_schedule_verified,
             "generic_interpreter_complete": false,
             "example_behavior_adapter": true,
-            "adapter_kind": parsed.kind.as_str(),
-            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime by ProgramKind instead of instantiating one complete generic equation schedule",
+            "adapter_kind": compiled.surface.kind.as_str(),
+            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime by inferred executable surface instead of instantiating one complete generic equation schedule",
             "not_final_architecture_acceptance": true,
             "generic_runtime_slices": {
+                "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
                 "ir_update_branch_table_loaded": true,
                 "update_branch_count": ir.update_branches.len(),
                 "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
@@ -1704,22 +1782,22 @@ fn base_example_report(
                 "generic_list_structural_commit_executor": true,
                 "ir_derived_value_table_loaded": true,
                 "derived_value_count": ir.derived_values.len(),
-                "todomvc_root_scalar_holds_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_generic_hold_storage_authoritative": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_title_hold_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_completed_bool_hold_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_editing_bool_hold_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_edit_text_hold_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_append_remove_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "todomvc_count_and_filter_views_from_ir": matches!(parsed.kind, ProgramKind::TodoMvc),
-                "cells_edit_state_holds_from_ir": matches!(parsed.kind, ProgramKind::Cells),
-                "cells_generic_hold_storage_authoritative": matches!(parsed.kind, ProgramKind::Cells),
-                "cells_hidden_grid_keys_from_generic_storage": matches!(parsed.kind, ProgramKind::Cells),
-                "cells_formula_pipeline_from_ir": matches!(parsed.kind, ProgramKind::Cells)
+                "todomvc_root_scalar_holds_from_ir": is_todomvc,
+                "todomvc_generic_hold_storage_authoritative": is_todomvc,
+                "todomvc_title_hold_from_ir": is_todomvc,
+                "todomvc_completed_bool_hold_from_ir": is_todomvc,
+                "todomvc_editing_bool_hold_from_ir": is_todomvc,
+                "todomvc_edit_text_hold_from_ir": is_todomvc,
+                "todomvc_append_remove_from_ir": is_todomvc,
+                "todomvc_count_and_filter_views_from_ir": is_todomvc,
+                "cells_edit_state_holds_from_ir": is_cells,
+                "cells_generic_hold_storage_authoritative": is_cells,
+                "cells_hidden_grid_keys_from_generic_storage": is_cells,
+                "cells_formula_pipeline_from_ir": is_cells
             }
         },
         "renderer": if matches!(layer, VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly) { "ply-engine" } else { "semantic" },
-        "program_kind": parsed.kind.as_str(),
+        "program_kind": compiled.surface.kind.as_str(),
         "program_hash": sha256_bytes(parsed.source.as_bytes()),
         "expression_count": ir.expression_count,
         "total_ticks": scenario.step.len(),
@@ -7021,7 +7099,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_surface_must_be_declared_in_boon_source() {
+    fn executable_surface_must_match_typed_ir_profile() {
         let source = include_str!("../../../examples/todomvc.bn")
             .replace("        completed:\n", "        done:\n");
         let err = run_scenario_source_with_step_limit(
@@ -7034,7 +7112,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("executable source missing state cell `todo.completed`")
+                .contains("typed IR does not match a supported executable surface profile")
         );
 
         let renamed_row_source =

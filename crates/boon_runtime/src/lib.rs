@@ -3704,6 +3704,7 @@ struct SourceRoute {
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
     derived_text_targets: Vec<&'static str>,
+    list_append_targets: Vec<SourceRouteListAppend>,
     list_remove_targets: Vec<SourceRouteListRemove>,
     actions: Vec<SourceRouteAction>,
 }
@@ -3721,6 +3722,12 @@ struct SourceRouteListRemove {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceRouteListAppend {
+    list: &'static str,
+    trigger: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceRouteAction {
     RootScalar,
     DerivedText {
@@ -3728,6 +3735,10 @@ enum SourceRouteAction {
     },
     ListRemove {
         list: &'static str,
+    },
+    ListAppend {
+        list: &'static str,
+        trigger: &'static str,
     },
     IndexedText {
         kind: SourceRouteTextAction,
@@ -4026,14 +4037,30 @@ impl SourceRoutePlan {
                 .push(transform.target);
         }
         for operation in &lists.operations {
-            if let RuntimeListOperationKind::Remove { source, predicate } = &operation.kind {
-                routes
-                    .route_mut(*source)
-                    .list_remove_targets
-                    .push(SourceRouteListRemove {
-                        list: operation.list,
-                        predicate: *predicate,
-                    });
+            match &operation.kind {
+                RuntimeListOperationKind::Append { trigger, .. } => {
+                    for route in routes
+                        .routes
+                        .iter_mut()
+                        .filter(|route| route.derived_text_targets.contains(trigger))
+                    {
+                        route.list_append_targets.push(SourceRouteListAppend {
+                            list: operation.list,
+                            trigger: *trigger,
+                        });
+                    }
+                }
+                RuntimeListOperationKind::Remove { source, predicate } => {
+                    routes
+                        .route_mut(*source)
+                        .list_remove_targets
+                        .push(SourceRouteListRemove {
+                            list: operation.list,
+                            predicate: *predicate,
+                        });
+                }
+                RuntimeListOperationKind::Retain { .. }
+                | RuntimeListOperationKind::Count { .. } => {}
             }
         }
         for route in &mut routes.routes {
@@ -4088,12 +4115,12 @@ impl SourceRoutePlan {
         Ok(self.require_source(source)?.has_indexed_text_target(target))
     }
 
-    fn has_derived_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_derived_text_target(target))
-    }
-
     fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
         Ok(self.require_source(source)?.has_list_remove_target(list))
+    }
+
+    fn has_list_append_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
+        Ok(self.require_source(source)?.has_list_append_target(list))
     }
 
     fn has_root_scalar_action(&self, source: &str) -> RuntimeResult<bool> {
@@ -4133,6 +4160,10 @@ impl SourceRoutePlan {
         list: &str,
     ) -> RuntimeResult<RuntimeListPredicate> {
         self.require_source(source)?.list_remove_predicate(list)
+    }
+
+    fn list_append_trigger(&self, source: &str, list: &str) -> RuntimeResult<&'static str> {
+        self.require_source(source)?.list_append_trigger(list)
     }
 
     fn route_mut(&mut self, source: &'static str) -> &mut SourceRoute {
@@ -4202,6 +4233,15 @@ impl SourceRoute {
                 .iter()
                 .map(|target| SourceRouteAction::ListRemove { list: target.list }),
         );
+        self.actions
+            .extend(
+                self.list_append_targets
+                    .iter()
+                    .map(|target| SourceRouteAction::ListAppend {
+                        list: target.list,
+                        trigger: target.trigger,
+                    }),
+            );
         self.actions
             .extend(self.indexed_text_targets.iter().filter_map(|target| {
                 let kind = match target.expression {
@@ -4362,20 +4402,23 @@ impl SourceRoute {
         Ok(target)
     }
 
-    fn has_derived_text_target(&self, target: &str) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::DerivedText { target: candidate } if candidate == target
-            )
-        })
-    }
-
     fn has_list_remove_target(&self, list: &str) -> bool {
         self.has_action(|action| {
             matches!(
                 action,
                 SourceRouteAction::ListRemove { list: candidate } if candidate == list
+            )
+        })
+    }
+
+    fn has_list_append_target(&self, list: &str) -> bool {
+        self.has_action(|action| {
+            matches!(
+                action,
+                SourceRouteAction::ListAppend {
+                    list: candidate,
+                    ..
+                } if candidate == list
             )
         })
     }
@@ -4391,6 +4434,30 @@ impl SourceRoute {
                 )
                 .into()
             })
+    }
+
+    fn list_append_trigger(&self, list: &str) -> RuntimeResult<&'static str> {
+        let mut trigger = None;
+        for candidate in &self.list_append_targets {
+            if candidate.list != list {
+                continue;
+            }
+            if trigger.is_some_and(|current| current != candidate.trigger) {
+                return Err(format!(
+                    "source `{}` has multiple list-append triggers for `{list}`",
+                    self.source
+                )
+                .into());
+            }
+            trigger = Some(candidate.trigger);
+        }
+        trigger.ok_or_else(|| {
+            format!(
+                "source `{}` has no compiled list-append route for `{list}`",
+                self.source
+            )
+            .into()
+        })
     }
 }
 
@@ -4837,7 +4904,7 @@ impl TodoRuntime {
             TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
-                    let append_trigger = self.list_equations.append_trigger("todos")?;
+                    let append_trigger = self.source_routes.list_append_trigger(source, "todos")?;
                     let title_to_add = self.generic.eval_derived_text_transform(
                         &self.derived_equations,
                         append_trigger,
@@ -4846,7 +4913,7 @@ impl TodoRuntime {
                         Some(text),
                     )?;
                     if let Some(title) = title_to_add {
-                        self.append_todo(title, &mut deltas, &mut patches)?;
+                        self.append_todo(source, title, &mut deltas, &mut patches)?;
                         self.apply_root_text_source(
                             source,
                             Some(text),
@@ -5192,15 +5259,11 @@ impl TodoRuntime {
         fallback_occurrence: usize,
     ) -> RuntimeResult<Option<TodoEvent<'a>>> {
         let source = source_event.source;
-        let append_trigger = self.list_equations.append_trigger("todos")?;
         self.source_routes
             .require_source(source)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
-            if self
-                .source_routes
-                .has_derived_text_target(source, append_trigger)?
-            {
+            if self.source_routes.has_list_append_target(source, "todos")? {
                 return Ok(Some(TodoEvent::NewInputKeyDown {
                     source,
                     key: source_event.key.unwrap_or_default(),
@@ -5371,6 +5434,7 @@ impl TodoRuntime {
 
     fn append_todo<'a>(
         &mut self,
+        source: &str,
         title: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
@@ -5378,7 +5442,7 @@ impl TodoRuntime {
         if title.is_empty() {
             return Ok(());
         }
-        let append_trigger = self.list_equations.append_trigger("todos")?;
+        let append_trigger = self.source_routes.list_append_trigger(source, "todos")?;
         let row_source_paths = self.list_source_bindings.source_paths("todos")?;
         let insert = self.generic.append_row_for_trigger_text_and_bind_sources(
             &self.list_equations,
@@ -7912,7 +7976,12 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime
-            .append_todo("New source row", &mut deltas, &mut patches)
+            .append_todo(
+                "store.sources.new_todo_input.key_down",
+                "New source row",
+                &mut deltas,
+                &mut patches,
+            )
             .unwrap();
         let (key, generation) = runtime
             .todo_row_identity(runtime.todo_len() - 1)

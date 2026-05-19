@@ -407,9 +407,10 @@ the compiled `HOLD` target before evaluating the branch. The remaining adapters
 still interpret committed facts into example-specific render patches, and list
 removal still asks the route plan for its compiled predicate. The source route
 plan now also materializes route capability actions (`RootScalar`,
-`DerivedText`, `ListRemove`, `IndexedText`, `IndexedBool`) from the compiled
-target tables, so adapters can classify source events by precomputed route
-capabilities instead of repeatedly inspecting scalar expression lists.
+`DerivedText`, `ListAppend`, `ListRemove`, `IndexedText`, `IndexedBool`) from
+the compiled target tables, so adapters can classify source events by
+precomputed route capabilities instead of repeatedly inspecting scalar
+expression lists.
 `List/remove` predicates for clear-completed and row delete are carried on the
 same source-route entries. TodoMVC remove events now carry only source and row
 selection data; row removal selects the compiled predicate at application time
@@ -428,7 +429,9 @@ list from indexed `HOLD` initializers and materializes appended rows from that
 template rather than from a TodoMVC-specific row constructor. The runtime keeps
 a generic per-list spare-row pool and resets spare rows from the typed append
 seed fields, preserving the zero-allocation speed budget after warmup without a
-Todo-specific pool.
+Todo-specific pool. Append routing is also part of the source-route action
+table: the TodoMVC key-down path asks the compiled route for its `ListAppend`
+trigger instead of comparing derived text target names outside the route plan.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

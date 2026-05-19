@@ -332,8 +332,12 @@ for `SourceText`, `PreviousValue`, `TextTrimOrPrevious`, constants, and
 binding checks now live in `GenericCircuitRuntime`; TodoMVC only reads them back
 to emit current protocol/render deltas. Generic runtime helpers now construct
 the keyed semantic facts for field, list, and source changes; example-specific
-code still lowers those facts into current TodoMVC/Cells render patches. Example
-runtimes only mirror committed values for render/test checks. TodoMVC
+code still lowers those facts into current TodoMVC/Cells render patches. TodoMVC
+root `SOURCE` events are dispatched through the generic branch table to the
+single root `HOLD` target they are allowed to drive, so the adapter no longer
+names `store.new_todo_text` or `store.selected_filter` at the event dispatch
+site. Example runtimes only mirror committed values for render/test checks.
+TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
 IR-derived predicates instead of Todo-specific loops. Both example runtimes
@@ -342,8 +346,11 @@ scenario steps.
 Executable reports also include `compiled_schedule`, a typed-IR-derived schedule
 summary that rejects unknown initializers, unsupported update branches,
 unsupported list predicates, and per-row graph clones before the example runtime
-starts. The tick executor remains adapter-backed until all source events execute
-through one generic schedule without the TodoMVC/Cells driver layer.
+starts. `run_loaded_scenario` now enters one shared `run_generic_scenario`
+loop through a `LoadedRuntime` shell, but that shell still selects the TodoMVC or
+Cells driver by `ProgramKind`. The tick executor remains adapter-backed until
+all source events execute through one generic schedule without the TodoMVC/Cells
+driver layer.
 
 Implementation note: the current IR cause table is source-derived, not a
 TodoMVC/Cells-specific Rust lookup table. It derives row scopes from

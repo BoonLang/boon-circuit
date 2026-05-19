@@ -1149,9 +1149,25 @@ fn run_loaded_scenario(
 ) -> RuntimeResult<RunOutput> {
     validate_executable_surface(parsed, ir)?;
     let compiled = CompiledProgram::from_ir(ir)?;
-    match parsed.kind {
-        ProgramKind::TodoMvc => run_todomvc(parsed, ir, &compiled, scenario, layer),
-        ProgramKind::Cells => run_cells(parsed, ir, &compiled, scenario, layer),
+    let runtime = LoadedRuntime::new(parsed, ir, &compiled)?;
+    run_generic_scenario(runtime, parsed, ir, &compiled, scenario, layer)
+}
+
+enum LoadedRuntime {
+    Todo(TodoRuntime),
+    Cells(CellsRuntime),
+}
+
+impl LoadedRuntime {
+    fn new(
+        parsed: &ParsedProgram,
+        ir: &TypedProgram,
+        compiled: &CompiledProgram,
+    ) -> RuntimeResult<Self> {
+        match parsed.kind {
+            ProgramKind::TodoMvc => Ok(Self::Todo(TodoRuntime::new(parsed, ir, compiled)?)),
+            ProgramKind::Cells => Ok(Self::Cells(CellsRuntime::new(parsed, ir, compiled)?)),
+        }
     }
 }
 
@@ -1556,40 +1572,6 @@ fn run_generic_scenario<R: ScenarioExecutor>(
     })
 }
 
-fn run_todomvc(
-    parsed: &ParsedProgram,
-    ir: &TypedProgram,
-    compiled: &CompiledProgram,
-    scenario: &Scenario,
-    layer: VerificationLayer,
-) -> RuntimeResult<RunOutput> {
-    run_generic_scenario(
-        TodoRuntime::new(parsed, ir, compiled)?,
-        parsed,
-        ir,
-        compiled,
-        scenario,
-        layer,
-    )
-}
-
-fn run_cells(
-    parsed: &ParsedProgram,
-    ir: &TypedProgram,
-    compiled: &CompiledProgram,
-    scenario: &Scenario,
-    layer: VerificationLayer,
-) -> RuntimeResult<RunOutput> {
-    run_generic_scenario(
-        CellsRuntime::new(parsed, ir, compiled)?,
-        parsed,
-        ir,
-        compiled,
-        scenario,
-        layer,
-    )
-}
-
 fn base_example_report(
     parsed: &ParsedProgram,
     ir: &TypedProgram,
@@ -1659,7 +1641,7 @@ fn base_example_report(
             "generic_interpreter_complete": false,
             "example_behavior_adapter": true,
             "adapter_kind": parsed.kind.as_str(),
-            "adapter_blocker": "run_loaded_scenario still dispatches by ProgramKind into TodoRuntime/CellsRuntime instead of executing all equations from a generic schedule",
+            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime by ProgramKind instead of instantiating one complete generic equation schedule",
             "not_final_architecture_acceptance": true,
             "generic_runtime_slices": {
                 "ir_update_branch_table_loaded": true,
@@ -1670,9 +1652,11 @@ fn base_example_report(
                 "generic_source_binding_store": true,
                 "generic_indexed_branch_evaluator": true,
                 "generic_semantic_delta_emitter": true,
+                "generic_loaded_runtime_shell": true,
                 "generic_root_text_tick_executor": true,
                 "generic_indexed_hold_commit_executor": true,
                 "generic_list_count_retain_executor": true,
+                "generic_root_source_dispatch": true,
                 "ir_list_operation_table_loaded": true,
                 "list_operation_count": ir.list_operations.len(),
                 "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -2343,6 +2327,27 @@ impl GenericCircuitRuntime {
             return Ok(None);
         };
         self.commit_root_text_candidate(target, candidate)
+    }
+
+    fn single_root_text_target_for_source(
+        &self,
+        equations: &ScalarEquationPlan,
+        source: &str,
+    ) -> RuntimeResult<Option<&'static str>> {
+        let mut target = None;
+        for branch in &equations.branches {
+            if branch.source != source || !self.root.contains_key(branch.target) {
+                continue;
+            }
+            if target.is_some_and(|current| current != branch.target) {
+                return Err(format!(
+                    "source `{source}` drives multiple root text HOLD targets in this runtime slice"
+                )
+                .into());
+            }
+            target = Some(branch.target);
+        }
+        Ok(target)
     }
 
     fn commit_root_text_candidate<'a>(
@@ -3295,17 +3300,6 @@ impl ScalarEquationPlan {
             _ => Ok(None),
         }
     }
-
-    fn const_value(&self, target: &str, source: &str) -> Option<&'static str> {
-        self.branches.iter().find_map(|branch| {
-            (branch.target == target && branch.source == source).then(|| {
-                match branch.expression {
-                    ScalarUpdateExpression::Const(value) => Some(value),
-                    _ => None,
-                }
-            })?
-        })
-    }
 }
 
 impl ListEquationPlan {
@@ -3704,8 +3698,7 @@ impl TodoRuntime {
         match event {
             TodoEvent::NewInputChange { source, text } => {
                 let seq = self.next_source_seq();
-                self.apply_scalar_text_source(
-                    "store.new_todo_text",
+                self.apply_root_text_source_event(
                     source,
                     Some(text),
                     seq,
@@ -3713,34 +3706,22 @@ impl TodoRuntime {
                     &mut patches,
                 )?;
             }
-            TodoEvent::NewInputKeyDown {
-                source: _,
-                key,
-                text,
-            } => {
+            TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
                     self.append_todo(text.trim(), &mut deltas, &mut patches)?;
-                    if let Some(reset) = then_value(EventPulse::present(seq), Cow::Borrowed("")) {
-                        self.commit_scalar_text_candidate(
-                            "store.new_todo_text",
-                            reset,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
-                    }
+                    self.apply_root_text_source_event(
+                        source,
+                        Some(text),
+                        seq,
+                        &mut deltas,
+                        &mut patches,
+                    )?;
                 }
             }
             TodoEvent::Filter { source } => {
                 let seq = self.next_source_seq();
-                self.apply_scalar_text_source(
-                    "store.selected_filter",
-                    source,
-                    None,
-                    seq,
-                    &mut deltas,
-                    &mut patches,
-                )?;
+                self.apply_root_text_source_event(source, None, seq, &mut deltas, &mut patches)?;
             }
             TodoEvent::ClearCompleted { source } => {
                 self.remove_where_source(source, &mut deltas, &mut patches)?;
@@ -4002,16 +3983,6 @@ impl TodoRuntime {
             }
             ("click", "Active filter" | "Completed filter" | "All filter", _) => {
                 let source = GenericSourceEvent::require(step)?.source;
-                let value = self
-                    .scalar_equations
-                    .const_value("store.selected_filter", source)
-                    .ok_or_else(|| {
-                        format!(
-                            "{} source `{source}` is not a constant branch for store.selected_filter in IR",
-                            step.id
-                        )
-                    })?;
-                let _value = value;
                 TodoEvent::Filter { source }
             }
             ("click", "Clear completed", _) => TodoEvent::ClearCompleted {
@@ -4596,17 +4567,21 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn commit_scalar_text_candidate<'a>(
+    fn apply_root_text_source_event<'a>(
         &mut self,
-        target: &'static str,
-        candidate: LatestCandidate<Cow<'a, str>>,
+        source: &str,
+        payload_text: Option<&'a str>,
+        seq: TickSeq,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
-        let Some(value) = self.generic.commit_root_text_candidate(target, candidate)? else {
-            return Ok(());
+        let Some(target) = self
+            .generic
+            .single_root_text_target_for_source(&self.scalar_equations, source)?
+        else {
+            return Err(format!("source `{source}` has no root text HOLD branch in IR").into());
         };
-        self.emit_root_text_commit(target, value, deltas, patches)
+        self.apply_scalar_text_source(target, source, payload_text, seq, deltas, patches)
     }
 
     fn emit_root_text_commit<'a>(
@@ -4840,6 +4815,48 @@ impl TodoRuntime {
             "source_binding_count": self.generic.source_binding_count(),
             "stale_source_drop_count": self.stale_source_drop_count
         })
+    }
+}
+
+impl ScenarioExecutor for LoadedRuntime {
+    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
+        match self {
+            Self::Todo(runtime) => runtime.prepare_for_scenario(scenario),
+            Self::Cells(runtime) => runtime.prepare_for_scenario(scenario),
+        }
+    }
+
+    fn apply_step<'a>(
+        &mut self,
+        step: &'a ScenarioStep,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) -> RuntimeResult<StepExecutionMetrics> {
+        match self {
+            Self::Todo(runtime) => runtime.apply_step(step, deltas, patches),
+            Self::Cells(runtime) => runtime.apply_step(step, deltas, patches),
+        }
+    }
+
+    fn assert_step_after_measurement(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+        match self {
+            Self::Todo(runtime) => runtime.assert_step_after_measurement(step),
+            Self::Cells(runtime) => runtime.assert_step_after_measurement(step),
+        }
+    }
+
+    fn state_summary(&self) -> JsonValue {
+        match self {
+            Self::Todo(runtime) => runtime.state_summary(),
+            Self::Cells(runtime) => runtime.state_summary(),
+        }
+    }
+
+    fn stress_profiles(&self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+        match self {
+            Self::Todo(runtime) => runtime.stress_profiles(ir),
+            Self::Cells(runtime) => runtime.stress_profiles(ir),
+        }
     }
 }
 

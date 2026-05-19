@@ -332,6 +332,34 @@ protocol/render deltas. Appending a keyed row and binding that row's source
 ports now happens in one generic list/source-store helper, so row-local source
 identity is attached at the same runtime boundary as the structural insert
 instead of in the TodoMVC adapter.
+Generic source-action commits now carry their list/key/generation/field identity
+and can emit keyed semantic deltas directly for root text, indexed text,
+indexed bool, and list append mutations. TodoMVC and Cells adapters still own
+surface-specific render patches and some derived summary/assertion behavior, so
+this is not the final adapter-free interpreter, but the semantic trace is no
+longer constructed only from app-specific helper functions.
+Source-event routing is also moving into the generic layer: the compiled
+`SourceRoutePlan` can now turn a normalized source event into a
+`GenericSourceActionInput` by deriving the root/list/indexed action shape from
+the static route table. Surface code still supplies the human-target-to-row
+lookup for visible Todo titles or Cells addresses, but it no longer decides
+whether the source is a root scalar, list append/remove, indexed text, or
+indexed bool action in runtime execution. At this point the remaining
+TodoMVC/Cells adapters are closer to surface drivers: they resolve visible row
+or cell targets, lower generic mutations into current render patches, and own
+example-specific summaries/assertions that still need to become generic before
+`example_behavior_adapter` can honestly become false.
+Report-facing summaries have also started moving behind generic storage
+projection helpers. TodoMVC summary rows are now projected from generic keyed
+list storage, and Cells summary fields such as address, formula text, editing
+text, and editing state use the same generic row projection. Formula values,
+errors, dependencies, and several assertions are still adapter-owned derived
+caches.
+Scenario assertions are following the same path: TodoMVC title/filter/count/edit
+checks now call generic root/list assertion helpers, and Cells formula/editing
+checks use generic row-field assertions. Assertions that depend on formula
+evaluation results, recomputation sets, or current surface-specific cache
+details remain adapter-owned for now.
 The row source paths themselves are compiled from typed IR source ports and the
 list's row scope into a generic `ListSourceBindingPlan`; runtime surface
 validation now checks TodoMVC and Cells row-source requirements against that

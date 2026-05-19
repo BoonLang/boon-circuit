@@ -29,6 +29,7 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [TodoMVC target shape](docs/examples/TODOMVC_CIRCUIT_STYLE.md)
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
+- [TodoMVC e2e test plan](docs/plans/TODOMVC_E2E_TEST_PLAN.md)
 
 ## Non-Goals For The First Pass
 

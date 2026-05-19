@@ -166,6 +166,9 @@ Add deterministic tests for:
 
 Write TodoMVC in `examples/todomvc.bn` using SOURCE and local field equations.
 
+The e2e contract is detailed in
+[TODOMVC_E2E_TEST_PLAN.md](TODOMVC_E2E_TEST_PLAN.md).
+
 Do not use:
 
 ```text

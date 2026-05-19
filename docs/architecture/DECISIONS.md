@@ -336,7 +336,10 @@ code still lowers those facts into current TodoMVC/Cells render patches. TodoMVC
 root `SOURCE` events are dispatched through the generic branch table to the
 single root `HOLD` target they are allowed to drive, so the adapter no longer
 names `store.new_todo_text` or `store.selected_filter` at the event dispatch
-site. Example runtimes only mirror committed values for render/test checks.
+site. The TodoMVC append title is now evaluated through a generic derived-text
+transform selected by the IR `List/append` trigger (`store.title_to_add`, or a
+renamed equivalent) instead of by trimming the Enter payload directly in the Todo
+adapter. Example runtimes only mirror committed values for render/test checks.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 
 use boon_ir::{
-    FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind, ListPredicate,
-    TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
+    DerivedValueKind, FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind,
+    ListPredicate, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
 };
 use boon_parser::{ParsedProgram, ProgramKind, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -1174,12 +1174,14 @@ impl LoadedRuntime {
 #[derive(Clone, Debug)]
 struct CompiledProgram {
     scalar_equations: ScalarEquationPlan,
+    derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     formula_equations: FormulaEquationPlan,
     schedule_node_count: usize,
     state_initializer_count: usize,
     list_initializer_count: usize,
     derived_value_count: usize,
+    derived_text_transform_count: usize,
     update_branch_count: usize,
     list_operation_count: usize,
     formula_operation_count: usize,
@@ -1249,14 +1251,18 @@ impl CompiledProgram {
             )
             .into());
         }
+        let derived_equations = DerivedEquationPlan::from_ir(ir);
+        let derived_text_transform_count = derived_equations.text_transforms.len();
         Ok(Self {
             scalar_equations: ScalarEquationPlan::from_ir(ir),
+            derived_equations,
             list_equations: ListEquationPlan::from_ir(ir),
             formula_equations: FormulaEquationPlan::from_ir(ir),
             schedule_node_count: ir.nodes.len(),
             state_initializer_count: ir.state_cells.len(),
             list_initializer_count: ir.lists.len(),
             derived_value_count: ir.derived_values.len(),
+            derived_text_transform_count,
             update_branch_count: ir.update_branches.len(),
             list_operation_count: ir.list_operations.len(),
             formula_operation_count: ir.formula_operations.len(),
@@ -1272,6 +1278,7 @@ impl CompiledProgram {
             "state_initializer_count": self.state_initializer_count,
             "list_initializer_count": self.list_initializer_count,
             "derived_value_count": self.derived_value_count,
+            "derived_text_transform_count": self.derived_text_transform_count,
             "update_branch_count": self.update_branch_count,
             "list_operation_count": self.list_operation_count,
             "formula_operation_count": self.formula_operation_count,
@@ -1657,6 +1664,7 @@ fn base_example_report(
                 "generic_indexed_hold_commit_executor": true,
                 "generic_list_count_retain_executor": true,
                 "generic_root_source_dispatch": true,
+                "generic_derived_text_transform_executor": true,
                 "ir_list_operation_table_loaded": true,
                 "list_operation_count": ir.list_operations.len(),
                 "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -2348,6 +2356,17 @@ impl GenericCircuitRuntime {
             target = Some(branch.target);
         }
         Ok(target)
+    }
+
+    fn eval_derived_text_transform<'a>(
+        &self,
+        equations: &DerivedEquationPlan,
+        target: &str,
+        source: &str,
+        key: Option<&str>,
+        text: Option<&'a str>,
+    ) -> RuntimeResult<Option<&'a str>> {
+        equations.eval_text_transform(target, source, key, text)
     }
 
     fn commit_root_text_candidate<'a>(
@@ -3148,6 +3167,24 @@ enum IndexedTextCandidate<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct DerivedEquationPlan {
+    text_transforms: Vec<RuntimeDerivedTextTransform>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeDerivedTextTransform {
+    target: &'static str,
+    source: &'static str,
+    expression: RuntimeDerivedTextExpression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDerivedTextExpression {
+    EnterKeyTextTrimNonEmpty,
+    Unsupported,
+}
+
+#[derive(Clone, Debug)]
 struct ListEquationPlan {
     operations: Vec<RuntimeListOperation>,
 }
@@ -3302,6 +3339,81 @@ impl ScalarEquationPlan {
     }
 }
 
+impl DerivedEquationPlan {
+    fn empty() -> Self {
+        Self {
+            text_transforms: Vec::new(),
+        }
+    }
+
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let append_triggers = ir
+            .list_operations
+            .iter()
+            .filter_map(|operation| match &operation.kind {
+                ListOperationKind::Append { trigger } => Some(trigger.as_str()),
+                ListOperationKind::Remove { .. }
+                | ListOperationKind::Retain { .. }
+                | ListOperationKind::Count { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let text_transforms = ir
+            .derived_values
+            .iter()
+            .filter(|value| {
+                value.kind == DerivedValueKind::SourceEventTransform
+                    && append_triggers.contains(value.path.as_str())
+            })
+            .map(|value| RuntimeDerivedTextTransform {
+                target: leak_runtime_path(value.path.clone()),
+                source: value
+                    .sources
+                    .first()
+                    .map(|source| leak_runtime_path(source.clone()))
+                    .unwrap_or(""),
+                expression: if value.sources.len() == 1 {
+                    RuntimeDerivedTextExpression::EnterKeyTextTrimNonEmpty
+                } else {
+                    RuntimeDerivedTextExpression::Unsupported
+                },
+            })
+            .collect();
+        Self { text_transforms }
+    }
+
+    fn eval_text_transform<'a>(
+        &self,
+        target: &str,
+        source: &str,
+        key: Option<&str>,
+        text: Option<&'a str>,
+    ) -> RuntimeResult<Option<&'a str>> {
+        let Some(transform) = self
+            .text_transforms
+            .iter()
+            .find(|transform| transform.target == target && transform.source == source)
+        else {
+            return Ok(None);
+        };
+        match transform.expression {
+            RuntimeDerivedTextExpression::EnterKeyTextTrimNonEmpty => {
+                if key != Some("Enter") {
+                    return Ok(None);
+                }
+                let text = text.ok_or_else(|| {
+                    format!("derived text transform `{target}` from `{source}` requires text")
+                })?;
+                let trimmed = text.trim();
+                Ok((!trimmed.is_empty()).then_some(trimmed))
+            }
+            RuntimeDerivedTextExpression::Unsupported => Err(format!(
+                "derived text transform `{target}` from `{source}` is unsupported"
+            )
+            .into()),
+        }
+    }
+}
+
 impl ListEquationPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
         let operations = ir
@@ -3434,6 +3546,7 @@ struct TodoRuntime {
     generic: GenericCircuitRuntime,
     todos: KeyedList<Todo>,
     scalar_equations: ScalarEquationPlan,
+    derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     row_source_paths: Vec<&'static str>,
     spare_todos: Vec<Todo>,
@@ -3536,6 +3649,7 @@ impl TodoRuntime {
             generic,
             todos,
             scalar_equations: compiled.scalar_equations.clone(),
+            derived_equations: compiled.derived_equations.clone(),
             list_equations: compiled.list_equations.clone(),
             row_source_paths,
             spare_todos: Vec::new(),
@@ -3584,6 +3698,7 @@ impl TodoRuntime {
             generic,
             todos,
             scalar_equations: ScalarEquationPlan::empty(),
+            derived_equations: DerivedEquationPlan::empty(),
             list_equations: ListEquationPlan::empty(),
             row_source_paths,
             spare_todos: Vec::new(),
@@ -3709,14 +3824,24 @@ impl TodoRuntime {
             TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
-                    self.append_todo(text.trim(), &mut deltas, &mut patches)?;
-                    self.apply_root_text_source_event(
+                    let append_trigger = self.list_equations.append_trigger("todos")?;
+                    let title_to_add = self.generic.eval_derived_text_transform(
+                        &self.derived_equations,
+                        append_trigger,
                         source,
+                        Some(key),
                         Some(text),
-                        seq,
-                        &mut deltas,
-                        &mut patches,
                     )?;
+                    if let Some(title) = title_to_add {
+                        self.append_todo(title, &mut deltas, &mut patches)?;
+                        self.apply_root_text_source_event(
+                            source,
+                            Some(text),
+                            seq,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
+                    }
                 }
             }
             TodoEvent::Filter { source } => {

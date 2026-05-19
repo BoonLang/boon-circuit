@@ -451,6 +451,17 @@ trigger instead of comparing derived text target names outside the route plan.
 The append text transform and row insertion now run as one generic source-routed
 list append helper, returning only the inserted key/generation and trigger text
 for the renderer adapter.
+Source-route action execution is now a generic runtime boundary, not only a set
+of classification helpers. The scheduled runtime can walk the precomputed
+`RootScalar`, `DerivedText`, `ListAppend`, `ListRemove`, `IndexedText`, and
+`IndexedBool` actions for a source, apply them through generic storage, and
+stream typed mutations back to the current TodoMVC driver. TodoMVC submit,
+toggle-all, edit-text change, row delete, and clear-completed paths now use that
+generic action executor. Some source paths intentionally remain targeted for the
+moment: root-only text/filter commits and single-row bool/title commits select
+one branch from a source route that may contain several actions, so the adapter
+still narrows those calls until the full tick executor can provide branch
+guards and renderer lowering without the TodoMVC driver layer.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

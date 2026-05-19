@@ -3521,7 +3521,6 @@ struct ListSourceBinding {
 #[derive(Clone, Debug, Default)]
 struct SourceRoute {
     source: &'static str,
-    scalar_targets: Vec<SourceRouteScalarTarget>,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
@@ -3792,7 +3791,6 @@ impl SourceRoutePlan {
                 target: branch.target,
                 expression: branch.expression,
             };
-            route.scalar_targets.push(scalar_target);
             if root_targets.contains(branch.target) {
                 route.root_scalar_targets.push(scalar_target);
             } else if branch.expression.is_indexed_text_expression() {
@@ -3874,28 +3872,10 @@ impl ListSourceBindingPlan {
 }
 
 impl SourceRoute {
-    fn has_scalar_target(&self, target: &str) -> bool {
-        self.scalar_targets
-            .iter()
-            .any(|candidate| candidate.target == target)
-    }
-
     fn has_indexed_text_target(&self, target: &str) -> bool {
         self.indexed_text_targets
             .iter()
             .any(|candidate| candidate.target == target)
-    }
-
-    fn scalar_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
-        self.has_scalar_target(target)
-            .then_some(target)
-            .ok_or_else(|| {
-                format!(
-                    "source `{}` has no compiled scalar target `{target}`",
-                    self.source
-                )
-                .into()
-            })
     }
 
     fn indexed_text_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
@@ -6339,9 +6319,9 @@ impl CellsRuntime {
         self.commit_from_source(
             "cell.sources.editor.commit",
             CellCommitTargets {
-                formula: route.scalar_target("cell.formula_text")?,
-                editing_text: route.scalar_target("cell.editing_text")?,
-                editing: route.scalar_target("cell.editing")?,
+                formula: route.indexed_text_target("cell.formula_text")?,
+                editing_text: route.indexed_text_target("cell.editing_text")?,
+                editing: route.indexed_bool_target("cell.editing")?,
             },
             address,
             formula,
@@ -8536,9 +8516,13 @@ mod tests {
             .commit_from_source(
                 "cell.sources.editor.apply",
                 CellCommitTargets {
-                    formula: commit_route.scalar_target("cell.formula_text").unwrap(),
-                    editing_text: commit_route.scalar_target("cell.editing_text").unwrap(),
-                    editing: commit_route.scalar_target("cell.editing").unwrap(),
+                    formula: commit_route
+                        .indexed_text_target("cell.formula_text")
+                        .unwrap(),
+                    editing_text: commit_route
+                        .indexed_text_target("cell.editing_text")
+                        .unwrap(),
+                    editing: commit_route.indexed_bool_target("cell.editing").unwrap(),
                 },
                 "A1",
                 "123",

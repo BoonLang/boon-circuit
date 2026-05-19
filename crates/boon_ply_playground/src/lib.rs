@@ -44,11 +44,19 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let (source, scenario, _) = example_paths(&example)?;
     let screenshot = report.with_extension("png");
     let os_probe_screenshot = report.with_file_name(format!("{example}-headed-os-input.png"));
+    let os_pointer_probe_screenshot =
+        report.with_file_name(format!("{example}-headed-os-pointer.png"));
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let os_probe_token = format!("boon-headed-os-{}-{example}", std::process::id());
     let headed_os_probe =
         run_os_keyboard_probe_in_window(&mut ply, &os_probe_token, &os_probe_screenshot).await?;
+    let headed_os_pointer_probe =
+        if std::env::var("BOON_ALLOW_OS_POINTER_PROBE").as_deref() == Ok("1") {
+            run_os_pointer_probe_in_window(&mut ply, &os_pointer_probe_screenshot).await?
+        } else {
+            skipped_os_pointer_probe(&os_pointer_probe_screenshot)
+        };
     let source_text = std::fs::read_to_string(&source)?;
     let scenario_data = parse_scenario(&scenario)?;
     let mut state = PlaygroundState::new(&example, &mut ply)?;
@@ -146,14 +154,21 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "input_backend".to_owned(),
-            json!("macroquad-os-events + wtype-real-keyboard-events"),
+            json!("macroquad-os-events + wtype-real-keyboard-events + ydotool-pointer-probe"),
         );
         object.insert("capture_backend".to_owned(), json!("macroquad-framebuffer"));
         object.insert(
             "focused_window_proof".to_owned(),
             json!("OS probe set Ply focus to os_probe_input, sent a real keyboard token, observed it in Ply text state, then captured the headed macroquad/Ply framebuffer"),
         );
+        let pointer_probe_attempted = headed_os_pointer_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("skip");
         let mut checkpoint_paths = vec![json!(screenshot), json!(os_probe_screenshot)];
+        if pointer_probe_attempted {
+            checkpoint_paths.push(json!(os_pointer_probe_screenshot));
+        }
         checkpoint_paths.extend(
             app_control_observations
                 .iter()
@@ -183,6 +198,12 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 "sha256": sha256_file(&os_probe_screenshot)?
             }),
         ];
+        if pointer_probe_attempted {
+            artifact_sha256s.push(json!({
+                "path": os_pointer_probe_screenshot,
+                "sha256": sha256_file(&os_pointer_probe_screenshot)?
+            }));
+        }
         artifact_sha256s.extend(app_control_observations.iter().filter_map(|observation| {
             Some(json!({
                 "path": observation.get("screenshot_path")?.clone(),
@@ -222,6 +243,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches visible application controls, emits matching observed Boon SOURCE events for the covered workflow, and applies covered prefix events through boon_runtime::LiveRuntime against real scenario-step expectations. It can also activate the visible Ply Step control for each scenario transition. It still replays the complete scenario through scenario user_action records after the visible-control probes, so it does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
         );
         object.insert("os_input_probe".to_owned(), headed_os_probe);
+        object.insert("os_pointer_probe".to_owned(), headed_os_pointer_probe);
         object.insert(
             "visible_app_control_os_input".to_owned(),
             json!(app_control_observations),
@@ -1213,6 +1235,106 @@ async fn run_os_keyboard_probe_in_window(
     }))
 }
 
+async fn run_os_pointer_probe_in_window(
+    ply: &mut Ply<()>,
+    screenshot: &PathBuf,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut click_attempted = false;
+    let mut click_seen = false;
+    let mut send_error = None;
+    let mut click_target = serde_json::Value::Null;
+    let mut bounds = serde_json::Value::Null;
+    let mut pointer_over = false;
+    let mut observed_mouse_position = serde_json::Value::Null;
+    let tool_path = command_path("ydotool");
+    for frame in 0..55 {
+        draw_os_input_probe_frame(ply, "pointer-click-probe", frame).await;
+        if let Some(button_bounds) = ply.bounding_box("os_probe_button") {
+            bounds = bounds_json(button_bounds);
+            if frame == 12 && !click_attempted && tool_path.is_some() {
+                click_attempted = true;
+                match send_real_pointer_click(button_bounds) {
+                    Ok(target) => click_target = target,
+                    Err(error) => send_error = Some(error.to_string()),
+                }
+            }
+        }
+        pointer_over = ply.pointer_over("os_probe_button");
+        let (mouse_x, mouse_y) = mouse_position();
+        observed_mouse_position = json!([mouse_x, mouse_y]);
+        if ply.is_just_pressed("os_probe_button") {
+            click_seen = true;
+            break;
+        }
+        if (tool_path.is_none() || click_attempted) && frame >= 28 {
+            break;
+        }
+        next_frame().await;
+    }
+    draw_os_input_probe_frame(ply, "pointer-click-probe", 181).await;
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = screenshot.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    let status = if tool_path.is_none() {
+        "skip"
+    } else if click_seen {
+        "pass"
+    } else {
+        "fail"
+    };
+    Ok(json!({
+        "status": status,
+        "tool": "ydotool",
+        "tool_path": tool_path,
+        "click_attempted": click_attempted,
+        "click_seen_by_ply": click_seen,
+        "send_error": send_error,
+        "target_element_id": "os_probe_button",
+        "target_bounds": bounds,
+        "click_target": click_target,
+        "pointer_over_after_attempt": pointer_over,
+        "observed_mouse_position": observed_mouse_position,
+        "coordinate_contract": "target screen coordinates are computed as macroquad window position plus Ply element center scaled by screen_dpi_scale",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "input_route_contract": "OS pointer event should hit a visible Ply button and be observed through Ply is_just_pressed",
+        "artifact": {
+            "path": screenshot,
+            "sha256": sha256_file(screenshot)?,
+            "nonzero_channels": pixel_stats.nonzero_channels,
+            "unique_rgba_values": pixel_stats.unique_rgba_values
+        }
+    }))
+}
+
+fn skipped_os_pointer_probe(screenshot: &PathBuf) -> serde_json::Value {
+    json!({
+        "status": "skip",
+        "tool": "ydotool",
+        "tool_path": command_path("ydotool"),
+        "click_attempted": false,
+        "click_seen_by_ply": false,
+        "send_error": null,
+        "target_element_id": "os_probe_button",
+        "target_bounds": null,
+        "click_target": null,
+        "pointer_over_after_attempt": false,
+        "observed_mouse_position": null,
+        "coordinate_contract": "target screen coordinates are computed as macroquad window position plus Ply element center scaled by screen_dpi_scale",
+        "input_route_contract": "OS pointer event should hit a visible Ply button and be observed through Ply is_just_pressed",
+        "skip_reason": "BOON_ALLOW_OS_POINTER_PROBE=1 is required because this probe moves and clicks the real desktop pointer",
+        "artifact": {
+            "path": screenshot,
+            "sha256": null,
+            "nonzero_channels": null,
+            "unique_rgba_values": null
+        }
+    })
+}
+
 async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("BOON_ALLOW_OS_INPUT_PROBE").as_deref() != Ok("1") {
         return Err(
@@ -1444,6 +1566,15 @@ async fn draw_os_input_probe_frame(ply: &mut Ply<()>, token: &str, frame: usize)
                             .selection_color(0xB9D7F5)
                     })
                     .empty();
+                ui.element()
+                    .id("os_probe_button")
+                    .width(fixed!(220.0))
+                    .height(fixed!(42.0))
+                    .background_color(0x2F6FB8)
+                    .layout(|layout| layout.align(CenterX, CenterY))
+                    .children(|ui| {
+                        ui.text("Pointer Probe", |text| text.font_size(16).color(0xFFFFFF));
+                    });
             });
     }
     ply.show(|_| {}).await;
@@ -2397,6 +2528,43 @@ fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(format!("wtype -k {key} exited with {status}").into())
     }
+}
+
+fn send_real_pointer_click(
+    bounds: ply_engine::math::BoundingBox,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let Some(ydotool) = command_path("ydotool") else {
+        return Err("ydotool is required for headed pointer probing".into());
+    };
+    let (window_x, window_y) = macroquad::miniquad::window::get_window_position();
+    let scale = screen_dpi_scale();
+    let local_x = bounds.x + bounds.width / 2.0;
+    let local_y = bounds.y + bounds.height / 2.0;
+    let screen_x = window_x as f32 + local_x * scale;
+    let screen_y = window_y as f32 + local_y * scale;
+    let screen_x_arg = format!("{}", screen_x.round() as i32);
+    let screen_y_arg = format!("{}", screen_y.round() as i32);
+    let move_status = std::process::Command::new(&ydotool)
+        .args(["mousemove", "--delay", "30", &screen_x_arg, &screen_y_arg])
+        .status()?;
+    if !move_status.success() {
+        return Err(format!("ydotool mousemove exited with {move_status}").into());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let click_status = std::process::Command::new(&ydotool)
+        .args(["click", "--delay", "30", "1"])
+        .status()?;
+    if !click_status.success() {
+        return Err(format!("ydotool click exited with {click_status}").into());
+    }
+    Ok(json!({
+        "window_position": [window_x, window_y],
+        "display_scale": scale,
+        "element_center_local": [local_x, local_y],
+        "screen_position": [screen_x.round() as i32, screen_y.round() as i32],
+        "mousemove_status": move_status.to_string(),
+        "click_status": click_status.to_string()
+    }))
 }
 
 fn os_key_name(scenario_key: &str) -> &str {

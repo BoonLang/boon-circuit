@@ -4755,6 +4755,7 @@ impl<'a> GenericSourceMutation<'a> {
             Self::RootText(commit) => Some(commit.semantic_delta()),
             Self::TextField(commit) => Some(commit.semantic_delta()),
             Self::TextFieldIdentity(_) => None,
+            Self::ValueField(commit) => Some(commit.semantic_delta()),
             Self::BoolField(commit) => Some(commit.semantic_delta()),
             Self::ListAppend(commit) => Some(commit.semantic_delta()),
             Self::ListRemove {
@@ -4802,6 +4803,7 @@ enum GenericSourceMutation<'a> {
     RootText(GenericRootTextCommit<'a>),
     TextField(GenericTextFieldCommit<'a>),
     TextFieldIdentity(GenericTextFieldIdentity),
+    ValueField(GenericValueFieldCommit<'a>),
     BoolField(GenericBoolFieldCommit),
     ListAppend(GenericTextListAppendCommit<'a>),
     ListRemove {
@@ -5970,14 +5972,11 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        if let GenericSourceMutation::RootText(commit) = mutation {
-                            TodoRuntime::emit_root_text_commit(
-                                commit.target,
-                                commit.value,
-                                &mut deltas,
-                                &mut patches,
-                            )?;
-                        }
+                        emit_todomvc_default_protocol_mutation(
+                            mutation,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                         Ok(())
                     },
                 )?;
@@ -6017,9 +6016,8 @@ impl TodoRuntime {
                     if let Some(insert) = insert {
                         self.emit_todo_insert(insert, &mut deltas, &mut patches);
                         if let Some(commit) = root_commit {
-                            TodoRuntime::emit_root_text_commit(
-                                commit.target,
-                                commit.value,
+                            emit_todomvc_default_protocol_mutation(
+                                GenericSourceMutation::RootText(commit),
                                 &mut deltas,
                                 &mut patches,
                             )?;
@@ -6046,14 +6044,11 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        if let GenericSourceMutation::RootText(commit) = mutation {
-                            TodoRuntime::emit_root_text_commit(
-                                commit.target,
-                                commit.value,
-                                &mut deltas,
-                                &mut patches,
-                            )?;
-                        }
+                        emit_todomvc_default_protocol_mutation(
+                            mutation,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                         Ok(())
                     },
                 )?;
@@ -6083,14 +6078,11 @@ impl TodoRuntime {
                         _ => None,
                     },
                     |mutation| {
-                        if let GenericSourceMutation::BoolField(completed) = mutation {
-                            deltas.push(completed.semantic_delta());
-                            patches.push(patch(
-                                "SetProperty",
-                                RenderTarget::TodoCheckbox(completed.key),
-                                ProtocolValue::CheckedProperty(completed.value),
-                            ));
-                        }
+                        emit_todomvc_default_protocol_mutation(
+                            mutation,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                         Ok(())
                     },
                 )?;
@@ -6211,14 +6203,11 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        if let GenericSourceMutation::TextField(edit_text) = mutation {
-                            deltas.push(edit_text.semantic_delta());
-                            patches.push(patch(
-                                "SetEditInput",
-                                RenderTarget::TodoEdit(edit_text.key),
-                                ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
-                            ));
-                        }
+                        emit_todomvc_default_protocol_mutation(
+                            mutation,
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                         Ok(())
                     },
                 )?;
@@ -6682,15 +6671,15 @@ impl TodoRuntime {
         push_source_binding_patches_for_insert(&self.generic, &insert, patches);
     }
 
-    fn apply_todo_bool_source_action(
+    fn apply_todo_bool_source_action<'a>(
         &mut self,
         step_id: &str,
         index: usize,
-        source: &str,
-        target_text: Option<&str>,
+        source: &'a str,
+        target_text: Option<&'a str>,
         all_completed_snapshot: bool,
-        deltas: &mut Vec<SemanticDelta<'_>>,
-        patches: &mut Vec<RenderPatch<'_>>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         let source_event = GenericSourceEvent {
             source,
@@ -6717,27 +6706,20 @@ impl TodoRuntime {
                 _ => None,
             },
             |mutation| {
-                if let GenericSourceMutation::BoolField(completed) = mutation {
-                    deltas.push(completed.semantic_delta());
-                    patches.push(patch(
-                        "SetProperty",
-                        RenderTarget::TodoCheckbox(completed.key),
-                        ProtocolValue::CheckedProperty(completed.value),
-                    ));
-                }
+                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )?;
         Ok(())
     }
 
-    fn set_completed_value(
+    fn set_completed_value<'a>(
         &mut self,
         target: &'static str,
         index: usize,
         value: bool,
-        deltas: &mut Vec<SemanticDelta<'_>>,
-        patches: &mut Vec<RenderPatch<'_>>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         let field = row_field_name(target);
         let (key, generation) = self
@@ -6750,21 +6732,20 @@ impl TodoRuntime {
             field,
             value,
         };
-        deltas.push(commit.semantic_delta());
-        patches.push(patch(
-            "SetProperty",
-            RenderTarget::TodoCheckbox(key),
-            ProtocolValue::CheckedProperty(value),
-        ));
+        emit_todomvc_default_protocol_mutation(
+            GenericSourceMutation::BoolField(commit),
+            deltas,
+            patches,
+        )?;
         Ok(())
     }
 
-    fn remove_where_source(
+    fn remove_where_source<'a>(
         &mut self,
         step_id: &str,
-        source: &str,
-        deltas: &mut Vec<SemanticDelta<'_>>,
-        patches: &mut Vec<RenderPatch<'_>>,
+        source: &'a str,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         let source_event = GenericSourceEvent {
             source,
@@ -6788,54 +6769,20 @@ impl TodoRuntime {
             input,
             |_| None,
             |mutation| {
-                match mutation {
-                    GenericSourceMutation::SourceUnbind(binding) => {
-                        if let Some(delta) =
-                            GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
-                        {
-                            deltas.push(delta);
-                        }
-                        patches.push(patch(
-                            "UnbindSource",
-                            RenderTarget::TodoSource(binding.key, binding.source_path),
-                            source_binding_value(&binding),
-                        ));
-                    }
-                    GenericSourceMutation::ListRemove {
-                        list,
-                        key,
-                        generation,
-                    } => {
-                        if let Some(delta) = (GenericSourceMutation::ListRemove {
-                            list,
-                            key,
-                            generation,
-                        })
-                        .semantic_delta()
-                        {
-                            deltas.push(delta);
-                        }
-                        patches.push(patch(
-                            "RemoveElement",
-                            RenderTarget::TodoRow(key),
-                            ProtocolValue::Null,
-                        ));
-                    }
-                    _ => {}
-                }
+                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )
     }
 
-    fn remove_index_source(
+    fn remove_index_source<'a>(
         &mut self,
         step_id: &str,
         index: usize,
-        source: &str,
-        target_text: Option<&str>,
-        deltas: &mut Vec<SemanticDelta<'_>>,
-        patches: &mut Vec<RenderPatch<'_>>,
+        source: &'a str,
+        target_text: Option<&'a str>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<bool> {
         let mut removed = false;
         let source_event = GenericSourceEvent {
@@ -6860,42 +6807,10 @@ impl TodoRuntime {
             input,
             |_| None,
             |mutation| {
-                match mutation {
-                    GenericSourceMutation::SourceUnbind(binding) => {
-                        if let Some(delta) =
-                            GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
-                        {
-                            deltas.push(delta);
-                        }
-                        patches.push(patch(
-                            "UnbindSource",
-                            RenderTarget::TodoSource(binding.key, binding.source_path),
-                            source_binding_value(&binding),
-                        ));
-                    }
-                    GenericSourceMutation::ListRemove {
-                        list,
-                        key,
-                        generation,
-                    } => {
-                        removed = true;
-                        if let Some(delta) = (GenericSourceMutation::ListRemove {
-                            list,
-                            key,
-                            generation,
-                        })
-                        .semantic_delta()
-                        {
-                            deltas.push(delta);
-                        }
-                        patches.push(patch(
-                            "RemoveElement",
-                            RenderTarget::TodoRow(key),
-                            ProtocolValue::Null,
-                        ));
-                    }
-                    _ => {}
+                if matches!(mutation, GenericSourceMutation::ListRemove { .. }) {
+                    removed = true;
                 }
+                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )?;
@@ -7532,6 +7447,27 @@ impl FormulaEquationPlan {
         Ok(())
     }
 
+    fn parse_cell_formula(
+        &self,
+        formula: &str,
+        columns: usize,
+        rows: usize,
+    ) -> RuntimeResult<FormulaAst> {
+        self.expect_parse("cell.parsed_formula", "formula_text")?;
+        Ok(parse_formula_ast(formula, columns, rows))
+    }
+
+    fn dependencies_into(&self, parsed: FormulaAst, deps: &mut Vec<usize>) -> RuntimeResult<()> {
+        self.expect_dependencies("cell.dependencies", "parsed_formula")?;
+        formula_ast_dependencies_into(parsed, deps);
+        Ok(())
+    }
+
+    fn cell_value_protocol(&self, cell: &Cell) -> RuntimeResult<ProtocolValue<'static>> {
+        self.expect_eval("cell.value", "parsed_formula", "cell_value_reader")?;
+        Ok(protocol_cell_value(cell))
+    }
+
     fn expect_parse(&self, target: &str, input: &str) -> RuntimeResult<()> {
         self.operations
             .iter()
@@ -7594,6 +7530,35 @@ impl FormulaEquationPlan {
             .ok_or_else(|| {
                 format!("missing Formula/error operation `{target}` from `{formula}` and `{value}`").into()
             })
+    }
+
+    fn dependencies_field(&self) -> RuntimeResult<&'static str> {
+        self.operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    RuntimeFormulaOperationKind::Dependencies { .. }
+                )
+            })
+            .map(|operation| row_field_name(operation.target))
+            .ok_or_else(|| "missing Formula/dependencies operation".into())
+    }
+
+    fn value_field(&self) -> RuntimeResult<&'static str> {
+        self.operations
+            .iter()
+            .find(|operation| matches!(operation.kind, RuntimeFormulaOperationKind::Eval { .. }))
+            .map(|operation| row_field_name(operation.target))
+            .ok_or_else(|| "missing Formula/eval operation".into())
+    }
+
+    fn error_field(&self) -> RuntimeResult<&'static str> {
+        self.operations
+            .iter()
+            .find(|operation| matches!(operation.kind, RuntimeFormulaOperationKind::Error { .. }))
+            .map(|operation| row_field_name(operation.target))
+            .ok_or_else(|| "missing Formula/error operation".into())
     }
 }
 
@@ -7913,30 +7878,26 @@ impl CellsRuntime {
                             GenericSourceMutation::TextField(commit)
                                 if commit.field == "editing_text" =>
                             {
-                                editing_text = Some(commit);
+                                editing_text = Some(());
                             }
                             GenericSourceMutation::BoolField(commit)
                                 if commit.field == "editing" =>
                             {
-                                editing = Some(commit);
+                                editing = Some(());
                             }
                             _ => {}
                         }
+                        emit_cells_default_protocol_mutation(
+                            mutation, address, None, true, false, deltas, patches,
+                        )?;
                         Ok(())
                     },
                 )?;
-                let editing_text = editing_text.ok_or_else(|| {
+                editing_text.ok_or_else(|| {
                     format!("editing-text update from `{source}` produced no change")
                 })?;
-                let editing = editing
+                editing
                     .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
-                deltas.push(editing_text.semantic_delta());
-                deltas.push(editing.semantic_delta());
-                patches.push(patch(
-                    "SetCellEditor",
-                    RenderTarget::Borrowed(Cow::Borrowed(address)),
-                    ProtocolValue::Text(Cow::Borrowed(editing_text.value)),
-                ));
             }
             CellEvent::Commit {
                 source,
@@ -7998,8 +7959,25 @@ impl CellsRuntime {
                     .ok_or_else(|| format!("editing cancel from `{source}` produced no change"))?;
                 let index = self.cell_index(address)?;
                 let value = self.cell_text_field(index, editing_text.field)?;
-                deltas.push(editing_text.semantic_delta_with_value(self.protocol_text(value)));
-                deltas.push(editing.semantic_delta());
+                let identity_value = self.protocol_text(value);
+                emit_cells_default_protocol_mutation(
+                    GenericSourceMutation::TextFieldIdentity(editing_text),
+                    address,
+                    Some(identity_value),
+                    false,
+                    false,
+                    deltas,
+                    patches,
+                )?;
+                emit_cells_default_protocol_mutation(
+                    GenericSourceMutation::BoolField(editing),
+                    address,
+                    None,
+                    false,
+                    false,
+                    deltas,
+                    patches,
+                )?;
                 patches.push(patch(
                     "SetCellText",
                     RenderTarget::Borrowed(Cow::Borrowed(address)),
@@ -8198,42 +8176,76 @@ impl CellsRuntime {
             .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
         let editing =
             editing.ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
-        self.cells[committed_index].parsed =
-            parse_formula_ast(formula.value, self.columns, self.rows);
-        self.replace_cell_dependencies(committed_index, formula.value);
+        self.cells[committed_index].parsed = self.generic.formula_equations.parse_cell_formula(
+            formula.value,
+            self.columns,
+            self.rows,
+        )?;
+        self.replace_cell_dependencies(committed_index)?;
         self.recompute_affected(address, recomputed)?;
         let cell = &self.cells[committed_index];
-        let value = protocol_cell_value(cell);
-        deltas.push(formula.semantic_delta());
-        deltas.push(editing_text.semantic_delta());
-        deltas.push(editing.semantic_delta());
-        deltas.push(
-            GenericValueFieldCommit {
+        let value = self.generic.formula_equations.cell_value_protocol(cell)?;
+        let value_field = self.generic.formula_equations.value_field()?;
+        let error_field = self.generic.formula_equations.error_field()?;
+        emit_cells_default_protocol_mutation(
+            GenericSourceMutation::TextField(formula),
+            address,
+            None,
+            false,
+            false,
+            deltas,
+            patches,
+        )?;
+        emit_cells_default_protocol_mutation(
+            GenericSourceMutation::TextField(editing_text),
+            address,
+            None,
+            false,
+            false,
+            deltas,
+            patches,
+        )?;
+        emit_cells_default_protocol_mutation(
+            GenericSourceMutation::BoolField(editing),
+            address,
+            None,
+            false,
+            false,
+            deltas,
+            patches,
+        )?;
+        emit_cells_default_protocol_mutation(
+            GenericSourceMutation::ValueField(GenericValueFieldCommit {
                 list: "cells",
                 key: formula.key,
                 generation: formula.generation,
-                field: "value",
+                field: value_field,
                 value: value.clone(),
-            }
-            .semantic_delta(),
-        );
+            }),
+            address,
+            None,
+            false,
+            true,
+            deltas,
+            patches,
+        )?;
         if let Some(error) = cell.error {
-            deltas.push(
-                GenericValueFieldCommit {
+            emit_cells_default_protocol_mutation(
+                GenericSourceMutation::ValueField(GenericValueFieldCommit {
                     list: "cells",
                     key: formula.key,
                     generation: formula.generation,
-                    field: "error",
+                    field: error_field,
                     value: ProtocolValue::Text(Cow::Borrowed(error)),
-                }
-                .semantic_delta(),
-            );
+                }),
+                address,
+                None,
+                false,
+                false,
+                deltas,
+                patches,
+            )?;
         }
-        patches.push(patch(
-            "SetCellText",
-            RenderTarget::Borrowed(Cow::Borrowed(address)),
-            value,
-        ));
         Ok(())
     }
 
@@ -8288,22 +8300,25 @@ impl CellsRuntime {
 
     fn sync_cell_derived_fields(&mut self, index: usize) -> RuntimeResult<()> {
         self.refresh_dependency_text(index);
+        let value_field = self.generic.formula_equations.value_field()?;
+        let error_field = self.generic.formula_equations.error_field()?;
+        let dependencies_field = self.generic.formula_equations.dependencies_field()?;
         self.generic.set_or_insert_list_row_textlike(
             "cells",
             index,
-            "value",
+            value_field,
             &self.cells[index].value,
         )?;
         self.generic.set_or_insert_list_row_textlike(
             "cells",
             index,
-            "error",
+            error_field,
             self.cells[index].error.unwrap_or_default(),
         )?;
         self.generic.set_or_insert_list_row_textlike(
             "cells",
             index,
-            "dependencies",
+            dependencies_field,
             &self.cells[index].dependency_text,
         )
     }
@@ -8341,22 +8356,21 @@ impl CellsRuntime {
         }
     }
 
-    fn replace_cell_dependencies(&mut self, cell_index: usize, formula: &str) {
+    fn replace_cell_dependencies(&mut self, cell_index: usize) -> RuntimeResult<()> {
         for offset in 0..self.cells[cell_index].deps.len() {
             let dependency = self.cells[cell_index].deps[offset];
             self.remove_reverse_dep(dependency, cell_index);
         }
         self.cells[cell_index].deps.clear();
-        formula_dependencies_into(
-            formula,
-            self.columns,
-            self.rows,
+        self.generic.formula_equations.dependencies_into(
+            self.cells[cell_index].parsed,
             &mut self.cells[cell_index].deps,
-        );
+        )?;
         for offset in 0..self.cells[cell_index].deps.len() {
             let dependency = self.cells[cell_index].deps[offset];
             self.add_reverse_dep(dependency, cell_index);
         }
+        Ok(())
     }
 
     fn add_reverse_dep(&mut self, dependency: usize, dependent: usize) {
@@ -8713,13 +8727,26 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
     Ok(json!([unrelated, dependent]))
 }
 
-fn formula_dependencies_into(formula: &str, columns: usize, rows: usize, deps: &mut Vec<usize>) {
-    for part in formula.split(|ch: char| !(ch.is_ascii_alphanumeric())) {
-        if let Some(index) = cell_index(part, columns, rows)
-            && !deps.contains(&index)
-        {
-            deps.push(index);
+fn formula_ast_dependencies_into(ast: FormulaAst, deps: &mut Vec<usize>) {
+    match ast {
+        FormulaAst::Cell(index) => push_unique_dependency(deps, index),
+        FormulaAst::Binary(left, _, right) => {
+            formula_term_dependencies_into(left, deps);
+            formula_term_dependencies_into(right, deps);
         }
+        FormulaAst::Empty | FormulaAst::Number(_) | FormulaAst::ParseError => {}
+    }
+}
+
+fn formula_term_dependencies_into(term: FormulaTerm, deps: &mut Vec<usize>) {
+    if let FormulaTerm::Cell(index) = term {
+        push_unique_dependency(deps, index);
+    }
+}
+
+fn push_unique_dependency(deps: &mut Vec<usize>, index: usize) {
+    if !deps.contains(&index) {
+        deps.push(index);
     }
 }
 
@@ -8985,6 +9012,144 @@ fn push_source_binding_deltas_for_insert<'a>(
         if let Some(delta) = GenericSourceMutation::SourceBind(binding.clone()).semantic_delta() {
             deltas.push(delta);
         }
+    }
+}
+
+fn emit_todomvc_default_protocol_mutation<'a>(
+    mutation: GenericSourceMutation<'a>,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    match mutation {
+        GenericSourceMutation::RootText(commit) => {
+            TodoRuntime::emit_root_text_commit(commit.target, commit.value, deltas, patches)
+        }
+        GenericSourceMutation::TextField(commit) => {
+            deltas.push(commit.semantic_delta());
+            match commit.field {
+                "title" => patches.push(patch(
+                    "SetText",
+                    RenderTarget::TodoTitle(commit.key),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                )),
+                "edit_text" => patches.push(patch(
+                    "SetEditInput",
+                    RenderTarget::TodoEdit(commit.key),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                )),
+                _ => {}
+            }
+            Ok(())
+        }
+        GenericSourceMutation::BoolField(commit) => {
+            deltas.push(commit.semantic_delta());
+            match commit.field {
+                "completed" => patches.push(patch(
+                    "SetProperty",
+                    RenderTarget::TodoCheckbox(commit.key),
+                    ProtocolValue::CheckedProperty(commit.value),
+                )),
+                "editing" if !commit.value => patches.push(patch(
+                    "HideEditInput",
+                    RenderTarget::TodoEdit(commit.key),
+                    ProtocolValue::Bool(commit.value),
+                )),
+                _ => {}
+            }
+            Ok(())
+        }
+        GenericSourceMutation::ListRemove {
+            list,
+            key,
+            generation,
+        } => {
+            if let Some(delta) = (GenericSourceMutation::ListRemove {
+                list,
+                key,
+                generation,
+            })
+            .semantic_delta()
+            {
+                deltas.push(delta);
+            }
+            patches.push(patch(
+                "RemoveElement",
+                RenderTarget::TodoRow(key),
+                ProtocolValue::Null,
+            ));
+            Ok(())
+        }
+        GenericSourceMutation::SourceUnbind(binding) => {
+            if let Some(delta) =
+                GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
+            {
+                deltas.push(delta);
+            }
+            patches.push(patch(
+                "UnbindSource",
+                RenderTarget::TodoSource(binding.key, binding.source_path),
+                source_binding_value(&binding),
+            ));
+            Ok(())
+        }
+        GenericSourceMutation::TextFieldIdentity(_)
+        | GenericSourceMutation::ValueField(_)
+        | GenericSourceMutation::ListAppend(_)
+        | GenericSourceMutation::SourceBind(_) => Ok(()),
+    }
+}
+
+fn emit_cells_default_protocol_mutation<'a>(
+    mutation: GenericSourceMutation<'a>,
+    address: &'a str,
+    identity_value: Option<ProtocolValue<'a>>,
+    patch_editor_text: bool,
+    patch_value_text: bool,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    match mutation {
+        GenericSourceMutation::TextField(commit) => {
+            deltas.push(commit.semantic_delta());
+            if patch_editor_text && commit.field == "editing_text" {
+                patches.push(patch(
+                    "SetCellEditor",
+                    RenderTarget::Borrowed(Cow::Borrowed(address)),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                ));
+            }
+            Ok(())
+        }
+        GenericSourceMutation::TextFieldIdentity(commit) => {
+            let value = identity_value.ok_or_else(|| {
+                format!(
+                    "cell text identity mutation for `{}` requires the copied field value",
+                    commit.field
+                )
+            })?;
+            deltas.push(commit.semantic_delta_with_value(value));
+            Ok(())
+        }
+        GenericSourceMutation::BoolField(commit) => {
+            deltas.push(commit.semantic_delta());
+            Ok(())
+        }
+        GenericSourceMutation::ValueField(commit) => {
+            deltas.push(commit.semantic_delta());
+            if patch_value_text {
+                patches.push(patch(
+                    "SetCellText",
+                    RenderTarget::Borrowed(Cow::Borrowed(address)),
+                    commit.value,
+                ));
+            }
+            Ok(())
+        }
+        GenericSourceMutation::RootText(_)
+        | GenericSourceMutation::ListAppend(_)
+        | GenericSourceMutation::ListRemove { .. }
+        | GenericSourceMutation::SourceBind(_)
+        | GenericSourceMutation::SourceUnbind(_) => Ok(()),
     }
 }
 

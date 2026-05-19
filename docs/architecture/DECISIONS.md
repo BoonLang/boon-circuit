@@ -506,6 +506,22 @@ selection for those source effects; it is the surface driver that routes
 scenario/user actions to source contexts, lowers generic mutations into the
 current render protocol, and keeps the Cells formula dependency cache until the
 complete equation/tick executor replaces the TodoMVC/Cells driver layer.
+TodoMVC mutation-to-protocol lowering has started moving behind a single shared
+surface helper: root text commits, indexed text/bool field commits, source
+unbinds, and row removes now pass through one generic mutation shape before the
+TodoMVC-specific render target is chosen. Appends and edit-open/close still need
+context-specific render patches. Cells now uses the same pattern for source
+text/bool commits, identity text copies, and formula-derived value/error field
+commits; the helper chooses the current cell editor/display patch while the
+source effect itself remains a generic mutation. Cells derived `value`, `error`,
+and `dependencies` storage fields are read from the compiled `Formula/*`
+operation targets instead of fixed Rust literals. Formula parsing and dependency
+extraction now enter through the compiled `FormulaEquationPlan` before updating
+the Cells cache, so dependency edges are derived from the parsed formula
+primitive rather than a second ad hoc text scan. Reports must continue to mark
+the runtime as adapter-backed because scenario target resolution, TodoMVC
+contextual render details, and the Cells formula dependency cache are still
+surface-driver responsibilities.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
@@ -568,6 +584,21 @@ e2e gate because the complete scenario is replayed through scenario user
 actions after the visible-control probes; the report keeps `os_input_limitation`
 until every TodoMVC/Cells scenario step is driven by actual visible app controls
 and observed source events.
+
+Visible manual launches should be routed through COSMIC's background launcher on
+this machine:
+
+```sh
+cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc
+```
+
+That keeps the native playground on the `boon-circuit` workspace while the user
+continues other work. Verifiers that send real desktop input must stay explicit:
+keyboard probes use `wtype`, and the pointer probe is opt-in with
+`BOON_ALLOW_OS_POINTER_PROBE=1` because it moves and clicks the real pointer.
+Reports may include `os_pointer_probe.status = "skip"` for normal headed runs;
+that is evidence that the run avoided pointer injection, not a pass for the
+final full-OS-input gate.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

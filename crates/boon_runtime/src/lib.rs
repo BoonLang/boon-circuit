@@ -1768,6 +1768,8 @@ fn base_example_report(
                 "generic_source_event_route_executor": true,
                 "generic_compiled_source_route_index": true,
                 "generic_source_route_scalar_expression_index": true,
+                "generic_indexed_text_route_index": true,
+                "generic_indexed_bool_route_index": true,
                 "generic_root_source_route_index": true,
                 "generic_list_remove_predicate_route": true,
                 "generic_routed_root_target_application": true,
@@ -3429,6 +3431,22 @@ enum ScalarUpdateExpression {
     Unsupported,
 }
 
+impl ScalarUpdateExpression {
+    fn is_indexed_text_expression(self) -> bool {
+        matches!(
+            self,
+            Self::SourceText | Self::PreviousValue(_) | Self::TextTrimOrPrevious { .. }
+        )
+    }
+
+    fn is_indexed_bool_expression(self) -> bool {
+        matches!(
+            self,
+            Self::Const("True") | Self::Const("False") | Self::BoolNot(_)
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ScalarTextValue<'a> {
     Text(Cow<'a, str>),
@@ -3504,6 +3522,8 @@ struct SourceRoute {
     source: &'static str,
     scalar_targets: Vec<SourceRouteScalarTarget>,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
+    indexed_text_targets: Vec<SourceRouteScalarTarget>,
+    indexed_bool_targets: Vec<SourceRouteScalarTarget>,
     derived_text_targets: Vec<&'static str>,
     list_remove_targets: Vec<SourceRouteListRemove>,
 }
@@ -3774,6 +3794,10 @@ impl SourceRoutePlan {
             route.scalar_targets.push(scalar_target);
             if root_targets.contains(branch.target) {
                 route.root_scalar_targets.push(scalar_target);
+            } else if branch.expression.is_indexed_text_expression() {
+                route.indexed_text_targets.push(scalar_target);
+            } else if branch.expression.is_indexed_bool_expression() {
+                route.indexed_bool_targets.push(scalar_target);
             }
         }
         for transform in &derived.text_transforms {
@@ -3882,37 +3906,28 @@ impl SourceRoute {
         Ok(target)
     }
 
-    fn single_non_root_scalar_target_matching(
-        &self,
-        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
-    ) -> RuntimeResult<Option<&'static str>> {
-        self.single_non_root_scalar_target_where(|_, expression| matches_expression(expression))
-    }
-
-    fn single_non_root_scalar_target_where(
+    fn single_indexed_text_target_where(
         &self,
         matches_target: impl Fn(&'static str, ScalarUpdateExpression) -> bool,
     ) -> RuntimeResult<Option<&'static str>> {
-        let mut target = None;
-        for candidate in &self.scalar_targets {
-            if self
-                .root_scalar_targets
-                .iter()
-                .any(|root| root.target == candidate.target)
-                || !matches_target(candidate.target, candidate.expression)
-            {
-                continue;
-            }
-            if target.is_some_and(|current| current != candidate.target) {
-                return Err(format!(
-                    "source `{}` has multiple matching non-root scalar targets",
-                    self.source
-                )
-                .into());
-            }
-            target = Some(candidate.target);
-        }
-        Ok(target)
+        single_route_target_where(
+            self.source,
+            "indexed text",
+            &self.indexed_text_targets,
+            matches_target,
+        )
+    }
+
+    fn single_indexed_bool_target_matching(
+        &self,
+        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        single_route_target_where(
+            self.source,
+            "indexed bool",
+            &self.indexed_bool_targets,
+            |_, expression| matches_expression(expression),
+        )
     }
 
     fn has_derived_text_target(&self, target: &str) -> bool {
@@ -3939,6 +3954,28 @@ impl SourceRoute {
                 .into()
             })
     }
+}
+
+fn single_route_target_where(
+    source: &str,
+    index_name: &str,
+    targets: &[SourceRouteScalarTarget],
+    matches_target: impl Fn(&'static str, ScalarUpdateExpression) -> bool,
+) -> RuntimeResult<Option<&'static str>> {
+    let mut target = None;
+    for candidate in targets {
+        if !matches_target(candidate.target, candidate.expression) {
+            continue;
+        }
+        if target.is_some_and(|current| current != candidate.target) {
+            return Err(format!(
+                "source `{source}` has multiple matching {index_name} scalar targets"
+            )
+            .into());
+        }
+        target = Some(candidate.target);
+    }
+    Ok(target)
 }
 
 impl ListEquationPlan {
@@ -4712,7 +4749,7 @@ impl TodoRuntime {
                     predicate: route.list_remove_predicate("todos")?,
                 }));
             }
-            if let Some(target) = route.single_non_root_scalar_target_matching(|expression| {
+            if let Some(target) = route.single_indexed_bool_target_matching(|expression| {
                 matches!(expression, ScalarUpdateExpression::BoolNot(_))
             })? {
                 return Ok(Some(TodoEvent::ToggleAll { source, target }));
@@ -4730,37 +4767,35 @@ impl TodoRuntime {
         let remove_predicate = removes_todos
             .then(|| route.list_remove_predicate("todos"))
             .transpose()?;
-        let toggles_completed_target =
-            route.single_non_root_scalar_target_matching(|expression| {
-                matches!(expression, ScalarUpdateExpression::BoolNot(_))
-            })?;
-        let title_target = route.single_non_root_scalar_target_where(|target, expression| {
+        let toggles_completed_target = route.single_indexed_bool_target_matching(|expression| {
+            matches!(expression, ScalarUpdateExpression::BoolNot(_))
+        })?;
+        let title_target = route.single_indexed_text_target_where(|target, expression| {
             row_field_name(target) == "title"
                 && matches!(
                     expression,
                     ScalarUpdateExpression::TextTrimOrPrevious { .. }
                 )
         })?;
-        let trim_text_target =
-            route.single_non_root_scalar_target_where(|target, expression| {
-                row_field_name(target) != "title"
-                    && matches!(
-                        expression,
-                        ScalarUpdateExpression::TextTrimOrPrevious { .. }
-                    )
-            })?;
-        let source_text_target = route.single_non_root_scalar_target_matching(|expression| {
+        let trim_text_target = route.single_indexed_text_target_where(|target, expression| {
+            row_field_name(target) != "title"
+                && matches!(
+                    expression,
+                    ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                )
+        })?;
+        let source_text_target = route.single_indexed_text_target_where(|_, expression| {
             matches!(expression, ScalarUpdateExpression::SourceText)
         })?;
         let edit_text_change_target = source_text_target.or(trim_text_target);
         let updates_title = title_target.is_some();
-        let previous_text_target = route.single_non_root_scalar_target_matching(|expression| {
+        let previous_text_target = route.single_indexed_text_target_where(|_, expression| {
             matches!(expression, ScalarUpdateExpression::PreviousValue(_))
         })?;
-        let edit_open_target = route.single_non_root_scalar_target_matching(|expression| {
+        let edit_open_target = route.single_indexed_bool_target_matching(|expression| {
             matches!(expression, ScalarUpdateExpression::Const("True"))
         })?;
-        let edit_close_target = route.single_non_root_scalar_target_matching(|expression| {
+        let edit_close_target = route.single_indexed_bool_target_matching(|expression| {
             matches!(expression, ScalarUpdateExpression::Const("False"))
         })?;
         let Some(target_occurrence) =

@@ -29,6 +29,7 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [TodoMVC target shape](docs/examples/TODOMVC_CIRCUIT_STYLE.md)
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
+- [Example verification plan](docs/plans/EXAMPLE_VERIFICATION_PLAN.md)
 - [TodoMVC e2e test plan](docs/plans/TODOMVC_E2E_TEST_PLAN.md)
 
 ## Non-Goals For The First Pass
@@ -52,3 +53,9 @@ The first implementation is only convincing if these are true:
 5. LIST changes propagate as keyed deltas to Ply, not as whole snapshots.
 6. Browser/server runtime sync can exchange semantic deltas, not full state.
 7. Every stateful value has a visible next-state equation.
+8. TodoMVC is accepted through a headed native Ply replay and manual pass, not
+   only a semantic or headless test.
+9. Cells and future examples use the same headed/manual/semantic/speed/resource
+   verification contract.
+10. Normal interactions complete in a couple of milliseconds in release mode
+    without excessive RAM or VRAM growth.

@@ -3,6 +3,10 @@
 This plan is derived from the existing TodoMVC test material in
 `~/repos/boon`, but it tightens the contract for Boon Circuit.
 
+This is a TodoMVC-specific specialization of
+[EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md). The shared plan is
+also the contract for Cells and future examples.
+
 The old repo has useful coverage in:
 
 - `playground/frontend/src/examples/todo_mvc/todo_mvc.expected`
@@ -13,8 +17,13 @@ The old repo has useful coverage in:
 
 The new repo should not copy the old tests mechanically. The old browser tests
 contain sleeps, commented-out bug tests, engine-specific skips, and DOM text
-checks that can hide semantic failures. Boon Circuit needs deterministic traces
-first, then renderer/browser/manual proof as separate layers.
+checks that can hide semantic failures. Earlier experiments also showed that
+headless WebGPU/browser paths can fail differently from real windows, and that
+Ply can have real display bugs such as bad Wayland scaling or a blurred first
+frame. Boon Circuit therefore treats a headed native Ply window as the primary
+e2e acceptance surface. Semantic and headless tests are still required, but they
+are supporting evidence and debug tools, not substitutes for seeing and driving
+the real UI.
 
 ## What Counts As Honest
 
@@ -26,24 +35,133 @@ A TodoMVC e2e pass requires all of these:
 3. One scenario file drives all test surfaces.
 4. Semantic state is asserted after every action.
 5. Semantic deltas and render deltas are asserted for key actions.
-6. The renderer is checked without diffing the whole UI tree.
-7. Manual testing uses the same scenario labels and records evidence.
-8. No skipped/commented bug scenario is counted as covered.
-9. No fixed sleeps are used as correctness. Tests wait for deterministic idle or
+6. A headed Ply window is opened, inspected, and driven through real OS input.
+7. The renderer is checked without diffing the whole UI tree.
+8. Manual testing uses the same scenario labels and records evidence.
+9. No skipped/commented bug scenario is counted as covered.
+10. No fixed sleeps are used as correctness. Tests wait for deterministic idle or
    fail after a bounded tick/frame limit.
-10. Reports include source hash, scenario hash, runtime stats, and failure
-    artifacts.
+11. Release-mode interaction latency is within the example budget.
+12. RAM and VRAM deltas are within the example budget.
+13. Reports include source hash, scenario hash, runtime stats, display/backend
+    metadata, screenshots, and failure artifacts.
 
 ## Test Layers
 
-### Layer 1: Semantic Trace Runner
+### Layer 1: Headed Ply Replay
 
 This is the primary e2e gate.
 
 Command shape:
 
 ```bash
-cargo run -p boon_cli -- scenario \
+cargo xtask verify-todomvc-headed-ply \
+  examples/todomvc.bn \
+  examples/todomvc.scn \
+  --report target/reports/todomvc-headed-ply.json
+```
+
+This opens the same native Ply playground a user will run, keeps the window
+visible, injects input through the OS event path, and records semantic/render
+evidence while the UI is on screen. The test should be automated enough to be
+repeatable, but it must remain observable by a human tester.
+
+The replay must drive real interactions:
+
+- pointer move, hover, click, and double-click.
+- keyboard typing, Enter, Escape, Tab when relevant.
+- focus and blur through the real window.
+- checkbox hit targets.
+- delete button hover and click.
+- edits while the input is visible.
+
+Visual checkpoints are mandatory:
+
+```text
+initial window is sharp, correctly scaled, and not blurred
+main input focus is visible
+checkboxes and delete hit targets are visible
+text is not clipped or overlapped
+footer/filter layout is stable
+edit input appears in the correct row
+large-list smoke keeps interaction responsive
+```
+
+The headed replay report must include:
+
+```text
+program_hash
+scenario_hash
+os
+window_backend
+display_scale
+window_size
+framebuffer_size
+graph_node_count
+semantic_trace_hash
+render_patch_trace_hash
+per-step pass/fail
+checkpoint_screenshot_or_video_paths
+input_focus_evidence
+timing_frame_stats
+manual_observer_notes_if_present
+```
+
+Run at least one headed pass on the normal desktop stack. When possible, run
+both Wayland and X11/XWayland, and include common display scale factors such as
+100 percent and the user's configured scaled mode. If scaling is blurred on
+startup, that is a failed e2e run even if semantic state is correct.
+
+### Layer 2: Manual Human Pass
+
+Manual testing is a first-class acceptance gate, not a courtesy pass. A real
+tester should interact with the live playground using the same scenario labels
+as the replay, while watching both the UI and the state/delta inspector.
+
+Command shape:
+
+```bash
+cargo xtask verify-todomvc-human \
+  examples/todomvc.bn \
+  examples/todomvc.scn \
+  --report target/reports/todomvc-human-<timestamp>.json
+```
+
+The playground must expose:
+
+```text
+scenario checklist
+current semantic state
+last source event
+last semantic deltas
+last render patches
+selected row data
+runtime graph/node count
+dirty key count
+display scale/window backend
+```
+
+Manual pass evidence is written to:
+
+```text
+target/reports/todomvc-human-<timestamp>.json
+target/reports/todomvc-human-<timestamp>-checkpoint-*.png
+```
+
+The manual report records each checked scenario label, display/backend details,
+the final state hash, screenshots, notes about visual quality, and whether the
+tester deviated from the scripted scenario.
+
+### Layer 3: Semantic Trace Runner
+
+This is the deterministic semantics gate and the main debugging tool when the
+headed UI fails. It is required before release, but it is not sufficient e2e
+acceptance by itself.
+
+Command shape:
+
+```bash
+cargo xtask verify-todomvc-semantic \
   examples/todomvc.bn \
   examples/todomvc.scn \
   --report target/reports/todomvc-semantic.json
@@ -52,7 +170,8 @@ cargo run -p boon_cli -- scenario \
 It runs the real parser, typed IR, static graph runtime, source event injection,
 `HOLD` commits, `LIST` memories, and semantic delta emission.
 
-It does not start a renderer.
+It does not start a renderer, so it cannot prove focus, scaling, blur,
+hit-testing, or frame presentation.
 
 Assertions:
 
@@ -82,17 +201,19 @@ semantic_delta_count per step
 allocation counters if available
 ```
 
-### Layer 2: Headless Ply Render E2E
+### Layer 4: Headless Ply Render Smoke
 
 This verifies lowering from semantic deltas to deterministic render patches.
+It is a fast CI smoke and regression aid only. It is not an acceptance gate for
+user-visible behavior because headless paths can miss windowing, scaling,
+presentation, WebGPU, and input-routing failures.
 
 Command shape:
 
 ```bash
-cargo run -p boon_cli -- scenario \
+cargo xtask verify-todomvc-ply-headless \
   examples/todomvc.bn \
   examples/todomvc.scn \
-  --renderer ply-headless \
   --report target/reports/todomvc-ply-headless.json
 ```
 
@@ -111,64 +232,50 @@ no whole-tree diff required
 This layer may inspect the render tree, but it should prove the patches that led
 to the tree. A final text snapshot alone is not enough.
 
-### Layer 3: Native Playground Replay
+### Layer 5: TodoMVC Speed And Resource Gate
 
-This verifies the actual native playground surface.
-
-Command shape:
-
-```bash
-cargo run -p boon_ply_playground -- \
-  --example examples/todomvc.bn \
-  --replay examples/todomvc.scn \
-  --report target/reports/todomvc-native-replay.json
-```
-
-This should open the same app that a user can interact with, replay the scenario,
-and write evidence:
-
-```text
-semantic trace
-render patch trace
-final render tree
-screenshots for selected checkpoints
-input/focus evidence
-timing/frame stats
-```
-
-### Layer 4: Manual Test Pass
-
-Manual testing is not a substitute for Layer 1-3. It is a final human pass over
-the live playground.
+This specializes the shared speed/resource gate from
+[EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md).
 
 Command shape:
 
 ```bash
-cargo run -p boon_ply_playground -- --example examples/todomvc.bn
+cargo xtask verify-todomvc-speed \
+  examples/todomvc.bn \
+  examples/todomvc.scn \
+  --budget examples/todomvc.budget.toml \
+  --report target/reports/todomvc-speed.json
 ```
 
-The playground must expose:
+Default TodoMVC budgets:
 
-```text
-scenario checklist
-current semantic state
-last source event
-last semantic deltas
-last render patches
-selected row data
-runtime graph/node count
-dirty key count
+```toml
+[latency_ms]
+single_row_toggle_input_to_idle_p95 = 3.0
+add_todo_input_to_idle_p95 = 3.0
+edit_commit_input_to_idle_p95 = 3.0
+filter_change_input_to_idle_p95 = 3.0
+clear_completed_normal_input_to_idle_p95 = 4.0
+max_single_step = 8.0
+
+[memory]
+normal_steady_rss_delta_mib = 64
+normal_peak_rss_delta_mib = 96
+large_list_steady_rss_delta_mib = 128
+large_list_peak_rss_delta_mib = 192
+steady_vram_delta_mib = 64
+peak_vram_delta_mib = 96
+
+[allocations]
+bounded_profile_allocs_after_warmup = 0
+graph_rebuilds_per_interaction = 0
 ```
 
-Manual pass evidence is written to:
-
-```text
-target/reports/todomvc-manual-<timestamp>.json
-target/reports/todomvc-manual-<timestamp>-final.png
-```
-
-The manual report records each checked scenario label, the final state hash, and
-whether the user deviated from the scripted scenario.
+The stress profile should include 1,000 and 10,000 todos. Single-row actions
+must stay proportional to the changed row plus declared aggregates/views. Bulk
+actions such as `ClearCompleted` must either finish within the normal budget for
+normal list sizes or be modeled as explicit bounded multi-tick work for stress
+profiles.
 
 ## Scenario File Shape
 
@@ -410,6 +517,12 @@ scenario_path
 scenario_hash
 runtime_profile
 renderer
+window_mode
+window_backend
+display_server
+display_scale
+window_size
+framebuffer_size
 program_hash
 total_ticks
 total_source_events
@@ -419,8 +532,22 @@ graph_node_count
 max_dirty_nodes
 max_dirty_keys
 allocations
+latency_ms_p50_p95_p99_max
+rss_delta_mib_steady_peak
+vram_delta_mib_steady_peak_or_unavailable_reason
 per-step pass/fail
 failure artifacts
+```
+
+Headed and manual reports must additionally include:
+
+```text
+input_injection_method
+focus_trace
+checkpoint_screenshot_or_video_paths
+visual_checkpoint_pass_fail
+manual_observer_if_present
+manual_notes_if_present
 ```
 
 Failure artifacts:
@@ -432,6 +559,7 @@ semantic deltas from failing tick
 render deltas from failing tick
 render tree snapshot when renderer is involved
 screenshot when UI is involved
+window/display metadata when UI is involved
 ```
 
 ## Commands To Exist
@@ -439,17 +567,21 @@ screenshot when UI is involved
 The final repo should expose:
 
 ```bash
+cargo xtask verify-todomvc-headed-ply
+cargo xtask verify-todomvc-human
 cargo xtask verify-todomvc-semantic
 cargo xtask verify-todomvc-ply-headless
-cargo xtask verify-todomvc-native-replay
-cargo xtask verify-todomvc-manual-report
+cargo xtask verify-todomvc-speed
 cargo xtask verify-todomvc-all
 cargo xtask bench-todomvc
 cargo xtask explain-todomvc-hardware
 ```
 
-`verify-todomvc-all` should fail if any required layer is missing. Missing
-implementation is a blocker, not a skipped pass.
+`verify-todomvc-all` should fail if `verify-todomvc-headed-ply`,
+`verify-todomvc-human`, `verify-todomvc-semantic`, or `verify-todomvc-speed` is
+missing or failing.
+`verify-todomvc-ply-headless` is useful for fast CI, but it must not be the only
+UI evidence. Missing implementation is a blocker, not a skipped pass.
 
 ## Manual Checklist
 
@@ -477,6 +609,15 @@ For every manual run, the tester should keep the delta/state inspector open and
 verify at least one representative source event, semantic delta, and render
 patch after add, toggle, clear, edit, and delete.
 
+The first manual checkpoint is visual, before any scripted action:
+
+- window starts at the expected size and scale.
+- rendered text is sharp.
+- no first-frame blur remains after the app becomes idle.
+- no labels, buttons, checkboxes, inputs, or footer text overlap.
+- the focused input has a visible caret/focus state.
+- pointer hover and click targets line up with visible pixels.
+
 ## What Not To Bring From The Old Tests
 
 Do not bring these forward as-is:
@@ -485,6 +626,8 @@ Do not bring these forward as-is:
 - commented-out bug tests.
 - expected-fail milestones that still exit successfully.
 - `preview text contains` as the only assertion.
+- headless renderer/browser results as the only UI proof.
+- screenshot-only approval without semantic and render-delta evidence.
 - app-specific Rust preview logic as the implementation under test.
 - identity-like todo ids in Boon source.
 
@@ -496,4 +639,4 @@ Useful pieces to preserve:
 - dynamic checkbox isolation.
 - clear completed after clear/re-add/re-check.
 - full-refresh persistence idea, once persistence exists.
-- visual/manual inspection as a separate evidence layer.
+- visual/manual inspection as a required acceptance layer.

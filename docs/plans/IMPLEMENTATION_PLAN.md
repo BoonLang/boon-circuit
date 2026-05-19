@@ -14,6 +14,10 @@ The implementation is not successful until all of these are true:
 6. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
 7. LIST changes emit keyed deltas to the renderer.
 8. The debugger can explain causes for a selected field/key.
+9. Every interactive example passes the shared headed/manual/semantic/speed
+   verification contract.
+10. Normal interactions complete in a couple of milliseconds in release mode
+    with bounded RAM and VRAM growth.
 
 ## Phase 0: Repo Skeleton
 
@@ -183,6 +187,9 @@ Hard gates:
 
 ```text
 cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
+cargo xtask verify-todomvc-headed-ply
+cargo xtask verify-todomvc-human
+cargo xtask verify-todomvc-speed
 cargo bench -p boon_runtime --bench todomvc
 ```
 
@@ -193,6 +200,9 @@ Performance checks:
   plain data field imported from external domain data.
 - toggling one todo emits one semantic field delta plus derived render deltas.
 - clear completed emits remove deltas for completed keys only.
+- normal interactions satisfy the budget in `examples/todomvc.budget.toml`.
+- 1,000 and 10,000 row stress profiles report RAM, VRAM, allocation, and dirty
+  key counts.
 
 ## Phase 5: Ply Playground
 
@@ -215,6 +225,25 @@ Hard gate:
 
 ```text
 cargo run -p boon_ply_playground
+cargo xtask verify-todomvc-headed-ply
+cargo xtask verify-example-headed-ply cells
+```
+
+This gate must open a real native Ply window and verify visible pixels, input,
+focus, scaling, and render patches. Headless render checks are useful fast
+smokes, but they are not enough to accept the playground.
+
+The playground also owns the shared example verification harness described in
+[EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md):
+
+```text
+verify-example-headed-ply
+verify-example-human
+verify-example-semantic
+verify-example-ply-headless
+verify-example-speed
+verify-example-all
+verify-examples-all
 ```
 
 ## Phase 6: Cells Proof
@@ -237,6 +266,12 @@ Hard gates:
 ```text
 cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
 cargo test -p boon_runtime cells
+cargo xtask verify-cells-headed-ply
+cargo xtask verify-cells-human
+cargo xtask verify-cells-semantic
+cargo xtask verify-cells-ply-headless
+cargo xtask verify-cells-speed
+cargo xtask verify-cells-all
 ```
 
 Required scenarios:
@@ -247,6 +282,10 @@ Required scenarios:
 - chained dependencies recompute.
 - cycle produces deterministic error.
 - unrelated cell edit does not recompute whole grid.
+- selection, typing, commit, cancel, and focus are tested in the headed Ply
+  window.
+- large grid edits satisfy `examples/cells.budget.toml`.
+- RAM, VRAM, allocation, dirty cell, and recomputed cell counts are reported.
 
 ## Phase 7: Profiles
 

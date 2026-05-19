@@ -129,3 +129,100 @@ FieldSet(/cells:C4, error, null)
 ```
 
 The grid renderer updates only affected cells. It does not diff the whole grid.
+
+## Verification Contract
+
+Cells must follow the shared contract in
+[../plans/EXAMPLE_VERIFICATION_PLAN.md](../plans/EXAMPLE_VERIFICATION_PLAN.md).
+It is not accepted by semantic tests alone.
+
+Required commands:
+
+```bash
+cargo xtask verify-cells-headed-ply
+cargo xtask verify-cells-human
+cargo xtask verify-cells-semantic
+cargo xtask verify-cells-ply-headless
+cargo xtask verify-cells-speed
+cargo xtask verify-cells-all
+```
+
+The headed Ply and manual passes must test real spreadsheet interaction:
+
+- click a cell.
+- type a literal.
+- type a formula.
+- commit with Enter.
+- cancel with Escape.
+- move focus with pointer and keyboard.
+- scroll the grid if the visible viewport is smaller than the declared grid.
+- inspect that only affected visible cells update.
+
+Required semantic scenarios:
+
+- literal edit.
+- formula edit.
+- formula references another cell.
+- dependency chain recomputes in deterministic topological order.
+- fanout recomputes all dependents and no unrelated cells.
+- cycle reports deterministic errors and does not loop forever.
+- deleting or replacing a formula removes stale dependency edges.
+- editing one unrelated cell does not recompute or redraw the whole grid.
+
+## Cells Speed And Resource Gate
+
+Cells is only a useful proof if it feels immediate while dependency tracking is
+real. Normal interactions should complete in a couple of milliseconds in release
+mode.
+
+Default Cells budgets:
+
+```toml
+[latency_ms]
+literal_edit_input_to_idle_p95 = 3.0
+formula_edit_input_to_idle_p95 = 3.0
+single_dependency_update_p95 = 3.0
+fanout_100_update_p95 = 4.0
+cycle_detection_p95 = 4.0
+max_single_step = 8.0
+
+[memory]
+grid_26x100_steady_rss_delta_mib = 64
+grid_26x100_peak_rss_delta_mib = 96
+grid_stress_steady_rss_delta_mib = 128
+grid_stress_peak_rss_delta_mib = 192
+steady_vram_delta_mib = 64
+peak_vram_delta_mib = 96
+
+[allocations]
+bounded_profile_allocs_after_warmup = 0
+graph_rebuilds_per_interaction = 0
+```
+
+The speed report must include:
+
+```text
+edited_cell
+formula_text_length
+dependency_edge_count
+dirty_cell_count
+recomputed_cell_count
+visible_cell_patch_count
+semantic_tick_ms_p50_p95_p99_max
+render_lowering_ms_p50_p95_p99_max
+ply_patch_apply_ms_p50_p95_p99_max
+input_to_idle_ms_p50_p95_p99_max
+rss_delta_mib_steady_peak
+vram_delta_mib_steady_peak_or_unavailable_reason
+heap_alloc_count_per_step
+graph_rebuild_count
+```
+
+Failure rules:
+
+- if a single unrelated edit recomputes the whole grid, the test fails.
+- if a hidden dependency edge survives formula replacement, the test fails.
+- if a headed cell edit is visually blurred, clipped, unfocused, or delayed, the
+  test fails even if semantic values are correct.
+- if a large fanout cannot finish within the budget, it must be explicit
+  multi-tick work with bounded per-tick latency and visible progress.

@@ -405,6 +405,9 @@ source-route, and list-source-binding tables together. Adapters no longer carry
 parallel copies of those plan tables or pass them back into generic storage on
 every commit; they ask the scheduled runtime to apply a source action and then
 translate the resulting generic facts into the current semantic/render protocol.
+Route classification in the adapters also goes through that scheduled runtime
+boundary, so TodoMVC and Cells no longer reach into the route plan directly to
+ask whether a source is append/remove/root/indexed-text/indexed-bool capable.
 Route target selection is exposed through `SourceRoutePlan` helpers rather than
 through example-specific direct reads of route internals. Generic runtime
 helpers now accept source route actions for indexed text and bool commits, so

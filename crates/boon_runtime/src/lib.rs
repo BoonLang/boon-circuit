@@ -2398,6 +2398,56 @@ impl GenericScheduledRuntime {
         self.list_source_bindings.source_paths(list)
     }
 
+    fn require_source(&self, source: &str) -> RuntimeResult<()> {
+        self.source_routes.require_source(source).map(|_| ())
+    }
+
+    fn has_list_append_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
+        self.source_routes.has_list_append_target(source, list)
+    }
+
+    fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
+        self.source_routes.has_list_remove_target(source, list)
+    }
+
+    fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
+        self.source_routes.single_root_scalar_target(source)
+    }
+
+    fn has_root_scalar_action(&self, source: &str) -> RuntimeResult<bool> {
+        self.source_routes.has_root_scalar_action(source)
+    }
+
+    fn has_indexed_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
+        self.source_routes.has_indexed_text_target(source, target)
+    }
+
+    fn has_indexed_text_action(
+        &self,
+        source: &str,
+        kind: SourceRouteTextAction,
+    ) -> RuntimeResult<bool> {
+        self.source_routes.has_indexed_text_action(source, kind)
+    }
+
+    fn has_indexed_text_action_where(
+        &self,
+        source: &str,
+        kind: SourceRouteTextAction,
+        matches_target: impl Fn(&'static str) -> bool,
+    ) -> RuntimeResult<bool> {
+        self.source_routes
+            .has_indexed_text_action_where(source, kind, matches_target)
+    }
+
+    fn has_indexed_bool_action(
+        &self,
+        source: &str,
+        kind: SourceRouteBoolAction,
+    ) -> RuntimeResult<bool> {
+        self.source_routes.has_indexed_bool_action(source, kind)
+    }
+
     fn reserve_spare_rows_for_list_append_text(
         &mut self,
         list: &str,
@@ -5729,15 +5779,10 @@ impl TodoRuntime {
     ) -> RuntimeResult<Option<TodoEvent<'a>>> {
         let source = source_event.source;
         self.generic
-            .source_routes
             .require_source(source)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
-            if self
-                .generic
-                .source_routes
-                .has_list_append_target(source, "todos")?
-            {
+            if self.generic.has_list_append_target(source, "todos")? {
                 return Ok(Some(TodoEvent::NewInputKeyDown {
                     source,
                     key: source_event.key.unwrap_or_default(),
@@ -5746,7 +5791,6 @@ impl TodoRuntime {
             }
             if source_event.text.is_some() {
                 self.generic
-                    .source_routes
                     .single_root_scalar_target(source)?
                     .ok_or_else(|| {
                         format!("{} source `{source}` has no root text target", step.id)
@@ -5756,21 +5800,16 @@ impl TodoRuntime {
                     text: source_event.text.unwrap_or_default(),
                 }));
             }
-            if self
-                .generic
-                .source_routes
-                .has_list_remove_target(source, "todos")?
-            {
+            if self.generic.has_list_remove_target(source, "todos")? {
                 return Ok(Some(TodoEvent::ClearCompleted { source }));
             }
             if self
                 .generic
-                .source_routes
                 .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
             {
                 return Ok(Some(TodoEvent::ToggleAll { source }));
             }
-            if self.generic.source_routes.has_root_scalar_action(source)? {
+            if self.generic.has_root_scalar_action(source)? {
                 return Ok(Some(TodoEvent::Filter { source }));
             }
             return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
@@ -5779,26 +5818,20 @@ impl TodoRuntime {
         let target_text = source_event
             .target_text
             .expect("checked target_text presence above");
-        let removes_todos = self
-            .generic
-            .source_routes
-            .has_list_remove_target(source, "todos")?;
+        let removes_todos = self.generic.has_list_remove_target(source, "todos")?;
         let toggles_completed = self
             .generic
-            .source_routes
             .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?;
-        let updates_title = self.generic.source_routes.has_indexed_text_action_where(
+        let updates_title = self.generic.has_indexed_text_action_where(
             source,
             SourceRouteTextAction::TextTrimOrPrevious,
             |target| row_field_name(target) == "title",
         )?;
         let has_previous_text = self
             .generic
-            .source_routes
             .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
         let opens_edit = self
             .generic
-            .source_routes
             .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?;
         let Some(target_occurrence) =
             self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
@@ -7102,7 +7135,6 @@ impl CellsRuntime {
     ) -> RuntimeResult<Option<CellEvent<'a>>> {
         let source = source_event.source;
         self.generic
-            .source_routes
             .require_source(source)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         let address = source_event
@@ -7111,7 +7143,6 @@ impl CellsRuntime {
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
         if self
             .generic
-            .source_routes
             .has_indexed_text_target(source, "cell.formula_text")?
         {
             let text = source_event

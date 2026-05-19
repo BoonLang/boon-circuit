@@ -1177,6 +1177,7 @@ struct CompiledProgram {
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     formula_equations: FormulaEquationPlan,
+    source_routes: SourceRoutePlan,
     schedule_node_count: usize,
     state_initializer_count: usize,
     list_initializer_count: usize,
@@ -1185,6 +1186,7 @@ struct CompiledProgram {
     update_branch_count: usize,
     list_operation_count: usize,
     formula_operation_count: usize,
+    source_route_count: usize,
     unsupported_update_branch_count: usize,
     unsupported_list_operation_count: usize,
 }
@@ -1251,13 +1253,30 @@ impl CompiledProgram {
             )
             .into());
         }
+        let scalar_equations = ScalarEquationPlan::from_ir(ir);
         let derived_equations = DerivedEquationPlan::from_ir(ir);
         let derived_text_transform_count = derived_equations.text_transforms.len();
+        let list_equations = ListEquationPlan::from_ir(ir);
+        let formula_equations = FormulaEquationPlan::from_ir(ir);
+        let root_targets = ir
+            .state_cells
+            .iter()
+            .filter(|cell| !cell.indexed)
+            .map(|cell| cell.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let source_routes = SourceRoutePlan::from_plans(
+            &scalar_equations,
+            &derived_equations,
+            &list_equations,
+            &root_targets,
+        );
+        let source_route_count = source_routes.routes.len();
         Ok(Self {
-            scalar_equations: ScalarEquationPlan::from_ir(ir),
+            scalar_equations,
             derived_equations,
-            list_equations: ListEquationPlan::from_ir(ir),
-            formula_equations: FormulaEquationPlan::from_ir(ir),
+            list_equations,
+            formula_equations,
+            source_routes,
             schedule_node_count: ir.nodes.len(),
             state_initializer_count: ir.state_cells.len(),
             list_initializer_count: ir.lists.len(),
@@ -1266,6 +1285,7 @@ impl CompiledProgram {
             update_branch_count: ir.update_branches.len(),
             list_operation_count: ir.list_operations.len(),
             formula_operation_count: ir.formula_operations.len(),
+            source_route_count,
             unsupported_update_branch_count,
             unsupported_list_operation_count,
         })
@@ -1282,6 +1302,7 @@ impl CompiledProgram {
             "update_branch_count": self.update_branch_count,
             "list_operation_count": self.list_operation_count,
             "formula_operation_count": self.formula_operation_count,
+            "source_route_count": self.source_route_count,
             "unsupported_update_branch_count": self.unsupported_update_branch_count,
             "unsupported_list_operation_count": self.unsupported_list_operation_count,
             "graph_clones_per_item": 0
@@ -1665,6 +1686,12 @@ fn base_example_report(
                 "generic_list_count_retain_executor": true,
                 "generic_root_source_dispatch": true,
                 "generic_derived_text_transform_executor": true,
+                "generic_source_event_route_executor": true,
+                "generic_compiled_source_route_index": true,
+                "generic_root_source_route_index": true,
+                "generic_list_remove_predicate_route": true,
+                "generic_routed_root_target_application": true,
+                "generic_routed_indexed_target_application": true,
                 "ir_list_operation_table_loaded": true,
                 "list_operation_count": ir.list_operations.len(),
                 "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -2337,27 +2364,6 @@ impl GenericCircuitRuntime {
         self.commit_root_text_candidate(target, candidate)
     }
 
-    fn single_root_text_target_for_source(
-        &self,
-        equations: &ScalarEquationPlan,
-        source: &str,
-    ) -> RuntimeResult<Option<&'static str>> {
-        let mut target = None;
-        for branch in &equations.branches {
-            if branch.source != source || !self.root.contains_key(branch.target) {
-                continue;
-            }
-            if target.is_some_and(|current| current != branch.target) {
-                return Err(format!(
-                    "source `{source}` drives multiple root text HOLD targets in this runtime slice"
-                )
-                .into());
-            }
-            target = Some(branch.target);
-        }
-        Ok(target)
-    }
-
     fn eval_derived_text_transform<'a>(
         &self,
         equations: &DerivedEquationPlan,
@@ -2699,17 +2705,15 @@ impl GenericCircuitRuntime {
         self.append_row(list, row)
     }
 
-    fn remove_row_for_source(
+    fn remove_row_for_predicate(
         &mut self,
-        equations: &ListEquationPlan,
         list: &str,
-        source: &str,
+        predicate: RuntimeListPredicate,
         index: usize,
     ) -> RuntimeResult<Option<KeyedRow<GenericRow>>> {
-        let predicate = equations.remove_predicate(list, source)?;
         if predicate == RuntimeListPredicate::Unsupported {
             return Err(
-                format!("remove source `{source}` has unsupported list predicate in IR").into(),
+                format!("remove over list `{list}` has unsupported predicate in IR").into(),
             );
         }
         if !self.list_row_matches_predicate(list, index, predicate)? {
@@ -3184,6 +3188,26 @@ enum RuntimeDerivedTextExpression {
     Unsupported,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SourceRoutePlan {
+    routes: Vec<SourceRoute>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceRoute {
+    source: &'static str,
+    scalar_targets: Vec<&'static str>,
+    root_scalar_targets: Vec<&'static str>,
+    derived_text_targets: Vec<&'static str>,
+    list_remove_targets: Vec<SourceRouteListRemove>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceRouteListRemove {
+    list: &'static str,
+    predicate: RuntimeListPredicate,
+}
+
 #[derive(Clone, Debug)]
 struct ListEquationPlan {
     operations: Vec<RuntimeListOperation>,
@@ -3414,6 +3438,119 @@ impl DerivedEquationPlan {
     }
 }
 
+impl SourceRoutePlan {
+    fn from_plans(
+        scalar: &ScalarEquationPlan,
+        derived: &DerivedEquationPlan,
+        lists: &ListEquationPlan,
+        root_targets: &BTreeSet<&str>,
+    ) -> Self {
+        let mut routes = Self::default();
+        for branch in &scalar.branches {
+            let route = routes.route_mut(branch.source);
+            route.scalar_targets.push(branch.target);
+            if root_targets.contains(branch.target) {
+                route.root_scalar_targets.push(branch.target);
+            }
+        }
+        for transform in &derived.text_transforms {
+            routes
+                .route_mut(transform.source)
+                .derived_text_targets
+                .push(transform.target);
+        }
+        for operation in &lists.operations {
+            if let RuntimeListOperationKind::Remove { source, predicate } = &operation.kind {
+                routes
+                    .route_mut(*source)
+                    .list_remove_targets
+                    .push(SourceRouteListRemove {
+                        list: operation.list,
+                        predicate: *predicate,
+                    });
+            }
+        }
+        routes
+    }
+
+    fn for_source(&self, source: &str) -> Option<&SourceRoute> {
+        self.routes.iter().find(|route| route.source == source)
+    }
+
+    fn route_mut(&mut self, source: &'static str) -> &mut SourceRoute {
+        if let Some(index) = self.routes.iter().position(|route| route.source == source) {
+            return &mut self.routes[index];
+        }
+        self.routes.push(SourceRoute {
+            source,
+            ..SourceRoute::default()
+        });
+        self.routes
+            .last_mut()
+            .expect("route was just pushed and must exist")
+    }
+}
+
+impl SourceRoute {
+    fn has_scalar_target(&self, target: &str) -> bool {
+        self.scalar_targets
+            .iter()
+            .any(|candidate| *candidate == target)
+    }
+
+    fn scalar_target(&self, target: &'static str) -> RuntimeResult<&'static str> {
+        self.has_scalar_target(target)
+            .then_some(target)
+            .ok_or_else(|| {
+                format!(
+                    "source `{}` has no compiled scalar target `{target}`",
+                    self.source
+                )
+                .into()
+            })
+    }
+
+    fn single_root_scalar_target(&self) -> RuntimeResult<Option<&'static str>> {
+        let mut target = None;
+        for candidate in &self.root_scalar_targets {
+            if target.is_some_and(|current| current != *candidate) {
+                return Err(format!(
+                    "source `{}` drives multiple root scalar targets in this runtime slice",
+                    self.source
+                )
+                .into());
+            }
+            target = Some(*candidate);
+        }
+        Ok(target)
+    }
+
+    fn has_derived_text_target(&self, target: &str) -> bool {
+        self.derived_text_targets
+            .iter()
+            .any(|candidate| *candidate == target)
+    }
+
+    fn has_list_remove_target(&self, list: &str) -> bool {
+        self.list_remove_targets
+            .iter()
+            .any(|candidate| candidate.list == list)
+    }
+
+    fn list_remove_predicate(&self, list: &str) -> RuntimeResult<RuntimeListPredicate> {
+        self.list_remove_targets
+            .iter()
+            .find_map(|candidate| (candidate.list == list).then_some(candidate.predicate))
+            .ok_or_else(|| {
+                format!(
+                    "source `{}` has no compiled list-remove route for `{list}`",
+                    self.source
+                )
+                .into()
+            })
+    }
+}
+
 impl ListEquationPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
         let operations = ir
@@ -3469,24 +3606,6 @@ impl ListEquationPlan {
                 | RuntimeListOperationKind::Count { .. } => None,
             })
             .ok_or_else(|| format!("list `{list}` has no append operation in IR").into())
-    }
-
-    fn remove_predicate(&self, list: &str, source: &str) -> RuntimeResult<RuntimeListPredicate> {
-        self.operations
-            .iter()
-            .find_map(|operation| match &operation.kind {
-                RuntimeListOperationKind::Remove {
-                    source: candidate,
-                    predicate,
-                } if operation.list == list && *candidate == source => Some(*predicate),
-                RuntimeListOperationKind::Append { .. }
-                | RuntimeListOperationKind::Remove { .. }
-                | RuntimeListOperationKind::Retain { .. }
-                | RuntimeListOperationKind::Count { .. } => None,
-            })
-            .ok_or_else(|| {
-                format!("list `{list}` has no remove operation driven by `{source}`").into()
-            })
     }
 
     fn count_predicate(&self, list: &str, target: &str) -> RuntimeResult<RuntimeListPredicate> {
@@ -3548,6 +3667,7 @@ struct TodoRuntime {
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
+    source_routes: SourceRoutePlan,
     row_source_paths: Vec<&'static str>,
     spare_todos: Vec<Todo>,
     spare_generic_todos: Vec<GenericRow>,
@@ -3561,18 +3681,22 @@ struct TodoRuntime {
 enum TodoEvent<'a> {
     NewInputChange {
         source: &'a str,
+        target: &'static str,
         text: &'a str,
     },
     NewInputKeyDown {
         source: &'a str,
+        reset_target: Option<&'static str>,
         key: &'a str,
         text: &'a str,
     },
     Filter {
         source: &'a str,
+        target: &'static str,
     },
     ClearCompleted {
         source: &'a str,
+        predicate: RuntimeListPredicate,
     },
     ToggleAll {
         source: &'a str,
@@ -3609,6 +3733,7 @@ enum TodoEvent<'a> {
     },
     RemoveTodo {
         source: &'a str,
+        predicate: RuntimeListPredicate,
         target_text: &'a str,
         target_occurrence: usize,
     },
@@ -3651,6 +3776,7 @@ impl TodoRuntime {
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
             list_equations: compiled.list_equations.clone(),
+            source_routes: compiled.source_routes.clone(),
             row_source_paths,
             spare_todos: Vec::new(),
             spare_generic_todos: Vec::new(),
@@ -3700,6 +3826,7 @@ impl TodoRuntime {
             scalar_equations: ScalarEquationPlan::empty(),
             derived_equations: DerivedEquationPlan::empty(),
             list_equations: ListEquationPlan::empty(),
+            source_routes: SourceRoutePlan::default(),
             row_source_paths,
             spare_todos: Vec::new(),
             spare_generic_todos: Vec::new(),
@@ -3811,9 +3938,14 @@ impl TodoRuntime {
             assert_todo_event_matches(step, &event)?;
         }
         match event {
-            TodoEvent::NewInputChange { source, text } => {
+            TodoEvent::NewInputChange {
+                source,
+                target,
+                text,
+            } => {
                 let seq = self.next_source_seq();
-                self.apply_root_text_source_event(
+                self.apply_scalar_text_source(
+                    target,
                     source,
                     Some(text),
                     seq,
@@ -3821,7 +3953,12 @@ impl TodoRuntime {
                     &mut patches,
                 )?;
             }
-            TodoEvent::NewInputKeyDown { source, key, text } => {
+            TodoEvent::NewInputKeyDown {
+                source,
+                reset_target,
+                key,
+                text,
+            } => {
                 let seq = self.next_source_seq();
                 if key == "Enter" {
                     let append_trigger = self.list_equations.append_trigger("todos")?;
@@ -3834,22 +3971,32 @@ impl TodoRuntime {
                     )?;
                     if let Some(title) = title_to_add {
                         self.append_todo(title, &mut deltas, &mut patches)?;
-                        self.apply_root_text_source_event(
-                            source,
-                            Some(text),
-                            seq,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
+                        if let Some(reset_target) = reset_target {
+                            self.apply_scalar_text_source(
+                                reset_target,
+                                source,
+                                Some(text),
+                                seq,
+                                &mut deltas,
+                                &mut patches,
+                            )?;
+                        }
                     }
                 }
             }
-            TodoEvent::Filter { source } => {
+            TodoEvent::Filter { source, target } => {
                 let seq = self.next_source_seq();
-                self.apply_root_text_source_event(source, None, seq, &mut deltas, &mut patches)?;
+                self.apply_scalar_text_source(
+                    target,
+                    source,
+                    None,
+                    seq,
+                    &mut deltas,
+                    &mut patches,
+                )?;
             }
-            TodoEvent::ClearCompleted { source } => {
-                self.remove_where_source(source, &mut deltas, &mut patches)?;
+            TodoEvent::ClearCompleted { predicate, .. } => {
+                self.remove_where_predicate(predicate, &mut deltas, &mut patches)?;
             }
             TodoEvent::ToggleAll { source } => {
                 let all_completed = self.all_completed();
@@ -4061,11 +4208,12 @@ impl TodoRuntime {
             }
             TodoEvent::RemoveTodo {
                 source,
+                predicate,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                if !self.remove_index_for_source(index, source, &mut deltas, &mut patches)? {
+                if !self.remove_index_for_predicate(index, predicate, &mut deltas, &mut patches)? {
                     return Err(format!(
                         "remove source `{source}` predicate does not match todo `{target_text}`"
                     )
@@ -4087,64 +4235,10 @@ impl TodoRuntime {
             return Ok(None);
         };
         let kind = toml_string_ref(action, "kind").unwrap_or_default();
-        let target = toml_string_ref(action, "target").unwrap_or_default();
         let target_text = toml_string_ref(action, "target_text").unwrap_or_default();
         let target_occurrence = toml_usize_ref(action, "target_occurrence").unwrap_or(1);
-        let event = match (kind, target, target_text) {
-            ("type_text", "new todo input", _) => {
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let text = toml_string_ref(action, "text").unwrap_or_default();
-                TodoEvent::NewInputChange { source, text }
-            }
-            ("key_down", "new todo input", _) => {
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let key = toml_string_ref(action, "key").unwrap_or_default();
-                let text = toml_string_ref(action, "text")
-                    .or(source_event.text)
-                    .unwrap_or_default();
-                TodoEvent::NewInputKeyDown { source, key, text }
-            }
-            ("click", "Active filter" | "Completed filter" | "All filter", _) => {
-                let source = GenericSourceEvent::require(step)?.source;
-                TodoEvent::Filter { source }
-            }
-            ("click", "Clear completed", _) => TodoEvent::ClearCompleted {
-                source: GenericSourceEvent::require(step)?.source,
-            },
-            ("click", "Toggle all", _) => TodoEvent::ToggleAll {
-                source: GenericSourceEvent::require(step)?.source,
-            },
-            ("click", _, text) if text.ends_with(" checkbox") => {
-                let source = GenericSourceEvent::require(step)?.source;
-                let target_text = text.trim_end_matches(" checkbox");
-                let Some(target_occurrence) =
-                    self.resolve_bound_occurrence(step, target_text, target_occurrence)
-                else {
-                    return Ok(None);
-                };
-                TodoEvent::TodoCheckbox {
-                    source,
-                    target_text,
-                    target_occurrence,
-                }
-            }
-            ("click", _, text) if text.ends_with(" delete") => {
-                let source = GenericSourceEvent::require(step)?.source;
-                let target_text = text.trim_end_matches(" delete");
-                let Some(target_occurrence) =
-                    self.resolve_bound_occurrence(step, target_text, target_occurrence)
-                else {
-                    return Ok(None);
-                };
-                TodoEvent::RemoveTodo {
-                    source,
-                    target_text,
-                    target_occurrence,
-                }
-            }
-            ("pointer_hover", _, text) if text.ends_with(" delete") => {
+        let event = match (kind, target_text) {
+            ("pointer_hover", text) if text.ends_with(" delete") => {
                 let target_text = text.trim_end_matches(" delete");
                 let target_occurrence = self
                     .resolve_bound_occurrence(step, target_text, target_occurrence)
@@ -4154,64 +4248,12 @@ impl TodoRuntime {
                     target_occurrence,
                 }
             }
-            ("double_click", _, text) if !text.is_empty() => {
-                let source = GenericSourceEvent::require(step)?.source;
-                let Some(target_occurrence) =
-                    self.resolve_bound_occurrence(step, text, target_occurrence)
-                else {
-                    return Ok(None);
-                };
-                TodoEvent::TodoTitleDoubleClick {
-                    source,
-                    target_text: text,
-                    target_occurrence,
-                }
-            }
-            ("type_text", "editing todo input", _) => {
-                self.editing_title()?;
-                let text = toml_string_ref(action, "text").unwrap_or_default();
+            _ if step.expected_source_event.is_some() => {
                 let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let target_text = source_event
-                    .target_text
-                    .ok_or_else(|| format!("{} editing change missing target_text", step.id))?;
-                TodoEvent::EditingTitleChange {
-                    source,
-                    target_text,
-                    text,
-                }
-            }
-            ("key_down", "editing todo input", _) => {
-                self.editing_title()?;
-                let key = toml_string_ref(action, "key").unwrap_or_default();
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let target_text = source_event
-                    .target_text
-                    .ok_or_else(|| format!("{} editing keydown missing target_text", step.id))?;
-                let text = toml_string_ref(action, "text").or(source_event.text);
-                TodoEvent::EditingTitleKeyDown {
-                    source,
-                    target_text,
-                    key,
-                    text,
-                }
-            }
-            ("blur", "editing todo input", _) => {
-                self.editing_title()?;
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let target_text = source_event
-                    .target_text
-                    .ok_or_else(|| format!("{} editing blur missing target_text", step.id))?;
-                let text = toml_string_ref(action, "text").or(source_event.text);
-                TodoEvent::EditingTitleBlur {
-                    source,
-                    target_text,
-                    text,
-                }
+                return self.route_source_event(step, source_event, target_occurrence);
             }
             _ => {
+                let target = toml_string_ref(action, "target").unwrap_or_default();
                 return Err(format!(
                     "{} cannot route TodoMVC user action kind=`{kind}` target=`{target}` target_text=`{target_text}`",
                     step.id
@@ -4220,6 +4262,122 @@ impl TodoRuntime {
             }
         };
         Ok(Some(event))
+    }
+
+    fn route_source_event<'a>(
+        &mut self,
+        step: &'a ScenarioStep,
+        source_event: GenericSourceEvent<'a>,
+        fallback_occurrence: usize,
+    ) -> RuntimeResult<Option<TodoEvent<'a>>> {
+        let source = source_event.source;
+        let append_trigger = self.list_equations.append_trigger("todos")?;
+        let route = self
+            .source_routes
+            .for_source(source)
+            .ok_or_else(|| format!("{} source `{source}` has no compiled route", step.id))?;
+        if source_event.target_text.is_none() {
+            if route.has_derived_text_target(append_trigger) {
+                return Ok(Some(TodoEvent::NewInputKeyDown {
+                    source,
+                    reset_target: route.single_root_scalar_target()?,
+                    key: source_event.key.unwrap_or_default(),
+                    text: source_event.text.unwrap_or_default(),
+                }));
+            }
+            if source_event.text.is_some() {
+                let target = route.single_root_scalar_target()?.ok_or_else(|| {
+                    format!("{} source `{source}` has no root text target", step.id)
+                })?;
+                return Ok(Some(TodoEvent::NewInputChange {
+                    source,
+                    target,
+                    text: source_event.text.unwrap_or_default(),
+                }));
+            }
+            if route.has_list_remove_target("todos") {
+                return Ok(Some(TodoEvent::ClearCompleted {
+                    source,
+                    predicate: route.list_remove_predicate("todos")?,
+                }));
+            }
+            if route.has_scalar_target("todo.completed") {
+                return Ok(Some(TodoEvent::ToggleAll { source }));
+            }
+            if let Some(target) = route.single_root_scalar_target()? {
+                return Ok(Some(TodoEvent::Filter { source, target }));
+            }
+            return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
+        }
+
+        let target_text = source_event
+            .target_text
+            .expect("checked target_text presence above");
+        let removes_todos = route.has_list_remove_target("todos");
+        let remove_predicate = removes_todos
+            .then(|| route.list_remove_predicate("todos"))
+            .transpose()?;
+        let toggles_completed = route.has_scalar_target("todo.completed");
+        let updates_title = route.has_scalar_target("todo.title");
+        let updates_editing_or_edit_text =
+            route.has_scalar_target("todo.editing") || route.has_scalar_target("todo.edit_text");
+        let Some(target_occurrence) =
+            self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
+        else {
+            return Ok(None);
+        };
+        if removes_todos {
+            return Ok(Some(TodoEvent::RemoveTodo {
+                source,
+                predicate: remove_predicate.expect("remove predicate was resolved above"),
+                target_text,
+                target_occurrence,
+            }));
+        }
+        if toggles_completed {
+            return Ok(Some(TodoEvent::TodoCheckbox {
+                source,
+                target_text,
+                target_occurrence,
+            }));
+        }
+        if source_event.key.is_some() {
+            self.editing_title()?;
+            return Ok(Some(TodoEvent::EditingTitleKeyDown {
+                source,
+                target_text,
+                key: source_event.key.unwrap_or_default(),
+                text: source_event.text,
+            }));
+        }
+        if updates_title {
+            self.editing_title()?;
+            return Ok(Some(TodoEvent::EditingTitleBlur {
+                source,
+                target_text,
+                text: source_event.text.or(Some(target_text)),
+            }));
+        }
+        if source_event.text.is_some() {
+            self.editing_title()?;
+            return Ok(Some(TodoEvent::EditingTitleChange {
+                source,
+                target_text,
+                text: source_event.text.unwrap_or_default(),
+            }));
+        }
+        if updates_editing_or_edit_text {
+            return Ok(Some(TodoEvent::TodoTitleDoubleClick {
+                source,
+                target_text,
+                target_occurrence,
+            }));
+        }
+        Err(format!(
+            "{} source `{source}` for target `{target_text}` has no TodoMVC route",
+            step.id
+        )
+        .into())
     }
 
     fn resolve_bound_occurrence(
@@ -4357,17 +4515,17 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn remove_where_source(
+    fn remove_where_predicate(
         &mut self,
-        source: &str,
+        predicate: RuntimeListPredicate,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
         let mut index = 0;
         while index < self.todos.len() {
-            let Some(generic_row) =
-                self.generic
-                    .remove_row_for_source(&self.list_equations, "todos", source, index)?
+            let Some(generic_row) = self
+                .generic
+                .remove_row_for_predicate("todos", predicate, index)?
             else {
                 index += 1;
                 continue;
@@ -4397,16 +4555,16 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn remove_index_for_source(
+    fn remove_index_for_predicate(
         &mut self,
         index: usize,
-        source: &str,
+        predicate: RuntimeListPredicate,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<bool> {
-        let Some(generic_row) =
-            self.generic
-                .remove_row_for_source(&self.list_equations, "todos", source, index)?
+        let Some(generic_row) = self
+            .generic
+            .remove_row_for_predicate("todos", predicate, index)?
         else {
             return Ok(false);
         };
@@ -4690,23 +4848,6 @@ impl TodoRuntime {
             self.emit_root_text_commit(target, value, deltas, patches)?;
         }
         Ok(())
-    }
-
-    fn apply_root_text_source_event<'a>(
-        &mut self,
-        source: &str,
-        payload_text: Option<&'a str>,
-        seq: TickSeq,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<()> {
-        let Some(target) = self
-            .generic
-            .single_root_text_target_for_source(&self.scalar_equations, source)?
-        else {
-            return Err(format!("source `{source}` has no root text HOLD branch in IR").into());
-        };
-        self.apply_scalar_text_source(target, source, payload_text, seq, deltas, patches)
     }
 
     fn emit_root_text_commit<'a>(
@@ -5293,6 +5434,7 @@ struct CellsRuntime {
     cells: Vec<Cell>,
     scalar_equations: ScalarEquationPlan,
     formula_equations: FormulaEquationPlan,
+    source_routes: SourceRoutePlan,
     reverse_deps: Vec<Vec<usize>>,
     columns: usize,
     rows: usize,
@@ -5311,18 +5453,32 @@ struct CellsRuntime {
 enum CellEvent<'a> {
     Change {
         source: &'a str,
+        editing_text_target: &'static str,
+        editing_target: &'static str,
         address: &'a str,
         text: &'a str,
     },
     Commit {
         source: &'a str,
+        formula_target: &'static str,
+        editing_text_target: &'static str,
+        editing_target: &'static str,
         address: &'a str,
         text: &'a str,
     },
     Cancel {
         source: &'a str,
+        editing_text_target: &'static str,
+        editing_target: &'static str,
         address: &'a str,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CellCommitTargets {
+    formula: &'static str,
+    editing_text: &'static str,
+    editing: &'static str,
 }
 
 impl CellsRuntime {
@@ -5348,16 +5504,25 @@ impl CellsRuntime {
             rows,
             compiled.scalar_equations.clone(),
             compiled.formula_equations.clone(),
+            compiled.source_routes.clone(),
         ))
     }
 
     fn with_dimensions(columns: usize, rows: usize) -> Self {
+        let scalar_equations = default_cells_scalar_equations();
+        let source_routes = SourceRoutePlan::from_plans(
+            &scalar_equations,
+            &DerivedEquationPlan::empty(),
+            &ListEquationPlan::empty(),
+            &BTreeSet::new(),
+        );
         Self::with_dimensions_and_equations(
             generic_cells_runtime(columns, rows),
             columns,
             rows,
-            default_cells_scalar_equations(),
+            scalar_equations,
             FormulaEquationPlan::default_cells(),
+            source_routes,
         )
     }
 
@@ -5367,6 +5532,7 @@ impl CellsRuntime {
         rows: usize,
         scalar_equations: ScalarEquationPlan,
         formula_equations: FormulaEquationPlan,
+        source_routes: SourceRoutePlan,
     ) -> Self {
         let cell_count = columns.saturating_mul(rows);
         let mut cells = Vec::with_capacity(cell_count);
@@ -5376,6 +5542,7 @@ impl CellsRuntime {
             cells,
             scalar_equations,
             formula_equations,
+            source_routes,
             reverse_deps: vec![Vec::new(); cell_count],
             columns,
             rows,
@@ -5500,14 +5667,16 @@ impl CellsRuntime {
         match event {
             CellEvent::Change {
                 source,
+                editing_text_target,
+                editing_target,
                 address,
                 text,
             } => {
                 let index = self.cell_index(address)?;
                 let (key, generation) = self.cell_key_generation(index);
                 let editing_text =
-                    self.cell_text_payload_update("cell.editing_text", source, Some(text))?;
-                let editing = self.cell_bool_update("cell.editing", source)?;
+                    self.cell_text_payload_update(editing_text_target, source, Some(text))?;
+                let editing = self.cell_bool_update(editing_target, source)?;
                 self.set_cell_text_field(index, "editing_text", editing_text)?;
                 self.set_cell_bool_field(index, "editing", editing)?;
                 deltas.push(cell_field_delta(
@@ -5530,16 +5699,36 @@ impl CellsRuntime {
             }
             CellEvent::Commit {
                 source,
+                formula_target,
+                editing_text_target,
+                editing_target,
                 address,
                 text,
             } => {
-                self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
+                self.commit_from_source(
+                    source,
+                    CellCommitTargets {
+                        formula: formula_target,
+                        editing_text: editing_text_target,
+                        editing: editing_target,
+                    },
+                    address,
+                    text,
+                    deltas,
+                    patches,
+                    recomputed,
+                )?;
             }
-            CellEvent::Cancel { source, address } => {
+            CellEvent::Cancel {
+                source,
+                editing_text_target,
+                editing_target,
+                address,
+            } => {
                 let index = self.cell_index(address)?;
                 let (key, generation) = self.cell_key_generation(index);
-                let previous_path = self.cell_previous_text_path("cell.editing_text", source)?;
-                let editing = self.cell_bool_update("cell.editing", source)?;
+                let previous_path = self.cell_previous_text_path(editing_text_target, source)?;
+                let editing = self.cell_bool_update(editing_target, source)?;
                 if previous_path != "formula_text" {
                     return Err(
                         format!("unsupported Cells previous text field `{previous_path}`").into(),
@@ -5571,53 +5760,55 @@ impl CellsRuntime {
     }
 
     fn route_step<'a>(&self, step: &'a ScenarioStep) -> RuntimeResult<Option<CellEvent<'a>>> {
-        let Some(action) = &step.user_action else {
+        if step.user_action.is_none() {
             return Ok(None);
-        };
-        let kind = toml_string_ref(action, "kind").unwrap_or_default();
-        let target = toml_string_ref(action, "target").unwrap_or_default();
-        let Some(address) = target
-            .split_whitespace()
-            .next()
+        }
+        let source_event = GenericSourceEvent::require(step)?;
+        self.route_source_event(step, source_event)
+    }
+
+    fn route_source_event<'a>(
+        &self,
+        step: &'a ScenarioStep,
+        source_event: GenericSourceEvent<'a>,
+    ) -> RuntimeResult<Option<CellEvent<'a>>> {
+        let source = source_event.source;
+        let route = self
+            .source_routes
+            .for_source(source)
+            .ok_or_else(|| format!("{} source `{source}` has no compiled route", step.id))?;
+        let address = source_event
+            .address
             .filter(|candidate| is_cell_address(candidate))
-        else {
-            return Err(format!("{} cannot route Cells target `{target}`", step.id).into());
-        };
-        let event = match kind {
-            "type_text" => {
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                let text = toml_string_ref(action, "text").unwrap_or_default();
-                CellEvent::Change {
-                    source,
-                    address,
-                    text,
-                }
-            }
-            "key_down" => {
-                let key = toml_string_ref(action, "key").unwrap_or_default();
-                let source_event = GenericSourceEvent::require(step)?;
-                let source = source_event.source;
-                if key == "Escape" {
-                    CellEvent::Cancel { source, address }
-                } else {
-                    let text = toml_string_ref(action, "text")
-                        .or(source_event.text)
-                        .ok_or_else(|| format!("{} commit missing text", step.id))?;
-                    CellEvent::Commit {
-                        source,
-                        address,
-                        text,
-                    }
-                }
-            }
-            _ => {
-                return Err(
-                    format!("{} cannot route Cells user action kind=`{kind}`", step.id).into(),
-                );
-            }
-        };
-        Ok(Some(event))
+            .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
+        if route.has_scalar_target("cell.formula_text") {
+            let text = source_event
+                .text
+                .ok_or_else(|| format!("{} Cells commit source event missing text", step.id))?;
+            return Ok(Some(CellEvent::Commit {
+                source,
+                formula_target: route.scalar_target("cell.formula_text")?,
+                editing_text_target: route.scalar_target("cell.editing_text")?,
+                editing_target: route.scalar_target("cell.editing")?,
+                address,
+                text,
+            }));
+        }
+        if let Some(text) = source_event.text {
+            return Ok(Some(CellEvent::Change {
+                source,
+                editing_text_target: route.scalar_target("cell.editing_text")?,
+                editing_target: route.scalar_target("cell.editing")?,
+                address,
+                text,
+            }));
+        }
+        Ok(Some(CellEvent::Cancel {
+            source,
+            editing_text_target: route.scalar_target("cell.editing_text")?,
+            editing_target: route.scalar_target("cell.editing")?,
+            address,
+        }))
     }
 
     fn assert_step(&self, step: &ScenarioStep, recomputed: &[usize]) -> RuntimeResult<()> {
@@ -5731,8 +5922,17 @@ impl CellsRuntime {
         patches: &mut Vec<RenderPatch<'a>>,
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
+        let route = self
+            .source_routes
+            .for_source("cell.sources.editor.commit")
+            .ok_or("default Cells commit source has no compiled route")?;
         self.commit_from_source(
             "cell.sources.editor.commit",
+            CellCommitTargets {
+                formula: route.scalar_target("cell.formula_text")?,
+                editing_text: route.scalar_target("cell.editing_text")?,
+                editing: route.scalar_target("cell.editing")?,
+            },
             address,
             formula,
             deltas,
@@ -5744,6 +5944,7 @@ impl CellsRuntime {
     fn commit_from_source<'a>(
         &mut self,
         source: &'a str,
+        targets: CellCommitTargets,
         address: &'a str,
         formula: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
@@ -5753,10 +5954,10 @@ impl CellsRuntime {
         self.formula_equations.expect_cells_pipeline()?;
         let committed_index = self.cell_index(address)?;
         let (key, generation) = self.cell_key_generation(committed_index);
-        let formula = self.cell_text_payload_update("cell.formula_text", source, Some(formula))?;
+        let formula = self.cell_text_payload_update(targets.formula, source, Some(formula))?;
         let editing_text =
-            self.cell_text_payload_update("cell.editing_text", source, Some(formula))?;
-        let editing = self.cell_bool_update("cell.editing", source)?;
+            self.cell_text_payload_update(targets.editing_text, source, Some(formula))?;
+        let editing = self.cell_bool_update(targets.editing, source)?;
         self.set_cell_text_field(committed_index, "formula_text", formula)?;
         self.set_cell_text_field(committed_index, "editing_text", editing_text)?;
         self.set_cell_bool_field(committed_index, "editing", editing)?;
@@ -6372,7 +6573,7 @@ fn assert_todo_event_matches(step: &ScenarioStep, event: &TodoEvent<'_>) -> Runt
         TodoEvent::NewInputChange { source, .. } => source,
         TodoEvent::NewInputKeyDown { source, .. } => source,
         TodoEvent::Filter { source, .. } => source,
-        TodoEvent::ClearCompleted { source } => source,
+        TodoEvent::ClearCompleted { source, .. } => source,
         TodoEvent::ToggleAll { source } => source,
         TodoEvent::TodoCheckbox { source, .. }
         | TodoEvent::TodoTitleDoubleClick { source, .. }
@@ -6437,13 +6638,17 @@ fn assert_cell_event_matches(step: &ScenarioStep, event: &CellEvent<'_>) -> Runt
             source,
             address,
             text,
+            ..
         } => (*source, *address, Some(*text)),
         CellEvent::Commit {
             source,
             address,
             text,
+            ..
         } => (*source, *address, Some(*text)),
-        CellEvent::Cancel { source, address } => (*source, *address, None),
+        CellEvent::Cancel {
+            source, address, ..
+        } => (*source, *address, None),
     };
     assert_source_event_field(&step.id, Some(expected.source), "source", source)?;
     assert_source_event_field(&step.id, expected.address, "address", address)?;
@@ -7635,9 +7840,15 @@ mod tests {
         assert_eq!(generic.list_len("todos").unwrap(), 2);
 
         let clear_source = "store.sources.clear_completed_button.press";
+        let clear_predicate = compiled
+            .source_routes
+            .for_source(clear_source)
+            .unwrap()
+            .list_remove_predicate("todos")
+            .unwrap();
         assert!(
             generic
-                .remove_row_for_source(&compiled.list_equations, "todos", clear_source, 0)
+                .remove_row_for_predicate("todos", clear_predicate, 0)
                 .unwrap()
                 .is_none(),
             "clear completed must not remove an active row"
@@ -7646,7 +7857,7 @@ mod tests {
             .commit_indexed_bool_field("todos", 0, "completed", true)
             .unwrap();
         let removed = generic
-            .remove_row_for_source(&compiled.list_equations, "todos", clear_source, 0)
+            .remove_row_for_predicate("todos", clear_predicate, 0)
             .unwrap()
             .expect("completed row should match the IR-derived remove predicate");
         assert_eq!(removed.key, 1);
@@ -7903,10 +8114,19 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
+        let commit_route = compiled
+            .source_routes
+            .for_source("cell.sources.editor.apply")
+            .unwrap();
 
         runtime
             .commit_from_source(
                 "cell.sources.editor.apply",
+                CellCommitTargets {
+                    formula: commit_route.scalar_target("cell.formula_text").unwrap(),
+                    editing_text: commit_route.scalar_target("cell.editing_text").unwrap(),
+                    editing: commit_route.scalar_target("cell.editing").unwrap(),
+                },
                 "A1",
                 "123",
                 &mut deltas,

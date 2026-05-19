@@ -339,7 +339,27 @@ names `store.new_todo_text` or `store.selected_filter` at the event dispatch
 site. The TodoMVC append title is now evaluated through a generic derived-text
 transform selected by the IR `List/append` trigger (`store.title_to_add`, or a
 renamed equivalent) instead of by trimming the Enter payload directly in the Todo
-adapter. Example runtimes only mirror committed values for render/test checks.
+adapter. TodoMVC source-producing scenario steps are now routed from the
+canonical `SOURCE` event facts and compiled branch/list-operation tables, not
+from UI labels such as "Active filter" or "Buy groceries checkbox"; only
+hover-only render affordances still use the UI action target because they do not
+produce a Boon source event. Cells uses the same boundary: source events carry
+the visible address plus optional text, and the compiled branch table
+distinguishes edit, commit, and cancel sources without reparsing UI target
+labels such as "A1 editor". Those source routes are now precomputed in the
+compiled runtime plan from scalar branches, derived text transforms, and list
+remove operations, so normal ticks no longer scan those tables just to classify
+a source. Root scalar `HOLD` dispatch also uses that same compiled route index
+to find the single root target for a source, and routed TodoMVC source events
+carry that root target into the application phase instead of looking it up again
+there. `List/remove` predicates for clear-completed and row delete are carried
+on the same source-route entries, so row removal uses the compiled predicate
+directly instead of looking it up by source during the row scan. Cells edit,
+commit, and cancel events now carry the indexed `HOLD` targets selected by their
+compiled source route (`cell.editing_text`, `cell.formula_text`, `cell.editing`,
+or renamed equivalents) into the application phase, so the application boundary
+does not choose those fields by hardcoded event kind. Example runtimes only
+mirror committed values for render/test checks.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

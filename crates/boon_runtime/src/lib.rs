@@ -1763,6 +1763,7 @@ fn base_example_report(
                 "generic_indexed_hold_commit_executor": true,
                 "generic_list_count_retain_executor": true,
                 "generic_todomvc_summary_reads_authoritative_storage": true,
+                "generic_todomvc_delta_identities_from_authoritative_storage": true,
                 "generic_root_source_dispatch": true,
                 "generic_derived_text_transform_executor": true,
                 "generic_source_event_route_executor": true,
@@ -4216,22 +4217,22 @@ impl TodoRuntime {
                 let edit_text_field = row_field_name(edit_text_target);
                 self.set_todo_bool_field(index, editing_field, editing)?;
                 self.set_todo_text_field(index, edit_text_field, edit_text)?;
-                let todo = &self.todos[index];
+                let (key, generation) = self.todo_row_identity(index)?;
                 deltas.push(field_delta(
-                    Some(todo.key),
-                    Some(todo.generation),
+                    Some(key),
+                    Some(generation),
                     editing_field,
                     ProtocolValue::Bool(editing),
                 ));
                 deltas.push(field_delta(
-                    Some(todo.key),
-                    Some(todo.generation),
+                    Some(key),
+                    Some(generation),
                     edit_text_field,
                     ProtocolValue::Text(Cow::Borrowed(edit_text)),
                 ));
                 patches.push(patch(
                     "ShowEditInput",
-                    RenderTarget::TodoEdit(todo.key),
+                    RenderTarget::TodoEdit(key),
                     ProtocolValue::Text(Cow::Borrowed(edit_text)),
                 ));
             }
@@ -4249,16 +4250,16 @@ impl TodoRuntime {
                 {
                     let edit_text_field = row_field_name(edit_text_target);
                     self.set_todo_text_field(index, edit_text_field, edit_text)?;
-                    let todo = &self.todos[index];
+                    let (key, generation) = self.todo_row_identity(index)?;
                     deltas.push(field_delta(
-                        Some(todo.key),
-                        Some(todo.generation),
+                        Some(key),
+                        Some(generation),
                         edit_text_field,
                         ProtocolValue::Text(Cow::Borrowed(edit_text)),
                     ));
                     patches.push(patch(
                         "SetEditInput",
-                        RenderTarget::TodoEdit(todo.key),
+                        RenderTarget::TodoEdit(key),
                         ProtocolValue::Text(Cow::Borrowed(edit_text)),
                     ));
                 }
@@ -4276,8 +4277,7 @@ impl TodoRuntime {
                     let index = self
                         .find_index(target_text)
                         .or_else(|_| self.find_editing_index())?;
-                    let row_key = self.todos[index].key;
-                    let row_generation = self.todos[index].generation;
+                    let (row_key, row_generation) = self.todo_row_identity(index)?;
                     if key == "Enter" {
                         let title_target = title_target.ok_or_else(|| {
                             format!("source `{source}` Enter route has no title target")
@@ -4326,16 +4326,15 @@ impl TodoRuntime {
                     )?;
                     let editing_field = row_field_name(editing_target);
                     self.set_todo_bool_field(index, editing_field, editing)?;
-                    let todo = &self.todos[index];
                     deltas.push(field_delta(
-                        Some(todo.key),
-                        Some(todo.generation),
+                        Some(row_key),
+                        Some(row_generation),
                         editing_field,
                         ProtocolValue::Bool(editing),
                     ));
                     patches.push(patch(
                         "HideEditInput",
-                        RenderTarget::TodoEdit(todo.key),
+                        RenderTarget::TodoEdit(row_key),
                         ProtocolValue::Bool(editing),
                     ));
                 }
@@ -4350,8 +4349,7 @@ impl TodoRuntime {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
-                let row_key = self.todos[index].key;
-                let row_generation = self.todos[index].generation;
+                let (row_key, row_generation) = self.todo_row_identity(index)?;
                 if let Some(title) = self.todo_title_update(
                     index,
                     title_target,
@@ -4381,16 +4379,15 @@ impl TodoRuntime {
                 )?;
                 let editing_field = row_field_name(editing_target);
                 self.set_todo_bool_field(index, editing_field, editing)?;
-                let todo = &self.todos[index];
                 deltas.push(field_delta(
-                    Some(todo.key),
-                    Some(todo.generation),
+                    Some(row_key),
+                    Some(row_generation),
                     editing_field,
                     ProtocolValue::Bool(editing),
                 ));
                 patches.push(patch(
                     "HideEditInput",
-                    RenderTarget::TodoEdit(todo.key),
+                    RenderTarget::TodoEdit(row_key),
                     ProtocolValue::Bool(editing),
                 ));
             }
@@ -4399,10 +4396,10 @@ impl TodoRuntime {
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let todo = &self.todos[index];
+                let (key, _) = self.todo_row_identity(index)?;
                 patches.push(patch(
                     "ShowDeleteButton",
-                    RenderTarget::TodoRow(todo.key),
+                    RenderTarget::TodoRow(key),
                     ProtocolValue::Bool(true),
                 ));
             }
@@ -4746,17 +4743,18 @@ impl TodoRuntime {
     ) -> RuntimeResult<()> {
         let field = row_field_name(target);
         self.set_todo_bool_field(index, field, completed)?;
-        let todo = &self.todos[index];
+        let (key, generation) = self.todo_row_identity(index)?;
+        let completed = self.generic.list_row_bool("todos", index, field)?;
         deltas.push(field_delta(
-            Some(todo.key),
-            Some(todo.generation),
+            Some(key),
+            Some(generation),
             field,
-            ProtocolValue::Bool(todo.value.completed),
+            ProtocolValue::Bool(completed),
         ));
         patches.push(patch(
             "SetProperty",
-            RenderTarget::TodoCheckbox(todo.key),
-            ProtocolValue::CheckedProperty(todo.value.completed),
+            RenderTarget::TodoCheckbox(key),
+            ProtocolValue::CheckedProperty(completed),
         ));
         Ok(())
     }
@@ -5242,6 +5240,10 @@ impl TodoRuntime {
 
     fn find_index(&self, title: &str) -> RuntimeResult<usize> {
         self.find_index_at_occurrence(title, 1)
+    }
+
+    fn todo_row_identity(&self, index: usize) -> RuntimeResult<(u64, u64)> {
+        self.generic.row_identity("todos", index)
     }
 
     fn find_index_at_occurrence(&self, title: &str, occurrence: usize) -> RuntimeResult<usize> {

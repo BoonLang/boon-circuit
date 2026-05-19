@@ -2673,44 +2673,6 @@ impl GenericScheduledRuntime {
         )
     }
 
-    fn commit_indexed_previous_text_action_source(
-        &mut self,
-        list: &str,
-        index: usize,
-        source: &str,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<GenericTextFieldIdentity> {
-        self.storage.commit_indexed_previous_text_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
-            list,
-            index,
-            source,
-            matches_target,
-        )
-    }
-
-    fn commit_cells_text_source_actions<'a>(
-        &mut self,
-        list: &str,
-        index: usize,
-        source: &str,
-        formula_text: &'a str,
-        matches_formula_target: impl Fn(&'static str) -> bool,
-        matches_editing_text_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<GenericCellsTextCommit<'a>> {
-        self.storage.commit_cells_text_source_actions(
-            &self.source_routes,
-            &self.scalar_equations,
-            list,
-            index,
-            source,
-            formula_text,
-            matches_formula_target,
-            matches_editing_text_target,
-        )
-    }
-
     fn commit_indexed_bool_action_source(
         &mut self,
         list: &str,
@@ -3236,26 +3198,6 @@ impl GenericCircuitRuntime {
         self.commit_indexed_text_source(equations, list, index, target, source, payload_text)
     }
 
-    fn commit_indexed_previous_text_action_source(
-        &mut self,
-        routes: &SourceRoutePlan,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        source: &str,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<GenericTextFieldIdentity> {
-        let Some(target) = routes.single_indexed_text_action_target_where(
-            source,
-            SourceRouteTextAction::PreviousValue,
-            matches_target,
-        )?
-        else {
-            return Err(format!("source `{source}` has no previous-text indexed action").into());
-        };
-        self.commit_indexed_previous_text_target_source(equations, list, index, target, source)
-    }
-
     fn commit_indexed_previous_text_target_source(
         &mut self,
         equations: &ScalarEquationPlan,
@@ -3287,57 +3229,6 @@ impl GenericCircuitRuntime {
             key,
             generation,
             field,
-        })
-    }
-
-    fn commit_cells_text_source_actions<'a>(
-        &mut self,
-        routes: &SourceRoutePlan,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        source: &str,
-        formula_text: &'a str,
-        matches_formula_target: impl Fn(&'static str) -> bool,
-        matches_editing_text_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<GenericCellsTextCommit<'a>> {
-        let formula = self
-            .commit_indexed_text_action_source(
-                routes,
-                equations,
-                list,
-                index,
-                source,
-                SourceRouteTextAction::SourceText,
-                matches_formula_target,
-                Some(formula_text),
-            )?
-            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
-        let editing_text = self
-            .commit_indexed_text_action_source(
-                routes,
-                equations,
-                list,
-                index,
-                source,
-                SourceRouteTextAction::SourceText,
-                matches_editing_text_target,
-                Some(formula.value),
-            )?
-            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
-        let editing = self.commit_indexed_bool_action_source(
-            routes,
-            equations,
-            list,
-            index,
-            source,
-            SourceRouteBoolAction::ConstFalse,
-            |_| None,
-        )?;
-        Ok(GenericCellsTextCommit {
-            formula,
-            editing_text,
-            editing,
         })
     }
 
@@ -4247,12 +4138,6 @@ struct GenericTextListAppendCommit<'a> {
     key: u64,
     generation: u64,
     value: &'a str,
-}
-
-struct GenericCellsTextCommit<'a> {
-    formula: GenericTextFieldCommit<'a>,
-    editing_text: GenericTextFieldCommit<'a>,
-    editing: GenericBoolFieldCommit,
 }
 
 struct GenericRootTextCommit<'a> {
@@ -7128,26 +7013,40 @@ impl CellsRuntime {
                 text,
             } => {
                 let index = self.cell_index(address)?;
-                let editing_text = self
-                    .generic
-                    .commit_indexed_text_action_source(
-                        "cells",
-                        index,
+                let mut editing_text = None;
+                let mut editing = None;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
                         source,
-                        SourceRouteTextAction::SourceText,
-                        |target| target == "cell.editing_text",
-                        Some(text),
-                    )?
-                    .ok_or_else(|| {
-                        format!("editing-text update from `{source}` produced no change")
-                    })?;
-                let editing = self.generic.commit_indexed_bool_action_source(
-                    "cells",
-                    index,
-                    source,
-                    SourceRouteBoolAction::ConstTrue,
+                        list: Some("cells"),
+                        index: Some(index),
+                        key: None,
+                        text: Some(text),
+                        seq: TickSeq(0),
+                    },
                     |_| None,
+                    |mutation| {
+                        match mutation {
+                            GenericSourceMutation::TextField(commit)
+                                if commit.field == "editing_text" =>
+                            {
+                                editing_text = Some(commit);
+                            }
+                            GenericSourceMutation::BoolField(commit)
+                                if commit.field == "editing" =>
+                            {
+                                editing = Some(commit);
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    },
                 )?;
+                let editing_text = editing_text.ok_or_else(|| {
+                    format!("editing-text update from `{source}` produced no change")
+                })?;
+                let editing = editing
+                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
                 deltas.push(cell_field_delta(
                     editing_text.key,
                     editing_text.generation,
@@ -7175,19 +7074,40 @@ impl CellsRuntime {
             }
             CellEvent::Cancel { source, address } => {
                 let index = self.cell_index(address)?;
-                let editing_text = self.generic.commit_indexed_previous_text_action_source(
-                    "cells",
-                    index,
-                    source,
-                    |target| target == "cell.editing_text",
-                )?;
-                let editing = self.generic.commit_indexed_bool_action_source(
-                    "cells",
-                    index,
-                    source,
-                    SourceRouteBoolAction::ConstFalse,
+                let mut editing_text = None;
+                let mut editing = None;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
+                        source,
+                        list: Some("cells"),
+                        index: Some(index),
+                        key: None,
+                        text: None,
+                        seq: TickSeq(0),
+                    },
                     |_| None,
+                    |mutation| {
+                        match mutation {
+                            GenericSourceMutation::TextFieldIdentity(commit)
+                                if commit.field == "editing_text" =>
+                            {
+                                editing_text = Some(commit);
+                            }
+                            GenericSourceMutation::BoolField(commit)
+                                if commit.field == "editing" =>
+                            {
+                                editing = Some(commit);
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    },
                 )?;
+                let editing_text = editing_text.ok_or_else(|| {
+                    format!("editing-text cancel from `{source}` produced no change")
+                })?;
+                let editing = editing
+                    .ok_or_else(|| format!("editing cancel from `{source}` produced no change"))?;
                 let value = self.cell_text_field(index, editing_text.field)?;
                 deltas.push(cell_field_delta(
                     editing_text.key,
@@ -7336,17 +7256,41 @@ impl CellsRuntime {
     ) -> RuntimeResult<()> {
         self.generic.formula_equations.expect_cells_pipeline()?;
         let committed_index = self.cell_index(address)?;
-        let commit = self.generic.commit_cells_text_source_actions(
-            "cells",
-            committed_index,
-            source,
-            formula,
-            |target| target == "cell.formula_text",
-            |target| target == "cell.editing_text",
+        let mut formula_commit = None;
+        let mut editing_text = None;
+        let mut editing = None;
+        self.generic.apply_source_actions(
+            GenericSourceActionInput {
+                source,
+                list: Some("cells"),
+                index: Some(committed_index),
+                key: None,
+                text: Some(formula),
+                seq: TickSeq(0),
+            },
+            |_| None,
+            |mutation| {
+                match mutation {
+                    GenericSourceMutation::TextField(commit) if commit.field == "formula_text" => {
+                        formula_commit = Some(commit);
+                    }
+                    GenericSourceMutation::TextField(commit) if commit.field == "editing_text" => {
+                        editing_text = Some(commit);
+                    }
+                    GenericSourceMutation::BoolField(commit) if commit.field == "editing" => {
+                        editing = Some(commit);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
         )?;
-        let formula = commit.formula;
-        let editing_text = commit.editing_text;
-        let editing = commit.editing;
+        let formula = formula_commit
+            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
+        let editing_text = editing_text
+            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
+        let editing =
+            editing.ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
         self.cells[committed_index].parsed =
             parse_formula_ast(formula.value, self.columns, self.rows);
         self.replace_cell_dependencies(committed_index, formula.value);

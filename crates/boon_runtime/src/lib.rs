@@ -579,10 +579,29 @@ impl LiveRuntime {
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step(&step)
+    }
+
+    pub fn apply_source_event_for_step(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+    ) -> RuntimeResult<LiveStepOutput> {
+        event.assert_matches_step(step)?;
+        let mut live_step = step.clone();
+        live_step.user_action = Some(live_source_user_action());
+        live_step.expected_source_event = Some(event.into_expected_source_event());
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step(&live_step)
+    }
+
+    fn apply_checked_step(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveStepOutput> {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         self.runtime
             .apply_step(&step, &mut semantic_deltas, &mut render_patches)?;
+        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+        self.runtime.assert_step_after_measurement(step)?;
         Ok(LiveStepOutput {
             semantic_deltas: semantic_deltas
                 .iter()
@@ -599,7 +618,32 @@ impl LiveRuntime {
 }
 
 impl LiveSourceEvent {
-    fn into_step(self, sequence: usize) -> ScenarioStep {
+    fn assert_matches_step(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+        let expected = GenericSourceEvent::require(step)?;
+        assert_live_source_event_field(
+            &step.id,
+            Some(expected.source),
+            "source",
+            Some(self.source.as_str()),
+        )?;
+        assert_live_source_event_field(&step.id, expected.text, "text", self.text.as_deref())?;
+        assert_live_source_event_field(&step.id, expected.key, "key", self.key.as_deref())?;
+        assert_live_source_event_field(
+            &step.id,
+            expected.address,
+            "address",
+            self.address.as_deref(),
+        )?;
+        assert_live_source_event_field(
+            &step.id,
+            expected.target_text,
+            "target_text",
+            self.target_text.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    fn into_expected_source_event(self) -> BTreeMap<String, toml::Value> {
         let mut expected_source_event = BTreeMap::new();
         expected_source_event.insert("source".to_owned(), toml::Value::String(self.source));
         if let Some(text) = self.text {
@@ -615,17 +659,41 @@ impl LiveSourceEvent {
             expected_source_event
                 .insert("target_text".to_owned(), toml::Value::String(target_text));
         }
-        let mut user_action = BTreeMap::new();
-        user_action.insert(
-            "kind".to_owned(),
-            toml::Value::String("live_source_event".to_owned()),
-        );
+        expected_source_event
+    }
+
+    fn into_step(self, sequence: usize) -> ScenarioStep {
         ScenarioStep {
             id: format!("live-source-event-{sequence}"),
-            user_action: Some(user_action),
-            expected_source_event: Some(expected_source_event),
+            user_action: Some(live_source_user_action()),
+            expected_source_event: Some(self.into_expected_source_event()),
             ..ScenarioStep::default()
         }
+    }
+}
+
+fn live_source_user_action() -> BTreeMap<String, toml::Value> {
+    let mut user_action = BTreeMap::new();
+    user_action.insert(
+        "kind".to_owned(),
+        toml::Value::String("live_source_event".to_owned()),
+    );
+    user_action
+}
+
+fn assert_live_source_event_field(
+    step_id: &str,
+    expected_value: Option<&str>,
+    key: &str,
+    actual_value: Option<&str>,
+) -> RuntimeResult<()> {
+    if expected_value.is_none() || expected_value == actual_value {
+        Ok(())
+    } else {
+        Err(format!(
+            "{step_id}: observed live source field `{key}` expected {expected_value:?}, got {actual_value:?}"
+        )
+        .into())
     }
 }
 
@@ -8283,6 +8351,7 @@ mod tests {
     #[test]
     fn live_runtime_applies_observed_todomvc_source_events() {
         let source = include_str!("../../../examples/todomvc.bn");
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
         let mut runtime = LiveRuntime::new(
             "playground-live:todomvc",
             source,
@@ -8290,20 +8359,26 @@ mod tests {
         )
         .unwrap();
         let change = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.sources.new_todo_input.change".to_owned(),
-                text: Some("Test todo".to_owned()),
-                ..LiveSourceEvent::default()
-            })
+            .apply_source_event_for_step(
+                &scenario.step[1],
+                LiveSourceEvent {
+                    source: "store.sources.new_todo_input.change".to_owned(),
+                    text: Some("Test todo".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
             .unwrap();
         assert_eq!(change.state_summary["new_todo_text"], "Test todo");
         let submit = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.sources.new_todo_input.key_down".to_owned(),
-                text: Some("Test todo".to_owned()),
-                key: Some("Enter".to_owned()),
-                ..LiveSourceEvent::default()
-            })
+            .apply_source_event_for_step(
+                &scenario.step[2],
+                LiveSourceEvent {
+                    source: "store.sources.new_todo_input.key_down".to_owned(),
+                    text: Some("Test todo".to_owned()),
+                    key: Some("Enter".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
             .unwrap();
         assert_eq!(submit.state_summary["todos"].as_array().unwrap().len(), 3);
         assert!(
@@ -8317,20 +8392,35 @@ mod tests {
     #[test]
     fn live_runtime_applies_observed_cells_source_events() {
         let source = include_str!("../../../examples/cells.bn");
+        let scenario = parse_scenario(Path::new("../../examples/cells.scn")).unwrap();
         let mut runtime = LiveRuntime::new(
             "playground-live:cells",
             source,
             Path::new("../../examples/cells.scn"),
         )
         .unwrap();
+        runtime
+            .apply_source_event_for_step(
+                &scenario.step[1],
+                LiveSourceEvent {
+                    source: "cell.sources.editor.change".to_owned(),
+                    text: Some("41".to_owned()),
+                    address: Some("A1".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
         let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.commit".to_owned(),
-                text: Some("41".to_owned()),
-                key: Some("Enter".to_owned()),
-                address: Some("A1".to_owned()),
-                ..LiveSourceEvent::default()
-            })
+            .apply_source_event_for_step(
+                &scenario.step[2],
+                LiveSourceEvent {
+                    source: "cell.sources.editor.commit".to_owned(),
+                    text: Some("41".to_owned()),
+                    key: Some("Enter".to_owned()),
+                    address: Some("A1".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
             .unwrap();
         assert_eq!(output.state_summary["cells"][0]["value"], "41");
         assert!(

@@ -496,27 +496,35 @@ derived-field references such as `new_todo_text -> title_to_add` to build
 known blocker before the full "no hardcoded app behavior" criterion is met.
 Executable reports include `runtime_execution` metadata so this blocker is
 visible in verification artifacts.
+
 Headed Ply verification now records three intermediate OS-input slices. First,
 it focuses one real visible application text control in the preview
 (`todo_new_input` for TodoMVC or `cell_editor_A1` for Cells), sends real OS
 keyboard text through `wtype`, observes the text through Ply state, captures the
-control screenshot, and stores the control bounds and artifact hash. Second, the
-same visible control emits observed Boon `SOURCE` events for the first
-text/submit workflow (`add-test-todo-type` plus `add-test-todo-submit`, or
-`edit-a1-literal` plus `commit-a1-literal`) and the headed report records those
-observed source events. TodoMVC also has keyboard-activatable visible controls
-for toggle-all, the first row checkbox, filters, and a delete button; those
-controls emit matching observed `SOURCE` events in the headed report. Covered
-observed source events are now also applied through `boon_runtime::LiveRuntime`,
-which wraps the same loaded runtime and source route executor used by semantic
-scenario replay. Third, it focuses the visible Step control, sends real OS
-keyboard activation, advances each scenario prefix through the playground,
-captures per-step screenshots, and stores the Step control bounds in the headed
-report. This does not satisfy the final e2e gate yet because the complete
-scenario is still replayed through scenario user actions after the
-visible-control probes; the report keeps `os_input_limitation` until every
-TodoMVC/Cells scenario step is driven by actual visible app controls and
-observed source events.
+control screenshot, and stores the control bounds and artifact hash. Second,
+visible controls emit observed Boon `SOURCE` events and the headed report
+records the observed payloads, bounds, screenshots, and runtime mutation result.
+For TodoMVC, the visible OS-driven live prefix currently checks nine real
+scenario steps through `filter-all`: `add-test-todo-type`,
+`add-test-todo-submit`, `reject-empty-todo`, `toggle-all-complete`,
+`toggle-all-active`, `toggle-buy-groceries`, `filter-active`,
+`filter-completed`, and `filter-all`. It also probes `delete-clean-room` as a
+visible event plus runtime mutation, but that is intentionally not marked as a
+scenario-prefix expectation because the edit/clear-completed steps before it
+are not yet visible-control driven. For Cells, the visible OS-driven live prefix
+checks `edit-a1-literal`, `commit-a1-literal`, and `edit-a1-cancel-draft`.
+Covered prefix events are applied through `boon_runtime::LiveRuntime` against
+the real scenario step, so expected source fields, semantic deltas, render
+patches, and state assertions must pass. The headed command now fails if a
+scenario-tagged visible SOURCE probe does not pass the runtime expectation
+checks; it cannot false-green on "SOURCE observed" alone. Third, it focuses the
+visible Step control, sends real OS keyboard activation, advances each scenario
+prefix through the playground, captures per-step screenshots, and stores the
+Step control bounds in the headed report. This still does not satisfy the final
+e2e gate because the complete scenario is replayed through scenario user
+actions after the visible-control probes; the report keeps `os_input_limitation`
+until every TodoMVC/Cells scenario step is driven by actual visible app controls
+and observed source events.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

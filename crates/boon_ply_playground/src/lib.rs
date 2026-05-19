@@ -1,6 +1,7 @@
 use boon_runtime::{
-    LiveRuntime, LiveSourceEvent, RunOutput, VerificationLayer, example_paths, parse_scenario,
-    run_scenario, run_scenario_source_with_step_limit, sha256_file, write_json,
+    LiveRuntime, LiveSourceEvent, LiveStepOutput, RunOutput, Scenario, ScenarioStep,
+    VerificationLayer, example_paths, parse_scenario, run_scenario,
+    run_scenario_source_with_step_limit, sha256_file, write_json,
 };
 use ply_engine::prelude::*;
 use serde_json::json;
@@ -53,7 +54,8 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let app_control_observations =
         drive_visible_app_control_probe(&mut ply, &mut state, &report, &example).await;
     let source_event_observations =
-        drive_visible_source_event_probe(&mut ply, &mut state, &report, &example).await;
+        drive_visible_source_event_probe(&mut ply, &mut state, &report, &example, &scenario_data)
+            .await;
     state.reset_to_initial(&ply);
     ply.clear_focus();
     for _ in 0..3 {
@@ -210,7 +212,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "os_input_limitation".to_owned(),
-            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches visible application controls, emits matching observed Boon SOURCE events for the covered workflow, and applies those observed SOURCE events through boon_runtime::LiveRuntime. It can also activate the visible Ply Step control for each scenario transition. It still replays the complete scenario through scenario user_action records after the visible-control probes, so it does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
+            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches visible application controls, emits matching observed Boon SOURCE events for the covered workflow, and applies covered prefix events through boon_runtime::LiveRuntime against real scenario-step expectations. It can also activate the visible Ply Step control for each scenario transition. It still replays the complete scenario through scenario user_action records after the visible-control probes, so it does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
         );
         object.insert("os_input_probe".to_owned(), headed_os_probe);
         object.insert(
@@ -243,6 +245,13 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) && source_event_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+            && (observation
+                .get("scenario_step_id")
+                .is_none_or(serde_json::Value::is_null)
+                || observation
+                    .get("scenario_expectations_checked")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true))
     }) && step_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) {
@@ -374,12 +383,15 @@ async fn drive_visible_source_event_probe(
     state: &mut PlaygroundState,
     report: &std::path::Path,
     example: &str,
+    scenario: &Scenario,
 ) -> Vec<serde_json::Value> {
     if example == "cells" {
         let edit_screenshot =
             report.with_file_name("cells-headed-source-event-edit-a1-literal.png");
         let commit_screenshot =
             report.with_file_name("cells-headed-source-event-commit-a1-literal.png");
+        let draft_screenshot =
+            report.with_file_name("cells-headed-source-event-edit-a1-cancel-draft.png");
         vec![
             drive_visible_source_text_event_probe(
                 ply,
@@ -392,6 +404,7 @@ async fn drive_visible_source_event_probe(
                     key: None,
                     address: Some("A1"),
                     screenshot: edit_screenshot,
+                    scenario_step: scenario_step_by_id(scenario, "edit-a1-literal"),
                 },
             )
             .await,
@@ -406,6 +419,22 @@ async fn drive_visible_source_event_probe(
                     key: Some("Enter"),
                     address: Some("A1"),
                     screenshot: commit_screenshot,
+                    scenario_step: scenario_step_by_id(scenario, "commit-a1-literal"),
+                },
+            )
+            .await,
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-a1-cancel-draft",
+                    element_id: "cell_editor_A1",
+                    text: "123",
+                    source: "cell.sources.editor.change",
+                    key: None,
+                    address: Some("A1"),
+                    screenshot: draft_screenshot,
+                    scenario_step: scenario_step_by_id(scenario, "edit-a1-cancel-draft"),
                 },
             )
             .await,
@@ -424,6 +453,7 @@ async fn drive_visible_source_event_probe(
                     address: None,
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-add-test-todo-type.png"),
+                    scenario_step: scenario_step_by_id(scenario, "add-test-todo-type"),
                 },
             )
             .await,
@@ -439,6 +469,23 @@ async fn drive_visible_source_event_probe(
                     address: None,
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-add-test-todo-submit.png"),
+                    scenario_step: scenario_step_by_id(scenario, "add-test-todo-submit"),
+                },
+            )
+            .await,
+            drive_visible_source_submit_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "reject-empty-todo",
+                    element_id: "todo_new_input",
+                    text: "   ",
+                    source: "store.sources.new_todo_input.key_down",
+                    key: Some("Enter"),
+                    address: None,
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-reject-empty-todo.png"),
+                    scenario_step: scenario_step_by_id(scenario, "reject-empty-todo"),
                 },
             )
             .await,
@@ -452,6 +499,17 @@ async fn drive_visible_source_event_probe(
                 target_text: None,
                 screenshot: report
                     .with_file_name("todomvc-headed-source-event-toggle-all-complete.png"),
+                scenario_step: scenario_step_by_id(scenario, "toggle-all-complete"),
+            },
+            VisibleSourcePressProbe {
+                id: "toggle-all-active",
+                element_id: Id::new("todo_toggle_all"),
+                element_label: "todo_toggle_all",
+                source: "store.sources.toggle_all_checkbox.click",
+                target_text: None,
+                screenshot: report
+                    .with_file_name("todomvc-headed-source-event-toggle-all-active.png"),
+                scenario_step: scenario_step_by_id(scenario, "toggle-all-active"),
             },
             VisibleSourcePressProbe {
                 id: "toggle-buy-groceries",
@@ -461,6 +519,7 @@ async fn drive_visible_source_event_probe(
                 target_text: Some("Buy groceries"),
                 screenshot: report
                     .with_file_name("todomvc-headed-source-event-toggle-buy-groceries.png"),
+                scenario_step: scenario_step_by_id(scenario, "toggle-buy-groceries"),
             },
             VisibleSourcePressProbe {
                 id: "filter-active",
@@ -469,6 +528,7 @@ async fn drive_visible_source_event_probe(
                 source: "store.sources.filter_active.press",
                 target_text: None,
                 screenshot: report.with_file_name("todomvc-headed-source-event-filter-active.png"),
+                scenario_step: scenario_step_by_id(scenario, "filter-active"),
             },
             VisibleSourcePressProbe {
                 id: "filter-completed",
@@ -478,6 +538,7 @@ async fn drive_visible_source_event_probe(
                 target_text: None,
                 screenshot: report
                     .with_file_name("todomvc-headed-source-event-filter-completed.png"),
+                scenario_step: scenario_step_by_id(scenario, "filter-completed"),
             },
             VisibleSourcePressProbe {
                 id: "filter-all",
@@ -486,6 +547,7 @@ async fn drive_visible_source_event_probe(
                 source: "store.sources.filter_all.press",
                 target_text: None,
                 screenshot: report.with_file_name("todomvc-headed-source-event-filter-all.png"),
+                scenario_step: scenario_step_by_id(scenario, "filter-all"),
             },
             VisibleSourcePressProbe {
                 id: "delete-clean-room",
@@ -495,6 +557,7 @@ async fn drive_visible_source_event_probe(
                 target_text: Some("Clean room"),
                 screenshot: report
                     .with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
+                scenario_step: None,
             },
         ] {
             observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
@@ -511,6 +574,7 @@ struct VisibleSourceTextProbe {
     key: Option<&'static str>,
     address: Option<&'static str>,
     screenshot: PathBuf,
+    scenario_step: Option<ScenarioStep>,
 }
 
 struct VisibleSourcePressProbe {
@@ -520,6 +584,7 @@ struct VisibleSourcePressProbe {
     source: &'static str,
     target_text: Option<&'static str>,
     screenshot: PathBuf,
+    scenario_step: Option<ScenarioStep>,
 }
 
 async fn drive_visible_source_text_event_probe(
@@ -650,12 +715,14 @@ async fn drive_visible_source_press_event_probe(
         next_frame().await;
     }
     let mut runtime_mutation_error = None;
+    let mut live_output = None;
     if let Some(event) = observed_event
         .as_ref()
         .and_then(live_source_event_from_json)
     {
-        if let Err(error) = state.apply_live_source_event(event) {
-            runtime_mutation_error = Some(error);
+        match state.apply_live_source_event(event, probe.scenario_step.as_ref()) {
+            Ok(output) => live_output = Some(output),
+            Err(error) => runtime_mutation_error = Some(error),
         }
     }
     draw_frame(ply, state).await;
@@ -670,7 +737,7 @@ async fn drive_visible_source_press_event_probe(
             .to_str()
             .unwrap_or("target/reports/invalid-source-press.png"),
     );
-    let pass = observed_event.is_some();
+    let pass = observed_event.is_some() && runtime_mutation_error.is_none();
     json!({
         "id": probe.id,
         "pass": pass,
@@ -689,6 +756,9 @@ async fn drive_visible_source_press_event_probe(
         "runtime_mutation_path": "observed visible SOURCE event -> boon_runtime::LiveRuntime::apply_source_event",
         "runtime_mutation_observed": runtime_mutation_error.is_none() && observed_event.is_some(),
         "runtime_mutation_error": runtime_mutation_error,
+        "scenario_step_id": probe.scenario_step.as_ref().map(|step| step.id.as_str()),
+        "scenario_expectations_checked": probe.scenario_step.is_some() && runtime_mutation_error.is_none() && observed_event.is_some(),
+        "runtime_output": live_output_summary(live_output.as_ref()),
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
@@ -706,12 +776,14 @@ async fn capture_visible_source_probe_result(
     bounds: serde_json::Value,
 ) -> serde_json::Value {
     let mut runtime_mutation_error = None;
+    let mut live_output = None;
     if let Some(event) = observed_event
         .as_ref()
         .and_then(live_source_event_from_json)
     {
-        if let Err(error) = state.apply_live_source_event(event) {
-            runtime_mutation_error = Some(error);
+        match state.apply_live_source_event(event, probe.scenario_step.as_ref()) {
+            Ok(output) => live_output = Some(output),
+            Err(error) => runtime_mutation_error = Some(error),
         }
     }
     draw_frame(ply, state).await;
@@ -726,7 +798,7 @@ async fn capture_visible_source_probe_result(
             .to_str()
             .unwrap_or("target/reports/invalid-source-event.png"),
     );
-    let pass = observed_event.is_some();
+    let pass = observed_event.is_some() && runtime_mutation_error.is_none();
     json!({
         "id": probe.id,
         "pass": pass,
@@ -747,11 +819,29 @@ async fn capture_visible_source_probe_result(
         "runtime_mutation_path": "observed visible SOURCE event -> boon_runtime::LiveRuntime::apply_source_event",
         "runtime_mutation_observed": runtime_mutation_error.is_none() && observed_event.is_some(),
         "runtime_mutation_error": runtime_mutation_error,
+        "scenario_step_id": probe.scenario_step.as_ref().map(|step| step.id.as_str()),
+        "scenario_expectations_checked": probe.scenario_step.is_some() && runtime_mutation_error.is_none() && observed_event.is_some(),
+        "runtime_output": live_output_summary(live_output.as_ref()),
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
+}
+
+fn scenario_step_by_id(scenario: &Scenario, id: &str) -> Option<ScenarioStep> {
+    scenario.step.iter().find(|step| step.id == id).cloned()
+}
+
+fn live_output_summary(output: Option<&LiveStepOutput>) -> serde_json::Value {
+    match output {
+        Some(output) => json!({
+            "semantic_delta_count": output.semantic_deltas.len(),
+            "render_patch_count": output.render_patches.len(),
+            "state_summary": output.state_summary
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 async fn drive_visible_step_control_sequence(
@@ -1257,19 +1347,25 @@ impl PlaygroundState {
         }
     }
 
-    fn apply_live_source_event(&mut self, event: LiveSourceEvent) -> Result<(), String> {
+    fn apply_live_source_event(
+        &mut self,
+        event: LiveSourceEvent,
+        scenario_step: Option<&ScenarioStep>,
+    ) -> Result<LiveStepOutput, String> {
         let live_runtime = self
             .live_runtime
             .as_mut()
             .ok_or_else(|| "playground live runtime is not initialized".to_owned())?;
-        let step = live_runtime
-            .apply_source_event(event)
-            .map_err(|error| error.to_string())?;
+        let step = match scenario_step {
+            Some(scenario_step) => live_runtime.apply_source_event_for_step(scenario_step, event),
+            None => live_runtime.apply_source_event(event),
+        }
+        .map_err(|error| error.to_string())?;
         if let Some(output) = &mut self.output {
-            output.semantic_deltas.extend(step.semantic_deltas);
-            output.render_patches.extend(step.render_patches);
-            output.state_summary = step.state_summary;
-            Ok(())
+            output.semantic_deltas.extend(step.semantic_deltas.clone());
+            output.render_patches.extend(step.render_patches.clone());
+            output.state_summary = step.state_summary.clone();
+            Ok(step)
         } else {
             Err("playground output is not initialized".to_owned())
         }

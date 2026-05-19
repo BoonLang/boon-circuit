@@ -1901,6 +1901,11 @@ fn base_example_report(
         "generic_indexed_branch_evaluator": true,
         "generic_indexed_scalar_commit_executor": true,
         "generic_semantic_delta_emitter": true,
+        "generic_source_mutation_semantic_delta_emitter": true,
+        "generic_derived_value_semantic_delta_emitter": true,
+        "generic_source_bind_semantic_delta_emitter": true,
+        "generic_list_remove_semantic_delta_emitter": true,
+        "generic_source_unbind_semantic_delta_emitter": true,
         "generic_loaded_runtime_shell": true,
         "generic_source_route_action_executor": true,
         "generic_todomvc_source_effects_through_action_executor": is_todomvc,
@@ -1915,6 +1920,7 @@ fn base_example_report(
         "generic_indexed_bulk_bool_commit_executor": true,
         "generic_list_append_source_binding_executor": true,
         "generic_list_remove_source_unbinding_executor": true,
+        "generic_list_move_semantic_delta_emitter": true,
         "generic_list_count_retain_executor": true,
         "generic_todomvc_summary_reads_authoritative_storage": true,
         "generic_todomvc_root_holds_no_mirror": is_todomvc,
@@ -2744,7 +2750,11 @@ impl GenericScheduledRuntime {
                         else {
                             continue;
                         };
-                        observe(GenericSourceMutation::ListRemove { key, generation })?;
+                        observe(GenericSourceMutation::ListRemove {
+                            list,
+                            key,
+                            generation,
+                        })?;
                     } else {
                         self.storage.remove_where_source_action_and_unbind_sources(
                             &self.source_routes,
@@ -2755,7 +2765,11 @@ impl GenericScheduledRuntime {
                                     observe(GenericSourceMutation::SourceUnbind(binding.clone()))
                                 }
                                 GenericListRemoveObservation::RowRemoved { key, generation } => {
-                                    observe(GenericSourceMutation::ListRemove { key, generation })
+                                    observe(GenericSourceMutation::ListRemove {
+                                        list,
+                                        key,
+                                        generation,
+                                    })
                                 }
                             },
                         )?;
@@ -3672,7 +3686,11 @@ impl GenericCircuitRuntime {
         let (key, generation) =
             self.append_row_for_trigger_text(equations, list, trigger, trigger_value)?;
         self.bind_row_sources(list, key, generation, source_paths);
-        Ok(GenericListRowCommit { key, generation })
+        Ok(GenericListRowCommit {
+            list,
+            key,
+            generation,
+        })
     }
 
     #[cfg(test)]
@@ -3833,11 +3851,22 @@ impl GenericCircuitRuntime {
         Ok(rows.remove_index(index))
     }
 
-    fn move_row(&mut self, list: &str, from: usize, to: usize) -> RuntimeResult<(u64, u64)> {
-        self.lists
+    fn move_row(
+        &mut self,
+        list: &'static str,
+        from: usize,
+        to: usize,
+    ) -> RuntimeResult<GenericListRowCommit> {
+        let (key, generation) = self
+            .lists
             .get_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .move_index(from, to)
+            .move_index(from, to)?;
+        Ok(GenericListRowCommit {
+            list,
+            key,
+            generation,
+        })
     }
 
     fn row_identity(&self, list: &str, index: usize) -> RuntimeResult<(u64, u64)> {
@@ -4477,8 +4506,18 @@ struct GenericBoolFieldCommit {
     value: bool,
 }
 
+#[derive(Clone, Debug)]
+struct GenericValueFieldCommit<'a> {
+    list: &'static str,
+    key: u64,
+    generation: u64,
+    field: &'static str,
+    value: ProtocolValue<'a>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GenericListRowCommit {
+    list: &'static str,
     key: u64,
     generation: u64,
 }
@@ -4519,6 +4558,33 @@ impl GenericBoolFieldCommit {
     }
 }
 
+impl<'a> GenericValueFieldCommit<'a> {
+    fn semantic_delta(&self) -> SemanticDelta<'a> {
+        GenericCircuitRuntime::semantic_field_delta(
+            Some(self.list),
+            Some(self.key),
+            Some(self.generation),
+            self.field,
+            self.value.clone(),
+        )
+    }
+}
+
+impl GenericListRowCommit {
+    fn semantic_move_delta(&self, to: usize) -> SemanticDelta<'static> {
+        SemanticDelta {
+            kind: "ListMove",
+            list_id: Some(self.list),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some("position"),
+            value: ProtocolValue::NumberText(to as i64),
+        }
+    }
+}
+
 impl GenericTextFieldIdentity {
     fn semantic_delta_with_value<'a>(&self, value: ProtocolValue<'a>) -> SemanticDelta<'a> {
         GenericCircuitRuntime::semantic_field_delta(
@@ -4555,6 +4621,39 @@ impl<'a> GenericRootTextCommit<'a> {
     }
 }
 
+impl<'a> GenericSourceMutation<'a> {
+    fn semantic_delta(&self) -> Option<SemanticDelta<'a>> {
+        match self {
+            Self::RootText(commit) => Some(commit.semantic_delta()),
+            Self::TextField(commit) => Some(commit.semantic_delta()),
+            Self::TextFieldIdentity(_) => None,
+            Self::BoolField(commit) => Some(commit.semantic_delta()),
+            Self::ListAppend(commit) => Some(commit.semantic_delta()),
+            Self::ListRemove {
+                list,
+                key,
+                generation,
+            } => Some(GenericCircuitRuntime::semantic_list_delta(
+                "ListRemove",
+                list,
+                *key,
+                *generation,
+                ProtocolValue::Null,
+            )),
+            Self::SourceBind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
+                "SourceBind",
+                binding,
+                ProtocolValue::Text(Cow::Borrowed(binding.source_path)),
+            )),
+            Self::SourceUnbind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
+                "SourceUnbind",
+                binding,
+                ProtocolValue::Null,
+            )),
+        }
+    }
+}
+
 enum GenericListRemoveObservation<'a> {
     SourceUnbind(&'a SourceBinding),
     RowRemoved { key: u64, generation: u64 },
@@ -4577,7 +4676,12 @@ enum GenericSourceMutation<'a> {
     TextFieldIdentity(GenericTextFieldIdentity),
     BoolField(GenericBoolFieldCommit),
     ListAppend(GenericTextListAppendCommit<'a>),
-    ListRemove { key: u64, generation: u64 },
+    ListRemove {
+        list: &'static str,
+        key: u64,
+        generation: u64,
+    },
+    SourceBind(SourceBinding),
     SourceUnbind(SourceBinding),
 }
 
@@ -6422,8 +6526,8 @@ impl TodoRuntime {
             RenderTarget::TodoRow(insert.key),
             ProtocolValue::Text(Cow::Borrowed(insert.value)),
         ));
-        push_source_binding_deltas_for_row(&self.generic, insert.key, insert.generation, deltas);
-        push_source_binding_patches_for_row(&self.generic, insert.key, insert.generation, patches);
+        push_source_binding_deltas_for_insert(&self.generic, &insert, deltas);
+        push_source_binding_patches_for_insert(&self.generic, &insert, patches);
     }
 
     fn apply_todo_bool_source_action(
@@ -6486,12 +6590,14 @@ impl TodoRuntime {
         let (key, generation) = self
             .generic
             .commit_indexed_bool_field("todos", index, field, value)?;
-        deltas.push(field_delta(
-            Some(key),
-            Some(generation),
+        let commit = GenericBoolFieldCommit {
+            list: "todos",
+            key,
+            generation,
             field,
-            ProtocolValue::Bool(value),
-        ));
+            value,
+        };
+        deltas.push(commit.semantic_delta());
         patches.push(patch(
             "SetProperty",
             RenderTarget::TodoCheckbox(key),
@@ -6531,20 +6637,31 @@ impl TodoRuntime {
             |mutation| {
                 match mutation {
                     GenericSourceMutation::SourceUnbind(binding) => {
-                        deltas.push(source_delta("SourceUnbind", &binding, ProtocolValue::Null));
+                        if let Some(delta) =
+                            GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
+                        {
+                            deltas.push(delta);
+                        }
                         patches.push(patch(
                             "UnbindSource",
                             RenderTarget::TodoSource(binding.key, binding.source_path),
                             source_binding_value(&binding),
                         ));
                     }
-                    GenericSourceMutation::ListRemove { key, generation } => {
-                        deltas.push(list_delta(
-                            "ListRemove",
+                    GenericSourceMutation::ListRemove {
+                        list,
+                        key,
+                        generation,
+                    } => {
+                        if let Some(delta) = (GenericSourceMutation::ListRemove {
+                            list,
                             key,
                             generation,
-                            ProtocolValue::Null,
-                        ));
+                        })
+                        .semantic_delta()
+                        {
+                            deltas.push(delta);
+                        }
                         patches.push(patch(
                             "RemoveElement",
                             RenderTarget::TodoRow(key),
@@ -6592,21 +6709,32 @@ impl TodoRuntime {
             |mutation| {
                 match mutation {
                     GenericSourceMutation::SourceUnbind(binding) => {
-                        deltas.push(source_delta("SourceUnbind", &binding, ProtocolValue::Null));
+                        if let Some(delta) =
+                            GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
+                        {
+                            deltas.push(delta);
+                        }
                         patches.push(patch(
                             "UnbindSource",
                             RenderTarget::TodoSource(binding.key, binding.source_path),
                             source_binding_value(&binding),
                         ));
                     }
-                    GenericSourceMutation::ListRemove { key, generation } => {
+                    GenericSourceMutation::ListRemove {
+                        list,
+                        key,
+                        generation,
+                    } => {
                         removed = true;
-                        deltas.push(list_delta(
-                            "ListRemove",
+                        if let Some(delta) = (GenericSourceMutation::ListRemove {
+                            list,
                             key,
                             generation,
-                            ProtocolValue::Null,
-                        ));
+                        })
+                        .semantic_delta()
+                        {
+                            deltas.push(delta);
+                        }
                         patches.push(patch(
                             "RemoveElement",
                             RenderTarget::TodoRow(key),
@@ -6631,7 +6759,11 @@ impl TodoRuntime {
         let generic_row =
             self.generic
                 .remove_row_and_unbind_sources("todos", index, |binding| {
-                    deltas.push(source_delta("SourceUnbind", binding, ProtocolValue::Null));
+                    if let Some(delta) =
+                        GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
+                    {
+                        deltas.push(delta);
+                    }
                     patches.push(patch(
                         "UnbindSource",
                         RenderTarget::TodoSource(binding.key, binding.source_path),
@@ -6661,20 +6793,11 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let (key, generation) = self.generic.move_row("todos", from, to)?;
-        deltas.push(SemanticDelta {
-            kind: "ListMove",
-            list_id: Some("todos"),
-            key: Some(key),
-            generation: Some(generation),
-            source_id: None,
-            bind_epoch: None,
-            field_path: Some("position"),
-            value: ProtocolValue::NumberText(to as i64),
-        });
+        let commit = self.generic.move_row("todos", from, to)?;
+        deltas.push(commit.semantic_move_delta(to));
         patches.push(patch(
             "MoveElement",
-            RenderTarget::TodoPosition(key),
+            RenderTarget::TodoPosition(commit.key),
             ProtocolValue::NumberText(to as i64),
         ));
         Ok(())
@@ -7827,19 +7950,27 @@ impl CellsRuntime {
         deltas.push(formula.semantic_delta());
         deltas.push(editing_text.semantic_delta());
         deltas.push(editing.semantic_delta());
-        deltas.push(cell_field_delta(
-            formula.key,
-            formula.generation,
-            "value",
-            value.clone(),
-        ));
+        deltas.push(
+            GenericValueFieldCommit {
+                list: "cells",
+                key: formula.key,
+                generation: formula.generation,
+                field: "value",
+                value: value.clone(),
+            }
+            .semantic_delta(),
+        );
         if let Some(error) = cell.error {
-            deltas.push(cell_field_delta(
-                formula.key,
-                formula.generation,
-                "error",
-                ProtocolValue::Text(Cow::Borrowed(error)),
-            ));
+            deltas.push(
+                GenericValueFieldCommit {
+                    list: "cells",
+                    key: formula.key,
+                    generation: formula.generation,
+                    field: "error",
+                    value: ProtocolValue::Text(Cow::Borrowed(error)),
+                }
+                .semantic_delta(),
+            );
         }
         patches.push(patch(
             "SetCellText",
@@ -8532,6 +8663,7 @@ fn assert_source_event_field(
     }
 }
 
+#[cfg(test)]
 fn list_delta<'a>(
     kind: &'static str,
     key: u64,
@@ -8541,6 +8673,7 @@ fn list_delta<'a>(
     GenericCircuitRuntime::semantic_list_delta(kind, "todos", key, generation, value)
 }
 
+#[cfg(test)]
 fn field_delta<'a>(
     key: Option<u64>,
     generation: Option<u64>,
@@ -8550,26 +8683,15 @@ fn field_delta<'a>(
     GenericCircuitRuntime::semantic_field_delta(key.map(|_| "todos"), key, generation, field, value)
 }
 
-fn source_delta<'a>(
-    kind: &'static str,
-    binding: &SourceBinding,
-    value: ProtocolValue<'a>,
-) -> SemanticDelta<'a> {
-    GenericCircuitRuntime::semantic_source_delta(kind, binding, value)
-}
-
-fn push_source_binding_deltas_for_row<'a>(
+fn push_source_binding_deltas_for_insert<'a>(
     runtime: &GenericCircuitRuntime,
-    key: u64,
-    generation: u64,
+    insert: &GenericTextListAppendCommit<'_>,
     deltas: &mut Vec<SemanticDelta<'a>>,
 ) {
-    for binding in runtime.row_source_bindings("todos", key, generation) {
-        deltas.push(source_delta(
-            "SourceBind",
-            binding,
-            ProtocolValue::Text(Cow::Borrowed(binding.source_path)),
-        ));
+    for binding in runtime.row_source_bindings(insert.list, insert.key, insert.generation) {
+        if let Some(delta) = GenericSourceMutation::SourceBind(binding.clone()).semantic_delta() {
+            deltas.push(delta);
+        }
     }
 }
 
@@ -8581,34 +8703,18 @@ fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
     }
 }
 
-fn push_source_binding_patches_for_row<'a>(
+fn push_source_binding_patches_for_insert<'a>(
     runtime: &GenericCircuitRuntime,
-    key: u64,
-    generation: u64,
+    insert: &GenericTextListAppendCommit<'_>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) {
-    for binding in runtime.row_source_bindings("todos", key, generation) {
+    for binding in runtime.row_source_bindings(insert.list, insert.key, insert.generation) {
         patches.push(patch(
             "BindSource",
             RenderTarget::TodoSource(binding.key, binding.source_path),
             source_binding_value(binding),
         ));
     }
-}
-
-fn cell_field_delta<'a>(
-    key: u64,
-    generation: u64,
-    field: &'static str,
-    value: ProtocolValue<'a>,
-) -> SemanticDelta<'a> {
-    GenericCircuitRuntime::semantic_field_delta(
-        Some("cells"),
-        Some(key),
-        Some(generation),
-        field,
-        value,
-    )
 }
 
 fn dirty_key_count(deltas: &[SemanticDelta<'_>]) -> usize {
@@ -8799,7 +8905,10 @@ mod tests {
             output
                 .semantic_deltas
                 .iter()
-                .any(|delta| delta.kind == "ListRemove")
+                .any(|delta| delta.kind == "ListRemove"
+                    && delta.list_id == Some("todos")
+                    && delta.key.is_some()
+                    && delta.generation.is_some())
         );
     }
 
@@ -10177,8 +10286,10 @@ mod tests {
         assert_eq!(runtime.todo_key(1), moved_key);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, "ListMove");
+        assert_eq!(deltas[0].list_id, Some("todos"));
         assert_eq!(deltas[0].key, Some(moved_key));
         assert_eq!(deltas[0].generation, Some(1));
+        assert_eq!(deltas[0].field_path, Some("position"));
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].kind, "MoveElement");
     }

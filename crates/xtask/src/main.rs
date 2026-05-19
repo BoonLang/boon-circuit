@@ -82,19 +82,26 @@ fn verify_specific(
     }
     if matches!(layer, VerificationLayer::HeadedPly) {
         let _headed_lock = HeadedVerifierLock::acquire()?;
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "boon_ply_playground",
-                "--",
-                "--verify-headed",
-                "--example",
-                name,
-                "--report",
-                report.to_str().ok_or("report path is not utf-8")?,
-            ])
-            .status()?;
+        let timeout = headed_verifier_timeout();
+        let mut command = Command::new("cargo");
+        command.args([
+            "run",
+            "-p",
+            "boon_ply_playground",
+            "--",
+            "--verify-headed",
+            "--example",
+            name,
+            "--report",
+            report.to_str().ok_or("report path is not utf-8")?,
+        ]);
+        let status = match run_command_with_timeout(&mut command, timeout) {
+            Ok(status) => status,
+            Err(error) => {
+                write_headed_debug_failure(name, &report, timeout, &error.to_string())?;
+                return Err(error);
+            }
+        };
         if !status.success() {
             return Err(format!("headed Ply verifier failed for {name}").into());
         }
@@ -106,6 +113,63 @@ fn verify_specific(
         verify_budget_passed(&output.report)?;
     }
     verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
+    let mut child = command.spawn()?;
+    let started = SystemTime::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed().unwrap_or_default() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "timed out after {}s waiting for {:?}",
+                timeout.as_secs(),
+                command
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn headed_verifier_timeout() -> Duration {
+    std::env::var("BOON_HEADED_VERIFIER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120))
+}
+
+fn write_headed_debug_failure(
+    name: &str,
+    report: &Path,
+    timeout: Duration,
+    error: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let debug_path = PathBuf::from(format!(
+        "target/reports/debug/{name}-headed-ply-failure.json"
+    ));
+    let debug_report = json!({
+        "status": "fail",
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "headed-ply-debug-failure",
+        "example": name,
+        "intended_report": report,
+        "timeout_seconds": timeout.as_secs(),
+        "error": error,
+        "failure_is_blocker": true,
+        "note": "debug report only; top-level headed-ply report is intentionally absent or invalid until real headed verification completes"
+    });
+    write_json(&debug_path, &debug_report)?;
     Ok(())
 }
 
@@ -155,11 +219,24 @@ fn remove_stale_headed_lock(path: &Path) -> Result<(), Box<dyn std::error::Error
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    if let Ok(text) = std::fs::read_to_string(path)
+        && let Some(pid) = text
+            .lines()
+            .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+        && !process_is_alive(pid)
+    {
+        std::fs::remove_file(path)?;
+        return Ok(());
+    }
     let modified = metadata.modified().unwrap_or(SystemTime::now());
     if modified.elapsed().unwrap_or_default() > Duration::from_secs(300) {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn verify_budget_passed(report: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {

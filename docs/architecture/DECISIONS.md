@@ -334,10 +334,15 @@ identity is attached at the same runtime boundary as the structural insert
 instead of in the TodoMVC adapter.
 Generic source-action commits now carry their list/key/generation/field identity
 and can emit keyed semantic deltas directly for root text, indexed text,
-indexed bool, and list append mutations. TodoMVC and Cells adapters still own
-surface-specific render patches and some derived summary/assertion behavior, so
-this is not the final adapter-free interpreter, but the semantic trace is no
-longer constructed only from app-specific helper functions.
+indexed bool, list append, list remove, list move, and source unbind mutations.
+Formula-derived value/error commits use the same generic keyed field commit path
+for their semantic deltas. Source bind facts emitted after list append now also
+flow through a generic `SourceBind` mutation and use the appended list's
+identity instead of a TodoMVC-specific `todos` helper.
+TodoMVC and Cells adapters still own surface-specific render patches and some
+derived summary/assertion behavior, so this is not the final adapter-free
+interpreter, but the semantic trace is no longer constructed only from
+app-specific helper functions.
 Source-event routing is also moving into the generic layer: the compiled
 `SourceRoutePlan` can now turn a normalized source event into a
 `GenericSourceActionInput` by deriving the root/list/indexed action shape from

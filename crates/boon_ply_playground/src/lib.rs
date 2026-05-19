@@ -255,6 +255,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     }) && step_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) {
+        macroquad::miniquad::window::quit();
         Ok(())
     } else {
         Err(format!(
@@ -1048,6 +1049,7 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
     });
     write_json(&report, &report_json)?;
     if passed {
+        macroquad::miniquad::window::quit();
         Ok(())
     } else {
         Err("OS input probe failed".into())

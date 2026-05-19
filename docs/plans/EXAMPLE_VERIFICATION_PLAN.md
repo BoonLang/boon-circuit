@@ -110,6 +110,15 @@ renderer patch.
 Headed replay fails if it injects `expected_source_event` directly instead of
 creating it through the visible window and input backend.
 
+Headed replay must also fail cleanly. The xtask wrapper owns a single headed
+Ply lock, removes stale locks whose recorded process id is no longer alive, and
+times out the native verifier child instead of leaving a spinning window or
+blocked aggregate run. A timed-out headed verifier is a blocker, not a partial
+pass; it may leave a debug-only failure report under `target/reports/debug/`,
+but it must not create a passing top-level headed report. Stale headed JSON
+reports should be removed or regenerated rather than kept as schema-valid
+evidence.
+
 The first checkpoint for every example is startup quality:
 
 - correct window size.

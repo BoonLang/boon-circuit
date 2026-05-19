@@ -312,20 +312,21 @@ Implementation note: a generic initialization runtime now materializes root
 state cells and keyed list rows from `TypedProgram` initializers. TodoMVC seed
 titles, `store.new_todo_text`, and `store.selected_filter` are initialized from
 that generic storage rather than by reparsing the source text in the runtime,
-and TodoMVC row fields now write that storage first while the Todo mirror is
-kept as a checked render/test cache. TodoMVC scenario assertions and state
-summaries now read root values, row fields, row identities, counts, and filter
-views from that generic storage instead of from the mirror. TodoMVC field
-deltas and render targets now also read row key/generation identity from generic
-storage for normal row updates. Cells now uses the same generic keyed list
-storage for `cell.formula_text`, `cell.editing_text`, and `cell.editing`; Cells
-state summaries read those fields and hidden key/generation facts from generic
+and the Todo runtime no longer keeps separate root mirrors for those `HOLD`
+values. TodoMVC row fields, hidden row identities, and source-bind epochs now
+live only in generic keyed-list storage; render patches, semantic deltas,
+scenario assertions, and state summaries read those facts back from the generic
+runtime instead of from a Todo row cache. TodoMVC field deltas and render
+targets now also read row key/generation identity from generic storage for
+normal row updates. Cells now uses the same generic keyed list storage for
+`cell.formula_text`, `cell.editing_text`, and `cell.editing`; Cells state
+summaries read those fields and hidden key/generation facts from generic
 storage, while formula value/error/dependency vectors remain derived caches.
 Root text `HOLD` commits and indexed text/bool `HOLD` field commits now go
-through generic runtime commit helpers before mirrors are updated. TodoMVC list
-append/remove operations now also enter through generic runtime structural
-helpers that check the IR-derived append trigger and remove predicates before
-the render/test mirror is updated.
+through generic runtime commit helpers. TodoMVC list append/remove operations
+now also enter through generic runtime structural helpers that check the
+IR-derived append trigger and remove predicates before emitting current
+protocol/render deltas.
 Scenario `expected_source_event` records are now normalized into a generic
 source-event object before TodoMVC or Cells consumes source path, text, key,
 address, or target row data. The per-step execution loop for timing, allocation
@@ -372,8 +373,9 @@ instead of looking it up by source during the row scan. Cells edit, commit, and
 cancel events now carry the indexed `HOLD` targets selected by their compiled
 source route (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or
 renamed equivalents) into the application phase, so the application boundary
-does not choose those fields by hardcoded event kind. Example runtimes only
-mirror committed values for render/test checks.
+does not choose those fields by hardcoded event kind. Example runtimes still
+adapt generic facts into their current protocol/render outputs; TodoMVC no
+longer mirrors committed row or root values for render/test checks.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
@@ -381,8 +383,10 @@ IR-derived predicates instead of Todo-specific loops. Those runtime predicates
 now carry the IR selector and row-field paths as data (`FieldBool`,
 `FieldBoolNot`, `SelectorVisibility`) instead of using Rust enum variants like
 "row completed" or "row active"; row paths are resolved to the current list row
-field at evaluation time. Both example runtimes assert that their mirrors stay
-synchronized with the generic storage after scenario steps.
+field at evaluation time. Example runtimes assert that required generic fields
+and hidden row identities are present after scenario steps; Cells still keeps
+derived formula caches outside keyed list storage until the complete equation
+executor replaces the adapter boundary.
 Executable reports also include `compiled_schedule`, a typed-IR-derived schedule
 summary that rejects unknown initializers, unsupported update branches,
 unsupported list predicates, and per-row graph clones before the example runtime

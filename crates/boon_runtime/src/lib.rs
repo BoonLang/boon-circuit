@@ -1763,6 +1763,8 @@ fn base_example_report(
                 "generic_indexed_hold_commit_executor": true,
                 "generic_list_count_retain_executor": true,
                 "generic_todomvc_summary_reads_authoritative_storage": true,
+                "generic_todomvc_root_holds_no_mirror": is_todomvc,
+                "generic_todomvc_rows_hold_no_mirror": is_todomvc,
                 "generic_todomvc_delta_identities_from_authoritative_storage": true,
                 "generic_root_source_dispatch": true,
                 "generic_derived_text_transform_executor": true,
@@ -2157,14 +2159,6 @@ impl<T> KeyedList<T> {
         self.rows.len()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &KeyedRow<T>> {
-        self.rows.iter()
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut KeyedRow<T>> {
-        self.rows.iter_mut()
-    }
-
     fn append(&mut self, value: T) -> (u64, u64) {
         let key = self.next_key;
         self.next_key += 1;
@@ -2317,14 +2311,6 @@ impl Default for SourceStore {
     fn default() -> Self {
         Self::with_capacity(0)
     }
-}
-
-#[derive(Clone, Debug)]
-struct Todo {
-    title: String,
-    edit_text: String,
-    completed: bool,
-    editing: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2841,6 +2827,14 @@ impl GenericCircuitRuntime {
             .get(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
         Ok((row.key, row.generation))
+    }
+
+    fn bound_index(&self, list: &str, key: u64, generation: u64) -> RuntimeResult<Option<usize>> {
+        Ok(self
+            .lists
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .bound_index(key, generation))
     }
 
     fn list_len(&self, list: &str) -> RuntimeResult<usize> {
@@ -3829,18 +3823,14 @@ fn row_field_name(path: &str) -> &str {
 #[derive(Clone, Debug)]
 struct TodoRuntime {
     generic: GenericCircuitRuntime,
-    todos: KeyedList<Todo>,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     source_routes: SourceRoutePlan,
     row_source_paths: Vec<&'static str>,
-    spare_todos: Vec<Todo>,
     spare_generic_todos: Vec<GenericRow>,
     next_source_seq: u64,
     stale_source_drop_count: u64,
-    new_todo_text: String,
-    selected_filter: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3923,50 +3913,35 @@ impl TodoRuntime {
     ) -> RuntimeResult<Self> {
         let mut generic = GenericCircuitRuntime::new(ir)?;
         let todo_count = generic.list_len("todos")?;
-        let new_todo_text = generic.root_textlike("store.new_todo_text")?;
-        let selected_filter = generic.root_textlike("store.selected_filter")?;
         let row_source_paths = todo_row_source_paths(parsed)?;
-        let todos = KeyedList::from_values(
-            (0..todo_count)
-                .map(|index| {
-                    Ok(Todo {
-                        title: generic
-                            .list_row_textlike("todos", index, "title")?
-                            .to_owned(),
-                        edit_text: generic
-                            .list_row_textlike("todos", index, "edit_text")?
-                            .to_owned(),
-                        completed: generic.list_row_bool("todos", index, "completed")?,
-                        editing: generic.list_row_bool("todos", index, "editing")?,
-                    })
-                })
-                .collect::<RuntimeResult<Vec<_>>>()?,
-        );
-        generic.reserve_source_bindings(todos.len() * row_source_paths.len());
-        for row in todos.iter() {
-            generic.bind_row_sources("todos", row.key, row.generation, &row_source_paths);
+        generic.reserve_source_bindings(todo_count * row_source_paths.len());
+        for index in 0..todo_count {
+            let (key, generation) = generic.row_identity("todos", index)?;
+            generic.bind_row_sources("todos", key, generation, &row_source_paths);
         }
         Self {
             generic,
-            todos,
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
             list_equations: compiled.list_equations.clone(),
             source_routes: compiled.source_routes.clone(),
             row_source_paths,
-            spare_todos: Vec::new(),
             spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
-            new_todo_text,
-            selected_filter,
         }
         .validate()
     }
 
     fn validate(self) -> RuntimeResult<Self> {
-        if self.todos.iter().any(|row| row.value.title.is_empty()) {
-            return Err("TodoMVC seed titles must not be empty".into());
+        for index in 0..self.generic.list_len("todos")? {
+            if self
+                .generic
+                .list_row_textlike("todos", index, "title")?
+                .is_empty()
+            {
+                return Err("TodoMVC seed titles must not be empty".into());
+            }
         }
         Ok(self)
     }
@@ -3986,30 +3961,23 @@ impl TodoRuntime {
         generic
             .lists
             .insert("todos".to_owned(), KeyedList::from_values(generic_rows));
-        let todos = KeyedList::from_values((0..count).map(|index| Todo {
-            title: format!("Todo {index}"),
-            edit_text: format!("Todo {index}"),
-            completed: false,
-            editing: false,
-        }));
-        generic.reserve_source_bindings(todos.len() * row_source_paths.len());
-        for row in todos.iter() {
-            generic.bind_row_sources("todos", row.key, row.generation, &row_source_paths);
+        generic.reserve_source_bindings(count * row_source_paths.len());
+        for index in 0..count {
+            let (key, generation) = generic
+                .row_identity("todos", index)
+                .expect("seeded TodoMVC row exists");
+            generic.bind_row_sources("todos", key, generation, &row_source_paths);
         }
         Self {
             generic,
-            todos,
             scalar_equations: ScalarEquationPlan::empty(),
             derived_equations: DerivedEquationPlan::empty(),
             list_equations: ListEquationPlan::empty(),
             source_routes: SourceRoutePlan::default(),
             row_source_paths,
-            spare_todos: Vec::new(),
             spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
-            new_todo_text: String::new(),
-            selected_filter: "All".to_owned(),
         }
     }
 
@@ -4047,9 +4015,6 @@ impl TodoRuntime {
                 }
             }
         }
-        self.new_todo_text.reserve(max_text_len);
-        self.selected_filter.reserve("Completed".len());
-        self.todos.reserve(append_count);
         self.generic
             .reserve_root_textlike("store.new_todo_text", max_text_len)
             .expect("TodoMVC generic runtime has new_todo_text root");
@@ -4061,41 +4026,18 @@ impl TodoRuntime {
             .expect("TodoMVC generic runtime has todos list");
         self.generic
             .reserve_source_bindings(append_count * self.row_source_paths.len());
-        self.spare_todos.reserve(append_count);
         self.spare_generic_todos.reserve(append_count);
-        for row in self.todos.iter_mut() {
-            row.value
-                .title
-                .reserve(max_text_len.saturating_sub(row.value.title.len()));
-            row.value
-                .edit_text
-                .reserve(max_text_len.saturating_sub(row.value.edit_text.len()));
-        }
-        let title_reserves = self
-            .todos
-            .iter()
-            .map(|row| max_text_len.saturating_sub(row.value.title.len()))
-            .collect::<Vec<_>>();
-        let edit_text_reserves = self
-            .todos
-            .iter()
-            .map(|row| max_text_len.saturating_sub(row.value.edit_text.len()))
-            .collect::<Vec<_>>();
         self.generic
-            .reserve_list_row_textlike_fields("todos", "title", |index, _| title_reserves[index])
+            .reserve_list_row_textlike_fields("todos", "title", |_, current| {
+                max_text_len.saturating_sub(current.len())
+            })
             .expect("TodoMVC generic runtime has title fields");
         self.generic
-            .reserve_list_row_textlike_fields("todos", "edit_text", |index, _| {
-                edit_text_reserves[index]
+            .reserve_list_row_textlike_fields("todos", "edit_text", |_, current| {
+                max_text_len.saturating_sub(current.len())
             })
             .expect("TodoMVC generic runtime has edit_text fields");
         for _ in 0..append_count {
-            self.spare_todos.push(Todo {
-                title: String::with_capacity(max_text_len),
-                edit_text: String::with_capacity(max_text_len),
-                completed: false,
-                editing: false,
-            });
             self.spare_generic_todos
                 .push(todo_generic_spare(max_text_len));
         }
@@ -4176,7 +4118,7 @@ impl TodoRuntime {
             }
             TodoEvent::ToggleAll { source, target } => {
                 let all_completed = self.all_completed();
-                for index in 0..self.todos.len() {
+                for index in 0..self.generic.list_len("todos")? {
                     let next_completed =
                         self.todo_bool_update_with_snapshot(index, target, source, all_completed)?;
                     self.set_completed(target, index, next_completed, &mut deltas, &mut patches)?;
@@ -4651,22 +4593,32 @@ impl TodoRuntime {
             self.stale_source_drop_count += 1;
             return None;
         }
-        let Some(index) = self.todos.bound_index(key, generation) else {
+        let Some(index) = self
+            .generic
+            .bound_index("todos", key, generation)
+            .ok()
+            .flatten()
+        else {
             self.stale_source_drop_count += 1;
             return None;
         };
-        let todo = &self.todos[index];
-        if todo.value.title != title {
+        if self
+            .generic
+            .list_row_textlike("todos", index, "title")
+            .map_or(true, |candidate| candidate != title)
+        {
             return None;
         }
         Some(self.occurrence_for_index_and_title(index, title))
     }
 
     fn occurrence_for_index_and_title(&self, target_index: usize, title: &str) -> usize {
-        self.todos
-            .iter()
-            .take(target_index + 1)
-            .filter(|todo| todo.value.title == title)
+        (0..=target_index)
+            .filter(|index| {
+                self.generic
+                    .list_row_textlike("todos", *index, "title")
+                    .is_ok_and(|candidate| candidate == title)
+            })
             .count()
             .max(1)
     }
@@ -4680,18 +4632,6 @@ impl TodoRuntime {
         if title.is_empty() {
             return Ok(());
         }
-        let mut todo = self.spare_todos.pop().unwrap_or_else(|| Todo {
-            title: String::with_capacity(title.len()),
-            edit_text: String::with_capacity(title.len()),
-            completed: false,
-            editing: false,
-        });
-        todo.title.clear();
-        todo.title.push_str(title);
-        todo.edit_text.clear();
-        todo.edit_text.push_str(title);
-        todo.completed = false;
-        todo.editing = false;
         let mut generic_todo = self
             .spare_generic_todos
             .pop()
@@ -4704,19 +4644,16 @@ impl TodoRuntime {
             append_trigger,
             generic_todo,
         )?;
-        let (key, generation) = self.todos.append(todo);
-        if (key, generation) != (generic_key, generic_generation) {
-            return Err(format!(
-                "generic todo append produced key/generation {generic_key}/{generic_generation}, mirror produced {key}/{generation}"
-            )
-            .into());
-        }
-        self.generic
-            .bind_row_sources("todos", key, generation, &self.row_source_paths);
+        self.generic.bind_row_sources(
+            "todos",
+            generic_key,
+            generic_generation,
+            &self.row_source_paths,
+        );
         deltas.push(list_delta(
             "ListInsert",
-            key,
-            generation,
+            generic_key,
+            generic_generation,
             ProtocolValue::TodoRow {
                 title: Cow::Borrowed(title),
                 completed: false,
@@ -4725,11 +4662,16 @@ impl TodoRuntime {
         ));
         patches.push(patch(
             "InsertElement",
-            RenderTarget::TodoRow(key),
+            RenderTarget::TodoRow(generic_key),
             ProtocolValue::Text(Cow::Borrowed(title)),
         ));
-        push_source_binding_deltas_for_row(&self.generic, key, generation, deltas);
-        push_source_binding_patches_for_row(&self.generic, key, generation, patches);
+        push_source_binding_deltas_for_row(&self.generic, generic_key, generic_generation, deltas);
+        push_source_binding_patches_for_row(
+            &self.generic,
+            generic_key,
+            generic_generation,
+            patches,
+        );
         Ok(())
     }
 
@@ -4766,7 +4708,7 @@ impl TodoRuntime {
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
         let mut index = 0;
-        while index < self.todos.len() {
+        while index < self.generic.list_len("todos")? {
             let Some(generic_row) = self
                 .generic
                 .remove_row_for_predicate("todos", predicate, index)?
@@ -4774,25 +4716,20 @@ impl TodoRuntime {
                 index += 1;
                 continue;
             };
-            let todo = self.remove_mirror_row_matching(index, generic_row)?;
-            push_source_unbinding_deltas_for_row(&self.generic, todo.key, todo.generation, deltas);
-            push_source_unbinding_patches_for_row(
-                &self.generic,
-                todo.key,
-                todo.generation,
-                patches,
-            );
-            self.generic
-                .unbind_row_sources("todos", todo.key, todo.generation);
+            let (key, generation) = (generic_row.key, generic_row.generation);
+            self.spare_generic_todos.push(generic_row.value);
+            push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
+            push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
+            self.generic.unbind_row_sources("todos", key, generation);
             deltas.push(list_delta(
                 "ListRemove",
-                todo.key,
-                todo.generation,
+                key,
+                generation,
                 ProtocolValue::Null,
             ));
             patches.push(patch(
                 "RemoveElement",
-                RenderTarget::TodoRow(todo.key),
+                RenderTarget::TodoRow(key),
                 ProtocolValue::Null,
             ));
         }
@@ -4812,20 +4749,20 @@ impl TodoRuntime {
         else {
             return Ok(false);
         };
-        let todo = self.remove_mirror_row_matching(index, generic_row)?;
-        push_source_unbinding_deltas_for_row(&self.generic, todo.key, todo.generation, deltas);
-        push_source_unbinding_patches_for_row(&self.generic, todo.key, todo.generation, patches);
-        self.generic
-            .unbind_row_sources("todos", todo.key, todo.generation);
+        let (key, generation) = (generic_row.key, generic_row.generation);
+        self.spare_generic_todos.push(generic_row.value);
+        push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
+        push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
+        self.generic.unbind_row_sources("todos", key, generation);
         deltas.push(list_delta(
             "ListRemove",
-            todo.key,
-            todo.generation,
+            key,
+            generation,
             ProtocolValue::Null,
         ));
         patches.push(patch(
             "RemoveElement",
-            RenderTarget::TodoRow(todo.key),
+            RenderTarget::TodoRow(key),
             ProtocolValue::Null,
         ));
         Ok(true)
@@ -4839,20 +4776,20 @@ impl TodoRuntime {
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
         let generic_row = self.generic.remove_row("todos", index)?;
-        let todo = self.remove_mirror_row_matching(index, generic_row)?;
-        push_source_unbinding_deltas_for_row(&self.generic, todo.key, todo.generation, deltas);
-        push_source_unbinding_patches_for_row(&self.generic, todo.key, todo.generation, patches);
-        self.generic
-            .unbind_row_sources("todos", todo.key, todo.generation);
+        let (key, generation) = (generic_row.key, generic_row.generation);
+        self.spare_generic_todos.push(generic_row.value);
+        push_source_unbinding_deltas_for_row(&self.generic, key, generation, deltas);
+        push_source_unbinding_patches_for_row(&self.generic, key, generation, patches);
+        self.generic.unbind_row_sources("todos", key, generation);
         deltas.push(list_delta(
             "ListRemove",
-            todo.key,
-            todo.generation,
+            key,
+            generation,
             ProtocolValue::Null,
         ));
         patches.push(patch(
             "RemoveElement",
-            RenderTarget::TodoRow(todo.key),
+            RenderTarget::TodoRow(key),
             ProtocolValue::Null,
         ));
         Ok(())
@@ -4865,14 +4802,7 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let (generic_key, generic_generation) = self.generic.move_row("todos", from, to)?;
-        let (key, generation) = self.todos.move_index(from, to)?;
-        if (key, generation) != (generic_key, generic_generation) {
-            return Err(format!(
-                "generic todo move produced key/generation {generic_key}/{generic_generation}, mirror produced {key}/{generation}"
-            )
-            .into());
-        }
+        let (key, generation) = self.generic.move_row("todos", from, to)?;
         deltas.push(SemanticDelta {
             kind: "ListMove",
             list_id: Some("todos"),
@@ -4891,66 +4821,15 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn remove_mirror_row_matching(
-        &mut self,
-        index: usize,
-        generic_row: KeyedRow<GenericRow>,
-    ) -> RuntimeResult<KeyedRow<Todo>> {
-        let todo = self.todos.remove_index(index);
-        if (generic_row.key, generic_row.generation) != (todo.key, todo.generation) {
-            return Err(format!(
-                "generic todo remove produced key/generation {}/{}, mirror removed {}/{}",
-                generic_row.key, generic_row.generation, todo.key, todo.generation
-            )
-            .into());
-        }
-        self.spare_generic_todos.push(generic_row.value);
-        Ok(todo)
-    }
-
     fn set_todo_text_field(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
-        let (generic_key, generic_generation) = self
-            .generic
+        self.generic
             .commit_indexed_text_field("todos", index, field, value)?;
-        if (generic_key, generic_generation)
-            != (self.todos[index].key, self.todos[index].generation)
-        {
-            return Err(format!(
-                "generic todo text commit touched key/generation {generic_key}/{generic_generation}, mirror has {}/{}",
-                self.todos[index].key, self.todos[index].generation
-            )
-            .into());
-        }
-        let row = &mut self.todos[index].value;
-        let target = match field {
-            "title" => &mut row.title,
-            "edit_text" => &mut row.edit_text,
-            _ => return Err(format!("unsupported Todo text field `{field}`").into()),
-        };
-        target.clear();
-        target.push_str(value);
         Ok(())
     }
 
     fn set_todo_bool_field(&mut self, index: usize, field: &str, value: bool) -> RuntimeResult<()> {
-        let (generic_key, generic_generation) = self
-            .generic
+        self.generic
             .commit_indexed_bool_field("todos", index, field, value)?;
-        if (generic_key, generic_generation)
-            != (self.todos[index].key, self.todos[index].generation)
-        {
-            return Err(format!(
-                "generic todo bool commit touched key/generation {generic_key}/{generic_generation}, mirror has {}/{}",
-                self.todos[index].key, self.todos[index].generation
-            )
-            .into());
-        }
-        let row = &mut self.todos[index].value;
-        match field {
-            "completed" => row.completed = value,
-            "editing" => row.editing = value,
-            _ => return Err(format!("unsupported Todo bool field `{field}`").into()),
-        }
         Ok(())
     }
 
@@ -5014,63 +4893,15 @@ impl TodoRuntime {
     }
 
     fn assert_generic_mirror_in_sync(&self) -> RuntimeResult<()> {
-        let generic_new_text = self.generic.root_textlike_ref("store.new_todo_text")?;
-        if generic_new_text != self.new_todo_text {
-            return Err(format!(
-                "store.new_todo_text generic `{generic_new_text}` != mirror `{}`",
-                self.new_todo_text
-            )
-            .into());
-        }
-        let generic_filter = self.generic.root_textlike_ref("store.selected_filter")?;
-        if generic_filter != self.selected_filter {
-            return Err(format!(
-                "store.selected_filter generic `{generic_filter}` != mirror `{}`",
-                self.selected_filter
-            )
-            .into());
-        }
-        let generic_len = self.generic.list_len("todos")?;
-        if generic_len != self.todos.len() {
-            return Err(format!(
-                "generic todos length {generic_len} != mirror {}",
-                self.todos.len()
-            )
-            .into());
-        }
-        for (index, row) in self.todos.iter().enumerate() {
-            let (generic_key, generic_generation) = self.generic.row_identity("todos", index)?;
-            if (generic_key, generic_generation) != (row.key, row.generation) {
-                return Err(format!(
-                    "row {index} identity generic {generic_key}/{generic_generation} != mirror {}/{}",
-                    row.key, row.generation
-                )
-                .into());
-            }
-            for (field, mirror) in [
-                ("title", row.value.title.as_str()),
-                ("edit_text", row.value.edit_text.as_str()),
-            ] {
-                let generic = self.generic.list_row_textlike("todos", index, field)?;
-                if generic != mirror {
-                    return Err(format!(
-                        "row {index} field `{field}` generic `{generic}` != mirror `{mirror}`"
-                    )
-                    .into());
-                }
-            }
-            for (field, mirror) in [
-                ("completed", row.value.completed),
-                ("editing", row.value.editing),
-            ] {
-                let generic = self.generic.list_row_bool("todos", index, field)?;
-                if generic != mirror {
-                    return Err(format!(
-                        "row {index} field `{field}` generic {generic} != mirror {mirror}"
-                    )
-                    .into());
-                }
-            }
+        self.generic.root_textlike_ref("store.new_todo_text")?;
+        self.generic.root_textlike_ref("store.selected_filter")?;
+        for index in 0..self.generic.list_len("todos")? {
+            self.generic.row_identity("todos", index)?;
+            self.generic.list_row_textlike("todos", index, "title")?;
+            self.generic
+                .list_row_textlike("todos", index, "edit_text")?;
+            self.generic.list_row_bool("todos", index, "completed")?;
+            self.generic.list_row_bool("todos", index, "editing")?;
         }
         Ok(())
     }
@@ -5105,8 +4936,6 @@ impl TodoRuntime {
     ) -> RuntimeResult<()> {
         match target {
             "store.new_todo_text" => {
-                self.new_todo_text.clear();
-                self.new_todo_text.push_str(&value);
                 deltas.push(field_delta(
                     None,
                     None,
@@ -5120,8 +4949,6 @@ impl TodoRuntime {
                 ));
             }
             "store.selected_filter" => {
-                self.selected_filter.clear();
-                self.selected_filter.push_str(&value);
                 deltas.push(field_delta(
                     None,
                     None,
@@ -5246,9 +5073,52 @@ impl TodoRuntime {
         self.generic.row_identity("todos", index)
     }
 
+    #[cfg(test)]
+    fn todo_len(&self) -> usize {
+        self.generic.list_len("todos").unwrap()
+    }
+
+    #[cfg(test)]
+    fn todo_key(&self, index: usize) -> u64 {
+        self.todo_row_identity(index).unwrap().0
+    }
+
+    #[cfg(test)]
+    fn todo_generation(&self, index: usize) -> u64 {
+        self.todo_row_identity(index).unwrap().1
+    }
+
+    #[cfg(test)]
+    fn todo_title_for_test(&self, index: usize) -> &str {
+        self.generic
+            .list_row_textlike("todos", index, "title")
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    fn todo_edit_text_for_test(&self, index: usize) -> &str {
+        self.generic
+            .list_row_textlike("todos", index, "edit_text")
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    fn todo_completed_for_test(&self, index: usize) -> bool {
+        self.generic
+            .list_row_bool("todos", index, "completed")
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    fn todo_editing_for_test(&self, index: usize) -> bool {
+        self.generic
+            .list_row_bool("todos", index, "editing")
+            .unwrap()
+    }
+
     fn find_index_at_occurrence(&self, title: &str, occurrence: usize) -> RuntimeResult<usize> {
         let occurrence = occurrence.max(1);
-        (0..self.todos.len())
+        (0..self.generic.list_len("todos")?)
             .filter(|index| {
                 self.generic
                     .list_row_textlike("todos", *index, "title")
@@ -5261,7 +5131,7 @@ impl TodoRuntime {
     }
 
     fn find_editing_index(&self) -> RuntimeResult<usize> {
-        (0..self.todos.len())
+        (0..self.generic.list_len("todos")?)
             .find(|index| {
                 self.generic
                     .list_row_bool("todos", *index, "editing")
@@ -5446,7 +5316,7 @@ fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
         "rows": rows,
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.todos.len(),
+        "list_slot_count": runtime.generic.list_len("todos").unwrap_or(0),
         "dirty_key_count": dirty_key_count(&deltas),
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
@@ -5472,7 +5342,7 @@ fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
         "rows": rows,
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.todos.len(),
+        "list_slot_count": runtime.generic.list_len("todos").unwrap_or(0),
         "dirty_key_count": dirty_key_count(&deltas),
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
@@ -7364,8 +7234,8 @@ mod tests {
             include_str!("../../../examples/todomvc.bn").replace("Clean room", "Buy groceries");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let target_key = runtime.todos[1].key;
-        let target_generation = runtime.todos[1].generation;
+        let target_key = runtime.todo_key(1);
+        let target_generation = runtime.todo_generation(1);
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         action.insert(
@@ -7400,8 +7270,8 @@ mod tests {
         runtime
             .apply_step_into(&step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.completed, false);
-        assert_eq!(runtime.todos[1].value.completed, true);
+        assert_eq!(runtime.todo_completed_for_test(0), false);
+        assert_eq!(runtime.todo_completed_for_test(1), true);
         assert_eq!(deltas.iter().find_map(|delta| delta.key), Some(2));
     }
 
@@ -7416,13 +7286,14 @@ mod tests {
         let row_source_count = runtime.row_source_paths.len();
         assert_eq!(
             runtime.generic.source_binding_count(),
-            runtime.todos.len() * row_source_count
+            runtime.todo_len() * row_source_count
         );
-        for row in runtime.todos.iter() {
+        for index in 0..runtime.todo_len() {
+            let (key, generation) = runtime.todo_row_identity(index).unwrap();
             assert_eq!(
                 runtime
                     .generic
-                    .row_source_binding_count("todos", row.key, row.generation),
+                    .row_source_binding_count("todos", key, generation),
                 row_source_count
             );
         }
@@ -7432,22 +7303,24 @@ mod tests {
         runtime
             .append_todo("New source row", &mut deltas, &mut patches)
             .unwrap();
-        let row = runtime.todos.iter().last().unwrap();
+        let (key, generation) = runtime
+            .todo_row_identity(runtime.todo_len() - 1)
+            .expect("appended row exists");
         assert_eq!(
             runtime
                 .generic
-                .row_source_binding_count("todos", row.key, row.generation),
+                .row_source_binding_count("todos", key, generation),
             row_source_count
         );
         let bind_count = deltas
             .iter()
-            .filter(|delta| delta.kind == "SourceBind" && delta.key == Some(row.key))
+            .filter(|delta| delta.kind == "SourceBind" && delta.key == Some(key))
             .count();
         assert_eq!(bind_count, row_source_count);
         assert!(
             deltas
                 .iter()
-                .filter(|delta| delta.kind == "SourceBind" && delta.key == Some(row.key))
+                .filter(|delta| delta.kind == "SourceBind" && delta.key == Some(key))
                 .all(|delta| delta.source_id.is_some() && delta.bind_epoch.is_some())
         );
         let bind_patch_count = patches
@@ -7484,11 +7357,11 @@ mod tests {
                 .row_source_paths
                 .contains(&"todo.sources.todo_checkbox.click")
         );
-        let row = runtime.todos.iter().next().unwrap();
+        let (key, generation) = runtime.todo_row_identity(0).unwrap();
         assert!(
             runtime
                 .generic
-                .row_source_bindings("todos", row.key, row.generation)
+                .row_source_bindings("todos", key, generation)
                 .any(|binding| binding.source_path == "todo.sources.done_checkbox.click")
         );
     }
@@ -7534,7 +7407,13 @@ mod tests {
         runtime
             .apply_step_into(&type_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.new_todo_text, "IR routed text");
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("store.new_todo_text")
+                .unwrap(),
+            "IR routed text"
+        );
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path == Some("store.new_todo_text")
         }));
@@ -7561,7 +7440,13 @@ mod tests {
         runtime
             .apply_step_into(&filter_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.selected_filter, "Active");
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("store.selected_filter")
+                .unwrap(),
+            "Active"
+        );
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path == Some("store.selected_filter")
         }));
@@ -7601,8 +7486,8 @@ mod tests {
         runtime
             .apply_step_into(&row_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todos[0].value.completed);
-        assert!(!runtime.todos[1].value.completed);
+        assert!(runtime.todo_completed_for_test(0));
+        assert!(!runtime.todo_completed_for_test(1));
 
         deltas.clear();
         patches.clear();
@@ -7626,7 +7511,7 @@ mod tests {
         runtime
             .apply_step_into(&all_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todos.iter().all(|todo| todo.value.completed));
+        assert!((0..runtime.todo_len()).all(|index| runtime.todo_completed_for_test(index)));
         assert_eq!(
             deltas
                 .iter()
@@ -7673,8 +7558,8 @@ mod tests {
         runtime
             .apply_step_into(&open_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todos[0].value.editing);
-        assert_eq!(runtime.todos[0].value.edit_text, "Buy groceries");
+        assert!(runtime.todo_editing_for_test(0));
+        assert_eq!(runtime.todo_edit_text_for_test(0), "Buy groceries");
 
         deltas.clear();
         patches.clear();
@@ -7713,7 +7598,7 @@ mod tests {
         runtime
             .apply_step_into(&change_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.edit_text, "Draft via IR");
+        assert_eq!(runtime.todo_edit_text_for_test(0), "Draft via IR");
 
         deltas.clear();
         patches.clear();
@@ -7746,8 +7631,8 @@ mod tests {
         runtime
             .apply_step_into(&close_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(!runtime.todos[0].value.editing);
-        assert_eq!(runtime.todos[0].value.edit_text, "Buy groceries");
+        assert!(!runtime.todo_editing_for_test(0));
+        assert_eq!(runtime.todo_edit_text_for_test(0), "Buy groceries");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet"
                 && delta.field_path == Some("editing")
@@ -7832,7 +7717,7 @@ mod tests {
         runtime
             .apply_step_into(&commit_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.title, "Committed via IR");
+        assert_eq!(runtime.todo_title_for_test(0), "Committed via IR");
         assert!(
             deltas
                 .iter()
@@ -7941,7 +7826,7 @@ mod tests {
         runtime
             .apply_step_into(&blur_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.title, "Blur via IR");
+        assert_eq!(runtime.todo_title_for_test(0), "Blur via IR");
         assert!(
             deltas
                 .iter()
@@ -7993,7 +7878,7 @@ mod tests {
         runtime
             .apply_step_into(&append_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[2].value.title, "Derived append");
+        assert_eq!(runtime.todo_title_for_test(2), "Derived append");
 
         deltas.clear();
         patches.clear();
@@ -8044,7 +7929,7 @@ mod tests {
         runtime
             .apply_step_into(&clear_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.title, "Clean room");
+        assert_eq!(runtime.todo_title_for_test(0), "Clean room");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
 
         deltas.clear();
@@ -8073,7 +7958,7 @@ mod tests {
         runtime
             .apply_step_into(&delete_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todos[0].value.title, "Derived append");
+        assert_eq!(runtime.todo_title_for_test(0), "Derived append");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
     }
 
@@ -8194,8 +8079,8 @@ mod tests {
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
         let row_source_count = runtime.row_source_paths.len();
-        let removed_key = runtime.todos[0].key;
-        let removed_generation = runtime.todos[0].generation;
+        let removed_key = runtime.todo_key(0);
+        let removed_generation = runtime.todo_generation(0);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime.remove_index(0, &mut deltas, &mut patches).unwrap();
@@ -8243,8 +8128,8 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let target_key = runtime.todos[0].key;
-        let target_generation = runtime.todos[0].generation;
+        let target_key = runtime.todo_key(0);
+        let target_generation = runtime.todo_generation(0);
         let binding = runtime
             .generic
             .row_source_bindings("todos", target_key, target_generation)
@@ -8287,7 +8172,7 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert_eq!(runtime.todos[0].value.completed, false);
+        assert_eq!(runtime.todo_completed_for_test(0), false);
     }
 
     #[test]
@@ -8298,8 +8183,8 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let stale_key = runtime.todos[0].key;
-        let stale_generation = runtime.todos[0].generation;
+        let stale_key = runtime.todo_key(0);
+        let stale_generation = runtime.todo_generation(0);
         let mut setup_deltas = Vec::new();
         let mut setup_patches = Vec::new();
         runtime
@@ -8340,9 +8225,9 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert_eq!(runtime.todos.len(), 1);
-        assert_eq!(runtime.todos[0].value.title, "Clean room");
-        assert_eq!(runtime.todos[0].value.completed, false);
+        assert_eq!(runtime.todo_len(), 1);
+        assert_eq!(runtime.todo_title_for_test(0), "Clean room");
+        assert_eq!(runtime.todo_completed_for_test(0), false);
     }
 
     #[test]
@@ -8353,11 +8238,11 @@ mod tests {
         )
         .unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let moved_key = runtime.todos[0].key;
+        let moved_key = runtime.todo_key(0);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime.move_index(0, 1, &mut deltas, &mut patches).unwrap();
-        assert_eq!(runtime.todos[1].key, moved_key);
+        assert_eq!(runtime.todo_key(1), moved_key);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, "ListMove");
         assert_eq!(deltas[0].key, Some(moved_key));

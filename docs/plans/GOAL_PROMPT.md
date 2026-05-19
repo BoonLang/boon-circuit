@@ -30,7 +30,7 @@ Implement:
 
 Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are real implementation blockers:
 - reports still say `static_graph_interpreter_adapter_backed`
-- `run_loaded_scenario` still dispatches by `ProgramKind` into `TodoRuntime`/`CellsRuntime`
+- `LoadedRuntime` owns generic storage now, but residual TodoMVC/Cells surface drivers still handle event classification, render lowering, and formula behavior
 - headed Ply checks still prove only an OS keyboard probe plus scenario replay, not every step through real OS pointer/keyboard hit testing
 - aggregate all reports and fresh human reports are still missing
 

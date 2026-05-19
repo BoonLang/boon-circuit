@@ -517,11 +517,12 @@ starts. The compiled plan also infers the executable surface profile from IR
 shape (`todos` plus TodoMVC state cells, or `cells` plus Cells state/formula
 tables) rather than trusting the parser's example marker during runtime
 dispatch and report generation. `run_loaded_scenario` now enters one shared
-`run_generic_scenario` loop through a `LoadedRuntime` shell. That shell now
-constructs the scheduled generic runtime before attaching a surface driver, but
-it still selects the TodoMVC or Cells driver by inferred surface profile. The
-tick executor remains adapter-backed until all source events execute through one
-generic schedule without the TodoMVC/Cells driver layer.
+`run_generic_scenario` loop through a `LoadedRuntime` shell. That shell owns the
+scheduled generic storage between ticks and temporarily lends it to the selected
+TodoMVC or Cells surface driver for residual event classification, render
+lowering, and Cells formula behavior. The tick executor remains adapter-backed
+until all source events execute through one generic schedule without the
+TodoMVC/Cells driver layer.
 
 Implementation note: the current IR cause table is source-derived, not a
 TodoMVC/Cells-specific Rust lookup table. It derives row scopes from

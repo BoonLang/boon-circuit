@@ -569,7 +569,7 @@ impl LiveRuntime {
         let compiled = CompiledProgram::from_ir(&ir)?;
         validate_executable_surface(&parsed, &ir, &compiled)?;
         let mut runtime = LoadedRuntime::new(&parsed, &ir, &compiled)?;
-        runtime.prepare_for_scenario(&scenario);
+        runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
             runtime,
             next_step: 1,
@@ -612,7 +612,7 @@ impl LiveRuntime {
         })
     }
 
-    pub fn state_summary(&self) -> JsonValue {
+    pub fn state_summary(&mut self) -> JsonValue {
         self.runtime.state_summary()
     }
 }
@@ -1319,9 +1319,15 @@ fn run_loaded_scenario(
     run_generic_scenario(runtime, parsed, ir, &compiled, scenario, layer)
 }
 
-enum LoadedRuntime {
-    Todo(TodoRuntime),
-    Cells(CellsRuntime),
+struct LoadedRuntime {
+    generic: Option<GenericScheduledRuntime>,
+    surface: LoadedRuntimeSurface,
+}
+
+enum LoadedRuntimeSurface {
+    Todo(TodoRuntimeState),
+    Cells(CellsRuntimeState),
+    Taken,
 }
 
 impl LoadedRuntime {
@@ -1332,9 +1338,71 @@ impl LoadedRuntime {
     ) -> RuntimeResult<Self> {
         let generic = GenericScheduledRuntime::new(ir, compiled)?;
         match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => Ok(Self::Todo(TodoRuntime::from_generic(generic)?)),
+            ExecutableSurfaceKind::TodoMvc => {
+                let runtime = TodoRuntime::from_generic(generic)?;
+                let (generic, state) = runtime.into_loaded_parts();
+                Ok(Self {
+                    generic: Some(generic),
+                    surface: LoadedRuntimeSurface::Todo(state),
+                })
+            }
             ExecutableSurfaceKind::Cells => {
-                Ok(Self::Cells(CellsRuntime::from_generic(generic, ir)?))
+                let runtime = CellsRuntime::from_generic(generic, ir)?;
+                let (generic, state) = runtime.into_loaded_parts();
+                Ok(Self {
+                    generic: Some(generic),
+                    surface: LoadedRuntimeSurface::Cells(state),
+                })
+            }
+        }
+    }
+
+    fn with_todo_runtime<T>(
+        &mut self,
+        call: impl FnOnce(&mut TodoRuntime) -> RuntimeResult<T>,
+    ) -> RuntimeResult<T> {
+        let generic = self
+            .generic
+            .take()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        match std::mem::replace(&mut self.surface, LoadedRuntimeSurface::Taken) {
+            LoadedRuntimeSurface::Todo(state) => {
+                let mut runtime = TodoRuntime::from_loaded_parts(generic, state);
+                let result = call(&mut runtime);
+                let (generic, state) = runtime.into_loaded_parts();
+                self.generic = Some(generic);
+                self.surface = LoadedRuntimeSurface::Todo(state);
+                result
+            }
+            surface => {
+                self.generic = Some(generic);
+                self.surface = surface;
+                Err("LoadedRuntime surface mismatch: expected TodoMVC".into())
+            }
+        }
+    }
+
+    fn with_cells_runtime<T>(
+        &mut self,
+        call: impl FnOnce(&mut CellsRuntime) -> RuntimeResult<T>,
+    ) -> RuntimeResult<T> {
+        let generic = self
+            .generic
+            .take()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        match std::mem::replace(&mut self.surface, LoadedRuntimeSurface::Taken) {
+            LoadedRuntimeSurface::Cells(state) => {
+                let mut runtime = CellsRuntime::from_loaded_parts(generic, state);
+                let result = call(&mut runtime);
+                let (generic, state) = runtime.into_loaded_parts();
+                self.generic = Some(generic);
+                self.surface = LoadedRuntimeSurface::Cells(state);
+                result
+            }
+            surface => {
+                self.generic = Some(generic);
+                self.surface = surface;
+                Err("LoadedRuntime surface mismatch: expected Cells".into())
             }
         }
     }
@@ -1706,7 +1774,7 @@ enum StepExecutionExtra {
 }
 
 trait ScenarioExecutor {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario);
+    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()>;
 
     fn apply_step<'a>(
         &mut self,
@@ -1715,11 +1783,11 @@ trait ScenarioExecutor {
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<StepExecutionMetrics>;
 
-    fn assert_step_after_measurement(&self, step: &ScenarioStep) -> RuntimeResult<()>;
+    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()>;
 
-    fn state_summary(&self) -> JsonValue;
+    fn state_summary(&mut self) -> JsonValue;
 
-    fn stress_profiles(&self, _ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+    fn stress_profiles(&mut self, _ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
         Ok(None)
     }
 }
@@ -1732,7 +1800,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
     scenario: &Scenario,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
-    runtime.prepare_for_scenario(scenario);
+    runtime.prepare_for_scenario(scenario)?;
     let mut semantic_deltas = Vec::new();
     let mut render_patches = Vec::new();
     let mut per_step = Vec::new();
@@ -1896,6 +1964,8 @@ fn base_example_report(
         "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
         "generic_scenario_loop_executor": true,
         "generic_schedule_instantiated_before_adapter": true,
+        "loaded_runtime_owns_generic_schedule_storage": true,
+        "surface_driver_borrows_generic_storage_for_tick": true,
         "generic_source_event_ingest": true,
         "generic_source_binding_store": true,
         "generic_indexed_branch_evaluator": true,
@@ -1975,7 +2045,7 @@ fn base_example_report(
         "generic_interpreter_complete": false,
         "example_behavior_adapter": true,
         "adapter_kind": compiled.surface.kind.as_str(),
-        "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime drivers by inferred executable surface after constructing the generic schedule",
+        "adapter_blocker": "LoadedRuntime now owns the generic schedule/storage, but TodoMVC/Cells surface drivers still handle event classification, render lowering, and formula-specific residual behavior",
         "not_final_architecture_acceptance": true,
         "generic_runtime_slices": generic_runtime_slices
     });
@@ -5592,6 +5662,12 @@ struct TodoRuntime {
 }
 
 #[derive(Clone, Debug)]
+struct TodoRuntimeState {
+    next_source_seq: u64,
+    stale_source_drop_count: u64,
+}
+
+#[derive(Clone, Debug)]
 enum TodoEvent<'a> {
     NewInputChange {
         source: &'a str,
@@ -5649,6 +5725,24 @@ enum TodoEvent<'a> {
 }
 
 impl TodoRuntime {
+    fn from_loaded_parts(generic: GenericScheduledRuntime, state: TodoRuntimeState) -> Self {
+        Self {
+            generic,
+            next_source_seq: state.next_source_seq,
+            stale_source_drop_count: state.stale_source_drop_count,
+        }
+    }
+
+    fn into_loaded_parts(self) -> (GenericScheduledRuntime, TodoRuntimeState) {
+        (
+            self.generic,
+            TodoRuntimeState {
+                next_source_seq: self.next_source_seq,
+                stale_source_drop_count: self.stale_source_drop_count,
+            },
+        )
+    }
+
     fn from_generic(mut generic: GenericScheduledRuntime) -> RuntimeResult<Self> {
         let todo_count = generic.list_len("todos")?;
         let row_source_paths = generic.row_source_paths("todos")?.to_vec();
@@ -7067,10 +7161,17 @@ impl TodoRuntime {
 }
 
 impl ScenarioExecutor for LoadedRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
-        match self {
-            Self::Todo(runtime) => runtime.prepare_for_scenario(scenario),
-            Self::Cells(runtime) => runtime.prepare_for_scenario(scenario),
+    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
+        match &self.surface {
+            LoadedRuntimeSurface::Todo(_) => self.with_todo_runtime(|runtime| {
+                runtime.prepare_for_scenario(scenario);
+                Ok(())
+            }),
+            LoadedRuntimeSurface::Cells(_) => self.with_cells_runtime(|runtime| {
+                runtime.prepare_for_scenario(scenario);
+                Ok(())
+            }),
+            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 
@@ -7080,37 +7181,60 @@ impl ScenarioExecutor for LoadedRuntime {
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<StepExecutionMetrics> {
-        match self {
-            Self::Todo(runtime) => runtime.apply_step(step, deltas, patches),
-            Self::Cells(runtime) => runtime.apply_step(step, deltas, patches),
+        match &self.surface {
+            LoadedRuntimeSurface::Todo(_) => {
+                self.with_todo_runtime(|runtime| runtime.apply_step(step, deltas, patches))
+            }
+            LoadedRuntimeSurface::Cells(_) => {
+                self.with_cells_runtime(|runtime| runtime.apply_step(step, deltas, patches))
+            }
+            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 
-    fn assert_step_after_measurement(&self, step: &ScenarioStep) -> RuntimeResult<()> {
-        match self {
-            Self::Todo(runtime) => runtime.assert_step_after_measurement(step),
-            Self::Cells(runtime) => runtime.assert_step_after_measurement(step),
+    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
+        match &self.surface {
+            LoadedRuntimeSurface::Todo(_) => {
+                self.with_todo_runtime(|runtime| runtime.assert_step_after_measurement(step))
+            }
+            LoadedRuntimeSurface::Cells(_) => {
+                self.with_cells_runtime(|runtime| runtime.assert_step_after_measurement(step))
+            }
+            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 
-    fn state_summary(&self) -> JsonValue {
-        match self {
-            Self::Todo(runtime) => runtime.state_summary(),
-            Self::Cells(runtime) => runtime.state_summary(),
+    fn state_summary(&mut self) -> JsonValue {
+        match &self.surface {
+            LoadedRuntimeSurface::Todo(_) => self
+                .with_todo_runtime(|runtime| Ok(runtime.state_summary()))
+                .unwrap_or_else(|error| json!({ "error": error.to_string() })),
+            LoadedRuntimeSurface::Cells(_) => self
+                .with_cells_runtime(|runtime| Ok(runtime.state_summary()))
+                .unwrap_or_else(|error| json!({ "error": error.to_string() })),
+            LoadedRuntimeSurface::Taken => {
+                json!({ "error": "LoadedRuntime surface was already borrowed" })
+            }
         }
     }
 
-    fn stress_profiles(&self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
-        match self {
-            Self::Todo(runtime) => runtime.stress_profiles(ir),
-            Self::Cells(runtime) => runtime.stress_profiles(ir),
+    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+        match &self.surface {
+            LoadedRuntimeSurface::Todo(_) => {
+                self.with_todo_runtime(|runtime| runtime.stress_profiles(ir))
+            }
+            LoadedRuntimeSurface::Cells(_) => {
+                self.with_cells_runtime(|runtime| runtime.stress_profiles(ir))
+            }
+            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 }
 
 impl ScenarioExecutor for TodoRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
+    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
         TodoRuntime::prepare_for_scenario(self, scenario);
+        Ok(())
     }
 
     fn apply_step<'a>(
@@ -7131,15 +7255,15 @@ impl ScenarioExecutor for TodoRuntime {
         })
     }
 
-    fn assert_step_after_measurement(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
         self.assert_step(step)
     }
 
-    fn state_summary(&self) -> JsonValue {
+    fn state_summary(&mut self) -> JsonValue {
         self.summary()
     }
 
-    fn stress_profiles(&self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
         Ok(Some(todomvc_stress_profiles(ir)))
     }
 }
@@ -7432,6 +7556,23 @@ struct CellsRuntime {
 }
 
 #[derive(Clone, Debug)]
+struct CellsRuntimeState {
+    cells: Vec<Cell>,
+    reverse_deps: Vec<Vec<usize>>,
+    columns: usize,
+    rows: usize,
+    interned_texts: Vec<&'static str>,
+    affected: Vec<usize>,
+    queue: Vec<usize>,
+    visiting: Vec<bool>,
+    eval_cache: Vec<Option<Result<i64, &'static str>>>,
+    step_recomputed: Vec<usize>,
+    last_recompute_candidates: usize,
+    last_formula_eval_calls: usize,
+    last_dependency_edge_walks: usize,
+}
+
+#[derive(Clone, Debug)]
 enum CellEvent<'a> {
     Change {
         source: &'a str,
@@ -7450,6 +7591,46 @@ enum CellEvent<'a> {
 }
 
 impl CellsRuntime {
+    fn from_loaded_parts(generic: GenericScheduledRuntime, state: CellsRuntimeState) -> Self {
+        Self {
+            generic,
+            cells: state.cells,
+            reverse_deps: state.reverse_deps,
+            columns: state.columns,
+            rows: state.rows,
+            interned_texts: state.interned_texts,
+            affected: state.affected,
+            queue: state.queue,
+            visiting: state.visiting,
+            eval_cache: state.eval_cache,
+            step_recomputed: state.step_recomputed,
+            last_recompute_candidates: state.last_recompute_candidates,
+            last_formula_eval_calls: state.last_formula_eval_calls,
+            last_dependency_edge_walks: state.last_dependency_edge_walks,
+        }
+    }
+
+    fn into_loaded_parts(self) -> (GenericScheduledRuntime, CellsRuntimeState) {
+        (
+            self.generic,
+            CellsRuntimeState {
+                cells: self.cells,
+                reverse_deps: self.reverse_deps,
+                columns: self.columns,
+                rows: self.rows,
+                interned_texts: self.interned_texts,
+                affected: self.affected,
+                queue: self.queue,
+                visiting: self.visiting,
+                eval_cache: self.eval_cache,
+                step_recomputed: self.step_recomputed,
+                last_recompute_candidates: self.last_recompute_candidates,
+                last_formula_eval_calls: self.last_formula_eval_calls,
+                last_dependency_edge_walks: self.last_dependency_edge_walks,
+            },
+        )
+    }
+
     fn from_generic(generic: GenericScheduledRuntime, ir: &TypedProgram) -> RuntimeResult<Self> {
         let (columns, rows) = cells_grid_dimensions_from_ir(ir)
             .ok_or("Cells IR has no Grid/cells list initializer")?;
@@ -8252,8 +8433,9 @@ impl CellsRuntime {
 }
 
 impl ScenarioExecutor for CellsRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
+    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
         CellsRuntime::prepare_for_scenario(self, scenario);
+        Ok(())
     }
 
     fn apply_step<'a>(
@@ -8282,15 +8464,15 @@ impl ScenarioExecutor for CellsRuntime {
         })
     }
 
-    fn assert_step_after_measurement(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
         self.assert_step(step, &self.step_recomputed)
     }
 
-    fn state_summary(&self) -> JsonValue {
+    fn state_summary(&mut self) -> JsonValue {
         self.summary()
     }
 
-    fn stress_profiles(&self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
         Ok(Some(cells_stress_profiles(ir)?))
     }
 }

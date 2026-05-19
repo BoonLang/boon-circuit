@@ -236,6 +236,10 @@ steady_vram_mib_if_available
 peak_vram_mib_if_available
 heap_alloc_count_per_step
 heap_alloc_bytes_per_step
+apply_heap_alloc_count
+apply_heap_alloc_bytes
+expectation_heap_alloc_count
+expectation_heap_alloc_bytes
 graph_node_count
 graph_rebuild_count
 list_slot_count

@@ -1815,8 +1815,26 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         let before = Instant::now();
         let allocations_before = allocation_snapshot();
         let metrics = runtime.apply_step(step, &mut step_deltas, &mut step_patches)?;
+        let allocations_after_apply = allocation_snapshot();
         assert_delta_expectations(step, &step_deltas, &step_patches)?;
+        let allocations_after_expectations = allocation_snapshot();
         let alloc_delta = allocation_delta(allocations_before);
+        let apply_alloc_delta = AllocationSnapshot {
+            count: allocations_after_apply
+                .count
+                .saturating_sub(allocations_before.count),
+            bytes: allocations_after_apply
+                .bytes
+                .saturating_sub(allocations_before.bytes),
+        };
+        let expectation_alloc_delta = AllocationSnapshot {
+            count: allocations_after_expectations
+                .count
+                .saturating_sub(allocations_after_apply.count),
+            bytes: allocations_after_expectations
+                .bytes
+                .saturating_sub(allocations_after_apply.bytes),
+        };
         let elapsed = before.elapsed().as_secs_f64() * 1000.0;
         latencies.push(elapsed);
         allocation_deltas.push(alloc_delta);
@@ -1832,6 +1850,10 @@ fn run_generic_scenario<R: ScenarioExecutor>(
             "render_patch_count": step_patches.len(),
             "heap_alloc_count": alloc_delta.count,
             "heap_alloc_bytes": alloc_delta.bytes,
+            "apply_heap_alloc_count": apply_alloc_delta.count,
+            "apply_heap_alloc_bytes": apply_alloc_delta.bytes,
+            "expectation_heap_alloc_count": expectation_alloc_delta.count,
+            "expectation_heap_alloc_bytes": expectation_alloc_delta.bytes,
             "latency_ms": elapsed,
         });
         let object = step_report
@@ -2752,7 +2774,7 @@ impl GenericScheduledRuntime {
         self.list_source_bindings
             .bindings
             .iter()
-            .find_map(|binding| (row_scope_name(binding.list) == scope).then_some(binding.list))
+            .find_map(|binding| row_scope_matches_list(binding.list, scope).then_some(binding.list))
             .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
     }
 
@@ -2996,7 +3018,9 @@ impl GenericCircuitRuntime {
                     .iter()
                     .map(|row| {
                         let seed_fields = list_seed_fields(row)?;
-                        row_template.materialize(seed_fields)
+                        let mut row = row_template.materialize(seed_fields)?;
+                        seed_indexed_formula_fields(ir, &row_scope, &mut row);
+                        Ok(row)
                     })
                     .collect::<RuntimeResult<Vec<_>>>()?,
                 ListInitializer::Grid { columns, rows } => {
@@ -3011,7 +3035,9 @@ impl GenericCircuitRuntime {
                             );
                             let mut seed_fields = BTreeMap::new();
                             seed_fields.insert("address".to_owned(), RuntimeValue::Text(address));
-                            grid_rows.push(row_template.materialize(seed_fields)?);
+                            let mut row = row_template.materialize(seed_fields)?;
+                            seed_indexed_formula_fields(ir, &row_scope, &mut row);
+                            grid_rows.push(row);
                         }
                     }
                     grid_rows
@@ -4451,12 +4477,41 @@ fn runtime_value_from_initial(
     }
 }
 
+fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut GenericRow) {
+    for value in ir
+        .derived_values
+        .iter()
+        .filter(|value| value.indexed && value.kind == DerivedValueKind::Formula)
+    {
+        let Some(field) = value
+            .path
+            .strip_prefix(row_scope)
+            .and_then(|path| path.strip_prefix('.'))
+        else {
+            continue;
+        };
+        row.fields
+            .entry(field.to_owned())
+            .or_insert_with(|| RuntimeValue::Text(String::new()));
+    }
+}
+
 fn row_scope_name(list_name: &str) -> String {
     list_name
         .strip_suffix("ies")
         .map(|prefix| format!("{prefix}y"))
         .or_else(|| list_name.strip_suffix('s').map(str::to_owned))
         .unwrap_or_else(|| format!("{list_name}_item"))
+}
+
+fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
+    if let Some(prefix) = list_name.strip_suffix("ies") {
+        return scope.strip_suffix('y') == Some(prefix);
+    }
+    if let Some(prefix) = list_name.strip_suffix('s') {
+        return scope == prefix;
+    }
+    scope.strip_suffix("_item") == Some(list_name)
 }
 
 fn todo_generic_row(title: &str) -> GenericRow {
@@ -4491,6 +4546,9 @@ fn cell_generic_row(address: &str) -> GenericRow {
     fields.insert("address".to_owned(), RuntimeValue::Text(address.to_owned()));
     fields.insert("editing_text".to_owned(), RuntimeValue::Text(String::new()));
     fields.insert("formula_text".to_owned(), RuntimeValue::Text(String::new()));
+    fields.insert("value".to_owned(), RuntimeValue::Text(String::new()));
+    fields.insert("error".to_owned(), RuntimeValue::Text(String::new()));
+    fields.insert("dependencies".to_owned(), RuntimeValue::Text(String::new()));
     fields.insert("editing".to_owned(), RuntimeValue::Bool(false));
     GenericRow { fields }
 }
@@ -6669,7 +6727,8 @@ impl TodoRuntime {
                 }
                 Ok(())
             },
-        )
+        )?;
+        Ok(())
     }
 
     fn set_completed_value(
@@ -7335,6 +7394,7 @@ struct Cell {
     value_number: Option<i64>,
     error: Option<&'static str>,
     deps: Vec<usize>,
+    dependency_text: String,
     parsed: FormulaAst,
 }
 
@@ -7770,6 +7830,7 @@ impl CellsRuntime {
         for cell in &mut self.cells {
             cell.value.reserve(max_text_len);
             cell.deps.reserve(max_deps);
+            cell.dependency_text.reserve(max_deps.saturating_mul(8));
         }
         self.generic
             .reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
@@ -7781,6 +7842,21 @@ impl CellsRuntime {
                 max_text_len.saturating_sub(current.len())
             })
             .expect("Cells generic runtime has editing_text fields");
+        self.generic
+            .reserve_list_row_textlike_fields("cells", "value", |_, current| {
+                max_text_len.saturating_sub(current.len())
+            })
+            .expect("Cells generic runtime has value fields");
+        self.generic
+            .reserve_list_row_textlike_fields("cells", "error", |_, current| {
+                max_text_len.saturating_sub(current.len())
+            })
+            .expect("Cells generic runtime has error fields");
+        self.generic
+            .reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
+                max_deps.saturating_mul(8).saturating_sub(current.len())
+            })
+            .expect("Cells generic runtime has dependency fields");
         let minimum_fanout_capacity = max_deps.max(4);
         for dependents in &mut self.reverse_deps {
             dependents.reserve(minimum_fanout_capacity);
@@ -8211,12 +8287,7 @@ impl CellsRuntime {
     }
 
     fn sync_cell_derived_fields(&mut self, index: usize) -> RuntimeResult<()> {
-        let dependencies = self.cells[index]
-            .deps
-            .iter()
-            .map(|dependency| self.address_for(*dependency))
-            .collect::<Vec<_>>()
-            .join(",");
+        self.refresh_dependency_text(index);
         self.generic.set_or_insert_list_row_textlike(
             "cells",
             index,
@@ -8229,8 +8300,27 @@ impl CellsRuntime {
             "error",
             self.cells[index].error.unwrap_or_default(),
         )?;
-        self.generic
-            .set_or_insert_list_row_textlike("cells", index, "dependencies", &dependencies)
+        self.generic.set_or_insert_list_row_textlike(
+            "cells",
+            index,
+            "dependencies",
+            &self.cells[index].dependency_text,
+        )
+    }
+
+    fn refresh_dependency_text(&mut self, index: usize) {
+        self.cells[index].dependency_text.clear();
+        for offset in 0..self.cells[index].deps.len() {
+            if offset > 0 {
+                self.cells[index].dependency_text.push(',');
+            }
+            let dependency = self.cells[index].deps[offset];
+            push_cell_address(
+                self.columns,
+                dependency,
+                &mut self.cells[index].dependency_text,
+            );
+        }
     }
 
     fn collect_affected(&mut self, changed_index: usize) {
@@ -8341,10 +8431,9 @@ impl CellsRuntime {
     }
 
     fn address_for(&self, index: usize) -> String {
-        let col = index % self.columns;
-        let row = index / self.columns + 1;
-        let label = spreadsheet_column_label(col).unwrap_or_else(|| "?".to_owned());
-        format!("{label}{row}")
+        let mut address = String::new();
+        push_cell_address(self.columns, index, &mut address);
+        address
     }
 
     fn eval_cell(&mut self, index: usize) -> Result<i64, &'static str> {
@@ -8474,6 +8563,28 @@ impl ScenarioExecutor for CellsRuntime {
 
     fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
         Ok(Some(cells_stress_profiles(ir)?))
+    }
+}
+
+fn push_cell_address(columns: usize, index: usize, output: &mut String) {
+    let col = index % columns;
+    let row = index / columns + 1;
+    push_spreadsheet_column_label(col, output);
+    write!(output, "{row}").expect("writing to String cannot fail");
+}
+
+fn push_spreadsheet_column_label(mut index: usize, output: &mut String) {
+    let mut buffer = [0u8; 8];
+    let mut len = 0usize;
+    index += 1;
+    while index > 0 && len < buffer.len() {
+        let rem = (index - 1) % 26;
+        buffer[len] = b'A' + rem as u8;
+        len += 1;
+        index = (index - 1) / 26;
+    }
+    for byte in buffer[..len].iter().rev() {
+        output.push(*byte as char);
     }
 }
 

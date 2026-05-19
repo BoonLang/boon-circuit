@@ -339,6 +339,13 @@ Formula-derived value/error commits use the same generic keyed field commit path
 for their semantic deltas. Source bind facts emitted after list append now also
 flow through a generic `SourceBind` mutation and use the appended list's
 identity instead of a TodoMVC-specific `todos` helper.
+Cells formula-derived row fields (`value`, `error`, `dependencies`) are seeded
+into each generic row when the static grid is materialized instead of being
+inserted lazily during the first recompute. The residual Cells formula driver
+keeps a reusable dependency-text buffer per cell and writes dependency addresses
+into that buffer without allocating, so formula recompute can satisfy the release
+speed gate's zero post-warmup allocation budget while the fully generic formula
+executor is still pending.
 TodoMVC and Cells adapters still own surface-specific render patches and some
 derived summary/assertion behavior, so this is not the final adapter-free
 interpreter, but the semantic trace is no longer constructed only from

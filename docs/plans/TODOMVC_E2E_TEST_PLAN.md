@@ -93,16 +93,26 @@ The headed replay report must include:
 program_hash
 scenario_hash
 os
+display_server
 window_backend
 display_scale
+display_socket_or_compositor_connection
 window_size
 framebuffer_size
+window_pid
+window_title
+input_backend
+capture_backend
+focused_window_proof
 graph_node_count
 semantic_trace_hash
 render_patch_trace_hash
 per-step pass/fail
 checkpoint_screenshot_or_video_paths
+checkpoint_artifact_sha256s
+nonblank_screenshot_hashes
 input_focus_evidence
+per_step_pointer_keyboard_route
 timing_frame_stats
 manual_observer_notes_if_present
 ```
@@ -150,7 +160,20 @@ target/reports/todomvc-human-<timestamp>-checkpoint-*.png
 
 The manual report records each checked scenario label, display/backend details,
 the final state hash, screenshots, notes about visual quality, and whether the
-tester deviated from the scripted scenario.
+tester deviated from the scripted scenario. It must include `manual_observer`,
+`generated_at_utc`, source/scenario hash matches, screenshot or video artifact
+hashes, and per-label pass/fail.
+
+Checker form:
+
+```bash
+cargo xtask verify-todomvc-human \
+  examples/todomvc.bn \
+  examples/todomvc.scn \
+  --check \
+  --max-age 24h \
+  --report target/reports/todomvc-human-<timestamp>.json
+```
 
 ### Layer 3: Semantic Trace Runner
 
@@ -279,7 +302,7 @@ profiles.
 
 ## Scenario File Shape
 
-Use a single scenario file, probably TOML or RON:
+Use a single TOML scenario file:
 
 ```toml
 name = "todomvc"
@@ -293,11 +316,13 @@ assert.no_data_field = "id"
 
 [[step]]
 id = "add-test-todo"
-event = { source = "store.sources.new_todo_input.change", payload = { text = "Test todo" } }
+user_action = { kind = "type_text", target = "new todo input", text = "Test todo" }
+expected_source_event = { source = "store.sources.new_todo_input.change", payload = { text = "Test todo" } }
 
 [[step]]
 id = "submit-test-todo"
-event = { source = "store.sources.new_todo_input.key_down", payload = { key = "Enter", text = "Test todo" } }
+user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
+expected_source_event = { source = "store.sources.new_todo_input.key_down", payload = { key = "Enter", text = "Test todo" } }
 assert.state.active_count = 3
 assert.rows = [
   { title = "Buy groceries", completed = false },
@@ -308,16 +333,20 @@ assert.semantic_delta_contains = ["ListInsert", "FieldSet:title"]
 assert.render_delta_contains = ["InsertElement", "BindSource"]
 ```
 
-The exact syntax can change. The important rule is that scenario actions target
-source paths and data payloads, not hidden runtime ids.
+The exact field names can evolve with the harness, but the first implementation
+should use one TOML format for all examples. Headed/manual layers execute
+`user_action` through the visible OS window and then assert that the expected
+source event was produced. Semantic-only layers may inject
+`expected_source_event` directly. Scenario actions never target hidden runtime
+ids.
 
 Renderer-only actions such as hover can be included, but they must be marked as
-renderer actions:
+user actions that do not necessarily produce a source event:
 
 ```toml
 [[step]]
 id = "hover-delete"
-renderer_event = { target_text = "Buy milk EDITED", event = "hover" }
+user_action = { kind = "pointer_hover", target_text = "Buy milk EDITED" }
 assert.render_text_contains = ["x"]
 ```
 
@@ -510,11 +539,17 @@ Every automated report should include:
 
 ```text
 command
+report_version
+generated_at_utc
+command_argv
+exit_status
 git_commit
+binary_hash
 source_path
 source_hash
 scenario_path
 scenario_hash
+budget_hash
 runtime_profile
 renderer
 window_mode
@@ -535,6 +570,7 @@ allocations
 latency_ms_p50_p95_p99_max
 rss_delta_mib_steady_peak
 vram_delta_mib_steady_peak_or_unavailable_reason
+artifact_sha256s
 per-step pass/fail
 failure artifacts
 ```
@@ -543,11 +579,17 @@ Headed and manual reports must additionally include:
 
 ```text
 input_injection_method
+window_pid
+window_title
+display_socket_or_compositor_connection
+input_backend
+capture_backend
+focused_window_proof
 focus_trace
 checkpoint_screenshot_or_video_paths
 visual_checkpoint_pass_fail
-manual_observer_if_present
-manual_notes_if_present
+manual_observer
+manual_notes
 ```
 
 Failure artifacts:
@@ -572,16 +614,24 @@ cargo xtask verify-todomvc-human
 cargo xtask verify-todomvc-semantic
 cargo xtask verify-todomvc-ply-headless
 cargo xtask verify-todomvc-speed
+cargo xtask verify-todomvc-negative
 cargo xtask verify-todomvc-all
 cargo xtask bench-todomvc
 cargo xtask explain-todomvc-hardware
 ```
 
 `verify-todomvc-all` should fail if `verify-todomvc-headed-ply`,
-`verify-todomvc-human`, `verify-todomvc-semantic`, or `verify-todomvc-speed` is
-missing or failing.
-`verify-todomvc-ply-headless` is useful for fast CI, but it must not be the only
-UI evidence. Missing implementation is a blocker, not a skipped pass.
+`verify-todomvc-human`, `verify-todomvc-semantic`,
+`verify-todomvc-ply-headless`, `verify-todomvc-speed`, or
+`verify-todomvc-negative` is missing or failing. It regenerates required reports
+by default and may check existing reports only with an explicit
+`--check-existing` mode. Missing implementation is a blocker, not a skipped
+pass.
+
+Negative verification must prove the harness fails on bad source hashes, bad
+scenario hashes, stale manual reports, missing screenshots/video, direct source
+event injection in headed replay, hidden runtime id exposure, and app-visible
+identity-based row routing.
 
 ## Manual Checklist
 

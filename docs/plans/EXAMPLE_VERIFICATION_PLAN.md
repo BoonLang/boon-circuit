@@ -20,6 +20,11 @@ The Boon source is the implementation under test. Rust code may provide generic
 runtime primitives, renderer glue, and domain primitives such as formula parsing,
 but it must not hardcode the example's app behavior.
 
+Use one TOML-compatible scenario format for all examples in the first
+implementation. The scenario file describes source events, human-visible target
+labels, semantic assertions, render-delta assertions, visual checkpoints, and
+speed/resource workloads.
+
 ## Acceptance Layers
 
 Every interactive example must pass the same layers:
@@ -47,13 +52,28 @@ cargo xtask verify-example-human <name>
 cargo xtask verify-example-semantic <name>
 cargo xtask verify-example-ply-headless <name>
 cargo xtask verify-example-speed <name>
+cargo xtask verify-example-negative <name>
 cargo xtask verify-example-all <name>
 cargo xtask verify-examples-all
 cargo xtask bench-example <name>
+cargo xtask verify-report-schema
 ```
 
 Example-specific aliases such as `verify-todomvc-headed-ply` or
 `verify-cells-speed` may exist, but they should call the generic harness.
+`verify-example-all <name>` regenerates all required reports by default. It may
+check existing reports only in an explicit `--check-existing` mode. It fails if
+any required layer is missing:
+
+```text
+headed Ply replay
+manual human report/check
+semantic trace
+headless renderer smoke
+speed/resource gate
+negative harness verification
+report schema validation
+```
 
 ## Human-Like Input
 
@@ -64,6 +84,18 @@ The headed replay and manual pass must use real interaction shapes:
 - real row/cell hit targets, not hidden runtime ids.
 - visible window state, not only internal render-tree assertions.
 - visual checkpoints before, during, and after interactions.
+
+Scenario files must distinguish:
+
+```text
+user_action              what the headed/manual harness does through OS input
+expected_source_event    what the runtime should receive after hit testing
+semantic_assertion       expected Boon state/delta after the tick
+render_assertion         expected render patch/pixel consequence
+```
+
+Headed replay fails if it injects `expected_source_event` directly instead of
+creating it through the visible window and input backend.
 
 The first checkpoint for every example is startup quality:
 
@@ -120,8 +152,20 @@ input_to_idle_ms_p50_p95_p99_max
 frame_time_ms_p50_p95_p99_max
 missed_frame_count
 operation_count
-per-operation outliers
+per_operation_outliers
 ```
+
+Measure speed in two layers:
+
+- runtime microbench: parser already warmed, no window, semantic tick and render
+  lowering only.
+- headed presentation: real window, real input route, real Ply patch application,
+  frame presentation, and visual artifacts.
+
+The couple-of-milliseconds budget applies to normal runtime interaction work.
+Headed reports must still be fast and must not miss frames, but they include OS,
+window manager, and presentation metadata so regressions are interpreted against
+the measured machine/profile.
 
 The harness should run:
 
@@ -176,8 +220,35 @@ dirty_key_count_p50_p95_p99_max
 render_patch_count_p50_p95_p99_max
 ```
 
+Every report, including manual reports, must include:
+
+```text
+report_version
+generated_at_utc
+command_argv
+exit_status
+git_commit
+binary_hash
+source_hash
+scenario_hash
+budget_hash
+artifact_sha256s
+```
+
 If VRAM cannot be read on a platform, the report must say so explicitly and the
 headed/manual visual pass still remains required.
+
+Manual reports must additionally include `manual_observer`, display/backend
+metadata, checklist pass/fail per label, screenshot/video artifact hashes, and a
+freshness limit. The checker form should reject stale reports:
+
+```bash
+cargo xtask verify-example-human <name> --check --max-age 24h
+```
+
+Headed replay reports must include `window_pid`, `window_title`, display socket
+or compositor connection, input backend, capture backend, focused-window proof,
+nonblank screenshot hashes, and per-step pointer/keyboard routes.
 
 ## Bulk Operations
 
@@ -205,7 +276,9 @@ Before a future example can be considered real, add:
 6. speed budget file.
 7. RAM/VRAM budget file.
 8. stress scenario sized to the example's declared profile.
-9. report artifacts checked by `verify-example-all <name>`.
+9. negative verification fixtures for bad hashes, stale reports, missing visual
+   artifacts, direct source injection, and hidden identity exposure.
+10. report artifacts checked by `verify-example-all <name>`.
 
 The harness should make the easiest path the honest path: run the real source,
 show the real UI, measure real latency, and store enough evidence to reproduce a

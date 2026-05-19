@@ -15,9 +15,11 @@ actor per cell.
 ## Table Shape
 
 ```text
-CellTable keyed by CellId:
+CellTable indexed by hidden runtime key:
+  address
   exists
   formula_text
+  editing_text
   parsed_formula
   value
   error
@@ -28,11 +30,15 @@ Dependency relation:
 
 ```text
 CellDependency:
-  from_cell
-  to_cell
+  from_address
+  to_address
 ```
 
-`from_cell -> to_cell` means `to_cell` reads `from_cell`.
+`from_address -> to_address` means `to_address` reads `from_address`.
+
+`address` is ordinary spreadsheet data such as `A1`, not hidden runtime
+identity. It can be displayed and compared as data. Runtime keys, slots, and
+source generations remain below the Boon language boundary.
 
 ## Boon Shape
 
@@ -41,7 +47,7 @@ Illustrative target:
 ```boon
 cells:
     Grid/cells(columns: 26, rows: 100)
-    |> List/map(new_cell)
+    |> List/map(seed, new: new_cell(seed: seed))
 
 FUNCTION new_cell(seed) {
     sources: [
@@ -53,14 +59,30 @@ FUNCTION new_cell(seed) {
     ]
 
     [
-        id: seed.id
+        address: seed.address
+
+        editing_text:
+            TEXT {} |> HOLD draft {
+                LATEST {
+                    sources.editor.change.text
+                    sources.editor.cancel |> THEN { formula_text }
+                    sources.editor.commit.text
+                }
+            }
 
         formula_text:
-            "" |> HOLD text {
+            TEXT {} |> HOLD formula_text {
                 LATEST {
-                    sources.editor.commit.text |> THEN {
-                        text
-                    }
+                    sources.editor.commit.text
+                }
+            }
+
+        editing:
+            False |> HOLD editing {
+                LATEST {
+                    sources.editor.change |> THEN { True }
+                    sources.editor.commit |> THEN { False }
+                    sources.editor.cancel |> THEN { False }
                 }
             }
 
@@ -82,8 +104,39 @@ FUNCTION new_cell(seed) {
 }
 ```
 
-The real syntax may differ. The important boundary is that parsing/evaluation
-are generic primitives, while cell behavior is expressed in Boon.
+The first implementation should keep this syntax close to the original Boon
+style. The important boundary is that parsing/evaluation are generic primitives,
+while edit state, commit/cancel behavior, and cell display state are expressed in
+Boon.
+
+`Grid/cells` produces domain coordinates and display addresses, for example:
+
+```text
+[row: 1, column: 1, address: TEXT { A1 }]
+```
+
+Those coordinates are ordinary data. They are not the hidden list key.
+
+## Formula Primitive Contract
+
+`Formula/parse`, `Formula/dependencies`, and `Formula/eval` are generic
+spreadsheet primitives, not a hardcoded Cells app.
+
+Minimum supported formula contract:
+
+```text
+literals: numbers and text
+references: A1 style cell addresses
+operators: + - * / for numeric values
+functions: SUM(range) can be added after the base proof
+errors: parse_error, cycle_error, missing_ref, type_error, div_by_zero
+```
+
+`Formula/parse(text)` returns a small formula AST or a deterministic error.
+`Formula/dependencies(ast)` returns a set of domain cell addresses. `Formula/eval`
+reads values by domain address through the runtime's dependency-aware reader and
+records which addresses were read. The reader must not expose hidden runtime
+keys.
 
 ## Propagation
 
@@ -98,8 +151,8 @@ When `formula_text[A1]` changes:
 The runtime may use an adjacency index:
 
 ```text
-dependents[from_cell] -> Set<CellId>
-dependencies[to_cell] -> Set<CellId>
+dependents[from_address] -> Set<CellAddress>
+dependencies[to_address] -> Set<CellAddress>
 ```
 
 This is not the same as Differential Dataflow. It is a purpose-built dependency
@@ -144,6 +197,7 @@ cargo xtask verify-cells-human
 cargo xtask verify-cells-semantic
 cargo xtask verify-cells-ply-headless
 cargo xtask verify-cells-speed
+cargo xtask verify-cells-negative
 cargo xtask verify-cells-all
 ```
 

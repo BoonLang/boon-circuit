@@ -9,9 +9,9 @@ either the old actor runtime or a reducer-style app model.
 Decision: Boon Circuit uses a static equation graph plus indexed state storage.
 
 The semantic graph is fixed after compile/elaboration. Dynamic application data,
-such as todos, users, rows, and cells, lives in memories keyed by stable item
-identity. Runtime work scales with changed keys and affected dependencies, not
-with dynamically instantiated actors.
+such as todos, users, rows, and spreadsheet cells, lives in memories keyed by
+hidden stable runtime keys. Runtime work scales with changed keys and affected
+dependencies, not with dynamically instantiated actors.
 
 ```text
 Boon source
@@ -68,7 +68,7 @@ Decision: appending a todo does not create new semantic graph nodes.
 Logical view:
 
 ```text
-todo #42 has title, completed, editing, alive
+todo #42 has title, completed, editing
 ```
 
 Physical view:
@@ -77,7 +77,7 @@ Physical view:
 title[42]
 completed[42]
 editing[42]
-alive[42]
+valid[42]  # hidden list membership, not Boon record data
 ```
 
 The compiler/runtime may show per-item dependency explanations, but internally
@@ -111,7 +111,7 @@ The original plain TodoMVC source has no todo `id`; each row's `title`,
 `editing`, `completed`, and element sources are local to the list item. This is
 the desired source shape.
 
-The runtime still keeps identity:
+The runtime still keeps retention/routing data:
 
 ```text
 list id
@@ -184,16 +184,17 @@ semantic operator can remain valid in software.
 
 ## D9. LATEST Is A Deterministic Merge
 
-Decision: `LATEST` merges candidate updates by event presence and tick order,
-with deterministic tie-breaking.
+Decision: `LATEST` merges candidate updates by event presence and monotonic
+source event sequence.
 
 Rules:
 
 - `SKIP` means no candidate value.
-- choose the candidate with the greatest `changed_at` sequence.
-- if two candidates have the same sequence, use source order or require an
-  explicit conflict policy.
-- ambiguous same-tick writes should be diagnosable.
+- choose the candidate with the greatest source event sequence.
+- pure expressions selected by an event inherit that event sequence.
+- if two candidates have the same greatest sequence, fail unless the source uses
+  explicit `PRIORITY` or proven `EXCLUSIVE`.
+- ambiguous same-tick writes are errors, not warnings.
 
 Potential future forms:
 
@@ -229,6 +230,9 @@ SourceUnbind(source_id)
 
 The renderer may lower those semantic facts to direct render patches, but no
 layer should need a full DOM or list diff to know what changed.
+
+Every keyed fact also carries generation/bind-epoch data as defined in the delta
+protocol. The key is a protocol/runtime fact, not a Boon value.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

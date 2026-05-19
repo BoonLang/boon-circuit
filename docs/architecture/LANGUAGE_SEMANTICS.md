@@ -78,8 +78,10 @@ False |> HOLD completed {
 }
 ```
 
-The body defines a next-state equation. The name after `HOLD` is the previous
-state value visible inside the equation.
+For the first interpreter, the piped expression is the initialization value for
+the state cell or row field. Dynamic resets are expressed as ordinary update
+candidates inside the body. The body defines a next-state equation. The name
+after `HOLD` is the previous committed state value visible inside the equation.
 
 For list items, `HOLD` becomes a field memory:
 
@@ -102,14 +104,23 @@ Rules:
 
 - branches that produce `SKIP` are ignored.
 - if exactly one branch produces a value, use it.
-- if multiple branches produce values, choose the most recent source sequence.
-- if ordering is ambiguous, use a deterministic tie-break and report a warning
-  unless an explicit policy exists.
+- if multiple branches produce values, choose the branch whose value carries the
+  greatest monotonic source event sequence.
+- pure expressions derived from a source event inherit that source event
+  sequence.
+- constants and stored values have no event sequence unless they are selected by
+  an event/presence gate.
+- if two candidates have the same greatest event sequence, that is a hard error
+  unless the source uses explicit `PRIORITY` or proven `EXCLUSIVE`.
 
 ## WHEN
 
-`WHEN` is pattern matching. It can be used for event decoding or ordinary pure
-selection.
+`WHEN` is pattern matching. It has two typed modes:
+
+- `Value<T> |> WHEN { ... }` is continuous pure selection and recomputes when
+  the matched value or branch dependencies change.
+- `Event<T> |> WHEN { ... }` is presence-gated event decoding. If the event is
+  absent in the current tick, the result is `SKIP`.
 
 ```boon
 selected_filter |> WHEN {
@@ -119,7 +130,9 @@ selected_filter |> WHEN {
 }
 ```
 
-On an absent event input, event-style `WHEN` returns `SKIP`.
+On an absent event input, event-style `WHEN` returns `SKIP`. Value-style `WHEN`
+does not have absence unless the value being matched is itself an event/optional
+value.
 
 ## WHILE
 
@@ -154,16 +167,18 @@ LIST[10000] {
 The syntax should stay close to original Boon. Capacity is a target/profile
 constraint, not a reason to force a new app-level collection syntax.
 
-## List/map And Render/for_each
+## List/map
 
 Mapping over a dynamic list does not clone semantic graph nodes per row.
 
 It creates a static row-template operator evaluated over active hidden keys:
 
 ```text
-for each changed or visible key:
+for each changed key:
     evaluate row template in scope /list:key
 ```
 
-Renderer objects may be created/deleted in the host, but the Boon equation graph
-does not change.
+Semantic `List/map` and `List/retain` never depend on renderer visibility.
+Renderer objects may be created/deleted/windowed in the host, but the Boon
+equation graph does not change and semantic recomputation is driven by dirty
+keys, not by visible rows.

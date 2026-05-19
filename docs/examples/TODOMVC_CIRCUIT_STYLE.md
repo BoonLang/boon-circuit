@@ -25,12 +25,12 @@ store: [
     ]
 
     new_todo_text:
-        Text/empty() |> HOLD text {
+        Text/empty |> HOLD text {
             LATEST {
                 sources.new_todo_input.change.text
 
                 title_to_add |> THEN {
-                    Text/empty()
+                    Text/empty
                 }
             }
         }
@@ -60,10 +60,18 @@ store: [
             [title: TEXT { Buy groceries }]
             [title: TEXT { Clean room }]
         }
-        |> List/append(title_to_add |> THEN {
+        |> List/append(item: title_to_add |> THEN {
             [title: title_to_add]
         })
-        |> List/map(new_todo)
+        |> List/remove(todo, when:
+            LATEST {
+                todo.sources.remove_todo_button.press |> THEN { True }
+                sources.clear_completed_button.press |> THEN {
+                    todo.completed
+                }
+            }
+        )
+        |> List/map(seed, new: new_todo(seed: seed, store: store))
 ]
 ```
 
@@ -83,22 +91,6 @@ FUNCTION new_todo(seed) {
     ]
 
     [
-        alive:
-            True |> HOLD alive {
-                LATEST {
-                    sources.remove_todo_button.press |> THEN {
-                        False
-                    }
-
-                    store.sources.clear_completed_button.press |> THEN {
-                        completed |> WHEN {
-                            True => False
-                            False => alive
-                        }
-                    }
-                }
-            }
-
         title:
             seed.title |> HOLD title {
                 LATEST {
@@ -150,7 +142,7 @@ FUNCTION new_todo(seed) {
 The runtime still creates a hidden row address for every todo:
 
 ```text
-/todos:<key>:<generation>
+(list_id=todos, parent_scope=/, item_key=<key>, generation=<generation>)
 ```
 
 That key is used for source binding, deltas, storage, stale-event rejection, and
@@ -160,28 +152,28 @@ developer.
 ## Derived Values
 
 ```boon
-visible_todos:
+store.visible_todos:
     store.todos
-    |> List/retain(todo,
-        if:
-            todo.alive
-            && store.selected_filter |> WHEN {
-                All => True
-                Active => todo.completed |> Bool/not()
-                Completed => todo.completed
-            }
+    |> List/retain(todo, if:
+        store.selected_filter |> WHEN {
+            All => True
+            Active => todo.completed |> Bool/not()
+            Completed => todo.completed
+        }
     )
 
-active_count:
+store.active_count:
     store.todos
-    |> List/count(todo, if: todo.alive && Bool/not(todo.completed))
+    |> List/retain(todo, if: todo.completed |> Bool/not())
+    |> List/count
 
-completed_count:
+store.completed_count:
     store.todos
-    |> List/count(todo, if: todo.alive && todo.completed)
+    |> List/retain(todo, if: todo.completed)
+    |> List/count
 
-all_completed:
-    active_count == 0 && completed_count > 0
+store.all_completed:
+    store.active_count == 0 |> Bool/and(store.completed_count > 0)
 ```
 
 ## Runtime Lowering
@@ -193,7 +185,7 @@ new_todo_text_next
 title_to_add_event
 selected_filter_next
 todos_append
-todo_alive_next[key]
+todos_remove[key]
 todo_title_next[key]
 todo_completed_next[key]
 todo_editing_next[key]

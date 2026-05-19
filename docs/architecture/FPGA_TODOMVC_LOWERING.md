@@ -40,10 +40,16 @@ todos:
         [title: TodoTitle { Buy groceries }]
         [title: TodoTitle { Clean room }]
     }
-    |> List/append(title_to_add |> THEN {
+    |> List/append(item: title_to_add |> THEN {
         [title: title_to_add]
     })
-    |> List/map(new_todo)
+    |> List/remove(todo, when:
+        LATEST {
+            todo.sources.remove_todo_button.press |> THEN { True }
+            clear_completed_button.press |> THEN { todo.completed }
+        }
+    )
+    |> List/map(seed, new: new_todo(seed: seed))
 
 FUNCTION new_todo(seed) {
     sources: [
@@ -54,7 +60,6 @@ FUNCTION new_todo(seed) {
     ]
 
     [
-        alive: True |> HOLD alive { ... }
         title: seed.title |> HOLD title { ... }
         completed: False |> HOLD completed { ... }
         editing: False |> HOLD editing { ... }
@@ -62,8 +67,9 @@ FUNCTION new_todo(seed) {
 }
 ```
 
-There is no `[id: ...]` field. `List/map(new_todo)` creates a row scope for each
-item. The compiler maps that scope to hardware storage.
+There is no `[id: ...]` field and no app-visible `alive` field. List membership
+is hidden `valid` storage. `List/map(seed, new: new_todo(seed: seed))` creates a
+row scope for each live item. The compiler maps that scope to hardware storage.
 
 ## Hardware Profile
 
@@ -117,17 +123,18 @@ mutating a reused slot. Neither is visible to Boon code.
 The row scope:
 
 ```text
-/todos:<slot>:<generation>
+(list_id=todos, parent_scope=/, item_key=<slot>, generation=<generation>)
 ```
 
-is the generated-code address used for state, source binding, and deltas.
+is the generated-code identity used for state, source binding, and deltas.
+Generation travels as a separate protocol field, not as a Boon value.
 
 ## Input Events
 
 A software renderer or host receives source bindings from the runtime:
 
 ```text
-Bind /todos:42:7/todo_checkbox.click -> source_id 9001
+Bind source=todo_checkbox.click list=todos key=42 generation=7 -> source_id 9001
 ```
 
 When the user clicks the checkbox, the host sends a compact hardware event:

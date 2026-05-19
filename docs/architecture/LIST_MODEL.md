@@ -19,7 +19,7 @@ For TodoMVC:
 
 ```text
 todos.order        Vec<TodoKey>
-todos.alive        BitSet/TodoKey -> Bool
+todos.valid        BitSet/TodoKey -> Bool
 todos.title        TodoKey -> Text
 todos.completed    TodoKey -> Bool
 todos.editing      TodoKey -> Bool
@@ -126,25 +126,29 @@ Tick behavior:
 
 1. evaluate append event.
 2. allocate key and generation.
-3. initialize stateful fields in the item scope.
+3. evaluate the static row initializer subgraph for the new key.
 4. insert key into order/index memory.
 5. emit `ListInsert` and initial `Field` deltas.
+6. bind row sources after commit; they cannot fire until the next tick.
 
 No graph nodes are allocated.
 
 ## Remove
 
-Removal marks the item dead and unbinds sources.
+Removal clears the hidden valid bit, removes the key from the live order/view,
+and unbinds sources.
 
 Tick behavior:
 
-1. set alive/valid bit to false or remove key from order.
+1. set hidden `valid[key]` to false and remove key from live order.
 2. emit `ListRemove`.
 3. emit `SourceUnbind` for item sources.
-4. keep storage until safe GC or reuse with a new generation.
+4. keep storage until an acknowledgement/barrier permits reuse with a new
+   generation.
 
 Stale source events must include generation and be ignored if the generation no
-longer matches.
+longer matches. The runtime should count and report stale-event drops so tests
+can prove stale UI/network events did not mutate reused storage.
 
 ## Move
 
@@ -181,13 +185,35 @@ possible.
 Examples:
 
 ```text
-active_count depends on todo.alive and todo.completed
-all_completed depends on count(alive) and count(completed && alive)
+active_count depends on live keys and todo.completed
+all_completed depends on count(live) and count(completed among live keys)
 ```
 
-The first interpreter may scan on broad events. The architecture should still
-represent enough dependency information to replace scans with maintained
+The first interpreter may scan only for explicitly declared broad or bulk
+operations. Single-key edits must update maintained aggregate state or dirty only
+the changed key plus declared aggregate/view operators. The architecture must
+represent enough dependency information to replace bulk scans with maintained
 indexes later.
+
+## Software Profiles
+
+Software also needs explicit bounds for honest performance and failure behavior.
+The default proof profile should declare:
+
+```text
+max rows per list
+max nested list depth
+max text bytes per field
+max source bindings
+event queue capacity
+delta queue capacity
+bulk work per tick
+overflow/backpressure policy
+```
+
+The dynamic profile can grow storage, but the verification budget still sets
+maximum accepted proof sizes. The bounded software profile should report
+overflow deterministically instead of reallocating silently in hot paths.
 
 ## Hardware Profiles
 

@@ -55,6 +55,31 @@ Avoid in the first pass:
 - bytecode VM
 - Rust/Zig codegen
 
+## Interpreter Scope Control
+
+Keep the first interpreter deliberately small:
+
+```text
+parse Boon source
+lower to typed equation IR
+compile a static schedule
+store values in typed arenas/register files
+run deterministic ticks
+emit semantic deltas
+lower deltas to Ply patches
+```
+
+Do not add a general VM, actor scheduler, async runtime, DD substrate, per-row
+graph builder, or app-specific preview engine to make the examples pass. If an
+example needs behavior the core cannot express, either add the smallest generic
+primitive needed by the language or mark the example as unsupported. Do not hide
+the behavior in Rust demo code.
+
+The release interpreter should be allocation-quiet after warm-up for bounded
+profiles. Normal interactions must dirty only the affected nodes/keys plus
+declared aggregates/views, and the verification reports must make graph rebuilds,
+allocations, latency, RAM, and VRAM visible.
+
 ## Phase 1: Parser And AST
 
 Implement enough Boon syntax for:
@@ -96,7 +121,7 @@ NodeId
 ExprId
 ScopeId
 SourceId
-CellId
+StateId
 ListId
 FieldId
 ```
@@ -119,10 +144,20 @@ Required debug output:
 ```text
 equation graph dump
 source table
-cell table
+state table
 list table
 dependency table
 ```
+
+Required identity checks:
+
+- hidden runtime keys, slots, generations, scope paths, and source ids are not
+  representable as Boon values.
+- equality over hidden runtime identity types is impossible in the IR.
+- examples with duplicate visible data, such as two todos with the same title,
+  still route row-local events to the correct hidden scope.
+- string grep checks for `id` are only supplemental; the IR verifier owns this
+  rule.
 
 ## Phase 3: Static Runtime Core
 
@@ -130,9 +165,9 @@ Implement:
 
 ```text
 Runtime
-Value
+TypedSlots
 SourceStore
-CellStore
+StateStore
 ListStore
 DeltaBuffer
 dirty propagation
@@ -166,7 +201,7 @@ Add deterministic tests for:
 - remove unbinds row sources.
 - keyed field update emits one field delta.
 
-## Phase 4: TodoMVC Proof
+## Phase 4: TodoMVC Semantic Proof
 
 Write TodoMVC in `examples/todomvc.bn` using SOURCE and local field equations.
 
@@ -187,9 +222,8 @@ Hard gates:
 
 ```text
 cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
-cargo xtask verify-todomvc-headed-ply
-cargo xtask verify-todomvc-human
-cargo xtask verify-todomvc-speed
+cargo xtask verify-todomvc-semantic
+cargo xtask verify-todomvc-ply-headless
 cargo bench -p boon_runtime --bench todomvc
 ```
 
@@ -225,7 +259,7 @@ Hard gate:
 
 ```text
 cargo run -p boon_ply_playground
-cargo xtask verify-todomvc-headed-ply
+cargo xtask verify-todomvc-all --report target/reports/todomvc-all.json
 cargo xtask verify-example-headed-ply cells
 ```
 
@@ -242,8 +276,10 @@ verify-example-human
 verify-example-semantic
 verify-example-ply-headless
 verify-example-speed
+verify-example-negative
 verify-example-all
 verify-examples-all
+verify-report-schema
 ```
 
 ## Phase 6: Cells Proof
@@ -271,6 +307,7 @@ cargo xtask verify-cells-human
 cargo xtask verify-cells-semantic
 cargo xtask verify-cells-ply-headless
 cargo xtask verify-cells-speed
+cargo xtask verify-cells-negative
 cargo xtask verify-cells-all
 ```
 

@@ -11,7 +11,7 @@ Semantic deltas:
 
 ```text
 source events
-cell changes
+state cell changes
 list insert/remove/move
 field changes
 source bind/unbind
@@ -64,11 +64,14 @@ StateDelta {
       list_id,
       scope,
       key,
+      generation,
       position
     },
     FieldSet {
+      list_id,
       scope,
       key,
+      generation,
       field_path,
       value,
       changed_at
@@ -77,10 +80,12 @@ StateDelta {
       scope,
       source_path,
       source_id,
-      generation
+      generation,
+      bind_epoch
     },
     SourceUnbind {
-      source_id
+      source_id,
+      bind_epoch
     }
   ]
 }
@@ -88,6 +93,16 @@ StateDelta {
 
 Nested scopes may be encoded as compact ids on the wire, but the logical model is
 a scope path.
+
+For keyed data, every semantic/render/network delta uses the canonical runtime
+identity tuple:
+
+```text
+(runtime_id, program_hash, list_id, parent_scope, item_key, generation)
+```
+
+Generation is mandatory on all keyed field, move, remove, source-bind, and
+source-unbind facts. It is not only an insert/remove concern.
 
 ## Source Event Shape
 
@@ -100,13 +115,17 @@ SourceEvent {
   source_id,
   scope,
   generation,
+  bind_epoch,
   client_seq,
   payload
 }
 ```
 
-Generation is mandatory for keyed list item sources. It prevents stale DOM or
-network events from writing into a reused row slot.
+Generation and bind epoch are mandatory for keyed list item sources. Generation
+prevents stale DOM or network events from writing into a reused row slot.
+Bind epoch prevents a late event from an old renderer binding from writing into a
+new binding that happens to reuse a source id. Source ids may be reused only
+after an acknowledgement/barrier or guarded by a new bind epoch.
 
 ## Boon To Ply
 
@@ -123,25 +142,25 @@ Boon semantic delta
 Example:
 
 ```text
-FieldSet(/todos:42, completed, true)
-  -> SetProperty(element=/todos:42/checkbox, checked=true)
-  -> SetClass(element=/todos:42/root, completed=true)
+FieldSet(list=todos, key=42, generation=7, field=completed, value=true)
+  -> SetProperty(element=/todos:42:7/checkbox, checked=true)
+  -> SetClass(element=/todos:42:7/root, completed=true)
 ```
 
 Insertion:
 
 ```text
-ListInsert(/todos, key=42, fields={title, completed, editing})
-  -> InsertElement(parent=/todo-list, key=/todos:42/root, position=...)
-  -> SetText(/todos:42/title, title)
-  -> BindSource(/todos:42/checkbox.click, source_id=...)
+ListInsert(list=todos, key=42, generation=7, fields={title, completed, editing})
+  -> InsertElement(parent=/todo-list, key=/todos:42:7/root, position=...)
+  -> SetText(/todos:42:7/title, title)
+  -> BindSource(/todos:42:7/checkbox.click, source_id=...)
 ```
 
 Removal:
 
 ```text
-ListRemove(/todos, key=42)
-  -> RemoveElement(/todos:42/root)
+ListRemove(list=todos, key=42, generation=7)
+  -> RemoveElement(/todos:42:7/root)
   -> SourceUnbind(...)
 ```
 
@@ -191,6 +210,15 @@ value
 Renderers should not infer protocol identity from array positions. Positions are
 layout facts; keys are hidden protocol/runtime facts. These keys are not Boon
 values and are never used for Boon equality.
+
+Replay rules:
+
+- `base_epoch` must match the receiver's current epoch.
+- `next_epoch` must advance by exactly one unless applying an explicit snapshot.
+- repeated `(runtime_id, client_seq)` source events are deduplicated.
+- applied server deltas carry authoritative `server_tick`.
+- if epoch, generation, or bind epoch mismatches, the receiver rejects the delta
+  and requests a snapshot recovery.
 
 ## Whole Snapshots
 

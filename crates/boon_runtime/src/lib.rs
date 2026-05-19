@@ -2331,9 +2331,22 @@ struct GenericRow {
 }
 
 #[derive(Clone, Debug, Default)]
+struct GenericRowTemplate {
+    fields: Vec<GenericRowFieldTemplate>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericRowFieldTemplate {
+    field: String,
+    initial_value: InitialValue,
+}
+
+#[derive(Clone, Debug, Default)]
 struct GenericCircuitRuntime {
     root: BTreeMap<String, RuntimeValue>,
     lists: BTreeMap<String, KeyedList<GenericRow>>,
+    row_templates: BTreeMap<String, GenericRowTemplate>,
+    spare_rows: BTreeMap<String, Vec<GenericRow>>,
     sources: SourceStore,
 }
 
@@ -2353,12 +2366,13 @@ impl GenericCircuitRuntime {
                 .iter()
                 .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
                 .collect::<Vec<_>>();
+            let row_template = GenericRowTemplate::from_cells(&row_scope, &indexed_cells)?;
             let rows = match &list.initializer {
                 ListInitializer::RecordLiteral { rows } => rows
                     .iter()
                     .map(|row| {
                         let seed_fields = list_seed_fields(row)?;
-                        materialize_generic_row(&row_scope, &indexed_cells, seed_fields)
+                        row_template.materialize(seed_fields)
                     })
                     .collect::<RuntimeResult<Vec<_>>>()?,
                 ListInitializer::Grid { columns, rows } => {
@@ -2373,11 +2387,7 @@ impl GenericCircuitRuntime {
                             );
                             let mut seed_fields = BTreeMap::new();
                             seed_fields.insert("address".to_owned(), RuntimeValue::Text(address));
-                            grid_rows.push(materialize_generic_row(
-                                &row_scope,
-                                &indexed_cells,
-                                seed_fields,
-                            )?);
+                            grid_rows.push(row_template.materialize(seed_fields)?);
                         }
                     }
                     grid_rows
@@ -2394,6 +2404,9 @@ impl GenericCircuitRuntime {
             runtime
                 .lists
                 .insert(list.name.clone(), KeyedList::from_values(rows));
+            runtime
+                .row_templates
+                .insert(list.name.clone(), row_template);
         }
         Ok(runtime)
     }
@@ -2991,17 +3004,84 @@ impl GenericCircuitRuntime {
         self.append_row(list, row)
     }
 
-    fn append_row_for_trigger_and_bind_sources(
+    fn append_row_for_trigger_text(
+        &mut self,
+        equations: &ListEquationPlan,
+        list: &str,
+        trigger: &str,
+        trigger_value: &str,
+    ) -> RuntimeResult<(u64, u64)> {
+        let append_fields = equations.append_fields(list, trigger)?;
+        let template = self
+            .row_templates
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
+        let mut row = self
+            .spare_rows
+            .get_mut(list)
+            .and_then(Vec::pop)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                let seed_fields = equations.append_seed_fields(list, trigger, trigger_value)?;
+                template.materialize(seed_fields)
+            })?;
+        template.reset_from_text_seeds(&mut row, |seed_name| {
+            append_fields
+                .iter()
+                .any(|field| field.name == seed_name && field.source == trigger)
+                .then_some(trigger_value)
+        })?;
+        self.append_row_for_trigger(equations, list, trigger, row)
+    }
+
+    fn reserve_spare_rows_for_trigger_text(
+        &mut self,
+        equations: &ListEquationPlan,
+        list: &str,
+        trigger: &str,
+        count: usize,
+        text_capacity: usize,
+    ) -> RuntimeResult<()> {
+        let spare_len = self.spare_rows.get(list).map(Vec::len).unwrap_or(0);
+        if spare_len >= count {
+            return Ok(());
+        }
+        let template = self
+            .row_templates
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
+        let additional = count - spare_len;
+        let spare_rows = self.spare_rows.entry(list.to_owned()).or_default();
+        spare_rows.reserve(additional);
+        for _ in 0..additional {
+            let seed_fields = equations.append_seed_fields(list, trigger, "")?;
+            let mut row = template.materialize(seed_fields)?;
+            row.reserve_textlike_fields(text_capacity)?;
+            spare_rows.push(row);
+        }
+        Ok(())
+    }
+
+    fn append_row_for_trigger_text_and_bind_sources(
         &mut self,
         equations: &ListEquationPlan,
         list: &'static str,
         trigger: &str,
-        row: GenericRow,
+        trigger_value: &str,
         source_paths: &[&'static str],
     ) -> RuntimeResult<GenericListRowCommit> {
-        let (key, generation) = self.append_row_for_trigger(equations, list, trigger, row)?;
+        let (key, generation) =
+            self.append_row_for_trigger_text(equations, list, trigger, trigger_value)?;
         self.bind_row_sources(list, key, generation, source_paths);
         Ok(GenericListRowCommit { key, generation })
+    }
+
+    fn spare_row(&mut self, list: &'static str, row: GenericRow) {
+        if let Some(rows) = self.spare_rows.get_mut(list) {
+            rows.push(row);
+            return;
+        }
+        self.spare_rows.insert(list.to_owned(), vec![row]);
     }
 
     fn remove_row_for_predicate(
@@ -3368,28 +3448,80 @@ fn list_seed_fields(
         .collect()
 }
 
-fn materialize_generic_row(
-    row_scope: &str,
-    indexed_cells: &[&boon_ir::StateCell],
-    mut fields: BTreeMap<String, RuntimeValue>,
-) -> RuntimeResult<GenericRow> {
-    for cell in indexed_cells {
-        let field = cell
-            .path
-            .strip_prefix(&format!("{row_scope}."))
-            .ok_or_else(|| {
-                format!(
-                    "state cell `{}` is not in row scope `{row_scope}`",
-                    cell.path
-                )
-            })?
-            .to_owned();
-        fields.insert(
-            field,
-            runtime_value_from_initial(&cell.initial_value, &fields)?,
-        );
+impl GenericRowTemplate {
+    fn from_cells(row_scope: &str, indexed_cells: &[&boon_ir::StateCell]) -> RuntimeResult<Self> {
+        let mut fields = Vec::with_capacity(indexed_cells.len());
+        for cell in indexed_cells {
+            let field = cell
+                .path
+                .strip_prefix(&format!("{row_scope}."))
+                .ok_or_else(|| {
+                    format!(
+                        "state cell `{}` is not in row scope `{row_scope}`",
+                        cell.path
+                    )
+                })?
+                .to_owned();
+            fields.push(GenericRowFieldTemplate {
+                field,
+                initial_value: cell.initial_value.clone(),
+            });
+        }
+        Ok(Self { fields })
     }
-    Ok(GenericRow { fields })
+
+    fn materialize(
+        &self,
+        mut seed_fields: BTreeMap<String, RuntimeValue>,
+    ) -> RuntimeResult<GenericRow> {
+        for field in &self.fields {
+            seed_fields.insert(
+                field.field.clone(),
+                runtime_value_from_initial(&field.initial_value, &seed_fields)?,
+            );
+        }
+        Ok(GenericRow {
+            fields: seed_fields,
+        })
+    }
+
+    fn reset_from_text_seeds<'a>(
+        &self,
+        row: &mut GenericRow,
+        seed_text: impl Fn(&str) -> Option<&'a str>,
+    ) -> RuntimeResult<()> {
+        for field in &self.fields {
+            let slot = row
+                .fields
+                .get_mut(&field.field)
+                .ok_or_else(|| format!("generic row missing field `{}`", field.field))?;
+            match &field.initial_value {
+                InitialValue::Text { value } => slot.set_textlike(value)?,
+                InitialValue::Bool { value } => slot.set_bool(*value)?,
+                InitialValue::Enum { value } => slot.set_textlike(value)?,
+                InitialValue::SeedField { path } => {
+                    let value =
+                        seed_text(path).ok_or_else(|| format!("seed field `{path}` is missing"))?;
+                    slot.set_textlike(value)?;
+                }
+                InitialValue::Unknown { summary } => {
+                    return Err(format!("unsupported state initializer `{summary}`").into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GenericRow {
+    fn reserve_textlike_fields(&mut self, additional: usize) -> RuntimeResult<()> {
+        for value in self.fields.values_mut() {
+            if value.as_textlike().is_some() {
+                value.reserve_textlike(additional)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn runtime_value_from_initial(
@@ -3425,41 +3557,6 @@ fn todo_generic_row(title: &str) -> GenericRow {
     fields.insert("completed".to_owned(), RuntimeValue::Bool(false));
     fields.insert("editing".to_owned(), RuntimeValue::Bool(false));
     GenericRow { fields }
-}
-
-fn todo_generic_spare(text_capacity: usize) -> GenericRow {
-    let mut fields = BTreeMap::new();
-    fields.insert(
-        "title".to_owned(),
-        RuntimeValue::Text(String::with_capacity(text_capacity)),
-    );
-    fields.insert(
-        "edit_text".to_owned(),
-        RuntimeValue::Text(String::with_capacity(text_capacity)),
-    );
-    fields.insert("completed".to_owned(), RuntimeValue::Bool(false));
-    fields.insert("editing".to_owned(), RuntimeValue::Bool(false));
-    GenericRow { fields }
-}
-
-fn reset_todo_generic_row(row: &mut GenericRow, title: &str) -> RuntimeResult<()> {
-    row.fields
-        .get_mut("title")
-        .ok_or("generic todo row missing title")?
-        .set_textlike(title)?;
-    row.fields
-        .get_mut("edit_text")
-        .ok_or("generic todo row missing edit_text")?
-        .set_textlike(title)?;
-    row.fields
-        .get_mut("completed")
-        .ok_or("generic todo row missing completed")?
-        .set_bool(false)?;
-    row.fields
-        .get_mut("editing")
-        .ok_or("generic todo row missing editing")?
-        .set_bool(false)?;
-    Ok(())
 }
 
 fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
@@ -3671,6 +3768,7 @@ struct RuntimeListOperation {
 enum RuntimeListOperationKind {
     Append {
         trigger: &'static str,
+        fields: Vec<RuntimeListAppendField>,
     },
     Remove {
         source: &'static str,
@@ -3684,6 +3782,12 @@ enum RuntimeListOperationKind {
         target: &'static str,
         predicate: RuntimeListPredicate,
     },
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeListAppendField {
+    name: &'static str,
+    source: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3830,7 +3934,7 @@ impl DerivedEquationPlan {
             .list_operations
             .iter()
             .filter_map(|operation| match &operation.kind {
-                ListOperationKind::Append { trigger } => Some(trigger.as_str()),
+                ListOperationKind::Append { trigger, .. } => Some(trigger.as_str()),
                 ListOperationKind::Remove { .. }
                 | ListOperationKind::Retain { .. }
                 | ListOperationKind::Count { .. } => None,
@@ -4319,9 +4423,18 @@ impl ListEquationPlan {
             .filter_map(|operation| {
                 let list = leak_runtime_path(operation.list.clone());
                 let kind = match &operation.kind {
-                    ListOperationKind::Append { trigger } => RuntimeListOperationKind::Append {
-                        trigger: leak_runtime_path(trigger.clone()),
-                    },
+                    ListOperationKind::Append { trigger, fields } => {
+                        RuntimeListOperationKind::Append {
+                            trigger: leak_runtime_path(trigger.clone()),
+                            fields: fields
+                                .iter()
+                                .map(|field| RuntimeListAppendField {
+                                    name: leak_runtime_path(field.name.clone()),
+                                    source: leak_runtime_path(field.source.clone()),
+                                })
+                                .collect(),
+                        }
+                    }
                     ListOperationKind::Remove { source, predicate } => {
                         RuntimeListOperationKind::Remove {
                             source: leak_runtime_path(source.clone()),
@@ -4357,7 +4470,7 @@ impl ListEquationPlan {
         self.operations
             .iter()
             .find_map(|operation| match &operation.kind {
-                RuntimeListOperationKind::Append { trigger } if operation.list == list => {
+                RuntimeListOperationKind::Append { trigger, .. } if operation.list == list => {
                     Some(*trigger)
                 }
                 RuntimeListOperationKind::Append { .. }
@@ -4366,6 +4479,60 @@ impl ListEquationPlan {
                 | RuntimeListOperationKind::Count { .. } => None,
             })
             .ok_or_else(|| format!("list `{list}` has no append operation in IR").into())
+    }
+
+    fn append_fields(&self, list: &str, trigger: &str) -> RuntimeResult<&[RuntimeListAppendField]> {
+        self.operations
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                RuntimeListOperationKind::Append {
+                    trigger: candidate,
+                    fields,
+                } if operation.list == list && *candidate == trigger => Some(fields.as_slice()),
+                RuntimeListOperationKind::Append { .. }
+                | RuntimeListOperationKind::Remove { .. }
+                | RuntimeListOperationKind::Retain { .. }
+                | RuntimeListOperationKind::Count { .. } => None,
+            })
+            .ok_or_else(|| format!("list `{list}` has no append trigger `{trigger}` in IR").into())
+    }
+
+    fn append_seed_fields(
+        &self,
+        list: &str,
+        trigger: &str,
+        trigger_value: &str,
+    ) -> RuntimeResult<BTreeMap<String, RuntimeValue>> {
+        let operation = self
+            .operations
+            .iter()
+            .find(|operation| match &operation.kind {
+                RuntimeListOperationKind::Append {
+                    trigger: candidate, ..
+                } => operation.list == list && *candidate == trigger,
+                RuntimeListOperationKind::Remove { .. }
+                | RuntimeListOperationKind::Retain { .. }
+                | RuntimeListOperationKind::Count { .. } => false,
+            })
+            .ok_or_else(|| format!("list `{list}` has no append trigger `{trigger}` in IR"))?;
+        let RuntimeListOperationKind::Append { fields, .. } = &operation.kind else {
+            unreachable!();
+        };
+        let mut seed_fields = BTreeMap::new();
+        for field in fields {
+            if field.source != trigger {
+                return Err(format!(
+                    "append field `{}` uses unsupported source `{}`; expected trigger `{trigger}`",
+                    field.name, field.source
+                )
+                .into());
+            }
+            seed_fields.insert(
+                field.name.to_owned(),
+                RuntimeValue::Text(trigger_value.to_owned()),
+            );
+        }
+        Ok(seed_fields)
     }
 
     fn count_predicate(&self, list: &str, target: &str) -> RuntimeResult<RuntimeListPredicate> {
@@ -4435,7 +4602,6 @@ struct TodoRuntime {
     list_equations: ListEquationPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
-    spare_generic_todos: Vec<GenericRow>,
     next_source_seq: u64,
     stale_source_drop_count: u64,
 }
@@ -4519,7 +4685,6 @@ impl TodoRuntime {
             list_equations: compiled.list_equations.clone(),
             source_routes: compiled.source_routes.clone(),
             list_source_bindings,
-            spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
         }
@@ -4571,7 +4736,6 @@ impl TodoRuntime {
             list_equations: ListEquationPlan::empty(),
             source_routes: SourceRoutePlan::default(),
             list_source_bindings,
-            spare_generic_todos: Vec::new(),
             next_source_seq: 1,
             stale_source_drop_count: 0,
         }
@@ -4626,7 +4790,21 @@ impl TodoRuntime {
             .expect("TodoMVC compiled runtime has row source bindings");
         self.generic
             .reserve_source_bindings(append_count * row_source_count);
-        self.spare_generic_todos.reserve(append_count);
+        if append_count > 0 {
+            let append_trigger = self
+                .list_equations
+                .append_trigger("todos")
+                .expect("TodoMVC compiled runtime has append trigger");
+            self.generic
+                .reserve_spare_rows_for_trigger_text(
+                    &self.list_equations,
+                    "todos",
+                    append_trigger,
+                    append_count,
+                    max_text_len,
+                )
+                .expect("TodoMVC generic runtime can reserve append rows");
+        }
         self.generic
             .reserve_list_row_textlike_fields("todos", "title", |_, current| {
                 max_text_len.saturating_sub(current.len())
@@ -4637,10 +4815,6 @@ impl TodoRuntime {
                 max_text_len.saturating_sub(current.len())
             })
             .expect("TodoMVC generic runtime has edit_text fields");
-        for _ in 0..append_count {
-            self.spare_generic_todos
-                .push(todo_generic_spare(max_text_len));
-        }
     }
 
     fn apply_step_into<'a>(
@@ -5204,18 +5378,13 @@ impl TodoRuntime {
         if title.is_empty() {
             return Ok(());
         }
-        let mut generic_todo = self
-            .spare_generic_todos
-            .pop()
-            .unwrap_or_else(|| todo_generic_row(title));
-        reset_todo_generic_row(&mut generic_todo, title)?;
         let append_trigger = self.list_equations.append_trigger("todos")?;
         let row_source_paths = self.list_source_bindings.source_paths("todos")?;
-        let insert = self.generic.append_row_for_trigger_and_bind_sources(
+        let insert = self.generic.append_row_for_trigger_text_and_bind_sources(
             &self.list_equations,
             "todos",
             append_trigger,
-            generic_todo,
+            title,
             row_source_paths,
         )?;
         deltas.push(list_delta(
@@ -5328,7 +5497,7 @@ impl TodoRuntime {
                 continue;
             };
             let (key, generation) = (generic_row.key, generic_row.generation);
-            self.spare_generic_todos.push(generic_row.value);
+            self.generic.spare_row("todos", generic_row.value);
             deltas.push(list_delta(
                 "ListRemove",
                 key,
@@ -5368,7 +5537,7 @@ impl TodoRuntime {
             return Ok(false);
         };
         let (key, generation) = (generic_row.key, generic_row.generation);
-        self.spare_generic_todos.push(generic_row.value);
+        self.generic.spare_row("todos", generic_row.value);
         deltas.push(list_delta(
             "ListRemove",
             key,
@@ -5401,7 +5570,7 @@ impl TodoRuntime {
                     ));
                 })?;
         let (key, generation) = (generic_row.key, generic_row.generation);
-        self.spare_generic_todos.push(generic_row.value);
+        self.generic.spare_row("todos", generic_row.value);
         deltas.push(list_delta(
             "ListRemove",
             key,

@@ -422,6 +422,13 @@ the event enum. Example runtimes still
 adapt generic facts into their current protocol/render outputs; TodoMVC no
 longer mirrors committed row or root values for render/test checks, and Cells
 no longer mirrors committed formula/editing fields.
+`List/append` row construction now lowers the `THEN { [field: source] }` record
+into typed append seed fields. `GenericCircuitRuntime` stores a row template per
+list from indexed `HOLD` initializers and materializes appended rows from that
+template rather than from a TodoMVC-specific row constructor. The runtime keeps
+a generic per-list spare-row pool and resets spare rows from the typed append
+seed fields, preserving the zero-allocation speed budget after warmup without a
+Todo-specific pool.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over

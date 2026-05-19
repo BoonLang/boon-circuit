@@ -157,6 +157,7 @@ pub struct ListOperation {
 pub enum ListOperationKind {
     Append {
         trigger: String,
+        fields: Vec<ListAppendField>,
     },
     Remove {
         source: String,
@@ -170,6 +171,12 @@ pub enum ListOperationKind {
         target: String,
         predicate: ListPredicate,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListAppendField {
+    pub name: String,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -486,9 +493,10 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
             continue;
         }
         if let Some(trigger) = list_append_trigger(&field.body, &field.parent_path) {
+            let fields = list_append_fields(&field.body, &field.parent_path);
             operations.push(ListOperation {
                 list: list_name.to_owned(),
-                kind: ListOperationKind::Append { trigger },
+                kind: ListOperationKind::Append { trigger, fields },
             });
         }
         for source in direct_source_refs(field, program) {
@@ -805,6 +813,33 @@ fn list_append_trigger(body: &str, parent_path: &str) -> Option<String> {
         .map(str::trim)
         .filter(|trigger| !trigger.is_empty())?;
     Some(canonical_local_path(trigger, parent_path))
+}
+
+fn list_append_fields(body: &str, parent_path: &str) -> Vec<ListAppendField> {
+    let Some((_, rest)) = body.split_once("List/append") else {
+        return Vec::new();
+    };
+    let Some((_, then_body)) = rest.split_once("|> THEN") else {
+        return Vec::new();
+    };
+    let Some((_, record)) = then_body.split_once('[') else {
+        return Vec::new();
+    };
+    let Some((record, _)) = record.split_once(']') else {
+        return Vec::new();
+    };
+    record
+        .split(',')
+        .filter_map(|entry| {
+            let (name, source) = entry.split_once(':')?;
+            let name = name.trim();
+            let source = source.trim();
+            (!name.is_empty() && !source.is_empty()).then(|| ListAppendField {
+                name: name.to_owned(),
+                source: canonical_local_path(source, parent_path),
+            })
+        })
+        .collect()
 }
 
 fn list_remove_predicate(branch: &str) -> ListPredicate {
@@ -1337,6 +1372,10 @@ mod tests {
                 && operation.kind
                     == ListOperationKind::Append {
                         trigger: "store.title_to_add".to_owned(),
+                        fields: vec![ListAppendField {
+                            name: "title".to_owned(),
+                            source: "store.title_to_add".to_owned(),
+                        }],
                     }
         }));
         assert!(ir.list_operations.iter().any(|operation| {

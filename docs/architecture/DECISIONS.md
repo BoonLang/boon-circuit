@@ -317,12 +317,13 @@ kept as a checked render/test cache. TodoMVC scenario assertions and state
 summaries now read root values, row fields, row identities, counts, and filter
 views from that generic storage instead of from the mirror. Cells now uses the
 same generic keyed list storage for `cell.formula_text`, `cell.editing_text`,
-and `cell.editing`; the formula/value/dependency vectors are derived caches.
-Root text `HOLD` commits and indexed text/bool `HOLD` field commits now go
-through generic runtime commit helpers before mirrors are updated. TodoMVC list
-append/remove operations now also enter through generic runtime structural
-helpers that check the IR-derived append trigger and remove predicates before
-the render/test mirror is updated.
+and `cell.editing`; Cells state summaries read those fields and hidden
+key/generation facts from generic storage, while formula value/error/dependency
+vectors remain derived caches. Root text `HOLD` commits and indexed text/bool
+`HOLD` field commits now go through generic runtime commit helpers before
+mirrors are updated. TodoMVC list append/remove operations now also enter
+through generic runtime structural helpers that check the IR-derived append
+trigger and remove predicates before the render/test mirror is updated.
 Scenario `expected_source_event` records are now normalized into a generic
 source-event object before TodoMVC or Cells consumes source path, text, key,
 address, or target row data. The per-step execution loop for timing, allocation

@@ -1794,6 +1794,7 @@ fn base_example_report(
                 "todomvc_count_and_filter_views_from_ir": is_todomvc,
                 "cells_edit_state_holds_from_ir": is_cells,
                 "cells_generic_hold_storage_authoritative": is_cells,
+                "cells_summary_reads_authoritative_storage": is_cells,
                 "cells_hidden_grid_keys_from_generic_storage": is_cells,
                 "cells_formula_pipeline_from_ir": is_cells
             }
@@ -6400,15 +6401,17 @@ impl CellsRuntime {
             "cells": interesting.iter().map(|address| {
                 let index = self.cell_index(address).unwrap_or_default();
                 let cell = self.cell(address).cloned().unwrap_or_default();
+                let (key, generation) = self.cell_key_generation(index);
                 json!({
                     "address": address,
-                    "formula": cell.formula,
-                    "editing_text": cell.editing_text,
+                    "formula": self.generic.list_row_textlike("cells", index, "formula_text").unwrap_or(""),
+                    "editing_text": self.generic.list_row_textlike("cells", index, "editing_text").unwrap_or(""),
                     "value": cell.value,
                     "error": cell.error,
-                    "editing": cell.editing,
+                    "editing": self.generic.list_row_bool("cells", index, "editing").unwrap_or(false),
                     "dependencies": cell.deps.iter().map(|index| self.address_for(*index)).collect::<Vec<_>>(),
-                    "hidden_key": self.cell_key_generation(index).0,
+                    "hidden_key": key,
+                    "hidden_generation": generation,
                 })
             }).collect::<Vec<_>>(),
             "hidden_keys": "debug/protocol only, not exposed to Boon source",

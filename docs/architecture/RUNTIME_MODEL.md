@@ -119,7 +119,7 @@ The compiler gets indexed cells by seeing a `HOLD` inside a list item scope.
 
 ## Scope Paths
 
-Scope paths are the runtime identity of state inside dynamic data:
+Scope paths are hidden runtime addresses for state inside dynamic data:
 
 ```text
 /                                           root
@@ -136,6 +136,10 @@ A stateful expression is identified by:
 
 The generation prevents stale events from mutating a deleted row whose storage
 slot was reused.
+
+Scope paths and generations are not Boon values. They cannot be read, compared,
+stored, or pattern-matched by Boon code. They exist only below the language
+boundary.
 
 ## Conflict Handling
 

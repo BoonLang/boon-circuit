@@ -102,13 +102,40 @@ not necessarily to the source app.
 Open design issue: source-level syntax may eventually need explicit key policy,
 but it should be minimal and compatible with the original TodoMVC style.
 
-## D5. SOURCE Is Canonical
+## D5. LIST Keys Are Internal By Default
+
+Decision: ordinary `LIST` items have stable runtime keys, but user code should
+not see or compare those keys. Boon has data equality, not object identity.
+
+The original plain TodoMVC source has no todo `id`; each row's `title`,
+`editing`, `completed`, and element sources are local to the list item. This is
+the desired source shape.
+
+The runtime still keeps identity:
+
+```text
+list id
+item key
+generation
+scope path
+```
+
+Indexes are not identity. They are positions and may change after filtering,
+sorting, deletion, or compaction.
+
+These are implementation facts, not Boon values. The Boon developer cannot ask
+for the current item key, compare it, or store it as app state.
+
+If input data contains a field named `id`, it remains ordinary data. Equality on
+that field compares data, not references or hidden runtime identity.
+
+## D6. SOURCE Is Canonical
 
 Decision: new examples should use `SOURCE` as explicit input ports. Legacy
 `LINK` can be supported later as compatibility sugar, but the new engine should
 not depend on late-bound actor links.
 
-Source identity must be structural:
+Source binding must be structural below the language:
 
 ```text
 program_hash
@@ -120,7 +147,7 @@ generation
 String event names such as `"toggle:3"` are acceptable only as temporary
 prototyping glue.
 
-## D6. HOLD Is Storage
+## D7. HOLD Is Storage
 
 Decision: `HOLD` is the only ordinary way to introduce persistent state.
 
@@ -135,7 +162,7 @@ HOLD inside nested comment -> Cell(expr_id, /todos:key/comments:key)
 
 Commit happens deterministically at the end of a tick.
 
-## D7. THEN Is Event Gating, Not Arbitrary Mutation
+## D8. THEN Is Event Gating, Not Arbitrary Mutation
 
 Decision: `THEN` evaluates its body only when the input event/value is present.
 It does not mutate state by itself.
@@ -155,7 +182,7 @@ PASSED.clk |> THEN { next_register_value }
 Clocked hardware lowering treats an impulse source as an edge trigger. The same
 semantic operator can remain valid in software.
 
-## D8. LATEST Is A Deterministic Merge
+## D9. LATEST Is A Deterministic Merge
 
 Decision: `LATEST` merges candidate updates by event presence and tick order,
 with deterministic tie-breaking.
@@ -176,7 +203,7 @@ PRIORITY { ... }  # source order is intentional
 LATEST { ... }    # most recent event wins deterministically
 ```
 
-## D9. WHILE Is Continuous Selection
+## D10. WHILE Is Continuous Selection
 
 Decision: `WHILE` is a continuous combinational gate/mux. It is not a loop.
 
@@ -184,7 +211,7 @@ It chooses an output while a condition or selected arm is true, and it recompute
 when dependencies change. Cycles through `WHILE` or pure expressions are errors
 unless broken by `HOLD`.
 
-## D10. LIST Deltas Are First-Class
+## D11. LIST Deltas Are First-Class
 
 Decision: `LIST` changes propagate as keyed deltas, not whole list snapshots.
 
@@ -203,7 +230,7 @@ SourceUnbind(source_id)
 The renderer may lower those semantic facts to direct render patches, but no
 layer should need a full DOM or list diff to know what changed.
 
-## D11. Differential Dataflow Is Optional, Not Core
+## D12. Differential Dataflow Is Optional, Not Core
 
 Decision: do not use Differential Dataflow as the primary runtime unless a later
 benchmark proves the local engine cannot handle derived relational workloads.
@@ -217,7 +244,38 @@ DD may still be useful for:
 
 But Boon state ownership remains explicit `HOLD`/field-memory equations.
 
-## D12. Start With Rust Static-Graph Interpreter
+## D13. FPGA Lowering Uses Profiles, Not App-Level Reducers
+
+Decision: an FPGA target should compile the same local TodoMVC equations with a
+hardware profile. It should not require rewriting TodoMVC into a central event
+handler or adding app-visible ids only for hardware identity.
+
+The profile supplies:
+
+```text
+clock/reset
+LIST capacities
+text widths and encodings
+event FIFO depth
+delta FIFO depth
+bulk operation latency policy
+```
+
+The compiler lowers:
+
+```text
+SOURCE       -> input event ports or event bus decoder
+HOLD         -> registers/register files
+LIST         -> valid bits, order memory, free list, generations
+List/append  -> allocation state machine
+List/remove  -> valid-bit/order update
+bulk ops     -> scan or parallel update engines
+deltas       -> output FIFO
+```
+
+The source-level values still declare their own next-state equations.
+
+## D14. Start With Rust Static-Graph Interpreter
 
 Decision: the first implementation should be a Rust interpreter over the static
 equation graph, not Rust codegen, Zig codegen, or DD.

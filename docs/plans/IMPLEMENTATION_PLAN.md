@@ -10,9 +10,10 @@ The implementation is not successful until all of these are true:
 2. The playground includes a code editor and can run custom Boon source.
 3. TodoMVC is written in local field-equation style, not a central reducer.
 4. TodoMVC can handle many todos without graph growth per todo.
-5. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
-6. LIST changes emit keyed deltas to the renderer.
-7. The debugger can explain causes for a selected field/key.
+5. Ordinary TodoMVC does not expose runtime identity, references, or row ids.
+6. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
+7. LIST changes emit keyed deltas to the renderer.
+8. The debugger can explain causes for a selected field/key.
 
 ## Phase 0: Repo Skeleton
 
@@ -171,6 +172,8 @@ Do not use:
 FUNCTION update(state, event)
 string event dispatch like "toggle:3"
 whole-list replacement for row field changes
+user-visible todo id just to make row retention or source routing work
+identity/reference comparison in Boon source
 ```
 
 Hard gates:
@@ -183,6 +186,8 @@ cargo bench -p boon_runtime --bench todomvc
 Performance checks:
 
 - graph node count is stable as todo count grows.
+- todo source does not contain `[id: ...]` or `next_todo_id` unless testing a
+  plain data field imported from external domain data.
 - toggling one todo emits one semantic field delta plus derived render deltas.
 - clear completed emits remove deltas for completed keys only.
 
@@ -257,7 +262,33 @@ hardware_bounded
 `hardware_bounded` rejects unsupported values such as unbounded text unless a
 storage profile is provided.
 
-## Phase 8: Codegen Later
+## Phase 8: FPGA TodoMVC Contract
+
+Before HDL/codegen work, prove the compiler can produce a hardware plan for the
+same no-user-id TodoMVC shape:
+
+```text
+LIST capacity
+fixed title width
+source event bus
+hidden slot/generation storage
+register-file fields
+append/remove state machines
+bulk operation scan policy
+delta output FIFO
+```
+
+Hard gate:
+
+```text
+cargo run -p boon_cli -- explain-hardware examples/todomvc.bn --profile fpga_todomvc
+```
+
+The output should show that row retention and source routing are implemented as
+internal slot/generation storage, not as required app-level `id` fields or Boon
+identity references.
+
+## Phase 9: Codegen Later
 
 Only after the interpreter proves semantics:
 

@@ -26,6 +26,46 @@ todos.editing      TodoKey -> Bool
 todos.generation   TodoKey -> Generation
 ```
 
+`TodoKey` is an internal runtime address. It is not a Boon value and is not the
+same thing as a user-visible `id` field.
+
+## Hidden Keys And Data Equality
+
+Ordinal list indexes are positions, not identity. They change when the list is
+filtered, sorted, compacted, or when an earlier item is deleted.
+
+```text
+before delete: [0:A, 1:B, 2:C]
+delete A
+after delete:  [0:B, 1:C]
+```
+
+If source events or retained state used only ordinal positions, a stale click
+from old position `1` could mutate the wrong item after compaction.
+
+The runtime therefore owns hidden stable list keys:
+
+```text
+position     visual/order fact, unstable
+key          hidden runtime address
+generation   reuse guard for stale events
+id field      ordinary app data if present
+```
+
+Ordinary TodoMVC should not need a user-visible `id`. The original plain
+TodoMVC source in `~/repos/boon` uses row-local links/state without an `id`
+field. A separate physical TodoMVC experiment added a `TodoId` only because it
+stored a global `selected_todo_id` and compared rows against it.
+
+The rule:
+
+```text
+Runtime LIST keys are hidden from Boon code.
+Boon equality is data equality.
+If data contains an id field, it is just data.
+Runtime keys, references, slots, and generations are never compared in Boon.
+```
+
 ## Item Scope
 
 When evaluating a row template for key `k`, the runtime enters:
@@ -161,3 +201,25 @@ nesting max depth = profile-defined
 
 The Boon source should not need to change except where the program genuinely
 requires unbounded behavior that the target cannot synthesize.
+
+On FPGA, the internal list key is usually the physical slot address plus a
+generation:
+
+```text
+TodoKey = slot index
+TodoGeneration = reuse counter
+
+valid[slot]
+generation[slot]
+title[slot]
+completed[slot]
+editing[slot]
+order[position] -> slot
+```
+
+This gives stable row retention and event routing without forcing an `id` field
+into the Boon todo record.
+
+From Boon's point of view, the slot and generation do not exist. They are only
+for generated code, source routing, stale-event rejection, and deterministic
+deltas.

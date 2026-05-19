@@ -4,6 +4,10 @@ This is the intended shape of TodoMVC for the new engine. It is not final Boon
 syntax; it is a design target. The important property is that each field locally
 declares what can change it.
 
+The original plain TodoMVC in `~/repos/boon` does not put an `id` field on todo
+records. That is the right default. Runtime retention needs hidden row keys, but
+those keys are not Boon values. Boon code sees and compares data only.
+
 ## Store Shape
 
 ```boon
@@ -42,13 +46,6 @@ store: [
             __ => SKIP
         }
 
-    next_todo_id:
-        3 |> HOLD id {
-            title_to_add |> THEN {
-                id + 1
-            }
-        }
-
     selected_filter:
         All |> HOLD filter {
             LATEST {
@@ -60,11 +57,11 @@ store: [
 
     todos:
         LIST {
-            [id: 1, title: TEXT { Buy groceries }]
-            [id: 2, title: TEXT { Clean room }]
+            [title: TEXT { Buy groceries }]
+            [title: TEXT { Clean room }]
         }
         |> List/append(title_to_add |> THEN {
-            [id: next_todo_id, title: title_to_add]
+            [title: title_to_add]
         })
         |> List/map(new_todo)
 ]
@@ -86,8 +83,6 @@ FUNCTION new_todo(seed) {
     ]
 
     [
-        id: seed.id
-
         alive:
             True |> HOLD alive {
                 LATEST {
@@ -152,6 +147,16 @@ FUNCTION new_todo(seed) {
 }
 ```
 
+The runtime still creates a hidden row address for every todo:
+
+```text
+/todos:<key>:<generation>
+```
+
+That key is used for source binding, deltas, storage, stale-event rejection, and
+debugging. It is not exposed to Boon code and cannot be compared by the Boon
+developer.
+
 ## Derived Values
 
 ```boon
@@ -186,7 +191,6 @@ The program above lowers to a static set of operators:
 ```text
 new_todo_text_next
 title_to_add_event
-next_todo_id_next
 selected_filter_next
 todos_append
 todo_alive_next[key]
@@ -200,6 +204,24 @@ render_todo_row_template[key]
 
 For 2 todos or 100000 todos, the operator graph is the same. Only memory size
 and changed-key sets grow.
+
+## Why The Old Physical Experiment Had Id
+
+The separate physical TodoMVC experiment in `~/repos/boon` added:
+
+```boon
+id: TodoId[id: Ulid/generate()]
+```
+
+because that example also had a global `selected_todo_id` and compared it in the
+row renderer to decide which row was being edited.
+
+That should be treated as a workaround from the old experiment, not the target
+language model. In the circuit model, editing should be row-local state driven by
+row-local sources, as in the original plain TodoMVC.
+
+If a program's input data contains a field named `id`, Boon treats it as ordinary
+data. Comparing it compares data. It is not a reference and not runtime identity.
 
 ## Required Debug View
 

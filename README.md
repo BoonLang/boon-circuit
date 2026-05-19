@@ -24,6 +24,7 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [Language semantics](docs/architecture/LANGUAGE_SEMANTICS.md)
 - [LIST and indexed memory model](docs/architecture/LIST_MODEL.md)
 - [Delta protocol for renderers and runtimes](docs/architecture/DELTA_PROTOCOL.md)
+- [FPGA TodoMVC lowering](docs/architecture/FPGA_TODOMVC_LOWERING.md)
 - [Relationship to previous Boon attempts](docs/architecture/PREVIOUS_ATTEMPTS.md)
 - [TodoMVC target shape](docs/examples/TODOMVC_CIRCUIT_STYLE.md)
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
@@ -45,7 +46,8 @@ The first implementation is only convincing if these are true:
 
 1. TodoMVC source keeps the original local field-equation feel.
 2. TodoMVC with many rows does not grow runtime graph topology per row.
-3. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
-4. LIST changes propagate as keyed deltas to Ply, not as whole snapshots.
-5. Browser/server runtime sync can exchange semantic deltas, not full state.
-6. Every stateful value has a visible next-state equation.
+3. Ordinary TodoMVC does not expose runtime identity, references, or row ids.
+4. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
+5. LIST changes propagate as keyed deltas to Ply, not as whole snapshots.
+6. Browser/server runtime sync can exchange semantic deltas, not full state.
+7. Every stateful value has a visible next-state equation.

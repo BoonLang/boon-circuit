@@ -173,7 +173,7 @@ even if the playground runs only locally.
 
 ## Determinism Rules
 
-Every delta should carry enough identity to be replayed:
+Every delta should carry enough protocol identity to be replayed:
 
 ```text
 program_hash
@@ -188,8 +188,9 @@ source_id
 value
 ```
 
-Renderers should not infer identity from array positions. Positions are layout
-facts; keys are identity.
+Renderers should not infer protocol identity from array positions. Positions are
+layout facts; keys are hidden protocol/runtime facts. These keys are not Boon
+values and are never used for Boon equality.
 
 ## Whole Snapshots
 

@@ -3,6 +3,18 @@
 This file captures the intended operational meaning of the Boon constructs that
 matter for the circuit engine.
 
+## Data Equality
+
+Boon values are data. Equality compares data structurally.
+
+There is no Boon-level object identity, reference identity, row identity, slot
+identity, or pointer identity. Runtime keys may exist below the language for
+retention, source routing, stale-event rejection, rendering, and network deltas,
+but Boon code cannot read or compare them.
+
+If input data contains a field named `id`, it is still ordinary data. Comparing
+that field compares its value, not a hidden runtime object.
+
 ## SOURCE
 
 `SOURCE` declares an input port.
@@ -15,13 +27,14 @@ change: SOURCE
 key_down: SOURCE
 ```
 
-Inside a list item, a source is keyed by item scope:
+Inside a list item, a source is bound by hidden item scope:
 
 ```text
 source expr id + /todos:42 + generation
 ```
 
-The host renderer binds concrete UI events to these structural source ids.
+The host renderer binds concrete UI events to these structural source ids. Those
+ids are not Boon values.
 
 ## SKIP
 
@@ -119,8 +132,8 @@ Cycles through `WHILE` must be rejected unless there is a `HOLD` in the cycle.
 
 ## LIST
 
-`LIST` is a collection value. In the circuit engine it lowers to keyed memory
-plus structural deltas.
+`LIST` is a collection value. In the circuit engine it lowers to hidden keyed
+memory plus structural deltas.
 
 Dynamic software:
 
@@ -145,7 +158,7 @@ constraint, not a reason to force a new app-level collection syntax.
 
 Mapping over a dynamic list does not clone semantic graph nodes per row.
 
-It creates a static row-template operator evaluated over active keys:
+It creates a static row-template operator evaluated over active hidden keys:
 
 ```text
 for each changed or visible key:

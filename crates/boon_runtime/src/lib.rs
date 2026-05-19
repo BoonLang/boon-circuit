@@ -1772,6 +1772,7 @@ fn base_example_report(
                 "generic_list_remove_predicate_route": true,
                 "generic_routed_root_target_application": true,
                 "generic_routed_indexed_target_application": true,
+                "generic_routed_todo_bool_target_application": true,
                 "ir_list_operation_table_loaded": true,
                 "list_operation_count": ir.list_operations.len(),
                 "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -3655,6 +3656,32 @@ impl SourceRoute {
         })
     }
 
+    fn single_non_root_scalar_target_matching(
+        &self,
+        matches_expression: impl Fn(ScalarUpdateExpression) -> bool,
+    ) -> RuntimeResult<Option<&'static str>> {
+        let mut target = None;
+        for candidate in &self.scalar_targets {
+            if self
+                .root_scalar_targets
+                .iter()
+                .any(|root| root.target == candidate.target)
+                || !matches_expression(candidate.expression)
+            {
+                continue;
+            }
+            if target.is_some_and(|current| current != candidate.target) {
+                return Err(format!(
+                    "source `{}` has multiple matching non-root scalar targets",
+                    self.source
+                )
+                .into());
+            }
+            target = Some(candidate.target);
+        }
+        Ok(target)
+    }
+
     fn has_derived_text_target(&self, target: &str) -> bool {
         self.derived_text_targets
             .iter()
@@ -3837,9 +3864,11 @@ enum TodoEvent<'a> {
     },
     ToggleAll {
         source: &'a str,
+        target: &'static str,
     },
     TodoCheckbox {
         source: &'a str,
+        target: &'static str,
         target_text: &'a str,
         target_occurrence: usize,
     },
@@ -4135,31 +4164,28 @@ impl TodoRuntime {
             TodoEvent::ClearCompleted { predicate, .. } => {
                 self.remove_where_predicate(predicate, &mut deltas, &mut patches)?;
             }
-            TodoEvent::ToggleAll { source } => {
+            TodoEvent::ToggleAll { source, target } => {
                 let all_completed = self.all_completed();
                 for index in 0..self.todos.len() {
-                    let next_completed = self.todo_bool_update_with_snapshot(
-                        index,
-                        "todo.completed",
-                        source,
-                        all_completed,
-                    )?;
-                    self.set_completed(index, next_completed, &mut deltas, &mut patches)?;
+                    let next_completed =
+                        self.todo_bool_update_with_snapshot(index, target, source, all_completed)?;
+                    self.set_completed(target, index, next_completed, &mut deltas, &mut patches)?;
                 }
             }
             TodoEvent::TodoCheckbox {
                 source,
+                target,
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let next_completed = self.todo_bool_update_with_snapshot(
                     index,
-                    "todo.completed",
+                    target,
                     source,
                     self.all_completed(),
                 )?;
-                self.set_completed(index, next_completed, &mut deltas, &mut patches)?;
+                self.set_completed(target, index, next_completed, &mut deltas, &mut patches)?;
             }
             TodoEvent::TodoTitleDoubleClick {
                 source,
@@ -4438,10 +4464,10 @@ impl TodoRuntime {
                     predicate: route.list_remove_predicate("todos")?,
                 }));
             }
-            if route.has_non_root_scalar_expression(|expression| {
+            if let Some(target) = route.single_non_root_scalar_target_matching(|expression| {
                 matches!(expression, ScalarUpdateExpression::BoolNot(_))
-            }) {
-                return Ok(Some(TodoEvent::ToggleAll { source }));
+            })? {
+                return Ok(Some(TodoEvent::ToggleAll { source, target }));
             }
             if let Some(target) = route.single_root_scalar_target()? {
                 return Ok(Some(TodoEvent::Filter { source, target }));
@@ -4456,9 +4482,10 @@ impl TodoRuntime {
         let remove_predicate = removes_todos
             .then(|| route.list_remove_predicate("todos"))
             .transpose()?;
-        let toggles_completed = route.has_non_root_scalar_expression(|expression| {
-            matches!(expression, ScalarUpdateExpression::BoolNot(_))
-        });
+        let toggles_completed_target =
+            route.single_non_root_scalar_target_matching(|expression| {
+                matches!(expression, ScalarUpdateExpression::BoolNot(_))
+            })?;
         let updates_title = route.has_non_root_scalar_expression(|expression| {
             matches!(
                 expression,
@@ -4484,9 +4511,10 @@ impl TodoRuntime {
                 target_occurrence,
             }));
         }
-        if toggles_completed {
+        if let Some(target) = toggles_completed_target {
             return Ok(Some(TodoEvent::TodoCheckbox {
                 source,
+                target,
                 target_text,
                 target_occurrence,
             }));
@@ -4644,17 +4672,19 @@ impl TodoRuntime {
 
     fn set_completed(
         &mut self,
+        target: &'static str,
         index: usize,
         completed: bool,
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        self.set_todo_bool_field(index, "completed", completed)?;
+        let field = row_field_name(target);
+        self.set_todo_bool_field(index, field, completed)?;
         let todo = &self.todos[index];
         deltas.push(field_delta(
             Some(todo.key),
             Some(todo.generation),
-            "completed",
+            field,
             ProtocolValue::Bool(todo.value.completed),
         ));
         patches.push(patch(
@@ -5338,7 +5368,7 @@ fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
     runtime
-        .set_completed(index, true, &mut deltas, &mut patches)
+        .set_completed("todo.completed", index, true, &mut deltas, &mut patches)
         .expect("stress toggle index is in range");
     let alloc_delta = allocation_delta(allocations_before);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -6736,7 +6766,7 @@ fn assert_todo_event_matches(step: &ScenarioStep, event: &TodoEvent<'_>) -> Runt
         TodoEvent::NewInputKeyDown { source, .. } => source,
         TodoEvent::Filter { source, .. } => source,
         TodoEvent::ClearCompleted { source, .. } => source,
-        TodoEvent::ToggleAll { source } => source,
+        TodoEvent::ToggleAll { source, .. } => source,
         TodoEvent::TodoCheckbox { source, .. }
         | TodoEvent::TodoTitleDoubleClick { source, .. }
         | TodoEvent::EditingTitleChange { source, .. }

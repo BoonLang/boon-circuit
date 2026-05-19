@@ -31,17 +31,37 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let (source, scenario, _) = example_paths(&example)?;
     let screenshot = report.with_extension("png");
     let os_probe_screenshot = report.with_file_name(format!("{example}-headed-os-input.png"));
-    let output = run_scenario(&source, &scenario, VerificationLayer::HeadedPly, None)?;
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let os_probe_token = format!("boon-headed-os-{}-{example}", std::process::id());
     let headed_os_probe =
         run_os_keyboard_probe_in_window(&mut ply, &os_probe_token, &os_probe_screenshot).await?;
     let source_text = std::fs::read_to_string(&source)?;
-    let scenario_len = parse_scenario(&scenario)?.step.len();
+    let scenario_data = parse_scenario(&scenario)?;
+    let mut state = PlaygroundState::new(&example, &mut ply)?;
     ply.set_text_value("source_editor", &source_text);
-    let state =
-        PlaygroundState::from_output(example.clone(), scenario.clone(), scenario_len, output);
+    state.reset_to_initial(&ply);
+    for _ in 0..3 {
+        draw_frame(&mut ply, &state).await;
+        next_frame().await;
+    }
+    let app_control_observations =
+        drive_visible_app_control_probe(&mut ply, &mut state, &report, &example).await;
+    let step_observations = drive_visible_step_control_sequence(
+        &mut ply,
+        &mut state,
+        &scenario_data,
+        &report,
+        &example,
+    )
+    .await;
+    let output = run_scenario(&source, &scenario, VerificationLayer::HeadedPly, None)?;
+    state = PlaygroundState::from_output(
+        example.clone(),
+        scenario.clone(),
+        scenario_data.step.len(),
+        output,
+    );
     for _ in 0..3 {
         draw_frame(&mut ply, &state).await;
         next_frame().await;
@@ -111,20 +131,44 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "focused_window_proof".to_owned(),
             json!("OS probe set Ply focus to os_probe_input, sent a real keyboard token, observed it in Ply text state, then captured the headed macroquad/Ply framebuffer"),
         );
+        let mut checkpoint_paths = vec![json!(screenshot), json!(os_probe_screenshot)];
+        checkpoint_paths.extend(
+            app_control_observations
+                .iter()
+                .filter_map(|observation| observation.get("screenshot_path").cloned()),
+        );
+        checkpoint_paths.extend(
+            step_observations
+                .iter()
+                .filter_map(|observation| observation.get("screenshot_path").cloned()),
+        );
         object.insert(
             "checkpoint_screenshot_or_video_paths".to_owned(),
-            json!([screenshot, os_probe_screenshot]),
+            json!(checkpoint_paths),
         );
-        object.insert(
-            "artifact_sha256s".to_owned(),
-            json!([{
+        let mut artifact_sha256s = vec![
+            json!({
                 "path": screenshot,
                 "sha256": sha256_file(&screenshot)?
-            }, {
+            }),
+            json!({
                 "path": os_probe_screenshot,
                 "sha256": sha256_file(&os_probe_screenshot)?
-            }]),
-        );
+            }),
+        ];
+        artifact_sha256s.extend(app_control_observations.iter().filter_map(|observation| {
+            Some(json!({
+                "path": observation.get("screenshot_path")?.clone(),
+                "sha256": observation.get("screenshot_sha256")?.clone()
+            }))
+        }));
+        artifact_sha256s.extend(step_observations.iter().filter_map(|observation| {
+            Some(json!({
+                "path": observation.get("screenshot_path")?.clone(),
+                "sha256": observation.get("screenshot_sha256")?.clone()
+            }))
+        }));
+        object.insert("artifact_sha256s".to_owned(), json!(artifact_sha256s));
         object.insert(
             "nonblank_screenshot_hashes".to_owned(),
             json!([{
@@ -134,17 +178,25 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "per_step_pointer_keyboard_route".to_owned(),
-            json!("real OS keyboard event -> focused Ply text input proof; scenario user_action -> routed source event -> runtime tick; expected_source_event is assertion-only"),
+            json!("real OS keyboard event -> focused Ply text input proof; real OS keyboard event -> visible app text-control proof; real OS keyboard activation -> visible Step control proof; scenario user_action -> routed source event -> runtime tick; expected_source_event is assertion-only"),
         );
         object.insert(
             "input_injection_method".to_owned(),
-            json!("os_keyboard_probe_plus_scenario_user_action_route"),
+            json!("os_keyboard_probe_visible_app_control_and_step_control_plus_scenario_user_action_route"),
         );
         object.insert(
             "os_input_limitation".to_owned(),
-            json!("This headed verifier proves real OS keyboard input reaches the Ply window, then replays scenario user_action records through the runtime route. It does not yet pointer-click or type each visible TodoMVC/Cells control through OS hit testing."),
+            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches one real visible application text control for the selected example, and can activate the visible Ply Step control for each scenario transition. It then replays scenario user_action records through the runtime route. It does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
         );
         object.insert("os_input_probe".to_owned(), headed_os_probe);
+        object.insert(
+            "visible_app_control_os_input".to_owned(),
+            json!(app_control_observations),
+        );
+        object.insert(
+            "visible_step_control_os_input".to_owned(),
+            json!(step_observations),
+        );
         object.insert(
             "playground_surface".to_owned(),
             json!({
@@ -159,7 +211,220 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
     }
     write_json(&report, &report_json)?;
-    Ok(())
+    if app_control_observations.iter().all(|observation| {
+        observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+    }) && step_observations.iter().all(|observation| {
+        observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "headed verifier did not activate every visible app-control probe and Step control; see `{}`",
+            report.display()
+        )
+        .into())
+    }
+}
+
+async fn drive_visible_app_control_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    report: &std::path::Path,
+    example: &str,
+) -> Vec<serde_json::Value> {
+    let (element_id, label, typed_text, contract) = if example == "cells" {
+        (
+            "cell_editor_A1",
+            "cells-a1-editor",
+            "41",
+            "OS keyboard text reached the visible Cells A1 editor text input",
+        )
+    } else {
+        (
+            "todo_new_input",
+            "todomvc-new-todo-input",
+            "Visible todo probe",
+            "OS keyboard text reached the visible TodoMVC new-todo text input",
+        )
+    };
+    let screenshot = report.with_file_name(format!("{example}-headed-app-control-{label}.png"));
+    vec![
+        drive_visible_text_input_probe(
+            ply,
+            state,
+            element_id,
+            label,
+            typed_text,
+            contract,
+            &screenshot,
+        )
+        .await,
+    ]
+}
+
+async fn drive_visible_text_input_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    element_id: &'static str,
+    label: &str,
+    typed_text: &str,
+    contract: &str,
+    screenshot: &PathBuf,
+) -> serde_json::Value {
+    ply.set_text_value(element_id, "");
+    let mut typed = false;
+    let mut send_error = None;
+    let mut observed_value = String::new();
+    let mut bounds = serde_json::Value::Null;
+    for frame in 0..120 {
+        draw_frame(ply, state).await;
+        if let Some(app_bounds) = ply.bounding_box(element_id) {
+            bounds = json!({
+                "x": app_bounds.x,
+                "y": app_bounds.y,
+                "width": app_bounds.width,
+                "height": app_bounds.height
+            });
+        }
+        ply.set_focus(element_id);
+        if frame == 8 && !typed {
+            typed = true;
+            if let Err(error) = send_real_keyboard_text(typed_text) {
+                send_error = Some(error.to_string());
+            }
+        }
+        observed_value = ply.get_text_value(element_id).to_owned();
+        if os_probe_observed_token(&observed_value, typed_text) {
+            break;
+        }
+        next_frame().await;
+    }
+    draw_frame(ply, state).await;
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = screenshot.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    image.export_png(
+        screenshot
+            .to_str()
+            .unwrap_or("target/reports/invalid-app-control.png"),
+    );
+    let pass = typed && os_probe_observed_token(&observed_value, typed_text);
+    let observed_insertion_order = if observed_value.contains(typed_text) {
+        "normal"
+    } else if observed_value.contains(&reverse_text(typed_text)) {
+        "reversed"
+    } else {
+        "missing"
+    };
+    ply.set_text_value(element_id, "");
+    json!({
+        "id": label,
+        "pass": pass,
+        "target_element_id": element_id,
+        "visible_bounds": bounds,
+        "input_route_contract": contract,
+        "keyboard_tool": "wtype",
+        "keyboard_tool_path": command_path("wtype"),
+        "typed": typed,
+        "send_error": send_error,
+        "typed_text_sha256": boon_runtime::sha256_bytes(typed_text.as_bytes()),
+        "observed_value_sha256": boon_runtime::sha256_bytes(observed_value.as_bytes()),
+        "observed_insertion_order": observed_insertion_order,
+        "screenshot_path": screenshot,
+        "screenshot_sha256": sha256_file(screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
+        "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
+    })
+}
+
+async fn drive_visible_step_control_sequence(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    scenario: &boon_runtime::Scenario,
+    report: &std::path::Path,
+    example: &str,
+) -> Vec<serde_json::Value> {
+    let mut observations = Vec::new();
+    for step_index in 1..scenario.step.len() {
+        let step = &scenario.step[step_index];
+        let screenshot = report.with_file_name(format!(
+            "{example}-headed-step-{step_index:02}-{}.png",
+            sanitize_artifact_label(&step.id)
+        ));
+        let observation =
+            drive_visible_step_control_once(ply, state, step_index + 1, &step.id, &screenshot)
+                .await;
+        observations.push(observation);
+    }
+    observations
+}
+
+async fn drive_visible_step_control_once(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    expected_limit: usize,
+    step_id: &str,
+    screenshot: &PathBuf,
+) -> serde_json::Value {
+    let mut pressed = false;
+    let mut key_sent = false;
+    let mut send_error = None;
+    let mut bounds = serde_json::Value::Null;
+    for frame in 0..90 {
+        draw_frame(ply, state).await;
+        if let Some(step_bounds) = ply.bounding_box("step_button") {
+            bounds = json!({
+                "x": step_bounds.x,
+                "y": step_bounds.y,
+                "width": step_bounds.width,
+                "height": step_bounds.height
+            });
+        }
+        ply.set_focus("step_button");
+        if frame == 6 && !key_sent {
+            key_sent = true;
+            if let Err(error) = send_real_key("Return") {
+                send_error = Some(error.to_string());
+            }
+        }
+        if ply.is_just_pressed("step_button") {
+            state.step_next(ply);
+            pressed = true;
+            break;
+        }
+        next_frame().await;
+    }
+    draw_frame(ply, state).await;
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = screenshot.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    image.export_png(
+        screenshot
+            .to_str()
+            .unwrap_or("target/reports/invalid-step.png"),
+    );
+    let observed_limit = state.step_limit.unwrap_or(state.scenario_len);
+    json!({
+        "id": step_id,
+        "pass": pressed && observed_limit == expected_limit,
+        "target_element_id": "step_button",
+        "visible_bounds": bounds,
+        "input_route_contract": "OS keyboard Enter reached focused visible Ply Step control, which advanced the scenario prefix in the playground",
+        "keyboard_tool": "wtype",
+        "keyboard_tool_path": command_path("wtype"),
+        "key_sent": key_sent,
+        "send_error": send_error,
+        "observed_step_limit": observed_limit,
+        "expected_step_limit": expected_limit,
+        "screenshot_path": screenshot,
+        "screenshot_sha256": sha256_file(screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
+        "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
+    })
 }
 
 async fn run_os_keyboard_probe_in_window(
@@ -836,11 +1101,40 @@ fn step_label(state: &PlaygroundState) -> String {
 fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
     let active = state["active_count"].as_u64().unwrap_or_default();
     let completed = state["completed_count"].as_u64().unwrap_or_default();
+    ui.element()
+        .id("todo_new_input")
+        .height(fixed!(40.0))
+        .width(grow!())
+        .background_color(0xFFFFFF)
+        .border(|border| border.color(0x2F6FB8).all(1))
+        .layout(|layout| layout.padding((10, 10, 7, 7)))
+        .text_input(|input| {
+            input
+                .placeholder("What needs to be done?")
+                .font(&DEFAULT_FONT)
+                .font_size(17)
+                .text_color(0x1F2630)
+                .placeholder_color(0x8B97A7)
+                .cursor_color(0x2F6FB8)
+                .selection_color(0xB9D7F5)
+        })
+        .empty();
+    ui.element()
+        .height(fixed!(32.0))
+        .width(grow!())
+        .layout(|layout| layout.direction(LeftToRight).gap(6))
+        .children(|ui| {
+            app_button(ui, "todo_toggle_all", "Toggle all", false);
+            app_button(ui, "todo_filter_all", "All", true);
+            app_button(ui, "todo_filter_active", "Active", false);
+            app_button(ui, "todo_filter_completed", "Completed", false);
+            app_button(ui, "todo_clear_completed", "Clear completed", false);
+        });
     ui.text(&format!("{active} active, {completed} completed"), |text| {
         text.font_size(16).color(0x2F6FB8)
     });
     if let Some(todos) = state["todos"].as_array() {
-        for todo in todos {
+        for (index, todo) in todos.iter().enumerate() {
             let title = todo["title"].as_str().unwrap_or("");
             let checked = if todo["completed"].as_bool().unwrap_or(false) {
                 "[x]"
@@ -854,9 +1148,32 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                 .border(|border| border.color(0xD5DDE8).all(1))
                 .layout(|layout| layout.padding((10, 10, 6, 6)).align(Left, CenterY))
                 .children(|ui| {
-                    ui.text(&format!("{checked} {title}"), |text| {
-                        text.font_size(16).color(0x1F2630)
-                    });
+                    ui.element()
+                        .id(("todo_row_checkbox", index as u32))
+                        .width(fixed!(34.0))
+                        .height(fixed!(24.0))
+                        .background_color(0xE4EAF2)
+                        .layout(|layout| layout.align(CenterX, CenterY))
+                        .children(|ui| {
+                            ui.text(checked, |text| text.font_size(14).color(0x1F2630));
+                        });
+                    ui.element()
+                        .id(("todo_row_title", index as u32))
+                        .width(grow!())
+                        .height(fixed!(24.0))
+                        .layout(|layout| layout.align(Left, CenterY))
+                        .children(|ui| {
+                            ui.text(title, |text| text.font_size(16).color(0x1F2630));
+                        });
+                    ui.element()
+                        .id(("todo_row_delete", index as u32))
+                        .width(fixed!(28.0))
+                        .height(fixed!(24.0))
+                        .background_color(0xF5E8E8)
+                        .layout(|layout| layout.align(CenterX, CenterY))
+                        .children(|ui| {
+                            ui.text("x", |text| text.font_size(14).color(0xA32929));
+                        });
                 });
         }
     }
@@ -869,19 +1186,66 @@ fn cells_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
             let value = cell["value"].as_str().unwrap_or("");
             let formula = cell["formula"].as_str().unwrap_or("");
             let error = cell["error"].as_str().unwrap_or("");
+            let cell_id = match address {
+                "A1" => Some("cell_editor_A1"),
+                "B1" => Some("cell_editor_B1"),
+                "C1" => Some("cell_editor_C1"),
+                "D1" => Some("cell_editor_D1"),
+                _ => None,
+            };
             ui.element()
-                .height(fixed!(34.0))
+                .height(fixed!(40.0))
                 .width(grow!())
                 .background_color(0xFFFFFF)
                 .border(|border| border.color(0xD5DDE8).all(1))
-                .layout(|layout| layout.padding((10, 10, 6, 6)).align(Left, CenterY))
+                .layout(|layout| {
+                    layout
+                        .direction(LeftToRight)
+                        .padding((8, 8, 5, 5))
+                        .gap(8)
+                        .align(Left, CenterY)
+                })
                 .children(|ui| {
-                    ui.text(&format!("{address}: {value}  {formula} {error}"), |text| {
-                        text.font_size(16).color(0x1F2630)
+                    ui.text(address, |text| text.font_size(15).color(0x2F6FB8));
+                    ui.element()
+                        .id(cell_id.unwrap_or("cell_editor_other"))
+                        .width(fixed!(140.0))
+                        .height(fixed!(28.0))
+                        .background_color(0xFFFFFF)
+                        .border(|border| border.color(0xD5DDE8).all(1))
+                        .layout(|layout| layout.padding((7, 7, 4, 4)))
+                        .text_input(|input| {
+                            input
+                                .placeholder(formula)
+                                .font(&DEFAULT_FONT)
+                                .font_size(14)
+                                .text_color(0x1F2630)
+                                .placeholder_color(0x8B97A7)
+                                .cursor_color(0x2F6FB8)
+                                .selection_color(0xB9D7F5)
+                        })
+                        .empty();
+                    ui.text(&format!("= {value} {error}"), |text| {
+                        text.font_size(15).color(0x1F2630)
                     });
                 });
         }
     }
+}
+
+fn app_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) {
+    ui.element()
+        .id(id)
+        .height(fixed!(28.0))
+        .width(fixed!(118.0))
+        .background_color(if selected { 0x2F6FB8 } else { 0xE4EAF2 })
+        .layout(|layout| layout.align(CenterX, CenterY))
+        .children(|ui| {
+            ui.text(label, |text| {
+                text.font_size(13)
+                    .color(if selected { 0xFFFFFF } else { 0x1F2630 })
+            });
+        });
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
@@ -948,6 +1312,33 @@ fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>>
     } else {
         Err(format!("wtype exited with {status}").into())
     }
+}
+
+fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(wtype) = command_path("wtype") else {
+        return Err("wtype is required for headed keyboard activation".into());
+    };
+    let status = std::process::Command::new(wtype)
+        .args(["-k", key])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("wtype -k {key} exited with {status}").into())
+    }
+}
+
+fn sanitize_artifact_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn unix_seconds_string() -> String {

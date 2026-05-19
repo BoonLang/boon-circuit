@@ -455,15 +455,15 @@ Source-route action execution is now a generic runtime boundary, not only a set
 of classification helpers. The scheduled runtime can walk the precomputed
 `RootScalar`, `DerivedText`, `ListAppend`, `ListRemove`, `IndexedText`, and
 `IndexedBool` actions for a source, apply them through generic storage, and
-stream typed mutations back to the current surface drivers. TodoMVC submit,
-toggle-all, edit-text change, row delete, and clear-completed paths now use that
-generic action executor; Cells change, commit, and cancel paths use the same
-executor for indexed text/bool source actions. Some TodoMVC source paths
-intentionally remain targeted for the moment: root-only text/filter commits and
-single-row bool/title commits select one branch from a source route that may
-contain several actions, so the adapter still narrows those calls until the full
-tick executor can provide branch guards and renderer lowering without the
-TodoMVC driver layer.
+stream typed mutations back to the current surface drivers. TodoMVC root,
+append, toggle, edit-open, edit-change, edit-commit, edit-cancel, blur, row
+delete, and clear-completed source effects now use that generic action executor;
+Cells change, commit, and cancel paths use the same executor for indexed
+text/bool source actions. The remaining adapter boundary is no longer branch
+selection for those source effects; it is the surface driver that routes
+scenario/user actions to source contexts, lowers generic mutations into the
+current render protocol, and keeps the Cells formula dependency cache until the
+complete equation/tick executor replaces the TodoMVC/Cells driver layer.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
@@ -496,6 +496,18 @@ derived-field references such as `new_todo_text -> title_to_add` to build
 known blocker before the full "no hardcoded app behavior" criterion is met.
 Executable reports include `runtime_execution` metadata so this blocker is
 visible in verification artifacts.
+Headed Ply verification now records two intermediate OS-input slices. First, it
+focuses one real visible application text control in the preview (`todo_new_input`
+for TodoMVC or `cell_editor_A1` for Cells), sends real OS keyboard text through
+`wtype`, observes the text through Ply state, captures the control screenshot,
+and stores the control bounds and artifact hash. Second, it focuses the visible
+Step control, sends real OS keyboard activation, advances each scenario prefix
+through the playground, captures per-step screenshots, and stores the Step
+control bounds in the headed report. This does not satisfy the final e2e gate
+yet because the full scenario is still replayed through scenario user actions
+after the visible-control probes; the report keeps `os_input_limitation` until
+every TodoMVC/Cells scenario step is driven by actual visible app controls and
+observed source events.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

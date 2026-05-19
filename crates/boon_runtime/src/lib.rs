@@ -1723,92 +1723,97 @@ fn base_example_report(
     let total_alloc_bytes: u64 = allocation_deltas.iter().map(|delta| delta.bytes).sum();
     let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
     let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
+    let generic_runtime_slices = json!({
+        "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
+        "ir_update_branch_table_loaded": true,
+        "update_branch_count": ir.update_branches.len(),
+        "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
+        "generic_scenario_loop_executor": true,
+        "generic_schedule_instantiated_before_adapter": true,
+        "generic_source_event_ingest": true,
+        "generic_source_binding_store": true,
+        "generic_indexed_branch_evaluator": true,
+        "generic_indexed_scalar_commit_executor": true,
+        "generic_semantic_delta_emitter": true,
+        "generic_loaded_runtime_shell": true,
+        "generic_source_route_action_executor": true,
+        "generic_todomvc_source_effects_through_action_executor": is_todomvc,
+        "generic_cells_source_effects_through_action_executor": is_cells,
+        "generic_root_text_tick_executor": true,
+        "generic_route_selected_root_hold_commit_executor": true,
+        "generic_indexed_hold_commit_executor": true,
+        "generic_route_selected_indexed_bool_commit_executor": true,
+        "generic_route_selected_todo_edit_text_commit_executor": true,
+        "generic_route_selected_todo_title_commit_executor": true,
+        "generic_route_selected_todo_editing_commit_executor": true,
+        "generic_indexed_bulk_bool_commit_executor": true,
+        "generic_list_append_source_binding_executor": true,
+        "generic_list_remove_source_unbinding_executor": true,
+        "generic_list_count_retain_executor": true,
+        "generic_todomvc_summary_reads_authoritative_storage": true,
+        "generic_todomvc_root_holds_no_mirror": is_todomvc,
+        "generic_todomvc_rows_hold_no_mirror": is_todomvc,
+        "generic_todomvc_delta_identities_from_authoritative_storage": true,
+        "generic_cells_committed_fields_hold_no_mirror": is_cells,
+        "generic_root_source_dispatch": true,
+        "generic_derived_text_transform_executor": true,
+        "generic_source_event_route_executor": true,
+        "generic_compiled_source_route_index": true,
+        "generic_source_route_scalar_expression_index": true,
+        "generic_indexed_text_route_index": true,
+        "generic_indexed_bool_route_index": true,
+        "generic_cells_editor_route_uses_indexed_targets": true,
+        "generic_root_source_route_index": true,
+        "generic_list_remove_predicate_route": true,
+        "generic_routed_root_target_application": true,
+        "generic_routed_indexed_target_application": true,
+        "generic_routed_todo_bool_target_application": true,
+        "generic_routed_todo_edit_text_target_application": true,
+        "ir_list_operation_table_loaded": true,
+        "list_operation_count": ir.list_operations.len(),
+        "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
+        "ir_formula_operation_table_loaded": true,
+        "formula_operation_count": ir.formula_operations.len(),
+        "ir_state_initializers_loaded": true,
+        "state_initializer_count": ir.state_cells.len(),
+        "ir_list_initializers_loaded": true,
+        "list_initializer_count": ir.lists.len(),
+        "generic_list_structural_commit_executor": true,
+        "ir_derived_value_table_loaded": true,
+        "derived_value_count": ir.derived_values.len(),
+        "todomvc_root_scalar_holds_from_ir": is_todomvc,
+        "todomvc_generic_hold_storage_authoritative": is_todomvc,
+        "todomvc_title_hold_from_ir": is_todomvc,
+        "todomvc_completed_bool_hold_from_ir": is_todomvc,
+        "todomvc_editing_bool_hold_from_ir": is_todomvc,
+        "todomvc_edit_text_hold_from_ir": is_todomvc,
+        "todomvc_append_remove_from_ir": is_todomvc,
+        "todomvc_count_and_filter_views_from_ir": is_todomvc,
+        "cells_edit_state_holds_from_ir": is_cells,
+        "cells_generic_hold_storage_authoritative": is_cells,
+        "cells_summary_reads_authoritative_storage": is_cells,
+        "cells_hidden_grid_keys_from_generic_storage": is_cells,
+        "cells_formula_pipeline_from_ir": is_cells
+    });
+    let runtime_execution = json!({
+        "implementation": "static_graph_interpreter_adapter_backed",
+        "source_loaded_from_boon": true,
+        "typed_ir_loaded": true,
+        "static_schedule_verified": ir.static_schedule_verified,
+        "generic_interpreter_complete": false,
+        "example_behavior_adapter": true,
+        "adapter_kind": compiled.surface.kind.as_str(),
+        "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime drivers by inferred executable surface after constructing the generic schedule",
+        "not_final_architecture_acceptance": true,
+        "generic_runtime_slices": generic_runtime_slices
+    });
     json!({
         "status": "pass",
         "command": layer.as_str(),
         "build_profile": build_profile(),
         "runtime_profile": "software_bounded",
         "compiled_schedule": compiled.report(),
-        "runtime_execution": {
-            "implementation": "static_graph_interpreter_adapter_backed",
-            "source_loaded_from_boon": true,
-            "typed_ir_loaded": true,
-            "static_schedule_verified": ir.static_schedule_verified,
-            "generic_interpreter_complete": false,
-            "example_behavior_adapter": true,
-            "adapter_kind": compiled.surface.kind.as_str(),
-            "adapter_blocker": "LoadedRuntime::new still selects TodoRuntime/CellsRuntime drivers by inferred executable surface after constructing the generic schedule",
-            "not_final_architecture_acceptance": true,
-            "generic_runtime_slices": {
-                "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
-                "ir_update_branch_table_loaded": true,
-                "update_branch_count": ir.update_branches.len(),
-                "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
-                "generic_scenario_loop_executor": true,
-                "generic_schedule_instantiated_before_adapter": true,
-                "generic_source_event_ingest": true,
-                "generic_source_binding_store": true,
-                "generic_indexed_branch_evaluator": true,
-                "generic_indexed_scalar_commit_executor": true,
-                "generic_semantic_delta_emitter": true,
-                "generic_loaded_runtime_shell": true,
-                "generic_root_text_tick_executor": true,
-                "generic_route_selected_root_hold_commit_executor": true,
-                "generic_indexed_hold_commit_executor": true,
-                "generic_route_selected_indexed_bool_commit_executor": true,
-                "generic_route_selected_todo_edit_text_commit_executor": true,
-                "generic_route_selected_todo_title_commit_executor": true,
-                "generic_route_selected_todo_editing_commit_executor": true,
-                "generic_indexed_bulk_bool_commit_executor": true,
-                "generic_list_append_source_binding_executor": true,
-                "generic_list_remove_source_unbinding_executor": true,
-                "generic_list_count_retain_executor": true,
-                "generic_todomvc_summary_reads_authoritative_storage": true,
-                "generic_todomvc_root_holds_no_mirror": is_todomvc,
-                "generic_todomvc_rows_hold_no_mirror": is_todomvc,
-                "generic_todomvc_delta_identities_from_authoritative_storage": true,
-                "generic_cells_committed_fields_hold_no_mirror": is_cells,
-                "generic_root_source_dispatch": true,
-                "generic_derived_text_transform_executor": true,
-                "generic_source_event_route_executor": true,
-                "generic_compiled_source_route_index": true,
-                "generic_source_route_scalar_expression_index": true,
-                "generic_indexed_text_route_index": true,
-                "generic_indexed_bool_route_index": true,
-                "generic_cells_editor_route_uses_indexed_targets": true,
-                "generic_root_source_route_index": true,
-                "generic_list_remove_predicate_route": true,
-                "generic_routed_root_target_application": true,
-                "generic_routed_indexed_target_application": true,
-                "generic_routed_todo_bool_target_application": true,
-                "generic_routed_todo_edit_text_target_application": true,
-                "ir_list_operation_table_loaded": true,
-                "list_operation_count": ir.list_operations.len(),
-                "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
-                "ir_formula_operation_table_loaded": true,
-                "formula_operation_count": ir.formula_operations.len(),
-                "ir_state_initializers_loaded": true,
-                "state_initializer_count": ir.state_cells.len(),
-                "ir_list_initializers_loaded": true,
-                "list_initializer_count": ir.lists.len(),
-                "generic_list_structural_commit_executor": true,
-                "ir_derived_value_table_loaded": true,
-                "derived_value_count": ir.derived_values.len(),
-                "todomvc_root_scalar_holds_from_ir": is_todomvc,
-                "todomvc_generic_hold_storage_authoritative": is_todomvc,
-                "todomvc_title_hold_from_ir": is_todomvc,
-                "todomvc_completed_bool_hold_from_ir": is_todomvc,
-                "todomvc_editing_bool_hold_from_ir": is_todomvc,
-                "todomvc_edit_text_hold_from_ir": is_todomvc,
-                "todomvc_append_remove_from_ir": is_todomvc,
-                "todomvc_count_and_filter_views_from_ir": is_todomvc,
-                "cells_edit_state_holds_from_ir": is_cells,
-                "cells_generic_hold_storage_authoritative": is_cells,
-                "cells_summary_reads_authoritative_storage": is_cells,
-                "cells_hidden_grid_keys_from_generic_storage": is_cells,
-                "cells_formula_pipeline_from_ir": is_cells
-            }
-        },
+        "runtime_execution": runtime_execution,
         "renderer": if matches!(layer, VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly) { "ply-engine" } else { "semantic" },
         "program_kind": compiled.surface.kind.as_str(),
         "program_hash": sha256_bytes(parsed.source.as_bytes()),
@@ -2616,21 +2621,6 @@ impl GenericScheduledRuntime {
         )
     }
 
-    fn apply_root_text_action_source<'a>(
-        &mut self,
-        source: &str,
-        payload_text: Option<&'a str>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
-        self.storage.apply_root_text_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
-            source,
-            payload_text,
-            seq,
-        )
-    }
-
     #[cfg(test)]
     fn append_text_row_source_action_and_bind_sources<'a>(
         &mut self,
@@ -2649,46 +2639,6 @@ impl GenericScheduledRuntime {
             key,
             text,
             source_paths,
-        )
-    }
-
-    fn commit_indexed_text_action_source<'a>(
-        &mut self,
-        list: &str,
-        index: usize,
-        source: &str,
-        kind: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-        payload_text: Option<&'a str>,
-    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
-        self.storage.commit_indexed_text_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
-            list,
-            index,
-            source,
-            kind,
-            matches_target,
-            payload_text,
-        )
-    }
-
-    fn commit_indexed_bool_action_source(
-        &mut self,
-        list: &str,
-        index: usize,
-        source: &str,
-        kind: SourceRouteBoolAction,
-        read_extra_bool: impl Fn(&str) -> Option<bool>,
-    ) -> RuntimeResult<GenericBoolFieldCommit> {
-        self.storage.commit_indexed_bool_action_source(
-            &self.source_routes,
-            &self.scalar_equations,
-            list,
-            index,
-            source,
-            kind,
-            read_extra_bool,
         )
     }
 
@@ -3179,25 +3129,6 @@ impl GenericCircuitRuntime {
         })
     }
 
-    fn commit_indexed_text_action_source<'a>(
-        &mut self,
-        routes: &SourceRoutePlan,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        source: &str,
-        kind: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-        payload_text: Option<&'a str>,
-    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
-        let Some(target) =
-            routes.single_indexed_text_action_target_where(source, kind, matches_target)?
-        else {
-            return Err(format!("source `{source}` has no indexed text action `{kind:?}`").into());
-        };
-        self.commit_indexed_text_source(equations, list, index, target, source, payload_text)
-    }
-
     fn commit_indexed_previous_text_target_source(
         &mut self,
         equations: &ScalarEquationPlan,
@@ -3230,22 +3161,6 @@ impl GenericCircuitRuntime {
             generation,
             field,
         })
-    }
-
-    fn commit_indexed_bool_action_source(
-        &mut self,
-        routes: &SourceRoutePlan,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        source: &str,
-        kind: SourceRouteBoolAction,
-        read_extra_bool: impl Fn(&str) -> Option<bool>,
-    ) -> RuntimeResult<GenericBoolFieldCommit> {
-        let Some(target) = routes.single_indexed_bool_action_target(source, kind)? else {
-            return Err(format!("source `{source}` has no indexed bool action `{kind:?}`").into());
-        };
-        self.commit_indexed_bool_source(equations, list, index, target, source, read_extra_bool)
     }
 
     fn commit_each_indexed_bool_source(
@@ -4594,25 +4509,6 @@ impl SourceRoutePlan {
         self.require_source(source)?.single_root_scalar_target()
     }
 
-    fn single_indexed_bool_action_target(
-        &self,
-        source: &str,
-        kind: SourceRouteBoolAction,
-    ) -> RuntimeResult<Option<&'static str>> {
-        self.require_source(source)?
-            .single_indexed_bool_action_target(kind)
-    }
-
-    fn single_indexed_text_action_target_where(
-        &self,
-        source: &str,
-        kind: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<Option<&'static str>> {
-        self.require_source(source)?
-            .single_indexed_text_action_target_where(kind, matches_target)
-    }
-
     fn has_indexed_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
         Ok(self.require_source(source)?.has_indexed_text_target(target))
     }
@@ -4814,26 +4710,6 @@ impl SourceRoute {
         })
     }
 
-    fn single_indexed_text_action_target_where(
-        &self,
-        expected: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<Option<&'static str>> {
-        single_route_action_target_where(
-            self.source,
-            "indexed text action",
-            &self.actions,
-            |action| match action {
-                SourceRouteAction::IndexedText { kind, target }
-                    if kind == expected && matches_target(target) =>
-                {
-                    Some(target)
-                }
-                _ => None,
-            },
-        )
-    }
-
     fn has_indexed_bool_action(&self, expected: SourceRouteBoolAction) -> bool {
         self.has_action(|action| {
             matches!(
@@ -4841,21 +4717,6 @@ impl SourceRoute {
                 SourceRouteAction::IndexedBool { kind, .. } if kind == expected
             )
         })
-    }
-
-    fn single_indexed_bool_action_target(
-        &self,
-        expected: SourceRouteBoolAction,
-    ) -> RuntimeResult<Option<&'static str>> {
-        single_route_action_target_where(
-            self.source,
-            "indexed bool action",
-            &self.actions,
-            |action| match action {
-                SourceRouteAction::IndexedBool { kind, target } if kind == expected => Some(target),
-                _ => None,
-            },
-        )
     }
 
     fn has_indexed_text_target(&self, target: &str) -> bool {
@@ -4943,27 +4804,6 @@ impl SourceRoute {
             .into()
         })
     }
-}
-
-fn single_route_action_target_where(
-    source: &str,
-    index_name: &str,
-    actions: &[SourceRouteAction],
-    select_target: impl Fn(SourceRouteAction) -> Option<&'static str>,
-) -> RuntimeResult<Option<&'static str>> {
-    let mut target = None;
-    for action in actions.iter().copied() {
-        let Some(candidate) = select_target(action) else {
-            continue;
-        };
-        if target.is_some_and(|current| current != candidate) {
-            return Err(
-                format!("source `{source}` has multiple matching {index_name} targets").into(),
-            );
-        }
-        target = Some(candidate);
-    }
-    Ok(target)
 }
 
 impl ListEquationPlan {
@@ -5362,7 +5202,28 @@ impl TodoRuntime {
         match event {
             TodoEvent::NewInputChange { source, text } => {
                 let seq = self.next_source_seq();
-                self.apply_root_text_source(source, Some(text), seq, &mut deltas, &mut patches)?;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
+                        source,
+                        list: None,
+                        index: None,
+                        key: None,
+                        text: Some(text),
+                        seq,
+                    },
+                    |_| None,
+                    |mutation| {
+                        if let GenericSourceMutation::RootText(commit) = mutation {
+                            TodoRuntime::emit_root_text_commit(
+                                commit.target,
+                                commit.value,
+                                &mut deltas,
+                                &mut patches,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             TodoEvent::NewInputKeyDown { source, key, text } => {
                 let seq = self.next_source_seq();
@@ -5405,7 +5266,28 @@ impl TodoRuntime {
             }
             TodoEvent::Filter { source } => {
                 let seq = self.next_source_seq();
-                self.apply_root_text_source(source, None, seq, &mut deltas, &mut patches)?;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
+                        source,
+                        list: None,
+                        index: None,
+                        key: None,
+                        text: None,
+                        seq,
+                    },
+                    |_| None,
+                    |mutation| {
+                        if let GenericSourceMutation::RootText(commit) = mutation {
+                            TodoRuntime::emit_root_text_commit(
+                                commit.target,
+                                commit.value,
+                                &mut deltas,
+                                &mut patches,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             TodoEvent::ClearCompleted { source } => {
                 self.remove_where_source(source, &mut deltas, &mut patches)?;
@@ -5450,7 +5332,7 @@ impl TodoRuntime {
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
-                self.set_completed_from_source(
+                self.apply_todo_bool_source_action(
                     index,
                     source,
                     all_completed,
@@ -5464,26 +5346,44 @@ impl TodoRuntime {
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let edit_text = self
-                    .generic
-                    .commit_indexed_text_action_source(
-                        "todos",
-                        index,
-                        source,
-                        SourceRouteTextAction::PreviousValue,
-                        |_| true,
-                        Some(target_text),
-                    )?
-                    .ok_or_else(|| {
-                        format!("previous-text update from `{source}` produced no change")
-                    })?;
                 let all_completed = self.all_completed();
-                let editing = self.commit_todo_bool_source(
-                    index,
-                    source,
-                    SourceRouteBoolAction::ConstTrue,
-                    all_completed,
+                let mut edit_text = None;
+                let mut editing = None;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
+                        source,
+                        list: Some("todos"),
+                        index: Some(index),
+                        key: None,
+                        text: Some(target_text),
+                        seq: TickSeq(0),
+                    },
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |mutation| {
+                        match mutation {
+                            GenericSourceMutation::TextField(commit)
+                                if commit.field == "edit_text" =>
+                            {
+                                edit_text = Some(commit);
+                            }
+                            GenericSourceMutation::BoolField(commit)
+                                if commit.field == "editing" =>
+                            {
+                                editing = Some(commit);
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    },
                 )?;
+                let edit_text = edit_text.ok_or_else(|| {
+                    format!("previous-text update from `{source}` produced no change")
+                })?;
+                let editing = editing
+                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
                 deltas.push(field_delta(
                     Some(editing.key),
                     Some(editing.generation),
@@ -5549,15 +5449,51 @@ impl TodoRuntime {
                         .find_index(target_text)
                         .or_else(|_| self.find_editing_index())?;
                     let (row_key, _) = self.todo_row_identity(index)?;
-                    if key == "Enter" {
-                        if let Some(title) = self.generic.commit_indexed_text_action_source(
-                            "todos",
-                            index,
+                    let all_completed = self.all_completed();
+                    let mut title = None;
+                    let mut edit_text = None;
+                    let mut editing = None;
+                    self.generic.apply_source_actions(
+                        GenericSourceActionInput {
                             source,
-                            SourceRouteTextAction::TextTrimOrPrevious,
-                            |target| row_field_name(target) == "title",
-                            text,
-                        )? {
+                            list: Some("todos"),
+                            index: Some(index),
+                            key: None,
+                            text: if key == "Enter" {
+                                text
+                            } else {
+                                Some(target_text)
+                            },
+                            seq: TickSeq(0),
+                        },
+                        |path| match path {
+                            "store.all_completed" => Some(all_completed),
+                            _ => None,
+                        },
+                        |mutation| {
+                            match mutation {
+                                GenericSourceMutation::TextField(commit)
+                                    if commit.field == "title" =>
+                                {
+                                    title = Some(commit);
+                                }
+                                GenericSourceMutation::TextField(commit)
+                                    if commit.field == "edit_text" =>
+                                {
+                                    edit_text = Some(commit);
+                                }
+                                GenericSourceMutation::BoolField(commit)
+                                    if commit.field == "editing" =>
+                                {
+                                    editing = Some(commit);
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    if key == "Enter" {
+                        if let Some(title) = title {
                             deltas.push(field_delta(
                                 Some(title.key),
                                 Some(title.generation),
@@ -5570,20 +5506,7 @@ impl TodoRuntime {
                                 ProtocolValue::Text(Cow::Borrowed(title.value)),
                             ));
                         }
-                    } else {
-                        let edit_text = self
-                            .generic
-                            .commit_indexed_text_action_source(
-                                "todos",
-                                index,
-                                source,
-                                SourceRouteTextAction::PreviousValue,
-                                |_| true,
-                                Some(target_text),
-                            )?
-                            .ok_or_else(|| {
-                                format!("previous-text update from `{source}` produced no change")
-                            })?;
+                    } else if let Some(edit_text) = edit_text {
                         deltas.push(field_delta(
                             Some(edit_text.key),
                             Some(edit_text.generation),
@@ -5591,13 +5514,9 @@ impl TodoRuntime {
                             ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
                         ));
                     }
-                    let all_completed = self.all_completed();
-                    let editing = self.commit_todo_bool_source(
-                        index,
-                        source,
-                        SourceRouteBoolAction::ConstFalse,
-                        all_completed,
-                    )?;
+                    let editing = editing.ok_or_else(|| {
+                        format!("editing update from `{source}` produced no change")
+                    })?;
                     deltas.push(field_delta(
                         Some(editing.key),
                         Some(editing.generation),
@@ -5620,14 +5539,38 @@ impl TodoRuntime {
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 let (row_key, _) = self.todo_row_identity(index)?;
-                if let Some(title) = self.generic.commit_indexed_text_action_source(
-                    "todos",
-                    index,
-                    source,
-                    SourceRouteTextAction::TextTrimOrPrevious,
-                    |target| row_field_name(target) == "title",
-                    text.or(Some(target_text)),
-                )? {
+                let all_completed = self.all_completed();
+                let mut title = None;
+                let mut editing = None;
+                self.generic.apply_source_actions(
+                    GenericSourceActionInput {
+                        source,
+                        list: Some("todos"),
+                        index: Some(index),
+                        key: None,
+                        text: text.or(Some(target_text)),
+                        seq: TickSeq(0),
+                    },
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |mutation| {
+                        match mutation {
+                            GenericSourceMutation::TextField(commit) if commit.field == "title" => {
+                                title = Some(commit);
+                            }
+                            GenericSourceMutation::BoolField(commit)
+                                if commit.field == "editing" =>
+                            {
+                                editing = Some(commit);
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(title) = title {
                     deltas.push(field_delta(
                         Some(title.key),
                         Some(title.generation),
@@ -5640,13 +5583,8 @@ impl TodoRuntime {
                         ProtocolValue::Text(Cow::Borrowed(title.value)),
                     ));
                 }
-                let all_completed = self.all_completed();
-                let editing = self.commit_todo_bool_source(
-                    index,
-                    source,
-                    SourceRouteBoolAction::ConstFalse,
-                    all_completed,
-                )?;
+                let editing = editing
+                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
                 deltas.push(field_delta(
                     Some(editing.key),
                     Some(editing.generation),
@@ -5957,7 +5895,7 @@ impl TodoRuntime {
         push_source_binding_patches_for_row(&self.generic, insert.key, insert.generation, patches);
     }
 
-    fn set_completed_from_source(
+    fn apply_todo_bool_source_action(
         &mut self,
         index: usize,
         source: &str,
@@ -5965,28 +5903,36 @@ impl TodoRuntime {
         deltas: &mut Vec<SemanticDelta<'_>>,
         patches: &mut Vec<RenderPatch<'_>>,
     ) -> RuntimeResult<()> {
-        let completed = self.generic.commit_indexed_bool_action_source(
-            "todos",
-            index,
-            source,
-            SourceRouteBoolAction::BoolNot,
+        self.generic.apply_source_actions(
+            GenericSourceActionInput {
+                source,
+                list: Some("todos"),
+                index: Some(index),
+                key: None,
+                text: None,
+                seq: TickSeq(0),
+            },
             |path| match path {
                 "store.all_completed" => Some(all_completed_snapshot),
                 _ => None,
             },
-        )?;
-        deltas.push(field_delta(
-            Some(completed.key),
-            Some(completed.generation),
-            completed.field,
-            ProtocolValue::Bool(completed.value),
-        ));
-        patches.push(patch(
-            "SetProperty",
-            RenderTarget::TodoCheckbox(completed.key),
-            ProtocolValue::CheckedProperty(completed.value),
-        ));
-        Ok(())
+            |mutation| {
+                if let GenericSourceMutation::BoolField(completed) = mutation {
+                    deltas.push(field_delta(
+                        Some(completed.key),
+                        Some(completed.generation),
+                        completed.field,
+                        ProtocolValue::Bool(completed.value),
+                    ));
+                    patches.push(patch(
+                        "SetProperty",
+                        RenderTarget::TodoCheckbox(completed.key),
+                        ProtocolValue::CheckedProperty(completed.value),
+                    ));
+                }
+                Ok(())
+            },
+        )
     }
 
     fn set_completed_value(
@@ -6243,23 +6189,6 @@ impl TodoRuntime {
         Ok(())
     }
 
-    fn apply_root_text_source<'a>(
-        &mut self,
-        source: &'a str,
-        payload_text: Option<&'a str>,
-        seq: TickSeq,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<()> {
-        if let Some(commit) =
-            self.generic
-                .apply_root_text_action_source(source, payload_text, seq)?
-        {
-            TodoRuntime::emit_root_text_commit(commit.target, commit.value, deltas, patches)?;
-        }
-        Ok(())
-    }
-
     fn emit_root_text_commit<'a>(
         target: &'static str,
         value: Cow<'a, str>,
@@ -6296,20 +6225,6 @@ impl TodoRuntime {
             _ => return Err(format!("unsupported scalar target `{target}`").into()),
         }
         Ok(())
-    }
-
-    fn commit_todo_bool_source(
-        &mut self,
-        index: usize,
-        source: &str,
-        kind: SourceRouteBoolAction,
-        all_completed_snapshot: bool,
-    ) -> RuntimeResult<GenericBoolFieldCommit> {
-        self.generic
-            .commit_indexed_bool_action_source("todos", index, source, kind, |path| match path {
-                "store.all_completed" => Some(all_completed_snapshot),
-                _ => None,
-            })
     }
 
     fn find_index(&self, title: &str) -> RuntimeResult<usize> {

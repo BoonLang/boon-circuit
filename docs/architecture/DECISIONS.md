@@ -496,18 +496,22 @@ derived-field references such as `new_todo_text -> title_to_add` to build
 known blocker before the full "no hardcoded app behavior" criterion is met.
 Executable reports include `runtime_execution` metadata so this blocker is
 visible in verification artifacts.
-Headed Ply verification now records two intermediate OS-input slices. First, it
-focuses one real visible application text control in the preview (`todo_new_input`
-for TodoMVC or `cell_editor_A1` for Cells), sends real OS keyboard text through
-`wtype`, observes the text through Ply state, captures the control screenshot,
-and stores the control bounds and artifact hash. Second, it focuses the visible
-Step control, sends real OS keyboard activation, advances each scenario prefix
-through the playground, captures per-step screenshots, and stores the Step
-control bounds in the headed report. This does not satisfy the final e2e gate
-yet because the full scenario is still replayed through scenario user actions
-after the visible-control probes; the report keeps `os_input_limitation` until
-every TodoMVC/Cells scenario step is driven by actual visible app controls and
-observed source events.
+Headed Ply verification now records three intermediate OS-input slices. First,
+it focuses one real visible application text control in the preview
+(`todo_new_input` for TodoMVC or `cell_editor_A1` for Cells), sends real OS
+keyboard text through `wtype`, observes the text through Ply state, captures the
+control screenshot, and stores the control bounds and artifact hash. Second, the
+same visible control emits observed Boon `SOURCE` events for the first
+text/submit workflow (`add-test-todo-type` plus `add-test-todo-submit`, or
+`edit-a1-literal` plus `commit-a1-literal`) and the headed report records those
+observed source events. Third, it focuses the visible Step control, sends real
+OS keyboard activation, advances each scenario prefix through the playground,
+captures per-step screenshots, and stores the Step control bounds in the headed
+report. This does not satisfy the final e2e gate yet because the full scenario
+is still replayed through scenario user actions after the visible-control
+probes, and the observed source-event probe is not yet the runtime mutation
+path; the report keeps `os_input_limitation` until every TodoMVC/Cells scenario
+step is driven by actual visible app controls and observed source events.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 

@@ -4,6 +4,7 @@ use boon_runtime::{
 };
 use ply_engine::prelude::*;
 use serde_json::json;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,10 @@ static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
     file_name: "FiraSans-Regular.otf",
     data: include_bytes!("/usr/share/fonts/opentype/fira/FiraSans-Regular.otf"),
 };
+
+thread_local! {
+    static UI_SOURCE_OBSERVATIONS: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
+}
 
 pub async fn run_app_from_args() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -47,6 +52,8 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     }
     let app_control_observations =
         drive_visible_app_control_probe(&mut ply, &mut state, &report, &example).await;
+    let source_event_observations =
+        drive_visible_source_event_probe(&mut ply, &mut state, &report, &example).await;
     let step_observations = drive_visible_step_control_sequence(
         &mut ply,
         &mut state,
@@ -138,6 +145,11 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 .filter_map(|observation| observation.get("screenshot_path").cloned()),
         );
         checkpoint_paths.extend(
+            source_event_observations
+                .iter()
+                .filter_map(|observation| observation.get("screenshot_path").cloned()),
+        );
+        checkpoint_paths.extend(
             step_observations
                 .iter()
                 .filter_map(|observation| observation.get("screenshot_path").cloned()),
@@ -162,6 +174,12 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 "sha256": observation.get("screenshot_sha256")?.clone()
             }))
         }));
+        artifact_sha256s.extend(source_event_observations.iter().filter_map(|observation| {
+            Some(json!({
+                "path": observation.get("screenshot_path")?.clone(),
+                "sha256": observation.get("screenshot_sha256")?.clone()
+            }))
+        }));
         artifact_sha256s.extend(step_observations.iter().filter_map(|observation| {
             Some(json!({
                 "path": observation.get("screenshot_path")?.clone(),
@@ -178,20 +196,24 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "per_step_pointer_keyboard_route".to_owned(),
-            json!("real OS keyboard event -> focused Ply text input proof; real OS keyboard event -> visible app text-control proof; real OS keyboard activation -> visible Step control proof; scenario user_action -> routed source event -> runtime tick; expected_source_event is assertion-only"),
+            json!("real OS keyboard event -> focused Ply text input proof; real OS keyboard event -> visible app text-control proof; visible app control -> observed Boon SOURCE event proof; real OS keyboard activation -> visible Step control proof; scenario user_action -> routed source event -> runtime tick; expected_source_event is assertion-only"),
         );
         object.insert(
             "input_injection_method".to_owned(),
-            json!("os_keyboard_probe_visible_app_control_and_step_control_plus_scenario_user_action_route"),
+            json!("os_keyboard_probe_visible_app_source_event_and_step_control_plus_scenario_user_action_route"),
         );
         object.insert(
             "os_input_limitation".to_owned(),
-            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches one real visible application text control for the selected example, and can activate the visible Ply Step control for each scenario transition. It then replays scenario user_action records through the runtime route. It does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing."),
+            json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches one real visible application text control for the selected example, emits a matching observed Boon SOURCE event for the first text/submit workflow, and can activate the visible Ply Step control for each scenario transition. It then replays scenario user_action records through the runtime route. It does not yet pointer-click or type every visible TodoMVC/Cells application control through OS hit testing, and the observed source-event probe is not yet the runtime mutation path."),
         );
         object.insert("os_input_probe".to_owned(), headed_os_probe);
         object.insert(
             "visible_app_control_os_input".to_owned(),
             json!(app_control_observations),
+        );
+        object.insert(
+            "visible_source_event_os_input".to_owned(),
+            json!(source_event_observations),
         );
         object.insert(
             "visible_step_control_os_input".to_owned(),
@@ -213,13 +235,15 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     write_json(&report, &report_json)?;
     if app_control_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+    }) && source_event_observations.iter().all(|observation| {
+        observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) && step_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) {
         Ok(())
     } else {
         Err(format!(
-            "headed verifier did not activate every visible app-control probe and Step control; see `{}`",
+            "headed verifier did not activate every visible app-control/source-event probe and Step control; see `{}`",
             report.display()
         )
         .into())
@@ -334,6 +358,230 @@ async fn drive_visible_text_input_probe(
         "observed_insertion_order": observed_insertion_order,
         "screenshot_path": screenshot,
         "screenshot_sha256": sha256_file(screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
+        "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
+    })
+}
+
+async fn drive_visible_source_event_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    report: &std::path::Path,
+    example: &str,
+) -> Vec<serde_json::Value> {
+    if example == "cells" {
+        let edit_screenshot =
+            report.with_file_name("cells-headed-source-event-edit-a1-literal.png");
+        let commit_screenshot =
+            report.with_file_name("cells-headed-source-event-commit-a1-literal.png");
+        vec![
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "edit-a1-literal",
+                    element_id: "cell_editor_A1",
+                    text: "41",
+                    source: "cell.sources.editor.change",
+                    key: None,
+                    address: Some("A1"),
+                    screenshot: edit_screenshot,
+                },
+            )
+            .await,
+            drive_visible_source_submit_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "commit-a1-literal",
+                    element_id: "cell_editor_A1",
+                    text: "41",
+                    source: "cell.sources.editor.commit",
+                    key: Some("Enter"),
+                    address: Some("A1"),
+                    screenshot: commit_screenshot,
+                },
+            )
+            .await,
+        ]
+    } else {
+        let type_screenshot =
+            report.with_file_name("todomvc-headed-source-event-add-test-todo-type.png");
+        let submit_screenshot =
+            report.with_file_name("todomvc-headed-source-event-add-test-todo-submit.png");
+        vec![
+            drive_visible_source_text_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "add-test-todo-type",
+                    element_id: "todo_new_input",
+                    text: "Test todo",
+                    source: "store.sources.new_todo_input.change",
+                    key: None,
+                    address: None,
+                    screenshot: type_screenshot,
+                },
+            )
+            .await,
+            drive_visible_source_submit_event_probe(
+                ply,
+                state,
+                VisibleSourceTextProbe {
+                    id: "add-test-todo-submit",
+                    element_id: "todo_new_input",
+                    text: "Test todo",
+                    source: "store.sources.new_todo_input.key_down",
+                    key: Some("Enter"),
+                    address: None,
+                    screenshot: submit_screenshot,
+                },
+            )
+            .await,
+        ]
+    }
+}
+
+struct VisibleSourceTextProbe {
+    id: &'static str,
+    element_id: &'static str,
+    text: &'static str,
+    source: &'static str,
+    key: Option<&'static str>,
+    address: Option<&'static str>,
+    screenshot: PathBuf,
+}
+
+async fn drive_visible_source_text_event_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    probe: VisibleSourceTextProbe,
+) -> serde_json::Value {
+    clear_ui_source_observations();
+    ply.set_text_value(probe.element_id, "");
+    let text_to_send = reverse_text(probe.text);
+    let mut typed = false;
+    let mut send_error = None;
+    let mut observed_event = None;
+    let mut bounds = serde_json::Value::Null;
+    for frame in 0..140 {
+        draw_frame(ply, state).await;
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id) {
+            bounds = bounds_json(element_bounds);
+        }
+        ply.set_focus(probe.element_id);
+        if frame == 8 && !typed {
+            typed = true;
+            if let Err(error) = send_real_keyboard_text(&text_to_send) {
+                send_error = Some(error.to_string());
+            }
+        }
+        if let Some(event) =
+            matching_ui_source_observation(probe.source, Some(probe.text), probe.key, probe.address)
+        {
+            observed_event = Some(event);
+            break;
+        }
+        next_frame().await;
+    }
+    capture_visible_source_probe_result(
+        ply,
+        state,
+        probe,
+        typed,
+        send_error,
+        observed_event,
+        bounds,
+    )
+    .await
+}
+
+async fn drive_visible_source_submit_event_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    probe: VisibleSourceTextProbe,
+) -> serde_json::Value {
+    clear_ui_source_observations();
+    ply.set_text_value(probe.element_id, probe.text);
+    let mut key_sent = false;
+    let mut send_error = None;
+    let mut observed_event = None;
+    let mut bounds = serde_json::Value::Null;
+    for frame in 0..100 {
+        draw_frame(ply, state).await;
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id) {
+            bounds = bounds_json(element_bounds);
+        }
+        ply.set_focus(probe.element_id);
+        if frame == 8 && !key_sent {
+            key_sent = true;
+            if let Some(key) = probe.key {
+                if let Err(error) = send_real_key(os_key_name(key)) {
+                    send_error = Some(error.to_string());
+                }
+            }
+        }
+        if let Some(event) =
+            matching_ui_source_observation(probe.source, Some(probe.text), probe.key, probe.address)
+        {
+            observed_event = Some(event);
+            break;
+        }
+        next_frame().await;
+    }
+    capture_visible_source_probe_result(
+        ply,
+        state,
+        probe,
+        key_sent,
+        send_error,
+        observed_event,
+        bounds,
+    )
+    .await
+}
+
+async fn capture_visible_source_probe_result(
+    ply: &mut Ply<()>,
+    state: &PlaygroundState,
+    probe: VisibleSourceTextProbe,
+    input_sent: bool,
+    send_error: Option<String>,
+    observed_event: Option<serde_json::Value>,
+    bounds: serde_json::Value,
+) -> serde_json::Value {
+    draw_frame(ply, state).await;
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = probe.screenshot.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    image.export_png(
+        probe
+            .screenshot
+            .to_str()
+            .unwrap_or("target/reports/invalid-source-event.png"),
+    );
+    let pass = observed_event.is_some();
+    json!({
+        "id": probe.id,
+        "pass": pass,
+        "target_element_id": probe.element_id,
+        "visible_bounds": bounds,
+        "input_route_contract": "real OS keyboard input reached a visible app control and the control emitted the expected Boon SOURCE event observation",
+        "keyboard_tool": "wtype",
+        "keyboard_tool_path": command_path("wtype"),
+        "input_sent": input_sent,
+        "send_error": send_error,
+        "expected_source_event": {
+            "source": probe.source,
+            "text": probe.text,
+            "key": probe.key,
+            "address": probe.address
+        },
+        "source_event_observed": observed_event,
+        "screenshot_path": probe.screenshot,
+        "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -551,6 +799,40 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
 
 fn os_probe_observed_token(value: &str, token: &str) -> bool {
     value.contains(token) || value.contains(&reverse_text(token))
+}
+
+fn record_ui_source_observation(event: serde_json::Value) {
+    UI_SOURCE_OBSERVATIONS.with(|observations| observations.borrow_mut().push(event));
+}
+
+fn clear_ui_source_observations() {
+    UI_SOURCE_OBSERVATIONS.with(|observations| observations.borrow_mut().clear());
+}
+
+fn matching_ui_source_observation(
+    source: &str,
+    text: Option<&str>,
+    key: Option<&str>,
+    address: Option<&str>,
+) -> Option<serde_json::Value> {
+    UI_SOURCE_OBSERVATIONS.with(|observations| {
+        observations
+            .borrow()
+            .iter()
+            .find(|event| {
+                event.get("source").and_then(serde_json::Value::as_str) == Some(source)
+                    && text.is_none_or(|expected| {
+                        event.get("text").and_then(serde_json::Value::as_str) == Some(expected)
+                    })
+                    && key.is_none_or(|expected| {
+                        event.get("key").and_then(serde_json::Value::as_str) == Some(expected)
+                    })
+                    && address.is_none_or(|expected| {
+                        event.get("address").and_then(serde_json::Value::as_str) == Some(expected)
+                    })
+            })
+            .cloned()
+    })
 }
 
 fn reverse_text(value: &str) -> String {
@@ -1117,6 +1399,19 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                 .placeholder_color(0x8B97A7)
                 .cursor_color(0x2F6FB8)
                 .selection_color(0xB9D7F5)
+                .on_changed(|text| {
+                    record_ui_source_observation(json!({
+                        "source": "store.sources.new_todo_input.change",
+                        "text": text
+                    }));
+                })
+                .on_submit(|text| {
+                    record_ui_source_observation(json!({
+                        "source": "store.sources.new_todo_input.key_down",
+                        "key": "Enter",
+                        "text": text
+                    }));
+                })
         })
         .empty();
     ui.element()
@@ -1215,6 +1510,8 @@ fn cells_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                         .border(|border| border.color(0xD5DDE8).all(1))
                         .layout(|layout| layout.padding((7, 7, 4, 4)))
                         .text_input(|input| {
+                            let source_address = address.to_owned();
+                            let commit_address = address.to_owned();
                             input
                                 .placeholder(formula)
                                 .font(&DEFAULT_FONT)
@@ -1223,6 +1520,21 @@ fn cells_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                                 .placeholder_color(0x8B97A7)
                                 .cursor_color(0x2F6FB8)
                                 .selection_color(0xB9D7F5)
+                                .on_changed(move |text| {
+                                    record_ui_source_observation(json!({
+                                        "source": "cell.sources.editor.change",
+                                        "address": source_address.clone(),
+                                        "text": text
+                                    }));
+                                })
+                                .on_submit(move |text| {
+                                    record_ui_source_observation(json!({
+                                        "source": "cell.sources.editor.commit",
+                                        "address": commit_address.clone(),
+                                        "key": "Enter",
+                                        "text": text
+                                    }));
+                                })
                         })
                         .empty();
                     ui.text(&format!("= {value} {error}"), |text| {
@@ -1258,6 +1570,15 @@ fn value_after(args: &[String], flag: &str) -> Option<String> {
 struct PixelStats {
     nonzero_channels: usize,
     unique_rgba_values: usize,
+}
+
+fn bounds_json(bounds: ply_engine::math::BoundingBox) -> serde_json::Value {
+    json!({
+        "x": bounds.x,
+        "y": bounds.y,
+        "width": bounds.width,
+        "height": bounds.height
+    })
 }
 
 fn image_stats(bytes: &[u8]) -> PixelStats {
@@ -1325,6 +1646,13 @@ fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         Err(format!("wtype -k {key} exited with {status}").into())
+    }
+}
+
+fn os_key_name(scenario_key: &str) -> &str {
+    match scenario_key {
+        "Enter" => "Return",
+        other => other,
     }
 }
 

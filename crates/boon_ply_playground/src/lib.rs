@@ -405,11 +405,7 @@ async fn drive_visible_source_event_probe(
             .await,
         ]
     } else {
-        let type_screenshot =
-            report.with_file_name("todomvc-headed-source-event-add-test-todo-type.png");
-        let submit_screenshot =
-            report.with_file_name("todomvc-headed-source-event-add-test-todo-submit.png");
-        vec![
+        let mut observations = vec![
             drive_visible_source_text_event_probe(
                 ply,
                 state,
@@ -420,7 +416,8 @@ async fn drive_visible_source_event_probe(
                     source: "store.sources.new_todo_input.change",
                     key: None,
                     address: None,
-                    screenshot: type_screenshot,
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-add-test-todo-type.png"),
                 },
             )
             .await,
@@ -434,11 +431,69 @@ async fn drive_visible_source_event_probe(
                     source: "store.sources.new_todo_input.key_down",
                     key: Some("Enter"),
                     address: None,
-                    screenshot: submit_screenshot,
+                    screenshot: report
+                        .with_file_name("todomvc-headed-source-event-add-test-todo-submit.png"),
                 },
             )
             .await,
-        ]
+        ];
+        for probe in [
+            VisibleSourcePressProbe {
+                id: "toggle-all-complete",
+                element_id: Id::new("todo_toggle_all"),
+                element_label: "todo_toggle_all",
+                source: "store.sources.toggle_all_checkbox.click",
+                target_text: None,
+                screenshot: report
+                    .with_file_name("todomvc-headed-source-event-toggle-all-complete.png"),
+            },
+            VisibleSourcePressProbe {
+                id: "toggle-buy-groceries",
+                element_id: Id::new_index("todo_row_checkbox", 0),
+                element_label: "todo_row_checkbox[0]",
+                source: "todo.sources.todo_checkbox.click",
+                target_text: Some("Buy groceries"),
+                screenshot: report
+                    .with_file_name("todomvc-headed-source-event-toggle-buy-groceries.png"),
+            },
+            VisibleSourcePressProbe {
+                id: "filter-active",
+                element_id: Id::new("todo_filter_active"),
+                element_label: "todo_filter_active",
+                source: "store.sources.filter_active.press",
+                target_text: None,
+                screenshot: report.with_file_name("todomvc-headed-source-event-filter-active.png"),
+            },
+            VisibleSourcePressProbe {
+                id: "filter-completed",
+                element_id: Id::new("todo_filter_completed"),
+                element_label: "todo_filter_completed",
+                source: "store.sources.filter_completed.press",
+                target_text: None,
+                screenshot: report
+                    .with_file_name("todomvc-headed-source-event-filter-completed.png"),
+            },
+            VisibleSourcePressProbe {
+                id: "filter-all",
+                element_id: Id::new("todo_filter_all"),
+                element_label: "todo_filter_all",
+                source: "store.sources.filter_all.press",
+                target_text: None,
+                screenshot: report.with_file_name("todomvc-headed-source-event-filter-all.png"),
+            },
+            VisibleSourcePressProbe {
+                id: "delete-clean-room",
+                element_id: Id::new_index("todo_row_delete", 1),
+                element_label: "todo_row_delete[1]",
+                source: "todo.sources.remove_todo_button.press",
+                target_text: Some("Clean room"),
+                screenshot: report
+                    .with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
+            },
+        ] {
+            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
+        }
+        observations
     }
 }
 
@@ -449,6 +504,15 @@ struct VisibleSourceTextProbe {
     source: &'static str,
     key: Option<&'static str>,
     address: Option<&'static str>,
+    screenshot: PathBuf,
+}
+
+struct VisibleSourcePressProbe {
+    id: &'static str,
+    element_id: Id,
+    element_label: &'static str,
+    source: &'static str,
+    target_text: Option<&'static str>,
     screenshot: PathBuf,
 }
 
@@ -476,9 +540,13 @@ async fn drive_visible_source_text_event_probe(
                 send_error = Some(error.to_string());
             }
         }
-        if let Some(event) =
-            matching_ui_source_observation(probe.source, Some(probe.text), probe.key, probe.address)
-        {
+        if let Some(event) = matching_ui_source_observation(
+            probe.source,
+            Some(probe.text),
+            probe.key,
+            probe.address,
+            None,
+        ) {
             observed_event = Some(event);
             break;
         }
@@ -521,9 +589,13 @@ async fn drive_visible_source_submit_event_probe(
                 }
             }
         }
-        if let Some(event) =
-            matching_ui_source_observation(probe.source, Some(probe.text), probe.key, probe.address)
-        {
+        if let Some(event) = matching_ui_source_observation(
+            probe.source,
+            Some(probe.text),
+            probe.key,
+            probe.address,
+            None,
+        ) {
             observed_event = Some(event);
             break;
         }
@@ -539,6 +611,71 @@ async fn drive_visible_source_submit_event_probe(
         bounds,
     )
     .await
+}
+
+async fn drive_visible_source_press_event_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    probe: VisibleSourcePressProbe,
+) -> serde_json::Value {
+    clear_ui_source_observations();
+    let mut key_sent = false;
+    let mut send_error = None;
+    let mut observed_event = None;
+    let mut bounds = serde_json::Value::Null;
+    for frame in 0..100 {
+        draw_frame(ply, state).await;
+        if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
+            bounds = bounds_json(element_bounds);
+        }
+        ply.set_focus(probe.element_id.clone());
+        if frame == 8 && !key_sent {
+            key_sent = true;
+            if let Err(error) = send_real_key("Return") {
+                send_error = Some(error.to_string());
+            }
+        }
+        if let Some(event) =
+            matching_ui_source_observation(probe.source, None, None, None, probe.target_text)
+        {
+            observed_event = Some(event);
+            break;
+        }
+        next_frame().await;
+    }
+    draw_frame(ply, state).await;
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = probe.screenshot.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    image.export_png(
+        probe
+            .screenshot
+            .to_str()
+            .unwrap_or("target/reports/invalid-source-press.png"),
+    );
+    let pass = observed_event.is_some();
+    json!({
+        "id": probe.id,
+        "pass": pass,
+        "target_element_id": probe.element_label,
+        "visible_bounds": bounds,
+        "input_route_contract": "real OS keyboard activation reached a visible app control and the control emitted the expected Boon SOURCE event observation",
+        "keyboard_tool": "wtype",
+        "keyboard_tool_path": command_path("wtype"),
+        "input_sent": key_sent,
+        "send_error": send_error,
+        "expected_source_event": {
+            "source": probe.source,
+            "target_text": probe.target_text
+        },
+        "source_event_observed": observed_event,
+        "screenshot_path": probe.screenshot,
+        "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
+        "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
+    })
 }
 
 async fn capture_visible_source_probe_result(
@@ -814,6 +951,7 @@ fn matching_ui_source_observation(
     text: Option<&str>,
     key: Option<&str>,
     address: Option<&str>,
+    target_text: Option<&str>,
 ) -> Option<serde_json::Value> {
     UI_SOURCE_OBSERVATIONS.with(|observations| {
         observations
@@ -829,6 +967,10 @@ fn matching_ui_source_observation(
                     })
                     && address.is_none_or(|expected| {
                         event.get("address").and_then(serde_json::Value::as_str) == Some(expected)
+                    })
+                    && target_text.is_none_or(|expected| {
+                        event.get("target_text").and_then(serde_json::Value::as_str)
+                            == Some(expected)
                     })
             })
             .cloned()
@@ -1419,11 +1561,41 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
         .width(grow!())
         .layout(|layout| layout.direction(LeftToRight).gap(6))
         .children(|ui| {
-            app_button(ui, "todo_toggle_all", "Toggle all", false);
-            app_button(ui, "todo_filter_all", "All", true);
-            app_button(ui, "todo_filter_active", "Active", false);
-            app_button(ui, "todo_filter_completed", "Completed", false);
-            app_button(ui, "todo_clear_completed", "Clear completed", false);
+            app_button(
+                ui,
+                "todo_toggle_all",
+                "Toggle all",
+                false,
+                Some("store.sources.toggle_all_checkbox.click"),
+            );
+            app_button(
+                ui,
+                "todo_filter_all",
+                "All",
+                true,
+                Some("store.sources.filter_all.press"),
+            );
+            app_button(
+                ui,
+                "todo_filter_active",
+                "Active",
+                false,
+                Some("store.sources.filter_active.press"),
+            );
+            app_button(
+                ui,
+                "todo_filter_completed",
+                "Completed",
+                false,
+                Some("store.sources.filter_completed.press"),
+            );
+            app_button(
+                ui,
+                "todo_clear_completed",
+                "Clear completed",
+                false,
+                Some("store.sources.clear_completed_button.press"),
+            );
         });
     ui.text(&format!("{active} active, {completed} completed"), |text| {
         text.font_size(16).color(0x2F6FB8)
@@ -1449,6 +1621,15 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                         .height(fixed!(24.0))
                         .background_color(0xE4EAF2)
                         .layout(|layout| layout.align(CenterX, CenterY))
+                        .on_press({
+                            let title = title.to_owned();
+                            move |_, _| {
+                                record_ui_source_observation(json!({
+                                    "source": "todo.sources.todo_checkbox.click",
+                                    "target_text": title
+                                }));
+                            }
+                        })
                         .children(|ui| {
                             ui.text(checked, |text| text.font_size(14).color(0x1F2630));
                         });
@@ -1457,6 +1638,15 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                         .width(grow!())
                         .height(fixed!(24.0))
                         .layout(|layout| layout.align(Left, CenterY))
+                        .on_press({
+                            let title = title.to_owned();
+                            move |_, _| {
+                                record_ui_source_observation(json!({
+                                    "source": "todo.sources.todo_title_element.double_click",
+                                    "target_text": title
+                                }));
+                            }
+                        })
                         .children(|ui| {
                             ui.text(title, |text| text.font_size(16).color(0x1F2630));
                         });
@@ -1466,6 +1656,15 @@ fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
                         .height(fixed!(24.0))
                         .background_color(0xF5E8E8)
                         .layout(|layout| layout.align(CenterX, CenterY))
+                        .on_press({
+                            let title = title.to_owned();
+                            move |_, _| {
+                                record_ui_source_observation(json!({
+                                    "source": "todo.sources.remove_todo_button.press",
+                                    "target_text": title
+                                }));
+                            }
+                        })
                         .children(|ui| {
                             ui.text("x", |text| text.font_size(14).color(0xA32929));
                         });
@@ -1545,19 +1744,33 @@ fn cells_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
     }
 }
 
-fn app_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) {
-    ui.element()
+fn app_button(
+    ui: &mut Ui<'_, ()>,
+    id: &'static str,
+    label: &str,
+    selected: bool,
+    source: Option<&'static str>,
+) {
+    let mut element = ui
+        .element()
         .id(id)
         .height(fixed!(28.0))
         .width(fixed!(118.0))
         .background_color(if selected { 0x2F6FB8 } else { 0xE4EAF2 })
-        .layout(|layout| layout.align(CenterX, CenterY))
-        .children(|ui| {
-            ui.text(label, |text| {
-                text.font_size(13)
-                    .color(if selected { 0xFFFFFF } else { 0x1F2630 })
-            });
+        .layout(|layout| layout.align(CenterX, CenterY));
+    if let Some(source) = source {
+        element = element.on_press(move |_, _| {
+            record_ui_source_observation(json!({
+                "source": source
+            }));
         });
+    }
+    element.children(|ui| {
+        ui.text(label, |text| {
+            text.font_size(13)
+                .color(if selected { 0xFFFFFF } else { 0x1F2630 })
+        });
+    });
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {

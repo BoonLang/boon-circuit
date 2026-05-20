@@ -6432,10 +6432,24 @@ impl GenericScheduledRuntime {
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
+        let selected_filter = self
+            .storage
+            .root_textlike_ref("store.selected_filter")
+            .unwrap_or("");
+        let visible_todos = todos
+            .iter()
+            .filter(|todo| match selected_filter {
+                "Active" => !todo["completed"].as_bool().unwrap_or(false),
+                "Completed" => todo["completed"].as_bool().unwrap_or(false),
+                _ => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         json!({
             "new_todo_text": self.storage.root_textlike_ref("store.new_todo_text").unwrap_or(""),
-            "selected_filter": self.storage.root_textlike_ref("store.selected_filter").unwrap_or(""),
+            "selected_filter": selected_filter,
             "todos": todos,
+            "visible_todos": visible_todos,
             "active_count": active_count,
             "completed_count": completed_count,
             "all_completed": active_count == 0 && completed_count > 0,

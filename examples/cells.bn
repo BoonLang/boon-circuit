@@ -56,3 +56,13 @@ FUNCTION new_cell(seed) {
             Formula/error(parsed_formula, value)
     ]
 }
+
+VIEW {
+    ForEach cells as cell {
+        Row id=cell_row height=40 {
+            Text value=$cell.address size=15
+            Input id=cell_editor key=$cell.address value=$cell.formula placeholder=$cell.formula change=cell.sources.editor.change submit=cell.sources.editor.commit cancel=cell.sources.editor.cancel address=$cell.address size=14
+            Text template="= {cell.value} {cell.error}" size=15
+        }
+    }
+}

@@ -105,23 +105,54 @@ pub fn parse_source(
     validate_list_capacities(&path, &source)?;
     validate_no_reducer_style_update(&path, &source)?;
     validate_no_hidden_identity_leak(&path, &source, kind)?;
-    let row_scope_functions = collect_row_scope_functions(&source);
-    let structure = collect_structure(&source, &row_scope_functions);
+    let semantic_source = strip_view_blocks(&source);
+    let row_scope_functions = collect_row_scope_functions(&semantic_source);
+    let structure = collect_structure(&semantic_source, &row_scope_functions);
     Ok(ParsedProgram {
-        expressions: collect_expressions(&source),
-        sources: collect_sources(&source),
+        expressions: collect_expressions(&semantic_source),
+        sources: collect_sources(&semantic_source),
         source_ports: structure.source_ports,
-        holds: collect_named_lines(&source, "HOLD"),
+        holds: collect_named_lines(&semantic_source, "HOLD"),
         state_cells: structure.state_cells,
-        lists: collect_named_lines(&source, "LIST"),
+        lists: collect_named_lines(&semantic_source, "LIST"),
         list_memories: structure.list_memories,
         row_scope_functions,
-        functions: collect_functions(&source),
-        operators: collect_operators(&source),
+        functions: collect_functions(&semantic_source),
+        operators: collect_operators(&semantic_source),
         path,
-        source,
+        source: semantic_source,
         kind,
     })
+}
+
+fn strip_view_blocks(source: &str) -> String {
+    let mut output = String::new();
+    let mut in_view = false;
+    let mut depth = 0i32;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !in_view && trimmed == "VIEW {" {
+            in_view = true;
+            depth = 1;
+            continue;
+        }
+        if in_view {
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth <= 0 {
+                in_view = false;
+            }
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
 }
 
 fn detect_kind(path: &str, source: &str) -> Result<ProgramKind, ParseError> {

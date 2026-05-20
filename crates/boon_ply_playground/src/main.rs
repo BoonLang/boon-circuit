@@ -5,12 +5,12 @@ fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
             window_title: "Boon Circuit Ply Playground".to_owned(),
-            window_width: 1180,
-            window_height: 760,
-            high_dpi: true,
+            window_width: 1500,
+            window_height: 1000,
+            high_dpi: false,
             sample_count: 1,
             platform: miniquad::conf::Platform {
-                linux_backend: miniquad::conf::LinuxBackend::X11WithWaylandFallback,
+                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly,
                 linux_wm_class: "boon-circuit-ply-playground",
                 ..Default::default()
             },

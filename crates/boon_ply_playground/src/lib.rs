@@ -8,17 +8,19 @@ use boon_runtime::{
 use ply_engine::prelude::*;
 use serde_json::json;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
-    file_name: "FiraSans-Regular.otf",
-    data: include_bytes!("/usr/share/fonts/opentype/fira/FiraSans-Regular.otf"),
+    file_name: "DejaVuSans.ttf",
+    data: include_bytes!("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
 };
 
 thread_local! {
     static UI_SOURCE_OBSERVATIONS: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
-    static LAST_FOCUSED_TODO_EDIT: RefCell<Option<FocusedTodoEdit>> = const { RefCell::new(None) };
+    static LAST_FOCUSED_RENDER_INPUT: RefCell<Option<FocusedRenderInput>> = const { RefCell::new(None) };
+    static RENDER_ID_LABELS: RefCell<BTreeMap<String, &'static str>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 const PLAYGROUND_HELP: &str = "\
@@ -26,20 +28,182 @@ boon_ply_playground
 
 Usage:
   boon_ply_playground --example <todomvc|cells>
+  boon_ply_playground --example <todomvc|cells> --mode <app|dev>
   boon_ply_playground --smoke-launch --example <name> --report <path>
   boon_ply_playground --verify-headed --example <name> --report <path>
   boon_ply_playground --verify-os-input-probe --report <path>
 ";
 
-#[derive(Clone)]
-struct FocusedTodoEdit {
-    index: u32,
-    target_text: String,
+#[derive(Clone, Debug)]
+struct FocusedRenderInput {
+    id: Id,
+    blur_source: Option<String>,
+    cancel_source: Option<String>,
+    escape_source: Option<String>,
+    address: Option<String>,
+    target_text: Option<String>,
 }
 
-#[derive(Clone)]
-struct FocusedCellEdit {
-    address: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaygroundView {
+    App,
+    Source,
+    Deltas,
+    Inspector,
+    Causes,
+    Scenario,
+}
+
+impl PlaygroundView {
+    fn from_mode_arg(args: &[String]) -> Self {
+        match value_after(args, "--mode").as_deref() {
+            Some("dev") | Some("source") => Self::Source,
+            Some("deltas") => Self::Deltas,
+            Some("inspector") => Self::Inspector,
+            Some("causes") => Self::Causes,
+            Some("scenario") => Self::Scenario,
+            _ => Self::App,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RenderNode {
+    Column {
+        id: Option<String>,
+        width: Option<f32>,
+        height: Option<f32>,
+        background: u32,
+        border: Option<u32>,
+        gap: f32,
+        padding: Option<(f32, f32, f32, f32)>,
+        children: Vec<RenderNode>,
+    },
+    Row {
+        id: Option<String>,
+        height: Option<f32>,
+        background: u32,
+        border: Option<u32>,
+        gap: f32,
+        padding: Option<(f32, f32, f32, f32)>,
+        children: Vec<RenderNode>,
+    },
+    ForEach {
+        list: String,
+        item: String,
+        children: Vec<RenderNode>,
+    },
+    Text {
+        value: RenderValue,
+        size: u16,
+        color: u32,
+        width: Option<RenderExtent>,
+        height: Option<f32>,
+        center: bool,
+    },
+    Input {
+        id: String,
+        key: Option<RenderValue>,
+        value: RenderValue,
+        placeholder: RenderValue,
+        change_source: Option<String>,
+        submit_source: Option<String>,
+        cancel_source: Option<String>,
+        escape_source: Option<String>,
+        blur_source: Option<String>,
+        address: Option<RenderValue>,
+        target: Option<RenderValue>,
+        visible: Option<RenderValue>,
+        size: u16,
+        height: Option<f32>,
+        color: u32,
+        placeholder_color: u32,
+        background: u32,
+        border: Option<u32>,
+    },
+    Button {
+        id: String,
+        text: RenderValue,
+        width: Option<RenderExtent>,
+        selected: Option<RenderSelection>,
+        source: Option<String>,
+        address: Option<RenderValue>,
+        target: Option<RenderValue>,
+        visible: Option<RenderValue>,
+        height: Option<f32>,
+        size: u16,
+        color: u32,
+        background: u32,
+        selected_color: u32,
+        selected_background: u32,
+        border: Option<u32>,
+        selected_border: Option<u32>,
+        align_left: bool,
+    },
+    Checkbox {
+        id: String,
+        checked: RenderValue,
+        source: Option<String>,
+        target: Option<RenderValue>,
+        size: f32,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum RenderValue {
+    Literal(String),
+    Path(String),
+    Template(String),
+}
+
+#[derive(Clone, Debug)]
+struct RenderSelection {
+    path: String,
+    expected: String,
+}
+
+#[derive(Clone, Debug)]
+enum RenderExtent {
+    Fill,
+    Fixed(f32),
+}
+
+impl RenderExtent {
+    fn from_attr(value: &str) -> Option<Self> {
+        match value {
+            "fill" | "Fill" => Some(Self::Fill),
+            _ => value.parse().ok().map(Self::Fixed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RenderContext<'a> {
+    root: &'a serde_json::Value,
+    bindings: Vec<(String, &'a serde_json::Value)>,
+    index_stack: Vec<usize>,
+}
+
+impl<'a> RenderContext<'a> {
+    fn root(root: &'a serde_json::Value) -> Self {
+        Self {
+            root,
+            bindings: Vec::new(),
+            index_stack: Vec::new(),
+        }
+    }
+
+    fn with_binding(
+        &self,
+        name: &str,
+        value: &'a serde_json::Value,
+        index: usize,
+    ) -> RenderContext<'a> {
+        let mut next = self.clone();
+        next.bindings.push((name.to_owned(), value));
+        next.index_stack.push(index);
+        next
+    }
 }
 
 pub async fn run_app_from_args() -> Result<(), Box<dyn std::error::Error>> {
@@ -2079,6 +2243,7 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
         "window_title": "Boon Circuit Ply Playground",
         "display_server": display_server(),
         "display_socket_or_compositor_connection": display_socket(),
+        "native_display_contract": native_display_contract(),
         "display_scale": screen_dpi_scale(),
         "window_size": [screen_width(), screen_height()],
         "os_input_probe": probe,
@@ -2121,6 +2286,13 @@ fn record_ui_source_observation(event: serde_json::Value) {
 
 fn clear_ui_source_observations() {
     UI_SOURCE_OBSERVATIONS.with(|observations| observations.borrow_mut().clear());
+}
+
+fn take_ui_source_observations() -> Vec<serde_json::Value> {
+    UI_SOURCE_OBSERVATIONS.with(|observations| {
+        let mut observations = observations.borrow_mut();
+        std::mem::take(&mut *observations)
+    })
 }
 
 fn ui_source_observations_snapshot() -> Vec<serde_json::Value> {
@@ -2243,6 +2415,7 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
         "window_title": "Boon Circuit Ply Playground",
         "display_server": display_server(),
         "display_socket_or_compositor_connection": display_socket(),
+        "native_display_contract": native_display_contract(),
         "display_scale": screen_dpi_scale(),
         "window_size": [screen_width(), screen_height()],
         "framebuffer_size": {
@@ -2287,7 +2460,9 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let selected = value_after(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let view = PlaygroundView::from_mode_arg(args);
     let mut state = PlaygroundState::new(&selected, &mut ply)?;
+    state.view = view;
     loop {
         if is_key_pressed(KeyCode::Key1) {
             state.load_example("todomvc", &mut ply)?;
@@ -2301,6 +2476,21 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         }
         if is_key_pressed(KeyCode::R) {
             state.reset_to_initial(&ply);
+        }
+        if is_key_pressed(KeyCode::A) {
+            state.view = PlaygroundView::App;
+        }
+        if is_key_pressed(KeyCode::S) {
+            state.view = PlaygroundView::Source;
+        }
+        if is_key_pressed(KeyCode::D) {
+            state.view = PlaygroundView::Deltas;
+        }
+        if is_key_pressed(KeyCode::I) {
+            state.view = PlaygroundView::Inspector;
+        }
+        if is_key_pressed(KeyCode::C) {
+            state.view = PlaygroundView::Causes;
         }
         if is_key_pressed(KeyCode::Right) {
             state.step_next(&ply);
@@ -2328,6 +2518,26 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         if ply.is_just_pressed("step_button") {
             state.step_next(&ply);
         }
+        if ply.is_just_pressed("view_app") {
+            state.view = PlaygroundView::App;
+        }
+        if ply.is_just_pressed("view_source") {
+            state.view = PlaygroundView::Source;
+        }
+        if ply.is_just_pressed("view_deltas") {
+            state.view = PlaygroundView::Deltas;
+        }
+        if ply.is_just_pressed("view_inspector") {
+            state.view = PlaygroundView::Inspector;
+        }
+        if ply.is_just_pressed("view_causes") {
+            state.view = PlaygroundView::Causes;
+        }
+        if ply.is_just_pressed("view_scenario") {
+            state.view = PlaygroundView::Scenario;
+        }
+        state.apply_observed_ui_source_events();
+        state.run_editor_text_if_changed(&ply);
         next_frame().await;
     }
     Ok(())
@@ -2396,9 +2606,12 @@ async fn draw_os_input_probe_frame(ply: &mut Ply<()>, token: &str, frame: usize)
 
 struct PlaygroundState {
     selected: String,
+    view: PlaygroundView,
     scenario_path: PathBuf,
     scenario_len: usize,
     scenario_steps: Vec<String>,
+    source_text_snapshot: String,
+    render_nodes: Vec<RenderNode>,
     step_limit: Option<usize>,
     output: Option<RunOutput>,
     live_runtime: Option<LiveRuntime>,
@@ -2409,9 +2622,12 @@ impl PlaygroundState {
     fn new(example: &str, ply: &mut Ply<()>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut state = Self {
             selected: example.to_owned(),
+            view: PlaygroundView::App,
             scenario_path: PathBuf::new(),
             scenario_len: 0,
             scenario_steps: Vec::new(),
+            source_text_snapshot: String::new(),
+            render_nodes: Vec::new(),
             step_limit: None,
             output: None,
             live_runtime: None,
@@ -2429,9 +2645,12 @@ impl PlaygroundState {
     ) -> Self {
         Self {
             selected,
+            view: PlaygroundView::App,
             scenario_path,
             scenario_len,
             scenario_steps: Vec::new(),
+            source_text_snapshot: String::new(),
+            render_nodes: Vec::new(),
             step_limit: None,
             output: Some(output),
             live_runtime: None,
@@ -2455,15 +2674,29 @@ impl PlaygroundState {
             .collect();
         self.scenario_len = self.scenario_steps.len();
         self.scenario_path = scenario;
-        self.step_limit = None;
+        self.step_limit = Some(1);
         ply.set_text_value("source_editor", &source_text);
+        self.source_text_snapshot = source_text.clone();
+        self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
         self.run_text(&source_text);
         Ok(())
     }
 
     fn run_editor_text(&mut self, ply: &Ply<()>) {
         let source_text = ply.get_text_value("source_editor").to_owned();
+        self.source_text_snapshot = source_text.clone();
+        self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
         self.run_text(&source_text);
+    }
+
+    fn run_editor_text_if_changed(&mut self, ply: &Ply<()>) {
+        let source_text = ply.get_text_value("source_editor").to_owned();
+        if source_text != self.source_text_snapshot {
+            self.source_text_snapshot = source_text.clone();
+            self.step_limit = Some(1);
+            self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
+            self.run_text(&source_text);
+        }
     }
 
     fn reset_to_initial(&mut self, ply: &Ply<()>) {
@@ -2539,146 +2772,220 @@ impl PlaygroundState {
             Err("playground output is not initialized".to_owned())
         }
     }
+
+    fn apply_observed_ui_source_events(&mut self) {
+        let observations = take_ui_source_observations();
+        for event in observations {
+            let Some(source_event) = live_source_event_from_json(&event) else {
+                continue;
+            };
+            if let Err(error) = self.apply_live_source_event(source_event, None) {
+                self.last_error = Some(format!("live SOURCE event failed: {error}"));
+                break;
+            } else {
+                self.last_error = None;
+            }
+        }
+    }
 }
 
 async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     clear_background(MacroquadColor::from_rgba(238, 241, 245, 255));
-    sync_visible_todo_edit_inputs(ply, state);
+    sync_render_inputs(ply, state);
     {
         let mut ui = ply.begin();
         build_ui(&mut ui, state);
     }
-    observe_todo_edit_input_escape(ply, state);
-    observe_cell_editor_escape(ply, state);
+    observe_render_input_escape(ply, state);
     ply.show(|_| {}).await;
-    observe_cell_editor_escape(ply, state);
-    observe_todo_edit_input_keys_and_blur(ply, state);
+    observe_render_input_blur(ply, state);
 }
 
-fn sync_visible_todo_edit_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
-    let Some(todos) = todo_state_array(state) else {
+fn sync_render_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
+    let Some(output) = &state.output else {
         return;
     };
     let focused = ply.focused_element();
-    for (index, todo) in todos.iter().enumerate() {
-        if !todo["editing"].as_bool().unwrap_or(false) {
+    let mut values = Vec::new();
+    collect_render_input_values(
+        &state.render_nodes,
+        &RenderContext::root(&output.state_summary),
+        &mut values,
+    );
+    for (id, value) in values {
+        if focused.as_ref() == Some(&id) {
             continue;
         }
-        let edit_id = Id::new_index("todo_row_edit", index as u32);
-        if focused.as_ref() == Some(&edit_id) {
-            continue;
-        }
-        let edit_text = todo["edit_text"]
-            .as_str()
-            .or_else(|| todo["title"].as_str())
-            .unwrap_or("");
-        if ply.get_text_value(edit_id.clone()) != edit_text {
-            ply.set_text_value(edit_id, edit_text);
+        if ply.get_text_value(id.clone()) != value {
+            ply.set_text_value(id, &value);
         }
     }
 }
 
-fn observe_todo_edit_input_escape(ply: &Ply<()>, state: &PlaygroundState) {
-    let current = focused_todo_edit(ply, state);
-    if let Some(edit) = &current
-        && is_key_pressed(KeyCode::Escape)
-    {
-        record_ui_source_observation(json!({
-            "source": "todo.sources.editing_todo_title_element.key_down",
-            "target_text": edit.target_text,
-            "key": "Escape"
-        }));
+fn collect_render_input_values(
+    nodes: &[RenderNode],
+    context: &RenderContext<'_>,
+    values: &mut Vec<(Id, String)>,
+) {
+    for node in nodes {
+        match node {
+            RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
+                collect_render_input_values(children, context, values);
+            }
+            RenderNode::ForEach {
+                list,
+                item,
+                children,
+            } => {
+                if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array)
+                {
+                    for (index, row) in rows.iter().enumerate() {
+                        let item_context = context.with_binding(item, row, index);
+                        collect_render_input_values(children, &item_context, values);
+                    }
+                }
+            }
+            RenderNode::Input {
+                id,
+                key,
+                value,
+                visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                values.push((
+                    render_id_with_key(id, key.as_ref(), context),
+                    eval_render_value(value, context),
+                ));
+            }
+            RenderNode::Text { .. } | RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
+        }
     }
 }
 
-fn observe_todo_edit_input_keys_and_blur(ply: &Ply<()>, state: &PlaygroundState) {
-    let current = focused_todo_edit(ply, state);
-    LAST_FOCUSED_TODO_EDIT.with(|last| {
+fn observe_render_input_escape(ply: &Ply<()>, state: &PlaygroundState) {
+    if !(is_key_pressed(KeyCode::Escape) || is_key_down(KeyCode::Escape)) {
+        return;
+    }
+    let Some(input) = focused_render_input(ply, state) else {
+        return;
+    };
+    if let Some(source) = input.escape_source.as_deref() {
+        record_ui_source_observation(render_source_event(
+            source,
+            None,
+            Some("Escape"),
+            input.address.as_deref(),
+            input.target_text.as_deref(),
+        ));
+    } else if let Some(source) = input.cancel_source.as_deref() {
+        record_ui_source_observation(render_source_event(
+            source,
+            None,
+            None,
+            input.address.as_deref(),
+            input.target_text.as_deref(),
+        ));
+    }
+}
+
+fn observe_render_input_blur(ply: &Ply<()>, state: &PlaygroundState) {
+    let current = focused_render_input(ply, state);
+    LAST_FOCUSED_RENDER_INPUT.with(|last| {
         let previous = last.borrow().clone();
         if let Some(previous) = previous {
             let focus_changed = current
                 .as_ref()
-                .is_none_or(|current| current.index != previous.index);
-            if focus_changed {
-                if is_key_pressed(KeyCode::Escape) || is_key_down(KeyCode::Escape) {
-                    record_ui_source_observation(json!({
-                        "source": "todo.sources.editing_todo_title_element.key_down",
-                        "target_text": previous.target_text,
-                        "key": "Escape"
-                    }));
-                }
-                let edit_id = Id::new_index("todo_row_edit", previous.index);
-                record_ui_source_observation(json!({
-                    "source": "todo.sources.editing_todo_title_element.blur",
-                    "target_text": previous.target_text,
-                    "text": ply.get_text_value(edit_id)
-                }));
+                .is_none_or(|current| current.id != previous.id);
+            if focus_changed
+                && let Some(source) = previous.blur_source.as_deref()
+            {
+                record_ui_source_observation(render_source_event(
+                    source,
+                    Some(ply.get_text_value(previous.id)),
+                    None,
+                    previous.address.as_deref(),
+                    previous.target_text.as_deref(),
+                ));
             }
         }
         *last.borrow_mut() = current;
     });
 }
 
-fn focused_todo_edit(ply: &Ply<()>, state: &PlaygroundState) -> Option<FocusedTodoEdit> {
+fn focused_render_input(ply: &Ply<()>, state: &PlaygroundState) -> Option<FocusedRenderInput> {
     let focused = ply.focused_element()?;
-    let todos = todo_state_array(state)?;
-    for (index, todo) in todos.iter().enumerate() {
-        if focused == Id::new_index("todo_row_edit", index as u32) {
-            return Some(FocusedTodoEdit {
-                index: index as u32,
-                target_text: todo["title"].as_str().unwrap_or("").to_owned(),
-            });
+    let output = state.output.as_ref()?;
+    let mut inputs = Vec::new();
+    collect_render_input_metadata(
+        &state.render_nodes,
+        &RenderContext::root(&output.state_summary),
+        &mut inputs,
+    );
+    inputs.into_iter().find(|input| input.id == focused)
+}
+
+fn collect_render_input_metadata(
+    nodes: &[RenderNode],
+    context: &RenderContext<'_>,
+    inputs: &mut Vec<FocusedRenderInput>,
+) {
+    for node in nodes {
+        match node {
+            RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
+                collect_render_input_metadata(children, context, inputs);
+            }
+            RenderNode::ForEach {
+                list,
+                item,
+                children,
+            } => {
+                if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array)
+                {
+                    for (index, row) in rows.iter().enumerate() {
+                        let item_context = context.with_binding(item, row, index);
+                        collect_render_input_metadata(children, &item_context, inputs);
+                    }
+                }
+            }
+            RenderNode::Input {
+                id,
+                key,
+                cancel_source,
+                escape_source,
+                blur_source,
+                address,
+                target,
+                visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                inputs.push(FocusedRenderInput {
+                    id: render_id_with_key(id, key.as_ref(), context),
+                    blur_source: blur_source.clone(),
+                    cancel_source: cancel_source.clone(),
+                    escape_source: escape_source.clone(),
+                    address: address
+                        .as_ref()
+                        .map(|value| eval_render_value(value, context)),
+                    target_text: target
+                        .as_ref()
+                        .map(|value| eval_render_value(value, context)),
+                });
+            }
+            RenderNode::Text { .. } | RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
         }
     }
-    None
-}
-
-fn observe_cell_editor_escape(ply: &Ply<()>, state: &PlaygroundState) {
-    let Some(edit) = focused_cell_edit(ply, state) else {
-        return;
-    };
-    if is_key_pressed(KeyCode::Escape) || is_key_down(KeyCode::Escape) {
-        record_ui_source_observation(json!({
-            "source": "cell.sources.editor.cancel",
-            "address": edit.address
-        }));
-    }
-}
-
-fn focused_cell_edit(ply: &Ply<()>, state: &PlaygroundState) -> Option<FocusedCellEdit> {
-    let focused = ply.focused_element();
-    let cells = state.output.as_ref()?.state_summary["cells"].as_array()?;
-    for cell in cells {
-        let address = cell["address"].as_str()?;
-        let Some(id) = cell_editor_id(address) else {
-            continue;
-        };
-        if focused.as_ref() == Some(&Id::new(id)) {
-            return Some(FocusedCellEdit {
-                address: address.to_owned(),
-            });
-        }
-    }
-    None
-}
-
-fn cell_editor_id(address: &str) -> Option<&'static str> {
-    match address {
-        "A1" => Some("cell_editor_A1"),
-        "B1" => Some("cell_editor_B1"),
-        "C1" => Some("cell_editor_C1"),
-        "D1" => Some("cell_editor_D1"),
-        _ => None,
-    }
-}
-
-fn todo_state_array(state: &PlaygroundState) -> Option<&Vec<serde_json::Value>> {
-    state
-        .output
-        .as_ref()?
-        .state_summary
-        .get("todos")?
-        .as_array()
 }
 
 fn build_ui(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
@@ -2745,6 +3052,23 @@ fn scenario_checklist(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         });
 }
 
+fn scenario_detail_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
+    panel(ui, "scenario_detail_panel", "Scenario", |ui| {
+        let completed = state.step_limit.unwrap_or(state.scenario_len);
+        for (index, label) in state.scenario_steps.iter().enumerate() {
+            let marker = if index < completed { "x" } else { " " };
+            let color = if index < completed {
+                0x1F2630
+            } else {
+                0x596579
+            };
+            ui.text(&format!("[{marker}] {label}"), |text| {
+                text.font_size(16).color(color)
+            });
+        }
+    });
+}
+
 fn nav_item(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) {
     ui.element()
         .id(id)
@@ -2771,14 +3095,14 @@ fn content(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         })
         .children(|ui| {
             toolbar(ui, state);
-            ui.element()
-                .width(grow!())
-                .height(grow!())
-                .layout(|layout| layout.direction(LeftToRight).gap(10))
-                .children(|ui| {
-                    source_panel(ui);
-                    runtime_panel(ui, state);
-                });
+            match state.view {
+                PlaygroundView::App => app_first_panel(ui, state),
+                PlaygroundView::Source => source_dev_panel(ui, state),
+                PlaygroundView::Deltas => delta_panel(ui, state),
+                PlaygroundView::Inspector => inspector_panel(ui, state),
+                PlaygroundView::Causes => explanation_panel(ui, state),
+                PlaygroundView::Scenario => scenario_detail_panel(ui, state),
+            }
         });
 }
 
@@ -2792,9 +3116,40 @@ fn toolbar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
             toolbar_button(ui, "run_button", "Run", true);
             toolbar_button(ui, "reset_button", "Reset", false);
             toolbar_button(ui, "step_button", "Step", false);
+            view_button(ui, "view_app", "App", state.view == PlaygroundView::App);
+            view_button(
+                ui,
+                "view_source",
+                "Source",
+                state.view == PlaygroundView::Source,
+            );
+            view_button(
+                ui,
+                "view_deltas",
+                "Deltas",
+                state.view == PlaygroundView::Deltas,
+            );
+            view_button(
+                ui,
+                "view_inspector",
+                "Inspector",
+                state.view == PlaygroundView::Inspector,
+            );
+            view_button(
+                ui,
+                "view_causes",
+                "Causes",
+                state.view == PlaygroundView::Causes,
+            );
+            view_button(
+                ui,
+                "view_scenario",
+                "Scenario",
+                state.view == PlaygroundView::Scenario,
+            );
             ui.text(
                 &format!("{} / {}", state.selected, step_label(state)),
-                |text| text.font_size(15).color(0x1F2630),
+                |text| text.font_size(18).color(0x1F2630),
             );
         });
 }
@@ -2811,6 +3166,54 @@ fn toolbar_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, primary: b
                 text.font_size(14)
                     .color(if primary { 0xFFFFFF } else { 0x1F2630 })
             });
+        });
+}
+
+fn view_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) {
+    ui.element()
+        .id(id)
+        .height(fixed!(32.0))
+        .width(fixed!(96.0))
+        .background_color(if selected { 0x1F2630 } else { 0xE4EAF2 })
+        .layout(|layout| layout.align(CenterX, CenterY))
+        .children(|ui| {
+            ui.text(label, |text| {
+                text.font_size(15)
+                    .color(if selected { 0xFFFFFF } else { 0x1F2630 })
+            });
+        });
+}
+
+fn app_first_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
+    ui.element()
+        .id("app_first_panel")
+        .width(grow!())
+        .height(grow!())
+        .background_color(0xF5F5F5)
+        .layout(|layout| {
+            layout
+                .direction(TopToBottom)
+                .padding((24, 24, 18, 18))
+                .align(CenterX, Top)
+        })
+        .children(|ui| {
+            if let Some(error) = &state.last_error {
+                ui.text(error, |text| text.font_size(18).color(0xA32929));
+                return;
+            }
+            preview_body(ui, state, PreviewLayout::Full);
+        });
+}
+
+fn source_dev_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
+    ui.element()
+        .id("source_dev_panel")
+        .width(grow!())
+        .height(grow!())
+        .layout(|layout| layout.direction(LeftToRight).gap(10))
+        .children(|ui| {
+            source_panel(ui);
+            runtime_panel(ui, state);
         });
 }
 
@@ -2867,6 +3270,17 @@ fn runtime_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
 
 fn preview_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
     panel(ui, "preview_panel", "Preview", |ui| {
+        preview_body(ui, state, PreviewLayout::Panel);
+    });
+}
+
+#[derive(Clone, Copy)]
+enum PreviewLayout {
+    Full,
+    Panel,
+}
+
+fn preview_body(ui: &mut Ui<'_, ()>, state: &PlaygroundState, layout: PreviewLayout) {
         if let Some(error) = &state.last_error {
             ui.text(error, |text| text.font_size(14).color(0xA32929));
             return;
@@ -2874,12 +3288,873 @@ fn preview_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         let Some(output) = &state.output else {
             return;
         };
-        if state.selected == "todomvc" {
-            todomvc_content(ui, &output.state_summary);
-        } else {
-            cells_content(ui, &output.state_summary);
+        if state.render_nodes.is_empty() {
+            ui.text("No VIEW block in Boon source", |text| {
+                text.font_size(16).color(0x596579)
+            });
+            compact_json(ui, &output.state_summary);
+            return;
         }
-    });
+        if matches!(layout, PreviewLayout::Full) {
+            ui.element()
+                .id("dynamic_boon_preview")
+                .width(grow!())
+                .height(grow!())
+                .layout(|layout| layout.direction(TopToBottom).align(CenterX, Top))
+                .children(|ui| {
+                    render_nodes(ui, &state.render_nodes, &RenderContext::root(&output.state_summary));
+                });
+        } else {
+            render_nodes(ui, &state.render_nodes, &RenderContext::root(&output.state_summary));
+        }
+}
+
+fn render_nodes(ui: &mut Ui<'_, ()>, nodes: &[RenderNode], context: &RenderContext<'_>) {
+    for node in nodes {
+        render_node(ui, node, context);
+    }
+}
+
+fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'_>) {
+    match node {
+        RenderNode::Column {
+            id,
+            width,
+            height,
+            background,
+            border,
+            gap,
+            padding,
+            children,
+        } => {
+            let mut element = ui
+                .element()
+                .width(width.map_or(grow!(), |width| fixed!(width)))
+                .background_color(*background);
+            if let Some(height) = height {
+                element = element.height(fixed!(*height));
+            }
+            if let Some(border) = border {
+                element = element.border(|border_style| border_style.color(*border).all(1));
+            }
+            let gap = *gap;
+            let padding = *padding;
+            element = element.layout(|layout| {
+                let layout = layout.direction(TopToBottom).gap(gap as u16);
+                if let Some(padding) = padding {
+                    layout.padding(padding_u16(padding))
+                } else {
+                    layout
+                }
+            });
+            if let Some(id) = id {
+                element = element.id(render_id(id, context));
+            }
+            element.children(|ui| render_nodes(ui, children, context));
+        }
+        RenderNode::Row {
+            id,
+            height,
+            background,
+            border,
+            gap,
+            padding,
+            children,
+        } => {
+            let mut element = ui
+                .element()
+                .width(grow!())
+                .height(height.map_or(fixed!(40.0), |height| fixed!(height)))
+                .background_color(*background);
+            if let Some(border) = border {
+                element = element.border(|border_style| border_style.color(*border).bottom(1));
+            }
+            let gap = *gap;
+            let padding = padding.unwrap_or((10.0, 10.0, 6.0, 6.0));
+            element = element.layout(|layout| {
+                layout
+                    .direction(LeftToRight)
+                    .padding(padding_u16(padding))
+                    .gap(gap as u16)
+                    .align(Left, CenterY)
+            });
+            if let Some(id) = id {
+                element = element.id(render_id(id, context));
+            }
+            element.children(|ui| render_nodes(ui, children, context));
+        }
+        RenderNode::ForEach {
+            list,
+            item,
+            children,
+        } => {
+            if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array) {
+                for (index, row) in rows.iter().enumerate() {
+                    let item_context = context.with_binding(item, row, index);
+                    render_nodes(ui, children, &item_context);
+                }
+            }
+        }
+        RenderNode::Text {
+            value,
+            size,
+            color,
+            width,
+            height,
+            center,
+        } => {
+            let label = eval_render_value(value, context);
+            let draw_text = |ui: &mut Ui<'_, ()>| {
+                ui.text(&label, |text| text.font_size(*size).color(*color));
+            };
+            if width.is_some() || height.is_some() || *center {
+                ui.element()
+                    .width(match width {
+                        Some(RenderExtent::Fill) => grow!(),
+                        Some(RenderExtent::Fixed(width)) => fixed!(*width),
+                        None => grow!(),
+                    })
+                    .height(height.map_or(fixed!((*size as f32 + 12.0).max(28.0)), |height| fixed!(height)))
+                    .layout(|layout| {
+                        if *center {
+                            layout.align(CenterX, CenterY)
+                        } else {
+                            layout.align(Left, CenterY)
+                        }
+                    })
+                    .children(draw_text);
+            } else {
+                draw_text(ui);
+            }
+        }
+        RenderNode::Input {
+            id,
+            key,
+            value: _,
+            placeholder,
+            change_source,
+            submit_source,
+            cancel_source: _,
+            escape_source: _,
+            blur_source: _,
+            address,
+            target,
+            visible,
+            size,
+            height,
+            color,
+            placeholder_color,
+            background,
+            border,
+        } => {
+            if visible
+                .as_ref()
+                .is_some_and(|visible| !eval_bool(visible, context))
+            {
+                return;
+            }
+            let element_id = render_id_with_key(id, key.as_ref(), context);
+            let change_source = change_source.clone();
+            let submit_source = submit_source.clone();
+            let address_value = address
+                .as_ref()
+                .map(|value| eval_render_value(value, context));
+            let target_value = target
+                .as_ref()
+                .map(|value| eval_render_value(value, context));
+            ui.element()
+                .id(element_id)
+                .height(height.map_or(fixed!((*size as f32 + 20.0).max(34.0)), |height| fixed!(height)))
+                .width(grow!())
+                .background_color(*background)
+                .border(|border_style| border_style.color(border.unwrap_or(0xD5DDE8)).all(1))
+                .layout(|layout| layout.padding((8, 8, 5, 5)))
+                .text_input(|input| {
+                    let change_address = address_value.clone();
+                    let change_target = target_value.clone();
+                    let submit_address = address_value.clone();
+                    let submit_target = target_value.clone();
+                    input
+                        .placeholder(&eval_render_value(placeholder, context))
+                        .font(&DEFAULT_FONT)
+                        .font_size(*size)
+                        .text_color(*color)
+                        .placeholder_color(*placeholder_color)
+                        .cursor_color(0x2F6FB8)
+                        .selection_color(0xB9D7F5)
+                        .on_changed(move |text| {
+                            if let Some(source) = &change_source {
+                                record_ui_source_observation(render_source_event(
+                                    source,
+                                    Some(text),
+                                    None,
+                                    change_address.as_deref(),
+                                    change_target.as_deref(),
+                                ));
+                            }
+                        })
+                        .on_submit(move |text| {
+                            if let Some(source) = &submit_source {
+                                record_ui_source_observation(render_source_event(
+                                    source,
+                                    Some(text),
+                                    Some("Enter"),
+                                    submit_address.as_deref(),
+                                    submit_target.as_deref(),
+                                ));
+                            }
+                        })
+                })
+                .empty();
+        }
+        RenderNode::Button {
+            id,
+            text,
+            width,
+            selected,
+            source,
+            address,
+            target,
+            visible,
+            height,
+            size,
+            color,
+            background,
+            selected_color,
+            selected_background,
+            border,
+            selected_border,
+            align_left,
+        } => {
+            if visible
+                .as_ref()
+                .is_some_and(|visible| !eval_bool(visible, context))
+            {
+                return;
+            }
+            let source = source.clone();
+            let address_value = address
+                .as_ref()
+                .map(|value| eval_render_value(value, context));
+            let target_value = target
+                .as_ref()
+                .map(|value| eval_render_value(value, context));
+            let selected = selected
+                .as_ref()
+                .is_some_and(|selection| selection_matches(selection, context));
+            ui.element()
+                .id(render_id(id, context))
+                .height(height.map_or(fixed!(32.0), |height| fixed!(height)))
+                .width(match width {
+                    Some(RenderExtent::Fill) => grow!(),
+                    Some(RenderExtent::Fixed(width)) => fixed!(*width),
+                    None => fixed!(118.0),
+                })
+                .background_color(if selected {
+                    *selected_background
+                } else {
+                    *background
+                })
+                .border(|border_style| {
+                    border_style
+                        .color(if selected {
+                            selected_border.or(*border).unwrap_or(0xFFFFFF)
+                        } else {
+                            border.unwrap_or(0xFFFFFF)
+                        })
+                        .all(1)
+                })
+                .layout(|layout| {
+                    if *align_left {
+                        layout.align(Left, CenterY)
+                    } else {
+                        layout.align(CenterX, CenterY)
+                    }
+                })
+                .on_press(move |_, _| {
+                    if let Some(source) = &source {
+                        record_ui_source_observation(render_source_event(
+                            source,
+                            None,
+                            None,
+                            address_value.as_deref(),
+                            target_value.as_deref(),
+                        ));
+                    }
+                })
+                .children(|ui| {
+                    ui.text(&eval_render_value(text, context), |text| {
+                        text.font_size(*size)
+                            .color(if selected { *selected_color } else { *color })
+                    });
+                });
+        }
+        RenderNode::Checkbox {
+            id,
+            checked,
+            source,
+            target,
+            size,
+        } => {
+            let source = source.clone();
+            let target_value = target
+                .as_ref()
+                .map(|value| eval_render_value(value, context));
+            let checked = eval_bool(checked, context);
+            ui.element()
+                .id(render_id(id, context))
+                .width(fixed!(*size + 12.0))
+                .height(fixed!(*size + 12.0))
+                .background_color(0xFFFFFF)
+                .layout(|layout| layout.align(CenterX, CenterY))
+                .on_press(move |_, _| {
+                    if let Some(source) = &source {
+                        record_ui_source_observation(render_source_event(
+                            source,
+                            None,
+                            None,
+                            None,
+                            target_value.as_deref(),
+                        ));
+                    }
+                })
+                .children(|ui| {
+                    ui.text(if checked { "✓" } else { "○" }, |text| {
+                        text.font_size(*size as u16)
+                            .color(if checked { 0x3EA390 } else { 0x949494 })
+                    });
+                });
+        }
+    }
+}
+
+fn render_source_event(
+    source: &str,
+    text: Option<&str>,
+    key: Option<&str>,
+    address: Option<&str>,
+    target_text: Option<&str>,
+) -> serde_json::Value {
+    let mut event = serde_json::Map::new();
+    event.insert("source".to_owned(), json!(source));
+    if let Some(text) = text {
+        event.insert("text".to_owned(), json!(text));
+    }
+    if let Some(key) = key {
+        event.insert("key".to_owned(), json!(key));
+    }
+    if let Some(address) = address {
+        event.insert("address".to_owned(), json!(address));
+    }
+    if let Some(target_text) = target_text {
+        event.insert("target_text".to_owned(), json!(target_text));
+    }
+    serde_json::Value::Object(event)
+}
+
+fn render_id(id: &str, context: &RenderContext<'_>) -> Id {
+    let label = render_id_label(id);
+    if let Some(index) = context.index_stack.last() {
+        Id::new_index(label, *index as u32)
+    } else {
+        Id::new(label)
+    }
+}
+
+fn render_id_with_key(
+    id: &str,
+    key: Option<&RenderValue>,
+    context: &RenderContext<'_>,
+) -> Id {
+    if let Some(key) = key {
+        let key = eval_render_value(key, context);
+        if !key.is_empty() {
+            return Id::new(render_id_label(&format!("{id}_{key}")));
+        }
+    }
+    render_id(id, context)
+}
+
+fn render_id_label(id: &str) -> &'static str {
+    RENDER_ID_LABELS.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        if let Some(label) = labels.get(id) {
+            return *label;
+        }
+        let label = Box::leak(id.to_owned().into_boxed_str());
+        labels.insert(id.to_owned(), label);
+        label
+    })
+}
+
+fn selection_matches(selection: &RenderSelection, context: &RenderContext<'_>) -> bool {
+    eval_path_text(&selection.path, context).as_deref() == Some(selection.expected.as_str())
+}
+
+fn eval_bool(value: &RenderValue, context: &RenderContext<'_>) -> bool {
+    match value {
+        RenderValue::Literal(value) => matches!(value.as_str(), "true" | "True" | "1"),
+        RenderValue::Path(path) => resolve_path(context, path)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .unwrap_or_else(|| value.as_u64().unwrap_or_default() != 0)
+            })
+            .unwrap_or(false),
+        RenderValue::Template(value) => !eval_template(value, context).is_empty(),
+    }
+}
+
+fn eval_render_value(value: &RenderValue, context: &RenderContext<'_>) -> String {
+    match value {
+        RenderValue::Literal(value) => value.clone(),
+        RenderValue::Path(path) => eval_path_text(path, context).unwrap_or_default(),
+        RenderValue::Template(value) => eval_template(value, context),
+    }
+}
+
+fn eval_template(template: &str, context: &RenderContext<'_>) -> String {
+    let mut output = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let path = &after_start[..end];
+        output.push_str(&eval_path_text(path, context).unwrap_or_default());
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn eval_path_text(path: &str, context: &RenderContext<'_>) -> Option<String> {
+    let value = resolve_path(context, path)?;
+    if let Some(value) = value.as_str() {
+        Some(value.to_owned())
+    } else if let Some(value) = value.as_bool() {
+        Some(value.to_string())
+    } else if let Some(value) = value.as_u64() {
+        Some(value.to_string())
+    } else if let Some(value) = value.as_i64() {
+        Some(value.to_string())
+    } else if value.is_null() {
+        Some(String::new())
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn resolve_path<'a>(
+    context: &'a RenderContext<'a>,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut value = context
+        .bindings
+        .iter()
+        .rev()
+        .find_map(|(name, value)| (name == first).then_some(*value))
+        .or_else(|| context.root.get(first))?;
+    for part in parts {
+        value = value.get(part)?;
+    }
+    Some(value)
+}
+
+fn parse_render_view(source: &str) -> Result<Vec<RenderNode>, String> {
+    let Some(lines) = render_view_lines(source) else {
+        return Ok(Vec::new());
+    };
+    parse_render_nodes(&lines)
+}
+
+fn render_view_lines(source: &str) -> Option<Vec<String>> {
+    let mut in_view = false;
+    let mut depth = 0i32;
+    let mut lines = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !in_view {
+            if trimmed == "VIEW {" {
+                in_view = true;
+                depth = 1;
+            }
+            continue;
+        }
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            return Some(lines);
+        }
+        lines.push(trimmed.to_owned());
+    }
+    None
+}
+
+#[derive(Debug)]
+enum RenderFrame {
+    Column {
+        id: Option<String>,
+        width: Option<f32>,
+        height: Option<f32>,
+        background: u32,
+        border: Option<u32>,
+        gap: f32,
+        padding: Option<(f32, f32, f32, f32)>,
+        children: Vec<RenderNode>,
+    },
+    Row {
+        id: Option<String>,
+        height: Option<f32>,
+        background: u32,
+        border: Option<u32>,
+        gap: f32,
+        padding: Option<(f32, f32, f32, f32)>,
+        children: Vec<RenderNode>,
+    },
+    ForEach {
+        list: String,
+        item: String,
+        children: Vec<RenderNode>,
+    },
+}
+
+fn parse_render_nodes(lines: &[String]) -> Result<Vec<RenderNode>, String> {
+    let mut root = Vec::new();
+    let mut stack = Vec::<RenderFrame>::new();
+    for line in lines {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "}" {
+            let frame = stack.pop().ok_or("VIEW block has an extra closing brace")?;
+            push_render_node(&mut root, &mut stack, frame.into_node());
+            continue;
+        }
+        if line.ends_with('{') {
+            stack.push(parse_render_frame(line)?);
+            continue;
+        }
+        let node = parse_render_leaf(line)?;
+        push_render_node(&mut root, &mut stack, node);
+    }
+    if !stack.is_empty() {
+        return Err("VIEW block has an unclosed container".to_owned());
+    }
+    Ok(root)
+}
+
+impl RenderFrame {
+    fn into_node(self) -> RenderNode {
+        match self {
+            Self::Column {
+                id,
+                width,
+                height,
+                background,
+                border,
+                gap,
+                padding,
+                children,
+            } => RenderNode::Column {
+                id,
+                width,
+                height,
+                background,
+                border,
+                gap,
+                padding,
+                children,
+            },
+            Self::Row {
+                id,
+                height,
+                background,
+                border,
+                gap,
+                padding,
+                children,
+            } => RenderNode::Row {
+                id,
+                height,
+                background,
+                border,
+                gap,
+                padding,
+                children,
+            },
+            Self::ForEach {
+                list,
+                item,
+                children,
+            } => RenderNode::ForEach {
+                list,
+                item,
+                children,
+            },
+        }
+    }
+
+    fn children_mut(&mut self) -> &mut Vec<RenderNode> {
+        match self {
+            Self::Column { children, .. }
+            | Self::Row { children, .. }
+            | Self::ForEach { children, .. } => children,
+        }
+    }
+}
+
+fn push_render_node(root: &mut Vec<RenderNode>, stack: &mut [RenderFrame], node: RenderNode) {
+    if let Some(parent) = stack.last_mut() {
+        parent.children_mut().push(node);
+    } else {
+        root.push(node);
+    }
+}
+
+fn parse_render_frame(line: &str) -> Result<RenderFrame, String> {
+    let without_brace = line.trim_end_matches('{').trim();
+    let tokens = tokenize_render_line(without_brace);
+    match tokens.first().map(String::as_str) {
+        Some("Column") => {
+            let attrs = parse_render_attrs(&tokens[1..]);
+            Ok(RenderFrame::Column {
+                id: attrs.get("id").cloned(),
+                width: attrs.get("width").and_then(|value| value.parse().ok()),
+                height: attrs.get("height").and_then(|value| value.parse().ok()),
+                background: parse_color(&attrs, "bg", 0xFFFFFF),
+                border: parse_optional_color(&attrs, "border"),
+                gap: parse_float(&attrs, "gap", 0.0),
+                padding: parse_padding(&attrs),
+                children: Vec::new(),
+            })
+        }
+        Some("Row") => {
+            let attrs = parse_render_attrs(&tokens[1..]);
+            Ok(RenderFrame::Row {
+                id: attrs.get("id").cloned(),
+                height: attrs.get("height").and_then(|value| value.parse().ok()),
+                background: parse_color(&attrs, "bg", 0xFFFFFF),
+                border: parse_optional_color(&attrs, "border").or(Some(0xEDEDED)),
+                gap: parse_float(&attrs, "gap", 8.0),
+                padding: parse_padding(&attrs),
+                children: Vec::new(),
+            })
+        }
+        Some("ForEach") if tokens.len() >= 4 && tokens[2] == "as" => Ok(RenderFrame::ForEach {
+            list: tokens[1].clone(),
+            item: tokens[3].clone(),
+            children: Vec::new(),
+        }),
+        Some(kind) => Err(format!("unsupported VIEW container `{kind}`")),
+        None => Err("empty VIEW container".to_owned()),
+    }
+}
+
+fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
+    let tokens = tokenize_render_line(line);
+    let Some(kind) = tokens.first().map(String::as_str) else {
+        return Err("empty VIEW leaf".to_owned());
+    };
+    let attrs = parse_render_attrs(&tokens[1..]);
+    match kind {
+        "Text" => Ok(RenderNode::Text {
+            value: render_value_from_attrs(&attrs, "value")
+                .or_else(|| render_value_from_attrs(&attrs, "text"))
+                .or_else(|| render_value_from_attrs(&attrs, "template"))
+                .unwrap_or_else(|| RenderValue::Literal(String::new())),
+            size: parse_size(&attrs, 16),
+            color: parse_color(&attrs, "color", 0x1F2630),
+            width: attrs.get("width").and_then(|value| RenderExtent::from_attr(value)),
+            height: attrs.get("height").and_then(|value| value.parse().ok()),
+            center: parse_bool_attr(&attrs, "center"),
+        }),
+        "Input" => Ok(RenderNode::Input {
+            id: required_attr(&attrs, "id")?,
+            key: render_value_from_attrs(&attrs, "key"),
+            value: render_value_from_attrs(&attrs, "value")
+                .unwrap_or_else(|| RenderValue::Literal(String::new())),
+            placeholder: render_value_from_attrs(&attrs, "placeholder")
+                .unwrap_or_else(|| RenderValue::Literal(String::new())),
+            change_source: attrs.get("change").cloned(),
+            submit_source: attrs.get("submit").cloned(),
+            cancel_source: attrs.get("cancel").cloned(),
+            escape_source: attrs.get("escape").cloned(),
+            blur_source: attrs.get("blur").cloned(),
+            address: render_value_from_attrs(&attrs, "address"),
+            target: render_value_from_attrs(&attrs, "target"),
+            visible: render_value_from_attrs(&attrs, "visible"),
+            size: parse_size(&attrs, 16),
+            height: attrs.get("height").and_then(|value| value.parse().ok()),
+            color: parse_color(&attrs, "color", 0x1F2630),
+            placeholder_color: parse_color(&attrs, "placeholder_color", 0x8B97A7),
+            background: parse_color(&attrs, "bg", 0xFFFFFF),
+            border: parse_optional_color(&attrs, "border"),
+        }),
+        "Button" => Ok(RenderNode::Button {
+            id: required_attr(&attrs, "id")?,
+            text: render_value_from_attrs(&attrs, "text")
+                .unwrap_or_else(|| RenderValue::Literal(String::new())),
+            width: attrs.get("width").and_then(|value| RenderExtent::from_attr(value)),
+            selected: attrs.get("selected").and_then(|value| {
+                let (path, expected) = value.split_once(':')?;
+                Some(RenderSelection {
+                    path: path.strip_prefix('$').unwrap_or(path).to_owned(),
+                    expected: expected.to_owned(),
+                })
+            }),
+            source: attrs.get("source").cloned(),
+            address: render_value_from_attrs(&attrs, "address"),
+            target: render_value_from_attrs(&attrs, "target"),
+            visible: render_value_from_attrs(&attrs, "visible"),
+            height: attrs.get("height").and_then(|value| value.parse().ok()),
+            size: parse_size(&attrs, 14),
+            color: parse_color(&attrs, "color", 0x1F2630),
+            background: parse_color(&attrs, "bg", 0xFFFFFF),
+            selected_color: parse_color(&attrs, "selected_color", 0x1F2630),
+            selected_background: parse_color(&attrs, "selected_bg", 0xFFFFFF),
+            border: parse_optional_color(&attrs, "border"),
+            selected_border: parse_optional_color(&attrs, "selected_border"),
+            align_left: attrs.get("align").is_some_and(|value| value == "left"),
+        }),
+        "Checkbox" => Ok(RenderNode::Checkbox {
+            id: required_attr(&attrs, "id")?,
+            checked: render_value_from_attrs(&attrs, "checked")
+                .unwrap_or_else(|| RenderValue::Literal("False".to_owned())),
+            source: attrs.get("source").cloned(),
+            target: render_value_from_attrs(&attrs, "target"),
+            size: parse_float(&attrs, "size", 48.0),
+        }),
+        _ => Err(format!("unsupported VIEW leaf `{kind}`")),
+    }
+}
+
+fn tokenize_render_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut in_quote = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                token.push(ch);
+            }
+            ' ' | '\t' if !in_quote => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            _ => token.push(ch),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn parse_render_attrs(tokens: &[String]) -> BTreeMap<String, String> {
+    tokens
+        .iter()
+        .filter_map(|token| {
+            let (key, value) = token.split_once('=')?;
+            Some((key.to_owned(), unquote(value)))
+        })
+        .collect()
+}
+
+fn unquote(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+        .to_owned()
+}
+
+fn render_value_from_attrs(attrs: &BTreeMap<String, String>, key: &str) -> Option<RenderValue> {
+    let value = attrs.get(key)?;
+    if key == "template" {
+        Some(RenderValue::Template(value.clone()))
+    } else if let Some(path) = value.strip_prefix('$') {
+        Some(RenderValue::Path(path.to_owned()))
+    } else if value.contains('{') && value.contains('}') {
+        Some(RenderValue::Template(value.clone()))
+    } else {
+        Some(RenderValue::Literal(value.clone()))
+    }
+}
+
+fn required_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<String, String> {
+    attrs
+        .get(key)
+        .cloned()
+        .ok_or_else(|| format!("VIEW node missing `{key}`"))
+}
+
+fn parse_size(attrs: &BTreeMap<String, String>, default: u16) -> u16 {
+    attrs
+        .get("size")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_float(attrs: &BTreeMap<String, String>, key: &str, default: f32) -> f32 {
+    attrs
+        .get(key)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_bool_attr(attrs: &BTreeMap<String, String>, key: &str) -> bool {
+    attrs
+        .get(key)
+        .is_some_and(|value| matches!(value.as_str(), "true" | "True" | "1" | "yes"))
+}
+
+fn parse_optional_color(attrs: &BTreeMap<String, String>, key: &str) -> Option<u32> {
+    attrs.get(key).and_then(|value| parse_color_value(value))
+}
+
+fn parse_color(attrs: &BTreeMap<String, String>, key: &str, default: u32) -> u32 {
+    parse_optional_color(attrs, key).unwrap_or(default)
+}
+
+fn parse_color_value(value: &str) -> Option<u32> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    u32::from_str_radix(value, 16).ok()
+}
+
+fn parse_padding(attrs: &BTreeMap<String, String>) -> Option<(f32, f32, f32, f32)> {
+    let value = attrs.get("padding")?;
+    let parts = value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [all] => Some((*all, *all, *all, *all)),
+        [horizontal, vertical] => Some((*horizontal, *horizontal, *vertical, *vertical)),
+        [left, right, top, bottom] => Some((*left, *right, *top, *bottom)),
+        _ => None,
+    }
+}
+
+fn padding_u16(padding: (f32, f32, f32, f32)) -> (u16, u16, u16, u16) {
+    (
+        padding.0.max(0.0) as u16,
+        padding.1.max(0.0) as u16,
+        padding.2.max(0.0) as u16,
+        padding.3.max(0.0) as u16,
+    )
 }
 
 fn delta_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
@@ -3002,301 +4277,6 @@ fn step_label(state: &PlaygroundState) -> String {
     }
 }
 
-fn todomvc_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
-    let active = state["active_count"].as_u64().unwrap_or_default();
-    let completed = state["completed_count"].as_u64().unwrap_or_default();
-    ui.element()
-        .id("todo_new_input")
-        .height(fixed!(40.0))
-        .width(grow!())
-        .background_color(0xFFFFFF)
-        .border(|border| border.color(0x2F6FB8).all(1))
-        .layout(|layout| layout.padding((10, 10, 7, 7)))
-        .text_input(|input| {
-            input
-                .placeholder("What needs to be done?")
-                .font(&DEFAULT_FONT)
-                .font_size(17)
-                .text_color(0x1F2630)
-                .placeholder_color(0x8B97A7)
-                .cursor_color(0x2F6FB8)
-                .selection_color(0xB9D7F5)
-                .on_changed(|text| {
-                    record_ui_source_observation(json!({
-                        "source": "store.sources.new_todo_input.change",
-                        "text": text
-                    }));
-                })
-                .on_submit(|text| {
-                    record_ui_source_observation(json!({
-                        "source": "store.sources.new_todo_input.key_down",
-                        "key": "Enter",
-                        "text": text
-                    }));
-                })
-        })
-        .empty();
-    ui.element()
-        .height(fixed!(32.0))
-        .width(grow!())
-        .layout(|layout| layout.direction(LeftToRight).gap(6))
-        .children(|ui| {
-            app_button(
-                ui,
-                "todo_toggle_all",
-                "Toggle all",
-                false,
-                Some("store.sources.toggle_all_checkbox.click"),
-            );
-            app_button(
-                ui,
-                "todo_filter_all",
-                "All",
-                true,
-                Some("store.sources.filter_all.press"),
-            );
-            app_button(
-                ui,
-                "todo_filter_active",
-                "Active",
-                false,
-                Some("store.sources.filter_active.press"),
-            );
-            app_button(
-                ui,
-                "todo_filter_completed",
-                "Completed",
-                false,
-                Some("store.sources.filter_completed.press"),
-            );
-            app_button(
-                ui,
-                "todo_clear_completed",
-                "Clear completed",
-                false,
-                Some("store.sources.clear_completed_button.press"),
-            );
-        });
-    ui.text(&format!("{active} active, {completed} completed"), |text| {
-        text.font_size(16).color(0x2F6FB8)
-    });
-    if let Some(todos) = state["todos"].as_array() {
-        for (index, todo) in todos.iter().enumerate() {
-            let title = todo["title"].as_str().unwrap_or("");
-            let edit_text = todo["edit_text"].as_str().unwrap_or(title);
-            let editing = todo["editing"].as_bool().unwrap_or(false);
-            let checked = if todo["completed"].as_bool().unwrap_or(false) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            ui.element()
-                .height(fixed!(34.0))
-                .width(grow!())
-                .background_color(0xFFFFFF)
-                .border(|border| border.color(0xD5DDE8).all(1))
-                .layout(|layout| layout.padding((10, 10, 6, 6)).align(Left, CenterY))
-                .children(|ui| {
-                    ui.element()
-                        .id(("todo_row_checkbox", index as u32))
-                        .width(fixed!(34.0))
-                        .height(fixed!(24.0))
-                        .background_color(0xE4EAF2)
-                        .layout(|layout| layout.align(CenterX, CenterY))
-                        .on_press({
-                            let title = title.to_owned();
-                            move |_, _| {
-                                record_ui_source_observation(json!({
-                                    "source": "todo.sources.todo_checkbox.click",
-                                    "target_text": title
-                                }));
-                            }
-                        })
-                        .children(|ui| {
-                            ui.text(checked, |text| text.font_size(14).color(0x1F2630));
-                        });
-                    if editing {
-                        ui.element()
-                            .id(("todo_row_edit", index as u32))
-                            .width(grow!())
-                            .height(fixed!(26.0))
-                            .background_color(0xFFFDF7)
-                            .border(|border| border.color(0xD9A441).all(1))
-                            .layout(|layout| layout.padding((8, 8, 4, 4)).align(Left, CenterY))
-                            .text_input(|input| {
-                                input
-                                    .placeholder(edit_text)
-                                    .font(&DEFAULT_FONT)
-                                    .font_size(16)
-                                    .text_color(0x1F2630)
-                                    .placeholder_color(0x596579)
-                                    .cursor_color(0x2F6FB8)
-                                    .selection_color(0xF5D990)
-                                    .on_changed({
-                                        let title = title.to_owned();
-                                        move |text| {
-                                            record_ui_source_observation(json!({
-                                                "source": "todo.sources.editing_todo_title_element.change",
-                                                "target_text": title,
-                                                "text": text
-                                            }));
-                                        }
-                                    })
-                                    .on_submit({
-                                        let title = title.to_owned();
-                                        move |text| {
-                                            record_ui_source_observation(json!({
-                                                "source": "todo.sources.editing_todo_title_element.key_down",
-                                                "target_text": title,
-                                                "key": "Enter",
-                                                "text": text
-                                            }));
-                                        }
-                                    })
-                            })
-                            .empty();
-                    } else {
-                        ui.element()
-                            .id(("todo_row_title", index as u32))
-                            .width(grow!())
-                            .height(fixed!(24.0))
-                            .layout(|layout| layout.align(Left, CenterY))
-                            .on_press({
-                                let title = title.to_owned();
-                                move |_, _| {
-                                    record_ui_source_observation(json!({
-                                        "source": "todo.sources.todo_title_element.double_click",
-                                        "target_text": title
-                                    }));
-                                }
-                            })
-                            .children(|ui| {
-                                ui.text(title, |text| text.font_size(16).color(0x1F2630));
-                            });
-                    }
-                    ui.element()
-                        .id(("todo_row_delete", index as u32))
-                        .width(fixed!(28.0))
-                        .height(fixed!(24.0))
-                        .background_color(0xF5E8E8)
-                        .layout(|layout| layout.align(CenterX, CenterY))
-                        .on_press({
-                            let title = title.to_owned();
-                            move |_, _| {
-                                record_ui_source_observation(json!({
-                                    "source": "todo.sources.remove_todo_button.press",
-                                    "target_text": title
-                                }));
-                            }
-                        })
-                        .children(|ui| {
-                            ui.text("x", |text| text.font_size(14).color(0xA32929));
-                        });
-                });
-        }
-    }
-}
-
-fn cells_content(ui: &mut Ui<'_, ()>, state: &serde_json::Value) {
-    if let Some(cells) = state["cells"].as_array() {
-        for cell in cells {
-            let address = cell["address"].as_str().unwrap_or("");
-            let value = cell["value"].as_str().unwrap_or("");
-            let formula = cell["formula"].as_str().unwrap_or("");
-            let error = cell["error"].as_str().unwrap_or("");
-            let cell_id = match address {
-                "A1" => Some("cell_editor_A1"),
-                "B1" => Some("cell_editor_B1"),
-                "C1" => Some("cell_editor_C1"),
-                "D1" => Some("cell_editor_D1"),
-                _ => None,
-            };
-            ui.element()
-                .height(fixed!(40.0))
-                .width(grow!())
-                .background_color(0xFFFFFF)
-                .border(|border| border.color(0xD5DDE8).all(1))
-                .layout(|layout| {
-                    layout
-                        .direction(LeftToRight)
-                        .padding((8, 8, 5, 5))
-                        .gap(8)
-                        .align(Left, CenterY)
-                })
-                .children(|ui| {
-                    ui.text(address, |text| text.font_size(15).color(0x2F6FB8));
-                    ui.element()
-                        .id(cell_id.unwrap_or("cell_editor_other"))
-                        .width(fixed!(140.0))
-                        .height(fixed!(28.0))
-                        .background_color(0xFFFFFF)
-                        .border(|border| border.color(0xD5DDE8).all(1))
-                        .layout(|layout| layout.padding((7, 7, 4, 4)))
-                        .text_input(|input| {
-                            let source_address = address.to_owned();
-                            let commit_address = address.to_owned();
-                            input
-                                .placeholder(formula)
-                                .font(&DEFAULT_FONT)
-                                .font_size(14)
-                                .text_color(0x1F2630)
-                                .placeholder_color(0x8B97A7)
-                                .cursor_color(0x2F6FB8)
-                                .selection_color(0xB9D7F5)
-                                .on_changed(move |text| {
-                                    record_ui_source_observation(json!({
-                                        "source": "cell.sources.editor.change",
-                                        "address": source_address.clone(),
-                                        "text": text
-                                    }));
-                                })
-                                .on_submit(move |text| {
-                                    record_ui_source_observation(json!({
-                                        "source": "cell.sources.editor.commit",
-                                        "address": commit_address.clone(),
-                                        "key": "Enter",
-                                        "text": text
-                                    }));
-                                })
-                        })
-                        .empty();
-                    ui.text(&format!("= {value} {error}"), |text| {
-                        text.font_size(15).color(0x1F2630)
-                    });
-                });
-        }
-    }
-}
-
-fn app_button(
-    ui: &mut Ui<'_, ()>,
-    id: &'static str,
-    label: &str,
-    selected: bool,
-    source: Option<&'static str>,
-) {
-    let mut element = ui
-        .element()
-        .id(id)
-        .height(fixed!(28.0))
-        .width(fixed!(118.0))
-        .background_color(if selected { 0x2F6FB8 } else { 0xE4EAF2 })
-        .layout(|layout| layout.align(CenterX, CenterY));
-    if let Some(source) = source {
-        element = element.on_press(move |_, _| {
-            record_ui_source_observation(json!({
-                "source": source
-            }));
-        });
-    }
-    element.children(|ui| {
-        ui.text(label, |text| {
-            text.font_size(13)
-                .color(if selected { 0xFFFFFF } else { 0x1F2630 })
-        });
-    });
-}
-
 fn value_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
         .find(|window| window[0] == flag)
@@ -3347,6 +4327,24 @@ fn display_socket() -> String {
     std::env::var("WAYLAND_DISPLAY")
         .or_else(|_| std::env::var("DISPLAY"))
         .unwrap_or_else(|_| "none".to_owned())
+}
+
+fn native_display_contract() -> serde_json::Value {
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    let display = std::env::var("DISPLAY").ok();
+    json!({
+        "required": true,
+        "status": if session_type.as_deref() == Some("wayland") && wayland_display.is_some() {
+            "pass"
+        } else {
+            "fail"
+        },
+        "xdg_session_type": session_type,
+        "wayland_display": wayland_display,
+        "display": display,
+        "contract": "native playground runs in a Wayland desktop session with WAYLAND_DISPLAY set; stricter socket-level proof is a follow-up gate"
+    })
 }
 
 fn command_path(command: &str) -> Option<String> {

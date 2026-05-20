@@ -1,5 +1,6 @@
 use boon_parser::{ParsedExpression, ParsedProgram, ProgramKind};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypedProgram {
@@ -34,6 +35,7 @@ pub enum IrNodeKind {
     SourceRead,
     PureCall,
     When,
+    While,
     Then,
     Latest,
     Hold,
@@ -230,6 +232,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
             source_line: cell.line,
         })
         .collect::<Vec<_>>();
+    verify_combinational_field_cycles(&fields, &state_cells)?;
     let lists = program
         .list_memories
         .iter()
@@ -248,7 +251,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     {
         return Err("List/map node must be indexed".to_owned());
     }
-    Ok(TypedProgram {
+    let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
         graph_node_count: nodes.len(),
@@ -264,7 +267,10 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
         lists,
         hidden_identity_verified: true,
         static_schedule_verified: true,
-    })
+    };
+    verify_static_schedule(&typed)?;
+    verify_hidden_identity(&typed)?;
+    Ok(typed)
 }
 
 pub fn verify_hidden_identity(program: &TypedProgram) -> Result<(), String> {
@@ -274,14 +280,530 @@ pub fn verify_hidden_identity(program: &TypedProgram) -> Result<(), String> {
     if program.lists.iter().any(|list| !list.has_generation) {
         return Err("all list memories must carry generation guards".to_owned());
     }
-    if program
-        .nodes
+    verify_identity_clean_identifiers(program)?;
+    Ok(())
+}
+
+pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
+    if !program.static_schedule_verified {
+        return Err("static schedule verification did not run".to_owned());
+    }
+    if program.graph_node_count != program.nodes.len() {
+        return Err(format!(
+            "graph_node_count {} does not match {} scheduled nodes",
+            program.graph_node_count,
+            program.nodes.len()
+        ));
+    }
+    for (index, node) in program.nodes.iter().enumerate() {
+        if node.id != index {
+            return Err(format!(
+                "scheduled node `{}` has id {}, expected {index}",
+                node.name, node.id
+            ));
+        }
+        if node
+            .expr_id
+            .is_some_and(|expr_id| expr_id >= program.expression_count)
+        {
+            return Err(format!(
+                "scheduled node `{}` references missing ExprId {:?}",
+                node.name, node.expr_id
+            ));
+        }
+        if matches!(
+            node.kind,
+            IrNodeKind::ListAppend
+                | IrNodeKind::ListRemove
+                | IrNodeKind::ListMap
+                | IrNodeKind::ListRetain
+                | IrNodeKind::Aggregate
+                | IrNodeKind::RenderLowering
+        ) && !node.indexed
+        {
+            return Err(format!(
+                "scheduled collection node `{}` is not indexed/keyed",
+                node.name
+            ));
+        }
+    }
+
+    let source_paths = unique_strings(
+        "source port",
+        program.sources.iter().map(|source| source.path.as_str()),
+    )?;
+    let state_paths = unique_strings(
+        "state cell",
+        program.state_cells.iter().map(|cell| cell.path.as_str()),
+    )?;
+    let list_names = unique_strings("list", program.lists.iter().map(|list| list.name.as_str()))?;
+    let derived_paths = unique_strings(
+        "derived value",
+        program
+            .derived_values
+            .iter()
+            .map(|value| value.path.as_str()),
+    )?;
+    let known_symbols = source_paths
         .iter()
-        .any(|node| node.name.contains("runtime_key") || node.name.contains("source_id"))
-    {
-        return Err("IR exposes a hidden runtime identity node".to_owned());
+        .chain(state_paths.iter())
+        .chain(list_names.iter())
+        .chain(derived_paths.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    for edge in &program.dependencies {
+        require_known_symbol("dependency source", &edge.from, &known_symbols)?;
+        require_known_symbol("dependency target", &edge.to, &known_symbols)?;
+    }
+    for cause in &program.possible_causes {
+        require_known_symbol("cause target", &cause.target, &known_symbols)?;
+        for source in &cause.sources {
+            require_known_symbol("cause source", source, &known_symbols)?;
+        }
+    }
+    for branch in &program.update_branches {
+        if !state_paths.contains(branch.target.as_str()) {
+            return Err(format!(
+                "update branch target `{}` is not a scheduled state cell",
+                branch.target
+            ));
+        }
+        if !source_paths.contains(branch.source.as_str()) {
+            return Err(format!(
+                "update branch source `{}` is not a declared source port",
+                branch.source
+            ));
+        }
+        verify_scheduled_update_expression(&branch.expression, &known_symbols)?;
+    }
+    for operation in &program.list_operations {
+        if !list_names.contains(operation.list.as_str()) {
+            return Err(format!(
+                "list operation references unknown list `{}`",
+                operation.list
+            ));
+        }
+        verify_scheduled_list_operation(&operation.kind, &source_paths, &known_symbols)?;
+    }
+    for operation in &program.formula_operations {
+        require_known_symbol("formula target", &operation.target, &known_symbols)?;
+        verify_scheduled_formula_operation(&operation.kind, &known_symbols)?;
     }
     Ok(())
+}
+
+fn unique_strings<'a>(
+    label: &str,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeSet<&'a str>, String> {
+    let mut set = BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            return Err(format!("{label} has empty path"));
+        }
+        if !set.insert(value) {
+            return Err(format!("duplicate {label} `{value}`"));
+        }
+    }
+    Ok(set)
+}
+
+fn require_known_symbol(
+    context: &str,
+    value: &str,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    if symbol_known(value, known_symbols) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} `{value}` is not in the static schedule symbol table"
+        ))
+    }
+}
+
+fn symbol_known(value: &str, known_symbols: &BTreeSet<&str>) -> bool {
+    known_symbols.contains(value)
+        || known_symbols.iter().any(|known| {
+            known
+                .rsplit_once('.')
+                .is_some_and(|(_, local)| local == value)
+        })
+}
+
+fn verify_scheduled_update_expression(
+    value: &UpdateExpression,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    match value {
+        UpdateExpression::SourcePayload { .. } | UpdateExpression::Const { .. } => Ok(()),
+        UpdateExpression::PreviousValue { path } | UpdateExpression::BoolNot { path } => {
+            require_known_symbol("update expression path", path, known_symbols)
+        }
+        UpdateExpression::TextTrimOrPrevious { path, previous } => {
+            if path != "text" && path != "key" {
+                require_known_symbol("trim source", path, known_symbols)?;
+            }
+            require_known_symbol("trim previous", previous, known_symbols)
+        }
+        UpdateExpression::Unknown { summary } => Err(format!(
+            "static schedule contains unsupported update expression `{summary}`"
+        )),
+    }
+}
+
+fn verify_scheduled_list_operation(
+    value: &ListOperationKind,
+    source_paths: &BTreeSet<&str>,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    match value {
+        ListOperationKind::Append { trigger, fields } => {
+            require_known_symbol("append trigger", trigger, known_symbols)?;
+            for field in fields {
+                require_known_symbol("append field source", &field.source, known_symbols)?;
+            }
+            Ok(())
+        }
+        ListOperationKind::Remove { source, predicate } => {
+            if !source_paths.contains(source.as_str()) {
+                return Err(format!(
+                    "remove source `{source}` is not a declared source port"
+                ));
+            }
+            verify_scheduled_list_predicate(predicate, known_symbols)
+        }
+        ListOperationKind::Retain { target, predicate }
+        | ListOperationKind::Count { target, predicate } => {
+            require_known_symbol("list operation target", target, known_symbols)?;
+            verify_scheduled_list_predicate(predicate, known_symbols)
+        }
+    }
+}
+
+fn verify_scheduled_list_predicate(
+    value: &ListPredicate,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    match value {
+        ListPredicate::AlwaysTrue => Ok(()),
+        ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
+            require_known_symbol("list predicate field", path, known_symbols)
+        }
+        ListPredicate::SelectedFilterVisibility {
+            selector,
+            row_field,
+        } => {
+            require_known_symbol("list predicate selector", selector, known_symbols)?;
+            require_known_symbol("list predicate row field", row_field, known_symbols)
+        }
+        ListPredicate::Unknown { summary } => Err(format!(
+            "static schedule contains unsupported list predicate `{summary}`"
+        )),
+    }
+}
+
+fn verify_scheduled_formula_operation(
+    value: &FormulaOperationKind,
+    known_symbols: &BTreeSet<&str>,
+) -> Result<(), String> {
+    match value {
+        FormulaOperationKind::Parse { input } | FormulaOperationKind::Dependencies { input } => {
+            require_known_symbol("formula input", input, known_symbols)
+        }
+        FormulaOperationKind::Eval { formula, read } => {
+            require_known_symbol("formula eval input", formula, known_symbols)?;
+            if read == "cell_value_reader" {
+                Ok(())
+            } else {
+                require_known_symbol("formula reader", read, known_symbols)
+            }
+        }
+        FormulaOperationKind::Error { formula, value } => {
+            require_known_symbol("formula error input", formula, known_symbols)?;
+            require_known_symbol("formula error value", value, known_symbols)
+        }
+    }
+}
+
+fn verify_combinational_field_cycles(
+    fields: &[FieldDef],
+    state_cells: &[StateCell],
+) -> Result<(), String> {
+    let state_paths = state_cells
+        .iter()
+        .map(|cell| cell.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for field in fields
+        .iter()
+        .filter(|field| !state_paths.contains(field.path.as_str()))
+    {
+        let mut visiting = Vec::new();
+        verify_combinational_field_cycles_from(field, fields, &state_paths, &mut visiting)?;
+    }
+    Ok(())
+}
+
+fn verify_combinational_field_cycles_from<'a>(
+    field: &'a FieldDef,
+    fields: &'a [FieldDef],
+    state_paths: &BTreeSet<&str>,
+    visiting: &mut Vec<&'a str>,
+) -> Result<(), String> {
+    if let Some(position) = visiting.iter().position(|path| *path == field.path) {
+        let mut cycle = visiting[position..].to_vec();
+        cycle.push(field.path.as_str());
+        return Err(format!(
+            "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD: {}",
+            cycle.join(" -> ")
+        ));
+    }
+    if state_paths.contains(field.path.as_str()) {
+        return Ok(());
+    }
+    visiting.push(field.path.as_str());
+    let body = field_dependency_body(&field.body);
+    for dependency in fields.iter().filter(|candidate| {
+        candidate.parent_path == field.parent_path
+            && text_mentions_unqualified_identifier(&body, &candidate.local_name)
+    }) {
+        if state_paths.contains(dependency.path.as_str()) {
+            continue;
+        }
+        verify_combinational_field_cycles_from(dependency, fields, state_paths, visiting)?;
+    }
+    visiting.pop();
+    Ok(())
+}
+
+fn field_dependency_body(body: &str) -> String {
+    let mut lines = body.lines();
+    let first = lines
+        .next()
+        .and_then(|line| line.split_once(':').map(|(_, rest)| rest))
+        .unwrap_or_default();
+    std::iter::once(first)
+        .chain(lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn text_mentions_unqualified_identifier(text: &str, identifier: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = identifier.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(index, window)| {
+            window == needle
+                && index.checked_sub(1).is_none_or(|before| {
+                    !is_identifier_byte(bytes[before])
+                        && bytes[before] != b'.'
+                        && bytes[before] != b'/'
+                })
+                && bytes
+                    .get(index + needle.len())
+                    .is_none_or(|after| !is_identifier_byte(*after))
+        })
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), String> {
+    for node in &program.nodes {
+        reject_hidden_identity_identifier("node", &node.name)?;
+    }
+    for source in &program.sources {
+        reject_hidden_identity_identifier("source port", &source.path)?;
+    }
+    for cell in &program.state_cells {
+        reject_hidden_identity_identifier("state cell", &cell.path)?;
+        reject_hidden_identity_identifier("hold name", &cell.hold_name)?;
+        reject_initial_value_identity(&cell.initial_value)?;
+    }
+    for list in &program.lists {
+        reject_hidden_identity_identifier("list", &list.name)?;
+        reject_list_initializer_identity(&list.initializer)?;
+    }
+    for value in &program.derived_values {
+        reject_hidden_identity_identifier("derived value", &value.path)?;
+        for source in &value.sources {
+            reject_hidden_identity_identifier("derived value source", source)?;
+        }
+    }
+    for edge in &program.dependencies {
+        reject_hidden_identity_identifier("dependency source", &edge.from)?;
+        reject_hidden_identity_identifier("dependency target", &edge.to)?;
+    }
+    for cause in &program.possible_causes {
+        reject_hidden_identity_identifier("cause target", &cause.target)?;
+        for source in &cause.sources {
+            reject_hidden_identity_identifier("cause source", source)?;
+        }
+    }
+    for branch in &program.update_branches {
+        reject_hidden_identity_identifier("update target", &branch.target)?;
+        reject_hidden_identity_identifier("update source", &branch.source)?;
+        reject_update_expression_identity(&branch.expression)?;
+    }
+    for operation in &program.list_operations {
+        reject_hidden_identity_identifier("list operation", &operation.list)?;
+        reject_list_operation_identity(&operation.kind)?;
+    }
+    for operation in &program.formula_operations {
+        reject_hidden_identity_identifier("formula target", &operation.target)?;
+        reject_formula_operation_identity(&operation.kind)?;
+    }
+    Ok(())
+}
+
+fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
+    match value {
+        InitialValue::SeedField { path } => reject_hidden_identity_identifier("seed field", path),
+        InitialValue::Enum { value } => reject_hidden_identity_identifier("enum value", value),
+        InitialValue::Unknown { summary } => {
+            reject_hidden_identity_identifier("unknown initializer", summary)
+        }
+        InitialValue::Text { .. } | InitialValue::Bool { .. } => Ok(()),
+    }
+}
+
+fn reject_list_initializer_identity(value: &ListInitializer) -> Result<(), String> {
+    match value {
+        ListInitializer::RecordLiteral { rows } => {
+            for row in rows {
+                for field in &row.fields {
+                    reject_hidden_identity_identifier("list seed field", &field.name)?;
+                    reject_initial_value_identity(&field.value)?;
+                }
+            }
+            Ok(())
+        }
+        ListInitializer::Unknown { summary } => {
+            reject_hidden_identity_identifier("unknown list initializer", summary)
+        }
+        ListInitializer::Grid { .. } | ListInitializer::Empty => Ok(()),
+    }
+}
+
+fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), String> {
+    match value {
+        UpdateExpression::SourcePayload { path } => {
+            reject_hidden_identity_identifier("source payload", path)
+        }
+        UpdateExpression::PreviousValue { path } | UpdateExpression::BoolNot { path } => {
+            reject_hidden_identity_identifier("update expression path", path)
+        }
+        UpdateExpression::TextTrimOrPrevious { path, previous } => {
+            reject_hidden_identity_identifier("trim source", path)?;
+            reject_hidden_identity_identifier("trim previous", previous)
+        }
+        UpdateExpression::Unknown { summary } => {
+            reject_hidden_identity_identifier("unknown update expression", summary)
+        }
+        UpdateExpression::Const { value } => {
+            reject_hidden_identity_identifier("const value", value)
+        }
+    }
+}
+
+fn reject_list_operation_identity(value: &ListOperationKind) -> Result<(), String> {
+    match value {
+        ListOperationKind::Append { trigger, fields } => {
+            reject_hidden_identity_identifier("append trigger", trigger)?;
+            for field in fields {
+                reject_hidden_identity_identifier("append field", &field.name)?;
+                reject_hidden_identity_identifier("append field source", &field.source)?;
+            }
+            Ok(())
+        }
+        ListOperationKind::Remove { source, predicate } => {
+            reject_hidden_identity_identifier("remove source", source)?;
+            reject_list_predicate_identity(predicate)
+        }
+        ListOperationKind::Retain { target, predicate }
+        | ListOperationKind::Count { target, predicate } => {
+            reject_hidden_identity_identifier("list operation target", target)?;
+            reject_list_predicate_identity(predicate)
+        }
+    }
+}
+
+fn reject_list_predicate_identity(value: &ListPredicate) -> Result<(), String> {
+    match value {
+        ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
+            reject_hidden_identity_identifier("list predicate field", path)
+        }
+        ListPredicate::SelectedFilterVisibility {
+            selector,
+            row_field,
+        } => {
+            reject_hidden_identity_identifier("list predicate selector", selector)?;
+            reject_hidden_identity_identifier("list predicate row field", row_field)
+        }
+        ListPredicate::Unknown { summary } => {
+            reject_hidden_identity_identifier("unknown list predicate", summary)
+        }
+        ListPredicate::AlwaysTrue => Ok(()),
+    }
+}
+
+fn reject_formula_operation_identity(value: &FormulaOperationKind) -> Result<(), String> {
+    match value {
+        FormulaOperationKind::Parse { input } | FormulaOperationKind::Dependencies { input } => {
+            reject_hidden_identity_identifier("formula input", input)
+        }
+        FormulaOperationKind::Eval { formula, read } => {
+            reject_hidden_identity_identifier("formula eval input", formula)?;
+            reject_hidden_identity_identifier("formula reader", read)
+        }
+        FormulaOperationKind::Error { formula, value } => {
+            reject_hidden_identity_identifier("formula error input", formula)?;
+            reject_hidden_identity_identifier("formula error value", value)
+        }
+    }
+}
+
+fn reject_hidden_identity_identifier(context: &str, value: &str) -> Result<(), String> {
+    if let Some(token) = hidden_identity_token(value) {
+        Err(format!(
+            "IR exposes hidden runtime identity token `{token}` in {context} `{value}`"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn hidden_identity_token(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    let tokens = lower
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty());
+    const FORBIDDEN: &[&str] = &[
+        "runtime_key",
+        "item_key",
+        "hidden_key",
+        "hidden_keys",
+        "generation",
+        "hidden_generation",
+        "target_generation",
+        "source_id",
+        "bind_epoch",
+        "listkey",
+        "slot",
+    ];
+    tokens.into_iter().find_map(|token| {
+        FORBIDDEN
+            .iter()
+            .copied()
+            .find(|forbidden| token == *forbidden)
+    })
 }
 
 pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
@@ -351,6 +873,8 @@ fn expression_node_kind(text: &str) -> Option<IrNodeKind> {
         Some(IrNodeKind::Aggregate)
     } else if text.contains("LATEST") {
         Some(IrNodeKind::Latest)
+    } else if text.contains("WHILE") {
+        Some(IrNodeKind::While)
     } else if text.contains("THEN") {
         Some(IrNodeKind::Then)
     } else if text.contains("WHEN") {
@@ -1566,6 +2090,132 @@ mod tests {
                 .all(|node| node.expr_id.unwrap() < parsed.expressions.len())
         );
         verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
+    fn hidden_identity_verifier_scans_boon_facing_ir_identifiers() {
+        let parsed = boon_parser::parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            ir.lists
+                .iter()
+                .any(|list| list.hidden_key_type.ends_with("Key")),
+            "internal list key types should remain IR metadata"
+        );
+        verify_hidden_identity(&ir).unwrap();
+
+        let mut with_bad_source = ir.clone();
+        with_bad_source.sources[0].path = "todo.sources.source_id.press".to_owned();
+        assert!(
+            verify_hidden_identity(&with_bad_source)
+                .unwrap_err()
+                .contains("source_id")
+        );
+
+        let mut with_bad_state = ir.clone();
+        with_bad_state.state_cells[0].path = "todo.generation".to_owned();
+        assert!(
+            verify_hidden_identity(&with_bad_state)
+                .unwrap_err()
+                .contains("generation")
+        );
+
+        let mut with_bad_branch = ir.clone();
+        with_bad_branch.update_branches[0].expression = UpdateExpression::PreviousValue {
+            path: "bind_epoch".to_owned(),
+        };
+        assert!(
+            verify_hidden_identity(&with_bad_branch)
+                .unwrap_err()
+                .contains("bind_epoch")
+        );
+
+        let mut with_bad_list_operation = ir.clone();
+        with_bad_list_operation.list_operations[0].kind = ListOperationKind::Retain {
+            target: "store.visible_todos".to_owned(),
+            predicate: ListPredicate::RowFieldBool {
+                path: "todo.hidden_key".to_owned(),
+            },
+        };
+        assert!(
+            verify_hidden_identity(&with_bad_list_operation)
+                .unwrap_err()
+                .contains("hidden_key")
+        );
+    }
+
+    #[test]
+    fn static_schedule_verifier_checks_order_and_symbol_tables() {
+        let parsed = boon_parser::parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        verify_static_schedule(&ir).unwrap();
+
+        let mut bad_node_order = ir.clone();
+        bad_node_order.nodes[0].id = 99;
+        assert!(
+            verify_static_schedule(&bad_node_order)
+                .unwrap_err()
+                .contains("expected 0")
+        );
+
+        let mut bad_expr_id = ir.clone();
+        bad_expr_id.nodes[0].expr_id = Some(ir.expression_count);
+        assert!(
+            verify_static_schedule(&bad_expr_id)
+                .unwrap_err()
+                .contains("missing ExprId")
+        );
+
+        let mut bad_branch_source = ir.clone();
+        bad_branch_source.update_branches[0].source = "store.sources.missing.press".to_owned();
+        assert!(
+            verify_static_schedule(&bad_branch_source)
+                .unwrap_err()
+                .contains("not a declared source port")
+        );
+
+        let mut bad_list_target = ir.clone();
+        bad_list_target.list_operations[0].list = "missing_list".to_owned();
+        assert!(
+            verify_static_schedule(&bad_list_target)
+                .unwrap_err()
+                .contains("unknown list")
+        );
+    }
+
+    #[test]
+    fn while_is_scheduled_as_combinational_selection() {
+        let source = include_str!("../../../examples/todomvc.bn").replace(
+            "\n    selected_filter:",
+            "\n    visible_when_selected:\n        selected_filter |> WHILE { True }\n\n    selected_filter:",
+        );
+        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            ir.nodes
+                .iter()
+                .any(|node| matches!(node.kind, IrNodeKind::While))
+        );
+    }
+
+    #[test]
+    fn combinational_cycles_must_be_broken_by_hold() {
+        let source = include_str!("../../../examples/todomvc.bn").replace(
+            "\n    selected_filter:",
+            "\n    cycle_left:\n        cycle_right |> WHILE { cycle_right }\n\n    cycle_right:\n        cycle_left |> WHILE { cycle_left }\n\n    selected_filter:",
+        );
+        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
+        let error = lower(&parsed).unwrap_err();
+        assert!(error.contains("combinational dependency cycle"));
+        assert!(error.contains("broken by HOLD"));
     }
 
     #[test]

@@ -128,13 +128,21 @@ Manual testing is a first-class acceptance gate, not a courtesy pass. A real
 tester should interact with the live playground using the same scenario labels
 as the replay, while watching both the UI and the state/delta inspector.
 
-Command shape:
+Template and preparation shape:
 
 ```bash
-cargo xtask verify-todomvc-human \
-  examples/todomvc.bn \
-  examples/todomvc.scn \
-  --report target/reports/todomvc-human-<timestamp>.json
+cargo xtask verify-todomvc-human --write-template --report target/reports/manual-templates/todomvc-human.json
+cargo xtask prepare-todomvc-human-report \
+  --observer <real-name> \
+  --started <unix-start> \
+  --finished <unix-finish> \
+  --window-pid <visible-playground-pid> \
+  --focused-window-proof <how-focus-was-confirmed> \
+  --notes <visual-notes> \
+  --capture-method <tool-used> \
+  --artifact <manual-png-or-video> \
+  --pass-label <each-todomvc-scenario-label> \
+  --report target/reports/todomvc-human.json
 ```
 
 The playground must expose:
@@ -154,25 +162,24 @@ display scale/window backend
 Manual pass evidence is written to:
 
 ```text
-target/reports/todomvc-human-<timestamp>.json
-target/reports/todomvc-human-<timestamp>-checkpoint-*.png
+target/reports/todomvc-human.json
+target/reports/manual-artifacts/todomvc-human-checkpoint-*.png
 ```
 
 The manual report records each checked scenario label, display/backend details,
 the final state hash, screenshots, notes about visual quality, and whether the
 tester deviated from the scripted scenario. It must include `manual_observer`,
 `generated_at_utc`, source/scenario hash matches, screenshot or video artifact
-hashes, and per-label pass/fail.
+hashes, the screenshot/video capture method, and per-label pass/fail. Manual
+checkpoint files must be created during the recorded session, not copied from an
+old run. The prepared report must also record the visible manual playground
+process id through `--window-pid` and a concrete `--focused-window-proof`;
+reusing the headed verifier process id is not valid manual evidence.
 
 Checker form:
 
 ```bash
-cargo xtask verify-todomvc-human \
-  examples/todomvc.bn \
-  examples/todomvc.scn \
-  --check \
-  --max-age 24h \
-  --report target/reports/todomvc-human-<timestamp>.json
+cargo xtask verify-todomvc-human --check --max-age 24h --report target/reports/todomvc-human.json
 ```
 
 ### Layer 3: Semantic Trace Runner
@@ -268,7 +275,12 @@ cargo xtask verify-todomvc-speed \
   examples/todomvc.scn \
   --budget examples/todomvc.budget.toml \
   --report target/reports/todomvc-speed.json
+cargo bench -p boon_runtime --bench todomvc
 ```
+
+The `cargo bench` path writes `target/reports/todomvc-bench.json` and a linked
+`target/reports/todomvc-bench-speed.json`. Both must be schema-valid; the
+readiness audit treats missing benchmark evidence as a blocker.
 
 Default TodoMVC budgets:
 
@@ -632,6 +644,12 @@ Negative verification must prove the harness fails on bad source hashes, bad
 scenario hashes, stale manual reports, missing screenshots/video, direct source
 event injection in headed replay, hidden runtime id exposure, and app-visible
 identity-based row routing.
+It must also keep fixtures for fake full-OS-input reports, headed-only or
+invalid manual artifacts, broken headed/manual report bindings, future manual
+timestamps, failed or debug speed reports, missing speed stress/resource fields,
+hand-written human reports without helper provenance, and manual report helpers
+that omit or invent scenario pass labels. Readiness auditing treats those
+fixture ids as required contract evidence.
 
 ## Manual Checklist
 

@@ -74,11 +74,22 @@ expect_semantic_delta_contains = ["FieldSet:store.selected_filter"]
 expect_render_delta_contains = ["SetSelectedFilter"]
 
 [[step]]
+id = "toggle-dynamic-test-todo-under-active-filter"
+user_action = { kind = "click", target_text = "Test todo checkbox" }
+expected_source_event = { source = "todo.sources.todo_checkbox.click", target_text = "Test todo" }
+expect_completed_titles = ["Buy groceries", "Test todo"]
+expect_visible_titles = ["Clean room"]
+expect_active_count = 1
+expect_completed_count = 2
+expect_semantic_delta_contains = ["FieldSet:completed"]
+expect_render_delta_contains = ["SetProperty"]
+
+[[step]]
 id = "filter-completed"
 user_action = { kind = "click", target = "Completed filter" }
 expected_source_event = { source = "store.sources.filter_completed.press" }
 expect_filter = "Completed"
-expect_visible_titles = ["Buy groceries"]
+expect_visible_titles = ["Buy groceries", "Test todo"]
 expect_semantic_delta_contains = ["FieldSet:store.selected_filter"]
 expect_render_delta_contains = ["SetSelectedFilter"]
 
@@ -175,8 +186,8 @@ expect_render_delta_contains = ["SetText", "HideEditInput"]
 id = "clear-completed"
 user_action = { kind = "click", target = "Clear completed" }
 expected_source_event = { source = "store.sources.clear_completed_button.press" }
-expect_titles = ["Clean room", "Blur saved title"]
-expect_active_count = 2
+expect_titles = ["Clean room"]
+expect_active_count = 1
 expect_completed_count = 0
 expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
 expect_render_delta_contains = ["RemoveElement", "UnbindSource"]
@@ -184,14 +195,60 @@ expect_render_delta_contains = ["RemoveElement", "UnbindSource"]
 [[step]]
 id = "hover-delete-clean-room"
 user_action = { kind = "pointer_hover", target_text = "Clean room delete" }
-expect_titles = ["Clean room", "Blur saved title"]
+expect_titles = ["Clean room"]
 expect_render_delta_contains = ["ShowDeleteButton"]
 
 [[step]]
 id = "delete-clean-room"
 user_action = { kind = "click", target_text = "Clean room delete" }
 expected_source_event = { source = "todo.sources.remove_todo_button.press", target_text = "Clean room" }
-expect_titles = ["Blur saved title"]
+expect_titles = []
+expect_active_count = 0
+expect_completed_count = 0
+expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
+expect_render_delta_contains = ["RemoveElement", "UnbindSource"]
+
+[[step]]
+id = "empty-state"
+expect_titles = []
+expect_active_count = 0
+expect_completed_count = 0
+
+[[step]]
+id = "add-after-clear-type"
+user_action = { kind = "type_text", target = "new todo input", text = "Fresh todo" }
+expected_source_event = { source = "store.sources.new_todo_input.change", text = "Fresh todo" }
+expect_new_text = "Fresh todo"
+expect_semantic_delta_contains = ["FieldSet:store.new_todo_text"]
+expect_render_delta_contains = ["SetInputValue"]
+
+[[step]]
+id = "add-after-clear-submit"
+user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
+expected_source_event = { source = "store.sources.new_todo_input.key_down", key = "Enter", text = "Fresh todo" }
+expect_titles = ["Fresh todo"]
 expect_active_count = 1
+expect_completed_count = 0
+expect_new_text = ""
+expect_semantic_delta_contains = ["ListInsert", "SourceBind", "FieldSet:store.new_todo_text"]
+expect_render_delta_contains = ["InsertElement", "BindSource", "SetInputValue"]
+
+[[step]]
+id = "toggle-all-single-after-clear"
+user_action = { kind = "click", target = "Toggle all" }
+expected_source_event = { source = "store.sources.toggle_all_checkbox.click" }
+expect_completed_titles = ["Fresh todo"]
+expect_active_count = 0
+expect_completed_count = 1
+expect_semantic_delta_contains = ["FieldSet:completed"]
+expect_render_delta_contains = ["SetProperty"]
+
+[[step]]
+id = "clear-all-rows"
+user_action = { kind = "click", target = "Clear completed" }
+expected_source_event = { source = "store.sources.clear_completed_button.press" }
+expect_titles = []
+expect_active_count = 0
+expect_completed_count = 0
 expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
 expect_render_delta_contains = ["RemoveElement", "UnbindSource"]

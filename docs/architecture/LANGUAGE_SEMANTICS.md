@@ -141,7 +141,9 @@ value.
 It is appropriate for combinational conditions that should remain true while
 their dependencies remain true.
 
-Cycles through `WHILE` must be rejected unless there is a `HOLD` in the cycle.
+Cycles through `WHILE` or pure expressions must be rejected unless there is a
+`HOLD` in the cycle. The first Rust interpreter enforces this during IR
+lowering, before runtime execution.
 
 ## LIST
 

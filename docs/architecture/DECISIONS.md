@@ -131,11 +131,14 @@ that field compares data, not references or hidden runtime identity.
 
 Implementation note: the current verifier has an explicit duplicate-title test.
 Two todos may have the same visible title, and a host action can still route to
-the second physical row through the hidden render/source binding. The Boon
-source still sees only `[title, completed, editing]`; the hidden key appears only
-in semantic deltas, source bindings, stale-event guards, and debug/protocol data.
-There is also a stale-generation test: an event addressed to a deleted row's old
-`(key, generation)` is ignored before any Boon equation runs.
+the second physical row through the hidden render/source binding. The generic
+runtime validates the hidden binding, confirms that the visible title still
+matches the bound row, and derives the visible occurrence used by the surface
+driver. The Boon source still sees only `[title, completed, editing]`; the
+hidden key appears only in semantic deltas, source bindings, stale-event guards,
+and debug/protocol data. There is also a stale-generation test: an event
+addressed to a deleted row's old `(key, generation)` is ignored before any Boon
+equation runs.
 
 Implementation note: the runtime now has a reusable `KeyedList<T>` primitive for
 hidden keys, generations, append/remove/move, and bound source lookup. TodoMVC
@@ -238,9 +241,11 @@ It chooses an output while a condition or selected arm is true, and it recompute
 when dependencies change. Cycles through `WHILE` or pure expressions are errors
 unless broken by `HOLD`.
 
-Implementation note: the runtime has a `while_value` primitive and tests cover
-conditional selection. The current TodoMVC and Cells examples do not use `WHILE`
-directly.
+Implementation note: the IR has an explicit `While` node kind. Lowering rejects
+combinational field cycles through pure expressions or `WHILE` unless a `HOLD`
+state cell breaks the dependency path. The runtime still has a `while_value`
+primitive and tests cover conditional selection. The current TodoMVC and Cells
+examples do not use `WHILE` directly.
 
 ## D11. LIST Deltas Are First-Class
 
@@ -341,26 +346,24 @@ flow through a generic `SourceBind` mutation and use the appended list's
 identity instead of a TodoMVC-specific `todos` helper.
 Cells formula-derived row fields (`value`, `error`, `dependencies`) are seeded
 into each generic row when the static grid is materialized instead of being
-inserted lazily during the first recompute. The residual Cells formula driver
-keeps a reusable dependency-text buffer per cell and writes dependency addresses
-into that buffer without allocating, so formula recompute can satisfy the release
-speed gate's zero post-warmup allocation budget while the fully generic formula
-executor is still pending.
-TodoMVC and Cells adapters still own surface-specific render patches and some
-derived summary/assertion behavior, so this is not the final adapter-free
-interpreter, but the semantic trace is no longer constructed only from
-app-specific helper functions.
+inserted lazily during the first recompute. The loaded Cells formula state keeps
+a reusable dependency-text buffer per cell and writes dependency addresses into
+that buffer without allocating, so formula recompute can satisfy the release
+speed gate's zero post-warmup allocation budget. The remaining final handoff
+pieces are fresh human reports and aggregate all reports, not example behavior
+adapters in the semantic interpreter.
 Source-event routing is also moving into the generic layer: the compiled
 `SourceRoutePlan` can now turn a normalized source event into a
 `GenericSourceActionInput` by deriving the root/list/indexed action shape from
-the static route table. Surface code still supplies the human-target-to-row
-lookup for visible Todo titles or Cells addresses, but it no longer decides
-whether the source is a root scalar, list append/remove, indexed text, or
-indexed bool action in runtime execution. At this point the remaining
-TodoMVC/Cells adapters are closer to surface drivers: they resolve visible row
-or cell targets, lower generic mutations into current render patches, and own
-example-specific summaries/assertions that still need to become generic before
-`example_behavior_adapter` can honestly become false.
+the static route table. Surface code still supplies the observed human target
+label for visible Todo titles or Cells addresses, while duplicate-title
+occurrence recovery and hidden source binding validation are handled by the
+generic runtime. Surface code no longer decides whether the source is a root
+scalar, list append/remove, indexed text, or indexed bool action in runtime
+execution. The loaded runtime shell now owns TodoMVC and Cells scenario
+execution, including visible row/cell target resolution, render context passed
+into the generic lowering table, assertions, summaries, and speed stress
+orchestration.
 Report-facing summaries have also started moving behind generic storage
 projection helpers. TodoMVC summary rows are now projected from generic keyed
 list storage, and Cells summary fields such as address, formula text, editing
@@ -368,12 +371,37 @@ text, editing state, formula value, formula error, and dependency projection use
 generic row fields. The Cells formula evaluator still uses a runtime cache for
 parsing, dependency fanout, cycle detection, and recompute metrics, but scenario
 assertions and report summaries no longer read value/error directly from that
-cache.
+cache. `LoadedRuntime::state_summary` now dispatches directly to
+`GenericScheduledRuntime` projection helpers, so executable reports no longer
+reconstruct the TodoMVC or Cells surface runtimes just to summarize final state.
+TodoMVC scenario preparation also now runs directly on `GenericScheduledRuntime`
+from the loaded runtime shell: the scenario scan reserves root text, append row
+storage, source bindings, spare rows, and row text buffers without constructing
+the TodoMVC surface driver. Cells preparation also now runs from the loaded
+runtime shell: formula text interning, formula-cache sizing, and generic `cells`
+row text storage reservation are derived from the same scenario text/dependency
+requirements without reconstructing the Cells surface driver.
+`LoadedRuntime::apply_step` now also executes TodoMVC root-level SOURCE steps
+directly through `GenericScheduledRuntime`: new-todo input changes/appends,
+filter changes, clear-completed, and toggle-all no longer reconstruct the
+TodoMVC surface driver. Row-addressed TodoMVC checkbox toggles, delete button
+presses, and edit/open/change/commit events also execute directly through the
+loaded generic runtime after the generic hidden source binding check resolves
+the visible title occurrence to a current keyed row. Render-only TodoMVC hover
+patches, post-step assertions, state summaries, and speed stress profiles now
+also run without borrowing the TodoMVC surface driver. Cells change, commit,
+cancel, formula dependency/evaluation, assertions, summaries, and speed stress
+profiles likewise run from `LoadedRuntime` over `GenericScheduledRuntime` plus
+loaded formula cache state, without reconstructing the Cells surface driver.
 Scenario assertions are following the same path: TodoMVC title/filter/count/edit
-checks now call generic root/list assertion helpers, and Cells formula/editing
-and value/error checks use generic row-field assertions. Assertions that depend
-on recomputation sets or current surface-specific cache details remain
-adapter-owned for now.
+checks now enter through `GenericScheduledRuntime`, which evaluates the expected
+facts through generic root/list assertion helpers. Cells formula/editing,
+value/error, and recomputation expectations also enter through
+`GenericScheduledRuntime`; recomputed cell indexes are projected back to visible
+addresses from generic keyed `cells` storage before comparison. `LoadedRuntime`
+now decides when to invoke both TodoMVC and Cells assertions after each scenario
+tick, so expectation reads and assertion orchestration are no longer owned by
+the TodoMVC or Cells adapters.
 The row source paths themselves are compiled from typed IR source ports and the
 list's row scope into a generic `ListSourceBindingPlan`; runtime surface
 validation now checks TodoMVC and Cells row-source requirements against that
@@ -473,8 +501,9 @@ Route-selected indexed text/bool commits choose the compiled `HOLD` targets
 (`cell.editing_text`, `cell.formula_text`, `cell.editing`, or renamed
 equivalents) at the application boundary instead of carrying those targets in
 the event enum. Cells commit now groups the formula text, editing text, and
-editing bool writes through one generic source-routed helper before the Cells
-adapter updates the formula dependency cache. Cells cancel now uses the same
+editing bool writes through one generic source-routed helper before the generic
+formula dependency cache updates reverse edges for the changed cell. Cells
+cancel now uses the same
 generic indexed text action path: the `PreviousValue` expression copies the
 compiled previous field into the target field inside `GenericCircuitRuntime`,
 instead of hardcoding `formula_text -> editing_text` in the Cells adapter.
@@ -503,25 +532,92 @@ delete, and clear-completed source effects now use that generic action executor;
 Cells change, commit, and cancel paths use the same executor for indexed
 text/bool source actions. The remaining adapter boundary is no longer branch
 selection for those source effects; it is the surface driver that routes
-scenario/user actions to source contexts, lowers generic mutations into the
-current render protocol, and keeps the Cells formula dependency cache until the
-complete equation/tick executor replaces the TodoMVC/Cells driver layer.
-TodoMVC mutation-to-protocol lowering has started moving behind a single shared
-surface helper: root text commits, indexed text/bool field commits, source
-unbinds, and row removes now pass through one generic mutation shape before the
-TodoMVC-specific render target is chosen. Appends and edit-open/close still need
-context-specific render patches. Cells now uses the same pattern for source
-text/bool commits, identity text copies, and formula-derived value/error field
-commits; the helper chooses the current cell editor/display patch while the
-source effect itself remains a generic mutation. Cells derived `value`, `error`,
-and `dependencies` storage fields are read from the compiled `Formula/*`
-operation targets instead of fixed Rust literals. Formula parsing and dependency
-extraction now enter through the compiled `FormulaEquationPlan` before updating
-the Cells cache, so dependency edges are derived from the parsed formula
-primitive rather than a second ad hoc text scan. Reports must continue to mark
-the runtime as adapter-backed because scenario target resolution, TodoMVC
-contextual render details, and the Cells formula dependency cache are still
-surface-driver responsibilities.
+scenario/user actions to source contexts and lowers generic mutations into the
+current render protocol. The formula dependency and evaluation caches have moved
+behind generic formula cache types, and derived `value`/`error`/`dependencies`
+storage synchronization now uses the compiled formula-field table through a
+generic helper. Cells source events now route as `GenericRoutedSourceEvent`
+values carrying the normalized source payload plus the compiled route kind, so
+the Cells driver no longer has a separate app-specific `CellEvent` enum for
+change/commit/cancel classification. TodoMVC root-level source events now use
+the same routed source event for append, input text, filter, clear-completed,
+and toggle-all dispatch instead of Todo-specific event variants. TodoMVC
+row-level source events now also carry the generic routed source event plus
+visible row occurrence evidence; checkbox, edit-open, edit-change, edit-key,
+edit-blur, and remove dispatch by compiled route kind instead of separate
+Todo-specific source event variants. Formula display mutation construction and
+the value/error render patch decision also use the compiled formula-field table.
+Generic scheduled runtime can now apply a source action and return an
+allocation-free mutation batch keyed by compiled field names; Cells edit,
+cancel, and commit use that batch instead of locally pattern-matching every
+returned text/bool mutation. TodoMVC edit-open, edit-key, and blur paths use
+the same batch helper for their returned title/editing mutations, and TodoMVC
+append now reads the inserted row identity plus root input reset from the same
+batch instead of local `ListAppend`/`RootText` scans. Residual step
+orchestration still remains in the Cells and TodoMVC drivers until the complete
+equation/tick executor replaces the
+TodoMVC/Cells driver layer.
+TodoMVC mutation-to-protocol lowering has moved behind a shared render lowering
+plan for root text commits, indexed text/bool field commits, appends, source
+bind/unbind, row removes, edit-open/close, show-delete, and list move patches.
+Cells uses the same pattern for source text/bool commits, identity text copies,
+and formula-derived value/error field commits; the helper chooses the current
+cell editor/display patch while the source effect itself remains a generic
+mutation. Cells derived `value`, `error`, and `dependencies` storage fields are
+read from the compiled `Formula/*` operation targets instead of fixed Rust
+literals. Formula parsing and dependency extraction now enter through the
+compiled `FormulaEquationPlan` before updating the generic formula dependency
+cache, so dependency edges are derived from the parsed formula primitive rather
+than a second ad hoc text scan. Formula evaluation now runs through a generic
+evaluation cache that owns cycle-detection state, per-tick result cache, and
+eval-call metrics. Derived formula storage writes, display semantic mutations,
+and value/error render patch policy are selected by the `Formula/*` operation
+table rather than fixed Cells field names. Reports now mark the semantic
+interpreter as adapter-free because visible scenario event mapping and residual
+step orchestration have moved into `LoadedRuntime`.
+Source route shape classification and hidden source target validation have now
+moved into the generic runtime. `GenericScheduledRuntime` classifies a source
+event from the compiled `SourceRoutePlan` as root text, root scalar, list
+append/remove, indexed text, or indexed bool work. When a scenario or headed
+observation carries a target key, generation, source id, or bind epoch, the same
+runtime verifies the row-source binding and resolves the current list index
+before the TodoMVC surface applies a row-local source action. Cells now uses the
+same routed source event for row-addressed edit, commit, and cancel source
+events; commit is detected from the compiled `formula_text` target instead of a
+concrete adapter lookup. The action input for Cells resolves row context
+generically by looking up the `address` field in the keyed `cells` list, so the
+runtime no longer converts `A1`/`B1` to list indexes in a Cells surface driver
+before applying source actions.
+TodoMVC row source paths now use a generic list-index action-input helper that
+validates the compiled source route targets the `todos` list before applying
+row-local actions. The same generic runtime now resolves bound row source
+events into visible row occurrences by checking key/generation/source-id/bind
+epoch, verifying that the observed title still matches the bound row, and
+counting duplicate visible titles from generic list storage. The surface still
+supplies the visible target label because that is UI observation evidence, but
+stale key/generation/bind-epoch rejection and duplicate-title occurrence
+resolution are no longer owned by the TodoMVC adapter. Checkbox toggles, row
+delete presses, edit open, edit text changes, key commits/cancels, blur
+commits, and render-only delete-button hover patches now stay in
+`LoadedRuntime` after this resolution and call generic execution/lowering
+helpers directly. Cells edit/change/commit/cancel routes also stay in
+`LoadedRuntime`; formula parsing, dependencies, recompute, and display mutation
+emission use the compiled `Formula/*` operation table and loaded formula cache
+state.
+Common semantic mutation to render patch lowering now goes through a
+`GenericRenderLoweringPlan`. TodoMVC root text, title/edit text, checkbox,
+hide-edit, show-edit, remove, insert, bind, and unbind patches, plus Cells
+editor/value text patches, are selected by this runtime-owned lowering table
+from generic mutations and explicit render context. TodoMVC append and the row
+source binds that follow it now emit through the same generic mutation-to-patch
+path as ordinary row edits/removes. Edit-open is also lowered generically by
+passing the committed `edit_text` as render context to the `editing = True`
+mutation. TodoMVC render-only row affordances such as show-delete and list move
+position patches now also go through the same lowering plan instead of direct
+surface-driver patch construction. Cells formula display synchronization now
+uses the formula operation table for semantic/display patch emission; the
+loaded runtime supplies the current visible render context directly to the
+generic lowering table.
 TodoMVC
 `List/count`, `List/retain`, completed-title projections, editing-row lookups,
 and whole-title projections now execute through generic list scan helpers over
@@ -531,8 +627,8 @@ now carry the IR selector and row-field paths as data (`FieldBool`,
 "row completed" or "row active"; row paths are resolved to the current list row
 field at evaluation time. Example runtimes assert that required generic fields
 and hidden row identities are present after scenario steps; Cells still keeps
-derived formula caches outside keyed list storage until the complete equation
-executor replaces the adapter boundary.
+formula dependency/evaluation caches beside generic keyed storage because those
+caches are runtime acceleration state, not Boon-visible values.
 Executable reports also include `compiled_schedule`, a typed-IR-derived schedule
 summary that rejects unknown initializers, unsupported update branches,
 unsupported list predicates, and per-row graph clones before the example runtime
@@ -541,37 +637,46 @@ shape (`todos` plus TodoMVC state cells, or `cells` plus Cells state/formula
 tables) rather than trusting the parser's example marker during runtime
 dispatch and report generation. `run_loaded_scenario` now enters one shared
 `run_generic_scenario` loop through a `LoadedRuntime` shell. That shell owns the
-scheduled generic storage between ticks and temporarily lends it to the selected
-TodoMVC or Cells surface driver for residual event classification, render
-lowering, and Cells formula behavior. The tick executor remains adapter-backed
-until all source events execute through one generic schedule without the
-TodoMVC/Cells driver layer.
+scheduled generic storage between ticks and no longer lends that storage to
+TodoMVC or Cells surface drivers for scenario execution. The remaining
+acceptance blockers are fresh human reports, aggregate all reports, and any
+future verification gaps found by the audit, not a semantic example adapter.
 
 Implementation note: the current IR cause table is source-derived, not a
 TodoMVC/Cells-specific Rust lookup table. It derives row scopes from
 `List/map(... new: function(...))`, then scans field equation bodies and local
 derived-field references such as `new_todo_text -> title_to_add` to build
-`possible_causes`. Runtime execution still has example adapters and remains a
-known blocker before the full "no hardcoded app behavior" criterion is met.
-Executable reports include `runtime_execution` metadata so this blocker is
-visible in verification artifacts.
+`possible_causes`. TodoMVC and Cells executable reports now identify the runtime
+as `static_graph_interpreter`, set `generic_interpreter_complete = true`, and
+set `example_behavior_adapter = false`. The headed reports now prove full
+OS pointer/keyboard coverage. The remaining acceptance blockers are fresh human
+reports, aggregate all reports, and any future verification gaps found by the
+readiness audit.
 
-Headed Ply verification now records three intermediate OS-input slices. First,
-it focuses one real visible application text control in the preview
+Headed Ply verification runs the native playground in release mode through
+`xtask`, because the debug build can take minutes to replay TodoMVC's visible
+control probes and can hit the wrapper timeout before writing the final report.
+It records three intermediate OS-input slices. First, it focuses one real
+visible application text control in the preview
 (`todo_new_input` for TodoMVC or `cell_editor_A1` for Cells), sends real OS
 keyboard text through `wtype`, observes the text through Ply state, captures the
 control screenshot, and stores the control bounds and artifact hash. Second,
 visible controls emit observed Boon `SOURCE` events and the headed report
 records the observed payloads, bounds, screenshots, and runtime mutation result.
-For TodoMVC, the visible OS-driven live prefix currently checks nine real
-scenario steps through `filter-all`: `add-test-todo-type`,
-`add-test-todo-submit`, `reject-empty-todo`, `toggle-all-complete`,
-`toggle-all-active`, `toggle-buy-groceries`, `filter-active`,
-`filter-completed`, and `filter-all`. It also probes `delete-clean-room` as a
-visible event plus runtime mutation, but that is intentionally not marked as a
-scenario-prefix expectation because the edit/clear-completed steps before it
-are not yet visible-control driven. For Cells, the visible OS-driven live prefix
-checks `edit-a1-literal`, `commit-a1-literal`, and `edit-a1-cancel-draft`.
+When `BOON_ALLOW_OS_POINTER_PROBE=1` is set, click/press-style source probes use
+the real pointer backend against their visible target bounds instead of keyboard
+activation; the report records `input_backend = "os_pointer"` and the selected
+pointer backend for each such probe. Text and submit probes use the same pointer
+backend to focus the visible text input, then send real keyboard events through
+`wtype`; edit fields are cleared by frame-spaced Backspace key presses rather
+than direct text replacement. Blur is driven by a real pointer click on a visible
+non-text target. Render-only TodoMVC hover is driven by a real pointer move
+without clicking the delete button. The current opt-in headed reports prove all
+TodoMVC and Cells scenario user actions through OS pointer/keyboard input:
+TodoMVC has 22 `os_input_steps`, including 11 pointer-click source probes, 8
+pointer-focus-plus-keyboard source probes, 1 pointer blur, and 1 pointer hover;
+Cells has 15 `os_input_steps`, including 11 pointer-focus-plus-keyboard source
+probes and assertion-only checkpoints for non-input steps.
 Covered prefix events are applied through `boon_runtime::LiveRuntime` against
 the real scenario step, so expected source fields, semantic deltas, render
 patches, and state assertions must pass. The headed command now fails if a
@@ -579,11 +684,10 @@ scenario-tagged visible SOURCE probe does not pass the runtime expectation
 checks; it cannot false-green on "SOURCE observed" alone. Third, it focuses the
 visible Step control, sends real OS keyboard activation, advances each scenario
 prefix through the playground, captures per-step screenshots, and stores the
-Step control bounds in the headed report. This still does not satisfy the final
-e2e gate because the complete scenario is replayed through scenario user
-actions after the visible-control probes; the report keeps `os_input_limitation`
-until every TodoMVC/Cells scenario step is driven by actual visible app controls
-and observed source events.
+Step control bounds in the headed report. When every scenario user action is
+covered, the headed report sets
+`input_injection_method = "os_pointer_keyboard_to_visible_window"` and writes a
+schema-checked `os_input_steps` entry for every scenario step.
 
 Visible manual launches should be routed through COSMIC's background launcher on
 this machine:
@@ -593,12 +697,54 @@ cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playg
 ```
 
 That keeps the native playground on the `boon-circuit` workspace while the user
-continues other work. Verifiers that send real desktop input must stay explicit:
-keyboard probes use `wtype`, and the pointer probe is opt-in with
+continues other work. It does not make real input focus-free: human-like
+keyboard and mouse testing must eventually target the visible playground window,
+because the compositor routes those events to the active surface. Verifiers that
+send real desktop input must stay explicit: keyboard probes use `wtype`, and the
+pointer probe is opt-in with
 `BOON_ALLOW_OS_POINTER_PROBE=1` because it moves and clicks the real pointer.
 Reports may include `os_pointer_probe.status = "skip"` for normal headed runs;
 that is evidence that the run avoided pointer injection, not a pass for the
-final full-OS-input gate.
+final full-OS-input gate. When the pointer probe is attempted, a failed hit is a
+schema failure rather than an accepted warning.
+
+The current reliable pointer backend on this COSMIC/Wayland machine is
+X11/XWayland XTest. The Ply process loads X11/XWayland libraries, and the
+headed probe now tries XTest absolute screen coordinates first and records
+`os_pointer_probe.click_target.backend = "x11_xtest"` when Ply observes the
+button click. The older `ydotool` path remains as a fallback but exited
+successfully without producing a Ply-observed hit with either relative-delta or
+absolute-screen-coordinate attempts; `ydotoold` is not available as a user
+service here.
+
+`cosmic-background-launch --workspace boon-circuit -- cargo xtask
+verify-todomvc-headed-ply` is not a valid full headed-verifier mode today. A
+direct lower-level attempt with `cosmic-background-launch --workspace
+boon-circuit -- cargo run --release -p boon_ply_playground -- --verify-headed
+--example todomvc` also left the verifier process alive for 120 seconds without
+creating its report. That is a failed verification, not a pass. Background
+launch is appropriate for manual playground surfaces and bounded smoke launches;
+automated headed verification still needs a directly controlled process and a
+real focused input route.
+
+The bounded background smoke should be run through:
+
+```sh
+cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json
+```
+
+That wrapper invokes `cosmic-background-launch`, records the launcher output and
+child PIDs, waits for fresh TodoMVC and Cells smoke reports, validates those
+reports, and verifies the bounded child processes have exited. Raw
+`cosmic-background-launch -- ... --smoke-launch` commands are still useful for
+diagnosis, but the wrapper is the acceptance evidence for background launch.
+
+`cargo xtask verify-playground-launch` is the bounded launch smoke for the native
+Ply surface. It opens the real playground for TodoMVC and Cells in release mode,
+draws several frames, captures nonblank screenshots, and records display/window
+metadata plus the expected surface controls. This proves startup/rendering and
+the manual-test surface are available, but it is intentionally separate from the
+headed OS-input and human-report gates.
 
 ## D12. Differential Dataflow Is Optional, Not Core
 
@@ -663,3 +809,29 @@ Future targets:
 2. Rust codegen from the same typed equation IR.
 3. Zig codegen.
 4. Hardware-oriented lowering or HDL generation for fixed profiles.
+
+## D15. Stress Evidence Must Use The Loaded IR Runtime
+
+Decision: TodoMVC and Cells speed stress profiles are part of the language
+proof, so they must construct their runtime from `CompiledProgram::from_ir` and
+`GenericScheduledRuntime::new`. Cells then initializes through the same loaded
+Cells path as normal scenario execution; TodoMVC stress rows are materialized
+from the IR-derived row template and compiled row-source bindings.
+
+The stress profiles must not instantiate old default Rust TodoMVC or Cells
+tables. This matters because a fast 10,000-row TodoMVC interaction or 26x100
+spreadsheet proves little if the measured path is not the Boon source path.
+Reports therefore include `ir_runtime_proof` for every TodoMVC and Cells stress
+profile, covering the inferred surface, schedule node count, operation counts,
+source route count, and source binding counts. Cells also records grid
+dimensions; TodoMVC records the row source binding count used for hidden source
+identity.
+
+The readiness audit enforces both sides:
+
+- source shape: TodoMVC and Cells stress profiles must use
+  `CompiledProgram::from_ir` and `GenericScheduledRuntime::new`; Cells must use
+  `initialize_loaded_cells_generic`, and TodoMVC must materialize rows through
+  the IR row template instead of a default source-binding helper;
+- report shape: TodoMVC and Cells stress profiles must carry IR-derived runtime
+  proof with operation counts and source routes.

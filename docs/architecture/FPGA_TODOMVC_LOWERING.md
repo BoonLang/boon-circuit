@@ -102,6 +102,13 @@ todos: LIST[256] { ... }
 The preferred app source can still use plain `LIST`; target profiles decide
 whether an unbounded software list is allowed.
 
+The current `boon_cli explain-hardware examples/todomvc.bn --profile
+fpga_todomvc` path enforces this as a real profile rather than a label. The
+report must include `bounded_storage_profile.name = "fpga_todomvc"`, effective
+`todos` capacity, fixed `todo.title` and `todo.edit_text` widths, input/output
+FIFO capacities, and an explicit overflow policy. `audit-goal-readiness` rejects
+hardware reports that omit those bounded-profile fields.
+
 ## Internal Storage
 
 The compiler lowers `todos` to bounded memories:

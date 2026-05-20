@@ -24,15 +24,14 @@ Implement:
 4. Static runtime core with typed storage, keyed dirty sets, deterministic ticks, HOLD, THEN, WHEN, WHILE, LATEST, LIST, append/remove/move, stale source rejection, and keyed semantic deltas.
 5. Delta lowering to Ply patches without virtual DOM or list diffing.
 6. Native Ply playground with example selector, code editor, run/reset/step controls, render preview, semantic delta log, selected value inspector, dependency explanation panel, and headed/manual test support.
+   - `cargo xtask verify-playground-custom-source` must prove the editor/source-text path runs modified Boon source and is not hardcoded to bundled examples.
 7. TodoMVC in Boon source, close to the original local field-equation style, with no app-visible todo id and no global reducer.
 8. Cells in Boon source, with generic formula primitives only, real edit/commit/cancel state in Boon, dependency tracking, cycle errors, and no hardcoded app behavior.
 9. Shared example verification harness and all documented xtask commands.
 
 Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are real implementation blockers:
-- reports still say `static_graph_interpreter_adapter_backed`
-- `LoadedRuntime` owns generic storage now, but residual TodoMVC/Cells surface drivers still handle event classification, render lowering, and formula behavior
-- headed Ply checks still prove only an OS keyboard probe plus scenario replay, not every step through real OS pointer/keyboard hit testing
 - aggregate all reports and fresh human reports are still missing
+- if `cargo xtask audit-goal-readiness` reports any additional blocker, treat it as authoritative current evidence
 
 Do not make these blockers green by weakening reports, schemas, docs, or audits. Make them green only by completing the implementation and verification they describe.
 
@@ -41,11 +40,13 @@ Verification must be honest and runnable:
 - cargo test -p boon_ir
 - cargo test -p boon_runtime
 - cargo test --workspace
+- cargo xtask verify-foundation
+- cargo xtask verify-playground-launch
 - cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --report target/reports/todomvc-cli-run.json
 - cargo xtask verify-todomvc-all --report target/reports/todomvc-all.json
 - cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/cells-cli-run.json
 - cargo xtask verify-cells-all --report target/reports/cells-all.json
-- cargo xtask verify-examples-all
+- cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
 - cargo xtask verify-report-schema
 - cargo xtask audit-goal-readiness
 

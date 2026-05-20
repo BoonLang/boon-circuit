@@ -31,6 +31,7 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
 - [Example verification plan](docs/plans/EXAMPLE_VERIFICATION_PLAN.md)
 - [TodoMVC e2e test plan](docs/plans/TODOMVC_E2E_TEST_PLAN.md)
+- [Manual testing runbook](docs/plans/MANUAL_TESTING_RUNBOOK.md)
 - [`/goal` prompt](docs/plans/GOAL_PROMPT.md)
 
 ## Non-Goals For The First Pass
@@ -76,10 +77,17 @@ cargo run -p boon_cli -- dump-ir examples/todomvc.bn
 cargo run -p boon_cli -- dump-ir examples/cells.bn
 cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
 cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
-cargo xtask verify-todomvc-headed-ply
-cargo xtask verify-cells-headed-ply
+BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
+BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
 cargo xtask verify-todomvc-speed
 cargo xtask verify-cells-speed
+cargo xtask verify-todomvc-negative
+cargo xtask verify-cells-negative
+cargo xtask verify-playground-custom-source
+cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json
+cargo bench -p boon_runtime --bench todomvc -- --report target/reports/todomvc-bench.json --speed-report target/reports/todomvc-bench-speed.json
+cargo xtask bench-todomvc
+cargo xtask bench-example cells
 cargo xtask verify-report-schema
 cargo xtask audit-goal-readiness
 cargo xtask verify-todomvc-human --write-template
@@ -88,21 +96,34 @@ cargo xtask verify-cells-human --write-template
 
 The speed aliases re-exec themselves through `cargo run --release -p xtask` and
 reports must contain `build_profile: "release"`.
-Executable reports contain `runtime_execution` metadata. At the current
-prototype stage it explicitly records that source and typed IR are loaded, but
-that runtime behavior is still adapter-backed until the generic static-graph
-interpreter replaces the TodoMVC/Cells execution adapters.
+Executable reports contain `runtime_execution` metadata. The current accepted
+semantic/headless/headed/speed reports must show that Boon source and typed IR
+are loaded, the static schedule is verified, and `example_behavior_adapter` is
+`false`.
 The native playground sidebar shows the scenario checklist labels used by the
 manual-report templates.
-The current headed Ply verifier proves a real OS keyboard event reaches the Ply
-window, captures nonblank screenshots, and then routes scenario `user_action`
-records through the runtime. It intentionally records this as an
-`os_input_limitation` until every scenario step is driven by real OS
-pointer/keyboard hit testing.
+The headed Ply verifier must be run with `BOON_ALLOW_OS_POINTER_PROBE=1` for
+final evidence. The passing headed reports use
+`input_injection_method = "os_pointer_keyboard_to_visible_window"`, have no
+`os_input_limitation`, record per-step visible targets and screenshots, and are
+checked by `audit-goal-readiness`.
+
+On this COSMIC desktop, open the manual playground surface without stealing
+unrelated focus by keeping the wrapper directly around the native window
+creator:
+
+```bash
+cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc
+cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example cells
+```
+
+Background launch is startup/focus-routing evidence only. Full headed OS input
+verification and real manual reports still require a focused visible playground
+session.
 
 `cargo xtask audit-goal-readiness` is the strict handoff gate. It writes
 `target/reports/debug/goal-readiness.json` and exits non-zero while any final
-acceptance blocker remains, including adapter-backed runtime execution, hybrid
+acceptance blocker remains, including adapter-backed runtime execution, partial
 headed input, missing aggregate reports, or missing fresh human reports.
 
 After a real manual pass, fill:
@@ -112,10 +133,26 @@ target/reports/todomvc-human.json
 target/reports/cells-human.json
 ```
 
-and check them with:
+Use the manual helper from `docs/plans/MANUAL_TESTING_RUNBOOK.md`; it requires
+the visible manual playground process id and a short focus proof, not the older
+headed verifier process id:
+
+```bash
+cargo xtask prepare-todomvc-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-todomvc-scenario-label> --report target/reports/todomvc-human.json
+cargo xtask prepare-cells-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-cells-scenario-label> --report target/reports/cells-human.json
+```
+
+The helper writes `manual_report_prepared_by`,
+`manual_report_template_path`, and `manual_report_template_sha256`; checker mode
+rejects hand-written JSON that skips the prepared-template path.
+
+Then check them with:
 
 ```bash
 cargo xtask verify-todomvc-human --check --report target/reports/todomvc-human.json
 cargo xtask verify-cells-human --check --report target/reports/cells-human.json
-cargo xtask verify-examples-all
+cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
+cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
+cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json
 ```

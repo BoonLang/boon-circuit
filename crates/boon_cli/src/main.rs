@@ -1,6 +1,18 @@
+#![recursion_limit = "256"]
+
 use boon_runtime::{VerificationLayer, run_scenario, write_json};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+
+const CLI_HELP: &str = "\
+usage:
+  boon_cli run <source> [--scenario <path>] [--report <path>]
+  boon_cli scenario <source> [--scenario <path>] [--report <path>]
+  boon_cli dump-ir <source>
+  boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--report <path>]
+
+Bundled examples default to target/reports/<example>-cli-run.json when --report is omitted.
+";
 
 fn main() {
     if let Err(error) = run() {
@@ -16,6 +28,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     match args.remove(0).as_str() {
+        "help" | "-h" | "--help" => {
+            print_help();
+            Ok(())
+        }
         "run" => run_program(&args),
         "scenario" => run_program(&args),
         "dump-ir" => dump_ir(&args),
@@ -47,6 +63,7 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let scenario = scenario.unwrap_or_else(|| default_scenario(source));
+    let report = report.or_else(|| default_cli_report(source, &scenario));
     let output = run_scenario(
         Path::new(source),
         Path::new(&scenario),
@@ -71,14 +88,16 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .find(|window| window[0] == "--profile")
         .map(|window| window[1].clone())
         .unwrap_or_else(|| "software_bounded".to_owned());
+    let hardware_profile = HardwareProfile::for_name(&profile)?;
     let (parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
+    hardware_profile.validate_program(parsed.kind)?;
     let source_hash =
         boon_runtime::sha256_file(Path::new(source)).unwrap_or_else(|_| "missing".to_owned());
     let command_argv = std::env::args().collect::<Vec<_>>();
     let register_file_fields = indexed_register_fields(&ir);
     let row_source_ports = indexed_row_source_ports(&ir);
     let list_operations = serde_json::to_value(&ir.list_operations)?;
-    let list_memories = serde_json::to_value(&ir.lists)?;
+    let list_memories = hardware_profile.list_memories(&ir)?;
     let state_cells = serde_json::to_value(&ir.state_cells)?;
     let report = json!({
         "status": "pass",
@@ -86,11 +105,14 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "explain-hardware",
         "command_argv": command_argv,
+        "exit_status": 0,
         "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
         "source_path": source,
         "source_hash": source_hash,
         "scenario_hash": "n/a",
         "program_hash": source_hash,
+        "budget_hash": boon_runtime::sha256_file(&Path::new(source).with_extension("budget.toml")).unwrap_or_else(|_| "missing-budget".to_owned()),
         "source": source,
         "profile": profile,
         "program_kind": parsed.kind.as_str(),
@@ -123,8 +145,38 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "generation_memory": true,
                 "order_memory": true,
                 "free_list": true,
-                "capacity_source": "target profile or LIST[n] syntax",
+                "capacity_source": hardware_profile.capacity_source,
+                "overflow_policy": hardware_profile.overflow_policy,
                 "list_memories": list_memories
+            },
+            "bounded_storage_profile": {
+                "name": hardware_profile.name,
+                "clock": hardware_profile.clock,
+                "reset": hardware_profile.reset,
+                "todos_capacity": hardware_profile.todos_capacity,
+                "todo_title_width": hardware_profile.todo_title_width,
+                "todo_edit_text_width": hardware_profile.todo_edit_text_width,
+                "input_event_fifo_capacity": hardware_profile.input_event_fifo_capacity,
+                "output_delta_fifo_capacity": hardware_profile.output_delta_fifo_capacity,
+                "unbounded_text_allowed": hardware_profile.unbounded_text_allowed
+            },
+            "fixed_text_storage": {
+                "todo.title": {
+                    "width": hardware_profile.todo_title_width,
+                    "encoding": "ascii"
+                },
+                "todo.edit_text": {
+                    "width": hardware_profile.todo_edit_text_width,
+                    "encoding": "ascii"
+                }
+            },
+            "input_event_fifo": {
+                "capacity": hardware_profile.input_event_fifo_capacity,
+                "overflow_policy": hardware_profile.overflow_policy
+            },
+            "output_delta_fifo": {
+                "capacity": hardware_profile.output_delta_fifo_capacity,
+                "overflow_policy": hardware_profile.overflow_policy
             },
             "register_file_fields": register_file_fields,
             "register_file_fields_source_derived": true,
@@ -163,6 +215,111 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+struct HardwareProfile {
+    name: &'static str,
+    clock: &'static str,
+    reset: &'static str,
+    todos_capacity: usize,
+    todo_title_width: usize,
+    todo_edit_text_width: usize,
+    input_event_fifo_capacity: usize,
+    output_delta_fifo_capacity: usize,
+    capacity_source: &'static str,
+    overflow_policy: &'static str,
+    unbounded_text_allowed: bool,
+}
+
+impl HardwareProfile {
+    fn for_name(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match name {
+            "fpga_todomvc" => Ok(Self {
+                name: "fpga_todomvc",
+                clock: "PASSED.clk",
+                reset: "PASSED.reset",
+                todos_capacity: 256,
+                todo_title_width: 64,
+                todo_edit_text_width: 64,
+                input_event_fifo_capacity: 16,
+                output_delta_fifo_capacity: 64,
+                capacity_source: "fpga_todomvc target profile",
+                overflow_policy: "explicit_overflow_error",
+                unbounded_text_allowed: false,
+            }),
+            "software_bounded" => Ok(Self {
+                name: "software_bounded",
+                clock: "software_tick",
+                reset: "software_reset",
+                todos_capacity: 10_000,
+                todo_title_width: 256,
+                todo_edit_text_width: 256,
+                input_event_fifo_capacity: 1024,
+                output_delta_fifo_capacity: 4096,
+                capacity_source: "software_bounded verification profile",
+                overflow_policy: "reported_runtime_error",
+                unbounded_text_allowed: false,
+            }),
+            other => Err(format!(
+                "unsupported hardware explanation profile `{other}`; expected `fpga_todomvc` or `software_bounded`"
+            )
+            .into()),
+        }
+    }
+
+    fn validate_program(
+        &self,
+        kind: boon_parser::ProgramKind,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.name == "fpga_todomvc" && kind != boon_parser::ProgramKind::TodoMvc {
+            return Err("profile `fpga_todomvc` only supports TodoMVC in this phase".into());
+        }
+        Ok(())
+    }
+
+    fn list_memories(
+        &self,
+        ir: &boon_ir::TypedProgram,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut memories = serde_json::to_value(&ir.lists)?;
+        let Some(items) = memories.as_array_mut() else {
+            return Ok(memories);
+        };
+        for item in items {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            let declared_capacity = object
+                .get("capacity")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize);
+            let effective_capacity = declared_capacity.unwrap_or(self.todos_capacity);
+            object.insert("effective_capacity".to_owned(), json!(effective_capacity));
+            object.insert(
+                "capacity_source".to_owned(),
+                json!(if declared_capacity.is_some() {
+                    "LIST[n] syntax"
+                } else {
+                    self.capacity_source
+                }),
+            );
+            object.insert("overflow_policy".to_owned(), json!(self.overflow_policy));
+            object.insert(
+                "fixed_text_fields".to_owned(),
+                json!({
+                    "title": {
+                        "width": self.todo_title_width,
+                        "encoding": "ascii"
+                    },
+                    "edit_text": {
+                        "width": self.todo_edit_text_width,
+                        "encoding": "ascii"
+                    }
+                }),
+            );
+        }
+        Ok(memories)
+    }
+}
+
 fn indexed_register_fields(ir: &boon_ir::TypedProgram) -> Vec<String> {
     let mut fields = ir
         .state_cells
@@ -195,10 +352,25 @@ fn default_scenario(source: &str) -> String {
     }
 }
 
+fn default_cli_report(source: &str, scenario: &str) -> Option<PathBuf> {
+    let source_path = Path::new(source);
+    let scenario_path = Path::new(scenario);
+    match (
+        source_path.file_name().and_then(|name| name.to_str()),
+        scenario_path.file_name().and_then(|name| name.to_str()),
+    ) {
+        (Some("todomvc.bn"), Some("todomvc.scn")) => {
+            Some(PathBuf::from("target/reports/todomvc-cli-run.json"))
+        }
+        (Some("cells.bn"), Some("cells.scn")) => {
+            Some(PathBuf::from("target/reports/cells-cli-run.json"))
+        }
+        _ => None,
+    }
+}
+
 fn print_help() {
-    eprintln!(
-        "usage:\n  boon_cli run <source> --scenario <scenario> [--report <path>]\n  boon_cli dump-ir <source>\n  boon_cli explain-hardware <source> --profile <profile>"
-    );
+    eprint!("{CLI_HELP}");
 }
 
 fn git_commit() -> String {
@@ -217,4 +389,33 @@ fn current_unix_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn current_binary_hash() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| boon_runtime::sha256_file(&path).ok())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CLI_HELP;
+
+    #[test]
+    fn help_advertises_supported_commands() {
+        for command in ["run", "scenario", "dump-ir", "explain-hardware"] {
+            assert!(
+                CLI_HELP.contains(&format!("boon_cli {command}")),
+                "help should advertise {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_advertises_default_cli_report_contract() {
+        assert!(CLI_HELP.contains("target/reports/<example>-cli-run.json"));
+        assert!(CLI_HELP.contains("--scenario <path>"));
+        assert!(CLI_HELP.contains("--report <path>"));
+    }
 }

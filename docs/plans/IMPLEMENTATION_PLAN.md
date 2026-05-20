@@ -80,6 +80,32 @@ profiles. Normal interactions must dirty only the affected nodes/keys plus
 declared aggregates/views, and the verification reports must make graph rebuilds,
 allocations, latency, RAM, and VRAM visible.
 
+`audit-goal-readiness` must also guard this scope directly. It checks that the
+workspace manifests do not pull in a Differential Dataflow/actor/channel-per-
+value/codegen/bytecode substrate for this phase, that out-of-phase codegen or
+bytecode commands are not exposed, and that speed stress reports keep
+`graph_rebuild_count = 0`, `graph_clones_per_item = 0`, stable graph node
+counts, and bounded render patch counts.
+
+The same audit parses and lowers `examples/todomvc.bn` and `examples/cells.bn`
+directly. It must prove TodoMVC has no global reducer or app-visible identity,
+that source tables come from declared `SOURCE` ports, that row-local events stay
+row-local in typed IR, and that Cells edit state plus formula primitives are
+represented by Boon-derived IR rather than hidden Rust app behavior.
+
+It also requires fresh CLI scenario reports for both examples:
+`target/reports/todomvc-cli-run.json` and
+`target/reports/cells-cli-run.json`. Those reports must come from the documented
+`boon_cli run <source> --scenario <scenario>` commands, match current
+source/scenario hashes, and prove the same Boon-source-to-typed-IR-to-static-
+runtime path as the harness reports.
+
+The readiness audit also checks scenario label coverage directly from
+`examples/todomvc.scn` and `examples/cells.scn`. TodoMVC dynamic-row,
+filtered-toggle, clear-all, empty-state, and add-after-clear coverage, and Cells
+dependency, fanout, cycle, stale-edge, unrelated-edit, and cancel coverage are
+hard gates, not informal checklist items.
+
 ## Phase 1: Parser And AST
 
 Implement enough Boon syntax for:
@@ -227,6 +253,12 @@ cargo xtask verify-todomvc-ply-headless
 cargo bench -p boon_runtime --bench todomvc
 ```
 
+The benchmark command must leave durable evidence, not only terminal output. It
+writes `target/reports/todomvc-bench.json`, writes a linked schema-checked
+`target/reports/todomvc-bench-speed.json`, and `audit-goal-readiness` fails if
+that benchmark evidence is missing or stale. The shared `cargo xtask
+bench-example cells` command applies the same report contract to Cells.
+
 Performance checks:
 
 - graph node count is stable as todo count grows.
@@ -236,7 +268,8 @@ Performance checks:
 - clear completed emits remove deltas for completed keys only.
 - normal interactions satisfy the budget in `examples/todomvc.budget.toml`.
 - 1,000 and 10,000 row stress profiles report RAM, VRAM, allocation, and dirty
-  key counts.
+  key counts, and every stress profile is schema-rejected if it allocates after
+  warmup.
 
 ## Phase 5: Ply Playground
 
@@ -259,6 +292,8 @@ Hard gate:
 
 ```text
 cargo run -p boon_ply_playground
+cargo xtask verify-playground-launch
+cargo xtask verify-playground-custom-source
 cargo xtask verify-todomvc-all --report target/reports/todomvc-all.json
 cargo xtask verify-example-headed-ply cells
 ```
@@ -267,10 +302,31 @@ This gate must open a real native Ply window and verify visible pixels, input,
 focus, scaling, and render patches. Headless render checks are useful fast
 smokes, but they are not enough to accept the playground.
 
+`verify-playground-custom-source` is the separate editor-path proof. It writes a
+modified TodoMVC source text into a report artifact, runs it through the same
+source-text execution entry point used by the playground editor, checks a
+matching custom scenario, and also proves the modified source fails the original
+scenario's initial-state assertions. That prevents the playground from passing
+only because bundled example files were hardcoded.
+
+The editor-path proof also writes a modified Cells source/scenario pair. The
+Cells variant changes `Grid/cells` dimensions, runs the custom source through the
+same source-text entry point, and proves the original full Cells scenario rejects
+the smaller grid. `audit-goal-readiness` requires both examples in
+`target/reports/playground-custom-source.json`.
+
+`verify-playground-launch` is the bounded native-window smoke proof. It launches
+the real Ply playground for TodoMVC and Cells, draws several frames, captures
+nonblank screenshots, and writes `target/reports/playground-launch*.json`. It is
+startup/render evidence only; it does not replace headed OS-input or human
+verification.
+
 The playground also owns the shared example verification harness described in
 [EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md):
 
 ```text
+verify-foundation
+verify-playground-launch
 verify-example-headed-ply
 verify-example-human
 verify-example-semantic
@@ -281,6 +337,23 @@ verify-example-all
 verify-examples-all
 verify-report-schema
 ```
+
+The cross-example command must leave durable evidence too:
+`verify-examples-all` writes `target/reports/examples-all.json` after the
+TodoMVC and Cells aggregate reports exist. Missing per-example aggregates still
+block first, because they include the real human reports.
+
+The final visible/manual handoff procedure is described in
+[MANUAL_TESTING_RUNBOOK.md](MANUAL_TESTING_RUNBOOK.md). Passing aggregate reports
+must include fresh checked human reports; missing human reports remain blockers,
+not warnings.
+
+`verify-foundation` is the repo-level parser/IR/runtime gate. It runs
+`cargo test -p boon_parser`, `cargo test -p boon_ir`,
+`cargo test -p boon_runtime`, and `cargo test --workspace`, then writes
+`target/reports/foundation.json`. `audit-goal-readiness` must require this
+report so foundational parser/IR/runtime coverage is not only an informal
+terminal command.
 
 ## Phase 6: Cells Proof
 

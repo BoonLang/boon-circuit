@@ -102,6 +102,7 @@ pub fn parse_source(
     let kind = detect_kind(&path, &source)?;
     validate_balanced_brackets(&path, &source)?;
     validate_required_constructs(&path, &source)?;
+    validate_list_capacities(&path, &source)?;
     validate_no_reducer_style_update(&path, &source)?;
     validate_no_hidden_identity_leak(&path, &source, kind)?;
     let row_scope_functions = collect_row_scope_functions(&source);
@@ -142,33 +143,41 @@ fn detect_kind(path: &str, source: &str) -> Result<ProgramKind, ParseError> {
 
 fn validate_balanced_brackets(path: &str, source: &str) -> Result<(), ParseError> {
     let mut stack = Vec::new();
-    for (line_index, ch) in source.chars().enumerate() {
-        match ch {
-            '[' | '{' | '(' => stack.push(ch),
-            ']' => {
-                if stack.pop() != Some('[') {
-                    return Err(error(path, line_index, "unbalanced `]`"));
+    for (line_index, line) in source.lines().enumerate() {
+        let line_number = line_index + 1;
+        for (column_index, ch) in line.chars().enumerate() {
+            let column_number = column_index + 1;
+            match ch {
+                '[' | '{' | '(' => stack.push((ch, line_number, column_number)),
+                ']' => {
+                    if stack.pop().map(|(ch, _, _)| ch) != Some('[') {
+                        return Err(error(path, line_number, column_number, "unbalanced `]`"));
+                    }
                 }
-            }
-            '}' => {
-                if stack.pop() != Some('{') {
-                    return Err(error(path, line_index, "unbalanced `}`"));
+                '}' => {
+                    if stack.pop().map(|(ch, _, _)| ch) != Some('{') {
+                        return Err(error(path, line_number, column_number, "unbalanced `}`"));
+                    }
                 }
-            }
-            ')' => {
-                if stack.pop() != Some('(') {
-                    return Err(error(path, line_index, "unbalanced `)`"));
+                ')' => {
+                    if stack.pop().map(|(ch, _, _)| ch) != Some('(') {
+                        return Err(error(path, line_number, column_number, "unbalanced `)`"));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     if stack.is_empty() {
         Ok(())
     } else {
+        let (ch, line, column) = stack
+            .last()
+            .copied()
+            .expect("stack is known to be nonempty");
         Err(ParseError {
             path: path.to_owned(),
-            message: "unclosed bracket/brace/paren".to_owned(),
+            message: format!("unclosed `{ch}` at line {line}, column {column}"),
         })
     }
 }
@@ -187,6 +196,50 @@ fn validate_required_constructs(path: &str, source: &str) -> Result<(), ParseErr
             path: path.to_owned(),
             message: "required list source `LIST` or `Grid/cells` is missing".to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_list_capacities(path: &str, source: &str) -> Result<(), ParseError> {
+    for (line_index, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(index) = line.find("LIST[") else {
+            continue;
+        };
+        let line_number = line_index + 1;
+        let capacity_column = index + "LIST[".len() + 1;
+        let rest = &line[index + "LIST[".len()..];
+        let Some((capacity, _)) = rest.split_once(']') else {
+            return Err(error(
+                path,
+                line_number,
+                capacity_column,
+                "LIST capacity is missing closing `]`",
+            ));
+        };
+        let capacity = capacity.trim();
+        if capacity.is_empty() {
+            return Err(error(
+                path,
+                line_number,
+                capacity_column,
+                "LIST capacity must be a positive integer",
+            ));
+        }
+        match capacity.parse::<usize>() {
+            Ok(value) if value > 0 => {}
+            _ => {
+                return Err(error(
+                    path,
+                    line_number,
+                    capacity_column,
+                    "LIST capacity must be a positive integer",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -383,9 +436,9 @@ fn collect_structure(source: &str, row_scopes: &[ParsedRowScopeFunction]) -> Str
             });
         }
         if trimmed.contains("LIST") || trimmed.contains("Grid/cells") {
-            let name = scope
-                .last()
-                .map(|(_, name)| name.clone())
+            let name = leading_field_name(trimmed)
+                .map(ToOwned::to_owned)
+                .or_else(|| scope.last().map(|(_, name)| name.clone()))
                 .unwrap_or_else(|| format!("list_{}", tables.list_memories.len()));
             tables.list_memories.push(ParsedListMemory {
                 name,
@@ -629,10 +682,10 @@ fn collect_operators(source: &str) -> Vec<String> {
     operators
 }
 
-fn error(path: &str, char_index: usize, message: &str) -> ParseError {
+fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
     ParseError {
         path: path.to_owned(),
-        message: format!("{message} near char {char_index}"),
+        message: format!("{message} at line {line}, column {column}"),
     }
 }
 
@@ -761,10 +814,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_profiled_list_capacity() {
+        let source = r#"
+EXAMPLE TodoMVC
+todos: LIST[10000] {}
+click: SOURCE
+value: False |> HOLD value { LATEST { click |> THEN { True } } }
+todos |> List/map(todo, new: new_todo(seed: todo))
+"#;
+        let program = parse_source("profiled-list.bn", source).unwrap();
+        let todos = program
+            .list_memories
+            .iter()
+            .find(|list| list.name == "todos")
+            .expect("expected todos list memory");
+        assert_eq!(todos.capacity, Some(10_000));
+    }
+
+    #[test]
+    fn rejects_malformed_list_capacity() {
+        let source = r#"
+EXAMPLE TodoMVC
+todos: LIST[many] {}
+click: SOURCE
+value: False |> HOLD value { LATEST { click |> THEN { True } } }
+todos |> List/map(todo, new: new_todo(seed: todo))
+"#;
+        let err = parse_source("bad-list-capacity.bn", source).unwrap_err();
+        assert!(
+            err.message
+                .contains("LIST capacity must be a positive integer")
+        );
+        assert!(err.message.contains("line 3"));
+    }
+
+    #[test]
+    fn rejects_zero_list_capacity() {
+        let source = r#"
+EXAMPLE TodoMVC
+todos: LIST[0] {}
+click: SOURCE
+value: False |> HOLD value { LATEST { click |> THEN { True } } }
+todos |> List/map(todo, new: new_todo(seed: todo))
+"#;
+        let err = parse_source("bad-zero-list-capacity.bn", source).unwrap_err();
+        assert!(
+            err.message
+                .contains("LIST capacity must be a positive integer")
+        );
+    }
+
+    #[test]
     fn rejects_hidden_todo_id() {
         let source = "EXAMPLE TodoMVC\nLIST {}\nid: TodoId[id: Ulid/generate()]\nSOURCE\nHOLD\nLATEST\nList/map";
         let err = parse_source("bad.bn", source).unwrap_err();
         assert!(err.message.contains("hidden runtime identity") || err.message.contains("id"));
+    }
+
+    #[test]
+    fn rejects_app_visible_todomvc_id_field() {
+        let source =
+            "EXAMPLE TodoMVC\nLIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
+        let err = parse_source("bad.bn", source).unwrap_err();
+        assert!(err.message.contains("app-visible `id`"));
     }
 
     #[test]
@@ -783,5 +895,38 @@ items |> List/map(item, new: new_item(seed: item))
 "#;
         let err = parse_source("bad-reducer.bn", source).unwrap_err();
         assert!(err.message.contains("central reducer"));
+    }
+
+    #[test]
+    fn bracket_diagnostics_report_line_and_column() {
+        let source = r#"
+EXAMPLE TodoMVC
+store: [
+    bad: )
+]
+SOURCE
+HOLD
+LATEST
+List/map
+"#;
+        let err = parse_source("bad-bracket.bn", source).unwrap_err();
+        assert!(err.message.contains("unbalanced `)`"));
+        assert!(err.message.contains("line 4, column 10"));
+    }
+
+    #[test]
+    fn unclosed_bracket_reports_opening_position() {
+        let source = r#"
+EXAMPLE Cells
+cells:
+    Grid/cells(columns: 26, rows: 100
+SOURCE
+HOLD
+LATEST
+List/map
+"#;
+        let err = parse_source("bad-unclosed.bn", source).unwrap_err();
+        assert!(err.message.contains("unclosed `(`"));
+        assert!(err.message.contains("line 4, column 15"));
     }
 }

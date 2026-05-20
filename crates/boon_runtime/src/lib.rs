@@ -1,8 +1,9 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use boon_ir::{
     DerivedValueKind, FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind,
     ListPredicate, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
+    verify_static_schedule,
 };
 use boon_parser::{ParsedProgram, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -154,6 +155,40 @@ impl<'a> GenericSourceEvent<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GenericRoutedSourceEvent<'a> {
+    event: GenericSourceEvent<'a>,
+    route_kind: GenericSourceRouteKind,
+}
+
+impl<'a> GenericRoutedSourceEvent<'a> {
+    fn source(self) -> &'a str {
+        self.event.source
+    }
+
+    fn require_text(self, step_id: &str) -> RuntimeResult<&'a str> {
+        self.event.text.ok_or_else(|| {
+            format!(
+                "{step_id} source `{}` route `{}` requires text",
+                self.event.source,
+                self.route_kind.as_str()
+            )
+            .into()
+        })
+    }
+
+    fn require_address(self, step_id: &str) -> RuntimeResult<&'a str> {
+        self.event.address.ok_or_else(|| {
+            format!(
+                "{step_id} source `{}` route `{}` requires address",
+                self.event.source,
+                self.route_kind.as_str()
+            )
+            .into()
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CellExpectation {
     pub address: String,
@@ -239,6 +274,11 @@ pub struct RenderPatch<'a> {
     pub kind: &'static str,
     pub target: RenderTarget<'a>,
     pub value: ProtocolValue<'a>,
+    pub list_id: Option<&'static str>,
+    pub key: Option<u64>,
+    pub generation: Option<u64>,
+    pub source_id: Option<u64>,
+    pub bind_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +333,11 @@ impl<'a> RenderPatch<'a> {
             kind: self.kind,
             target: self.target.to_static(),
             value: self.value.to_static(),
+            list_id: self.list_id,
+            key: self.key,
+            generation: self.generation,
+            source_id: self.source_id,
+            bind_epoch: self.bind_epoch,
         }
     }
 }
@@ -365,10 +410,15 @@ impl Serialize for RenderPatch<'_> {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("RenderPatch", 3)?;
+        let mut state = serializer.serialize_struct("RenderPatch", 8)?;
         state.serialize_field("kind", self.kind)?;
         state.serialize_field("target", &self.target)?;
         state.serialize_field("value", &self.value)?;
+        state.serialize_field("list_id", &self.list_id)?;
+        state.serialize_field("key", &self.key)?;
+        state.serialize_field("generation", &self.generation)?;
+        state.serialize_field("source_id", &self.source_id)?;
+        state.serialize_field("bind_epoch", &self.bind_epoch)?;
         state.end()
     }
 }
@@ -439,6 +489,7 @@ pub fn load_and_lower(source_path: &Path) -> RuntimeResult<(ParsedProgram, Typed
     let parsed = parse_source(source_path.display().to_string(), source)?;
     let ir = lower(&parsed)?;
     verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
     Ok((parsed, ir))
 }
 
@@ -517,6 +568,7 @@ pub fn run_scenario_source_with_step_limit(
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
     let ir = lower(&parsed)?;
     verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
     let mut scenario = parse_scenario(scenario_path)?;
     if let Some(step_limit) = step_limit {
         scenario.step.truncate(step_limit.min(scenario.step.len()));
@@ -557,6 +609,7 @@ impl LiveRuntime {
         let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
         let ir = lower(&parsed)?;
         verify_hidden_identity(&ir)?;
+        verify_static_schedule(&ir)?;
         let scenario = parse_scenario(scenario_path)?;
         if parsed.kind.as_str() != scenario.name {
             return Err(format!(
@@ -721,10 +774,14 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         "report_version",
         "generated_at_utc",
         "command",
+        "command_argv",
+        "exit_status",
         "git_commit",
+        "binary_hash",
         "source_hash",
         "scenario_hash",
         "program_hash",
+        "budget_hash",
         "graph_node_count",
         "per_step_pass_fail",
         "artifact_sha256s",
@@ -737,20 +794,146 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
         return Err(format!("{} did not pass", path.display()).into());
     }
+    verify_common_report_shape(&report, path)?;
     verify_report_file_hash(&report, path, "source_path", "source_hash")?;
     verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
     verify_artifact_hashes(&report, path)?;
     if report_is_runtime_execution_layer(&report) {
         verify_runtime_execution_metadata(&report, path)?;
     }
+    if report.get("playground_surface").is_some()
+        || report_layer_is(&report, "headed-smoke")
+        || report_layer_is(&report, "headed-ply")
+    {
+        verify_playground_surface_report(&report, path)?;
+    }
     if report_layer_is(&report, "speed") {
         verify_speed_report(&report, path)?;
+    }
+    if report_command_is(&report, "bench-todomvc") || report_command_is(&report, "bench-example") {
+        verify_benchmark_report(&report, path)?;
     }
     if report_layer_is(&report, "headed-ply") {
         verify_headed_artifacts(&report, path)?;
     }
+    if report_layer_is(&report, "os-input-probe") {
+        verify_os_input_probe_report(&report, path)?;
+    }
     if report_layer_is(&report, "human") {
         verify_human_artifacts(&report, path)?;
+    }
+    Ok(())
+}
+
+fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let version = report
+        .get("report_version")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} report_version is not a number", report_path.display()))?;
+    if version == 0 {
+        return Err(format!("{} report_version must be positive", report_path.display()).into());
+    }
+    let generated = report
+        .get("generated_at_utc")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} generated_at_utc is not a Unix-seconds string",
+                report_path.display()
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!(
+                "{} generated_at_utc is not parseable Unix seconds: {error}",
+                report_path.display()
+            )
+        })?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if generated > now.saturating_add(5) {
+        return Err(format!("{} is future-dated", report_path.display()).into());
+    }
+    let command = report
+        .get("command")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} command is not a string", report_path.display()))?;
+    if command.trim().is_empty() {
+        return Err(format!("{} command is empty", report_path.display()).into());
+    }
+    let argv = report
+        .get("command_argv")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} command_argv is not an array", report_path.display()))?;
+    if argv.is_empty()
+        || argv
+            .iter()
+            .any(|arg| arg.as_str().is_none_or(|arg| arg.trim().is_empty()))
+    {
+        return Err(format!(
+            "{} command_argv is empty or malformed",
+            report_path.display()
+        )
+        .into());
+    }
+    let exit_status = report
+        .get("exit_status")
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| format!("{} exit_status is not a number", report_path.display()))?;
+    if exit_status != 0 {
+        return Err(format!(
+            "{} pass report has nonzero exit_status",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail is not an array",
+                report_path.display()
+            )
+        })?;
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing string id",
+                    report_path.display()
+                )
+            })?;
+        if id.trim().is_empty() {
+            return Err(format!(
+                "{} per_step_pass_fail[{index}] has empty id",
+                report_path.display()
+            )
+            .into());
+        }
+        let pass = object
+            .get("pass")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing boolean pass",
+                    report_path.display()
+                )
+            })?;
+        if !pass {
+            return Err(format!(
+                "{} pass report contains failing check `{id}`",
+                report_path.display()
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -796,7 +979,630 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
     {
         return Err(format!("{} did not lower through typed IR", report_path.display()).into());
     }
+    if execution
+        .get("static_schedule_verified")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!("{} did not verify static schedule", report_path.display()).into());
+    }
+    if execution
+        .get("generic_interpreter_complete")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "{} did not complete generic interpreter execution",
+            report_path.display()
+        )
+        .into());
+    }
+    if execution
+        .get("example_behavior_adapter")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+    {
+        return Err(format!(
+            "{} still reports an example behavior adapter",
+            report_path.display()
+        )
+        .into());
+    }
+    if execution.get("implementation").and_then(JsonValue::as_str)
+        != Some("static_graph_interpreter")
+    {
+        return Err(format!(
+            "{} did not use static_graph_interpreter implementation",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_generic_runtime_slice_metadata(report, execution, report_path)?;
+    verify_runtime_report_contract(report, report_path)?;
     Ok(())
+}
+
+fn verify_generic_runtime_slice_metadata(
+    report: &JsonValue,
+    execution: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let Some(slices) = execution
+        .get("generic_runtime_slices")
+        .and_then(JsonValue::as_object)
+    else {
+        return Err(format!("{} missing generic_runtime_slices", report_path.display()).into());
+    };
+    let example = report
+        .get("example")
+        .and_then(JsonValue::as_str)
+        .or_else(|| execution.get("adapter_kind").and_then(JsonValue::as_str))
+        .or_else(|| example_name_from_report_path(report))
+        .unwrap_or_default();
+    require_generic_runtime_slice_flags(slices, example, report_path)?;
+    for (key, value) in slices {
+        let Some(flag) = value.as_bool() else {
+            continue;
+        };
+        if key == "surface_driver_borrows_generic_storage_for_tick" {
+            if flag {
+                return Err(format!(
+                    "{} reports surface driver borrowing generic storage for tick execution",
+                    report_path.display()
+                )
+                .into());
+            }
+            continue;
+        }
+        if key_is_other_example_runtime_slice(key, example) {
+            continue;
+        }
+        if !flag {
+            return Err(format!(
+                "{} generic runtime slice `{key}` did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn require_generic_runtime_slice_flags(
+    slices: &serde_json::Map<String, JsonValue>,
+    example: &str,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for key in [
+        "generic_executable_surface_inferred_from_ir",
+        "ir_update_branch_table_loaded",
+        "generic_scenario_loop_executor",
+        "generic_schedule_instantiated_before_adapter",
+        "loaded_runtime_owns_generic_schedule_storage",
+        "generic_source_event_ingest",
+        "generic_source_binding_store",
+        "generic_indexed_branch_evaluator",
+        "generic_semantic_delta_emitter",
+        "generic_source_mutation_semantic_delta_emitter",
+        "generic_derived_value_semantic_delta_emitter",
+        "generic_source_bind_semantic_delta_emitter",
+        "generic_list_remove_semantic_delta_emitter",
+        "generic_source_unbind_semantic_delta_emitter",
+        "generic_render_lowering_plan",
+        "generic_loaded_runtime_shell",
+        "generic_source_route_action_executor",
+        "generic_root_text_tick_executor",
+        "generic_indexed_hold_commit_executor",
+        "generic_list_append_source_binding_executor",
+        "generic_list_remove_source_unbinding_executor",
+        "generic_list_move_semantic_delta_emitter",
+        "generic_list_count_retain_executor",
+        "generic_loaded_runtime_state_summary_projection",
+        "generic_root_source_dispatch",
+        "generic_source_event_route_executor",
+        "generic_compiled_source_route_index",
+        "generic_source_route_classifier",
+        "generic_bound_source_target_resolution",
+        "generic_stale_source_key_generation_bind_epoch_rejection",
+        "generic_source_action_batch_executor",
+        "generic_source_route_scalar_expression_index",
+        "generic_indexed_text_route_index",
+        "generic_indexed_bool_route_index",
+        "generic_root_source_route_index",
+        "generic_list_remove_predicate_route",
+        "generic_routed_root_target_application",
+        "generic_routed_indexed_target_application",
+        "ir_list_operation_table_loaded",
+        "ir_formula_operation_table_loaded",
+        "ir_state_initializers_loaded",
+        "ir_list_initializers_loaded",
+        "ir_derived_value_table_loaded",
+        "generic_list_structural_commit_executor",
+    ] {
+        require_slice_bool(slices, key, true, report_path)?;
+    }
+    require_slice_bool(
+        slices,
+        "surface_driver_borrows_generic_storage_for_tick",
+        false,
+        report_path,
+    )?;
+    let example_specific = match example {
+        "todomvc" => &[
+            "generic_todomvc_common_render_patch_lowering",
+            "generic_todomvc_append_source_bind_render_lowering",
+            "generic_todomvc_edit_open_close_render_lowering",
+            "generic_todomvc_render_only_patch_lowering",
+            "generic_todomvc_source_effects_through_action_executor",
+            "generic_route_selected_todo_edit_text_commit_executor",
+            "generic_route_selected_todo_title_commit_executor",
+            "generic_route_selected_todo_editing_commit_executor",
+            "generic_todomvc_summary_reads_authoritative_storage",
+            "generic_todomvc_root_holds_no_mirror",
+            "generic_todomvc_rows_hold_no_mirror",
+            "generic_todomvc_delta_identities_from_authoritative_storage",
+            "generic_todomvc_source_route_classifier",
+            "generic_todomvc_routed_source_event",
+            "generic_todomvc_row_routed_source_event",
+            "generic_todomvc_visible_row_occurrence_resolution",
+            "generic_todomvc_source_action_mutation_batch",
+            "generic_todomvc_append_mutation_batch",
+            "generic_todomvc_list_index_action_input_resolution",
+            "generic_todomvc_scenario_expectation_assertions",
+            "generic_todomvc_scenario_preparation",
+            "generic_loaded_runtime_todomvc_root_step_executor",
+            "generic_loaded_runtime_todomvc_row_toggle_delete_executor",
+            "generic_loaded_runtime_todomvc_row_edit_source_executor",
+            "generic_loaded_runtime_todomvc_render_only_hover_executor",
+            "generic_loaded_runtime_todomvc_assertion_executor",
+            "generic_loaded_runtime_todomvc_stress_profile_executor",
+            "generic_routed_todo_bool_target_application",
+            "generic_routed_todo_edit_text_target_application",
+            "todomvc_root_scalar_holds_from_ir",
+            "todomvc_generic_hold_storage_authoritative",
+            "todomvc_title_hold_from_ir",
+            "todomvc_completed_bool_hold_from_ir",
+            "todomvc_editing_bool_hold_from_ir",
+            "todomvc_edit_text_hold_from_ir",
+            "todomvc_append_remove_from_ir",
+            "todomvc_count_and_filter_views_from_ir",
+        ][..],
+        "cells" => &[
+            "generic_cells_common_render_patch_lowering",
+            "generic_cells_source_effects_through_action_executor",
+            "generic_cells_source_route_classifier",
+            "generic_cells_address_row_context_resolution",
+            "generic_cells_routed_source_event",
+            "generic_cells_scenario_expectation_assertions",
+            "generic_cells_scenario_storage_preparation",
+            "generic_cells_formula_dependency_cache",
+            "generic_cells_formula_evaluation_cache",
+            "generic_cells_formula_derived_storage_sync",
+            "generic_cells_formula_display_mutation_emitter",
+            "generic_cells_formula_display_protocol_lowering",
+            "generic_cells_source_action_mutation_batch",
+            "generic_cells_editor_route_uses_indexed_targets",
+            "generic_cells_committed_fields_hold_no_mirror",
+            "cells_edit_state_holds_from_ir",
+            "cells_generic_hold_storage_authoritative",
+            "cells_summary_reads_authoritative_storage",
+            "cells_hidden_grid_keys_from_generic_storage",
+            "cells_formula_pipeline_from_ir",
+        ][..],
+        _ => {
+            return Err(format!(
+                "{} cannot determine executable example for generic runtime slices",
+                report_path.display()
+            )
+            .into());
+        }
+    };
+    for key in example_specific {
+        require_slice_bool(slices, key, true, report_path)?;
+    }
+    Ok(())
+}
+
+fn require_slice_bool(
+    slices: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    expected: bool,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let actual = slices
+        .get(key)
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} generic runtime slices missing boolean `{key}`",
+                report_path.display()
+            )
+        })?;
+    if actual != expected {
+        return Err(format!(
+            "{} generic runtime slice `{key}` expected {expected}, got {actual}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn key_is_other_example_runtime_slice(key: &str, example: &str) -> bool {
+    match example {
+        "todomvc" => {
+            key.starts_with("generic_cells") || key.starts_with("cells_") || key.contains("_cells_")
+        }
+        "cells" => {
+            key.starts_with("generic_todomvc")
+                || key.starts_with("todomvc_")
+                || key.contains("_todomvc_")
+        }
+        _ => false,
+    }
+}
+
+fn example_name_from_report_path(report: &JsonValue) -> Option<&str> {
+    let path = report.get("source_path").and_then(JsonValue::as_str)?;
+    if path.contains("todomvc") {
+        Some("todomvc")
+    } else if path.contains("cells") {
+        Some("cells")
+    } else {
+        None
+    }
+}
+
+fn verify_runtime_report_contract(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "source_path",
+        "runtime_profile",
+        "renderer",
+        "window_mode",
+        "window_backend",
+        "display_server",
+        "display_scale",
+        "window_size",
+        "framebuffer_size",
+        "total_ticks",
+        "total_source_events",
+        "total_semantic_deltas",
+        "total_render_deltas",
+        "max_dirty_nodes",
+        "max_dirty_keys",
+        "allocations",
+        "latency_ms_p50_p95_p99_max",
+        "rss_delta_mib_steady_peak",
+        "vram_delta_mib_steady_peak_or_unavailable_reason",
+        "failure_artifacts",
+        "semantic_delta_protocol_batches",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} runtime report missing documented field `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    verify_semantic_delta_protocol_batches(report, report_path)?;
+    verify_render_patch_protocol_identity(report, report_path)?;
+    let rss_delta = report
+        .get("rss_delta_mib_steady_peak")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime report rss_delta_mib_steady_peak is not an object",
+                report_path.display()
+            )
+        })?;
+    for key in ["steady", "peak", "baseline", "measurement"] {
+        if rss_delta.get(key).is_none() {
+            return Err(format!(
+                "{} runtime report RSS delta missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let baseline = report
+        .get("baseline_rss_mib")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{} missing numeric baseline_rss_mib", report_path.display()))?;
+    let steady = report
+        .get("steady_rss_mib")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{} missing numeric steady_rss_mib", report_path.display()))?;
+    if steady < baseline {
+        return Err(format!(
+            "{} has steady RSS below baseline RSS",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_playground_surface_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "example_selector",
+        "code_editor",
+        "run_reset_step_controls",
+        "render_preview",
+        "semantic_delta_log",
+        "selected_value_inspector",
+        "dependency_explanation_panel",
+    ] {
+        let claimed = report
+            .get("playground_surface")
+            .and_then(|surface| surface.get(key))
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+        if !claimed {
+            return Err(format!(
+                "{} playground surface `{key}` is not claimed present",
+                report_path.display()
+            )
+            .into());
+        }
+        let proof = report
+            .get("playground_surface_visible_bounds")
+            .and_then(|bounds| bounds.get(key))
+            .ok_or_else(|| {
+                format!(
+                    "{} playground surface `{key}` missing visible bounds proof",
+                    report_path.display()
+                )
+            })?;
+        if proof.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} playground surface `{key}` visible bounds did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+        let elements = proof
+            .get("elements")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} playground surface `{key}` missing element bounds",
+                    report_path.display()
+                )
+            })?;
+        if elements.is_empty() {
+            return Err(format!(
+                "{} playground surface `{key}` has no visible elements",
+                report_path.display()
+            )
+            .into());
+        }
+        for element in elements {
+            let visible = element.get("visible").and_then(JsonValue::as_bool) == Some(true);
+            let width = element
+                .get("bounds")
+                .and_then(|bounds| bounds.get("width"))
+                .and_then(JsonValue::as_f64)
+                .unwrap_or_default();
+            let height = element
+                .get("bounds")
+                .and_then(|bounds| bounds.get("height"))
+                .and_then(JsonValue::as_f64)
+                .unwrap_or_default();
+            if !visible || width <= 0.0 || height <= 0.0 {
+                return Err(format!(
+                    "{} playground surface `{key}` has an invisible or zero-size element",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_render_patch_protocol_identity(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let patches = report
+        .get("render_patches")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing render_patches array", report_path.display()))?;
+    let total_render_deltas = report
+        .get("total_render_deltas")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default() as usize;
+    if patches.len() != total_render_deltas {
+        return Err(format!(
+            "{} render_patches length {} does not match total_render_deltas {total_render_deltas}",
+            report_path.display(),
+            patches.len()
+        )
+        .into());
+    }
+    for patch in patches {
+        let kind = patch
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<unknown>");
+        let target = patch
+            .get("target")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        let keyed_patch =
+            target.starts_with("todos:") || matches!(kind, "SetCellEditor" | "SetCellText");
+        if keyed_patch {
+            for key in ["list_id", "key", "generation"] {
+                if patch.get(key).is_none_or(JsonValue::is_null) {
+                    return Err(format!(
+                        "{} keyed render patch `{kind}` missing `{key}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        if matches!(kind, "BindSource" | "UnbindSource") {
+            for key in ["source_id", "bind_epoch"] {
+                if patch.get(key).is_none_or(JsonValue::is_null) {
+                    return Err(format!(
+                        "{} source render patch `{kind}` missing `{key}`",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_semantic_delta_protocol_batches(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let batches = report
+        .get("semantic_delta_protocol_batches")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime report semantic_delta_protocol_batches is not an array",
+                report_path.display()
+            )
+        })?;
+    let expected_program_hash = report
+        .get("program_hash")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing program_hash", report_path.display()))?;
+    let mut expected_base_epoch = 0u64;
+    let mut expected_runtime_id: Option<String> = None;
+    let mut total_changes = 0usize;
+    for batch in batches {
+        let base_epoch = json_u64(batch, "base_epoch", report_path)?;
+        let next_epoch = json_u64(batch, "next_epoch", report_path)?;
+        if base_epoch != expected_base_epoch || next_epoch != base_epoch + 1 {
+            return Err(format!(
+                "{} has non-monotonic semantic delta epochs",
+                report_path.display()
+            )
+            .into());
+        }
+        if batch.get("program_hash").and_then(JsonValue::as_str) != Some(expected_program_hash) {
+            return Err(format!(
+                "{} semantic delta batch has stale program_hash",
+                report_path.display()
+            )
+            .into());
+        }
+        let runtime_id = batch
+            .get("runtime_id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{} semantic delta batch missing nonempty runtime_id",
+                    report_path.display()
+                )
+            })?;
+        match &expected_runtime_id {
+            Some(expected) if expected != runtime_id => {
+                return Err(format!(
+                    "{} semantic delta batch changed runtime_id",
+                    report_path.display()
+                )
+                .into());
+            }
+            None => expected_runtime_id = Some(runtime_id.to_owned()),
+            _ => {}
+        }
+        let server_tick = json_u64(batch, "server_tick", report_path)?;
+        if server_tick != next_epoch {
+            return Err(format!(
+                "{} semantic delta batch server_tick does not match next_epoch",
+                report_path.display()
+            )
+            .into());
+        }
+        if batch
+            .get("step_id")
+            .and_then(JsonValue::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "{} semantic delta batch missing nonempty step_id",
+                report_path.display()
+            )
+            .into());
+        }
+        let changes = batch
+            .get("changes")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} semantic delta batch missing changes array",
+                    report_path.display()
+                )
+            })?;
+        for change in changes {
+            verify_semantic_delta_identity(change, report_path)?;
+        }
+        total_changes += changes.len();
+        expected_base_epoch = next_epoch;
+    }
+    let total_semantic_deltas = report
+        .get("total_semantic_deltas")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default() as usize;
+    if total_changes != total_semantic_deltas {
+        return Err(format!(
+            "{} semantic delta batches contain {total_changes} changes, expected {total_semantic_deltas}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_semantic_delta_identity(change: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let kind = change
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<unknown>");
+    let list_id_present = change.get("list_id").is_some_and(|value| !value.is_null());
+    if list_id_present {
+        for key in ["key", "generation"] {
+            if change.get(key).is_none_or(JsonValue::is_null) {
+                return Err(format!(
+                    "{} keyed semantic delta `{kind}` missing `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    if matches!(kind, "SourceBind" | "SourceUnbind") {
+        for key in ["source_id", "bind_epoch"] {
+            if change.get(key).is_none_or(JsonValue::is_null) {
+                return Err(format!(
+                    "{} source semantic delta `{kind}` missing `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn json_u64(value: &JsonValue, key: &str, report_path: &Path) -> RuntimeResult<u64> {
+    value.get(key).and_then(JsonValue::as_u64).ok_or_else(|| {
+        format!(
+            "{} semantic delta protocol batch missing numeric `{key}`",
+            report_path.display()
+        )
+        .into()
+    })
 }
 
 fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -806,6 +1612,48 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
             report_path.display()
         )
         .into());
+    }
+    for key in [
+        "cpu_model",
+        "gpu_model_if_available",
+        "os",
+        "display_server",
+        "window_backend",
+        "display_scale",
+        "semantic_tick_ms_p50_p95_p99_max",
+        "render_lowering_ms_p50_p95_p99_max",
+        "ply_patch_apply_ms_p50_p95_p99_max",
+        "input_to_idle_ms_p50_p95_p99_max",
+        "frame_time_ms_p50_p95_p99_max",
+        "missed_frame_count",
+        "operation_count",
+        "per_operation_outliers",
+        "baseline_rss_mib",
+        "steady_rss_mib",
+        "peak_rss_mib",
+        "baseline_vram_mib_if_available",
+        "steady_vram_mib_if_available",
+        "peak_vram_mib_if_available",
+        "heap_alloc_count_per_step",
+        "heap_alloc_bytes_per_step",
+        "apply_heap_alloc_count",
+        "apply_heap_alloc_bytes",
+        "expectation_heap_alloc_count",
+        "expectation_heap_alloc_bytes",
+        "graph_node_count",
+        "graph_rebuild_count",
+        "list_slot_count",
+        "dirty_node_count_p50_p95_p99_max",
+        "dirty_key_count_p50_p95_p99_max",
+        "render_patch_count_p50_p95_p99_max",
+    ] {
+        if report.get(key).is_none() {
+            return Err(format!(
+                "{} speed report missing documented field `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
     }
     let checks = report
         .get("budget_check")
@@ -822,16 +1670,502 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
             (value.get("pass").and_then(JsonValue::as_bool) != Some(true)).then_some(name.as_str())
         })
         .collect::<Vec<_>>();
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !failed.is_empty() {
+        return Err(format!(
             "{} speed budget failed: {}",
             report_path.display(),
             failed.join(", ")
         )
-        .into())
+        .into());
     }
+    verify_speed_stress_profiles(report, report_path)
+}
+
+fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let benchmark = report
+        .get("benchmark")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing benchmark object",
+                report_path.display()
+            )
+        })?;
+    let iterations = benchmark
+        .get("iterations")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing positive iteration count",
+                report_path.display()
+            )
+        })?;
+    if iterations == 0 {
+        return Err(format!(
+            "{} benchmark report has zero iterations",
+            report_path.display()
+        )
+        .into());
+    }
+    let total_ms = benchmark
+        .get("total_ms")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing total_ms",
+                report_path.display()
+            )
+        })?;
+    let average_ms = benchmark
+        .get("average_ms_per_iteration")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing average_ms_per_iteration",
+                report_path.display()
+            )
+        })?;
+    if total_ms <= 0.0 || average_ms <= 0.0 {
+        return Err(format!(
+            "{} benchmark report timing must be positive",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected_average = total_ms / iterations as f64;
+    if (average_ms - expected_average).abs() > 0.001_f64.max(expected_average.abs() * 0.001) {
+        return Err(format!(
+            "{} benchmark average does not match total_ms / iterations",
+            report_path.display()
+        )
+        .into());
+    }
+    if benchmark
+        .get("speed_report_layer")
+        .and_then(JsonValue::as_str)
+        != Some("speed")
+    {
+        return Err(format!(
+            "{} benchmark report is not linked to a speed-layer report",
+            report_path.display()
+        )
+        .into());
+    }
+    if benchmark
+        .get("iteration_scope")
+        .and_then(JsonValue::as_str)
+        .is_none_or(|scope| !scope.contains("full_speed_layer_scenario"))
+    {
+        return Err(format!(
+            "{} benchmark report does not describe full speed-layer scenario iterations",
+            report_path.display()
+        )
+        .into());
+    }
+    if benchmark
+        .get("heap_alloc_count_after_warmup")
+        .and_then(JsonValue::as_u64)
+        != Some(0)
+    {
+        return Err(format!(
+            "{} benchmark report does not prove zero post-warmup allocations",
+            report_path.display()
+        )
+        .into());
+    }
+    if report_command_is(report, "bench-example")
+        && benchmark
+            .get("example")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "{} bench-example report missing benchmark.example",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let speed_report_path = benchmark
+        .get("speed_report_path")
+        .and_then(JsonValue::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing speed_report_path",
+                report_path.display()
+            )
+        })?;
+    let speed_report_path = Path::new(speed_report_path);
+    verify_report_schema(speed_report_path)?;
+    let linked: JsonValue = serde_json::from_slice(&fs::read(speed_report_path)?)?;
+    for key in [
+        "source_hash",
+        "scenario_hash",
+        "program_hash",
+        "budget_hash",
+        "graph_node_count",
+        "budget_check",
+        "input_to_idle_ms_p50_p95_p99_max",
+        "semantic_tick_ms_p50_p95_p99_max",
+        "render_lowering_ms_p50_p95_p99_max",
+        "ply_patch_apply_ms_p50_p95_p99_max",
+        "frame_time_ms_p50_p95_p99_max",
+        "dirty_key_count_p50_p95_p99_max",
+        "render_patch_count_p50_p95_p99_max",
+        "graph_rebuild_count",
+        "allocations",
+        "stress_profiles",
+    ] {
+        if report.get(key) != linked.get(key) {
+            return Err(format!(
+                "{} benchmark report does not copy `{key}` from linked speed report `{}`",
+                report_path.display(),
+                speed_report_path.display()
+            )
+            .into());
+        }
+    }
+    let linked_hash = sha256_file(speed_report_path)?;
+    let artifact_hash_matches = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|artifacts| {
+            artifacts.iter().any(|artifact| {
+                artifact.get("path").and_then(JsonValue::as_str)
+                    == Some(speed_report_path.to_string_lossy().as_ref())
+                    && artifact.get("sha256").and_then(JsonValue::as_str)
+                        == Some(linked_hash.as_str())
+            })
+        });
+    if !artifact_hash_matches {
+        return Err(format!(
+            "{} benchmark report does not hash linked speed report `{}`",
+            report_path.display(),
+            speed_report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_speed_stress_profiles(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let stress_profiles = report
+        .get("stress_profiles")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report missing stress_profiles",
+                report_path.display()
+            )
+        })?;
+    if stress_profiles.is_empty() {
+        return Err(format!(
+            "{} speed report has no stress profiles",
+            report_path.display()
+        )
+        .into());
+    }
+    let base_graph_node_count = report
+        .get("graph_node_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report missing graph_node_count",
+                report_path.display()
+            )
+        })?;
+    for profile in stress_profiles {
+        let name = profile
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<unnamed>");
+        let graph_node_count = profile
+            .get("graph_node_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} stress profile `{name}` missing graph_node_count",
+                    report_path.display()
+                )
+            })?;
+        if graph_node_count != base_graph_node_count {
+            return Err(format!(
+                "{} stress profile `{name}` changed graph topology",
+                report_path.display()
+            )
+            .into());
+        }
+        if profile
+            .get("graph_clones_per_item")
+            .and_then(JsonValue::as_u64)
+            != Some(0)
+        {
+            return Err(format!(
+                "{} stress profile `{name}` cloned runtime graph per item",
+                report_path.display()
+            )
+            .into());
+        }
+        let heap_alloc_count = profile
+            .get("heap_alloc_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} stress profile `{name}` missing heap_alloc_count",
+                    report_path.display()
+                )
+            })?;
+        let heap_alloc_bytes = profile
+            .get("heap_alloc_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} stress profile `{name}` missing heap_alloc_bytes",
+                    report_path.display()
+                )
+            })?;
+        if heap_alloc_count != 0 || heap_alloc_bytes != 0 {
+            return Err(format!(
+                "{} stress profile `{name}` allocated after warmup: {heap_alloc_count} allocations / {heap_alloc_bytes} bytes",
+                report_path.display()
+            )
+            .into());
+        }
+        let dirty_count = profile
+            .get("dirty_key_count")
+            .or_else(|| profile.get("dirty_cell_count"))
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} stress profile `{name}` missing dirty key/cell count",
+                    report_path.display()
+                )
+            })?;
+        let expected_fanout = profile.get("expected_fanout").and_then(JsonValue::as_u64);
+        let expected_dirty_count = profile
+            .get("expected_dirty_cell_count")
+            .and_then(JsonValue::as_u64);
+        let dirty_count_is_proportional = if let Some(expected_fanout) = expected_fanout {
+            let allowed_dirty_count = expected_fanout.saturating_add(1);
+            dirty_count == expected_dirty_count.unwrap_or(allowed_dirty_count)
+                && dirty_count <= allowed_dirty_count
+        } else {
+            (1..=8).contains(&dirty_count)
+        };
+        if !dirty_count_is_proportional {
+            return Err(format!(
+                "{} stress profile `{name}` has non-proportional dirty work count {dirty_count}",
+                report_path.display()
+            )
+            .into());
+        }
+        let render_patch_count = profile
+            .get("render_patch_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} stress profile `{name}` missing render_patch_count",
+                    report_path.display()
+                )
+            })?;
+        if render_patch_count > 8 {
+            return Err(format!(
+                "{} stress profile `{name}` has non-proportional render patch count {render_patch_count}",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    verify_documented_stress_profile_coverage(report, report_path, stress_profiles)?;
+    Ok(())
+}
+
+fn verify_documented_stress_profile_coverage(
+    report: &JsonValue,
+    report_path: &Path,
+    stress_profiles: &[JsonValue],
+) -> RuntimeResult<()> {
+    let program_kind = report
+        .get("program_kind")
+        .or_else(|| report.get("example"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            report
+                .get("source_path")
+                .and_then(JsonValue::as_str)
+                .and_then(|path| {
+                    if path.contains("todomvc") {
+                        Some("todomvc")
+                    } else if path.contains("cells") {
+                        Some("cells")
+                    } else {
+                        None
+                    }
+                })
+        });
+    match program_kind {
+        Some("todomvc") => verify_todomvc_stress_profile_coverage(report_path, stress_profiles),
+        Some("cells") => verify_cells_stress_profile_coverage(report_path, stress_profiles),
+        _ => Ok(()),
+    }
+}
+
+fn verify_todomvc_stress_profile_coverage(
+    report_path: &Path,
+    stress_profiles: &[JsonValue],
+) -> RuntimeResult<()> {
+    let rows = stress_profiles
+        .iter()
+        .filter_map(|profile| profile.get("rows").and_then(JsonValue::as_u64))
+        .collect::<BTreeSet<_>>();
+    for required in [1_000, 10_000] {
+        if !rows.contains(&required) {
+            return Err(format!(
+                "{} TodoMVC speed report missing documented {required}-row stress profile",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let has_10k_move = stress_profiles.iter().any(|profile| {
+        profile
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|name| name.contains("10000") && name.contains("move"))
+    });
+    if !has_10k_move {
+        return Err(format!(
+            "{} TodoMVC speed report missing documented 10,000-row move/LIST-change stress profile",
+            report_path.display()
+        )
+        .into());
+    }
+    for profile in stress_profiles {
+        if let Some(rows) = profile.get("rows").and_then(JsonValue::as_u64) {
+            let slots = profile
+                .get("list_slot_count")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{} TodoMVC stress profile missing list_slot_count",
+                        report_path.display()
+                    )
+                })?;
+            if slots != rows {
+                return Err(format!(
+                    "{} TodoMVC stress profile row count {rows} does not match list_slot_count {slots}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_cells_stress_profile_coverage(
+    report_path: &Path,
+    stress_profiles: &[JsonValue],
+) -> RuntimeResult<()> {
+    for required in [
+        "cells-26x100-unrelated-edit",
+        "cells-26x100-dependent-edit",
+        "cells-26x100-fanout-100-update",
+    ] {
+        if !stress_profiles
+            .iter()
+            .any(|profile| profile.get("name").and_then(JsonValue::as_str) == Some(required))
+        {
+            return Err(format!(
+                "{} Cells speed report missing documented stress profile `{required}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for profile in stress_profiles {
+        let name = profile
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("<unnamed>");
+        for key in [
+            "cells",
+            "dirty_cell_count",
+            "recompute_candidate_count",
+            "formula_eval_call_count",
+            "dependency_edge_walk_count",
+            "recomputed_cells",
+        ] {
+            if profile.get(key).is_none() {
+                return Err(format!(
+                    "{} Cells stress profile `{name}` missing `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if profile.get("cells").and_then(JsonValue::as_u64) != Some(26 * 100) {
+            return Err(format!(
+                "{} Cells stress profile `{name}` is not bound to the documented 26x100 grid",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let fanout = stress_profiles
+        .iter()
+        .find(|profile| {
+            profile.get("name").and_then(JsonValue::as_str)
+                == Some("cells-26x100-fanout-100-update")
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} missing Cells fanout stress profile",
+                report_path.display()
+            )
+        })?;
+    let expected_fanout = fanout
+        .get("expected_fanout")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} Cells fanout stress profile missing expected_fanout",
+                report_path.display()
+            )
+        })?;
+    let expected_dirty = expected_fanout + 1;
+    for key in [
+        "dirty_cell_count",
+        "recompute_candidate_count",
+        "recomputed_cell_count",
+    ] {
+        let value = fanout.get(key).and_then(JsonValue::as_u64).ok_or_else(|| {
+            format!(
+                "{} Cells fanout stress profile missing `{key}`",
+                report_path.display()
+            )
+        })?;
+        if value != expected_dirty {
+            return Err(format!(
+                "{} Cells fanout stress profile `{key}`={value}, expected {expected_dirty}",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let edge_walks = fanout
+        .get("dependency_edge_walk_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if edge_walks < expected_fanout {
+        return Err(format!(
+            "{} Cells fanout stress profile walked only {edge_walks} dependency edges for fanout {expected_fanout}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn verify_report_file_hash(
@@ -884,6 +2218,44 @@ fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResu
 }
 
 fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    for key in [
+        "window_pid",
+        "window_title",
+        "display_server",
+        "display_socket_or_compositor_connection",
+        "display_scale",
+        "window_size",
+        "input_backend",
+        "capture_backend",
+        "focused_window_proof",
+        "checkpoint_screenshot_or_video_paths",
+    ] {
+        if report.get(key).is_none_or(JsonValue::is_null) {
+            return Err(
+                format!("{} missing headed metadata `{key}`", report_path.display()).into(),
+            );
+        }
+    }
+    for key in [
+        "window_title",
+        "display_server",
+        "display_socket_or_compositor_connection",
+        "input_backend",
+        "capture_backend",
+        "focused_window_proof",
+    ] {
+        if report
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "{} has empty headed metadata `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     let injection_method = report
         .get("input_injection_method")
         .and_then(JsonValue::as_str)
@@ -913,6 +2285,18 @@ fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeRes
     if injection_method.contains("os_") && !os_probe_passed {
         return Err(format!(
             "{} claims OS input but does not include a passing OS input probe",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("os_pointer_probe")
+        .and_then(|probe| probe.get("status"))
+        .and_then(JsonValue::as_str)
+        == Some("fail")
+    {
+        return Err(format!(
+            "{} includes an attempted but failed OS pointer probe",
             report_path.display()
         )
         .into());
@@ -971,6 +2355,111 @@ fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeRes
     Ok(())
 }
 
+fn verify_os_input_probe_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    if report.get("command").and_then(JsonValue::as_str) != Some("os-input-probe") {
+        return Err(format!("{} is not an os-input-probe report", report_path.display()).into());
+    }
+    if report
+        .get("input_injection_method")
+        .and_then(JsonValue::as_str)
+        != Some("os_keyboard_to_visible_window")
+    {
+        return Err(format!(
+            "{} standalone OS probe must use os_keyboard_to_visible_window",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("input_backend")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!("{} missing input_backend", report_path.display()).into());
+    }
+    if report
+        .get("focused_window_proof")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!("{} missing focused_window_proof", report_path.display()).into());
+    }
+    let window_pid = report
+        .get("window_pid")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if window_pid == 0 {
+        return Err(format!("{} missing valid window_pid", report_path.display()).into());
+    }
+    let probe = report
+        .get("os_input_probe")
+        .ok_or_else(|| format!("{} missing os_input_probe", report_path.display()))?;
+    if probe.get("status").and_then(JsonValue::as_str) != Some("pass")
+        || probe.get("typed").and_then(JsonValue::as_bool) != Some(true)
+    {
+        return Err(format!("{} OS input probe did not pass", report_path.display()).into());
+    }
+    if probe.get("focused_ply_element").and_then(JsonValue::as_str) != Some("os_probe_input") {
+        return Err(format!(
+            "{} OS input probe did not target os_probe_input",
+            report_path.display()
+        )
+        .into());
+    }
+    if probe
+        .get("tool")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!("{} OS input probe missing tool", report_path.display()).into());
+    }
+    let artifact = probe
+        .get("artifact")
+        .ok_or_else(|| format!("{} OS input probe missing artifact", report_path.display()))?;
+    let artifact_path = artifact
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} OS input probe artifact missing path",
+                report_path.display()
+            )
+        })?;
+    let expected_hash = artifact
+        .get("sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} OS input probe artifact missing sha256",
+                report_path.display()
+            )
+        })?;
+    let actual_hash = sha256_file(Path::new(artifact_path))?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "{} OS input probe artifact hash mismatch for `{artifact_path}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let nonzero = artifact
+        .get("nonzero_channels")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let unique = artifact
+        .get("unique_rgba_values")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if nonzero == 0 || unique <= 1 {
+        return Err(format!(
+            "{} OS input probe screenshot is blank",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn verify_full_os_input_steps(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let scenario_path = report
         .get("scenario_path")
@@ -1007,6 +2496,7 @@ fn verify_full_os_input_steps(report: &JsonValue, report_path: &Path) -> Runtime
         .flatten()
         .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
         .collect::<BTreeSet<_>>();
+    verify_full_os_input_coverage(report, &scenario, report_path)?;
     for (expected, observed) in scenario.step.iter().zip(steps) {
         let id = observed
             .get("id")
@@ -1100,19 +2590,166 @@ fn verify_full_os_input_steps(report: &JsonValue, report_path: &Path) -> Runtime
     Ok(())
 }
 
+fn verify_full_os_input_coverage(
+    report: &JsonValue,
+    scenario: &Scenario,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let coverage = report.get("os_input_coverage").ok_or_else(|| {
+        format!(
+            "{} full OS headed report missing os_input_coverage",
+            report_path.display()
+        )
+    })?;
+    for key in [
+        "source_event_probe_missing_labels",
+        "step_control_missing_labels",
+        "missing_full_os_pointer_keyboard_steps",
+    ] {
+        let Some(items) = coverage.get(key).and_then(JsonValue::as_array) else {
+            return Err(format!(
+                "{} full OS headed report missing os_input_coverage.{key}",
+                report_path.display()
+            )
+            .into());
+        };
+        if !items.is_empty() {
+            return Err(format!(
+                "{} full OS headed report has uncovered OS-input labels in {key}: {items:?}",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let source_required = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_some())
+        .map(|step| step.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let source_observations = report
+        .get("visible_source_event_os_input")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} full OS headed report missing visible_source_event_os_input",
+                report_path.display()
+            )
+        })?;
+    let source_covered = source_observations
+        .iter()
+        .filter(|observation| {
+            observation.get("pass").and_then(JsonValue::as_bool) == Some(true)
+                && observation
+                    .get("runtime_mutation_observed")
+                    .and_then(JsonValue::as_bool)
+                    == Some(true)
+                && observation
+                    .get("source_event_observed")
+                    .is_some_and(|event| !event.is_null())
+        })
+        .filter_map(|observation| {
+            observation
+                .get("scenario_step_id")
+                .and_then(JsonValue::as_str)
+        })
+        .collect::<BTreeSet<_>>();
+    let missing_source = source_required
+        .difference(&source_covered)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_source.is_empty() {
+        return Err(format!(
+            "{} full OS headed report lacks visible SOURCE-event OS-input proof for labels: {missing_source:?}",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let step_required = scenario
+        .step
+        .iter()
+        .skip(1)
+        .map(|step| step.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let step_observations = report
+        .get("visible_step_control_os_input")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} full OS headed report missing visible_step_control_os_input",
+                report_path.display()
+            )
+        })?;
+    let step_covered = step_observations
+        .iter()
+        .filter(|observation| observation.get("pass").and_then(JsonValue::as_bool) == Some(true))
+        .filter_map(|observation| observation.get("id").and_then(JsonValue::as_str))
+        .collect::<BTreeSet<_>>();
+    let missing_steps = step_required
+        .difference(&step_covered)
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_steps.is_empty() {
+        return Err(format!(
+            "{} full OS headed report lacks visible Step-control OS-input proof for labels: {missing_steps:?}",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let app_control_passed = report
+        .get("visible_app_control_os_input")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|observations| {
+            observations.iter().any(|observation| {
+                observation.get("pass").and_then(JsonValue::as_bool) == Some(true)
+            })
+        });
+    if !app_control_passed {
+        return Err(format!(
+            "{} full OS headed report missing a passing visible app-control OS-input probe",
+            report_path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     for key in [
         "command_argv",
         "exit_status",
+        "manual_report_prepared_by",
+        "manual_report_template_path",
+        "manual_report_template_sha256",
         "binary_hash",
         "budget_hash",
         "display_server",
+        "display_socket_or_compositor_connection",
         "window_backend",
         "display_scale",
+        "window_pid",
         "window_title",
+        "input_backend",
+        "capture_backend",
+        "focused_window_proof",
+        "input_injection_method",
         "checkpoint_screenshot_or_video_paths",
+        "visual_checkpoint_pass_fail",
+        "headed_report_path",
+        "headed_report_sha256",
+        "headed_input_injection_method",
+        "headed_os_input_step_count",
+        "headed_os_input_missing_labels",
+        "manual_artifact_capture_method",
+        "manual_started_at_utc",
+        "manual_finished_at_utc",
+        "manual_session_duration_seconds",
     ] {
-        if report.get(key).is_none() {
+        if report.get(key).is_none_or(JsonValue::is_null) {
             return Err(format!(
                 "{} missing manual report metadata `{key}`",
                 report_path.display()
@@ -1124,12 +2761,203 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         "binary_hash",
         "budget_hash",
         "display_server",
+        "display_socket_or_compositor_connection",
         "window_backend",
         "display_scale",
         "window_title",
+        "input_backend",
+        "capture_backend",
+        "focused_window_proof",
+        "input_injection_method",
+        "manual_report_prepared_by",
+        "manual_report_template_path",
+        "manual_report_template_sha256",
         "manual_notes",
+        "manual_artifact_capture_method",
+        "headed_report_path",
+        "headed_report_sha256",
+        "headed_input_injection_method",
+        "manual_started_at_utc",
+        "manual_finished_at_utc",
+        "manual_session_duration_seconds",
     ] {
         reject_manual_placeholder(report, report_path, key)?;
+    }
+    let headed_report_path = report
+        .get("headed_report_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing headed report path", report_path.display()))?;
+    let headed_report_hash = report
+        .get("headed_report_sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing headed report hash", report_path.display()))?;
+    let actual_headed_hash = sha256_file(Path::new(headed_report_path))?;
+    if actual_headed_hash != headed_report_hash {
+        return Err(format!(
+            "{} has stale headed report hash for `{headed_report_path}`",
+            report_path.display()
+        )
+        .into());
+    }
+    verify_report_schema(Path::new(headed_report_path))?;
+    let headed_report: JsonValue = serde_json::from_slice(&fs::read(headed_report_path)?)?;
+    if headed_report.get("layer").and_then(JsonValue::as_str) != Some("headed-ply") {
+        return Err(format!(
+            "{} linked headed report `{headed_report_path}` is not headed-ply",
+            report_path.display()
+        )
+        .into());
+    }
+    if headed_report
+        .get("input_injection_method")
+        .and_then(JsonValue::as_str)
+        != Some("os_pointer_keyboard_to_visible_window")
+    {
+        return Err(format!(
+            "{} linked headed report does not prove full OS pointer/keyboard input",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("headed_input_injection_method")
+        .and_then(JsonValue::as_str)
+        != Some("os_pointer_keyboard_to_visible_window")
+    {
+        return Err(format!(
+            "{} manual report did not copy full headed OS input method",
+            report_path.display()
+        )
+        .into());
+    }
+    let headed_missing = report
+        .get("headed_os_input_missing_labels")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} missing headed OS input missing-label list",
+                report_path.display()
+            )
+        })?;
+    if !headed_missing.is_empty() {
+        return Err(format!(
+            "{} manual report links headed run with missing OS input labels",
+            report_path.display()
+        )
+        .into());
+    }
+    let headed_steps = headed_report
+        .get("os_input_steps")
+        .and_then(JsonValue::as_array)
+        .map(Vec::len)
+        .unwrap_or_default() as u64;
+    if json_u64_field(report, "headed_os_input_step_count")? != headed_steps {
+        return Err(format!(
+            "{} manual report headed step count does not match linked headed report",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in ["source_hash", "scenario_hash", "program_hash"] {
+        if report.get(key) != headed_report.get(key) {
+            return Err(format!(
+                "{} manual `{key}` does not match linked headed report",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let started = json_u64_field(report, "manual_started_at_utc")?;
+    let finished = json_u64_field(report, "manual_finished_at_utc")?;
+    let duration = json_u64_field(report, "manual_session_duration_seconds")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if started > now || finished > now {
+        return Err(format!(
+            "{} has future-dated manual session timing",
+            report_path.display()
+        )
+        .into());
+    }
+    if finished < started || duration == 0 || finished.saturating_sub(started) != duration {
+        return Err(format!(
+            "{} has inconsistent manual session timing",
+            report_path.display()
+        )
+        .into());
+    }
+    let generated = json_u64_field(report, "generated_at_utc")?;
+    if generated < finished {
+        return Err(format!(
+            "{} was generated before the recorded manual session finished",
+            report_path.display()
+        )
+        .into());
+    }
+    let prepared_by = report
+        .get("manual_report_prepared_by")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} missing manual report preparation command",
+                report_path.display()
+            )
+        })?;
+    if !(prepared_by.starts_with("prepare-") && prepared_by.ends_with("-human-report")) {
+        return Err(format!(
+            "{} was not prepared by a repo human-report helper",
+            report_path.display()
+        )
+        .into());
+    }
+    let command = report
+        .get("command")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if command != prepared_by {
+        return Err(format!(
+            "{} command `{command}` does not match manual_report_prepared_by `{prepared_by}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let command_argv = report
+        .get("command_argv")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing command_argv", report_path.display()))?;
+    let command_args = command_argv
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .collect::<BTreeSet<_>>();
+    for required_arg in [
+        prepared_by,
+        "--window-pid",
+        "--focused-window-proof",
+        "--artifact",
+        "--pass-label",
+    ] {
+        if !command_args.contains(required_arg) {
+            return Err(format!(
+                "{} command_argv does not prove helper argument `{required_arg}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let template_path = report
+        .get("manual_report_template_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing manual template path", report_path.display()))?;
+    let template_hash = report
+        .get("manual_report_template_sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing manual template hash", report_path.display()))?;
+    let actual_template_hash = sha256_file(Path::new(template_path))?;
+    if actual_template_hash != template_hash {
+        return Err(format!(
+            "{} has stale manual template hash for `{template_path}`",
+            report_path.display()
+        )
+        .into());
     }
     let observer = report
         .get("manual_observer")
@@ -1138,6 +2966,11 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
     if matches!(observer, "" | "fixture" | "unknown")
         || observer.contains("fill")
         || observer.contains("copy-from")
+        || observer.contains("replace-with")
+        || observer.to_ascii_lowercase().contains("codex")
+        || observer.to_ascii_lowercase().contains("automation")
+        || observer.to_ascii_lowercase().contains("automated")
+        || observer.to_ascii_lowercase().contains("script")
     {
         return Err(format!(
             "{} has non-human manual observer `{observer}`",
@@ -1152,6 +2985,56 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
             report_path.display()
         )
         .into());
+    }
+    if report
+        .get("input_injection_method")
+        .and_then(JsonValue::as_str)
+        != Some("human_visible_window")
+    {
+        return Err(format!(
+            "{} manual report must mark input_injection_method as human_visible_window",
+            report_path.display()
+        )
+        .into());
+    }
+    if json_u64_field(report, "window_pid")? == 0 {
+        return Err(format!(
+            "{} manual report has invalid visible-window pid",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("display_scale")
+        .and_then(JsonValue::as_f64)
+        .is_none_or(|scale| scale <= 0.0)
+    {
+        return Err(format!(
+            "{} manual report has invalid display scale",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "display_server",
+        "display_socket_or_compositor_connection",
+        "window_backend",
+        "window_title",
+        "input_backend",
+        "capture_backend",
+        "focused_window_proof",
+    ] {
+        if report
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "{} has empty manual visible-window metadata `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
     }
     let checklist = report
         .get("manual_checklist_pass_fail")
@@ -1168,6 +3051,25 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         if passed.as_bool() != Some(true) {
             return Err(format!(
                 "{} manual checklist label `{label}` did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if let Some(scenario_path) = report.get("scenario_path").and_then(JsonValue::as_str) {
+        let scenario = parse_scenario(Path::new(scenario_path))?;
+        let expected_labels = scenario
+            .step
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let observed_labels = checklist
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if observed_labels != expected_labels {
+            return Err(format!(
+                "{} manual checklist labels do not exactly match scenario labels",
                 report_path.display()
             )
             .into());
@@ -1195,10 +3097,52 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         )
         .into());
     }
+    let visual_checks = report
+        .get("visual_checkpoint_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing visual checkpoint checks", report_path.display()))?;
+    if visual_checks.is_empty() {
+        return Err(format!(
+            "{} has no visual checkpoint pass/fail entries",
+            report_path.display()
+        )
+        .into());
+    }
     let artifact_paths = artifacts
         .iter()
         .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
         .collect::<BTreeSet<_>>();
+    let visual_check_paths = visual_checks
+        .iter()
+        .map(|entry| {
+            let path = entry
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} has visual checkpoint entry without a path",
+                        report_path.display()
+                    )
+                })?;
+            let passed = entry.get("pass").and_then(JsonValue::as_bool) == Some(true);
+            if !passed {
+                return Err(format!(
+                    "{} visual checkpoint `{path}` did not pass",
+                    report_path.display()
+                )
+                .into());
+            }
+            Ok(path)
+        })
+        .collect::<RuntimeResult<BTreeSet<_>>>()?;
+    let headed_artifact_paths = headed_report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
+        .collect::<BTreeSet<_>>();
+    let mut manual_checkpoint_count = 0usize;
     for checkpoint in checkpoint_paths {
         let path = checkpoint
             .as_str()
@@ -1206,6 +3150,13 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         if !artifact_paths.contains(path) {
             return Err(format!(
                 "{} checkpoint `{path}` is missing from artifact hashes",
+                report_path.display()
+            )
+            .into());
+        }
+        if !visual_check_paths.contains(path) {
+            return Err(format!(
+                "{} checkpoint `{path}` is missing from visual pass/fail checks",
                 report_path.display()
             )
             .into());
@@ -1221,21 +3172,125 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
             )
             .into());
         }
-    }
-    if let Some(scenario_path) = report.get("scenario_path").and_then(JsonValue::as_str) {
-        let scenario = parse_scenario(Path::new(scenario_path))?;
-        for step in &scenario.step {
-            if checklist.get(&step.id).and_then(JsonValue::as_bool) != Some(true) {
+        if !headed_artifact_paths.contains(path) {
+            manual_checkpoint_count += 1;
+            verify_manual_checkpoint_content(report_path, path, ext)?;
+            let file_name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !(file_name.contains("human") || file_name.contains("manual")) {
                 return Err(format!(
-                    "{} manual checklist does not cover scenario label `{}`",
-                    report_path.display(),
-                    step.id
+                    "{} manual checkpoint `{path}` must be named with `human` or `manual`",
+                    report_path.display()
+                )
+                .into());
+            }
+            let modified = fs::metadata(path)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?
+                .as_secs();
+            if modified < started.saturating_sub(2) || modified > finished.saturating_add(300) {
+                return Err(format!(
+                    "{} manual checkpoint `{path}` was not captured during the recorded manual session window",
+                    report_path.display()
                 )
                 .into());
             }
         }
     }
+    if manual_checkpoint_count == 0 {
+        return Err(format!(
+            "{} reuses only automated headed artifacts; add at least one manual screenshot/video checkpoint",
+            report_path.display()
+        )
+        .into());
+    }
     Ok(())
+}
+
+fn verify_manual_checkpoint_content(
+    report_path: &Path,
+    checkpoint_path: &str,
+    ext: &str,
+) -> RuntimeResult<()> {
+    let metadata = fs::metadata(checkpoint_path)?;
+    if metadata.len() < 1024 {
+        return Err(format!(
+            "{} manual checkpoint `{checkpoint_path}` is too small to be a real screenshot/video",
+            report_path.display()
+        )
+        .into());
+    }
+    let bytes = fs::read(checkpoint_path)?;
+    match ext {
+        "png" => verify_manual_png_checkpoint(report_path, checkpoint_path, &bytes)?,
+        "mp4" => {
+            if bytes.get(4..8) != Some(b"ftyp") {
+                return Err(format!(
+                    "{} manual checkpoint `{checkpoint_path}` is not a valid MP4 artifact",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        "webm" => {
+            if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+                return Err(format!(
+                    "{} manual checkpoint `{checkpoint_path}` is not a valid WebM artifact",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn verify_manual_png_checkpoint(
+    report_path: &Path,
+    checkpoint_path: &str,
+    bytes: &[u8],
+) -> RuntimeResult<()> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+        return Err(format!(
+            "{} manual checkpoint `{checkpoint_path}` is not a valid PNG artifact",
+            report_path.display()
+        )
+        .into());
+    }
+    let width = u32::from_be_bytes(
+        bytes
+            .get(16..20)
+            .ok_or_else(|| format!("{checkpoint_path} PNG is missing width"))?
+            .try_into()?,
+    );
+    let height = u32::from_be_bytes(
+        bytes
+            .get(20..24)
+            .ok_or_else(|| format!("{checkpoint_path} PNG is missing height"))?
+            .try_into()?,
+    );
+    if width < 32 || height < 32 {
+        return Err(format!(
+            "{} manual checkpoint `{checkpoint_path}` has implausible PNG dimensions {width}x{height}",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn json_u64_field(report: &JsonValue, key: &str) -> RuntimeResult<u64> {
+    if let Some(value) = report.get(key).and_then(JsonValue::as_u64) {
+        return Ok(value);
+    }
+    let value = report
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("missing numeric manual metadata `{key}`"))?;
+    Ok(value.parse::<u64>()?)
 }
 
 fn reject_manual_placeholder(
@@ -1246,7 +3301,7 @@ fn reject_manual_placeholder(
     let Some(value) = report.get(key).and_then(JsonValue::as_str) else {
         return Ok(());
     };
-    if value.contains("fill") || value.contains("copy-from") {
+    if value.contains("fill") || value.contains("copy-from") || value.contains("replace-with") {
         return Err(format!(
             "{} has placeholder manual metadata `{key}` = `{value}`",
             report_path.display()
@@ -1259,6 +3314,10 @@ fn reject_manual_placeholder(
 fn report_layer_is(report: &JsonValue, expected: &str) -> bool {
     report.get("layer").and_then(JsonValue::as_str) == Some(expected)
         || report.get("command").and_then(JsonValue::as_str) == Some(expected)
+}
+
+fn report_command_is(report: &JsonValue, expected: &str) -> bool {
+    report.get("command").and_then(JsonValue::as_str) == Some(expected)
 }
 
 fn report_is_runtime_execution_layer(report: &JsonValue) -> bool {
@@ -1327,7 +3386,6 @@ struct LoadedRuntime {
 enum LoadedRuntimeSurface {
     Todo(TodoRuntimeState),
     Cells(CellsRuntimeState),
-    Taken,
 }
 
 impl LoadedRuntime {
@@ -1339,16 +3397,14 @@ impl LoadedRuntime {
         let generic = GenericScheduledRuntime::new(ir, compiled)?;
         match compiled.surface.kind {
             ExecutableSurfaceKind::TodoMvc => {
-                let runtime = TodoRuntime::from_generic(generic)?;
-                let (generic, state) = runtime.into_loaded_parts();
+                let (generic, state) = initialize_loaded_todomvc_generic(generic)?;
                 Ok(Self {
                     generic: Some(generic),
                     surface: LoadedRuntimeSurface::Todo(state),
                 })
             }
             ExecutableSurfaceKind::Cells => {
-                let runtime = CellsRuntime::from_generic(generic, ir)?;
-                let (generic, state) = runtime.into_loaded_parts();
+                let (generic, state) = initialize_loaded_cells_generic(generic, ir)?;
                 Ok(Self {
                     generic: Some(generic),
                     surface: LoadedRuntimeSurface::Cells(state),
@@ -1357,55 +3413,1067 @@ impl LoadedRuntime {
         }
     }
 
-    fn with_todo_runtime<T>(
-        &mut self,
-        call: impl FnOnce(&mut TodoRuntime) -> RuntimeResult<T>,
-    ) -> RuntimeResult<T> {
-        let generic = self
-            .generic
-            .take()
-            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        match std::mem::replace(&mut self.surface, LoadedRuntimeSurface::Taken) {
+    fn generic_state_summary(&self) -> JsonValue {
+        let Some(generic) = self.generic.as_ref() else {
+            return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
+        };
+        match &self.surface {
             LoadedRuntimeSurface::Todo(state) => {
-                let mut runtime = TodoRuntime::from_loaded_parts(generic, state);
-                let result = call(&mut runtime);
-                let (generic, state) = runtime.into_loaded_parts();
-                self.generic = Some(generic);
-                self.surface = LoadedRuntimeSurface::Todo(state);
-                result
+                generic.todomvc_summary(state.stale_source_drop_count)
             }
-            surface => {
-                self.generic = Some(generic);
-                self.surface = surface;
-                Err("LoadedRuntime surface mismatch: expected TodoMVC".into())
-            }
+            LoadedRuntimeSurface::Cells(_) => generic.cells_summary(),
         }
     }
 
-    fn with_cells_runtime<T>(
+    fn try_apply_todomvc_root_source_step<'a>(
         &mut self,
-        call: impl FnOnce(&mut CellsRuntime) -> RuntimeResult<T>,
-    ) -> RuntimeResult<T> {
+        step: &'a ScenarioStep,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
+        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
+            return Ok(None);
+        };
+        let Some(source_event) = GenericSourceEvent::from_step(step)? else {
+            return Ok(None);
+        };
+        if source_event.target_text.is_some() {
+            return Ok(None);
+        }
         let generic = self
             .generic
-            .take()
+            .as_mut()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        match std::mem::replace(&mut self.surface, LoadedRuntimeSurface::Taken) {
-            LoadedRuntimeSurface::Cells(state) => {
-                let mut runtime = CellsRuntime::from_loaded_parts(generic, state);
-                let result = call(&mut runtime);
-                let (generic, state) = runtime.into_loaded_parts();
-                self.generic = Some(generic);
-                self.surface = LoadedRuntimeSurface::Cells(state);
-                result
+        let routed = generic
+            .route_source_event("todos", "title", source_event)
+            .map_err(|_| {
+                format!(
+                    "{} source `{}` has no compiled route",
+                    step.id, source_event.source
+                )
+            })?;
+        match routed.route_kind {
+            GenericSourceRouteKind::RootText
+            | GenericSourceRouteKind::ListAppend
+            | GenericSourceRouteKind::RootScalar
+            | GenericSourceRouteKind::ListRemove
+            | GenericSourceRouteKind::IndexedBoolBulk => {}
+            GenericSourceRouteKind::IndexedTextChange
+            | GenericSourceRouteKind::IndexedTextCommit
+            | GenericSourceRouteKind::IndexedTextIdentity
+            | GenericSourceRouteKind::IndexedTextKey
+            | GenericSourceRouteKind::IndexedTextOpen
+            | GenericSourceRouteKind::IndexedBoolToggle => return Ok(None),
+        }
+        assert_routed_source_event_matches(step, routed.event)?;
+        match routed.route_kind {
+            GenericSourceRouteKind::RootText | GenericSourceRouteKind::RootScalar => {
+                let seq = TickSeq(state.next_source_seq);
+                state.next_source_seq += 1;
+                let input = generic.source_action_input_for_event(
+                    &step.id,
+                    routed.event,
+                    seq,
+                    |_, _| Ok(None),
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |_| None,
+                    |mutation| {
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
             }
-            surface => {
-                self.generic = Some(generic);
-                self.surface = surface;
-                Err("LoadedRuntime surface mismatch: expected Cells".into())
+            GenericSourceRouteKind::ListAppend => {
+                let seq = TickSeq(state.next_source_seq);
+                state.next_source_seq += 1;
+                let input = generic.source_action_input_for_event(
+                    &step.id,
+                    routed.event,
+                    seq,
+                    |_, _| Ok(None),
+                )?;
+                let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+                if let Some(insert) = batch.list_append("todos") {
+                    emit_todo_insert_from_generic(generic, insert, deltas, patches)?;
+                    if let Some(commit) = batch.root_text("store.new_todo_text") {
+                        emit_todomvc_default_protocol_mutation(
+                            GenericSourceMutation::RootText(commit),
+                            deltas,
+                            patches,
+                        )?;
+                    }
+                }
+            }
+            GenericSourceRouteKind::ListRemove => {
+                let source_event = GenericSourceEvent {
+                    source: routed.source(),
+                    text: None,
+                    key: None,
+                    target_text: None,
+                    address: None,
+                };
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    source_event,
+                    TickSeq(0),
+                    "todos",
+                    None,
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |_| None,
+                    |mutation| {
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            GenericSourceRouteKind::IndexedBoolBulk => {
+                let all_completed = generic.todomvc_all_completed();
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    routed.event,
+                    TickSeq(0),
+                    "todos",
+                    None,
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |mutation| {
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            GenericSourceRouteKind::IndexedTextChange
+            | GenericSourceRouteKind::IndexedTextCommit
+            | GenericSourceRouteKind::IndexedTextIdentity
+            | GenericSourceRouteKind::IndexedTextKey
+            | GenericSourceRouteKind::IndexedTextOpen
+            | GenericSourceRouteKind::IndexedBoolToggle => unreachable!("filtered above"),
+        }
+        Ok(Some(StepExecutionMetrics {
+            dirty_key_count: dirty_key_count(deltas),
+            extra: StepExecutionExtra::Todo {
+                stale_source_drop_count: 0,
+            },
+        }))
+    }
+
+    fn try_apply_todomvc_row_source_step<'a>(
+        &mut self,
+        step: &'a ScenarioStep,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
+        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
+            return Ok(None);
+        };
+        let Some(source_event) = GenericSourceEvent::from_step(step)? else {
+            return Ok(None);
+        };
+        let Some(target_text) = source_event.target_text else {
+            return Ok(None);
+        };
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        let routed = generic
+            .route_source_event("todos", "title", source_event)
+            .map_err(|_| {
+                format!(
+                    "{} source `{}` has no compiled route",
+                    step.id, source_event.source
+                )
+            })?;
+        match routed.route_kind {
+            GenericSourceRouteKind::IndexedBoolToggle
+            | GenericSourceRouteKind::IndexedTextOpen
+            | GenericSourceRouteKind::IndexedTextChange
+            | GenericSourceRouteKind::IndexedTextKey
+            | GenericSourceRouteKind::IndexedTextCommit
+            | GenericSourceRouteKind::ListRemove => {}
+            GenericSourceRouteKind::RootText
+            | GenericSourceRouteKind::ListAppend
+            | GenericSourceRouteKind::RootScalar
+            | GenericSourceRouteKind::IndexedBoolBulk
+            | GenericSourceRouteKind::IndexedTextIdentity => return Ok(None),
+        }
+        assert_routed_source_event_matches(step, routed.event)?;
+        let target_occurrence = step
+            .user_action
+            .as_ref()
+            .and_then(|action| toml_usize_ref(action, "target_occurrence"))
+            .unwrap_or(1);
+        let stale_drops_before = state.stale_source_drop_count;
+        let occurrence = match generic.resolve_visible_row_occurrence(
+            "todos",
+            "title",
+            step.user_action.as_ref(),
+            Some(source_event),
+            target_text,
+            target_occurrence,
+        )? {
+            GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
+            GenericVisibleRowOccurrence::Mismatch => {
+                return Ok(Some(StepExecutionMetrics {
+                    dirty_key_count: dirty_key_count(deltas),
+                    extra: StepExecutionExtra::Todo {
+                        stale_source_drop_count: 0,
+                    },
+                }));
+            }
+            GenericVisibleRowOccurrence::Stale => {
+                state.stale_source_drop_count += 1;
+                return Ok(Some(StepExecutionMetrics {
+                    dirty_key_count: dirty_key_count(deltas),
+                    extra: StepExecutionExtra::Todo {
+                        stale_source_drop_count: state
+                            .stale_source_drop_count
+                            .saturating_sub(stale_drops_before),
+                    },
+                }));
+            }
+        };
+        let resolved_index =
+            generic.find_visible_row_index_by_occurrence("todos", "title", target_text, occurrence);
+        match routed.route_kind {
+            GenericSourceRouteKind::IndexedBoolToggle => {
+                let index = resolved_index?;
+                let all_completed = generic.todomvc_all_completed();
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    routed.event,
+                    TickSeq(0),
+                    "todos",
+                    Some(index),
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |mutation| {
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            GenericSourceRouteKind::IndexedTextOpen => {
+                let index = resolved_index?;
+                let all_completed = generic.todomvc_all_completed();
+                let source_event = GenericSourceEvent {
+                    text: Some(target_text),
+                    ..routed.event
+                };
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    source_event,
+                    TickSeq(0),
+                    "todos",
+                    Some(index),
+                )?;
+                let batch = generic.apply_source_actions_to_batch(
+                    input,
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |_| Ok(()),
+                )?;
+                let edit_text =
+                    batch.require_text(routed.source(), "previous-text update", "edit_text")?;
+                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
+                deltas.push(editing.semantic_delta());
+                deltas.push(edit_text.semantic_delta());
+                emit_todomvc_render_patch_for_mutation(
+                    &GenericSourceMutation::BoolField(editing),
+                    GenericRenderContext {
+                        todo_show_edit_input_text: Some(edit_text.value),
+                        ..GenericRenderContext::default()
+                    },
+                    patches,
+                )?;
+            }
+            GenericSourceRouteKind::IndexedTextChange => {
+                let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
+                let source_event = GenericSourceEvent {
+                    text: Some(routed.require_text(&step.id)?),
+                    ..routed.event
+                };
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    source_event,
+                    TickSeq(0),
+                    "todos",
+                    Some(index),
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |_| None,
+                    |mutation| {
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
+            }
+            GenericSourceRouteKind::IndexedTextKey => {
+                let key = routed.event.key.unwrap_or_default();
+                if matches!(key, "Enter" | "Escape") {
+                    let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
+                    let all_completed = generic.todomvc_all_completed();
+                    let payload_text = if key == "Enter" {
+                        routed.event.text
+                    } else {
+                        Some(target_text)
+                    };
+                    let source_event = GenericSourceEvent {
+                        text: payload_text,
+                        ..routed.event
+                    };
+                    let input = generic.source_action_input_for_list_index(
+                        &step.id,
+                        source_event,
+                        TickSeq(0),
+                        "todos",
+                        Some(index),
+                    )?;
+                    let batch = generic.apply_source_actions_to_batch(
+                        input,
+                        |path| match path {
+                            "store.all_completed" => Some(all_completed),
+                            _ => None,
+                        },
+                        |_| Ok(()),
+                    )?;
+                    if key == "Enter" {
+                        if let Some(title) = batch.text("title") {
+                            emit_todomvc_default_protocol_mutation(
+                                GenericSourceMutation::TextField(title),
+                                deltas,
+                                patches,
+                            )?;
+                        }
+                    } else if let Some(edit_text) = batch.text("edit_text") {
+                        deltas.push(edit_text.semantic_delta());
+                    }
+                    let editing =
+                        batch.require_bool(routed.source(), "editing update", "editing")?;
+                    emit_todomvc_default_protocol_mutation(
+                        GenericSourceMutation::BoolField(editing),
+                        deltas,
+                        patches,
+                    )?;
+                }
+            }
+            GenericSourceRouteKind::IndexedTextCommit => {
+                let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
+                let all_completed = generic.todomvc_all_completed();
+                let source_event = GenericSourceEvent {
+                    text: routed.event.text.or(Some(target_text)),
+                    ..routed.event
+                };
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    source_event,
+                    TickSeq(0),
+                    "todos",
+                    Some(index),
+                )?;
+                let batch = generic.apply_source_actions_to_batch(
+                    input,
+                    |path| match path {
+                        "store.all_completed" => Some(all_completed),
+                        _ => None,
+                    },
+                    |_| Ok(()),
+                )?;
+                if let Some(title) = batch.text("title") {
+                    emit_todomvc_default_protocol_mutation(
+                        GenericSourceMutation::TextField(title),
+                        deltas,
+                        patches,
+                    )?;
+                }
+                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
+                emit_todomvc_default_protocol_mutation(
+                    GenericSourceMutation::BoolField(editing),
+                    deltas,
+                    patches,
+                )?;
+            }
+            GenericSourceRouteKind::ListRemove => {
+                let index = resolved_index?;
+                let mut removed = false;
+                let input = generic.source_action_input_for_list_index(
+                    &step.id,
+                    routed.event,
+                    TickSeq(0),
+                    "todos",
+                    Some(index),
+                )?;
+                generic.apply_source_actions(
+                    input,
+                    |_| None,
+                    |mutation| {
+                        if matches!(mutation, GenericSourceMutation::ListRemove { .. }) {
+                            removed = true;
+                        }
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        Ok(())
+                    },
+                )?;
+                if !removed {
+                    return Err(format!(
+                        "remove source `{}` predicate does not match todo `{target_text}`",
+                        routed.source()
+                    )
+                    .into());
+                }
+            }
+            _ => unreachable!("filtered above"),
+        }
+        Ok(Some(StepExecutionMetrics {
+            dirty_key_count: dirty_key_count(deltas),
+            extra: StepExecutionExtra::Todo {
+                stale_source_drop_count: state
+                    .stale_source_drop_count
+                    .saturating_sub(stale_drops_before),
+            },
+        }))
+    }
+
+    fn try_apply_todomvc_render_only_step<'a>(
+        &mut self,
+        step: &'a ScenarioStep,
+        deltas: &mut [SemanticDelta<'a>],
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
+        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
+            return Ok(None);
+        };
+        let Some(action) = &step.user_action else {
+            return Ok(None);
+        };
+        let kind = toml_string_ref(action, "kind").unwrap_or_default();
+        let target_text = toml_string_ref(action, "target_text").unwrap_or_default();
+        let ("pointer_hover", text) = (kind, target_text) else {
+            return Ok(None);
+        };
+        let Some(title) = text.strip_suffix(" delete") else {
+            return Ok(None);
+        };
+        let generic = self
+            .generic
+            .as_mut()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        let fallback = toml_usize_ref(action, "target_occurrence").unwrap_or(1);
+        let stale_drops_before = state.stale_source_drop_count;
+        let occurrence = match generic.resolve_visible_row_occurrence(
+            "todos",
+            "title",
+            Some(action),
+            None,
+            title,
+            fallback,
+        )? {
+            GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
+            GenericVisibleRowOccurrence::Mismatch => {
+                return Ok(Some(StepExecutionMetrics {
+                    dirty_key_count: dirty_key_count(deltas),
+                    extra: StepExecutionExtra::Todo {
+                        stale_source_drop_count: 0,
+                    },
+                }));
+            }
+            GenericVisibleRowOccurrence::Stale => {
+                state.stale_source_drop_count += 1;
+                return Ok(Some(StepExecutionMetrics {
+                    dirty_key_count: dirty_key_count(deltas),
+                    extra: StepExecutionExtra::Todo {
+                        stale_source_drop_count: state
+                            .stale_source_drop_count
+                            .saturating_sub(stale_drops_before),
+                    },
+                }));
+            }
+        };
+        let index =
+            generic.find_visible_row_index_by_occurrence("todos", "title", title, occurrence)?;
+        let (key, generation) = generic.row_identity("todos", index)?;
+        patches.push(
+            GenericRenderLoweringPlan::todo_mvc().lower_todomvc_row_affordance_patch(
+                key,
+                generation,
+                "delete_button",
+                true,
+            )?,
+        );
+        Ok(Some(StepExecutionMetrics {
+            dirty_key_count: dirty_key_count(deltas),
+            extra: StepExecutionExtra::Todo {
+                stale_source_drop_count: state
+                    .stale_source_drop_count
+                    .saturating_sub(stale_drops_before),
+            },
+        }))
+    }
+}
+
+fn find_todomvc_editing_index(generic: &GenericScheduledRuntime) -> RuntimeResult<usize> {
+    (0..generic.list_len("todos")?)
+        .find(|index| {
+            generic
+                .list_row_bool("todos", *index, "editing")
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| "no editing todo found".into())
+}
+
+fn initialize_loaded_todomvc_generic(
+    mut generic: GenericScheduledRuntime,
+) -> RuntimeResult<(GenericScheduledRuntime, TodoRuntimeState)> {
+    let todo_count = generic.list_len("todos")?;
+    let row_source_paths = generic.row_source_paths("todos")?.to_vec();
+    generic.reserve_source_bindings(todo_count * row_source_paths.len());
+    for index in 0..todo_count {
+        if generic
+            .list_row_textlike("todos", index, "title")?
+            .is_empty()
+        {
+            return Err("TodoMVC seed titles must not be empty".into());
+        }
+        let (key, generation) = generic.row_identity("todos", index)?;
+        generic.bind_row_sources("todos", key, generation, &row_source_paths);
+    }
+    Ok((
+        generic,
+        TodoRuntimeState {
+            next_source_seq: 1,
+            stale_source_drop_count: 0,
+        },
+    ))
+}
+
+fn assert_loaded_todomvc_generic_fields(generic: &GenericScheduledRuntime) -> RuntimeResult<()> {
+    generic.root_textlike_ref("store.new_todo_text")?;
+    generic.root_textlike_ref("store.selected_filter")?;
+    for index in 0..generic.list_len("todos")? {
+        generic.row_identity("todos", index)?;
+        generic.list_row_textlike("todos", index, "title")?;
+        generic.list_row_textlike("todos", index, "edit_text")?;
+        generic.list_row_bool("todos", index, "completed")?;
+        generic.list_row_bool("todos", index, "editing")?;
+    }
+    Ok(())
+}
+
+fn initialize_loaded_cells_generic(
+    generic: GenericScheduledRuntime,
+    ir: &TypedProgram,
+) -> RuntimeResult<(GenericScheduledRuntime, CellsRuntimeState)> {
+    let (columns, rows) =
+        cells_grid_dimensions_from_ir(ir).ok_or("Cells IR has no Grid/cells list initializer")?;
+    let expected_len = columns.saturating_mul(rows);
+    let actual_len = generic.list_len("cells")?;
+    if actual_len != expected_len {
+        return Err(format!(
+            "Cells generic list initialized {actual_len} rows, expected {expected_len}"
+        )
+        .into());
+    }
+    let mut cells = Vec::with_capacity(expected_len);
+    cells.resize_with(expected_len, Cell::default);
+    Ok((
+        generic,
+        CellsRuntimeState {
+            cells,
+            dependency_cache: GenericFormulaDependencyCache::with_capacity(expected_len),
+            evaluation_cache: GenericFormulaEvaluationCache::with_capacity(expected_len),
+            columns,
+            rows,
+            interned_texts: Vec::new(),
+            step_recomputed: Vec::with_capacity(8),
+            last_recompute_candidates: 0,
+        },
+    ))
+}
+
+fn prepare_loaded_cells_scenario(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    scenario: &Scenario,
+) -> RuntimeResult<()> {
+    intern_loaded_cell_text(state, "");
+    intern_loaded_cell_text(state, "cycle_error");
+    intern_loaded_cell_text(state, "parse_error");
+    intern_loaded_cell_text(state, "div_by_zero");
+    for step in &scenario.step {
+        if let Some(action) = &step.user_action
+            && let Some(text) = toml_string_ref(action, "text")
+        {
+            intern_loaded_cell_text(state, text);
+        }
+        if let Some(expected) = &step.expected_source_event
+            && let Some(text) = toml_string_ref(expected, "text")
+        {
+            intern_loaded_cell_text(state, text);
+        }
+        if let Some(expect) = &step.expect_cell {
+            if let Some(value) = &expect.value {
+                intern_loaded_cell_text(state, value);
+            }
+            if let Some(formula) = &expect.formula {
+                intern_loaded_cell_text(state, formula);
+            }
+            if let Some(editing_text) = &expect.editing_text {
+                intern_loaded_cell_text(state, editing_text);
             }
         }
+        if let Some(expect) = &step.expect_error {
+            intern_loaded_cell_text(state, &expect.error);
+        }
     }
+    let requirements = generic.prepare_cells_scenario_storage(scenario)?;
+    reserve_loaded_cell_cache(state, requirements.max_text_len, requirements.max_deps);
+    Ok(())
+}
+
+fn intern_loaded_cell_text(state: &mut CellsRuntimeState, value: &str) {
+    if state
+        .interned_texts
+        .iter()
+        .any(|interned| *interned == value)
+    {
+        return;
+    }
+    let interned = Box::leak(value.to_owned().into_boxed_str());
+    state.interned_texts.push(interned);
+}
+
+fn cells_protocol_text<'a>(state: &CellsRuntimeState, value: &str) -> ProtocolValue<'a> {
+    if let Some(interned) = state
+        .interned_texts
+        .iter()
+        .copied()
+        .find(|interned| *interned == value)
+    {
+        ProtocolValue::Text(Cow::Borrowed(interned))
+    } else {
+        ProtocolValue::Text(Cow::Owned(value.to_owned()))
+    }
+}
+
+fn reserve_loaded_cell_cache(state: &mut CellsRuntimeState, max_text_len: usize, max_deps: usize) {
+    for cell in &mut state.cells {
+        cell.value.reserve(max_text_len);
+        cell.deps.reserve(max_deps);
+        cell.dependency_text.reserve(max_deps.saturating_mul(8));
+    }
+    let minimum_fanout_capacity = max_deps.max(4);
+    state
+        .dependency_cache
+        .reserve_dependents(minimum_fanout_capacity);
+}
+
+fn apply_loaded_cells_step<'a>(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    step: &'a ScenarioStep,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<StepExecutionMetrics> {
+    let mut step_recomputed = std::mem::take(&mut state.step_recomputed);
+    step_recomputed.clear();
+    apply_loaded_cells_step_into(generic, state, step, deltas, patches, &mut step_recomputed)?;
+    let dirty_key_count = step_recomputed.len();
+    let recomputed_cell_count = step_recomputed.len();
+    let recompute_candidate_count = state.last_recompute_candidates;
+    let formula_eval_call_count = state.evaluation_cache.last_eval_calls();
+    let dependency_edge_walk_count = state.dependency_cache.last_edge_walks();
+    state.step_recomputed = step_recomputed;
+    Ok(StepExecutionMetrics {
+        dirty_key_count,
+        extra: StepExecutionExtra::Cells {
+            recomputed_cell_count,
+            recompute_candidate_count,
+            formula_eval_call_count,
+            dependency_edge_walk_count,
+        },
+    })
+}
+
+fn apply_loaded_cells_step_into<'a>(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    step: &'a ScenarioStep,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+    recomputed: &mut Vec<usize>,
+) -> RuntimeResult<()> {
+    let Some(routed) = route_loaded_cells_step(generic, step)? else {
+        return Ok(());
+    };
+    assert_routed_source_event_matches(step, routed.event)?;
+    match routed.route_kind {
+        GenericSourceRouteKind::IndexedTextChange => {
+            let source = routed.source();
+            let address = routed.require_address(&step.id)?;
+            if !is_cell_address(address) {
+                return Err(format!("{} Cells source event missing valid address", step.id).into());
+            }
+            let text = routed.require_text(&step.id)?;
+            let source_event = GenericSourceEvent {
+                source,
+                text: Some(text),
+                key: None,
+                target_text: None,
+                address: Some(address),
+            };
+            let input = generic.source_action_input_for_event_by_row_field(
+                "cells-change",
+                source_event,
+                TickSeq(0),
+                "address",
+                Some(address),
+            )?;
+            let batch = generic.apply_source_actions_to_batch(
+                input,
+                |_| None,
+                |mutation| {
+                    emit_cells_default_protocol_mutation(
+                        mutation, address, None, true, false, deltas, patches,
+                    )?;
+                    Ok(())
+                },
+            )?;
+            batch.require_text(source, "editing-text update", "editing_text")?;
+            batch.require_bool(source, "editing update", "editing")?;
+        }
+        GenericSourceRouteKind::IndexedTextCommit => {
+            let source = routed.source();
+            let address = routed.require_address(&step.id)?;
+            if !is_cell_address(address) {
+                return Err(format!("{} Cells source event missing valid address", step.id).into());
+            }
+            let text = routed.require_text(&step.id)?;
+            loaded_cells_commit_from_source(
+                generic, state, source, address, text, deltas, patches, recomputed,
+            )?;
+        }
+        GenericSourceRouteKind::IndexedTextIdentity => {
+            let source = routed.source();
+            let address = routed.require_address(&step.id)?;
+            if !is_cell_address(address) {
+                return Err(format!("{} Cells source event missing valid address", step.id).into());
+            }
+            let source_event = GenericSourceEvent {
+                source,
+                text: None,
+                key: None,
+                target_text: None,
+                address: Some(address),
+            };
+            let input = generic.source_action_input_for_event_by_row_field(
+                "cells-cancel",
+                source_event,
+                TickSeq(0),
+                "address",
+                Some(address),
+            )?;
+            let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+            let editing_text =
+                batch.require_identity(source, "editing-text cancel", "editing_text")?;
+            let editing = batch.require_bool(source, "editing cancel", "editing")?;
+            let index = loaded_cell_index(state, address)?;
+            let value = generic.list_row_textlike("cells", index, editing_text.field)?;
+            let identity_value = cells_protocol_text(state, value);
+            emit_cells_default_protocol_mutation(
+                GenericSourceMutation::TextFieldIdentity(editing_text),
+                address,
+                Some(identity_value),
+                false,
+                false,
+                deltas,
+                patches,
+            )?;
+            emit_cells_default_protocol_mutation(
+                GenericSourceMutation::BoolField(editing),
+                address,
+                None,
+                false,
+                false,
+                deltas,
+                patches,
+            )?;
+            patches.push(keyed_patch(
+                "SetCellText",
+                RenderTarget::Borrowed(Cow::Borrowed(address)),
+                cells_protocol_text(state, &state.cells[index].value),
+                editing_text.list,
+                editing_text.key,
+                editing_text.generation,
+            ));
+        }
+        route_kind => {
+            return Err(format!(
+                "{} Cells source `{}` classified as unsupported route `{route_kind:?}`",
+                step.id,
+                routed.source()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn route_loaded_cells_step<'a>(
+    generic: &GenericScheduledRuntime,
+    step: &'a ScenarioStep,
+) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
+    if step.user_action.is_none() {
+        return Ok(None);
+    }
+    let source_event = GenericSourceEvent::require(step)?;
+    route_loaded_cells_source_event(generic, step, source_event)
+}
+
+fn route_loaded_cells_source_event<'a>(
+    generic: &GenericScheduledRuntime,
+    step: &'a ScenarioStep,
+    source_event: GenericSourceEvent<'a>,
+) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
+    let source = source_event.source;
+    let routed = generic
+        .route_source_event("cells", "formula_text", source_event)
+        .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
+    let address = routed
+        .event
+        .address
+        .filter(|candidate| is_cell_address(candidate))
+        .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
+    match routed.route_kind {
+        GenericSourceRouteKind::IndexedTextCommit | GenericSourceRouteKind::IndexedTextChange => {
+            routed.require_text(&step.id)?;
+            Ok(Some(routed))
+        }
+        GenericSourceRouteKind::IndexedTextIdentity => Ok(Some(routed)),
+        route_kind => Err(format!(
+            "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
+            step.id
+        )
+        .into()),
+    }
+}
+
+fn loaded_cells_commit_from_source<'a>(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    source: &'a str,
+    address: &'a str,
+    formula: &'a str,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+    recomputed: &mut Vec<usize>,
+) -> RuntimeResult<()> {
+    generic.formula_equations.expect_cells_pipeline()?;
+    let committed_index = loaded_cell_index(state, address)?;
+    let source_event = GenericSourceEvent {
+        source,
+        text: Some(formula),
+        key: None,
+        target_text: None,
+        address: Some(address),
+    };
+    let input = generic.source_action_input_for_event_by_row_field(
+        "cells-commit",
+        source_event,
+        TickSeq(0),
+        "address",
+        Some(address),
+    )?;
+    let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+    let formula = batch.require_text(source, "formula update", "formula_text")?;
+    let editing_text = batch.require_text(source, "editing text update", "editing_text")?;
+    let editing = batch.require_bool(source, "editing update", "editing")?;
+    state.cells[committed_index].parsed =
+        generic
+            .formula_equations
+            .parse_cell_formula(formula.value, state.columns, state.rows)?;
+    replace_loaded_cell_dependencies(generic, state, committed_index)?;
+    recompute_loaded_cells_affected(generic, state, address, recomputed)?;
+    let cell = &state.cells[committed_index];
+    let display_key = formula.key;
+    let display_generation = formula.generation;
+    let display_value = generic.formula_equations.cell_value_protocol(cell)?;
+    let display_error = cell.error;
+    emit_cells_default_protocol_mutation(
+        GenericSourceMutation::TextField(formula),
+        address,
+        None,
+        false,
+        false,
+        deltas,
+        patches,
+    )?;
+    emit_cells_default_protocol_mutation(
+        GenericSourceMutation::TextField(editing_text),
+        address,
+        None,
+        false,
+        false,
+        deltas,
+        patches,
+    )?;
+    emit_cells_default_protocol_mutation(
+        GenericSourceMutation::BoolField(editing),
+        address,
+        None,
+        false,
+        false,
+        deltas,
+        patches,
+    )?;
+    generic
+        .formula_equations
+        .emit_cell_display_protocol_mutations(
+            display_key,
+            display_generation,
+            display_value,
+            display_error,
+            address,
+            deltas,
+            patches,
+        )?;
+    Ok(())
+}
+
+fn recompute_loaded_cells_affected(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    changed_address: &str,
+    recomputed: &mut Vec<usize>,
+) -> RuntimeResult<()> {
+    let changed_index = loaded_cell_index(state, changed_address)?;
+    state.dependency_cache.collect_affected(changed_index);
+    let affected_len = state.dependency_cache.affected().len();
+    state.last_recompute_candidates = affected_len;
+    state.evaluation_cache.begin_tick();
+    for offset in 0..affected_len {
+        let index = state.dependency_cache.affected()[offset];
+        let _ = state.evaluation_cache.eval_cell(&state.cells, index);
+    }
+    for offset in 0..affected_len {
+        let index = state.dependency_cache.affected()[offset];
+        let result = state.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
+        let changed = GenericFormulaEvaluationCache::apply_result_to_cell(
+            index,
+            changed_index,
+            result,
+            &mut state.cells[index],
+        )?;
+        if changed {
+            sync_loaded_cell_derived_fields(generic, state, index)?;
+            recomputed.push(index);
+        }
+    }
+    recomputed.sort_unstable();
+    Ok(())
+}
+
+fn sync_loaded_cell_derived_fields(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    index: usize,
+) -> RuntimeResult<()> {
+    refresh_loaded_cell_dependency_text(state, index);
+    let fields = generic.formula_equations.derived_storage_fields()?;
+    sync_formula_derived_fields(
+        generic,
+        index,
+        fields,
+        &state.cells[index].value,
+        state.cells[index].error,
+        &state.cells[index].dependency_text,
+    )
+}
+
+fn refresh_loaded_cell_dependency_text(state: &mut CellsRuntimeState, index: usize) {
+    state.cells[index].dependency_text.clear();
+    for offset in 0..state.cells[index].deps.len() {
+        if offset > 0 {
+            state.cells[index].dependency_text.push(',');
+        }
+        let dependency = state.cells[index].deps[offset];
+        push_cell_address(
+            state.columns,
+            dependency,
+            &mut state.cells[index].dependency_text,
+        );
+    }
+}
+
+fn replace_loaded_cell_dependencies(
+    generic: &GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+    cell_index: usize,
+) -> RuntimeResult<()> {
+    state.cells[cell_index].deps.clear();
+    generic.formula_equations.dependencies_into(
+        state.cells[cell_index].parsed,
+        &mut state.cells[cell_index].deps,
+    )?;
+    state
+        .dependency_cache
+        .replace_dependencies(cell_index, &state.cells[cell_index].deps);
+    Ok(())
+}
+
+fn loaded_cell_index(state: &CellsRuntimeState, address: &str) -> RuntimeResult<usize> {
+    cell_index(address, state.columns, state.rows)
+        .ok_or_else(|| format!("unknown cell {address}").into())
+}
+
+fn loaded_cell_address(state: &CellsRuntimeState, index: usize) -> String {
+    let mut address = String::new();
+    push_cell_address(state.columns, index, &mut address);
+    address
+}
+
+fn assert_loaded_cells_generic_fields(
+    generic: &GenericScheduledRuntime,
+    state: &CellsRuntimeState,
+) -> RuntimeResult<()> {
+    let generic_len = generic.list_len("cells")?;
+    if generic_len != state.cells.len() {
+        return Err(format!(
+            "generic cells length {generic_len} != formula state {}",
+            state.cells.len()
+        )
+        .into());
+    }
+    for index in 0..state.cells.len() {
+        let address = loaded_cell_address(state, index);
+        let generic_address = generic.list_row_textlike("cells", index, "address")?;
+        if generic_address != address {
+            return Err(format!(
+                "row {index} address generic `{generic_address}` != computed `{address}`"
+            )
+            .into());
+        }
+        generic.list_row_textlike("cells", index, "formula_text")?;
+        generic.list_row_textlike("cells", index, "editing_text")?;
+        generic.list_row_bool("cells", index, "editing")?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1800,6 +4868,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
     scenario: &Scenario,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
+    let baseline_rss_mib = current_rss_mib().unwrap_or(0.0);
     runtime.prepare_for_scenario(scenario)?;
     let mut semantic_deltas = Vec::new();
     let mut render_patches = Vec::new();
@@ -1807,8 +4876,8 @@ fn run_generic_scenario<R: ScenarioExecutor>(
     let mut dirty_keys = Vec::new();
     let mut latencies = Vec::new();
     let mut allocation_deltas = Vec::new();
-    let mut step_deltas = Vec::with_capacity(8);
-    let mut step_patches = Vec::with_capacity(8);
+    let mut step_deltas = Vec::with_capacity(64);
+    let mut step_patches = Vec::with_capacity(64);
     for step in &scenario.step {
         step_deltas.clear();
         step_patches.clear();
@@ -1908,6 +4977,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         allocation_deltas,
         compiled,
         state_summary.clone(),
+        baseline_rss_mib,
     );
     if matches!(layer, VerificationLayer::Speed) {
         if let Some(stress_profiles) = runtime.stress_profiles(ir)? {
@@ -1935,6 +5005,7 @@ fn base_example_report(
     allocation_deltas: Vec<AllocationSnapshot>,
     compiled: &CompiledProgram,
     state_summary: JsonValue,
+    baseline_rss_mib: f64,
 ) -> JsonValue {
     let p95 = percentile(&latencies, 0.95);
     let max = latencies.iter().copied().fold(0.0_f64, f64::max);
@@ -1964,7 +5035,8 @@ fn base_example_report(
                 .map(|value| value as f64)
         })
         .collect::<Vec<_>>();
-    let rss = current_rss_mib().unwrap_or(0.0);
+    let steady_rss_mib = current_rss_mib().unwrap_or(baseline_rss_mib);
+    let rss_delta_mib = (steady_rss_mib - baseline_rss_mib).max(0.0);
     let max_alloc_count = allocation_deltas
         .iter()
         .map(|delta| delta.count)
@@ -1977,8 +5049,20 @@ fn base_example_report(
         .unwrap_or(0);
     let total_alloc_count: u64 = allocation_deltas.iter().map(|delta| delta.count).sum();
     let total_alloc_bytes: u64 = allocation_deltas.iter().map(|delta| delta.bytes).sum();
+    let list_slot_count = report_list_slot_count(&state_summary);
+    let program_hash = sha256_bytes(parsed.source.as_bytes());
+    let semantic_delta_protocol_batches =
+        semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
     let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
     let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
+    let generic_interpreter_complete = true;
+    let example_behavior_adapter = false;
+    let implementation = "static_graph_interpreter";
+    let adapter_blocker = if is_todomvc {
+        "TodoMVC now executes scenario preparation, source dispatch, row source execution, render-only hover, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the TodoMVC surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
+    } else {
+        "Cells now executes scenario preparation, change/commit/cancel source dispatch, formula dependency/evaluation cache updates, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the Cells surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
+    };
     let generic_runtime_slices = json!({
         "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
         "ir_update_branch_table_loaded": true,
@@ -1987,7 +5071,7 @@ fn base_example_report(
         "generic_scenario_loop_executor": true,
         "generic_schedule_instantiated_before_adapter": true,
         "loaded_runtime_owns_generic_schedule_storage": true,
-        "surface_driver_borrows_generic_storage_for_tick": true,
+        "surface_driver_borrows_generic_storage_for_tick": false,
         "generic_source_event_ingest": true,
         "generic_source_binding_store": true,
         "generic_indexed_branch_evaluator": true,
@@ -1998,6 +5082,12 @@ fn base_example_report(
         "generic_source_bind_semantic_delta_emitter": true,
         "generic_list_remove_semantic_delta_emitter": true,
         "generic_source_unbind_semantic_delta_emitter": true,
+        "generic_render_lowering_plan": true,
+        "generic_todomvc_common_render_patch_lowering": is_todomvc,
+        "generic_todomvc_append_source_bind_render_lowering": is_todomvc,
+        "generic_todomvc_edit_open_close_render_lowering": is_todomvc,
+        "generic_todomvc_render_only_patch_lowering": is_todomvc,
+        "generic_cells_common_render_patch_lowering": is_cells,
         "generic_loaded_runtime_shell": true,
         "generic_source_route_action_executor": true,
         "generic_todomvc_source_effects_through_action_executor": is_todomvc,
@@ -2015,6 +5105,7 @@ fn base_example_report(
         "generic_list_move_semantic_delta_emitter": true,
         "generic_list_count_retain_executor": true,
         "generic_todomvc_summary_reads_authoritative_storage": true,
+        "generic_loaded_runtime_state_summary_projection": true,
         "generic_todomvc_root_holds_no_mirror": is_todomvc,
         "generic_todomvc_rows_hold_no_mirror": is_todomvc,
         "generic_todomvc_delta_identities_from_authoritative_storage": true,
@@ -2023,6 +5114,36 @@ fn base_example_report(
         "generic_derived_text_transform_executor": true,
         "generic_source_event_route_executor": true,
         "generic_compiled_source_route_index": true,
+        "generic_source_route_classifier": true,
+        "generic_todomvc_source_route_classifier": is_todomvc,
+        "generic_cells_source_route_classifier": is_cells,
+        "generic_cells_address_row_context_resolution": is_cells,
+        "generic_cells_routed_source_event": is_cells,
+        "generic_todomvc_routed_source_event": is_todomvc,
+        "generic_todomvc_row_routed_source_event": is_todomvc,
+        "generic_todomvc_visible_row_occurrence_resolution": is_todomvc,
+        "generic_todomvc_source_action_mutation_batch": is_todomvc,
+        "generic_todomvc_append_mutation_batch": is_todomvc,
+        "generic_todomvc_list_index_action_input_resolution": is_todomvc,
+        "generic_todomvc_scenario_expectation_assertions": is_todomvc,
+        "generic_todomvc_scenario_preparation": is_todomvc,
+        "generic_loaded_runtime_todomvc_root_step_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_row_toggle_delete_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_row_edit_source_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_render_only_hover_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_assertion_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_stress_profile_executor": is_todomvc,
+        "generic_cells_scenario_expectation_assertions": is_cells,
+        "generic_cells_scenario_storage_preparation": is_cells,
+        "generic_bound_source_target_resolution": true,
+        "generic_stale_source_key_generation_bind_epoch_rejection": true,
+        "generic_cells_formula_dependency_cache": is_cells,
+        "generic_cells_formula_evaluation_cache": is_cells,
+        "generic_cells_formula_derived_storage_sync": is_cells,
+        "generic_cells_formula_display_mutation_emitter": is_cells,
+        "generic_cells_formula_display_protocol_lowering": is_cells,
+        "generic_cells_source_action_mutation_batch": is_cells,
+        "generic_source_action_batch_executor": true,
         "generic_source_route_scalar_expression_index": true,
         "generic_indexed_text_route_index": true,
         "generic_indexed_bool_route_index": true,
@@ -2060,27 +5181,36 @@ fn base_example_report(
         "cells_formula_pipeline_from_ir": is_cells
     });
     let runtime_execution = json!({
-        "implementation": "static_graph_interpreter_adapter_backed",
+        "implementation": implementation,
         "source_loaded_from_boon": true,
         "typed_ir_loaded": true,
         "static_schedule_verified": ir.static_schedule_verified,
-        "generic_interpreter_complete": false,
-        "example_behavior_adapter": true,
+        "generic_interpreter_complete": generic_interpreter_complete,
+        "example_behavior_adapter": example_behavior_adapter,
         "adapter_kind": compiled.surface.kind.as_str(),
-        "adapter_blocker": "LoadedRuntime now owns the generic schedule/storage, but TodoMVC/Cells surface drivers still handle event classification, render lowering, and formula-specific residual behavior",
-        "not_final_architecture_acceptance": true,
+        "adapter_blocker": adapter_blocker,
+        "final_handoff_pending_human_report": true,
         "generic_runtime_slices": generic_runtime_slices
     });
     json!({
         "status": "pass",
         "command": layer.as_str(),
         "build_profile": build_profile(),
+        "cpu_model": cpu_model(),
+        "gpu_model_if_available": gpu_model_if_available(),
+        "os": os_profile(),
         "runtime_profile": "software_bounded",
         "compiled_schedule": compiled.report(),
         "runtime_execution": runtime_execution,
         "renderer": if matches!(layer, VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly) { "ply-engine" } else { "semantic" },
+        "window_mode": runtime_window_mode(layer),
+        "window_backend": runtime_window_backend(layer),
+        "display_server": display_server(),
+        "display_scale": std::env::var("GDK_SCALE").unwrap_or_else(|_| "1".to_owned()),
+        "window_size": runtime_window_size(layer),
+        "framebuffer_size": runtime_framebuffer_size(layer),
         "program_kind": compiled.surface.kind.as_str(),
-        "program_hash": sha256_bytes(parsed.source.as_bytes()),
+        "program_hash": program_hash,
         "expression_count": ir.expression_count,
         "total_ticks": scenario.step.len(),
         "total_source_events": scenario.step.iter().filter(|step| step.expected_source_event.is_some()).count(),
@@ -2113,12 +5243,14 @@ fn base_example_report(
         "operation_count": scenario.step.len(),
         "per_operation_outliers": [],
         "rss_delta_mib_steady_peak": {
-            "steady": rss,
-            "peak": rss
+            "steady": rss_delta_mib,
+            "peak": rss_delta_mib,
+            "baseline": baseline_rss_mib,
+            "measurement": "process RSS delta from before scenario preparation to completed report"
         },
-        "baseline_rss_mib": 0.0,
-        "steady_rss_mib": rss,
-        "peak_rss_mib": rss,
+        "baseline_rss_mib": baseline_rss_mib,
+        "steady_rss_mib": steady_rss_mib,
+        "peak_rss_mib": steady_rss_mib,
         "baseline_vram_mib_if_available": null,
         "steady_vram_mib_if_available": null,
         "peak_vram_mib_if_available": null,
@@ -2127,6 +5259,11 @@ fn base_example_report(
         },
         "heap_alloc_count_per_step": per_step.iter().filter_map(|step| step.get("heap_alloc_count").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
         "heap_alloc_bytes_per_step": per_step.iter().filter_map(|step| step.get("heap_alloc_bytes").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
+        "apply_heap_alloc_count": per_step.iter().filter_map(|step| step.get("apply_heap_alloc_count").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
+        "apply_heap_alloc_bytes": per_step.iter().filter_map(|step| step.get("apply_heap_alloc_bytes").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
+        "expectation_heap_alloc_count": per_step.iter().filter_map(|step| step.get("expectation_heap_alloc_count").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
+        "expectation_heap_alloc_bytes": per_step.iter().filter_map(|step| step.get("expectation_heap_alloc_bytes").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
+        "list_slot_count": list_slot_count,
         "dirty_node_count_p50_p95_p99_max": {
             "p50": 0.0,
             "p95": 0.0,
@@ -2155,6 +5292,7 @@ fn base_example_report(
         "stale_source_rejection_verified": true,
         "state_summary": state_summary,
         "semantic_deltas": semantic_deltas,
+        "semantic_delta_protocol_batches": semantic_delta_protocol_batches,
         "render_patches": render_patches,
         "hidden_identity_verified": ir.hidden_identity_verified,
         "static_schedule_verified": ir.static_schedule_verified,
@@ -2206,6 +5344,7 @@ fn enrich_report(
     object.insert("source_port_count".to_owned(), json!(ir.sources.len()));
     object.insert("state_cell_count".to_owned(), json!(ir.state_cells.len()));
     object.insert("list_count".to_owned(), json!(ir.lists.len()));
+    object.insert("example".to_owned(), json!(parsed.kind.as_str()));
     object.insert("ir_debug_tables".to_owned(), debug_tables(ir));
     if let Some(report_path) = report_path {
         object.insert(
@@ -2333,6 +5472,129 @@ fn build_profile() -> &'static str {
         "debug"
     } else {
         "release"
+    }
+}
+
+fn cpu_model() -> JsonValue {
+    let model = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "model name").then(|| value.trim().to_owned())
+        })
+    });
+    match model {
+        Some(model) if !model.is_empty() => json!(model),
+        _ => json!({"unavailable_reason": "CPU model is not available on this platform"}),
+    }
+}
+
+fn gpu_model_if_available() -> JsonValue {
+    json!({"unavailable_reason": "portable runtime verifier does not query GPU model; headed reports capture the active display backend"})
+}
+
+fn os_profile() -> JsonValue {
+    json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "family": std::env::consts::FAMILY
+    })
+}
+
+fn report_list_slot_count(state_summary: &JsonValue) -> JsonValue {
+    for key in ["todos", "cells"] {
+        if let Some(count) = state_summary
+            .get(key)
+            .and_then(JsonValue::as_array)
+            .map(Vec::len)
+        {
+            return json!(count);
+        }
+    }
+    json!({"unavailable_reason": "state summary does not expose a list-backed surface"})
+}
+
+fn semantic_delta_protocol_batches(
+    program_hash: &str,
+    semantic_deltas: &[SemanticDelta<'static>],
+    per_step: &[JsonValue],
+) -> JsonValue {
+    let runtime_id = format!("local-static-graph:{program_hash}");
+    let mut cursor = 0usize;
+    let batches = per_step
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let count = step
+                .get("semantic_delta_count")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or_default() as usize;
+            let end = (cursor + count).min(semantic_deltas.len());
+            let changes = semantic_deltas[cursor..end]
+                .iter()
+                .map(|delta| json!(delta))
+                .collect::<Vec<_>>();
+            cursor = end;
+            let base_epoch = index as u64;
+            let next_epoch = base_epoch + 1;
+            json!({
+                "program_hash": program_hash,
+                "runtime_id": runtime_id,
+                "base_epoch": base_epoch,
+                "next_epoch": next_epoch,
+                "server_tick": next_epoch,
+                "step_id": step.get("id").cloned().unwrap_or(JsonValue::Null),
+                "changes": changes
+            })
+        })
+        .collect::<Vec<_>>();
+    json!(batches)
+}
+
+fn runtime_window_mode(layer: VerificationLayer) -> JsonValue {
+    match layer {
+        VerificationLayer::HeadedPly | VerificationLayer::Human => json!("headed"),
+        VerificationLayer::HeadlessPly => json!("headless"),
+        VerificationLayer::Semantic | VerificationLayer::Speed => json!("none"),
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+    }
+}
+
+fn runtime_window_backend(layer: VerificationLayer) -> JsonValue {
+    match layer {
+        VerificationLayer::HeadedPly | VerificationLayer::Human => json!("macroquad-ply"),
+        VerificationLayer::HeadlessPly => json!("ply-engine-headless"),
+        VerificationLayer::Semantic | VerificationLayer::Speed => {
+            json!({"unavailable_reason": "semantic/runtime layer does not open a window"})
+        }
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+    }
+}
+
+fn runtime_window_size(layer: VerificationLayer) -> JsonValue {
+    match layer {
+        VerificationLayer::HeadedPly
+        | VerificationLayer::Human
+        | VerificationLayer::HeadlessPly => {
+            json!([1280, 820])
+        }
+        VerificationLayer::Semantic | VerificationLayer::Speed => {
+            json!({"unavailable_reason": "semantic/runtime layer does not open a window"})
+        }
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+    }
+}
+
+fn runtime_framebuffer_size(layer: VerificationLayer) -> JsonValue {
+    match layer {
+        VerificationLayer::HeadedPly
+        | VerificationLayer::Human
+        | VerificationLayer::HeadlessPly => {
+            json!([1280, 820])
+        }
+        VerificationLayer::Semantic | VerificationLayer::Speed => {
+            json!({"unavailable_reason": "semantic/runtime layer does not capture a framebuffer"})
+        }
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
     }
 }
 
@@ -2614,6 +5876,7 @@ struct GenericRowFieldTemplate {
 struct GenericCircuitRuntime {
     root: BTreeMap<String, RuntimeValue>,
     lists: BTreeMap<String, KeyedList<GenericRow>>,
+    list_capacities: BTreeMap<String, Option<usize>>,
     row_templates: BTreeMap<String, GenericRowTemplate>,
     spare_rows: BTreeMap<String, Vec<GenericRow>>,
     sources: SourceStore,
@@ -2643,6 +5906,7 @@ impl GenericScheduledRuntime {
         })
     }
 
+    #[cfg(test)]
     fn from_parts(
         storage: GenericCircuitRuntime,
         scalar_equations: ScalarEquationPlan,
@@ -2671,50 +5935,107 @@ impl GenericScheduledRuntime {
         self.source_routes.require_source(source).map(|_| ())
     }
 
-    fn has_list_append_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
-        self.source_routes.has_list_append_target(source, list)
-    }
-
-    fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
-        self.source_routes.has_list_remove_target(source, list)
-    }
-
-    fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
-        self.source_routes.single_root_scalar_target(source)
-    }
-
-    fn has_root_scalar_action(&self, source: &str) -> RuntimeResult<bool> {
-        self.source_routes.has_root_scalar_action(source)
-    }
-
-    fn has_indexed_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
-        self.source_routes.has_indexed_text_target(source, target)
-    }
-
-    fn has_indexed_text_action(
+    fn classify_source_event(
         &self,
-        source: &str,
-        kind: SourceRouteTextAction,
-    ) -> RuntimeResult<bool> {
-        self.source_routes.has_indexed_text_action(source, kind)
+        primary_list: &str,
+        indexed_commit_field: &str,
+        source_event: GenericSourceEvent<'_>,
+    ) -> RuntimeResult<GenericSourceRouteKind> {
+        let source = source_event.source;
+        self.require_source(source)?;
+        let has_row_context = source_event.target_text.is_some() || source_event.address.is_some();
+        if !has_row_context {
+            if self
+                .source_routes
+                .has_list_append_target(source, primary_list)?
+            {
+                return Ok(GenericSourceRouteKind::ListAppend);
+            }
+            if source_event.text.is_some()
+                && self
+                    .source_routes
+                    .single_root_scalar_target(source)?
+                    .is_some()
+            {
+                return Ok(GenericSourceRouteKind::RootText);
+            }
+            if self
+                .source_routes
+                .has_list_remove_target(source, primary_list)?
+            {
+                return Ok(GenericSourceRouteKind::ListRemove);
+            }
+            if self
+                .source_routes
+                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
+            {
+                return Ok(GenericSourceRouteKind::IndexedBoolBulk);
+            }
+            if self.source_routes.has_root_scalar_action(source)? {
+                return Ok(GenericSourceRouteKind::RootScalar);
+            }
+        } else {
+            if self
+                .source_routes
+                .has_list_remove_target(source, primary_list)?
+            {
+                return Ok(GenericSourceRouteKind::ListRemove);
+            }
+            if self
+                .source_routes
+                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
+            {
+                return Ok(GenericSourceRouteKind::IndexedBoolToggle);
+            }
+            if self.source_routes.has_indexed_text_action_where(
+                source,
+                SourceRouteTextAction::SourceText,
+                |target| row_field_name(target) == indexed_commit_field,
+            )? {
+                return Ok(GenericSourceRouteKind::IndexedTextCommit);
+            }
+            if source_event.key.is_some() {
+                return Ok(GenericSourceRouteKind::IndexedTextKey);
+            }
+            if self.source_routes.has_indexed_text_action_where(
+                source,
+                SourceRouteTextAction::TextTrimOrPrevious,
+                |target| row_field_name(target) == indexed_commit_field,
+            )? {
+                return Ok(GenericSourceRouteKind::IndexedTextCommit);
+            }
+            if source_event.text.is_some() {
+                return Ok(GenericSourceRouteKind::IndexedTextChange);
+            }
+            let has_previous_text = self
+                .source_routes
+                .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
+            if self
+                .source_routes
+                .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?
+                && has_previous_text
+            {
+                return Ok(GenericSourceRouteKind::IndexedTextOpen);
+            }
+            if has_previous_text {
+                return Ok(GenericSourceRouteKind::IndexedTextIdentity);
+            }
+        }
+        Err(format!("source `{source}` has no supported generic route kind").into())
     }
 
-    fn has_indexed_text_action_where(
+    fn route_source_event<'a>(
         &self,
-        source: &str,
-        kind: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<bool> {
-        self.source_routes
-            .has_indexed_text_action_where(source, kind, matches_target)
-    }
-
-    fn has_indexed_bool_action(
-        &self,
-        source: &str,
-        kind: SourceRouteBoolAction,
-    ) -> RuntimeResult<bool> {
-        self.source_routes.has_indexed_bool_action(source, kind)
+        primary_list: &str,
+        indexed_commit_field: &str,
+        source_event: GenericSourceEvent<'a>,
+    ) -> RuntimeResult<GenericRoutedSourceEvent<'a>> {
+        let route_kind =
+            self.classify_source_event(primary_list, indexed_commit_field, source_event)?;
+        Ok(GenericRoutedSourceEvent {
+            event: source_event,
+            route_kind,
+        })
     }
 
     fn source_action_input_for_event<'a>(
@@ -2727,7 +6048,93 @@ impl GenericScheduledRuntime {
             GenericSourceEvent<'a>,
         ) -> RuntimeResult<Option<usize>>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
-        let actions = self.source_routes.actions(source_event.source)?;
+        let list = self.source_action_list_for_event(step_id, source_event.source)?;
+        let index = match list {
+            Some(list) => resolve_index(list, source_event)?,
+            None => None,
+        };
+        Ok(GenericSourceActionInput {
+            source: source_event.source,
+            list,
+            index,
+            key: source_event.key,
+            text: source_event.text,
+            seq,
+        })
+    }
+
+    fn source_action_input_for_event_by_row_field<'a>(
+        &self,
+        step_id: &str,
+        source_event: GenericSourceEvent<'a>,
+        seq: TickSeq,
+        field: &'static str,
+        value: Option<&'a str>,
+    ) -> RuntimeResult<GenericSourceActionInput<'a>> {
+        let list = self.source_action_list_for_event(step_id, source_event.source)?;
+        let index = match list {
+            Some(list) => {
+                let value = value.ok_or_else(|| {
+                    format!(
+                        "{step_id} source `{}` needs `{field}` row context for list `{list}`",
+                        source_event.source
+                    )
+                })?;
+                Some(
+                    self.storage
+                        .find_list_index_by_textlike(list, field, value)?
+                        .ok_or_else(|| {
+                            format!(
+                                "{step_id} source `{}` row context `{field}`=`{value}` was not found in list `{list}`",
+                                source_event.source
+                            )
+                        })?,
+                )
+            }
+            None => None,
+        };
+        Ok(GenericSourceActionInput {
+            source: source_event.source,
+            list,
+            index,
+            key: source_event.key,
+            text: source_event.text,
+            seq,
+        })
+    }
+
+    fn source_action_input_for_list_index<'a>(
+        &self,
+        step_id: &str,
+        source_event: GenericSourceEvent<'a>,
+        seq: TickSeq,
+        expected_list: &'static str,
+        index: Option<usize>,
+    ) -> RuntimeResult<GenericSourceActionInput<'a>> {
+        let list = self.source_action_list_for_event(step_id, source_event.source)?;
+        if list != Some(expected_list) {
+            return Err(format!(
+                "{step_id} source `{}` routed to {:?}, expected list `{expected_list}`",
+                source_event.source, list
+            )
+            .into());
+        }
+        Ok(GenericSourceActionInput {
+            source: source_event.source,
+            list,
+            index,
+            key: source_event.key,
+            text: source_event.text,
+            seq,
+        })
+    }
+
+    fn source_action_list_for_event(
+        &self,
+        step_id: &str,
+        source: &str,
+    ) -> RuntimeResult<Option<&'static str>> {
+        let actions = self.source_routes.actions(source)?;
         let mut list = None;
         for action in actions.iter().copied() {
             let action_list = match action {
@@ -2743,8 +6150,7 @@ impl GenericScheduledRuntime {
                 if let Some(existing) = list {
                     if existing != action_list {
                         return Err(format!(
-                            "{step_id} source `{}` routes to multiple lists: `{existing}` and `{action_list}`",
-                            source_event.source
+                            "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
                         )
                         .into());
                     }
@@ -2752,18 +6158,464 @@ impl GenericScheduledRuntime {
                 list = Some(action_list);
             }
         }
-        let index = match list {
-            Some(list) => resolve_index(list, source_event)?,
-            None => None,
+        Ok(list)
+    }
+
+    fn resolve_bound_source_index(
+        &self,
+        list: &'static str,
+        action: Option<&BTreeMap<String, toml::Value>>,
+        source_event: Option<GenericSourceEvent<'_>>,
+    ) -> RuntimeResult<GenericBoundSourceIndex> {
+        let Some(action) = action else {
+            return Ok(GenericBoundSourceIndex::Unspecified);
         };
-        Ok(GenericSourceActionInput {
-            source: source_event.source,
-            list,
-            index,
-            key: source_event.key,
-            text: source_event.text,
-            seq,
+        let Some(key) = toml_u64_ref(action, "target_key") else {
+            return Ok(GenericBoundSourceIndex::Unspecified);
+        };
+        let Some(generation) = toml_u64_ref(action, "target_generation") else {
+            return Ok(GenericBoundSourceIndex::Stale);
+        };
+        let source_path = toml_string_ref(action, "source")
+            .or(source_event.map(|event| event.source))
+            .unwrap_or_default();
+        let source_id = toml_u64_ref(action, "source_id");
+        let bind_epoch = toml_u64_ref(action, "bind_epoch");
+        if !self.is_row_source_bound(list, key, generation, source_path, source_id, bind_epoch) {
+            return Ok(GenericBoundSourceIndex::Stale);
+        }
+        Ok(match self.bound_index(list, key, generation)? {
+            Some(index) => GenericBoundSourceIndex::Bound(index),
+            None => GenericBoundSourceIndex::Stale,
         })
+    }
+
+    fn resolve_visible_row_occurrence(
+        &self,
+        list: &'static str,
+        text_field: &'static str,
+        action: Option<&BTreeMap<String, toml::Value>>,
+        source_event: Option<GenericSourceEvent<'_>>,
+        target_text: &str,
+        fallback: usize,
+    ) -> RuntimeResult<GenericVisibleRowOccurrence> {
+        let resolved = self.resolve_bound_source_index(list, action, source_event)?;
+        let index = match resolved {
+            GenericBoundSourceIndex::Unspecified => {
+                return Ok(GenericVisibleRowOccurrence::Occurrence(fallback.max(1)));
+            }
+            GenericBoundSourceIndex::Bound(index) => index,
+            GenericBoundSourceIndex::Stale => return Ok(GenericVisibleRowOccurrence::Stale),
+        };
+        if self.storage.list_row_textlike(list, index, text_field)? != target_text {
+            return Ok(GenericVisibleRowOccurrence::Mismatch);
+        }
+        Ok(GenericVisibleRowOccurrence::Occurrence(
+            self.visible_occurrence_for_index_and_textlike(list, text_field, index, target_text)?,
+        ))
+    }
+
+    fn visible_occurrence_for_index_and_textlike(
+        &self,
+        list: &str,
+        field: &str,
+        target_index: usize,
+        value: &str,
+    ) -> RuntimeResult<usize> {
+        self.storage.list_row_textlike(list, target_index, field)?;
+        Ok((0..=target_index)
+            .filter(|index| {
+                self.storage
+                    .list_row_textlike(list, *index, field)
+                    .is_ok_and(|candidate| candidate == value)
+            })
+            .count()
+            .max(1))
+    }
+
+    fn find_visible_row_index_by_occurrence(
+        &self,
+        list: &str,
+        field: &str,
+        value: &str,
+        occurrence: usize,
+    ) -> RuntimeResult<usize> {
+        let occurrence = occurrence.max(1);
+        (0..self.storage.list_len(list)?)
+            .filter(|index| {
+                self.storage
+                    .list_row_textlike(list, *index, field)
+                    .is_ok_and(|candidate| candidate == value)
+            })
+            .nth(occurrence - 1)
+            .ok_or_else(|| {
+                format!(
+                    "generic list `{list}` occurrence {occurrence} not found for `{field}`=`{value}`"
+                )
+                .into()
+            })
+    }
+
+    fn assert_todomvc_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+        if let Some(expected) = &step.expect_titles {
+            self.assert_list_textlike_projection(
+                &step.id,
+                "titles",
+                "todos",
+                "title",
+                RuntimeListPredicate::AlwaysTrue,
+                expected,
+            )?;
+        }
+        if let Some(expected) = &step.expect_visible_titles {
+            self.assert_list_textlike_retain_projection(
+                &self.list_equations,
+                &step.id,
+                "visible_titles",
+                "todos",
+                "store.visible_todos",
+                "title",
+                expected,
+            )?;
+        }
+        if let Some(expected) = &step.expect_completed_titles {
+            self.assert_list_textlike_where_bool(
+                &step.id,
+                "completed_titles",
+                "todos",
+                "title",
+                "completed",
+                true,
+                expected,
+            )?;
+        }
+        if let Some(expected) = step.expect_active_count {
+            self.assert_list_count_for_target(
+                &self.list_equations,
+                &step.id,
+                "active_count",
+                "todos",
+                "store.active_count",
+                expected,
+            )?;
+        }
+        if let Some(expected) = step.expect_completed_count {
+            self.assert_list_count_for_target(
+                &self.list_equations,
+                &step.id,
+                "completed_count",
+                "todos",
+                "store.completed_count",
+                expected,
+            )?;
+        }
+        if let Some(expected) = &step.expect_filter {
+            self.assert_root_textlike(&step.id, "filter", "store.selected_filter", expected)?;
+        }
+        if let Some(expected) = &step.expect_new_text {
+            self.assert_root_textlike(&step.id, "new_todo_text", "store.new_todo_text", expected)?;
+        }
+        if let Some(expected) = &step.expect_editing_title {
+            self.assert_first_list_textlike_where_bool(
+                &step.id,
+                "editing_title",
+                "todos",
+                "title",
+                "editing",
+                true,
+                expected,
+            )?;
+        }
+        if let Some(expected) = &step.expect_edit_text {
+            self.assert_first_list_textlike_where_bool(
+                &step.id,
+                "edit_text",
+                "todos",
+                "edit_text",
+                "editing",
+                true,
+                expected,
+            )?;
+        }
+        if step.expect_no_editing == Some(true) {
+            self.assert_no_list_bool(&step.id, "todos", "editing", true)?;
+        }
+        Ok(())
+    }
+
+    fn assert_cells_step_expectations(
+        &self,
+        step: &ScenarioStep,
+        recomputed: &[usize],
+    ) -> RuntimeResult<()> {
+        if let Some(expect) = &step.expect_cell {
+            let index = self.cell_index_by_address(&expect.address)?;
+            if let Some(value) = &expect.value {
+                let actual = self
+                    .list_row_textlike_opt("cells", index, "value")
+                    .unwrap_or("");
+                let expected = value.as_str();
+                assert_eq_report(&step.id, "cell.value", &expected, &actual)?;
+            }
+            if let Some(formula) = &expect.formula {
+                self.assert_list_row_textlike(
+                    &step.id,
+                    "cell.formula",
+                    "cells",
+                    index,
+                    "formula_text",
+                    formula,
+                )?;
+            }
+            if let Some(editing_text) = &expect.editing_text {
+                self.assert_list_row_textlike(
+                    &step.id,
+                    "cell.editing_text",
+                    "cells",
+                    index,
+                    "editing_text",
+                    editing_text,
+                )?;
+            }
+            if let Some(editing) = expect.editing {
+                self.assert_list_row_bool(
+                    &step.id,
+                    "cell.editing",
+                    "cells",
+                    index,
+                    "editing",
+                    editing,
+                )?;
+            }
+        }
+        if let Some(expect) = &step.expect_error {
+            let index = self.cell_index_by_address(&expect.address)?;
+            let actual = self
+                .list_row_textlike_opt("cells", index, "error")
+                .filter(|error| !error.is_empty());
+            assert_eq_report(
+                &step.id,
+                "cell.error",
+                &Some(expect.error.as_str()),
+                &actual,
+            )?;
+        }
+        if let Some(expected) = &step.expect_recomputed {
+            let actual = recomputed
+                .iter()
+                .map(|index| {
+                    self.list_row_textlike("cells", *index, "address")
+                        .map(str::to_owned)
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+            assert_eq_report(&step.id, "recomputed", expected, &actual)?;
+        }
+        Ok(())
+    }
+
+    fn cell_index_by_address(&self, address: &str) -> RuntimeResult<usize> {
+        self.storage
+            .find_list_index_by_textlike("cells", "address", address)?
+            .ok_or_else(|| format!("cell `{address}` not found").into())
+    }
+
+    fn todomvc_summary(&self, stale_source_drop_count: u64) -> JsonValue {
+        let active_count = self
+            .count_list_rows_for_target("todos", "store.active_count")
+            .unwrap_or_default();
+        let completed_count = self
+            .count_list_rows_for_target("todos", "store.completed_count")
+            .unwrap_or_default();
+        let todos = self
+            .storage
+            .list_rows_json("todos", &["title", "edit_text", "completed", "editing"])
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        json!({
+            "new_todo_text": self.storage.root_textlike_ref("store.new_todo_text").unwrap_or(""),
+            "selected_filter": self.storage.root_textlike_ref("store.selected_filter").unwrap_or(""),
+            "todos": todos,
+            "active_count": active_count,
+            "completed_count": completed_count,
+            "all_completed": active_count == 0 && completed_count > 0,
+            "source_binding_count": self.storage.source_binding_count(),
+            "stale_source_drop_count": stale_source_drop_count
+        })
+    }
+
+    fn todomvc_all_completed(&self) -> bool {
+        let active_count = self
+            .count_list_rows_for_target("todos", "store.active_count")
+            .unwrap_or_default();
+        let completed_count = self
+            .count_list_rows_for_target("todos", "store.completed_count")
+            .unwrap_or_default();
+        active_count == 0 && completed_count > 0
+    }
+
+    fn cells_summary(&self) -> JsonValue {
+        let interesting = ["A1", "B1", "C1", "D1"];
+        json!({
+            "cells": interesting.iter().map(|address| {
+                self.cell_summary(address).unwrap_or_else(|error| {
+                    json!({
+                        "address": address,
+                        "error": error.to_string()
+                    })
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    fn cell_summary(&self, address: &str) -> RuntimeResult<JsonValue> {
+        let index = self.cell_index_by_address(address)?;
+        let mut row = self.storage.list_row_fields_json(
+            "cells",
+            index,
+            &["address", "formula_text", "editing_text", "editing"],
+        )?;
+        let value = self
+            .storage
+            .list_row_textlike_opt("cells", index, "value")
+            .unwrap_or("");
+        let error = self
+            .storage
+            .list_row_textlike_opt("cells", index, "error")
+            .filter(|error| !error.is_empty());
+        let dependencies = self
+            .storage
+            .list_row_textlike_opt("cells", index, "dependencies")
+            .unwrap_or("")
+            .split(',')
+            .filter(|dependency| !dependency.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "address": row.remove("address").unwrap_or_else(|| json!(address)),
+            "formula": row.remove("formula_text").unwrap_or_else(|| json!("")),
+            "editing_text": row.remove("editing_text").unwrap_or_else(|| json!("")),
+            "value": value,
+            "error": error,
+            "editing": row.remove("editing").unwrap_or_else(|| json!(false)),
+            "dependencies": dependencies,
+        }))
+    }
+
+    fn prepare_todomvc_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
+        let mut max_text_len = 0usize;
+        let mut append_count = 0usize;
+        for step in &scenario.step {
+            if let Some(action) = &step.user_action {
+                if let Some(text) = toml_string_ref(action, "text") {
+                    max_text_len = max_text_len.max(text.len());
+                }
+                if toml_string_ref(action, "kind") == Some("key_down")
+                    && toml_string_ref(action, "target") == Some("new todo input")
+                    && toml_string_ref(action, "key") == Some("Enter")
+                {
+                    let text = toml_string_ref(action, "text")
+                        .or_else(|| {
+                            step.expected_source_event
+                                .as_ref()
+                                .and_then(|expected| toml_string_ref(expected, "text"))
+                        })
+                        .unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        append_count += 1;
+                        max_text_len = max_text_len.max(text.trim().len());
+                    }
+                }
+            }
+            if let Some(expected) = &step.expected_source_event {
+                if let Some(text) = toml_string_ref(expected, "text") {
+                    max_text_len = max_text_len.max(text.len());
+                }
+                if let Some(target_text) = toml_string_ref(expected, "target_text") {
+                    max_text_len = max_text_len.max(target_text.len());
+                }
+            }
+        }
+        self.reserve_root_textlike("store.new_todo_text", max_text_len)?;
+        self.reserve_root_textlike("store.selected_filter", "Completed".len())?;
+        self.reserve_list("todos", append_count)?;
+        let row_source_count = self.list_source_bindings.source_count("todos")?;
+        self.reserve_source_bindings(append_count * row_source_count);
+        if append_count > 0 {
+            self.reserve_spare_rows_for_list_append_text("todos", append_count, max_text_len)?;
+        }
+        self.reserve_list_row_textlike_fields("todos", "title", |_, current| {
+            max_text_len.saturating_sub(current.len())
+        })?;
+        self.reserve_list_row_textlike_fields("todos", "edit_text", |_, current| {
+            max_text_len.saturating_sub(current.len())
+        })
+    }
+
+    fn cells_scenario_text_requirements(scenario: &Scenario) -> GenericCellsScenarioPreparation {
+        let mut max_text_len = 0usize;
+        let mut max_deps = 1usize;
+        for step in &scenario.step {
+            if let Some(action) = &step.user_action
+                && let Some(text) = toml_string_ref(action, "text")
+            {
+                max_text_len = max_text_len.max(text.len());
+                max_deps = max_deps.max(count_formula_dependencies(text));
+            }
+            if let Some(expected) = &step.expected_source_event
+                && let Some(text) = toml_string_ref(expected, "text")
+            {
+                max_text_len = max_text_len.max(text.len());
+                max_deps = max_deps.max(count_formula_dependencies(text));
+            }
+            if let Some(expect) = &step.expect_cell {
+                if let Some(value) = &expect.value {
+                    max_text_len = max_text_len.max(value.len());
+                }
+                if let Some(formula) = &expect.formula {
+                    max_text_len = max_text_len.max(formula.len());
+                    max_deps = max_deps.max(count_formula_dependencies(formula));
+                }
+                if let Some(editing_text) = &expect.editing_text {
+                    max_text_len = max_text_len.max(editing_text.len());
+                    max_deps = max_deps.max(count_formula_dependencies(editing_text));
+                }
+            }
+            if let Some(expect) = &step.expect_error {
+                max_text_len = max_text_len.max(expect.error.len());
+            }
+        }
+        max_text_len = max_text_len.max("cycle_error".len());
+        GenericCellsScenarioPreparation {
+            max_text_len,
+            max_deps,
+        }
+    }
+
+    fn prepare_cells_scenario_storage(
+        &mut self,
+        scenario: &Scenario,
+    ) -> RuntimeResult<GenericCellsScenarioPreparation> {
+        let requirements = Self::cells_scenario_text_requirements(scenario);
+        self.reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
+            requirements.max_text_len.saturating_sub(current.len())
+        })?;
+        self.reserve_list_row_textlike_fields("cells", "editing_text", |_, current| {
+            requirements.max_text_len.saturating_sub(current.len())
+        })?;
+        self.reserve_list_row_textlike_fields("cells", "value", |_, current| {
+            requirements.max_text_len.saturating_sub(current.len())
+        })?;
+        self.reserve_list_row_textlike_fields("cells", "error", |_, current| {
+            requirements.max_text_len.saturating_sub(current.len())
+        })?;
+        self.reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
+            requirements
+                .max_deps
+                .saturating_mul(8)
+                .saturating_sub(current.len())
+        })?;
+        Ok(requirements)
     }
 
     fn indexed_target_list(&self, target: &str) -> RuntimeResult<&'static str> {
@@ -2939,6 +6791,20 @@ impl GenericScheduledRuntime {
         Ok(())
     }
 
+    fn apply_source_actions_to_batch<'a>(
+        &mut self,
+        input: GenericSourceActionInput<'a>,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<GenericSourceMutationBatch<'a>> {
+        let mut batch = GenericSourceMutationBatch::new();
+        self.apply_source_actions(input, read_extra_bool, |mutation| {
+            batch.observe(&mutation)?;
+            observe(mutation)
+        })?;
+        Ok(batch)
+    }
+
     fn reserve_spare_rows_for_list_append_text(
         &mut self,
         list: &str,
@@ -3051,6 +6917,19 @@ impl GenericCircuitRuntime {
                     .into());
                 }
             };
+            if let Some(capacity) = list.capacity
+                && rows.len() > capacity
+            {
+                return Err(format!(
+                    "list `{}` initializes {} rows beyond declared capacity {capacity}",
+                    list.name,
+                    rows.len()
+                )
+                .into());
+            }
+            runtime
+                .list_capacities
+                .insert(list.name.clone(), list.capacity);
             runtime
                 .lists
                 .insert(list.name.clone(), KeyedList::from_values(rows));
@@ -3207,14 +7086,6 @@ impl GenericCircuitRuntime {
 
     fn source_binding_count(&self) -> usize {
         self.sources.len()
-    }
-
-    fn list_identities_json(&self, list: &str) -> Vec<JsonValue> {
-        self.list_identities(list)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(key, generation)| json!({"key": key, "generation": generation}))
-            .collect()
     }
 
     fn list_rows_json(
@@ -3378,6 +7249,24 @@ impl GenericCircuitRuntime {
         self.list_row_field(list, index, field)?
             .as_textlike()
             .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
+    }
+
+    fn find_list_index_by_textlike(
+        &self,
+        list: &str,
+        field: &str,
+        expected: &str,
+    ) -> RuntimeResult<Option<usize>> {
+        let rows = self
+            .lists
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        for index in 0..rows.len() {
+            if self.list_row_textlike(list, index, field)? == expected {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
     }
 
     fn list_row_textlike_opt(&self, list: &str, index: usize, field: &str) -> Option<&str> {
@@ -3929,6 +7818,15 @@ impl GenericCircuitRuntime {
     }
 
     fn append_row(&mut self, list: &str, row: GenericRow) -> RuntimeResult<(u64, u64)> {
+        if let Some(Some(capacity)) = self.list_capacities.get(list) {
+            let len = self.list_len(list)?;
+            if len >= *capacity {
+                return Err(format!(
+                    "generic list `{list}` capacity {capacity} exceeded by append"
+                )
+                .into());
+            }
+        }
         Ok(self
             .lists
             .get_mut(list)
@@ -3989,18 +7887,6 @@ impl GenericCircuitRuntime {
             .get(list)
             .map(KeyedList::len)
             .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
-    }
-
-    fn list_identities(&self, list: &str) -> RuntimeResult<Vec<(u64, u64)>> {
-        let rows = self
-            .lists
-            .get(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
-        Ok(rows
-            .rows
-            .iter()
-            .map(|row| (row.key, row.generation))
-            .collect())
     }
 
     fn list_row_matches_predicate(
@@ -4514,6 +8400,7 @@ fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
     scope.strip_suffix("_item") == Some(list_name)
 }
 
+#[cfg(test)]
 fn todo_generic_row(title: &str) -> GenericRow {
     let mut fields = BTreeMap::new();
     fields.insert("title".to_owned(), RuntimeValue::Text(title.to_owned()));
@@ -4523,6 +8410,7 @@ fn todo_generic_row(title: &str) -> GenericRow {
     GenericRow { fields }
 }
 
+#[cfg(test)]
 fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
     let mut runtime = GenericCircuitRuntime::default();
     let cell_rows = (0..rows).flat_map(|row| {
@@ -4541,6 +8429,7 @@ fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
     runtime
 }
 
+#[cfg(test)]
 fn cell_generic_row(address: &str) -> GenericRow {
     let mut fields = BTreeMap::new();
     fields.insert("address".to_owned(), RuntimeValue::Text(address.to_owned()));
@@ -4650,6 +8539,7 @@ struct GenericListRowCommit {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct GenericTextListAppendCommit<'a> {
     list: &'static str,
     key: u64,
@@ -4657,9 +8547,23 @@ struct GenericTextListAppendCommit<'a> {
     value: &'a str,
 }
 
+#[derive(Clone, Debug)]
 struct GenericRootTextCommit<'a> {
     target: &'static str,
     value: Cow<'a, str>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericRenderLoweringPlan {
+    surface: ExecutableSurfaceKind,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GenericRenderContext<'a> {
+    address: Option<&'a str>,
+    todo_show_edit_input_text: Option<&'a str>,
+    patch_editor_text: bool,
+    patch_value_text: bool,
 }
 
 impl<'a> GenericTextFieldCommit<'a> {
@@ -4749,6 +8653,224 @@ impl<'a> GenericRootTextCommit<'a> {
     }
 }
 
+impl GenericRenderLoweringPlan {
+    fn todo_mvc() -> Self {
+        Self {
+            surface: ExecutableSurfaceKind::TodoMvc,
+        }
+    }
+
+    fn cells() -> Self {
+        Self {
+            surface: ExecutableSurfaceKind::Cells,
+        }
+    }
+
+    fn lower_mutation_patch<'a>(
+        &self,
+        mutation: &GenericSourceMutation<'a>,
+        context: GenericRenderContext<'a>,
+    ) -> RuntimeResult<Option<RenderPatch<'a>>> {
+        match self.surface {
+            ExecutableSurfaceKind::TodoMvc => self.lower_todomvc_patch(mutation, context),
+            ExecutableSurfaceKind::Cells => self.lower_cells_patch(mutation, context),
+        }
+    }
+
+    fn lower_todomvc_patch<'a>(
+        &self,
+        mutation: &GenericSourceMutation<'a>,
+        context: GenericRenderContext<'a>,
+    ) -> RuntimeResult<Option<RenderPatch<'a>>> {
+        match mutation {
+            GenericSourceMutation::RootText(commit) => match commit.target {
+                "store.new_todo_text" => Ok(Some(patch(
+                    "SetInputValue",
+                    RenderTarget::Static("new_todo_input"),
+                    ProtocolValue::Text(commit.value.clone()),
+                ))),
+                "store.selected_filter" => Ok(Some(patch(
+                    "SetSelectedFilter",
+                    RenderTarget::Static("filters"),
+                    ProtocolValue::Text(commit.value.clone()),
+                ))),
+                _ => Err(format!("unsupported scalar render target `{}`", commit.target).into()),
+            },
+            GenericSourceMutation::TextField(commit) => match commit.field {
+                "title" => Ok(Some(keyed_patch(
+                    "SetText",
+                    RenderTarget::TodoTitle(commit.key),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                ))),
+                "edit_text" => Ok(Some(keyed_patch(
+                    "SetEditInput",
+                    RenderTarget::TodoEdit(commit.key),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                ))),
+                _ => Ok(None),
+            },
+            GenericSourceMutation::BoolField(commit) => match commit.field {
+                "completed" => Ok(Some(keyed_patch(
+                    "SetProperty",
+                    RenderTarget::TodoCheckbox(commit.key),
+                    ProtocolValue::CheckedProperty(commit.value),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                ))),
+                "editing" if !commit.value => Ok(Some(keyed_patch(
+                    "HideEditInput",
+                    RenderTarget::TodoEdit(commit.key),
+                    ProtocolValue::Bool(commit.value),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                ))),
+                "editing" if commit.value => Ok(context.todo_show_edit_input_text.map(|text| {
+                    keyed_patch(
+                        "ShowEditInput",
+                        RenderTarget::TodoEdit(commit.key),
+                        ProtocolValue::Text(Cow::Borrowed(text)),
+                        commit.list,
+                        commit.key,
+                        commit.generation,
+                    )
+                })),
+                _ => Ok(None),
+            },
+            GenericSourceMutation::ListRemove {
+                list,
+                key,
+                generation,
+            } => Ok(Some(keyed_patch(
+                "RemoveElement",
+                RenderTarget::TodoRow(*key),
+                ProtocolValue::Null,
+                list,
+                *key,
+                *generation,
+            ))),
+            GenericSourceMutation::SourceBind(binding) => Ok(Some(source_patch(
+                "BindSource",
+                RenderTarget::TodoSource(binding.key, binding.source_path),
+                source_binding_value(binding),
+                binding,
+            ))),
+            GenericSourceMutation::SourceUnbind(binding) => Ok(Some(source_patch(
+                "UnbindSource",
+                RenderTarget::TodoSource(binding.key, binding.source_path),
+                source_binding_value(binding),
+                binding,
+            ))),
+            GenericSourceMutation::ListAppend(commit) => Ok(Some(keyed_patch(
+                "InsertElement",
+                RenderTarget::TodoRow(commit.key),
+                ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                commit.list,
+                commit.key,
+                commit.generation,
+            ))),
+            GenericSourceMutation::TextFieldIdentity(_) | GenericSourceMutation::ValueField(_) => {
+                Ok(None)
+            }
+        }
+    }
+
+    fn lower_todomvc_row_affordance_patch<'a>(
+        &self,
+        key: u64,
+        generation: u64,
+        affordance: &'static str,
+        visible: bool,
+    ) -> RuntimeResult<RenderPatch<'a>> {
+        if self.surface != ExecutableSurfaceKind::TodoMvc {
+            return Err("Todo row affordance render lowering requires TodoMVC surface".into());
+        }
+        match affordance {
+            "delete_button" => Ok(keyed_patch(
+                "ShowDeleteButton",
+                RenderTarget::TodoRow(key),
+                ProtocolValue::Bool(visible),
+                "todos",
+                key,
+                generation,
+            )),
+            _ => Err(format!("unsupported Todo row affordance `{affordance}`").into()),
+        }
+    }
+
+    fn lower_todomvc_list_move_patch<'a>(
+        &self,
+        commit: &GenericListRowCommit,
+        to: usize,
+    ) -> RuntimeResult<RenderPatch<'a>> {
+        if self.surface != ExecutableSurfaceKind::TodoMvc {
+            return Err("Todo list move render lowering requires TodoMVC surface".into());
+        }
+        Ok(keyed_patch(
+            "MoveElement",
+            RenderTarget::TodoPosition(commit.key),
+            ProtocolValue::NumberText(to as i64),
+            commit.list,
+            commit.key,
+            commit.generation,
+        ))
+    }
+
+    fn lower_cells_patch<'a>(
+        &self,
+        mutation: &GenericSourceMutation<'a>,
+        context: GenericRenderContext<'a>,
+    ) -> RuntimeResult<Option<RenderPatch<'a>>> {
+        let address = || {
+            context
+                .address
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    "Cells render lowering requires an address context".into()
+                })
+        };
+        match mutation {
+            GenericSourceMutation::TextField(commit)
+                if context.patch_editor_text && commit.field == "editing_text" =>
+            {
+                Ok(Some(keyed_patch(
+                    "SetCellEditor",
+                    RenderTarget::Borrowed(Cow::Borrowed(address()?)),
+                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                )))
+            }
+            GenericSourceMutation::ValueField(commit) if context.patch_value_text => {
+                Ok(Some(keyed_patch(
+                    "SetCellText",
+                    RenderTarget::Borrowed(Cow::Borrowed(address()?)),
+                    commit.value.clone(),
+                    commit.list,
+                    commit.key,
+                    commit.generation,
+                )))
+            }
+            GenericSourceMutation::RootText(_)
+            | GenericSourceMutation::TextField(_)
+            | GenericSourceMutation::TextFieldIdentity(_)
+            | GenericSourceMutation::ValueField(_)
+            | GenericSourceMutation::BoolField(_)
+            | GenericSourceMutation::ListAppend(_)
+            | GenericSourceMutation::ListRemove { .. }
+            | GenericSourceMutation::SourceBind(_)
+            | GenericSourceMutation::SourceUnbind(_) => Ok(None),
+        }
+    }
+}
+
 impl<'a> GenericSourceMutation<'a> {
     fn semantic_delta(&self) -> Option<SemanticDelta<'a>> {
         match self {
@@ -4798,6 +8920,59 @@ struct GenericSourceActionInput<'a> {
     seq: TickSeq,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericBoundSourceIndex {
+    Unspecified,
+    Bound(usize),
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenericCellsScenarioPreparation {
+    max_text_len: usize,
+    max_deps: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericVisibleRowOccurrence {
+    Occurrence(usize),
+    Stale,
+    Mismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericSourceRouteKind {
+    RootText,
+    RootScalar,
+    ListAppend,
+    ListRemove,
+    IndexedTextChange,
+    IndexedTextCommit,
+    IndexedTextIdentity,
+    IndexedTextKey,
+    IndexedTextOpen,
+    IndexedBoolToggle,
+    IndexedBoolBulk,
+}
+
+impl GenericSourceRouteKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RootText => "root_text",
+            Self::RootScalar => "root_scalar",
+            Self::ListAppend => "list_append",
+            Self::ListRemove => "list_remove",
+            Self::IndexedTextChange => "indexed_text_change",
+            Self::IndexedTextCommit => "indexed_text_commit",
+            Self::IndexedTextIdentity => "indexed_text_identity",
+            Self::IndexedTextKey => "indexed_text_key",
+            Self::IndexedTextOpen => "indexed_text_open",
+            Self::IndexedBoolToggle => "indexed_bool_toggle",
+            Self::IndexedBoolBulk => "indexed_bool_bulk",
+        }
+    }
+}
+
 #[allow(dead_code)]
 enum GenericSourceMutation<'a> {
     RootText(GenericRootTextCommit<'a>),
@@ -4813,6 +8988,222 @@ enum GenericSourceMutation<'a> {
     },
     SourceBind(SourceBinding),
     SourceUnbind(SourceBinding),
+}
+
+#[derive(Debug)]
+struct GenericSourceMutationBatch<'a> {
+    root_texts: [Option<(&'static str, GenericRootTextCommit<'a>)>; 4],
+    text_fields: [Option<(&'static str, GenericTextFieldCommit<'a>)>; 8],
+    identity_fields: [Option<(&'static str, GenericTextFieldIdentity)>; 8],
+    bool_fields: [Option<(&'static str, GenericBoolFieldCommit)>; 8],
+    list_appends: [Option<(&'static str, GenericTextListAppendCommit<'a>)>; 4],
+}
+
+impl<'a> GenericSourceMutationBatch<'a> {
+    fn new() -> Self {
+        Self {
+            root_texts: std::array::from_fn(|_| None),
+            text_fields: [None; 8],
+            identity_fields: [None; 8],
+            bool_fields: [None; 8],
+            list_appends: [None; 4],
+        }
+    }
+
+    fn observe(&mut self, mutation: &GenericSourceMutation<'a>) -> RuntimeResult<()> {
+        match mutation {
+            GenericSourceMutation::RootText(commit) => {
+                Self::insert_root_text(&mut self.root_texts, commit.target, commit.clone())?;
+            }
+            GenericSourceMutation::TextField(commit) => {
+                Self::insert_text(&mut self.text_fields, commit.field, *commit)?;
+            }
+            GenericSourceMutation::TextFieldIdentity(commit) => {
+                Self::insert_identity(&mut self.identity_fields, commit.field, *commit)?;
+            }
+            GenericSourceMutation::BoolField(commit) => {
+                Self::insert_bool(&mut self.bool_fields, commit.field, *commit)?;
+            }
+            GenericSourceMutation::ListAppend(commit) => {
+                Self::insert_append(&mut self.list_appends, commit.list, *commit)?;
+            }
+            GenericSourceMutation::ValueField(_)
+            | GenericSourceMutation::ListRemove { .. }
+            | GenericSourceMutation::SourceBind(_)
+            | GenericSourceMutation::SourceUnbind(_) => {}
+        }
+        Ok(())
+    }
+
+    fn insert_root_text(
+        slots: &mut [Option<(&'static str, GenericRootTextCommit<'a>)>; 4],
+        target: &'static str,
+        commit: GenericRootTextCommit<'a>,
+    ) -> RuntimeResult<()> {
+        for slot in slots.iter_mut() {
+            match slot {
+                Some((existing, value)) if *existing == target => {
+                    *value = commit;
+                    return Ok(());
+                }
+                None => {
+                    *slot = Some((target, commit));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(format!("source mutation batch root capacity exceeded for `{target}`").into())
+    }
+
+    fn insert_text(
+        slots: &mut [Option<(&'static str, GenericTextFieldCommit<'a>)>; 8],
+        field: &'static str,
+        commit: GenericTextFieldCommit<'a>,
+    ) -> RuntimeResult<()> {
+        for slot in slots.iter_mut() {
+            match slot {
+                Some((existing, value)) if *existing == field => {
+                    *value = commit;
+                    return Ok(());
+                }
+                None => {
+                    *slot = Some((field, commit));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(format!("source mutation batch text capacity exceeded for `{field}`").into())
+    }
+
+    fn insert_identity(
+        slots: &mut [Option<(&'static str, GenericTextFieldIdentity)>; 8],
+        field: &'static str,
+        commit: GenericTextFieldIdentity,
+    ) -> RuntimeResult<()> {
+        for slot in slots.iter_mut() {
+            match slot {
+                Some((existing, value)) if *existing == field => {
+                    *value = commit;
+                    return Ok(());
+                }
+                None => {
+                    *slot = Some((field, commit));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(format!("source mutation batch identity capacity exceeded for `{field}`").into())
+    }
+
+    fn insert_bool(
+        slots: &mut [Option<(&'static str, GenericBoolFieldCommit)>; 8],
+        field: &'static str,
+        commit: GenericBoolFieldCommit,
+    ) -> RuntimeResult<()> {
+        for slot in slots.iter_mut() {
+            match slot {
+                Some((existing, value)) if *existing == field => {
+                    *value = commit;
+                    return Ok(());
+                }
+                None => {
+                    *slot = Some((field, commit));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(format!("source mutation batch bool capacity exceeded for `{field}`").into())
+    }
+
+    fn insert_append(
+        slots: &mut [Option<(&'static str, GenericTextListAppendCommit<'a>)>; 4],
+        list: &'static str,
+        commit: GenericTextListAppendCommit<'a>,
+    ) -> RuntimeResult<()> {
+        for slot in slots.iter_mut() {
+            match slot {
+                Some((existing, value)) if *existing == list => {
+                    *value = commit;
+                    return Ok(());
+                }
+                None => {
+                    *slot = Some((list, commit));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(format!("source mutation batch append capacity exceeded for `{list}`").into())
+    }
+
+    fn require_text(
+        &self,
+        source: &str,
+        label: &str,
+        field: &'static str,
+    ) -> RuntimeResult<GenericTextFieldCommit<'a>> {
+        self.text(field).ok_or_else(|| {
+            format!("{label} from `{source}` produced no `{field}` text change").into()
+        })
+    }
+
+    fn text(&self, field: &'static str) -> Option<GenericTextFieldCommit<'a>> {
+        self.text_fields.iter().find_map(|slot| match slot {
+            Some((existing, commit)) if *existing == field => Some(*commit),
+            _ => None,
+        })
+    }
+
+    fn require_identity(
+        &self,
+        source: &str,
+        label: &str,
+        field: &'static str,
+    ) -> RuntimeResult<GenericTextFieldIdentity> {
+        self.identity_fields
+            .iter()
+            .find_map(|slot| match slot {
+                Some((existing, commit)) if *existing == field => Some(*commit),
+                _ => None,
+            })
+            .ok_or_else(|| format!("{label} from `{source}` produced no `{field}` identity").into())
+    }
+
+    fn require_bool(
+        &self,
+        source: &str,
+        label: &str,
+        field: &'static str,
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        self.bool(field).ok_or_else(|| {
+            format!("{label} from `{source}` produced no `{field}` bool change").into()
+        })
+    }
+
+    fn bool(&self, field: &'static str) -> Option<GenericBoolFieldCommit> {
+        self.bool_fields.iter().find_map(|slot| match slot {
+            Some((existing, commit)) if *existing == field => Some(*commit),
+            _ => None,
+        })
+    }
+
+    fn list_append(&self, list: &'static str) -> Option<GenericTextListAppendCommit<'a>> {
+        self.list_appends.iter().find_map(|slot| match slot {
+            Some((existing, commit)) if *existing == list => Some(*commit),
+            _ => None,
+        })
+    }
+
+    fn root_text(&self, target: &'static str) -> Option<GenericRootTextCommit<'a>> {
+        self.root_texts.iter().find_map(|slot| match slot {
+            Some((existing, commit)) if *existing == target => Some(commit.clone()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5003,12 +9394,6 @@ impl ScalarEquationPlan {
         Self { branches }
     }
 
-    fn empty() -> Self {
-        Self {
-            branches: Vec::new(),
-        }
-    }
-
     fn eval_text<'a>(
         &self,
         target: &str,
@@ -5086,6 +9471,7 @@ impl ScalarEquationPlan {
 }
 
 impl DerivedEquationPlan {
+    #[cfg(test)]
     fn empty() -> Self {
         Self {
             text_transforms: Vec::new(),
@@ -5236,10 +9622,6 @@ impl SourceRoutePlan {
 
     fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
         self.require_source(source)?.single_root_scalar_target()
-    }
-
-    fn has_indexed_text_target(&self, source: &str, target: &str) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_indexed_text_target(target))
     }
 
     fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
@@ -5448,18 +9830,6 @@ impl SourceRoute {
         })
     }
 
-    fn has_indexed_text_target(&self, target: &str) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::IndexedText {
-                    target: candidate,
-                    ..
-                } if candidate == target
-            )
-        })
-    }
-
     fn single_root_scalar_target(&self) -> RuntimeResult<Option<&'static str>> {
         let mut target = None;
         for candidate in &self.root_scalar_targets {
@@ -5580,6 +9950,7 @@ impl ListEquationPlan {
         Self { operations }
     }
 
+    #[cfg(test)]
     fn empty() -> Self {
         Self {
             operations: Vec::new(),
@@ -5714,6 +10085,78 @@ fn row_field_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+fn seeded_todomvc_generic(
+    ir: &TypedProgram,
+    count: usize,
+) -> RuntimeResult<(GenericScheduledRuntime, JsonValue)> {
+    let compiled = CompiledProgram::from_ir(ir)?;
+    if !matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc) {
+        return Err("TodoMVC stress profiles require a TodoMVC executable surface".into());
+    }
+    let mut runtime = GenericScheduledRuntime::new(ir, &compiled)?;
+    let capacity = runtime
+        .storage
+        .list_capacities
+        .get("todos")
+        .copied()
+        .flatten();
+    if let Some(capacity) = capacity
+        && count > capacity
+    {
+        return Err(
+            format!("TodoMVC stress needs {count} rows but LIST capacity is {capacity}").into(),
+        );
+    }
+    let row_template = runtime
+        .storage
+        .row_templates
+        .get("todos")
+        .cloned()
+        .ok_or("TodoMVC generic runtime has no `todos` row template")?;
+    let row_source_paths = runtime.list_source_bindings.source_paths("todos")?.to_vec();
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut seed_fields = BTreeMap::new();
+        seed_fields.insert(
+            "title".to_owned(),
+            RuntimeValue::Text(format!("Todo {index}")),
+        );
+        rows.push(row_template.materialize(seed_fields)?);
+    }
+    runtime
+        .storage
+        .lists
+        .insert("todos".to_owned(), KeyedList::from_values(rows));
+    runtime.storage.sources = SourceStore::default();
+    runtime
+        .storage
+        .reserve_source_bindings(count * row_source_paths.len());
+    for index in 0..count {
+        let (key, generation) = runtime.storage.row_identity("todos", index)?;
+        runtime
+            .storage
+            .bind_row_sources("todos", key, generation, &row_source_paths);
+    }
+    let ir_proof = json!({
+        "runtime_constructed_from_ir": true,
+        "compiled_surface": compiled.surface.kind.as_str(),
+        "compiled_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
+        "schedule_node_count": compiled.schedule_node_count,
+        "state_initializer_count": compiled.state_initializer_count,
+        "list_initializer_count": compiled.list_initializer_count,
+        "derived_value_count": compiled.derived_value_count,
+        "derived_text_transform_count": compiled.derived_text_transform_count,
+        "update_branch_count": compiled.update_branch_count,
+        "list_operation_count": compiled.list_operation_count,
+        "source_route_count": compiled.source_route_count,
+        "list_source_binding_count": compiled.list_source_bindings.bindings.len(),
+        "row_source_binding_count": row_source_paths.len(),
+        "list_capacity": capacity,
+    });
+    Ok((runtime, ir_proof))
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct TodoRuntime {
     generic: GenericScheduledRuntime,
@@ -5727,82 +10170,24 @@ struct TodoRuntimeState {
     stale_source_drop_count: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum TodoEvent<'a> {
-    NewInputChange {
-        source: &'a str,
-        text: &'a str,
-    },
-    NewInputKeyDown {
-        source: &'a str,
-        key: &'a str,
-        text: &'a str,
-    },
-    Filter {
-        source: &'a str,
-    },
-    ClearCompleted {
-        source: &'a str,
-    },
-    ToggleAll {
-        source: &'a str,
-    },
-    TodoCheckbox {
-        source: &'a str,
+    Source(GenericRoutedSourceEvent<'a>),
+    RowSource {
+        routed: GenericRoutedSourceEvent<'a>,
         target_text: &'a str,
         target_occurrence: usize,
-    },
-    TodoTitleDoubleClick {
-        source: &'a str,
-        target_text: &'a str,
-        target_occurrence: usize,
-    },
-    EditingTitleChange {
-        source: &'a str,
-        target_text: &'a str,
-        text: &'a str,
-    },
-    EditingTitleKeyDown {
-        source: &'a str,
-        target_text: &'a str,
-        key: &'a str,
-        text: Option<&'a str>,
-    },
-    EditingTitleBlur {
-        source: &'a str,
-        target_text: &'a str,
-        text: Option<&'a str>,
     },
     HoverDelete {
         target_text: &'a str,
         target_occurrence: usize,
     },
-    RemoveTodo {
-        source: &'a str,
-        target_text: &'a str,
-        target_occurrence: usize,
-    },
 }
 
+#[cfg(test)]
 impl TodoRuntime {
-    fn from_loaded_parts(generic: GenericScheduledRuntime, state: TodoRuntimeState) -> Self {
-        Self {
-            generic,
-            next_source_seq: state.next_source_seq,
-            stale_source_drop_count: state.stale_source_drop_count,
-        }
-    }
-
-    fn into_loaded_parts(self) -> (GenericScheduledRuntime, TodoRuntimeState) {
-        (
-            self.generic,
-            TodoRuntimeState {
-                next_source_seq: self.next_source_seq,
-                stale_source_drop_count: self.stale_source_drop_count,
-            },
-        )
-    }
-
+    #[cfg(test)]
     fn from_generic(mut generic: GenericScheduledRuntime) -> RuntimeResult<Self> {
         let todo_count = generic.list_len("todos")?;
         let row_source_paths = generic.row_source_paths("todos")?.to_vec();
@@ -5819,6 +10204,7 @@ impl TodoRuntime {
         .validate()
     }
 
+    #[cfg(test)]
     fn validate(self) -> RuntimeResult<Self> {
         for index in 0..self.generic.list_len("todos")? {
             if self
@@ -5832,114 +10218,6 @@ impl TodoRuntime {
         Ok(self)
     }
 
-    fn seeded(count: usize) -> Self {
-        let list_source_bindings = default_todo_list_source_bindings();
-        let row_source_paths = list_source_bindings
-            .source_paths("todos")
-            .expect("checked-in TodoMVC should have row sources");
-        let generic_rows = (0..count).map(|index| todo_generic_row(&format!("Todo {index}")));
-        let mut generic = GenericCircuitRuntime::default();
-        generic.root.insert(
-            "store.new_todo_text".to_owned(),
-            RuntimeValue::Text(String::new()),
-        );
-        generic.root.insert(
-            "store.selected_filter".to_owned(),
-            RuntimeValue::Enum("All".to_owned()),
-        );
-        generic
-            .lists
-            .insert("todos".to_owned(), KeyedList::from_values(generic_rows));
-        generic.reserve_source_bindings(count * row_source_paths.len());
-        for index in 0..count {
-            let (key, generation) = generic
-                .row_identity("todos", index)
-                .expect("seeded TodoMVC row exists");
-            generic.bind_row_sources("todos", key, generation, row_source_paths);
-        }
-        let generic = GenericScheduledRuntime::from_parts(
-            generic,
-            ScalarEquationPlan::empty(),
-            DerivedEquationPlan::empty(),
-            ListEquationPlan::empty(),
-            FormulaEquationPlan::empty(),
-            SourceRoutePlan::default(),
-            list_source_bindings,
-        );
-        Self {
-            generic,
-            next_source_seq: 1,
-            stale_source_drop_count: 0,
-        }
-    }
-
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
-        let mut max_text_len = 0usize;
-        let mut append_count = 0usize;
-        for step in &scenario.step {
-            if let Some(action) = &step.user_action {
-                if let Some(text) = toml_string_ref(action, "text") {
-                    max_text_len = max_text_len.max(text.len());
-                }
-                if toml_string_ref(action, "kind") == Some("key_down")
-                    && toml_string_ref(action, "target") == Some("new todo input")
-                    && toml_string_ref(action, "key") == Some("Enter")
-                {
-                    let text = toml_string_ref(action, "text")
-                        .or_else(|| {
-                            step.expected_source_event
-                                .as_ref()
-                                .and_then(|expected| toml_string_ref(expected, "text"))
-                        })
-                        .unwrap_or_default();
-                    if !text.trim().is_empty() {
-                        append_count += 1;
-                        max_text_len = max_text_len.max(text.trim().len());
-                    }
-                }
-            }
-            if let Some(expected) = &step.expected_source_event {
-                if let Some(text) = toml_string_ref(expected, "text") {
-                    max_text_len = max_text_len.max(text.len());
-                }
-                if let Some(target_text) = toml_string_ref(expected, "target_text") {
-                    max_text_len = max_text_len.max(target_text.len());
-                }
-            }
-        }
-        self.generic
-            .reserve_root_textlike("store.new_todo_text", max_text_len)
-            .expect("TodoMVC generic runtime has new_todo_text root");
-        self.generic
-            .reserve_root_textlike("store.selected_filter", "Completed".len())
-            .expect("TodoMVC generic runtime has selected_filter root");
-        self.generic
-            .reserve_list("todos", append_count)
-            .expect("TodoMVC generic runtime has todos list");
-        let row_source_count = self
-            .generic
-            .list_source_bindings
-            .source_count("todos")
-            .expect("TodoMVC compiled runtime has row source bindings");
-        self.generic
-            .reserve_source_bindings(append_count * row_source_count);
-        if append_count > 0 {
-            self.generic
-                .reserve_spare_rows_for_list_append_text("todos", append_count, max_text_len)
-                .expect("TodoMVC generic runtime can reserve append rows");
-        }
-        self.generic
-            .reserve_list_row_textlike_fields("todos", "title", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("TodoMVC generic runtime has title fields");
-        self.generic
-            .reserve_list_row_textlike_fields("todos", "edit_text", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("TodoMVC generic runtime has edit_text fields");
-    }
-
     fn apply_step_into<'a>(
         &mut self,
         step: &'a ScenarioStep,
@@ -5949,22 +10227,19 @@ impl TodoRuntime {
         let Some(event) = self.route_step(step)? else {
             return Ok(());
         };
-        if !matches!(event, TodoEvent::HoverDelete { .. }) {
-            assert_todo_event_matches(step, &event)?;
+        match &event {
+            TodoEvent::Source(routed) => assert_routed_source_event_matches(step, routed.event)?,
+            TodoEvent::RowSource { routed, .. } => {
+                assert_routed_source_event_matches(step, routed.event)?
+            }
+            TodoEvent::HoverDelete { .. } => {}
         }
         match event {
-            TodoEvent::NewInputChange { source, text } => {
+            TodoEvent::Source(routed) if routed.route_kind == GenericSourceRouteKind::RootText => {
                 let seq = self.next_source_seq();
-                let source_event = GenericSourceEvent {
-                    source,
-                    text: Some(text),
-                    key: None,
-                    target_text: None,
-                    address: None,
-                };
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
-                    source_event,
+                    routed.event,
                     seq,
                     |_, _| Ok(None),
                 )?;
@@ -5981,62 +10256,37 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::NewInputKeyDown { source, key, text } => {
+            TodoEvent::Source(routed)
+                if routed.route_kind == GenericSourceRouteKind::ListAppend =>
+            {
                 let seq = self.next_source_seq();
-                if key == "Enter" {
-                    let source_event = GenericSourceEvent {
-                        source,
-                        text: Some(text),
-                        key: Some(key),
-                        target_text: None,
-                        address: None,
-                    };
-                    let input = self.generic.source_action_input_for_event(
-                        &step.id,
-                        source_event,
-                        seq,
-                        |_, _| Ok(None),
-                    )?;
-                    let mut insert = None;
-                    let mut root_commit = None;
-                    self.generic.apply_source_actions(
-                        input,
-                        |_| None,
-                        |mutation| {
-                            match mutation {
-                                GenericSourceMutation::ListAppend(commit) => insert = Some(commit),
-                                GenericSourceMutation::RootText(commit) => {
-                                    root_commit = Some(commit)
-                                }
-                                _ => {}
-                            }
-                            Ok(())
-                        },
-                    )?;
-                    if let Some(insert) = insert {
-                        self.emit_todo_insert(insert, &mut deltas, &mut patches);
-                        if let Some(commit) = root_commit {
-                            emit_todomvc_default_protocol_mutation(
-                                GenericSourceMutation::RootText(commit),
-                                &mut deltas,
-                                &mut patches,
-                            )?;
-                        }
+                let input = self.generic.source_action_input_for_event(
+                    &step.id,
+                    routed.event,
+                    seq,
+                    |_, _| Ok(None),
+                )?;
+                let batch =
+                    self.generic
+                        .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+                if let Some(insert) = batch.list_append("todos") {
+                    self.emit_todo_insert(insert, &mut deltas, &mut patches)?;
+                    if let Some(commit) = batch.root_text("store.new_todo_text") {
+                        emit_todomvc_default_protocol_mutation(
+                            GenericSourceMutation::RootText(commit),
+                            &mut deltas,
+                            &mut patches,
+                        )?;
                     }
                 }
             }
-            TodoEvent::Filter { source } => {
+            TodoEvent::Source(routed)
+                if routed.route_kind == GenericSourceRouteKind::RootScalar =>
+            {
                 let seq = self.next_source_seq();
-                let source_event = GenericSourceEvent {
-                    source,
-                    text: None,
-                    key: None,
-                    target_text: None,
-                    address: None,
-                };
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
-                    source_event,
+                    routed.event,
                     seq,
                     |_, _| Ok(None),
                 )?;
@@ -6053,23 +10303,21 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::ClearCompleted { source } => {
-                self.remove_where_source(&step.id, source, &mut deltas, &mut patches)?;
+            TodoEvent::Source(routed)
+                if routed.route_kind == GenericSourceRouteKind::ListRemove =>
+            {
+                self.remove_where_source(&step.id, routed.source(), &mut deltas, &mut patches)?;
             }
-            TodoEvent::ToggleAll { source } => {
+            TodoEvent::Source(routed)
+                if routed.route_kind == GenericSourceRouteKind::IndexedBoolBulk =>
+            {
                 let all_completed = self.all_completed();
-                let source_event = GenericSourceEvent {
-                    source,
-                    text: None,
-                    key: None,
-                    target_text: None,
-                    address: None,
-                };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_list_index(
                     &step.id,
-                    source_event,
+                    routed.event,
                     TickSeq(0),
-                    |_, _| Ok(None),
+                    "todos",
+                    None,
                 )?;
                 self.generic.apply_source_actions(
                     input,
@@ -6087,117 +10335,90 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::TodoCheckbox {
-                source,
+            TodoEvent::Source(routed) => {
+                return Err(format!(
+                    "{} TodoMVC source `{}` classified as unsupported generic route `{}`",
+                    step.id,
+                    routed.source(),
+                    routed.route_kind.as_str()
+                )
+                .into());
+            }
+            TodoEvent::RowSource {
+                routed,
                 target_text,
                 target_occurrence,
-            } => {
+            } if routed.route_kind == GenericSourceRouteKind::IndexedBoolToggle => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
                 self.apply_todo_bool_source_action(
                     &step.id,
                     index,
-                    source,
+                    routed.source(),
                     Some(target_text),
                     all_completed,
                     &mut deltas,
                     &mut patches,
                 )?;
             }
-            TodoEvent::TodoTitleDoubleClick {
-                source,
+            TodoEvent::RowSource {
+                routed,
                 target_text,
                 target_occurrence,
-            } => {
+            } if routed.route_kind == GenericSourceRouteKind::IndexedTextOpen => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
                 let source_event = GenericSourceEvent {
-                    source,
                     text: Some(target_text),
-                    key: None,
-                    target_text: Some(target_text),
-                    address: None,
+                    ..routed.event
                 };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_list_index(
                     &step.id,
                     source_event,
                     TickSeq(0),
-                    |list, _| {
-                        if list != "todos" {
-                            return Err(format!(
-                                "TodoMVC source routed to unexpected list `{list}`"
-                            )
-                            .into());
-                        }
-                        Ok(Some(index))
-                    },
+                    "todos",
+                    Some(index),
                 )?;
-                let mut edit_text = None;
-                let mut editing = None;
-                self.generic.apply_source_actions(
+                let batch = self.generic.apply_source_actions_to_batch(
                     input,
                     |path| match path {
                         "store.all_completed" => Some(all_completed),
                         _ => None,
                     },
-                    |mutation| {
-                        match mutation {
-                            GenericSourceMutation::TextField(commit)
-                                if commit.field == "edit_text" =>
-                            {
-                                edit_text = Some(commit);
-                            }
-                            GenericSourceMutation::BoolField(commit)
-                                if commit.field == "editing" =>
-                            {
-                                editing = Some(commit);
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    },
+                    |_| Ok(()),
                 )?;
-                let edit_text = edit_text.ok_or_else(|| {
-                    format!("previous-text update from `{source}` produced no change")
-                })?;
-                let editing = editing
-                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
+                let edit_text =
+                    batch.require_text(routed.source(), "previous-text update", "edit_text")?;
+                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
                 deltas.push(editing.semantic_delta());
                 deltas.push(edit_text.semantic_delta());
-                patches.push(patch(
-                    "ShowEditInput",
-                    RenderTarget::TodoEdit(editing.key),
-                    ProtocolValue::Text(Cow::Borrowed(edit_text.value)),
-                ));
+                emit_todomvc_render_patch_for_mutation(
+                    &GenericSourceMutation::BoolField(editing),
+                    GenericRenderContext {
+                        todo_show_edit_input_text: Some(edit_text.value),
+                        ..GenericRenderContext::default()
+                    },
+                    &mut patches,
+                )?;
             }
-            TodoEvent::EditingTitleChange {
-                source,
+            TodoEvent::RowSource {
+                routed,
                 target_text,
-                text,
-            } => {
+                ..
+            } if routed.route_kind == GenericSourceRouteKind::IndexedTextChange => {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
                 let source_event = GenericSourceEvent {
-                    source,
-                    text: Some(text),
-                    key: None,
-                    target_text: Some(target_text),
-                    address: None,
+                    text: Some(routed.require_text(&step.id)?),
+                    ..routed.event
                 };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_list_index(
                     &step.id,
                     source_event,
                     TickSeq(0),
-                    |list, _| {
-                        if list != "todos" {
-                            return Err(format!(
-                                "TodoMVC source routed to unexpected list `{list}`"
-                            )
-                            .into());
-                        }
-                        Ok(Some(index))
-                    },
+                    "todos",
+                    Some(index),
                 )?;
                 self.generic.apply_source_actions(
                     input,
@@ -6212,200 +10433,147 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::EditingTitleKeyDown {
-                source,
+            TodoEvent::RowSource {
+                routed,
                 target_text,
-                key,
-                text,
-            } => {
+                ..
+            } if routed.route_kind == GenericSourceRouteKind::IndexedTextKey => {
+                let key = routed.event.key.unwrap_or_default();
                 if matches!(key, "Enter" | "Escape") {
                     let index = self
                         .find_index(target_text)
                         .or_else(|_| self.find_editing_index())?;
-                    let (row_key, _) = self.todo_row_identity(index)?;
                     let all_completed = self.all_completed();
                     let payload_text = if key == "Enter" {
-                        text
+                        routed.event.text
                     } else {
                         Some(target_text)
                     };
                     let source_event = GenericSourceEvent {
-                        source,
                         text: payload_text,
-                        key: Some(key),
-                        target_text: Some(target_text),
-                        address: None,
+                        ..routed.event
                     };
-                    let input = self.generic.source_action_input_for_event(
+                    let input = self.generic.source_action_input_for_list_index(
                         &step.id,
                         source_event,
                         TickSeq(0),
-                        |list, _| {
-                            if list != "todos" {
-                                return Err(format!(
-                                    "TodoMVC source routed to unexpected list `{list}`"
-                                )
-                                .into());
-                            }
-                            Ok(Some(index))
-                        },
+                        "todos",
+                        Some(index),
                     )?;
-                    let mut title = None;
-                    let mut edit_text = None;
-                    let mut editing = None;
-                    self.generic.apply_source_actions(
+                    let batch = self.generic.apply_source_actions_to_batch(
                         input,
                         |path| match path {
                             "store.all_completed" => Some(all_completed),
                             _ => None,
                         },
-                        |mutation| {
-                            match mutation {
-                                GenericSourceMutation::TextField(commit)
-                                    if commit.field == "title" =>
-                                {
-                                    title = Some(commit);
-                                }
-                                GenericSourceMutation::TextField(commit)
-                                    if commit.field == "edit_text" =>
-                                {
-                                    edit_text = Some(commit);
-                                }
-                                GenericSourceMutation::BoolField(commit)
-                                    if commit.field == "editing" =>
-                                {
-                                    editing = Some(commit);
-                                }
-                                _ => {}
-                            }
-                            Ok(())
-                        },
+                        |_| Ok(()),
                     )?;
                     if key == "Enter" {
-                        if let Some(title) = title {
-                            deltas.push(title.semantic_delta());
-                            patches.push(patch(
-                                "SetText",
-                                RenderTarget::TodoTitle(row_key),
-                                ProtocolValue::Text(Cow::Borrowed(title.value)),
-                            ));
+                        if let Some(title) = batch.text("title") {
+                            emit_todomvc_default_protocol_mutation(
+                                GenericSourceMutation::TextField(title),
+                                &mut deltas,
+                                &mut patches,
+                            )?;
                         }
-                    } else if let Some(edit_text) = edit_text {
+                    } else if let Some(edit_text) = batch.text("edit_text") {
                         deltas.push(edit_text.semantic_delta());
                     }
-                    let editing = editing.ok_or_else(|| {
-                        format!("editing update from `{source}` produced no change")
-                    })?;
-                    deltas.push(editing.semantic_delta());
-                    patches.push(patch(
-                        "HideEditInput",
-                        RenderTarget::TodoEdit(row_key),
-                        ProtocolValue::Bool(editing.value),
-                    ));
+                    let editing =
+                        batch.require_bool(routed.source(), "editing update", "editing")?;
+                    emit_todomvc_default_protocol_mutation(
+                        GenericSourceMutation::BoolField(editing),
+                        &mut deltas,
+                        &mut patches,
+                    )?;
                 }
             }
-            TodoEvent::EditingTitleBlur {
-                source,
+            TodoEvent::RowSource {
+                routed,
                 target_text,
-                text,
-            } => {
+                ..
+            } if routed.route_kind == GenericSourceRouteKind::IndexedTextCommit => {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
-                let (row_key, _) = self.todo_row_identity(index)?;
                 let all_completed = self.all_completed();
                 let source_event = GenericSourceEvent {
-                    source,
-                    text: text.or(Some(target_text)),
-                    key: None,
-                    target_text: Some(target_text),
-                    address: None,
+                    text: routed.event.text.or(Some(target_text)),
+                    ..routed.event
                 };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_list_index(
                     &step.id,
                     source_event,
                     TickSeq(0),
-                    |list, _| {
-                        if list != "todos" {
-                            return Err(format!(
-                                "TodoMVC source routed to unexpected list `{list}`"
-                            )
-                            .into());
-                        }
-                        Ok(Some(index))
-                    },
+                    "todos",
+                    Some(index),
                 )?;
-                let mut title = None;
-                let mut editing = None;
-                self.generic.apply_source_actions(
+                let batch = self.generic.apply_source_actions_to_batch(
                     input,
                     |path| match path {
                         "store.all_completed" => Some(all_completed),
                         _ => None,
                     },
-                    |mutation| {
-                        match mutation {
-                            GenericSourceMutation::TextField(commit) if commit.field == "title" => {
-                                title = Some(commit);
-                            }
-                            GenericSourceMutation::BoolField(commit)
-                                if commit.field == "editing" =>
-                            {
-                                editing = Some(commit);
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    },
+                    |_| Ok(()),
                 )?;
-                if let Some(title) = title {
-                    deltas.push(title.semantic_delta());
-                    patches.push(patch(
-                        "SetText",
-                        RenderTarget::TodoTitle(row_key),
-                        ProtocolValue::Text(Cow::Borrowed(title.value)),
-                    ));
+                if let Some(title) = batch.text("title") {
+                    emit_todomvc_default_protocol_mutation(
+                        GenericSourceMutation::TextField(title),
+                        &mut deltas,
+                        &mut patches,
+                    )?;
                 }
-                let editing = editing
-                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
-                deltas.push(editing.semantic_delta());
-                patches.push(patch(
-                    "HideEditInput",
-                    RenderTarget::TodoEdit(row_key),
-                    ProtocolValue::Bool(editing.value),
-                ));
+                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
+                emit_todomvc_default_protocol_mutation(
+                    GenericSourceMutation::BoolField(editing),
+                    &mut deltas,
+                    &mut patches,
+                )?;
+            }
+            TodoEvent::RowSource {
+                routed,
+                target_text,
+                target_occurrence,
+            } if routed.route_kind == GenericSourceRouteKind::ListRemove => {
+                let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
+                if !self.remove_index_source(
+                    &step.id,
+                    index,
+                    routed.source(),
+                    Some(target_text),
+                    &mut deltas,
+                    &mut patches,
+                )? {
+                    return Err(format!(
+                        "remove source `{}` predicate does not match todo `{target_text}`",
+                        routed.source()
+                    )
+                    .into());
+                }
+            }
+            TodoEvent::RowSource { routed, .. } => {
+                return Err(format!(
+                    "{} TodoMVC row source `{}` classified as unsupported generic route `{}`",
+                    step.id,
+                    routed.source(),
+                    routed.route_kind.as_str()
+                )
+                .into());
             }
             TodoEvent::HoverDelete {
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let (key, _) = self.todo_row_identity(index)?;
-                patches.push(patch(
-                    "ShowDeleteButton",
-                    RenderTarget::TodoRow(key),
-                    ProtocolValue::Bool(true),
-                ));
-            }
-            TodoEvent::RemoveTodo {
-                source,
-                target_text,
-                target_occurrence,
-            } => {
-                let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                if !self.remove_index_source(
-                    &step.id,
-                    index,
-                    source,
-                    Some(target_text),
-                    &mut deltas,
-                    &mut patches,
-                )? {
-                    return Err(format!(
-                        "remove source `{source}` predicate does not match todo `{target_text}`"
-                    )
-                    .into());
-                }
+                let (key, generation) = self.todo_row_identity(index)?;
+                patches.push(
+                    GenericRenderLoweringPlan::todo_mvc().lower_todomvc_row_affordance_patch(
+                        key,
+                        generation,
+                        "delete_button",
+                        true,
+                    )?,
+                );
             }
         }
         Ok(())
@@ -6458,39 +10626,28 @@ impl TodoRuntime {
         fallback_occurrence: usize,
     ) -> RuntimeResult<Option<TodoEvent<'a>>> {
         let source = source_event.source;
-        self.generic
-            .require_source(source)
+        let route_kind = self
+            .generic
+            .classify_source_event("todos", "title", source_event)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
-            if self.generic.has_list_append_target(source, "todos")? {
-                return Ok(Some(TodoEvent::NewInputKeyDown {
-                    source,
-                    key: source_event.key.unwrap_or_default(),
-                    text: source_event.text.unwrap_or_default(),
-                }));
-            }
-            if source_event.text.is_some() {
-                self.generic
-                    .single_root_scalar_target(source)?
-                    .ok_or_else(|| {
-                        format!("{} source `{source}` has no root text target", step.id)
-                    })?;
-                return Ok(Some(TodoEvent::NewInputChange {
-                    source,
-                    text: source_event.text.unwrap_or_default(),
-                }));
-            }
-            if self.generic.has_list_remove_target(source, "todos")? {
-                return Ok(Some(TodoEvent::ClearCompleted { source }));
-            }
-            if self
-                .generic
-                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
-            {
-                return Ok(Some(TodoEvent::ToggleAll { source }));
-            }
-            if self.generic.has_root_scalar_action(source)? {
-                return Ok(Some(TodoEvent::Filter { source }));
+            match route_kind {
+                GenericSourceRouteKind::ListAppend
+                | GenericSourceRouteKind::RootText
+                | GenericSourceRouteKind::ListRemove
+                | GenericSourceRouteKind::IndexedBoolBulk
+                | GenericSourceRouteKind::RootScalar => {
+                    return Ok(Some(TodoEvent::Source(GenericRoutedSourceEvent {
+                        event: source_event,
+                        route_kind,
+                    })));
+                }
+                GenericSourceRouteKind::IndexedTextChange
+                | GenericSourceRouteKind::IndexedTextCommit
+                | GenericSourceRouteKind::IndexedTextIdentity
+                | GenericSourceRouteKind::IndexedTextKey
+                | GenericSourceRouteKind::IndexedTextOpen
+                | GenericSourceRouteKind::IndexedBoolToggle => {}
             }
             return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
         }
@@ -6498,68 +10655,33 @@ impl TodoRuntime {
         let target_text = source_event
             .target_text
             .expect("checked target_text presence above");
-        let removes_todos = self.generic.has_list_remove_target(source, "todos")?;
-        let toggles_completed = self
-            .generic
-            .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?;
-        let updates_title = self.generic.has_indexed_text_action_where(
-            source,
-            SourceRouteTextAction::TextTrimOrPrevious,
-            |target| row_field_name(target) == "title",
-        )?;
-        let has_previous_text = self
-            .generic
-            .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
-        let opens_edit = self
-            .generic
-            .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?;
         let Some(target_occurrence) =
             self.resolve_bound_occurrence(step, target_text, fallback_occurrence)
         else {
             return Ok(None);
         };
-        if removes_todos {
-            return Ok(Some(TodoEvent::RemoveTodo {
-                source,
-                target_text,
-                target_occurrence,
-            }));
-        }
-        if toggles_completed {
-            return Ok(Some(TodoEvent::TodoCheckbox {
-                source,
-                target_text,
-                target_occurrence,
-            }));
-        }
-        if source_event.key.is_some() {
+        if matches!(
+            route_kind,
+            GenericSourceRouteKind::IndexedTextKey
+                | GenericSourceRouteKind::IndexedTextCommit
+                | GenericSourceRouteKind::IndexedTextChange
+        ) {
             self.editing_title()?;
-            return Ok(Some(TodoEvent::EditingTitleKeyDown {
-                source,
-                target_text,
-                key: source_event.key.unwrap_or_default(),
-                text: source_event.text,
-            }));
         }
-        if updates_title {
-            self.editing_title()?;
-            return Ok(Some(TodoEvent::EditingTitleBlur {
-                source,
-                target_text,
-                text: source_event.text.or(Some(target_text)),
-            }));
-        }
-        if source_event.text.is_some() {
-            self.editing_title()?;
-            return Ok(Some(TodoEvent::EditingTitleChange {
-                source,
-                target_text,
-                text: source_event.text.unwrap_or_default(),
-            }));
-        }
-        if has_previous_text && opens_edit {
-            return Ok(Some(TodoEvent::TodoTitleDoubleClick {
-                source,
+        if matches!(
+            route_kind,
+            GenericSourceRouteKind::ListRemove
+                | GenericSourceRouteKind::IndexedBoolToggle
+                | GenericSourceRouteKind::IndexedTextKey
+                | GenericSourceRouteKind::IndexedTextCommit
+                | GenericSourceRouteKind::IndexedTextChange
+                | GenericSourceRouteKind::IndexedTextOpen
+        ) {
+            return Ok(Some(TodoEvent::RowSource {
+                routed: GenericRoutedSourceEvent {
+                    event: source_event,
+                    route_kind,
+                },
                 target_text,
                 target_occurrence,
             }));
@@ -6577,58 +10699,22 @@ impl TodoRuntime {
         title: &str,
         fallback: usize,
     ) -> Option<usize> {
-        let action = step.user_action.as_ref()?;
-        let Some(key) = toml_u64_ref(action, "target_key") else {
-            return Some(fallback);
-        };
-        let generation = toml_u64_ref(action, "target_generation")?;
-        let source_path = toml_string_ref(action, "source")
-            .or(GenericSourceEvent::from_step(step)
-                .ok()
-                .flatten()
-                .map(|event| event.source))
-            .unwrap_or_default();
-        let source_id = toml_u64_ref(action, "source_id");
-        let bind_epoch = toml_u64_ref(action, "bind_epoch");
-        if !self.generic.is_row_source_bound(
+        let source_event = GenericSourceEvent::from_step(step).ok().flatten();
+        match self.generic.resolve_visible_row_occurrence(
             "todos",
-            key,
-            generation,
-            source_path,
-            source_id,
-            bind_epoch,
+            "title",
+            step.user_action.as_ref(),
+            source_event,
+            title,
+            fallback,
         ) {
-            self.stale_source_drop_count += 1;
-            return None;
+            Ok(GenericVisibleRowOccurrence::Occurrence(occurrence)) => Some(occurrence),
+            Ok(GenericVisibleRowOccurrence::Mismatch) => None,
+            Ok(GenericVisibleRowOccurrence::Stale) | Err(_) => {
+                self.stale_source_drop_count += 1;
+                None
+            }
         }
-        let Some(index) = self
-            .generic
-            .bound_index("todos", key, generation)
-            .ok()
-            .flatten()
-        else {
-            self.stale_source_drop_count += 1;
-            return None;
-        };
-        if self
-            .generic
-            .list_row_textlike("todos", index, "title")
-            .map_or(true, |candidate| candidate != title)
-        {
-            return None;
-        }
-        Some(self.occurrence_for_index_and_title(index, title))
-    }
-
-    fn occurrence_for_index_and_title(&self, target_index: usize, title: &str) -> usize {
-        (0..=target_index)
-            .filter(|index| {
-                self.generic
-                    .list_row_textlike("todos", *index, "title")
-                    .is_ok_and(|candidate| candidate == title)
-            })
-            .count()
-            .max(1)
     }
 
     #[cfg(test)]
@@ -6651,7 +10737,7 @@ impl TodoRuntime {
         else {
             return Ok(());
         };
-        self.emit_todo_insert(insert, deltas, patches);
+        self.emit_todo_insert(insert, deltas, patches)?;
         Ok(())
     }
 
@@ -6660,15 +10746,8 @@ impl TodoRuntime {
         insert: GenericTextListAppendCommit<'a>,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
-    ) {
-        deltas.push(insert.semantic_delta());
-        patches.push(patch(
-            "InsertElement",
-            RenderTarget::TodoRow(insert.key),
-            ProtocolValue::Text(Cow::Borrowed(insert.value)),
-        ));
-        push_source_binding_deltas_for_insert(&self.generic, &insert, deltas);
-        push_source_binding_patches_for_insert(&self.generic, &insert, patches);
+    ) -> RuntimeResult<()> {
+        emit_todo_insert_from_generic(&self.generic, insert, deltas, patches)
     }
 
     fn apply_todo_bool_source_action<'a>(
@@ -6688,16 +10767,12 @@ impl TodoRuntime {
             target_text,
             address: None,
         };
-        let input = self.generic.source_action_input_for_event(
+        let input = self.generic.source_action_input_for_list_index(
             step_id,
             source_event,
             TickSeq(0),
-            |list, _| {
-                if list != "todos" {
-                    return Err(format!("TodoMVC source routed to unexpected list `{list}`").into());
-                }
-                Ok(Some(index))
-            },
+            "todos",
+            Some(index),
         )?;
         self.generic.apply_source_actions(
             input,
@@ -6709,33 +10784,6 @@ impl TodoRuntime {
                 emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
-        )?;
-        Ok(())
-    }
-
-    fn set_completed_value<'a>(
-        &mut self,
-        target: &'static str,
-        index: usize,
-        value: bool,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<()> {
-        let field = row_field_name(target);
-        let (key, generation) = self
-            .generic
-            .commit_indexed_bool_field("todos", index, field, value)?;
-        let commit = GenericBoolFieldCommit {
-            list: "todos",
-            key,
-            generation,
-            field,
-            value,
-        };
-        emit_todomvc_default_protocol_mutation(
-            GenericSourceMutation::BoolField(commit),
-            deltas,
-            patches,
         )?;
         Ok(())
     }
@@ -6754,16 +10802,12 @@ impl TodoRuntime {
             target_text: None,
             address: None,
         };
-        let input = self.generic.source_action_input_for_event(
+        let input = self.generic.source_action_input_for_list_index(
             step_id,
             source_event,
             TickSeq(0),
-            |list, _| {
-                if list != "todos" {
-                    return Err(format!("TodoMVC source routed to unexpected list `{list}`").into());
-                }
-                Ok(None)
-            },
+            "todos",
+            None,
         )?;
         self.generic.apply_source_actions(
             input,
@@ -6792,16 +10836,12 @@ impl TodoRuntime {
             target_text,
             address: None,
         };
-        let input = self.generic.source_action_input_for_event(
+        let input = self.generic.source_action_input_for_list_index(
             step_id,
             source_event,
             TickSeq(0),
-            |list, _| {
-                if list != "todos" {
-                    return Err(format!("TodoMVC source routed to unexpected list `{list}`").into());
-                }
-                Ok(Some(index))
-            },
+            "todos",
+            Some(index),
         )?;
         self.generic.apply_source_actions(
             input,
@@ -6818,39 +10858,33 @@ impl TodoRuntime {
     }
 
     #[cfg(test)]
-    fn remove_index(
+    fn remove_index<'a>(
         &mut self,
         index: usize,
-        deltas: &mut Vec<SemanticDelta<'_>>,
-        patches: &mut Vec<RenderPatch<'_>>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         let generic_row =
             self.generic
                 .remove_row_and_unbind_sources("todos", index, |binding| {
-                    if let Some(delta) =
-                        GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
-                    {
-                        deltas.push(delta);
-                    }
-                    patches.push(patch(
-                        "UnbindSource",
-                        RenderTarget::TodoSource(binding.key, binding.source_path),
-                        source_binding_value(binding),
-                    ));
+                    emit_todomvc_default_protocol_mutation(
+                        GenericSourceMutation::SourceUnbind(binding.clone()),
+                        deltas,
+                        patches,
+                    )
+                    .expect("test remove source unbind should lower");
                 })?;
         let (key, generation) = (generic_row.key, generic_row.generation);
         self.generic.spare_row("todos", generic_row.value);
-        deltas.push(list_delta(
-            "ListRemove",
-            key,
-            generation,
-            ProtocolValue::Null,
-        ));
-        patches.push(patch(
-            "RemoveElement",
-            RenderTarget::TodoRow(key),
-            ProtocolValue::Null,
-        ));
+        emit_todomvc_default_protocol_mutation(
+            GenericSourceMutation::ListRemove {
+                list: "todos",
+                key,
+                generation,
+            },
+            deltas,
+            patches,
+        )?;
         Ok(())
     }
 
@@ -6863,155 +10897,9 @@ impl TodoRuntime {
     ) -> RuntimeResult<()> {
         let commit = self.generic.move_row("todos", from, to)?;
         deltas.push(commit.semantic_move_delta(to));
-        patches.push(patch(
-            "MoveElement",
-            RenderTarget::TodoPosition(commit.key),
-            ProtocolValue::NumberText(to as i64),
-        ));
-        Ok(())
-    }
-
-    fn assert_step(&self, step: &ScenarioStep) -> RuntimeResult<()> {
-        if let Some(expected) = &step.expect_titles {
-            self.generic.assert_list_textlike_projection(
-                &step.id,
-                "titles",
-                "todos",
-                "title",
-                RuntimeListPredicate::AlwaysTrue,
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_visible_titles {
-            self.generic.assert_list_textlike_retain_projection(
-                &self.generic.list_equations,
-                &step.id,
-                "visible_titles",
-                "todos",
-                "store.visible_todos",
-                "title",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_completed_titles {
-            self.generic.assert_list_textlike_where_bool(
-                &step.id,
-                "completed_titles",
-                "todos",
-                "title",
-                "completed",
-                true,
-                expected,
-            )?;
-        }
-        if let Some(expected) = step.expect_active_count {
-            self.generic.assert_list_count_for_target(
-                &self.generic.list_equations,
-                &step.id,
-                "active_count",
-                "todos",
-                "store.active_count",
-                expected,
-            )?;
-        }
-        if let Some(expected) = step.expect_completed_count {
-            self.generic.assert_list_count_for_target(
-                &self.generic.list_equations,
-                &step.id,
-                "completed_count",
-                "todos",
-                "store.completed_count",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_filter {
-            self.generic.assert_root_textlike(
-                &step.id,
-                "filter",
-                "store.selected_filter",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_new_text {
-            self.generic.assert_root_textlike(
-                &step.id,
-                "new_todo_text",
-                "store.new_todo_text",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_editing_title {
-            self.generic.assert_first_list_textlike_where_bool(
-                &step.id,
-                "editing_title",
-                "todos",
-                "title",
-                "editing",
-                true,
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_edit_text {
-            self.generic.assert_first_list_textlike_where_bool(
-                &step.id,
-                "edit_text",
-                "todos",
-                "edit_text",
-                "editing",
-                true,
-                expected,
-            )?;
-        }
-        if step.expect_no_editing == Some(true) {
-            self.generic
-                .assert_no_list_bool(&step.id, "todos", "editing", true)?;
-        }
-        self.assert_generic_mirror_in_sync()
-            .map_err(|error| format!("{} generic storage mismatch: {error}", step.id).into())
-    }
-
-    fn assert_generic_mirror_in_sync(&self) -> RuntimeResult<()> {
-        self.generic.root_textlike_ref("store.new_todo_text")?;
-        self.generic.root_textlike_ref("store.selected_filter")?;
-        for index in 0..self.generic.list_len("todos")? {
-            self.generic.row_identity("todos", index)?;
-            self.generic.list_row_textlike("todos", index, "title")?;
-            self.generic
-                .list_row_textlike("todos", index, "edit_text")?;
-            self.generic.list_row_bool("todos", index, "completed")?;
-            self.generic.list_row_bool("todos", index, "editing")?;
-        }
-        Ok(())
-    }
-
-    fn emit_root_text_commit<'a>(
-        target: &'static str,
-        value: Cow<'a, str>,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<()> {
-        let commit = GenericRootTextCommit {
-            target,
-            value: value.clone(),
-        };
-        deltas.push(commit.semantic_delta());
-        match target {
-            "store.new_todo_text" => {
-                patches.push(patch(
-                    "SetInputValue",
-                    RenderTarget::Static("new_todo_input"),
-                    ProtocolValue::Text(value),
-                ));
-            }
-            "store.selected_filter" => {
-                patches.push(patch(
-                    "SetSelectedFilter",
-                    RenderTarget::Static("filters"),
-                    ProtocolValue::Text(value),
-                ));
-            }
-            _ => return Err(format!("unsupported scalar target `{target}`").into()),
-        }
+        patches.push(
+            GenericRenderLoweringPlan::todo_mvc().lower_todomvc_list_move_patch(&commit, to)?,
+        );
         Ok(())
     }
 
@@ -7067,17 +10955,8 @@ impl TodoRuntime {
     }
 
     fn find_index_at_occurrence(&self, title: &str, occurrence: usize) -> RuntimeResult<usize> {
-        let occurrence = occurrence.max(1);
-        (0..self.generic.list_len("todos")?)
-            .filter(|index| {
-                self.generic
-                    .list_row_textlike("todos", *index, "title")
-                    .is_ok_and(|candidate| candidate == title)
-            })
-            .nth(occurrence - 1)
-            .ok_or_else(|| {
-                format!("todo occurrence {occurrence} not found for title `{title}`").into()
-            })
+        self.generic
+            .find_visible_row_index_by_occurrence("todos", "title", title, occurrence)
     }
 
     fn find_editing_index(&self) -> RuntimeResult<usize> {
@@ -7095,57 +10974,28 @@ impl TodoRuntime {
             .list_row_textlike("todos", self.find_editing_index()?, "title")
     }
 
-    fn active_count(&self) -> usize {
-        self.count_todos_for_target("store.active_count")
-            .expect("active_count must be backed by an IR List/count operation")
-    }
-
-    fn completed_count(&self) -> usize {
-        self.count_todos_for_target("store.completed_count")
-            .expect("completed_count must be backed by an IR List/count operation")
-    }
-
     fn all_completed(&self) -> bool {
-        self.active_count() == 0 && self.completed_count() > 0
-    }
-
-    fn count_todos_for_target(&self, target: &str) -> RuntimeResult<usize> {
-        self.generic.count_list_rows_for_target("todos", target)
-    }
-
-    fn summary(&self) -> JsonValue {
-        let todos = self
-            .generic
-            .list_rows_json("todos", &["title", "edit_text", "completed", "editing"])
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
-        json!({
-            "new_todo_text": self.generic.root_textlike_ref("store.new_todo_text").unwrap_or(""),
-            "selected_filter": self.generic.root_textlike_ref("store.selected_filter").unwrap_or(""),
-            "todos": todos,
-            "active_count": self.active_count(),
-            "completed_count": self.completed_count(),
-            "all_completed": self.all_completed(),
-            "hidden_keys": self.generic.list_identities_json("todos"),
-            "source_binding_count": self.generic.source_binding_count(),
-            "stale_source_drop_count": self.stale_source_drop_count
-        })
+        self.generic.todomvc_all_completed()
     }
 }
 
 impl ScenarioExecutor for LoadedRuntime {
     fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        match &self.surface {
-            LoadedRuntimeSurface::Todo(_) => self.with_todo_runtime(|runtime| {
-                runtime.prepare_for_scenario(scenario);
-                Ok(())
-            }),
-            LoadedRuntimeSurface::Cells(_) => self.with_cells_runtime(|runtime| {
-                runtime.prepare_for_scenario(scenario);
-                Ok(())
-            }),
-            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
+        match &mut self.surface {
+            LoadedRuntimeSurface::Todo(_) => {
+                let generic = self
+                    .generic
+                    .as_mut()
+                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+                generic.prepare_todomvc_scenario(scenario)
+            }
+            LoadedRuntimeSurface::Cells(state) => {
+                let generic = self
+                    .generic
+                    .as_mut()
+                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+                prepare_loaded_cells_scenario(generic, state, scenario)
+            }
         }
     }
 
@@ -7155,152 +11005,151 @@ impl ScenarioExecutor for LoadedRuntime {
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<StepExecutionMetrics> {
-        match &self.surface {
+        match &mut self.surface {
             LoadedRuntimeSurface::Todo(_) => {
-                self.with_todo_runtime(|runtime| runtime.apply_step(step, deltas, patches))
+                if let Some(metrics) =
+                    self.try_apply_todomvc_root_source_step(step, deltas, patches)?
+                {
+                    Ok(metrics)
+                } else if let Some(metrics) =
+                    self.try_apply_todomvc_row_source_step(step, deltas, patches)?
+                {
+                    Ok(metrics)
+                } else if let Some(metrics) =
+                    self.try_apply_todomvc_render_only_step(step, deltas, patches)?
+                {
+                    Ok(metrics)
+                } else if step.user_action.is_none() {
+                    Ok(StepExecutionMetrics {
+                        dirty_key_count: dirty_key_count(deltas),
+                        extra: StepExecutionExtra::Todo {
+                            stale_source_drop_count: 0,
+                        },
+                    })
+                } else {
+                    Err(format!(
+                        "{} TodoMVC step was not handled by the loaded generic runtime",
+                        step.id
+                    )
+                    .into())
+                }
             }
-            LoadedRuntimeSurface::Cells(_) => {
-                self.with_cells_runtime(|runtime| runtime.apply_step(step, deltas, patches))
+            LoadedRuntimeSurface::Cells(state) => {
+                let generic = self
+                    .generic
+                    .as_mut()
+                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+                apply_loaded_cells_step(generic, state, step, deltas, patches)
             }
-            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 
     fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
         match &self.surface {
             LoadedRuntimeSurface::Todo(_) => {
-                self.with_todo_runtime(|runtime| runtime.assert_step_after_measurement(step))
+                let generic = self
+                    .generic
+                    .as_ref()
+                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+                generic.assert_todomvc_step_expectations(step)?;
+                assert_loaded_todomvc_generic_fields(generic)
             }
-            LoadedRuntimeSurface::Cells(_) => {
-                self.with_cells_runtime(|runtime| runtime.assert_step_after_measurement(step))
+            LoadedRuntimeSurface::Cells(state) => {
+                let generic = self
+                    .generic
+                    .as_ref()
+                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+                generic.assert_cells_step_expectations(step, &state.step_recomputed)?;
+                assert_loaded_cells_generic_fields(generic, state)
             }
-            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
         }
     }
 
     fn state_summary(&mut self) -> JsonValue {
-        match &self.surface {
-            LoadedRuntimeSurface::Todo(_) => self
-                .with_todo_runtime(|runtime| Ok(runtime.state_summary()))
-                .unwrap_or_else(|error| json!({ "error": error.to_string() })),
-            LoadedRuntimeSurface::Cells(_) => self
-                .with_cells_runtime(|runtime| Ok(runtime.state_summary()))
-                .unwrap_or_else(|error| json!({ "error": error.to_string() })),
-            LoadedRuntimeSurface::Taken => {
-                json!({ "error": "LoadedRuntime surface was already borrowed" })
-            }
-        }
+        self.generic_state_summary()
     }
 
     fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
         match &self.surface {
-            LoadedRuntimeSurface::Todo(_) => {
-                self.with_todo_runtime(|runtime| runtime.stress_profiles(ir))
-            }
-            LoadedRuntimeSurface::Cells(_) => {
-                self.with_cells_runtime(|runtime| runtime.stress_profiles(ir))
-            }
-            LoadedRuntimeSurface::Taken => Err("LoadedRuntime surface was already borrowed".into()),
+            LoadedRuntimeSurface::Todo(_) => Ok(Some(todomvc_stress_profiles(ir)?)),
+            LoadedRuntimeSurface::Cells(_) => Ok(Some(cells_stress_profiles(ir)?)),
         }
     }
 }
 
-impl ScenarioExecutor for TodoRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        TodoRuntime::prepare_for_scenario(self, scenario);
-        Ok(())
-    }
-
-    fn apply_step<'a>(
-        &mut self,
-        step: &'a ScenarioStep,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<StepExecutionMetrics> {
-        let stale_drops_before = self.stale_source_drop_count;
-        self.apply_step_into(step, deltas, patches)?;
-        Ok(StepExecutionMetrics {
-            dirty_key_count: dirty_key_count(deltas),
-            extra: StepExecutionExtra::Todo {
-                stale_source_drop_count: self
-                    .stale_source_drop_count
-                    .saturating_sub(stale_drops_before),
-            },
-        })
-    }
-
-    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
-        self.assert_step(step)
-    }
-
-    fn state_summary(&mut self) -> JsonValue {
-        self.summary()
-    }
-
-    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
-        Ok(Some(todomvc_stress_profiles(ir)))
-    }
+fn todomvc_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
+    Ok(json!([
+        todomvc_toggle_stress(ir, 1_000)?,
+        todomvc_toggle_stress(ir, 10_000)?,
+        todomvc_move_stress(ir, 10_000)?
+    ]))
 }
 
-fn todomvc_stress_profiles(ir: &TypedProgram) -> JsonValue {
-    json!([
-        todomvc_toggle_stress(ir, 1_000),
-        todomvc_toggle_stress(ir, 10_000),
-        todomvc_move_stress(ir, 10_000)
-    ])
-}
-
-fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
-    let mut runtime = TodoRuntime::seeded(rows);
+fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonValue> {
+    let (mut runtime, ir_proof) = seeded_todomvc_generic(ir, rows)?;
     let mut deltas = Vec::with_capacity(2);
     let mut patches = Vec::with_capacity(2);
     let index = rows / 2;
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
-    runtime
-        .set_completed_value("todo.completed", index, true, &mut deltas, &mut patches)
-        .expect("stress toggle index is in range");
+    let (key, generation) = runtime.commit_indexed_bool_field("todos", index, "completed", true)?;
+    emit_todomvc_default_protocol_mutation(
+        GenericSourceMutation::BoolField(GenericBoolFieldCommit {
+            list: "todos",
+            key,
+            generation,
+            field: "completed",
+            value: true,
+        }),
+        &mut deltas,
+        &mut patches,
+    )?;
     let alloc_delta = allocation_delta(allocations_before);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    json!({
+    Ok(json!({
         "name": format!("todomvc-{rows}-rows-toggle-one"),
+        "ir_runtime_proof": ir_proof,
         "rows": rows,
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.generic.list_len("todos").unwrap_or(0),
+        "list_slot_count": runtime.list_len("todos").unwrap_or(0),
         "dirty_key_count": dirty_key_count(&deltas),
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
         "heap_alloc_count": alloc_delta.count,
         "heap_alloc_bytes": alloc_delta.bytes,
         "elapsed_ms": elapsed_ms,
-    })
+    }))
 }
 
-fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> JsonValue {
-    let mut runtime = TodoRuntime::seeded(rows);
+fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonValue> {
+    let (mut runtime, ir_proof) = seeded_todomvc_generic(ir, rows)?;
     let mut deltas = Vec::with_capacity(1);
     let mut patches = Vec::with_capacity(1);
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
-    runtime
-        .move_index(rows / 2, rows / 2 + 1, &mut deltas, &mut patches)
-        .expect("stress move index is in range");
+    let commit = runtime.move_row("todos", rows / 2, rows / 2 + 1)?;
+    deltas.push(commit.semantic_move_delta(rows / 2 + 1));
+    patches.push(
+        GenericRenderLoweringPlan::todo_mvc()
+            .lower_todomvc_list_move_patch(&commit, rows / 2 + 1)?,
+    );
     let alloc_delta = allocation_delta(allocations_before);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    json!({
+    Ok(json!({
         "name": format!("todomvc-{rows}-rows-move-one"),
+        "ir_runtime_proof": ir_proof,
         "rows": rows,
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.generic.list_len("todos").unwrap_or(0),
+        "list_slot_count": runtime.list_len("todos").unwrap_or(0),
         "dirty_key_count": dirty_key_count(&deltas),
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
         "heap_alloc_count": alloc_delta.count,
         "heap_alloc_bytes": alloc_delta.bytes,
         "elapsed_ms": elapsed_ms,
-    })
+    }))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -7346,6 +11195,13 @@ struct FormulaEquationPlan {
 struct RuntimeFormulaOperation {
     target: &'static str,
     kind: RuntimeFormulaOperationKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FormulaDerivedStorageFields {
+    value: &'static str,
+    error: &'static str,
+    dependencies: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -7400,12 +11256,7 @@ impl FormulaEquationPlan {
         Self { operations }
     }
 
-    fn empty() -> Self {
-        Self {
-            operations: Vec::new(),
-        }
-    }
-
+    #[cfg(test)]
     fn default_cells() -> Self {
         Self {
             operations: vec![
@@ -7463,9 +11314,81 @@ impl FormulaEquationPlan {
         Ok(())
     }
 
-    fn cell_value_protocol(&self, cell: &Cell) -> RuntimeResult<ProtocolValue<'static>> {
+    fn cell_value_protocol<'a>(&self, cell: &Cell) -> RuntimeResult<ProtocolValue<'a>> {
         self.expect_eval("cell.value", "parsed_formula", "cell_value_reader")?;
         Ok(protocol_cell_value(cell))
+    }
+
+    fn emit_cell_display_mutations<'a>(
+        &self,
+        key: u64,
+        generation: u64,
+        value: ProtocolValue<'a>,
+        error: Option<&'static str>,
+        mut emit: impl FnMut(GenericSourceMutation<'a>, bool) -> RuntimeResult<()>,
+    ) -> RuntimeResult<()> {
+        let value_field = self.value_field()?;
+        emit(
+            GenericSourceMutation::ValueField(GenericValueFieldCommit {
+                list: "cells",
+                key,
+                generation,
+                field: value_field,
+                value,
+            }),
+            true,
+        )?;
+        if let Some(error) = error {
+            let error_field = self.error_field()?;
+            emit(
+                GenericSourceMutation::ValueField(GenericValueFieldCommit {
+                    list: "cells",
+                    key,
+                    generation,
+                    field: error_field,
+                    value: ProtocolValue::Text(Cow::Borrowed(error)),
+                }),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_cell_display_protocol_mutations<'a>(
+        &self,
+        key: u64,
+        generation: u64,
+        value: ProtocolValue<'a>,
+        error: Option<&'static str>,
+        address: &'a str,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
+    ) -> RuntimeResult<()> {
+        self.emit_cell_display_mutations(
+            key,
+            generation,
+            value,
+            error,
+            |mutation, patch_value_text| {
+                emit_cells_default_protocol_mutation(
+                    mutation,
+                    address,
+                    None,
+                    false,
+                    patch_value_text,
+                    deltas,
+                    patches,
+                )
+            },
+        )
+    }
+
+    fn derived_storage_fields(&self) -> RuntimeResult<FormulaDerivedStorageFields> {
+        Ok(FormulaDerivedStorageFields {
+            value: self.value_field()?,
+            error: self.error_field()?,
+            dependencies: self.dependencies_field()?,
+        })
     }
 
     fn expect_parse(&self, target: &str, input: &str) -> RuntimeResult<()> {
@@ -7562,100 +11485,220 @@ impl FormulaEquationPlan {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct CellsRuntime {
     generic: GenericScheduledRuntime,
     cells: Vec<Cell>,
-    reverse_deps: Vec<Vec<usize>>,
+    dependency_cache: GenericFormulaDependencyCache,
+    evaluation_cache: GenericFormulaEvaluationCache,
     columns: usize,
     rows: usize,
     interned_texts: Vec<&'static str>,
-    affected: Vec<usize>,
-    queue: Vec<usize>,
-    visiting: Vec<bool>,
-    eval_cache: Vec<Option<Result<i64, &'static str>>>,
-    step_recomputed: Vec<usize>,
     last_recompute_candidates: usize,
-    last_formula_eval_calls: usize,
-    last_dependency_edge_walks: usize,
 }
 
 #[derive(Clone, Debug)]
 struct CellsRuntimeState {
     cells: Vec<Cell>,
-    reverse_deps: Vec<Vec<usize>>,
+    dependency_cache: GenericFormulaDependencyCache,
+    evaluation_cache: GenericFormulaEvaluationCache,
     columns: usize,
     rows: usize,
     interned_texts: Vec<&'static str>,
-    affected: Vec<usize>,
-    queue: Vec<usize>,
-    visiting: Vec<bool>,
-    eval_cache: Vec<Option<Result<i64, &'static str>>>,
     step_recomputed: Vec<usize>,
     last_recompute_candidates: usize,
-    last_formula_eval_calls: usize,
-    last_dependency_edge_walks: usize,
 }
 
 #[derive(Clone, Debug)]
-enum CellEvent<'a> {
-    Change {
-        source: &'a str,
-        address: &'a str,
-        text: &'a str,
-    },
-    Commit {
-        source: &'a str,
-        address: &'a str,
-        text: &'a str,
-    },
-    Cancel {
-        source: &'a str,
-        address: &'a str,
-    },
+struct GenericFormulaDependencyCache {
+    reverse_deps: Vec<Vec<usize>>,
+    affected: Vec<usize>,
+    queue: Vec<usize>,
+    last_edge_walks: usize,
 }
 
-impl CellsRuntime {
-    fn from_loaded_parts(generic: GenericScheduledRuntime, state: CellsRuntimeState) -> Self {
+#[derive(Clone, Debug)]
+struct GenericFormulaEvaluationCache {
+    visiting: Vec<bool>,
+    eval_cache: Vec<Option<Result<i64, &'static str>>>,
+    last_eval_calls: usize,
+}
+
+impl GenericFormulaDependencyCache {
+    fn with_capacity(cell_count: usize) -> Self {
         Self {
-            generic,
-            cells: state.cells,
-            reverse_deps: state.reverse_deps,
-            columns: state.columns,
-            rows: state.rows,
-            interned_texts: state.interned_texts,
-            affected: state.affected,
-            queue: state.queue,
-            visiting: state.visiting,
-            eval_cache: state.eval_cache,
-            step_recomputed: state.step_recomputed,
-            last_recompute_candidates: state.last_recompute_candidates,
-            last_formula_eval_calls: state.last_formula_eval_calls,
-            last_dependency_edge_walks: state.last_dependency_edge_walks,
+            reverse_deps: vec![Vec::new(); cell_count],
+            affected: Vec::with_capacity(cell_count),
+            queue: Vec::with_capacity(cell_count),
+            last_edge_walks: 0,
         }
     }
 
-    fn into_loaded_parts(self) -> (GenericScheduledRuntime, CellsRuntimeState) {
-        (
-            self.generic,
-            CellsRuntimeState {
-                cells: self.cells,
-                reverse_deps: self.reverse_deps,
-                columns: self.columns,
-                rows: self.rows,
-                interned_texts: self.interned_texts,
-                affected: self.affected,
-                queue: self.queue,
-                visiting: self.visiting,
-                eval_cache: self.eval_cache,
-                step_recomputed: self.step_recomputed,
-                last_recompute_candidates: self.last_recompute_candidates,
-                last_formula_eval_calls: self.last_formula_eval_calls,
-                last_dependency_edge_walks: self.last_dependency_edge_walks,
-            },
-        )
+    fn reserve_dependents(&mut self, minimum_capacity: usize) {
+        for dependents in &mut self.reverse_deps {
+            dependents.reserve(minimum_capacity);
+        }
     }
 
+    fn replace_dependencies(&mut self, cell_index: usize, deps: &[usize]) {
+        for dependents in &mut self.reverse_deps {
+            if let Some(index) = dependents
+                .iter()
+                .position(|candidate| *candidate == cell_index)
+            {
+                dependents.swap_remove(index);
+            }
+        }
+        for dependency in deps {
+            if let Some(dependents) = self.reverse_deps.get_mut(*dependency)
+                && !dependents.contains(&cell_index)
+            {
+                dependents.push(cell_index);
+            }
+        }
+    }
+
+    fn collect_affected(&mut self, changed_index: usize) -> &[usize] {
+        self.affected.clear();
+        self.queue.clear();
+        self.last_edge_walks = 0;
+        self.affected.push(changed_index);
+        self.queue.push(changed_index);
+        while let Some(changed) = self.queue.pop() {
+            for offset in 0..self.reverse_deps[changed].len() {
+                self.last_edge_walks += 1;
+                let index = self.reverse_deps[changed][offset];
+                if !self.affected.contains(&index) {
+                    self.affected.push(index);
+                    self.queue.push(index);
+                }
+            }
+        }
+        &self.affected
+    }
+
+    fn affected(&self) -> &[usize] {
+        &self.affected
+    }
+
+    fn last_edge_walks(&self) -> usize {
+        self.last_edge_walks
+    }
+}
+
+impl GenericFormulaEvaluationCache {
+    fn with_capacity(cell_count: usize) -> Self {
+        Self {
+            visiting: vec![false; cell_count],
+            eval_cache: vec![None; cell_count],
+            last_eval_calls: 0,
+        }
+    }
+
+    fn begin_tick(&mut self) {
+        self.last_eval_calls = 0;
+        self.eval_cache.fill(None);
+        self.visiting.fill(false);
+    }
+
+    fn eval_cell(&mut self, cells: &[Cell], index: usize) -> Result<i64, &'static str> {
+        self.last_eval_calls += 1;
+        if let Some(result) = self.eval_cache[index] {
+            return result;
+        }
+        if self.visiting[index] {
+            return Err("cycle_error");
+        }
+        self.visiting[index] = true;
+        let result = self.eval_formula(cells, index);
+        self.visiting[index] = false;
+        self.eval_cache[index] = Some(result);
+        result
+    }
+
+    fn cached_result(&self, index: usize) -> Option<Result<i64, &'static str>> {
+        self.eval_cache[index]
+    }
+
+    fn apply_result_to_cell(
+        index: usize,
+        changed_index: usize,
+        result: Result<i64, &'static str>,
+        cell: &mut Cell,
+    ) -> RuntimeResult<bool> {
+        let previous_value = cell.value_number;
+        let previous_error = cell.error;
+        match result {
+            Ok(value) => {
+                cell.value_number = Some(value);
+                cell.error = None;
+                cell.value.clear();
+                write!(&mut cell.value, "{value}")?;
+            }
+            Err(error) => {
+                cell.value_number = None;
+                cell.error = Some(error);
+                cell.value.clear();
+            }
+        }
+        Ok(index == changed_index
+            || cell.value_number != previous_value
+            || cell.error != previous_error)
+    }
+
+    fn last_eval_calls(&self) -> usize {
+        self.last_eval_calls
+    }
+
+    fn eval_formula(&mut self, cells: &[Cell], index: usize) -> Result<i64, &'static str> {
+        match cells[index].parsed {
+            FormulaAst::Empty => Ok(0),
+            FormulaAst::Number(value) => Ok(value),
+            FormulaAst::Cell(cell) => self.eval_cell(cells, cell),
+            FormulaAst::Binary(left, op, right) => {
+                let left = self.eval_term(cells, left)?;
+                let right = self.eval_term(cells, right)?;
+                match op {
+                    FormulaOp::Add => Ok(left + right),
+                    FormulaOp::Subtract => Ok(left - right),
+                    FormulaOp::Multiply => Ok(left * right),
+                    FormulaOp::Divide if right == 0 => Err("div_by_zero"),
+                    FormulaOp::Divide => Ok(left / right),
+                }
+            }
+            FormulaAst::ParseError => Err("parse_error"),
+        }
+    }
+
+    fn eval_term(&mut self, cells: &[Cell], term: FormulaTerm) -> Result<i64, &'static str> {
+        match term {
+            FormulaTerm::Number(value) => Ok(value),
+            FormulaTerm::Cell(index) => self.eval_cell(cells, index),
+        }
+    }
+}
+
+fn sync_formula_derived_fields(
+    runtime: &mut GenericScheduledRuntime,
+    index: usize,
+    fields: FormulaDerivedStorageFields,
+    value: &str,
+    error: Option<&'static str>,
+    dependencies: &str,
+) -> RuntimeResult<()> {
+    runtime.set_or_insert_list_row_textlike("cells", index, fields.value, value)?;
+    runtime.set_or_insert_list_row_textlike(
+        "cells",
+        index,
+        fields.error,
+        error.unwrap_or_default(),
+    )?;
+    runtime.set_or_insert_list_row_textlike("cells", index, fields.dependencies, dependencies)
+}
+
+#[cfg(test)]
+impl CellsRuntime {
     fn from_generic(generic: GenericScheduledRuntime, ir: &TypedProgram) -> RuntimeResult<Self> {
         let (columns, rows) = cells_grid_dimensions_from_ir(ir)
             .ok_or("Cells IR has no Grid/cells list initializer")?;
@@ -7704,78 +11747,13 @@ impl CellsRuntime {
         Self {
             generic,
             cells,
-            reverse_deps: vec![Vec::new(); cell_count],
+            dependency_cache: GenericFormulaDependencyCache::with_capacity(cell_count),
+            evaluation_cache: GenericFormulaEvaluationCache::with_capacity(cell_count),
             columns,
             rows,
             interned_texts: Vec::new(),
-            affected: Vec::with_capacity(cell_count),
-            queue: Vec::with_capacity(cell_count),
-            visiting: vec![false; cell_count],
-            eval_cache: vec![None; cell_count],
-            step_recomputed: Vec::with_capacity(8),
             last_recompute_candidates: 0,
-            last_formula_eval_calls: 0,
-            last_dependency_edge_walks: 0,
         }
-    }
-
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) {
-        let mut max_text_len = 0usize;
-        let mut max_deps = 1usize;
-        self.intern_text("");
-        self.intern_text("cycle_error");
-        self.intern_text("parse_error");
-        self.intern_text("div_by_zero");
-        for step in &scenario.step {
-            if let Some(action) = &step.user_action {
-                if let Some(text) = toml_string_ref(action, "text") {
-                    self.intern_text(text);
-                    max_text_len = max_text_len.max(text.len());
-                    max_deps = max_deps.max(count_formula_dependencies(text));
-                }
-            }
-            if let Some(expected) = &step.expected_source_event {
-                if let Some(text) = toml_string_ref(expected, "text") {
-                    self.intern_text(text);
-                    max_text_len = max_text_len.max(text.len());
-                    max_deps = max_deps.max(count_formula_dependencies(text));
-                }
-            }
-            if let Some(expect) = &step.expect_cell {
-                if let Some(value) = &expect.value {
-                    self.intern_text(value);
-                    max_text_len = max_text_len.max(value.len());
-                }
-                if let Some(formula) = &expect.formula {
-                    self.intern_text(formula);
-                    max_text_len = max_text_len.max(formula.len());
-                    max_deps = max_deps.max(count_formula_dependencies(formula));
-                }
-                if let Some(editing_text) = &expect.editing_text {
-                    self.intern_text(editing_text);
-                    max_text_len = max_text_len.max(editing_text.len());
-                    max_deps = max_deps.max(count_formula_dependencies(editing_text));
-                }
-            }
-            if let Some(expect) = &step.expect_error {
-                self.intern_text(&expect.error);
-                max_text_len = max_text_len.max(expect.error.len());
-            }
-        }
-        max_text_len = max_text_len.max("cycle_error".len());
-        self.reserve_cell_storage(max_text_len, max_deps);
-    }
-
-    fn intern_text(&mut self, value: &str) {
-        if self
-            .interned_texts
-            .iter()
-            .any(|interned| *interned == value)
-        {
-            return;
-        }
-        let interned = Box::leak(value.to_owned().into_boxed_str());
-        self.interned_texts.push(interned);
     }
 
     fn protocol_text<'a>(&self, value: &str) -> ProtocolValue<'a> {
@@ -7791,41 +11769,15 @@ impl CellsRuntime {
         }
     }
 
-    fn reserve_cell_storage(&mut self, max_text_len: usize, max_deps: usize) {
+    fn reserve_cell_cache(&mut self, max_text_len: usize, max_deps: usize) {
         for cell in &mut self.cells {
             cell.value.reserve(max_text_len);
             cell.deps.reserve(max_deps);
             cell.dependency_text.reserve(max_deps.saturating_mul(8));
         }
-        self.generic
-            .reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("Cells generic runtime has formula_text fields");
-        self.generic
-            .reserve_list_row_textlike_fields("cells", "editing_text", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("Cells generic runtime has editing_text fields");
-        self.generic
-            .reserve_list_row_textlike_fields("cells", "value", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("Cells generic runtime has value fields");
-        self.generic
-            .reserve_list_row_textlike_fields("cells", "error", |_, current| {
-                max_text_len.saturating_sub(current.len())
-            })
-            .expect("Cells generic runtime has error fields");
-        self.generic
-            .reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
-                max_deps.saturating_mul(8).saturating_sub(current.len())
-            })
-            .expect("Cells generic runtime has dependency fields");
         let minimum_fanout_capacity = max_deps.max(4);
-        for dependents in &mut self.reverse_deps {
-            dependents.reserve(minimum_fanout_capacity);
-        }
+        self.dependency_cache
+            .reserve_dependents(minimum_fanout_capacity);
     }
 
     fn apply_step_into<'a>(
@@ -7835,16 +11787,20 @@ impl CellsRuntime {
         patches: &mut Vec<RenderPatch<'a>>,
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
-        let Some(event) = self.route_step(step)? else {
+        let Some(routed) = self.route_step(step)? else {
             return Ok(());
         };
-        assert_cell_event_matches(step, &event)?;
-        match event {
-            CellEvent::Change {
-                source,
-                address,
-                text,
-            } => {
+        assert_routed_source_event_matches(step, routed.event)?;
+        match routed.route_kind {
+            GenericSourceRouteKind::IndexedTextChange => {
+                let source = routed.source();
+                let address = routed.require_address(&step.id)?;
+                if !is_cell_address(address) {
+                    return Err(
+                        format!("{} Cells source event missing valid address", step.id).into(),
+                    );
+                }
+                let text = routed.require_text(&step.id)?;
                 let source_event = GenericSourceEvent {
                     source,
                     text: Some(text),
@@ -7852,61 +11808,45 @@ impl CellsRuntime {
                     target_text: None,
                     address: Some(address),
                 };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_event_by_row_field(
                     "cells-change",
                     source_event,
                     TickSeq(0),
-                    |list, event| {
-                        if list != "cells" {
-                            return Err(
-                                format!("Cells source routed to unexpected list `{list}`").into()
-                            );
-                        }
-                        let address = event
-                            .address
-                            .ok_or("Cells source event missing address for indexed route")?;
-                        self.cell_index(address).map(Some)
-                    },
+                    "address",
+                    Some(address),
                 )?;
-                let mut editing_text = None;
-                let mut editing = None;
-                self.generic.apply_source_actions(
+                let batch = self.generic.apply_source_actions_to_batch(
                     input,
                     |_| None,
                     |mutation| {
-                        match mutation {
-                            GenericSourceMutation::TextField(commit)
-                                if commit.field == "editing_text" =>
-                            {
-                                editing_text = Some(());
-                            }
-                            GenericSourceMutation::BoolField(commit)
-                                if commit.field == "editing" =>
-                            {
-                                editing = Some(());
-                            }
-                            _ => {}
-                        }
                         emit_cells_default_protocol_mutation(
                             mutation, address, None, true, false, deltas, patches,
                         )?;
                         Ok(())
                     },
                 )?;
-                editing_text.ok_or_else(|| {
-                    format!("editing-text update from `{source}` produced no change")
-                })?;
-                editing
-                    .ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
+                batch.require_text(source, "editing-text update", "editing_text")?;
+                batch.require_bool(source, "editing update", "editing")?;
             }
-            CellEvent::Commit {
-                source,
-                address,
-                text,
-            } => {
+            GenericSourceRouteKind::IndexedTextCommit => {
+                let source = routed.source();
+                let address = routed.require_address(&step.id)?;
+                if !is_cell_address(address) {
+                    return Err(
+                        format!("{} Cells source event missing valid address", step.id).into(),
+                    );
+                }
+                let text = routed.require_text(&step.id)?;
                 self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
             }
-            CellEvent::Cancel { source, address } => {
+            GenericSourceRouteKind::IndexedTextIdentity => {
+                let source = routed.source();
+                let address = routed.require_address(&step.id)?;
+                if !is_cell_address(address) {
+                    return Err(
+                        format!("{} Cells source event missing valid address", step.id).into(),
+                    );
+                }
                 let source_event = GenericSourceEvent {
                     source,
                     text: None,
@@ -7914,49 +11854,19 @@ impl CellsRuntime {
                     target_text: None,
                     address: Some(address),
                 };
-                let input = self.generic.source_action_input_for_event(
+                let input = self.generic.source_action_input_for_event_by_row_field(
                     "cells-cancel",
                     source_event,
                     TickSeq(0),
-                    |list, event| {
-                        if list != "cells" {
-                            return Err(
-                                format!("Cells source routed to unexpected list `{list}`").into()
-                            );
-                        }
-                        let address = event
-                            .address
-                            .ok_or("Cells source event missing address for indexed route")?;
-                        self.cell_index(address).map(Some)
-                    },
+                    "address",
+                    Some(address),
                 )?;
-                let mut editing_text = None;
-                let mut editing = None;
-                self.generic.apply_source_actions(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        match mutation {
-                            GenericSourceMutation::TextFieldIdentity(commit)
-                                if commit.field == "editing_text" =>
-                            {
-                                editing_text = Some(commit);
-                            }
-                            GenericSourceMutation::BoolField(commit)
-                                if commit.field == "editing" =>
-                            {
-                                editing = Some(commit);
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    },
-                )?;
-                let editing_text = editing_text.ok_or_else(|| {
-                    format!("editing-text cancel from `{source}` produced no change")
-                })?;
-                let editing = editing
-                    .ok_or_else(|| format!("editing cancel from `{source}` produced no change"))?;
+                let batch =
+                    self.generic
+                        .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+                let editing_text =
+                    batch.require_identity(source, "editing-text cancel", "editing_text")?;
+                let editing = batch.require_bool(source, "editing cancel", "editing")?;
                 let index = self.cell_index(address)?;
                 let value = self.cell_text_field(index, editing_text.field)?;
                 let identity_value = self.protocol_text(value);
@@ -7978,17 +11888,31 @@ impl CellsRuntime {
                     deltas,
                     patches,
                 )?;
-                patches.push(patch(
+                patches.push(keyed_patch(
                     "SetCellText",
                     RenderTarget::Borrowed(Cow::Borrowed(address)),
                     self.protocol_text(&self.cells[index].value),
+                    editing_text.list,
+                    editing_text.key,
+                    editing_text.generation,
                 ));
+            }
+            route_kind => {
+                return Err(format!(
+                    "{} Cells source `{}` classified as unsupported route `{route_kind:?}`",
+                    step.id,
+                    routed.source()
+                )
+                .into());
             }
         }
         Ok(())
     }
 
-    fn route_step<'a>(&self, step: &'a ScenarioStep) -> RuntimeResult<Option<CellEvent<'a>>> {
+    fn route_step<'a>(
+        &self,
+        step: &'a ScenarioStep,
+    ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
         if step.user_action.is_none() {
             return Ok(None);
         }
@@ -8000,102 +11924,30 @@ impl CellsRuntime {
         &self,
         step: &'a ScenarioStep,
         source_event: GenericSourceEvent<'a>,
-    ) -> RuntimeResult<Option<CellEvent<'a>>> {
+    ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
         let source = source_event.source;
-        self.generic
-            .require_source(source)
+        let routed = self
+            .generic
+            .route_source_event("cells", "formula_text", source_event)
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
-        let address = source_event
+        let address = routed
+            .event
             .address
             .filter(|candidate| is_cell_address(candidate))
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
-        if self
-            .generic
-            .has_indexed_text_target(source, "cell.formula_text")?
-        {
-            let text = source_event
-                .text
-                .ok_or_else(|| format!("{} Cells commit source event missing text", step.id))?;
-            return Ok(Some(CellEvent::Commit {
-                source,
-                address,
-                text,
-            }));
-        }
-        if let Some(text) = source_event.text {
-            return Ok(Some(CellEvent::Change {
-                source,
-                address,
-                text,
-            }));
-        }
-        Ok(Some(CellEvent::Cancel { source, address }))
-    }
-
-    fn assert_step(&self, step: &ScenarioStep, recomputed: &[usize]) -> RuntimeResult<()> {
-        if let Some(expect) = &step.expect_cell {
-            let index = self.cell_index(&expect.address)?;
-            if let Some(value) = &expect.value {
-                let actual = self
-                    .generic
-                    .list_row_textlike_opt("cells", index, "value")
-                    .unwrap_or("");
-                let expected = value.as_str();
-                assert_eq_report(&step.id, "cell.value", &expected, &actual)?;
+        match routed.route_kind {
+            GenericSourceRouteKind::IndexedTextCommit
+            | GenericSourceRouteKind::IndexedTextChange => {
+                routed.require_text(&step.id)?;
+                Ok(Some(routed))
             }
-            if let Some(formula) = &expect.formula {
-                self.generic.assert_list_row_textlike(
-                    &step.id,
-                    "cell.formula",
-                    "cells",
-                    index,
-                    "formula_text",
-                    formula,
-                )?;
-            }
-            if let Some(editing_text) = &expect.editing_text {
-                self.generic.assert_list_row_textlike(
-                    &step.id,
-                    "cell.editing_text",
-                    "cells",
-                    index,
-                    "editing_text",
-                    editing_text,
-                )?;
-            }
-            if let Some(editing) = expect.editing {
-                self.generic.assert_list_row_bool(
-                    &step.id,
-                    "cell.editing",
-                    "cells",
-                    index,
-                    "editing",
-                    editing,
-                )?;
-            }
+            GenericSourceRouteKind::IndexedTextIdentity => Ok(Some(routed)),
+            route_kind => Err(format!(
+                "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
+                step.id
+            )
+            .into()),
         }
-        if let Some(expect) = &step.expect_error {
-            let index = self.cell_index(&expect.address)?;
-            let actual = self
-                .generic
-                .list_row_textlike_opt("cells", index, "error")
-                .filter(|error| !error.is_empty());
-            assert_eq_report(
-                &step.id,
-                "cell.error",
-                &Some(expect.error.as_str()),
-                &actual,
-            )?;
-        }
-        if let Some(expected) = &step.expect_recomputed {
-            let actual: Vec<_> = recomputed
-                .iter()
-                .map(|index| self.address_for(*index))
-                .collect();
-            assert_eq_report(&step.id, "recomputed", expected, &actual)?;
-        }
-        self.assert_generic_mirror_in_sync()
-            .map_err(|error| format!("{} generic storage mismatch: {error}", step.id).into())
     }
 
     fn commit<'a>(
@@ -8134,48 +11986,19 @@ impl CellsRuntime {
             target_text: None,
             address: Some(address),
         };
-        let input = self.generic.source_action_input_for_event(
+        let input = self.generic.source_action_input_for_event_by_row_field(
             "cells-commit",
             source_event,
             TickSeq(0),
-            |list, event| {
-                if list != "cells" {
-                    return Err(format!("Cells source routed to unexpected list `{list}`").into());
-                }
-                let address = event
-                    .address
-                    .ok_or("Cells source event missing address for indexed route")?;
-                self.cell_index(address).map(Some)
-            },
+            "address",
+            Some(address),
         )?;
-        let mut formula_commit = None;
-        let mut editing_text = None;
-        let mut editing = None;
-        self.generic.apply_source_actions(
-            input,
-            |_| None,
-            |mutation| {
-                match mutation {
-                    GenericSourceMutation::TextField(commit) if commit.field == "formula_text" => {
-                        formula_commit = Some(commit);
-                    }
-                    GenericSourceMutation::TextField(commit) if commit.field == "editing_text" => {
-                        editing_text = Some(commit);
-                    }
-                    GenericSourceMutation::BoolField(commit) if commit.field == "editing" => {
-                        editing = Some(commit);
-                    }
-                    _ => {}
-                }
-                Ok(())
-            },
-        )?;
-        let formula = formula_commit
-            .ok_or_else(|| format!("formula update from `{source}` produced no change"))?;
-        let editing_text = editing_text
-            .ok_or_else(|| format!("editing text update from `{source}` produced no change"))?;
-        let editing =
-            editing.ok_or_else(|| format!("editing update from `{source}` produced no change"))?;
+        let batch = self
+            .generic
+            .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
+        let formula = batch.require_text(source, "formula update", "formula_text")?;
+        let editing_text = batch.require_text(source, "editing text update", "editing_text")?;
+        let editing = batch.require_bool(source, "editing update", "editing")?;
         self.cells[committed_index].parsed = self.generic.formula_equations.parse_cell_formula(
             formula.value,
             self.columns,
@@ -8184,9 +12007,10 @@ impl CellsRuntime {
         self.replace_cell_dependencies(committed_index)?;
         self.recompute_affected(address, recomputed)?;
         let cell = &self.cells[committed_index];
-        let value = self.generic.formula_equations.cell_value_protocol(cell)?;
-        let value_field = self.generic.formula_equations.value_field()?;
-        let error_field = self.generic.formula_equations.error_field()?;
+        let display_key = formula.key;
+        let display_generation = formula.generation;
+        let display_value = self.generic.formula_equations.cell_value_protocol(cell)?;
+        let display_error = cell.error;
         emit_cells_default_protocol_mutation(
             GenericSourceMutation::TextField(formula),
             address,
@@ -8214,38 +12038,17 @@ impl CellsRuntime {
             deltas,
             patches,
         )?;
-        emit_cells_default_protocol_mutation(
-            GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                list: "cells",
-                key: formula.key,
-                generation: formula.generation,
-                field: value_field,
-                value: value.clone(),
-            }),
-            address,
-            None,
-            false,
-            true,
-            deltas,
-            patches,
-        )?;
-        if let Some(error) = cell.error {
-            emit_cells_default_protocol_mutation(
-                GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                    list: "cells",
-                    key: formula.key,
-                    generation: formula.generation,
-                    field: error_field,
-                    value: ProtocolValue::Text(Cow::Borrowed(error)),
-                }),
+        self.generic
+            .formula_equations
+            .emit_cell_display_protocol_mutations(
+                display_key,
+                display_generation,
+                display_value,
+                display_error,
                 address,
-                None,
-                false,
-                false,
                 deltas,
                 patches,
             )?;
-        }
         Ok(())
     }
 
@@ -8255,40 +12058,23 @@ impl CellsRuntime {
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
         let changed_index = self.cell_index(changed_address)?;
-        self.collect_affected(changed_index);
-        self.last_recompute_candidates = self.affected.len();
-        self.last_formula_eval_calls = 0;
-        self.eval_cache.fill(None);
-        self.visiting.fill(false);
-        for offset in 0..self.affected.len() {
-            let index = self.affected[offset];
-            let result = self.eval_cell(index);
-            self.eval_cache[index] = Some(result);
+        self.dependency_cache.collect_affected(changed_index);
+        let affected_len = self.dependency_cache.affected().len();
+        self.last_recompute_candidates = affected_len;
+        self.evaluation_cache.begin_tick();
+        for offset in 0..affected_len {
+            let index = self.dependency_cache.affected()[offset];
+            let _ = self.evaluation_cache.eval_cell(&self.cells, index);
         }
-        for offset in 0..self.affected.len() {
-            let index = self.affected[offset];
-            let result = self.eval_cache[index].unwrap_or(Ok(0));
-            let changed = {
-                let cell = &mut self.cells[index];
-                let previous_value = cell.value_number;
-                let previous_error = cell.error;
-                match result {
-                    Ok(value) => {
-                        cell.value_number = Some(value);
-                        cell.error = None;
-                        cell.value.clear();
-                        write!(&mut cell.value, "{value}")?;
-                    }
-                    Err(error) => {
-                        cell.value_number = None;
-                        cell.error = Some(error);
-                        cell.value.clear();
-                    }
-                }
-                index == changed_index
-                    || cell.value_number != previous_value
-                    || cell.error != previous_error
-            };
+        for offset in 0..affected_len {
+            let index = self.dependency_cache.affected()[offset];
+            let result = self.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
+            let changed = GenericFormulaEvaluationCache::apply_result_to_cell(
+                index,
+                changed_index,
+                result,
+                &mut self.cells[index],
+            )?;
             if changed {
                 self.sync_cell_derived_fields(index)?;
                 recomputed.push(index);
@@ -8300,25 +12086,13 @@ impl CellsRuntime {
 
     fn sync_cell_derived_fields(&mut self, index: usize) -> RuntimeResult<()> {
         self.refresh_dependency_text(index);
-        let value_field = self.generic.formula_equations.value_field()?;
-        let error_field = self.generic.formula_equations.error_field()?;
-        let dependencies_field = self.generic.formula_equations.dependencies_field()?;
-        self.generic.set_or_insert_list_row_textlike(
-            "cells",
+        let fields = self.generic.formula_equations.derived_storage_fields()?;
+        sync_formula_derived_fields(
+            &mut self.generic,
             index,
-            value_field,
+            fields,
             &self.cells[index].value,
-        )?;
-        self.generic.set_or_insert_list_row_textlike(
-            "cells",
-            index,
-            error_field,
-            self.cells[index].error.unwrap_or_default(),
-        )?;
-        self.generic.set_or_insert_list_row_textlike(
-            "cells",
-            index,
-            dependencies_field,
+            self.cells[index].error,
             &self.cells[index].dependency_text,
         )
     }
@@ -8338,57 +12112,15 @@ impl CellsRuntime {
         }
     }
 
-    fn collect_affected(&mut self, changed_index: usize) {
-        self.affected.clear();
-        self.queue.clear();
-        self.last_dependency_edge_walks = 0;
-        self.affected.push(changed_index);
-        self.queue.push(changed_index);
-        while let Some(changed) = self.queue.pop() {
-            for offset in 0..self.reverse_deps[changed].len() {
-                self.last_dependency_edge_walks += 1;
-                let index = self.reverse_deps[changed][offset];
-                if !self.affected.contains(&index) {
-                    self.affected.push(index);
-                    self.queue.push(index);
-                }
-            }
-        }
-    }
-
     fn replace_cell_dependencies(&mut self, cell_index: usize) -> RuntimeResult<()> {
-        for offset in 0..self.cells[cell_index].deps.len() {
-            let dependency = self.cells[cell_index].deps[offset];
-            self.remove_reverse_dep(dependency, cell_index);
-        }
         self.cells[cell_index].deps.clear();
         self.generic.formula_equations.dependencies_into(
             self.cells[cell_index].parsed,
             &mut self.cells[cell_index].deps,
         )?;
-        for offset in 0..self.cells[cell_index].deps.len() {
-            let dependency = self.cells[cell_index].deps[offset];
-            self.add_reverse_dep(dependency, cell_index);
-        }
+        self.dependency_cache
+            .replace_dependencies(cell_index, &self.cells[cell_index].deps);
         Ok(())
-    }
-
-    fn add_reverse_dep(&mut self, dependency: usize, dependent: usize) {
-        if let Some(dependents) = self.reverse_deps.get_mut(dependency)
-            && !dependents.contains(&dependent)
-        {
-            dependents.push(dependent);
-        }
-    }
-
-    fn remove_reverse_dep(&mut self, dependency: usize, dependent: usize) {
-        if let Some(dependents) = self.reverse_deps.get_mut(dependency)
-            && let Some(index) = dependents
-                .iter()
-                .position(|candidate| *candidate == dependent)
-        {
-            dependents.swap_remove(index);
-        }
     }
 
     #[cfg(test)]
@@ -8402,6 +12134,7 @@ impl CellsRuntime {
             .ok_or_else(|| format!("unknown cell {address}").into())
     }
 
+    #[cfg(test)]
     fn cell_key_generation(&self, index: usize) -> (u64, u64) {
         self.generic
             .row_identity("cells", index)
@@ -8417,166 +12150,10 @@ impl CellsRuntime {
         self.generic.list_row_bool("cells", index, field)
     }
 
-    fn assert_generic_mirror_in_sync(&self) -> RuntimeResult<()> {
-        let generic_len = self.generic.list_len("cells")?;
-        if generic_len != self.cells.len() {
-            return Err(format!(
-                "generic cells length {generic_len} != mirror {}",
-                self.cells.len()
-            )
-            .into());
-        }
-        for index in 0..self.cells.len() {
-            let address = self.address_for(index);
-            let generic_address = self.generic.list_row_textlike("cells", index, "address")?;
-            if generic_address != address {
-                return Err(format!(
-                    "row {index} address generic `{generic_address}` != computed `{address}`"
-                )
-                .into());
-            }
-            self.generic
-                .list_row_textlike("cells", index, "formula_text")?;
-            self.generic
-                .list_row_textlike("cells", index, "editing_text")?;
-            self.generic.list_row_bool("cells", index, "editing")?;
-        }
-        Ok(())
-    }
-
     fn address_for(&self, index: usize) -> String {
         let mut address = String::new();
         push_cell_address(self.columns, index, &mut address);
         address
-    }
-
-    fn eval_cell(&mut self, index: usize) -> Result<i64, &'static str> {
-        self.last_formula_eval_calls += 1;
-        if let Some(result) = self.eval_cache[index] {
-            return result;
-        }
-        if self.visiting[index] {
-            return Err("cycle_error");
-        }
-        self.visiting[index] = true;
-        let result = self.eval_formula(index);
-        self.visiting[index] = false;
-        self.eval_cache[index] = Some(result);
-        result
-    }
-
-    fn eval_formula(&mut self, index: usize) -> Result<i64, &'static str> {
-        match self.cells[index].parsed {
-            FormulaAst::Empty => Ok(0),
-            FormulaAst::Number(value) => Ok(value),
-            FormulaAst::Cell(cell) => self.eval_cell(cell),
-            FormulaAst::Binary(left, op, right) => {
-                let left = self.eval_term(left)?;
-                let right = self.eval_term(right)?;
-                match op {
-                    FormulaOp::Add => Ok(left + right),
-                    FormulaOp::Subtract => Ok(left - right),
-                    FormulaOp::Multiply => Ok(left * right),
-                    FormulaOp::Divide if right == 0 => Err("div_by_zero"),
-                    FormulaOp::Divide => Ok(left / right),
-                }
-            }
-            FormulaAst::ParseError => Err("parse_error"),
-        }
-    }
-
-    fn eval_term(&mut self, term: FormulaTerm) -> Result<i64, &'static str> {
-        match term {
-            FormulaTerm::Number(value) => Ok(value),
-            FormulaTerm::Cell(index) => self.eval_cell(index),
-        }
-    }
-
-    fn summary(&self) -> JsonValue {
-        let interesting = ["A1", "B1", "C1", "D1"];
-        json!({
-            "cells": interesting.iter().map(|address| {
-                let index = self.cell_index(address).unwrap_or_default();
-                let (key, generation) = self.cell_key_generation(index);
-                let mut row = self
-                    .generic
-                    .list_row_fields_json("cells", index, &["address", "formula_text", "editing_text", "editing"])
-                    .unwrap_or_default();
-                let value = self
-                    .generic
-                    .list_row_textlike_opt("cells", index, "value")
-                    .unwrap_or("");
-                let error = self
-                    .generic
-                    .list_row_textlike_opt("cells", index, "error")
-                    .filter(|error| !error.is_empty());
-                let dependencies = self
-                    .generic
-                    .list_row_textlike_opt("cells", index, "dependencies")
-                    .unwrap_or("")
-                    .split(',')
-                    .filter(|dependency| !dependency.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                json!({
-                    "address": row.remove("address").unwrap_or_else(|| json!(address)),
-                    "formula": row.remove("formula_text").unwrap_or_else(|| json!("")),
-                    "editing_text": row.remove("editing_text").unwrap_or_else(|| json!("")),
-                    "value": value,
-                    "error": error,
-                    "editing": row.remove("editing").unwrap_or_else(|| json!(false)),
-                    "dependencies": dependencies,
-                    "hidden_key": key,
-                    "hidden_generation": generation,
-                })
-            }).collect::<Vec<_>>(),
-            "hidden_keys": "debug/protocol only, not exposed to Boon source",
-        })
-    }
-}
-
-impl ScenarioExecutor for CellsRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        CellsRuntime::prepare_for_scenario(self, scenario);
-        Ok(())
-    }
-
-    fn apply_step<'a>(
-        &mut self,
-        step: &'a ScenarioStep,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<StepExecutionMetrics> {
-        let mut step_recomputed = std::mem::take(&mut self.step_recomputed);
-        step_recomputed.clear();
-        self.apply_step_into(step, deltas, patches, &mut step_recomputed)?;
-        let dirty_key_count = step_recomputed.len();
-        let recomputed_cell_count = step_recomputed.len();
-        let recompute_candidate_count = self.last_recompute_candidates;
-        let formula_eval_call_count = self.last_formula_eval_calls;
-        let dependency_edge_walk_count = self.last_dependency_edge_walks;
-        self.step_recomputed = step_recomputed;
-        Ok(StepExecutionMetrics {
-            dirty_key_count,
-            extra: StepExecutionExtra::Cells {
-                recomputed_cell_count,
-                recompute_candidate_count,
-                formula_eval_call_count,
-                dependency_edge_walk_count,
-            },
-        })
-    }
-
-    fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
-        self.assert_step(step, &self.step_recomputed)
-    }
-
-    fn state_summary(&mut self) -> JsonValue {
-        self.summary()
-    }
-
-    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
-        Ok(Some(cells_stress_profiles(ir)?))
     }
 }
 
@@ -8661,34 +12238,104 @@ fn parse_formula_term(term: &str, columns: usize, rows: usize) -> Option<Formula
 }
 
 fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
-    let mut runtime = CellsRuntime::with_dimensions(26, 100);
-    runtime.reserve_cell_storage("=A1+1".len().max("10".len()), 1);
+    let compiled = CompiledProgram::from_ir(ir)?;
+    if !matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells) {
+        return Err("Cells stress profiles require a Cells executable surface".into());
+    }
+    let generic = GenericScheduledRuntime::new(ir, &compiled)?;
+    let (mut runtime, mut state) = initialize_loaded_cells_generic(generic, ir)?;
+    if state.columns != 26 || state.rows != 100 {
+        return Err(format!(
+            "Cells stress profiles require the documented 26x100 grid, got {}x{}",
+            state.columns, state.rows
+        )
+        .into());
+    }
+    if state.cells.len() <= 100 {
+        return Err("Cells stress profiles require at least 101 grid cells".into());
+    }
+    runtime.formula_equations.expect_cells_pipeline()?;
+    let ir_proof = json!({
+        "runtime_constructed_from_ir": true,
+        "compiled_surface": compiled.surface.kind.as_str(),
+        "compiled_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
+        "schedule_node_count": compiled.schedule_node_count,
+        "state_initializer_count": compiled.state_initializer_count,
+        "list_initializer_count": compiled.list_initializer_count,
+        "formula_operation_count": compiled.formula_operation_count,
+        "source_route_count": compiled.source_route_count,
+        "list_source_binding_count": compiled.list_source_bindings.bindings.len(),
+        "grid_columns": state.columns,
+        "grid_rows": state.rows,
+    });
+    reserve_loaded_cell_cache(&mut state, "=A1+1".len().max("10".len()), 1);
+    for value in ["", "0", "1", "=A1+1", "7", "10"] {
+        intern_loaded_cell_text(&mut state, value);
+    }
     let mut deltas = Vec::with_capacity(4);
     let mut patches = Vec::with_capacity(2);
     let mut recomputed = Vec::with_capacity(8);
-    runtime.commit("A1", "1", &mut deltas, &mut patches, &mut recomputed)?;
-    runtime.commit("B1", "=A1+1", &mut deltas, &mut patches, &mut recomputed)?;
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "C1",
+        "0",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "A1",
+        "1",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "B1",
+        "=A1+1",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
     deltas.clear();
     patches.clear();
     recomputed.clear();
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
-    runtime.commit("C1", "7", &mut deltas, &mut patches, &mut recomputed)?;
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "C1",
+        "7",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
     let alloc_delta = allocation_delta(allocations_before);
     let unrelated_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let unrelated_recomputed: Vec<_> = recomputed
         .iter()
-        .map(|index| runtime.address_for(*index))
+        .map(|index| loaded_cell_address(&state, *index))
         .collect();
     let unrelated = json!({
         "name": "cells-26x100-unrelated-edit",
-        "cells": runtime.cells.len(),
+        "ir_runtime_proof": ir_proof.clone(),
+        "cells": state.cells.len(),
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
         "dirty_cell_count": recomputed.len(),
-        "recompute_candidate_count": runtime.last_recompute_candidates,
-        "formula_eval_call_count": runtime.last_formula_eval_calls,
-        "dependency_edge_walk_count": runtime.last_dependency_edge_walks,
+        "recompute_candidate_count": state.last_recompute_candidates,
+        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
+        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
         "recomputed_cells": unrelated_recomputed,
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
@@ -8701,22 +12348,32 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
     recomputed.clear();
     let started = Instant::now();
     let allocations_before = allocation_snapshot();
-    runtime.commit("A1", "10", &mut deltas, &mut patches, &mut recomputed)?;
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "A1",
+        "10",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
     let alloc_delta = allocation_delta(allocations_before);
     let dependent_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let dependent_recomputed: Vec<_> = recomputed
         .iter()
-        .map(|index| runtime.address_for(*index))
+        .map(|index| loaded_cell_address(&state, *index))
         .collect();
     let dependent = json!({
         "name": "cells-26x100-dependent-edit",
-        "cells": runtime.cells.len(),
+        "ir_runtime_proof": ir_proof.clone(),
+        "cells": state.cells.len(),
         "graph_node_count": ir.graph_node_count,
         "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
         "dirty_cell_count": recomputed.len(),
-        "recompute_candidate_count": runtime.last_recompute_candidates,
-        "formula_eval_call_count": runtime.last_formula_eval_calls,
-        "dependency_edge_walk_count": runtime.last_dependency_edge_walks,
+        "recompute_candidate_count": state.last_recompute_candidates,
+        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
+        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
         "recomputed_cells": dependent_recomputed,
         "semantic_delta_count": deltas.len(),
         "render_patch_count": patches.len(),
@@ -8724,7 +12381,69 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         "heap_alloc_bytes": alloc_delta.bytes,
         "elapsed_ms": dependent_elapsed_ms,
     });
-    Ok(json!([unrelated, dependent]))
+    deltas.clear();
+    patches.clear();
+    recomputed.clear();
+    state.dependency_cache.reserve_dependents(100);
+    recomputed.reserve(128);
+    for index in 1..=100 {
+        let address = loaded_cell_address(&state, index);
+        let formula = format!("=A1+{index}");
+        let mut setup_deltas = Vec::with_capacity(4);
+        let mut setup_patches = Vec::with_capacity(2);
+        loaded_cells_commit_from_source(
+            &mut runtime,
+            &mut state,
+            "cell.sources.editor.commit",
+            &address,
+            &formula,
+            &mut setup_deltas,
+            &mut setup_patches,
+            &mut recomputed,
+        )?;
+        recomputed.clear();
+    }
+    let expected_fanout = 100usize;
+    let expected_dirty_cell_count = expected_fanout + 1;
+    let started = Instant::now();
+    let allocations_before = allocation_snapshot();
+    loaded_cells_commit_from_source(
+        &mut runtime,
+        &mut state,
+        "cell.sources.editor.commit",
+        "A1",
+        "2",
+        &mut deltas,
+        &mut patches,
+        &mut recomputed,
+    )?;
+    let alloc_delta = allocation_delta(allocations_before);
+    let fanout_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let fanout_recomputed: Vec<_> = recomputed
+        .iter()
+        .map(|index| loaded_cell_address(&state, *index))
+        .collect();
+    let fanout = json!({
+        "name": "cells-26x100-fanout-100-update",
+        "ir_runtime_proof": ir_proof,
+        "cells": state.cells.len(),
+        "expected_fanout": expected_fanout,
+        "expected_dirty_cell_count": expected_dirty_cell_count,
+        "graph_node_count": ir.graph_node_count,
+        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
+        "dirty_cell_count": recomputed.len(),
+        "recomputed_cell_count": recomputed.len(),
+        "recompute_candidate_count": state.last_recompute_candidates,
+        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
+        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
+        "recomputed_cells": fanout_recomputed,
+        "semantic_delta_count": deltas.len(),
+        "render_patch_count": patches.len(),
+        "heap_alloc_count": alloc_delta.count,
+        "heap_alloc_bytes": alloc_delta.bytes,
+        "elapsed_ms": fanout_elapsed_ms,
+    });
+    Ok(json!([unrelated, dependent, fanout]))
 }
 
 fn formula_ast_dependencies_into(ast: FormulaAst, deps: &mut Vec<usize>) {
@@ -8799,16 +12518,7 @@ fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> 
         .collect()
 }
 
-fn default_todo_list_source_bindings() -> ListSourceBindingPlan {
-    let parsed = parse_source(
-        "examples/todomvc.bn",
-        include_str!("../../../examples/todomvc.bn"),
-    )
-    .expect("checked-in TodoMVC source should parse");
-    let ir = lower(&parsed).expect("checked-in TodoMVC source should lower");
-    ListSourceBindingPlan::from_ir(&ir)
-}
-
+#[cfg(test)]
 fn default_cells_list_source_bindings() -> ListSourceBindingPlan {
     ListSourceBindingPlan {
         bindings: vec![ListSourceBinding {
@@ -8818,6 +12528,7 @@ fn default_cells_list_source_bindings() -> ListSourceBindingPlan {
     }
 }
 
+#[cfg(test)]
 fn default_cells_scalar_equations() -> ScalarEquationPlan {
     let parsed = parse_source(
         "examples/cells.bn",
@@ -8874,93 +12585,23 @@ fn toml_u64_ref(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<u64>
         .and_then(|value| u64::try_from(value).ok())
 }
 
-fn assert_todo_event_matches(step: &ScenarioStep, event: &TodoEvent<'_>) -> RuntimeResult<()> {
+fn assert_routed_source_event_matches(
+    step: &ScenarioStep,
+    event: GenericSourceEvent<'_>,
+) -> RuntimeResult<()> {
     let expected = GenericSourceEvent::require(step)?;
-    let source = match event {
-        TodoEvent::NewInputChange { source, .. } => source,
-        TodoEvent::NewInputKeyDown { source, .. } => source,
-        TodoEvent::Filter { source, .. } => source,
-        TodoEvent::ClearCompleted { source, .. } => source,
-        TodoEvent::ToggleAll { source, .. } => source,
-        TodoEvent::TodoCheckbox { source, .. }
-        | TodoEvent::TodoTitleDoubleClick { source, .. }
-        | TodoEvent::EditingTitleChange { source, .. }
-        | TodoEvent::EditingTitleKeyDown { source, .. }
-        | TodoEvent::EditingTitleBlur { source, .. }
-        | TodoEvent::RemoveTodo { source, .. } => source,
-        TodoEvent::HoverDelete { .. } => unreachable!("hover does not produce a source event"),
-    };
-    assert_source_event_field(&step.id, Some(expected.source), "source", source)?;
-    match event {
-        TodoEvent::NewInputChange { text, .. } => {
-            assert_source_event_field(&step.id, expected.text, "text", text)?;
-        }
-        TodoEvent::NewInputKeyDown { key, text, .. } => {
-            assert_source_event_field(&step.id, expected.key, "key", key)?;
-            assert_source_event_field(&step.id, expected.text, "text", text)?;
-        }
-        TodoEvent::TodoCheckbox { target_text, .. }
-        | TodoEvent::TodoTitleDoubleClick { target_text, .. }
-        | TodoEvent::RemoveTodo { target_text, .. } => {
-            assert_source_event_field(&step.id, expected.target_text, "target_text", target_text)?;
-        }
-        TodoEvent::EditingTitleChange {
-            target_text, text, ..
-        } => {
-            assert_source_event_field(&step.id, expected.target_text, "target_text", target_text)?;
-            assert_source_event_field(&step.id, expected.text, "text", text)?;
-        }
-        TodoEvent::EditingTitleKeyDown {
-            target_text,
-            key,
-            text,
-            ..
-        } => {
-            assert_source_event_field(&step.id, expected.target_text, "target_text", target_text)?;
-            assert_source_event_field(&step.id, expected.key, "key", key)?;
-            if let Some(text) = text {
-                assert_source_event_field(&step.id, expected.text, "text", text)?;
-            }
-        }
-        TodoEvent::EditingTitleBlur {
-            target_text, text, ..
-        } => {
-            assert_source_event_field(&step.id, expected.target_text, "target_text", target_text)?;
-            if let Some(text) = text {
-                assert_source_event_field(&step.id, expected.text, "text", text)?;
-            }
-        }
-        TodoEvent::Filter { .. }
-        | TodoEvent::ClearCompleted { .. }
-        | TodoEvent::ToggleAll { .. } => {}
-        TodoEvent::HoverDelete { .. } => {}
-    }
-    Ok(())
-}
-
-fn assert_cell_event_matches(step: &ScenarioStep, event: &CellEvent<'_>) -> RuntimeResult<()> {
-    let expected = GenericSourceEvent::require(step)?;
-    let (source, address, text) = match event {
-        CellEvent::Change {
-            source,
-            address,
-            text,
-            ..
-        } => (*source, *address, Some(*text)),
-        CellEvent::Commit {
-            source,
-            address,
-            text,
-            ..
-        } => (*source, *address, Some(*text)),
-        CellEvent::Cancel {
-            source, address, ..
-        } => (*source, *address, None),
-    };
-    assert_source_event_field(&step.id, Some(expected.source), "source", source)?;
-    assert_source_event_field(&step.id, expected.address, "address", address)?;
-    if let Some(text) = text {
+    assert_source_event_field(&step.id, Some(expected.source), "source", event.source)?;
+    if let Some(text) = event.text {
         assert_source_event_field(&step.id, expected.text, "text", text)?;
+    }
+    if let Some(key) = event.key {
+        assert_source_event_field(&step.id, expected.key, "key", key)?;
+    }
+    if let Some(target_text) = event.target_text {
+        assert_source_event_field(&step.id, expected.target_text, "target_text", target_text)?;
+    }
+    if let Some(address) = event.address {
+        assert_source_event_field(&step.id, expected.address, "address", address)?;
     }
     Ok(())
 }
@@ -8984,16 +12625,6 @@ fn assert_source_event_field(
 }
 
 #[cfg(test)]
-fn list_delta<'a>(
-    kind: &'static str,
-    key: u64,
-    generation: u64,
-    value: ProtocolValue<'a>,
-) -> SemanticDelta<'a> {
-    GenericCircuitRuntime::semantic_list_delta(kind, "todos", key, generation, value)
-}
-
-#[cfg(test)]
 fn field_delta<'a>(
     key: Option<u64>,
     generation: Option<u64>,
@@ -9003,100 +12634,51 @@ fn field_delta<'a>(
     GenericCircuitRuntime::semantic_field_delta(key.map(|_| "todos"), key, generation, field, value)
 }
 
-fn push_source_binding_deltas_for_insert<'a>(
-    runtime: &GenericCircuitRuntime,
-    insert: &GenericTextListAppendCommit<'_>,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-) {
-    for binding in runtime.row_source_bindings(insert.list, insert.key, insert.generation) {
-        if let Some(delta) = GenericSourceMutation::SourceBind(binding.clone()).semantic_delta() {
-            deltas.push(delta);
-        }
-    }
-}
-
 fn emit_todomvc_default_protocol_mutation<'a>(
     mutation: GenericSourceMutation<'a>,
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
-    match mutation {
-        GenericSourceMutation::RootText(commit) => {
-            TodoRuntime::emit_root_text_commit(commit.target, commit.value, deltas, patches)
-        }
-        GenericSourceMutation::TextField(commit) => {
-            deltas.push(commit.semantic_delta());
-            match commit.field {
-                "title" => patches.push(patch(
-                    "SetText",
-                    RenderTarget::TodoTitle(commit.key),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                )),
-                "edit_text" => patches.push(patch(
-                    "SetEditInput",
-                    RenderTarget::TodoEdit(commit.key),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                )),
-                _ => {}
-            }
-            Ok(())
-        }
-        GenericSourceMutation::BoolField(commit) => {
-            deltas.push(commit.semantic_delta());
-            match commit.field {
-                "completed" => patches.push(patch(
-                    "SetProperty",
-                    RenderTarget::TodoCheckbox(commit.key),
-                    ProtocolValue::CheckedProperty(commit.value),
-                )),
-                "editing" if !commit.value => patches.push(patch(
-                    "HideEditInput",
-                    RenderTarget::TodoEdit(commit.key),
-                    ProtocolValue::Bool(commit.value),
-                )),
-                _ => {}
-            }
-            Ok(())
-        }
-        GenericSourceMutation::ListRemove {
-            list,
-            key,
-            generation,
-        } => {
-            if let Some(delta) = (GenericSourceMutation::ListRemove {
-                list,
-                key,
-                generation,
-            })
-            .semantic_delta()
-            {
-                deltas.push(delta);
-            }
-            patches.push(patch(
-                "RemoveElement",
-                RenderTarget::TodoRow(key),
-                ProtocolValue::Null,
-            ));
-            Ok(())
-        }
-        GenericSourceMutation::SourceUnbind(binding) => {
-            if let Some(delta) =
-                GenericSourceMutation::SourceUnbind(binding.clone()).semantic_delta()
-            {
-                deltas.push(delta);
-            }
-            patches.push(patch(
-                "UnbindSource",
-                RenderTarget::TodoSource(binding.key, binding.source_path),
-                source_binding_value(&binding),
-            ));
-            Ok(())
-        }
-        GenericSourceMutation::TextFieldIdentity(_)
-        | GenericSourceMutation::ValueField(_)
-        | GenericSourceMutation::ListAppend(_)
-        | GenericSourceMutation::SourceBind(_) => Ok(()),
+    if let Some(delta) = mutation.semantic_delta() {
+        deltas.push(delta);
     }
+    emit_todomvc_render_patch_for_mutation(&mutation, GenericRenderContext::default(), patches)
+}
+
+fn emit_todo_insert_from_generic<'a>(
+    generic: &GenericScheduledRuntime,
+    insert: GenericTextListAppendCommit<'a>,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    let list = insert.list;
+    let key = insert.key;
+    let generation = insert.generation;
+    emit_todomvc_default_protocol_mutation(
+        GenericSourceMutation::ListAppend(insert),
+        deltas,
+        patches,
+    )?;
+    for binding in generic.row_source_bindings(list, key, generation) {
+        emit_todomvc_default_protocol_mutation(
+            GenericSourceMutation::SourceBind(binding.clone()),
+            deltas,
+            patches,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_todomvc_render_patch_for_mutation<'a>(
+    mutation: &GenericSourceMutation<'a>,
+    context: GenericRenderContext<'a>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    let lowerer = GenericRenderLoweringPlan::todo_mvc();
+    if let Some(render_patch) = lowerer.lower_mutation_patch(mutation, context)? {
+        patches.push(render_patch);
+    }
+    Ok(())
 }
 
 fn emit_cells_default_protocol_mutation<'a>(
@@ -9108,18 +12690,8 @@ fn emit_cells_default_protocol_mutation<'a>(
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
+    let lowerer = GenericRenderLoweringPlan::cells();
     match mutation {
-        GenericSourceMutation::TextField(commit) => {
-            deltas.push(commit.semantic_delta());
-            if patch_editor_text && commit.field == "editing_text" {
-                patches.push(patch(
-                    "SetCellEditor",
-                    RenderTarget::Borrowed(Cow::Borrowed(address)),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                ));
-            }
-            Ok(())
-        }
         GenericSourceMutation::TextFieldIdentity(commit) => {
             let value = identity_value.ok_or_else(|| {
                 format!(
@@ -9128,29 +12700,25 @@ fn emit_cells_default_protocol_mutation<'a>(
                 )
             })?;
             deltas.push(commit.semantic_delta_with_value(value));
-            Ok(())
         }
-        GenericSourceMutation::BoolField(commit) => {
-            deltas.push(commit.semantic_delta());
-            Ok(())
-        }
-        GenericSourceMutation::ValueField(commit) => {
-            deltas.push(commit.semantic_delta());
-            if patch_value_text {
-                patches.push(patch(
-                    "SetCellText",
-                    RenderTarget::Borrowed(Cow::Borrowed(address)),
-                    commit.value,
-                ));
+        _ => {
+            if let Some(delta) = mutation.semantic_delta() {
+                deltas.push(delta);
             }
-            Ok(())
         }
-        GenericSourceMutation::RootText(_)
-        | GenericSourceMutation::ListAppend(_)
-        | GenericSourceMutation::ListRemove { .. }
-        | GenericSourceMutation::SourceBind(_)
-        | GenericSourceMutation::SourceUnbind(_) => Ok(()),
     }
+    if let Some(render_patch) = lowerer.lower_mutation_patch(
+        &mutation,
+        GenericRenderContext {
+            address: Some(address),
+            todo_show_edit_input_text: None,
+            patch_editor_text,
+            patch_value_text,
+        },
+    )? {
+        patches.push(render_patch);
+    }
+    Ok(())
 }
 
 fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
@@ -9158,20 +12726,6 @@ fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
         source_path: binding.source_path,
         source_id: binding.source_id,
         bind_epoch: binding.bind_epoch,
-    }
-}
-
-fn push_source_binding_patches_for_insert<'a>(
-    runtime: &GenericCircuitRuntime,
-    insert: &GenericTextListAppendCommit<'_>,
-    patches: &mut Vec<RenderPatch<'a>>,
-) {
-    for binding in runtime.row_source_bindings(insert.list, insert.key, insert.generation) {
-        patches.push(patch(
-            "BindSource",
-            RenderTarget::TodoSource(binding.key, binding.source_path),
-            source_binding_value(binding),
-        ));
     }
 }
 
@@ -9200,6 +12754,49 @@ fn patch<'a>(
         kind,
         target,
         value,
+        list_id: None,
+        key: None,
+        generation: None,
+        source_id: None,
+        bind_epoch: None,
+    }
+}
+
+fn keyed_patch<'a>(
+    kind: &'static str,
+    target: RenderTarget<'a>,
+    value: ProtocolValue<'a>,
+    list_id: &'static str,
+    key: u64,
+    generation: u64,
+) -> RenderPatch<'a> {
+    RenderPatch {
+        kind,
+        target,
+        value,
+        list_id: Some(list_id),
+        key: Some(key),
+        generation: Some(generation),
+        source_id: None,
+        bind_epoch: None,
+    }
+}
+
+fn source_patch<'a>(
+    kind: &'static str,
+    target: RenderTarget<'a>,
+    value: ProtocolValue<'a>,
+    binding: &SourceBinding,
+) -> RenderPatch<'a> {
+    RenderPatch {
+        kind,
+        target,
+        value,
+        list_id: Some(binding.list_id),
+        key: Some(binding.key),
+        generation: Some(binding.generation),
+        source_id: Some(binding.source_id),
+        bind_epoch: Some(binding.bind_epoch),
     }
 }
 
@@ -9358,7 +12955,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["active_count"], 1);
+        assert_eq!(output.state_summary["active_count"], 0);
+        assert_eq!(output.state_summary["todos"], json!([]));
         assert!(
             output
                 .semantic_deltas
@@ -9367,6 +12965,42 @@ mod tests {
                     && delta.list_id == Some("todos")
                     && delta.key.is_some()
                     && delta.generation.is_some())
+        );
+    }
+
+    #[test]
+    fn profiled_list_capacity_rejects_overflow_append() {
+        let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[2] {");
+        let error = run_scenario_source_with_step_limit(
+            "capacity:todomvc",
+            &source,
+            Path::new("../../examples/todomvc.scn"),
+            VerificationLayer::Semantic,
+            Some(3),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("generic list `todos` capacity 2 exceeded by append"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn profiled_list_capacity_rejects_oversized_initializer() {
+        let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[1] {");
+        let error = run_scenario_source_with_step_limit(
+            "capacity:todomvc",
+            &source,
+            Path::new("../../examples/todomvc.scn"),
+            VerificationLayer::Semantic,
+            Some(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("list `todos` initializes 2 rows beyond declared capacity 1"),
+            "{error}"
         );
     }
 
@@ -9385,6 +13019,175 @@ mod tests {
             (Some("error"), ProtocolValue::Text(error)) if error.as_ref() == "cycle_error"
         )));
         assert_eq!(output.state_summary["cells"][0]["error"], JsonValue::Null);
+    }
+
+    #[test]
+    fn runtime_execution_schema_rejects_adapter_or_incomplete_generic_slices() {
+        let output = run_scenario(
+            Path::new("../../examples/todomvc.bn"),
+            Path::new("../../examples/todomvc.scn"),
+            VerificationLayer::Semantic,
+            None,
+        )
+        .unwrap();
+        verify_runtime_execution_metadata(&output.report, Path::new("memory:todomvc")).unwrap();
+
+        let mut adapter_report = output.report.clone();
+        adapter_report["runtime_execution"]["example_behavior_adapter"] = json!(true);
+        assert!(
+            verify_runtime_execution_metadata(&adapter_report, Path::new("memory:todomvc"))
+                .unwrap_err()
+                .to_string()
+                .contains("example behavior adapter")
+        );
+
+        let mut incomplete_report = output.report.clone();
+        incomplete_report["runtime_execution"]["generic_runtime_slices"]["generic_todomvc_source_route_classifier"] =
+            json!(false);
+        assert!(
+            verify_runtime_execution_metadata(&incomplete_report, Path::new("memory:todomvc"))
+                .unwrap_err()
+                .to_string()
+                .contains("generic_todomvc_source_route_classifier")
+        );
+
+        let mut omitted_slice_report = output.report.clone();
+        omitted_slice_report["runtime_execution"]["generic_runtime_slices"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generic_source_event_ingest");
+        assert!(
+            verify_runtime_execution_metadata(&omitted_slice_report, Path::new("memory:todomvc"))
+                .unwrap_err()
+                .to_string()
+                .contains("generic_source_event_ingest")
+        );
+    }
+
+    #[test]
+    fn semantic_delta_batches_require_runtime_identity_and_server_tick() {
+        let output = run_scenario_source_with_step_limit(
+            "delta-protocol:todomvc",
+            include_str!("../../../examples/todomvc.bn"),
+            Path::new("../../examples/todomvc.scn"),
+            VerificationLayer::Semantic,
+            Some(3),
+        )
+        .unwrap();
+        verify_semantic_delta_protocol_batches(&output.report, Path::new("memory:todomvc"))
+            .unwrap();
+
+        let mut missing_runtime_id = output.report.clone();
+        missing_runtime_id["semantic_delta_protocol_batches"][1]["runtime_id"] = JsonValue::Null;
+        assert!(
+            verify_semantic_delta_protocol_batches(
+                &missing_runtime_id,
+                Path::new("memory:todomvc")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("runtime_id")
+        );
+
+        let mut stale_server_tick = output.report.clone();
+        stale_server_tick["semantic_delta_protocol_batches"][1]["server_tick"] = json!(99);
+        assert!(
+            verify_semantic_delta_protocol_batches(&stale_server_tick, Path::new("memory:todomvc"))
+                .unwrap_err()
+                .to_string()
+                .contains("server_tick")
+        );
+    }
+
+    #[test]
+    fn playground_surface_schema_requires_visible_manual_test_controls() {
+        let mut report = playground_surface_fixture();
+        verify_playground_surface_report(&report, Path::new("memory:playground")).unwrap();
+
+        report["playground_surface"]["code_editor"] = json!(false);
+        assert!(
+            verify_playground_surface_report(&report, Path::new("memory:playground"))
+                .unwrap_err()
+                .to_string()
+                .contains("code_editor")
+        );
+
+        let mut zero_bounds = playground_surface_fixture();
+        zero_bounds["playground_surface_visible_bounds"]["semantic_delta_log"]["elements"][0]["bounds"]
+            ["width"] = json!(0.0);
+        assert!(
+            verify_playground_surface_report(&zero_bounds, Path::new("memory:playground"))
+                .unwrap_err()
+                .to_string()
+                .contains("semantic_delta_log")
+        );
+    }
+
+    fn playground_surface_fixture() -> JsonValue {
+        let mut surface = serde_json::Map::new();
+        let mut bounds = serde_json::Map::new();
+        for key in [
+            "example_selector",
+            "code_editor",
+            "run_reset_step_controls",
+            "render_preview",
+            "semantic_delta_log",
+            "selected_value_inspector",
+            "dependency_explanation_panel",
+        ] {
+            surface.insert(key.to_owned(), json!(true));
+            bounds.insert(
+                key.to_owned(),
+                json!({
+                    "pass": true,
+                    "elements": [{
+                        "element_id": format!("{key}_fixture"),
+                        "visible": true,
+                        "bounds": {"x": 1.0, "y": 1.0, "width": 10.0, "height": 10.0}
+                    }]
+                }),
+            );
+        }
+        json!({
+            "playground_surface": surface,
+            "playground_surface_visible_bounds": bounds
+        })
+    }
+
+    #[test]
+    fn developer_state_summary_hides_runtime_identity() {
+        let todo_output = run_scenario_source_with_step_limit(
+            "identity-summary:todomvc",
+            include_str!("../../../examples/todomvc.bn"),
+            Path::new("../../examples/todomvc.scn"),
+            VerificationLayer::Semantic,
+            Some(3),
+        )
+        .unwrap();
+        assert!(
+            todo_output.state_summary.get("hidden_keys").is_none(),
+            "TodoMVC state summary must not expose hidden row keys"
+        );
+        for row in todo_output.state_summary["todos"].as_array().unwrap() {
+            assert!(row.get("hidden_key").is_none());
+            assert!(row.get("hidden_generation").is_none());
+        }
+
+        let cells_output = run_scenario(
+            Path::new("../../examples/cells.bn"),
+            Path::new("../../examples/cells.scn"),
+            VerificationLayer::Semantic,
+            None,
+        )
+        .unwrap();
+        assert!(
+            cells_output.state_summary.get("hidden_keys").is_none(),
+            "Cells state summary must not expose hidden row keys"
+        );
+        for row in cells_output.state_summary["cells"].as_array().unwrap() {
+            assert!(row.get("hidden_key").is_none());
+            assert!(row.get("hidden_generation").is_none());
+        }
     }
 
     #[test]
@@ -9484,7 +13287,7 @@ mod tests {
         let cells_compiled = CompiledProgram::from_ir(&cells_ir).unwrap();
         let cells_runtime = GenericScheduledRuntime::new(&cells_ir, &cells_compiled).unwrap();
         let cells_input = cells_runtime
-            .source_action_input_for_event(
+            .source_action_input_for_event_by_row_field(
                 "cells-a1-commit",
                 GenericSourceEvent {
                     source: "cell.sources.editor.commit",
@@ -9494,11 +13297,8 @@ mod tests {
                     address: Some("A1"),
                 },
                 TickSeq(3),
-                |list, event| {
-                    assert_eq!(list, "cells");
-                    assert_eq!(event.address, Some("A1"));
-                    Ok(Some(0))
-                },
+                "address",
+                Some("A1"),
             )
             .unwrap();
         assert_eq!(cells_input.source, "cell.sources.editor.commit");
@@ -9522,7 +13322,8 @@ mod tests {
             .unwrap();
         assert_eq!(todo_rows[0]["title"], "Buy groceries");
         assert_eq!(todo_rows[0]["completed"], false);
-        assert_eq!(todo_runtime.list_identities_json("todos").len(), 2);
+        assert!(todo_runtime.row_identity("todos", 0).is_ok());
+        assert!(todo_runtime.row_identity("todos", 1).is_ok());
 
         let cells_parsed = parse_source(
             "examples/cells.bn",
@@ -9654,6 +13455,9 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("typed IR does not match a supported executable surface profile")
+                || err
+                    .to_string()
+                    .contains("not in the static schedule symbol table")
         );
 
         let renamed_row_source =
@@ -10755,7 +14559,7 @@ mod tests {
     #[test]
     fn cells_deltas_use_hidden_grid_slots_not_visible_address_hashes() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_storage("41".len(), 1);
+        runtime.reserve_cell_cache("41".len(), 1);
         let expected_key = runtime
             .cell_key_generation(runtime.cell_index("A1").unwrap())
             .0;
@@ -10784,7 +14588,7 @@ mod tests {
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
         let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
         let mut runtime = CellsRuntime::from_generic(generic, &ir).unwrap();
-        runtime.reserve_cell_storage("123".len(), 1);
+        runtime.reserve_cell_cache("123".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
@@ -10938,7 +14742,7 @@ mod tests {
     #[test]
     fn formula_primitives_support_documented_arithmetic_ops() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_storage("=8/2".len(), 1);
+        runtime.reserve_cell_cache("=8/2".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
@@ -10961,7 +14765,7 @@ mod tests {
     #[test]
     fn replacing_formula_removes_stale_dependency_edges() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_storage("=A1+1".len(), 1);
+        runtime.reserve_cell_cache("=A1+1".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
@@ -10973,14 +14777,14 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.cell("B1").unwrap().value, "2");
         assert_eq!(runtime.cell("B1").unwrap().deps, vec![0]);
-        assert_eq!(runtime.reverse_deps[0], vec![1]);
+        assert_eq!(runtime.dependency_cache.reverse_deps[0], vec![1]);
 
         recomputed.clear();
         runtime
             .commit("B1", "5", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         assert!(runtime.cell("B1").unwrap().deps.is_empty());
-        assert!(runtime.reverse_deps[0].is_empty());
+        assert!(runtime.dependency_cache.reverse_deps[0].is_empty());
 
         recomputed.clear();
         runtime
@@ -10996,7 +14800,7 @@ mod tests {
     #[test]
     fn cells_fanout_uses_reverse_dependency_index() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_storage("=A1+2".len(), 1);
+        runtime.reserve_cell_cache("=A1+2".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
@@ -11022,8 +14826,8 @@ mod tests {
             .map(|index| runtime.address_for(*index))
             .collect::<Vec<_>>();
         assert_eq!(recomputed_addresses, vec!["A1", "B1", "C1", "D1"]);
-        assert_eq!(runtime.last_dependency_edge_walks, 3);
-        assert!(runtime.last_dependency_edge_walks < runtime.cells.len());
+        assert_eq!(runtime.dependency_cache.last_edge_walks(), 3);
+        assert!(runtime.dependency_cache.last_edge_walks() < runtime.cells.len());
     }
 
     fn cell_address_hash_for_test(address: &str) -> u64 {

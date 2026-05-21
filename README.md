@@ -235,5 +235,6 @@ cargo xtask verify-cells-human --check --report target/reports/cells-human.json
 cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```

@@ -22,4 +22,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
 sha2 = "0.10"
+image = { version = "0.24.9", default-features = false, features = ["png"] }
 ply-engine = { version = "1.1.1", default-features = false }

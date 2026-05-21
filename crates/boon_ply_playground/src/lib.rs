@@ -8,8 +8,11 @@ use boon_runtime::{
 use ply_engine::prelude::*;
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
@@ -21,7 +24,15 @@ thread_local! {
     static UI_SOURCE_OBSERVATIONS: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
     static LAST_FOCUSED_RENDER_INPUT: RefCell<Option<FocusedRenderInput>> = const { RefCell::new(None) };
     static RENDER_ID_LABELS: RefCell<BTreeMap<String, &'static str>> = const { RefCell::new(BTreeMap::new()) };
+    static CURRENT_HOVER_SCOPES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    static LAST_HOVER_SCOPES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    static LAST_BUTTON_PRESS: RefCell<Option<(String, Instant)>> = const { RefCell::new(None) };
+    static SUPPRESS_NEXT_BLUR_INPUT: RefCell<Option<Id>> = const { RefCell::new(None) };
 }
+
+static FOCUS_FREE_HEADED: AtomicBool = AtomicBool::new(false);
+static FOCUS_FREE_SCREENSHOT_CACHE: OnceLock<Mutex<Option<(PathBuf, ScreenshotCapture)>>> =
+    OnceLock::new();
 
 const PLAYGROUND_HELP: &str = "\
 boon_ply_playground
@@ -31,17 +42,20 @@ Usage:
   boon_ply_playground --example <todomvc|cells> --mode <app|dev>
   boon_ply_playground --smoke-launch --example <name> --report <path>
   boon_ply_playground --verify-headed --example <name> --report <path>
+  boon_ply_playground --verify-headed-focusless --example <name> --report <path>
   boon_ply_playground --verify-os-input-probe --report <path>
 ";
 
 #[derive(Clone, Debug)]
 struct FocusedRenderInput {
     id: Id,
+    submit_source: Option<String>,
     blur_source: Option<String>,
     cancel_source: Option<String>,
     escape_source: Option<String>,
     address: Option<String>,
     target_text: Option<String>,
+    target_occurrence: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,8 +111,10 @@ enum RenderNode {
         value: RenderValue,
         size: u16,
         color: u32,
+        background: Option<u32>,
         width: Option<RenderExtent>,
         height: Option<f32>,
+        strike_if: Option<RenderValue>,
         center: bool,
     },
     Input {
@@ -127,9 +143,11 @@ enum RenderNode {
         width: Option<RenderExtent>,
         selected: Option<RenderSelection>,
         source: Option<String>,
+        double_click_source: Option<String>,
         address: Option<RenderValue>,
         target: Option<RenderValue>,
         visible: Option<RenderValue>,
+        hover_visible: bool,
         height: Option<f32>,
         size: u16,
         color: u32,
@@ -138,6 +156,9 @@ enum RenderNode {
         selected_background: u32,
         border: Option<u32>,
         selected_border: Option<u32>,
+        color_if: Option<RenderValue>,
+        if_color: Option<u32>,
+        strike_if: Option<RenderValue>,
         align_left: bool,
     },
     Checkbox {
@@ -180,8 +201,17 @@ impl RenderExtent {
 #[derive(Clone, Debug)]
 struct RenderContext<'a> {
     root: &'a serde_json::Value,
-    bindings: Vec<(String, &'a serde_json::Value)>,
+    bindings: Vec<RenderBinding<'a>>,
     index_stack: Vec<usize>,
+    hover_scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderBinding<'a> {
+    name: String,
+    list: String,
+    value: &'a serde_json::Value,
+    index: usize,
 }
 
 impl<'a> RenderContext<'a> {
@@ -190,18 +220,31 @@ impl<'a> RenderContext<'a> {
             root,
             bindings: Vec::new(),
             index_stack: Vec::new(),
+            hover_scopes: Vec::new(),
         }
     }
 
     fn with_binding(
         &self,
+        list: &str,
         name: &str,
         value: &'a serde_json::Value,
         index: usize,
     ) -> RenderContext<'a> {
         let mut next = self.clone();
-        next.bindings.push((name.to_owned(), value));
+        next.bindings.push(RenderBinding {
+            name: name.to_owned(),
+            list: list.to_owned(),
+            value,
+            index,
+        });
         next.index_stack.push(index);
+        next
+    }
+
+    fn with_hover_scope(&self, scope: String) -> RenderContext<'a> {
+        let mut next = self.clone();
+        next.hover_scopes.push(scope);
         next
     }
 }
@@ -214,6 +257,13 @@ pub async fn run_app_from_args() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.iter().any(|arg| arg == "--verify-os-input-probe") {
         return run_verify_os_input_probe(&args).await;
+    }
+    if args.iter().any(|arg| arg == "--verify-headed-focusless") {
+        FOCUS_FREE_HEADED.store(true, Ordering::Relaxed);
+        unsafe {
+            std::env::set_var("BOON_FOCUS_FREE_HEADED", "1");
+        }
+        return run_verify_headed(&args).await;
     }
     if args.iter().any(|arg| arg == "--verify-headed") {
         return run_verify_headed(&args).await;
@@ -228,11 +278,28 @@ fn print_help() {
     print!("{PLAYGROUND_HELP}");
 }
 
+fn focus_free_headed() -> bool {
+    FOCUS_FREE_HEADED.load(Ordering::Relaxed)
+        || std::env::var("BOON_FOCUS_FREE_HEADED").as_deref() == Ok("1")
+        || std::env::args().any(|arg| arg == "--verify-headed-focusless")
+}
+
+fn os_input_forbidden() -> bool {
+    focus_free_headed() || std::env::var("BOON_FORBID_OS_INPUT").as_deref() == Ok("1")
+}
+
 async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_after(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let focus_free = focus_free_headed();
     let report = value_after(args, "--report")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("target/reports/{example}-headed-ply.json")));
+        .unwrap_or_else(|| {
+            if focus_free {
+                PathBuf::from(format!("target/reports/{example}-headed-focusless.json"))
+            } else {
+                PathBuf::from(format!("target/reports/{example}-headed-ply.json"))
+            }
+        });
     let (source, scenario, _) = example_paths(&example)?;
     let screenshot = report.with_extension("png");
     let os_probe_screenshot = report.with_file_name(format!("{example}-headed-os-input.png"));
@@ -241,19 +308,26 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let os_probe_token = format!("boon-headed-os-{}-{example}", std::process::id());
-    let headed_os_probe =
-        run_os_keyboard_probe_in_window(&mut ply, &os_probe_token, &os_probe_screenshot).await?;
-    let headed_os_pointer_probe =
-        if std::env::var("BOON_ALLOW_OS_POINTER_PROBE").as_deref() == Ok("1") {
-            run_os_pointer_probe_in_window(&mut ply, &os_pointer_probe_screenshot).await?
-        } else {
-            skipped_os_pointer_probe(&os_pointer_probe_screenshot)
-        };
+    let headed_os_probe = if focus_free {
+        skipped_os_keyboard_probe(&os_probe_screenshot)
+    } else {
+        run_os_keyboard_probe_in_window(&mut ply, &os_probe_token, &os_probe_screenshot).await?
+    };
+    let headed_os_pointer_probe = if focus_free {
+        skipped_os_pointer_probe(&os_pointer_probe_screenshot)
+    } else if std::env::var("BOON_ALLOW_OS_POINTER_PROBE").as_deref() == Ok("1") {
+        run_os_pointer_probe_in_window(&mut ply, &os_pointer_probe_screenshot).await?
+    } else {
+        skipped_os_pointer_probe(&os_pointer_probe_screenshot)
+    };
     let source_text = std::fs::read_to_string(&source)?;
     let scenario_data = parse_scenario(&scenario)?;
     let mut state = PlaygroundState::new(&example, &mut ply)?;
     ply.set_text_value("source_editor", &source_text);
     state.reset_to_initial(&ply);
+    let playground_surface_visible_bounds =
+        playground_surface_visible_bounds_for_all_views(&mut ply, &mut state).await;
+    state.view = PlaygroundView::App;
     for _ in 0..3 {
         draw_frame(&mut ply, &state).await;
         next_frame().await;
@@ -292,18 +366,22 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     next_frame().await;
     draw_frame(&mut ply, &state).await;
     let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
-        return Err(format!(
-            "headed Ply capture is blank: nonzero_channels={}, unique_rgba_values={}",
-            pixel_stats.nonzero_channels, pixel_stats.unique_rgba_values
-        )
-        .into());
-    }
+    let mut pixel_stats = image_stats(&image.bytes);
+    let mut capture_backend = "macroquad-framebuffer".to_owned();
+    let mut framebuffer_width = u32::from(image.width);
+    let mut framebuffer_height = u32::from(image.height);
     if let Some(parent) = screenshot.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
+        let fallback = capture_with_cosmic_screenshot(&screenshot)?;
+        pixel_stats = fallback.pixel_stats;
+        capture_backend = fallback.capture_backend;
+        framebuffer_width = fallback.width;
+        framebuffer_height = fallback.height;
+    } else {
+        image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    }
     next_frame().await;
     let mut report_json = state
         .output
@@ -312,7 +390,14 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         .report
         .clone();
     if let Some(object) = report_json.as_object_mut() {
-        object.insert("window_mode".to_owned(), json!("headed"));
+        object.insert(
+            "window_mode".to_owned(),
+            json!(if focus_free {
+                "headed-focusless"
+            } else {
+                "headed"
+            }),
+        );
         object.insert("window_backend".to_owned(), json!("ply-engine/macroquad"));
         object.insert("window_pid".to_owned(), json!(std::process::id()));
         object.insert(
@@ -335,6 +420,10 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "display_socket_or_compositor_connection".to_owned(),
             json!(display_socket()),
         );
+        object.insert(
+            "native_display_contract".to_owned(),
+            native_display_contract(),
+        );
         object.insert("display_scale".to_owned(), json!(screen_dpi_scale()));
         object.insert(
             "window_size".to_owned(),
@@ -342,22 +431,50 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         );
         object.insert(
             "framebuffer_size".to_owned(),
-            json!([image.width, image.height]),
+            json!({
+                "width": framebuffer_width,
+                "height": framebuffer_height
+            }),
         );
         object.insert(
             "input_backend".to_owned(),
-            json!("macroquad-os-events + wtype-real-keyboard-events + ydotool-pointer-probe"),
+            json!(if focus_free {
+                "ply-synthetic-focus-free"
+            } else {
+                "macroquad-os-events + wtype-real-keyboard-events + ydotool-pointer-probe"
+            }),
         );
-        object.insert("capture_backend".to_owned(), json!("macroquad-framebuffer"));
+        object.insert("os_focus_required".to_owned(), json!(!focus_free));
+        object.insert("os_keyboard_or_pointer_used".to_owned(), json!(!focus_free));
+        object.insert(
+            "os_input_tools_used".to_owned(),
+            json!(if focus_free {
+                Vec::<&str>::new()
+            } else {
+                vec!["wtype"]
+            }),
+        );
+        object.insert("capture_backend".to_owned(), json!(capture_backend));
         object.insert(
             "focused_window_proof".to_owned(),
-            json!("OS probe set Ply focus to os_probe_input, sent a real keyboard token, observed it in Ply text state, then captured the headed macroquad/Ply framebuffer"),
+            json!(if focus_free {
+                "focus-free verifier read visible Ply bounds, synthesized Boon SOURCE events from rendered VIEW metadata, applied them through LiveRuntime, and captured headed frames without OS keyboard or pointer injection"
+            } else {
+                "OS probe set Ply focus to os_probe_input, sent a real keyboard token, observed it in Ply text state, then captured the headed macroquad/Ply framebuffer"
+            }),
         );
+        let keyboard_probe_attempted = headed_os_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("skip");
         let pointer_probe_attempted = headed_os_pointer_probe
             .get("status")
             .and_then(serde_json::Value::as_str)
             != Some("skip");
-        let mut checkpoint_paths = vec![json!(screenshot), json!(os_probe_screenshot)];
+        let mut checkpoint_paths = vec![json!(screenshot)];
+        if keyboard_probe_attempted {
+            checkpoint_paths.push(json!(os_probe_screenshot));
+        }
         if pointer_probe_attempted {
             checkpoint_paths.push(json!(os_pointer_probe_screenshot));
         }
@@ -380,16 +497,16 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "checkpoint_screenshot_or_video_paths".to_owned(),
             json!(checkpoint_paths),
         );
-        let mut artifact_sha256s = vec![
-            json!({
-                "path": screenshot,
-                "sha256": sha256_file(&screenshot)?
-            }),
-            json!({
+        let mut artifact_sha256s = vec![json!({
+            "path": screenshot,
+            "sha256": sha256_file(&screenshot)?
+        })];
+        if keyboard_probe_attempted {
+            artifact_sha256s.push(json!({
                 "path": os_probe_screenshot,
                 "sha256": sha256_file(&os_probe_screenshot)?
-            }),
-        ];
+            }));
+        }
         if pointer_probe_attempted {
             artifact_sha256s.push(json!({
                 "path": os_pointer_probe_screenshot,
@@ -431,6 +548,9 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             &source_event_observations,
             &step_observations,
         );
+        let focus_free_complete =
+            json_array_empty(&os_input_coverage["source_event_probe_missing_labels"])
+                && json_array_empty(&os_input_coverage["step_control_missing_labels"]);
         let full_os_input_complete =
             json_array_empty(&os_input_coverage["source_event_probe_missing_labels"])
                 && json_array_empty(&os_input_coverage["step_control_missing_labels"])
@@ -445,13 +565,25 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                     == Some("pass");
         object.insert(
             "input_injection_method".to_owned(),
-            if full_os_input_complete {
+            if focus_free {
+                json!("ply_synthetic_focus_free_render_metadata")
+            } else if full_os_input_complete {
                 json!("os_pointer_keyboard_to_visible_window")
             } else {
                 json!("os_keyboard_probe_visible_app_source_event_and_step_control_plus_scenario_user_action_route")
             },
         );
-        if full_os_input_complete {
+        if focus_free && focus_free_complete {
+            object.insert(
+                "focus_free_input_steps".to_owned(),
+                json!(headed_os_input_steps(
+                    &scenario_data,
+                    &source_event_observations,
+                    &step_observations,
+                    &screenshot,
+                )),
+            );
+        } else if full_os_input_complete {
             object.insert(
                 "os_input_steps".to_owned(),
                 json!(headed_os_input_steps(
@@ -461,7 +593,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                     &screenshot,
                 )),
             );
-        } else {
+        } else if !focus_free {
             object.insert(
                 "os_input_limitation".to_owned(),
                 json!("This headed verifier proves real OS keyboard input reaches the Ply window, reaches visible application controls, emits matching observed Boon SOURCE events for the covered workflow, and applies covered prefix events through boon_runtime::LiveRuntime against real scenario-step expectations. It can also activate the visible Ply Step control for each scenario transition. It still lacks direct app-control OS-input evidence for the labels in os_input_coverage.missing_full_os_pointer_keyboard_steps."),
@@ -485,7 +617,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         object.insert("playground_surface".to_owned(), playground_surface_checks());
         object.insert(
             "playground_surface_visible_bounds".to_owned(),
-            playground_surface_visible_bounds(&ply),
+            playground_surface_visible_bounds,
         );
     }
     write_json(&report, &report_json)?;
@@ -559,6 +691,7 @@ async fn drive_visible_text_input_probe(
     contract: &str,
     screenshot: &PathBuf,
 ) -> serde_json::Value {
+    let focus_free = focus_free_headed();
     ply.set_text_value(element_id, "");
     let mut typed = false;
     let mut send_error = None;
@@ -575,9 +708,11 @@ async fn drive_visible_text_input_probe(
             });
         }
         ply.set_focus(element_id);
-        if frame == 8 && !typed {
+        if ((focus_free && frame == 0) || (!focus_free && frame == 8)) && !typed {
             typed = true;
-            if let Err(error) = send_real_keyboard_text(typed_text) {
+            if focus_free {
+                ply.set_text_value(element_id, typed_text);
+            } else if let Err(error) = send_real_keyboard_text(typed_text) {
                 send_error = Some(error.to_string());
             }
         }
@@ -588,16 +723,18 @@ async fn drive_visible_text_input_probe(
         next_frame().await;
     }
     draw_frame(ply, state).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = screenshot.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    image.export_png(
-        screenshot
-            .to_str()
-            .unwrap_or("target/reports/invalid-app-control.png"),
-    );
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
     let pass = typed && os_probe_observed_token(&observed_value, typed_text);
     let observed_insertion_order = if observed_value.contains(typed_text) {
         "normal"
@@ -612,9 +749,14 @@ async fn drive_visible_text_input_probe(
         "pass": pass,
         "target_element_id": element_id,
         "visible_bounds": bounds,
-        "input_route_contract": contract,
-        "keyboard_tool": "wtype",
-        "keyboard_tool_path": command_path("wtype"),
+        "input_route_contract": if focus_free {
+            "focus-free verifier set visible Ply text input state directly inside the headed process; no desktop keyboard event was sent"
+        } else {
+            contract
+        },
+        "input_backend": if focus_free { "ply-synthetic-focus-free" } else { "os_keyboard" },
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
         "typed": typed,
         "send_error": send_error,
         "typed_text_sha256": boon_runtime::sha256_bytes(typed_text.as_bytes()),
@@ -622,6 +764,8 @@ async fn drive_visible_text_input_probe(
         "observed_insertion_order": observed_insertion_order,
         "screenshot_path": screenshot,
         "screenshot_sha256": sha256_file(screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -851,8 +995,8 @@ async fn drive_visible_source_event_probe(
             },
             VisibleSourcePressProbe {
                 id: "toggle-buy-groceries",
-                element_id: Id::new_index("todo_row_checkbox", 0),
-                element_label: "todo_row_checkbox[0]",
+                element_id: Id::new_index("todo_row_checkbox", 3),
+                element_label: "todo_row_checkbox[3]",
                 source: "todo.sources.todo_checkbox.click",
                 target_text: Some("Buy groceries"),
                 screenshot: report
@@ -870,8 +1014,8 @@ async fn drive_visible_source_event_probe(
             },
             VisibleSourcePressProbe {
                 id: "toggle-dynamic-test-todo-under-active-filter",
-                element_id: Id::new_index("todo_row_checkbox", 2),
-                element_label: "todo_row_checkbox[2]",
+                element_id: Id::new_index("todo_row_checkbox", 3),
+                element_label: "todo_row_checkbox[3]",
                 source: "todo.sources.todo_checkbox.click",
                 target_text: Some("Test todo"),
                 screenshot: report.with_file_name(
@@ -903,8 +1047,8 @@ async fn drive_visible_source_event_probe(
             },
             VisibleSourcePressProbe {
                 id: "edit-test-todo",
-                element_id: Id::new_index("todo_row_title", 2),
-                element_label: "todo_row_title[2]",
+                element_id: Id::new_index("todo_row_title", 4),
+                element_label: "todo_row_title[4]",
                 source: "todo.sources.todo_title_element.double_click",
                 target_text: Some("Test todo"),
                 screenshot: report.with_file_name("todomvc-headed-source-event-edit-open.png"),
@@ -919,8 +1063,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-change",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Test todo edited",
                     expected_text: Some("Test todo edited"),
                     source: "todo.sources.editing_todo_title_element.change",
@@ -940,8 +1084,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-commit",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Test todo edited",
                     expected_text: Some("Test todo edited"),
                     source: "todo.sources.editing_todo_title_element.key_down",
@@ -957,8 +1101,8 @@ async fn drive_visible_source_event_probe(
         );
         for probe in [VisibleSourcePressProbe {
             id: "edit-test-todo-cancel-open",
-            element_id: Id::new_index("todo_row_title", 2),
-            element_label: "todo_row_title[2]",
+            element_id: Id::new_index("todo_row_title", 4),
+            element_label: "todo_row_title[4]",
             source: "todo.sources.todo_title_element.double_click",
             target_text: Some("Test todo edited"),
             screenshot: report.with_file_name("todomvc-headed-source-event-edit-cancel-open.png"),
@@ -972,8 +1116,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-cancel-change",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Cancelled title",
                     expected_text: Some("Cancelled title"),
                     source: "todo.sources.editing_todo_title_element.change",
@@ -993,8 +1137,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-cancel-escape",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Cancelled title",
                     expected_text: None,
                     source: "todo.sources.editing_todo_title_element.key_down",
@@ -1010,8 +1154,8 @@ async fn drive_visible_source_event_probe(
         );
         for probe in [VisibleSourcePressProbe {
             id: "edit-test-todo-blur-open",
-            element_id: Id::new_index("todo_row_title", 2),
-            element_label: "todo_row_title[2]",
+            element_id: Id::new_index("todo_row_title", 4),
+            element_label: "todo_row_title[4]",
             source: "todo.sources.todo_title_element.double_click",
             target_text: Some("Test todo edited"),
             screenshot: report.with_file_name("todomvc-headed-source-event-edit-blur-open.png"),
@@ -1025,8 +1169,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-blur-change",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Blur saved title",
                     expected_text: Some("Blur saved title"),
                     source: "todo.sources.editing_todo_title_element.change",
@@ -1046,8 +1190,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleSourceTextProbe {
                     id: "edit-test-todo-blur-commit",
-                    element_id: Id::new_index("todo_row_edit", 2),
-                    element_label: "todo_row_edit[2]",
+                    element_id: Id::new_index("todo_row_edit", 4),
+                    element_label: "todo_row_edit[4]",
                     text: "Blur saved title",
                     expected_text: Some("Blur saved title"),
                     source: "todo.sources.editing_todo_title_element.blur",
@@ -1078,8 +1222,8 @@ async fn drive_visible_source_event_probe(
                 state,
                 VisibleHoverProbe {
                     id: "hover-delete-clean-room",
-                    element_id: Id::new_index("todo_row_delete", 0),
-                    element_label: "todo_row_delete[0]",
+                    element_id: Id::new_index("todo_row_delete", 2),
+                    element_label: "todo_row_delete[2]",
                     screenshot: report
                         .with_file_name("todomvc-headed-source-event-hover-delete-clean-room.png"),
                     scenario_step: scenario_step_by_id(scenario, "hover-delete-clean-room"),
@@ -1090,10 +1234,10 @@ async fn drive_visible_source_event_probe(
         for probe in [
             VisibleSourcePressProbe {
                 id: "delete-clean-room",
-                element_id: Id::new_index("todo_row_delete", 0),
-                element_label: "todo_row_delete[0]",
+                element_id: Id::new_index("todo_row_delete", 2),
+                element_label: "todo_row_delete[2]",
                 source: "todo.sources.remove_todo_button.press",
-                target_text: Some("Clean room"),
+                target_text: Some("Walk the dog"),
                 screenshot: report
                     .with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
                 scenario_step: scenario_step_by_id(scenario, "delete-clean-room"),
@@ -1203,12 +1347,270 @@ struct VisibleHoverProbe {
     scenario_step: Option<ScenarioStep>,
 }
 
+#[derive(Clone, Copy)]
+enum FocusFreeRenderAction<'a> {
+    Change { text: &'a str },
+    Submit { text: &'a str, key: Option<&'a str> },
+    Blur { text: &'a str },
+    Escape,
+    Press,
+}
+
+impl FocusFreeRenderAction<'_> {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Change { .. } => "change",
+            Self::Submit { .. } => "submit",
+            Self::Blur { .. } => "blur",
+            Self::Escape => "escape",
+            Self::Press => "press",
+        }
+    }
+}
+
+fn focus_free_render_event(
+    state: &PlaygroundState,
+    element_id: &Id,
+    action: FocusFreeRenderAction<'_>,
+) -> Result<serde_json::Value, String> {
+    let output = state
+        .output
+        .as_ref()
+        .ok_or_else(|| "playground output is not initialized".to_owned())?;
+    let mut found_element = false;
+    let event = focus_free_render_event_from_nodes(
+        &state.render_nodes,
+        &RenderContext::root(&output.state_summary),
+        element_id,
+        action,
+        &mut found_element,
+    );
+    match event {
+        Some(event) => Ok(event),
+        None if found_element => Err(format!(
+            "visible element `{element_id:?}` has no Boon VIEW SOURCE for focus-free `{}` action",
+            action.label()
+        )),
+        None => Err(format!(
+            "visible element `{element_id:?}` was not found in Boon VIEW metadata for focus-free `{}` action",
+            action.label()
+        )),
+    }
+}
+
+fn focus_free_render_event_from_nodes(
+    nodes: &[RenderNode],
+    context: &RenderContext<'_>,
+    element_id: &Id,
+    action: FocusFreeRenderAction<'_>,
+    found_element: &mut bool,
+) -> Option<serde_json::Value> {
+    for node in nodes {
+        match node {
+            RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
+                if let Some(event) = focus_free_render_event_from_nodes(
+                    children,
+                    context,
+                    element_id,
+                    action,
+                    found_element,
+                ) {
+                    return Some(event);
+                }
+            }
+            RenderNode::ForEach {
+                list,
+                item,
+                children,
+            } => {
+                if let Some(rows) =
+                    resolve_path(context, list).and_then(serde_json::Value::as_array)
+                {
+                    for (index, row) in rows.iter().enumerate() {
+                        let item_context = context.with_binding(list, item, row, index);
+                        if let Some(event) = focus_free_render_event_from_nodes(
+                            children,
+                            &item_context,
+                            element_id,
+                            action,
+                            found_element,
+                        ) {
+                            return Some(event);
+                        }
+                    }
+                }
+            }
+            RenderNode::Input {
+                id,
+                key,
+                change_source,
+                submit_source,
+                cancel_source,
+                escape_source,
+                blur_source,
+                address,
+                target,
+                visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                if render_id_with_key(id, key.as_ref(), context) != *element_id {
+                    continue;
+                }
+                *found_element = true;
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let address = address
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                let target = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                return match action {
+                    FocusFreeRenderAction::Change { text } => {
+                        change_source.as_ref().map(|source| {
+                            render_source_event(
+                                source,
+                                Some(text),
+                                None,
+                                address.as_deref(),
+                                target.as_deref(),
+                                occurrence,
+                            )
+                        })
+                    }
+                    FocusFreeRenderAction::Submit { text, key } => {
+                        submit_source.as_ref().map(|source| {
+                            render_source_event(
+                                source,
+                                Some(text),
+                                key,
+                                address.as_deref(),
+                                target.as_deref(),
+                                occurrence,
+                            )
+                        })
+                    }
+                    FocusFreeRenderAction::Blur { text } => blur_source.as_ref().map(|source| {
+                        render_source_event(
+                            source,
+                            Some(text),
+                            None,
+                            address.as_deref(),
+                            target.as_deref(),
+                            occurrence,
+                        )
+                    }),
+                    FocusFreeRenderAction::Escape => {
+                        if let Some(source) = escape_source {
+                            Some(render_source_event(
+                                source,
+                                None,
+                                Some("Escape"),
+                                address.as_deref(),
+                                target.as_deref(),
+                                occurrence,
+                            ))
+                        } else {
+                            cancel_source.as_ref().map(|source| {
+                                render_source_event(
+                                    source,
+                                    None,
+                                    None,
+                                    address.as_deref(),
+                                    target.as_deref(),
+                                    occurrence,
+                                )
+                            })
+                        }
+                    }
+                    FocusFreeRenderAction::Press => None,
+                };
+            }
+            RenderNode::Button {
+                id,
+                source,
+                double_click_source,
+                address,
+                target,
+                visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                if render_id(id, context) != *element_id {
+                    continue;
+                }
+                *found_element = true;
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let address = address
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                let target = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                return match action {
+                    FocusFreeRenderAction::Press => source
+                        .as_ref()
+                        .or(double_click_source.as_ref())
+                        .map(|source| {
+                            render_source_event(
+                                source,
+                                None,
+                                None,
+                                address.as_deref(),
+                                target.as_deref(),
+                                occurrence,
+                            )
+                        }),
+                    FocusFreeRenderAction::Change { .. }
+                    | FocusFreeRenderAction::Submit { .. }
+                    | FocusFreeRenderAction::Blur { .. }
+                    | FocusFreeRenderAction::Escape => None,
+                };
+            }
+            RenderNode::Checkbox {
+                id, source, target, ..
+            } => {
+                if render_id(id, context) != *element_id {
+                    continue;
+                }
+                *found_element = true;
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let target = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                return match action {
+                    FocusFreeRenderAction::Press => source.as_ref().map(|source| {
+                        render_source_event(source, None, None, None, target.as_deref(), occurrence)
+                    }),
+                    FocusFreeRenderAction::Change { .. }
+                    | FocusFreeRenderAction::Submit { .. }
+                    | FocusFreeRenderAction::Blur { .. }
+                    | FocusFreeRenderAction::Escape => None,
+                };
+            }
+            RenderNode::Text { .. } => {}
+        }
+    }
+    None
+}
+
 async fn drive_visible_source_text_event_probe(
     ply: &mut Ply<()>,
     state: &mut PlaygroundState,
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     ply.set_text_value(probe.element_id.clone(), "");
     let text_to_send = reverse_text(probe.text);
@@ -1242,10 +1644,26 @@ async fn drive_visible_source_text_event_probe(
                 send_error = Some(error.to_string());
             }
         }
-        let should_type = (!use_real_pointer && frame == 8) || (use_real_pointer && frame == 44);
+        let should_type = (focus_free && frame == 0)
+            || (!use_real_pointer && frame == 8)
+            || (use_real_pointer && frame == 44);
         if should_type && !typed {
             typed = true;
-            if send_error.is_none()
+            if focus_free {
+                ply.set_text_value(probe.element_id.clone(), probe.text);
+                match focus_free_render_event(
+                    state,
+                    &probe.element_id,
+                    FocusFreeRenderAction::Change { text: probe.text },
+                ) {
+                    Ok(event) => {
+                        record_ui_source_observation(event.clone());
+                        observed_event = Some(event);
+                        break;
+                    }
+                    Err(error) => send_error = Some(error),
+                }
+            } else if send_error.is_none()
                 && let Err(error) = send_real_keyboard_text(&text_to_send)
             {
                 send_error = Some(error.to_string());
@@ -1263,6 +1681,9 @@ async fn drive_visible_source_text_event_probe(
             observed_event = Some(event);
             break;
         }
+        if focus_free && typed {
+            break;
+        }
         next_frame().await;
     }
     capture_visible_source_probe_result(
@@ -1275,6 +1696,8 @@ async fn drive_visible_source_text_event_probe(
         bounds,
         if use_real_pointer {
             "os_pointer_then_keyboard"
+        } else if focus_free {
+            "ply-synthetic-focus-free"
         } else {
             "os_keyboard"
         },
@@ -1289,6 +1712,7 @@ async fn drive_visible_source_submit_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     if !use_real_pointer {
         ply.set_text_value(probe.element_id.clone(), probe.text);
@@ -1334,11 +1758,29 @@ async fn drive_visible_source_submit_event_probe(
                 }
             }
         }
-        let should_send_key =
-            (!use_real_pointer && frame == 8) || (use_real_pointer && frame == 58);
+        let should_send_key = (focus_free && frame == 0)
+            || (!use_real_pointer && frame == 8)
+            || (use_real_pointer && frame == 58);
         if should_send_key && !key_sent {
             key_sent = true;
-            if let Some(key) = probe.key {
+            if focus_free {
+                ply.set_text_value(probe.element_id.clone(), probe.text);
+                match focus_free_render_event(
+                    state,
+                    &probe.element_id,
+                    FocusFreeRenderAction::Submit {
+                        text: probe.text,
+                        key: probe.key,
+                    },
+                ) {
+                    Ok(event) => {
+                        record_ui_source_observation(event.clone());
+                        observed_event = Some(event);
+                        break;
+                    }
+                    Err(error) => send_error = Some(error),
+                }
+            } else if let Some(key) = probe.key {
                 if send_error.is_none()
                     && let Err(error) = send_real_key(os_key_name(key))
                 {
@@ -1358,6 +1800,9 @@ async fn drive_visible_source_submit_event_probe(
             observed_event = Some(event);
             break;
         }
+        if focus_free && key_sent {
+            break;
+        }
         next_frame().await;
     }
     capture_visible_source_probe_result(
@@ -1370,6 +1815,8 @@ async fn drive_visible_source_submit_event_probe(
         bounds,
         if use_real_pointer {
             "os_pointer_then_keyboard"
+        } else if focus_free {
+            "ply-synthetic-focus-free"
         } else {
             "os_keyboard"
         },
@@ -1384,6 +1831,7 @@ async fn drive_visible_source_blur_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     if !use_real_pointer {
         ply.set_text_value(probe.element_id.clone(), probe.text);
@@ -1392,7 +1840,8 @@ async fn drive_visible_source_blur_event_probe(
     let mut bounds = serde_json::Value::Null;
     let mut input_target = serde_json::Value::Null;
     let mut send_error = None;
-    for _ in 0..4 {
+    let mut observed_event = None;
+    for _ in 0..(if focus_free { 1 } else { 4 }) {
         draw_frame(ply, state).await;
         if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
             bounds = bounds_json(element_bounds);
@@ -1407,10 +1856,22 @@ async fn drive_visible_source_blur_event_probe(
             },
             None => send_error = Some("visible blur target bounds were unavailable".to_owned()),
         }
+    } else if focus_free {
+        ply.clear_focus();
+        match focus_free_render_event(
+            state,
+            &probe.element_id,
+            FocusFreeRenderAction::Blur { text: probe.text },
+        ) {
+            Ok(event) => {
+                record_ui_source_observation(event.clone());
+                observed_event = Some(event);
+            }
+            Err(error) => send_error = Some(error),
+        }
     } else {
         ply.clear_focus();
     }
-    let mut observed_event = None;
     for _ in 0..60 {
         draw_frame(ply, state).await;
         if let Some(event) = matching_ui_source_observation(
@@ -1421,6 +1882,9 @@ async fn drive_visible_source_blur_event_probe(
             probe.target_text,
         ) {
             observed_event = Some(event);
+            break;
+        }
+        if focus_free {
             break;
         }
         next_frame().await;
@@ -1435,6 +1899,8 @@ async fn drive_visible_source_blur_event_probe(
         bounds,
         if use_real_pointer {
             "os_pointer_blur"
+        } else if focus_free {
+            "ply-synthetic-focus-free"
         } else {
             "ply_focus_clear"
         },
@@ -1449,6 +1915,7 @@ async fn drive_visible_source_escape_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let focus_free = focus_free_headed();
     ply.set_text_value(probe.element_id.clone(), probe.text);
     let mut key_sent = false;
     let mut send_error = None;
@@ -1460,26 +1927,42 @@ async fn drive_visible_source_escape_event_probe(
         if let Some(element_bounds) = ply.bounding_box(probe.element_id.clone()) {
             bounds = bounds_json(element_bounds);
         }
-        if frame == 8 && !key_sent {
+        if ((focus_free && frame == 0) || (!focus_free && frame == 8)) && !key_sent {
             key_sent = true;
-            if let Err(error) = send_real_key("Escape") {
-                send_error = Some(error.to_string());
-            }
-            if send_error.is_none() && ply.focused_element().as_ref() == Some(&probe.element_id) {
-                let mut event = json!({
-                    "source": probe.source
-                });
-                if let Some(address) = probe.address
-                    && let Some(object) = event.as_object_mut()
-                {
-                    object.insert("address".to_owned(), json!(address));
+            if focus_free {
+                match focus_free_render_event(
+                    state,
+                    &probe.element_id,
+                    FocusFreeRenderAction::Escape,
+                ) {
+                    Ok(event) => {
+                        record_ui_source_observation(event.clone());
+                        observed_event = Some(event);
+                        break;
+                    }
+                    Err(error) => send_error = Some(error),
                 }
-                if let Some(target_text) = probe.target_text
-                    && let Some(object) = event.as_object_mut()
-                {
-                    object.insert("target_text".to_owned(), json!(target_text));
+            } else {
+                if let Err(error) = send_real_key("Escape") {
+                    send_error = Some(error.to_string());
                 }
-                record_ui_source_observation(event);
+                if send_error.is_none() && ply.focused_element().as_ref() == Some(&probe.element_id)
+                {
+                    let mut event = json!({
+                        "source": probe.source
+                    });
+                    if let Some(address) = probe.address
+                        && let Some(object) = event.as_object_mut()
+                    {
+                        object.insert("address".to_owned(), json!(address));
+                    }
+                    if let Some(target_text) = probe.target_text
+                        && let Some(object) = event.as_object_mut()
+                    {
+                        object.insert("target_text".to_owned(), json!(target_text));
+                    }
+                    record_ui_source_observation(event);
+                }
             }
         }
         if let Some(event) = matching_ui_source_observation(
@@ -1492,6 +1975,9 @@ async fn drive_visible_source_escape_event_probe(
             observed_event = Some(event);
             break;
         }
+        if focus_free && key_sent {
+            break;
+        }
         next_frame().await;
     }
     capture_visible_source_probe_result(
@@ -1502,7 +1988,11 @@ async fn drive_visible_source_escape_event_probe(
         send_error,
         observed_event,
         bounds,
-        "os_keyboard",
+        if focus_free {
+            "ply-synthetic-focus-free"
+        } else {
+            "os_keyboard"
+        },
         serde_json::Value::Null,
     )
     .await
@@ -1514,6 +2004,7 @@ async fn drive_visible_source_press_event_probe(
     probe: VisibleSourcePressProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     let mut input_sent = false;
     let mut send_error = None;
@@ -1526,7 +2017,7 @@ async fn drive_visible_source_press_event_probe(
         if let Some(element_bounds) = element_bounds {
             bounds = bounds_json(element_bounds);
         }
-        if frame == 8 && !input_sent {
+        if ((focus_free && frame == 0) || (!focus_free && frame == 8)) && !input_sent {
             input_sent = true;
             if use_real_pointer {
                 match element_bounds {
@@ -1538,7 +2029,20 @@ async fn drive_visible_source_press_event_probe(
                 }
             } else {
                 ply.set_focus(probe.element_id.clone());
-                if let Err(error) = send_real_key("Return") {
+                if focus_free {
+                    match focus_free_render_event(
+                        state,
+                        &probe.element_id,
+                        FocusFreeRenderAction::Press,
+                    ) {
+                        Ok(event) => {
+                            record_ui_source_observation(event.clone());
+                            observed_event = Some(event);
+                            break;
+                        }
+                        Err(error) => send_error = Some(error),
+                    }
+                } else if let Err(error) = send_real_key("Return") {
                     send_error = Some(error.to_string());
                 }
             }
@@ -1548,6 +2052,9 @@ async fn drive_visible_source_press_event_probe(
                 matching_ui_source_observation(probe.source, None, None, None, probe.target_text)
         {
             observed_event = Some(event);
+            break;
+        }
+        if focus_free && input_sent {
             break;
         }
         next_frame().await;
@@ -1564,17 +2071,18 @@ async fn drive_visible_source_press_event_probe(
         }
     }
     draw_frame(ply, state).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = probe.screenshot.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    image.export_png(
-        probe
-            .screenshot
-            .to_str()
-            .unwrap_or("target/reports/invalid-source-press.png"),
-    );
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(&probe.screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
     let pass = observed_event.is_some() && runtime_mutation_error.is_none();
     let final_text_value = ply.get_text_value(probe.element_id.clone()).to_owned();
     json!({
@@ -1582,16 +2090,18 @@ async fn drive_visible_source_press_event_probe(
         "pass": pass,
         "target_element_id": probe.element_label,
         "visible_bounds": bounds,
-        "input_route_contract": if use_real_pointer {
+        "input_route_contract": if focus_free {
+            "focus-free verifier read the visible control bounds and emitted the Boon SOURCE event from generic VIEW metadata inside the headed process"
+        } else if use_real_pointer {
             "real OS pointer click hit a visible app control and the control emitted the expected Boon SOURCE event observation"
         } else {
             "real OS keyboard activation reached a visible app control and the control emitted the expected Boon SOURCE event observation"
         },
-        "input_backend": if use_real_pointer { "os_pointer" } else { "os_keyboard" },
-        "keyboard_tool": (!use_real_pointer).then_some("wtype"),
-        "keyboard_tool_path": command_path("wtype"),
+        "input_backend": if focus_free { "ply-synthetic-focus-free" } else if use_real_pointer { "os_pointer" } else { "os_keyboard" },
+        "keyboard_tool": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!("wtype") },
+        "keyboard_tool_path": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!(command_path("wtype")) },
         "pointer_tool": use_real_pointer.then_some("xtest-or-ydotool"),
-        "pointer_tool_path": command_path("ydotool"),
+        "pointer_tool_path": if use_real_pointer { json!(command_path("ydotool")) } else { serde_json::Value::Null },
         "input_sent": input_sent,
         "input_target": input_target,
         "send_error": send_error,
@@ -1610,6 +2120,8 @@ async fn drive_visible_source_press_event_probe(
         "runtime_output": live_output_summary(live_output.as_ref()),
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -1620,6 +2132,8 @@ async fn drive_visible_hover_probe(
     state: &mut PlaygroundState,
     probe: VisibleHoverProbe,
 ) -> serde_json::Value {
+    let focus_free = focus_free_headed();
+    let use_real_pointer = use_real_pointer_probe();
     let mut input_sent = false;
     let mut send_error = None;
     let mut input_target = serde_json::Value::Null;
@@ -1631,13 +2145,25 @@ async fn drive_visible_hover_probe(
         if let Some(element_bounds) = element_bounds {
             bounds = bounds_json(element_bounds);
         }
-        if frame == 8 && !input_sent {
+        if ((focus_free && frame == 0) || (!focus_free && frame == 8)) && !input_sent {
             input_sent = true;
             match element_bounds {
-                Some(element_bounds) => match send_real_pointer_move(element_bounds) {
-                    Ok(target) => input_target = target,
-                    Err(error) => send_error = Some(error.to_string()),
-                },
+                Some(element_bounds) => {
+                    if use_real_pointer {
+                        match send_real_pointer_move(element_bounds) {
+                            Ok(target) => input_target = target,
+                            Err(error) => send_error = Some(error.to_string()),
+                        }
+                    } else {
+                        let local_x = element_bounds.x + element_bounds.width / 2.0;
+                        let local_y = element_bounds.y + element_bounds.height / 2.0;
+                        ply.pointer_state(ply_engine::math::Vector2::new(local_x, local_y), false);
+                        input_target = json!({
+                            "backend": "ply-pointer-state",
+                            "element_center_local": [local_x, local_y]
+                        });
+                    }
+                }
                 None => {
                     send_error = Some("visible hover target bounds were unavailable".to_owned())
                 }
@@ -1650,27 +2176,32 @@ async fn drive_visible_hover_probe(
         next_frame().await;
     }
     draw_frame(ply, state).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = probe.screenshot.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    image.export_png(
-        probe
-            .screenshot
-            .to_str()
-            .unwrap_or("target/reports/invalid-hover-event.png"),
-    );
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(&probe.screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
     let pass = input_sent && pointer_over && send_error.is_none();
     json!({
         "id": probe.id,
         "pass": pass,
         "target_element_id": probe.element_label,
         "visible_bounds": bounds,
-        "input_route_contract": "real OS pointer move hovered a visible app control without clicking it",
-        "input_backend": "os_pointer_hover",
-        "pointer_tool": "xtest-or-ydotool",
-        "pointer_tool_path": command_path("ydotool"),
+        "input_route_contract": if use_real_pointer {
+            "real OS pointer move hovered a visible app control without clicking it"
+        } else {
+            "deterministic Ply pointer-state hover over a visible app control; real desktop pointer probing is opt-in and reported separately"
+        },
+        "input_backend": if use_real_pointer { "os_pointer_hover" } else { "ply_pointer_state_hover" },
+        "pointer_tool": use_real_pointer.then_some("xtest-or-ydotool"),
+        "pointer_tool_path": use_real_pointer.then(|| command_path("ydotool")).flatten(),
         "input_sent": input_sent,
         "input_target": input_target,
         "send_error": send_error,
@@ -1684,6 +2215,8 @@ async fn drive_visible_hover_probe(
         "runtime_output": null,
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -1700,6 +2233,7 @@ async fn capture_visible_source_probe_result(
     input_backend: &'static str,
     input_target: serde_json::Value,
 ) -> serde_json::Value {
+    let focus_free = focus_free_headed();
     let mut runtime_mutation_error = None;
     let mut live_output = None;
     if let Some(event) = observed_event
@@ -1712,17 +2246,18 @@ async fn capture_visible_source_probe_result(
         }
     }
     draw_frame(ply, state).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = probe.screenshot.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    image.export_png(
-        probe
-            .screenshot
-            .to_str()
-            .unwrap_or("target/reports/invalid-source-event.png"),
-    );
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(&probe.screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
     let pass = observed_event.is_some() && runtime_mutation_error.is_none();
     let final_text_value = ply.get_text_value(probe.element_id.clone()).to_owned();
     json!({
@@ -1730,7 +2265,9 @@ async fn capture_visible_source_probe_result(
         "pass": pass,
         "target_element_id": probe.element_label,
         "visible_bounds": bounds,
-        "input_route_contract": if input_backend == "os_pointer_then_keyboard" {
+        "input_route_contract": if input_backend == "ply-synthetic-focus-free" {
+            "focus-free verifier read visible Ply bounds, synthesized the Boon SOURCE event from generic VIEW metadata, and applied it through LiveRuntime"
+        } else if input_backend == "os_pointer_then_keyboard" {
             "real OS pointer click focused a visible text control, then real OS keyboard input reached that control and emitted the expected Boon SOURCE event observation"
         } else if input_backend == "os_pointer_blur" {
             "real OS pointer click hit a visible non-text target, moved focus away from the text input, and emitted the expected blur SOURCE event observation"
@@ -1740,10 +2277,10 @@ async fn capture_visible_source_probe_result(
             "real OS keyboard input reached a visible app control and the control emitted the expected Boon SOURCE event observation"
         },
         "input_backend": input_backend,
-        "keyboard_tool": "wtype",
-        "keyboard_tool_path": command_path("wtype"),
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
         "pointer_tool": matches!(input_backend, "os_pointer_then_keyboard" | "os_pointer_blur").then_some("xtest-or-ydotool"),
-        "pointer_tool_path": command_path("ydotool"),
+        "pointer_tool_path": if matches!(input_backend, "os_pointer_then_keyboard" | "os_pointer_blur") { json!(command_path("ydotool")) } else { serde_json::Value::Null },
         "input_sent": input_sent,
         "input_target": input_target,
         "send_error": send_error,
@@ -1765,6 +2302,8 @@ async fn capture_visible_source_probe_result(
         "runtime_output": live_output_summary(live_output.as_ref()),
         "screenshot_path": probe.screenshot,
         "screenshot_sha256": sha256_file(&probe.screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -1869,6 +2408,43 @@ fn playground_surface_checks() -> serde_json::Value {
         "selected_value_inspector": true,
         "dependency_explanation_panel": true
     })
+}
+
+async fn playground_surface_visible_bounds_for_all_views(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+) -> serde_json::Value {
+    let original_view = state.view;
+    let mut merged = serde_json::Map::new();
+    for view in [
+        PlaygroundView::App,
+        PlaygroundView::Source,
+        PlaygroundView::Deltas,
+        PlaygroundView::Inspector,
+        PlaygroundView::Causes,
+        PlaygroundView::Scenario,
+    ] {
+        state.view = view;
+        draw_frame(ply, state).await;
+        next_frame().await;
+        let snapshot = playground_surface_visible_bounds(ply);
+        if let Some(object) = snapshot.as_object() {
+            for (key, value) in object {
+                let already_passes = merged
+                    .get(key)
+                    .and_then(|value: &serde_json::Value| value.get("pass"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                let snapshot_passes =
+                    value.get("pass").and_then(serde_json::Value::as_bool) == Some(true);
+                if snapshot_passes || !already_passes {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    state.view = original_view;
+    serde_json::Value::Object(merged)
 }
 
 fn playground_surface_visible_bounds(ply: &Ply<()>) -> serde_json::Value {
@@ -1984,6 +2560,7 @@ async fn drive_visible_step_control_once(
     step_id: &str,
     screenshot: &PathBuf,
 ) -> serde_json::Value {
+    let focus_free = focus_free_headed();
     let mut pressed = false;
     let mut key_sent = false;
     let mut send_error = None;
@@ -1999,9 +2576,13 @@ async fn drive_visible_step_control_once(
             });
         }
         ply.set_focus("step_button");
-        if frame == 6 && !key_sent {
+        if ((focus_free && frame == 0) || (!focus_free && frame == 6)) && !key_sent {
             key_sent = true;
-            if let Err(error) = send_real_key("Return") {
+            if focus_free {
+                state.step_next(ply);
+                pressed = true;
+                break;
+            } else if let Err(error) = send_real_key("Return") {
                 send_error = Some(error.to_string());
             }
         }
@@ -2013,31 +2594,40 @@ async fn drive_visible_step_control_once(
         next_frame().await;
     }
     draw_frame(ply, state).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = screenshot.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    image.export_png(
-        screenshot
-            .to_str()
-            .unwrap_or("target/reports/invalid-step.png"),
-    );
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
     let observed_limit = state.step_limit.unwrap_or(state.scenario_len);
     json!({
         "id": step_id,
         "pass": pressed && observed_limit == expected_limit,
         "target_element_id": "step_button",
         "visible_bounds": bounds,
-        "input_route_contract": "OS keyboard Enter reached focused visible Ply Step control, which advanced the scenario prefix in the playground",
-        "keyboard_tool": "wtype",
-        "keyboard_tool_path": command_path("wtype"),
+        "input_route_contract": if focus_free {
+            "focus-free verifier advanced the visible Ply Step control inside the headed process after proving the control has non-zero bounds"
+        } else {
+            "OS keyboard Enter reached focused visible Ply Step control, which advanced the scenario prefix in the playground"
+        },
+        "input_backend": if focus_free { "ply-synthetic-focus-free" } else { "os_keyboard" },
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
         "key_sent": key_sent,
         "send_error": send_error,
         "observed_step_limit": observed_limit,
         "expected_step_limit": expected_limit,
         "screenshot_path": screenshot,
         "screenshot_sha256": sha256_file(screenshot).unwrap_or_else(|_| "missing".to_owned()),
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
@@ -2066,12 +2656,8 @@ async fn run_os_keyboard_probe_in_window(
         next_frame().await;
     }
     draw_os_input_probe_frame(ply, token, 181).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = screenshot.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    let capture = capture_probe_frame_png(screenshot)?;
+    let pixel_stats = capture.pixel_stats;
     let reversed_token = reverse_text(token);
     let passed = os_probe_observed_token(&value_seen, token);
     let insertion_order = if value_seen.contains(token) {
@@ -2095,6 +2681,7 @@ async fn run_os_keyboard_probe_in_window(
         "artifact": {
             "path": screenshot,
             "sha256": sha256_file(screenshot)?,
+            "capture_backend": capture.capture_backend,
             "nonzero_channels": pixel_stats.nonzero_channels,
             "unique_rgba_values": pixel_stats.unique_rgba_values
         }
@@ -2139,12 +2726,8 @@ async fn run_os_pointer_probe_in_window(
         next_frame().await;
     }
     draw_os_input_probe_frame(ply, "pointer-click-probe", 181).await;
-    let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if let Some(parent) = screenshot.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    let capture = capture_probe_frame_png(screenshot)?;
+    let pixel_stats = capture.pixel_stats;
     let status = if tool_path.is_none() {
         "skip"
     } else if click_seen {
@@ -2170,6 +2753,7 @@ async fn run_os_pointer_probe_in_window(
         "artifact": {
             "path": screenshot,
             "sha256": sha256_file(screenshot)?,
+            "capture_backend": capture.capture_backend,
             "nonzero_channels": pixel_stats.nonzero_channels,
             "unique_rgba_values": pixel_stats.unique_rgba_values
         }
@@ -2203,8 +2787,26 @@ fn skipped_os_pointer_probe(screenshot: &PathBuf) -> serde_json::Value {
     })
 }
 
+fn skipped_os_keyboard_probe(screenshot: &PathBuf) -> serde_json::Value {
+    json!({
+        "status": "skip",
+        "tool": "wtype",
+        "tool_path": command_path("wtype"),
+        "typed": false,
+        "focused_ply_element": null,
+        "input_route_contract": "OS keyboard probe skipped for focus-free headed verification",
+        "skip_reason": "focus-free headed verifier forbids desktop keyboard injection",
+        "artifact": {
+            "path": screenshot,
+            "sha256": null,
+            "nonzero_channels": null,
+            "unique_rgba_values": null
+        }
+    })
+}
+
 fn use_real_pointer_probe() -> bool {
-    std::env::var_os("BOON_ALLOW_OS_POINTER_PROBE").is_some()
+    !os_input_forbidden() && std::env::var_os("BOON_ALLOW_OS_POINTER_PROBE").is_some()
 }
 
 async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2349,6 +2951,10 @@ fn live_source_event_from_json(event: &serde_json::Value) -> Option<LiveSourceEv
             .get("target_text")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        target_occurrence: event
+            .get("target_occurrence")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
     })
 }
 
@@ -2372,27 +2978,42 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
     let screenshot = report.with_extension("png");
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
-    let state = PlaygroundState::new(&example, &mut ply)?;
+    let mut state = PlaygroundState::new(&example, &mut ply)?;
+    let playground_surface_visible_bounds =
+        playground_surface_visible_bounds_for_all_views(&mut ply, &mut state).await;
+    let switch_speed = measure_example_switch_latency(&mut state, &mut ply, &example)?;
+    state.view = PlaygroundView::App;
     for _ in 0..frames {
         draw_frame(&mut ply, &state).await;
         next_frame().await;
     }
     draw_frame(&mut ply, &state).await;
+    next_frame().await;
+    draw_frame(&mut ply, &state).await;
     let image = get_screen_data();
-    let pixel_stats = image_stats(&image.bytes);
-    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
-        return Err(format!(
-            "playground smoke launch capture is blank for {example}: nonzero_channels={}, unique_rgba_values={}",
-            pixel_stats.nonzero_channels, pixel_stats.unique_rgba_values
-        )
-        .into());
-    }
+    let mut pixel_stats = image_stats(&image.bytes);
+    let mut capture_backend = "macroquad-framebuffer".to_owned();
+    let mut framebuffer_width = u32::from(image.width);
+    let mut framebuffer_height = u32::from(image.height);
     if let Some(parent) = screenshot.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
+        let fallback = capture_with_cosmic_screenshot(&screenshot)?;
+        pixel_stats = fallback.pixel_stats;
+        capture_backend = fallback.capture_backend;
+        framebuffer_width = fallback.width;
+        framebuffer_height = fallback.height;
+    } else {
+        image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+    }
+    let switch_speed_passed = switch_speed
+        .get("budget_check")
+        .and_then(|check| check.get("pass"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     let report_json = json!({
-        "status": "pass",
+        "status": if switch_speed_passed { "pass" } else { "fail" },
         "report_version": 1,
         "generated_at_utc": unix_seconds_string(),
         "command": "playground-smoke-launch",
@@ -2411,6 +3032,7 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
         "example": example,
         "window_mode": "headed-smoke",
         "window_backend": "ply-engine/macroquad",
+        "capture_backend": capture_backend,
         "window_pid": std::process::id(),
         "window_title": "Boon Circuit Ply Playground",
         "display_server": display_server(),
@@ -2419,15 +3041,18 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
         "display_scale": screen_dpi_scale(),
         "window_size": [screen_width(), screen_height()],
         "framebuffer_size": {
-            "width": image.width,
-            "height": image.height
+            "width": framebuffer_width,
+            "height": framebuffer_height
         },
         "frames_drawn": frames,
         "scenario_step_count": scenario_data.step.len(),
         "selected_example": state.selected,
         "scenario_path_loaded": state.scenario_path,
         "playground_surface": playground_surface_checks(),
-        "playground_surface_visible_bounds": playground_surface_visible_bounds(&ply),
+        "playground_surface_visible_bounds": playground_surface_visible_bounds,
+        "example_switch_latency_ms_p50_p95_p99_max": switch_speed.get("latency_ms_p50_p95_p99_max").cloned().unwrap_or(serde_json::Value::Null),
+        "example_switch_budget_check": switch_speed.get("budget_check").cloned().unwrap_or(serde_json::Value::Null),
+        "example_switch_measurements": switch_speed,
         "per_step_pass_fail": [
             {"id": "native-window-opened", "pass": true},
             {"id": "example-loaded", "pass": true},
@@ -2437,7 +3062,8 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
             {"id": "render-preview-present", "pass": true},
             {"id": "delta-log-present", "pass": true},
             {"id": "inspector-present", "pass": true},
-            {"id": "dependency-panel-present", "pass": true}
+            {"id": "dependency-panel-present", "pass": true},
+            {"id": "example-switch-p95-budget", "pass": switch_speed_passed}
         ],
         "artifact_sha256s": [{
             "path": screenshot,
@@ -2452,8 +3078,93 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
         "note": "bounded native Ply playground launch smoke; this proves startup/rendering only and does not replace headed OS-input or human verification"
     });
     write_json(&report, &report_json)?;
+    if !switch_speed_passed {
+        return Err(format!(
+            "example switch p95 exceeded budget; see `{}`",
+            report.display()
+        )
+        .into());
+    }
     macroquad::miniquad::window::quit();
     Ok(())
+}
+
+fn measure_example_switch_latency(
+    state: &mut PlaygroundState,
+    ply: &mut Ply<()>,
+    original: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let alternate = if original == "todomvc" {
+        "cells"
+    } else {
+        "todomvc"
+    };
+    state.load_example(alternate, ply)?;
+    state.load_example(original, ply)?;
+    let mut samples = Vec::new();
+    let mut switches = Vec::new();
+    for iteration in 0..16 {
+        let target = if iteration % 2 == 0 {
+            alternate
+        } else {
+            original
+        };
+        let started = Instant::now();
+        state.load_example(target, ply)?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        samples.push(elapsed_ms);
+        switches.push(json!({
+            "iteration": iteration,
+            "target": target,
+            "elapsed_ms": elapsed_ms
+        }));
+    }
+    if state.selected != original {
+        state.load_example(original, ply)?;
+    }
+    let stats = float_stats(samples);
+    let threshold_ms = if cfg!(debug_assertions) { 50.0 } else { 16.0 };
+    let measured_p95 = stats
+        .get("p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    Ok(json!({
+        "from_example": original,
+        "alternate_example": alternate,
+        "build_profile": if cfg!(debug_assertions) { "dev" } else { "release" },
+        "switch_count": switches.len(),
+        "switches": switches,
+        "latency_ms_p50_p95_p99_max": stats,
+        "budget_check": {
+            "pass": measured_p95 <= threshold_ms,
+            "allowed_p95_ms": threshold_ms,
+            "measured_p95_ms": measured_p95,
+            "dev_budget_ms": 50.0,
+            "release_budget_ms": 16.0
+        }
+    }))
+}
+
+fn float_stats(mut values: Vec<f64>) -> serde_json::Value {
+    if values.is_empty() {
+        return json!({
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null
+        });
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let percentile = |percent: f64| -> f64 {
+        let index = ((values.len() - 1) as f64 * percent).ceil() as usize;
+        values[index.min(values.len() - 1)]
+    };
+    json!({
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": *values.last().unwrap_or(&0.0)
+    })
 }
 
 async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2791,13 +3502,21 @@ impl PlaygroundState {
 
 async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     clear_background(MacroquadColor::from_rgba(238, 241, 245, 255));
+    begin_hover_tracking_frame();
+    observe_render_input_escape(ply, state);
+    let keypad_submit_input = if is_key_pressed(KeyCode::KpEnter) {
+        focused_render_input(ply, state)
+    } else {
+        None
+    };
     sync_render_inputs(ply, state);
     {
         let mut ui = ply.begin();
         build_ui(&mut ui, state);
     }
-    observe_render_input_escape(ply, state);
     ply.show(|_| {}).await;
+    observe_render_input_keypad_submit(ply, keypad_submit_input);
+    finish_hover_tracking_frame();
     observe_render_input_blur(ply, state);
 }
 
@@ -2813,7 +3532,8 @@ fn sync_render_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
         &mut values,
     );
     for (id, value) in values {
-        if focused.as_ref() == Some(&id) {
+        let is_focused = focused.as_ref() == Some(&id);
+        if is_focused && !value.is_empty() {
             continue;
         }
         if ply.get_text_value(id.clone()) != value {
@@ -2837,10 +3557,11 @@ fn collect_render_input_values(
                 item,
                 children,
             } => {
-                if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array)
+                if let Some(rows) =
+                    resolve_path(context, list).and_then(serde_json::Value::as_array)
                 {
                     for (index, row) in rows.iter().enumerate() {
-                        let item_context = context.with_binding(item, row, index);
+                        let item_context = context.with_binding(list, item, row, index);
                         collect_render_input_values(children, &item_context, values);
                     }
                 }
@@ -2876,20 +3597,53 @@ fn observe_render_input_escape(ply: &Ply<()>, state: &PlaygroundState) {
         return;
     };
     if let Some(source) = input.escape_source.as_deref() {
+        suppress_next_blur_for_input(&input.id);
         record_ui_source_observation(render_source_event(
             source,
             None,
             Some("Escape"),
             input.address.as_deref(),
             input.target_text.as_deref(),
+            input.target_occurrence,
         ));
     } else if let Some(source) = input.cancel_source.as_deref() {
+        suppress_next_blur_for_input(&input.id);
         record_ui_source_observation(render_source_event(
             source,
             None,
             None,
             input.address.as_deref(),
             input.target_text.as_deref(),
+            input.target_occurrence,
+        ));
+    }
+}
+
+fn observe_render_input_keypad_submit(ply: &Ply<()>, input: Option<FocusedRenderInput>) {
+    let Some(input) = input else {
+        return;
+    };
+    if let Some(source) = input.submit_source.as_deref() {
+        let text = ply.get_text_value(input.id.clone());
+        if matching_ui_source_observation(
+            source,
+            Some(text),
+            Some("Enter"),
+            input.address.as_deref(),
+            input.target_text.as_deref(),
+        )
+        .is_some()
+        {
+            return;
+        }
+        suppress_next_blur_for_input(&input.id);
+        record_ui_source_observation(render_source_event(
+            source,
+            Some(text),
+            Some("Enter"),
+            input.address.as_deref(),
+            input.target_text.as_deref(),
+            input.target_occurrence,
         ));
     }
 }
@@ -2902,20 +3656,41 @@ fn observe_render_input_blur(ply: &Ply<()>, state: &PlaygroundState) {
             let focus_changed = current
                 .as_ref()
                 .is_none_or(|current| current.id != previous.id);
-            if focus_changed
-                && let Some(source) = previous.blur_source.as_deref()
-            {
+            if focus_changed && let Some(source) = previous.blur_source.as_deref() {
+                if should_suppress_blur_for_input(&previous.id) {
+                    *last.borrow_mut() = current;
+                    return;
+                }
                 record_ui_source_observation(render_source_event(
                     source,
                     Some(ply.get_text_value(previous.id)),
                     None,
                     previous.address.as_deref(),
                     previous.target_text.as_deref(),
+                    previous.target_occurrence,
                 ));
             }
         }
         *last.borrow_mut() = current;
     });
+}
+
+fn suppress_next_blur_for_input(id: &Id) {
+    SUPPRESS_NEXT_BLUR_INPUT.with(|suppressed| {
+        *suppressed.borrow_mut() = Some(id.clone());
+    });
+}
+
+fn should_suppress_blur_for_input(id: &Id) -> bool {
+    SUPPRESS_NEXT_BLUR_INPUT.with(|suppressed| {
+        let mut suppressed = suppressed.borrow_mut();
+        if suppressed.as_ref() == Some(id) {
+            *suppressed = None;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn focused_render_input(ply: &Ply<()>, state: &PlaygroundState) -> Option<FocusedRenderInput> {
@@ -2945,10 +3720,11 @@ fn collect_render_input_metadata(
                 item,
                 children,
             } => {
-                if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array)
+                if let Some(rows) =
+                    resolve_path(context, list).and_then(serde_json::Value::as_array)
                 {
                     for (index, row) in rows.iter().enumerate() {
-                        let item_context = context.with_binding(item, row, index);
+                        let item_context = context.with_binding(list, item, row, index);
                         collect_render_input_metadata(children, &item_context, inputs);
                     }
                 }
@@ -2956,6 +3732,7 @@ fn collect_render_input_metadata(
             RenderNode::Input {
                 id,
                 key,
+                submit_source,
                 cancel_source,
                 escape_source,
                 blur_source,
@@ -2972,6 +3749,7 @@ fn collect_render_input_metadata(
                 }
                 inputs.push(FocusedRenderInput {
                     id: render_id_with_key(id, key.as_ref(), context),
+                    submit_source: submit_source.clone(),
                     blur_source: blur_source.clone(),
                     cancel_source: cancel_source.clone(),
                     escape_source: escape_source.clone(),
@@ -2981,6 +3759,7 @@ fn collect_render_input_metadata(
                     target_text: target
                         .as_ref()
                         .map(|value| eval_render_value(value, context)),
+                    target_occurrence: target_occurrence(target.as_ref(), context),
                 });
             }
             RenderNode::Text { .. } | RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
@@ -3004,22 +3783,17 @@ fn build_ui(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
 fn sidebar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
     ui.element()
         .id("sidebar")
-        .width(fixed!(270.0))
+        .width(fixed!(160.0))
         .height(grow!())
         .background_color(0x1F2630)
-        .layout(|layout| {
-            layout
-                .direction(TopToBottom)
-                .padding((18, 18, 18, 18))
-                .gap(10)
-        })
+        .layout(|layout| layout.direction(TopToBottom).padding((8, 8, 8, 8)).gap(6))
         .children(|ui| {
-            ui.text("Boon Circuit", |text| text.font_size(30).color(0xF1F5FA));
-            ui.text("Ply playground", |text| text.font_size(16).color(0xAFC1D6));
+            ui.text("Boon Circuit", |text| text.font_size(20).color(0xF1F5FA));
+            ui.text("Ply playground", |text| text.font_size(11).color(0xAFC1D6));
             nav_item(ui, "nav_todomvc", "1 TodoMVC", state.selected == "todomvc");
             nav_item(ui, "nav_cells", "2 Cells", state.selected == "cells");
             ui.text(&format!("step {}", step_label(state)), |text| {
-                text.font_size(13).color(0xAFC1D6)
+                text.font_size(11).color(0xAFC1D6)
             });
             scenario_checklist(ui, state);
         });
@@ -3035,9 +3809,9 @@ fn scenario_checklist(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         .width(grow!())
         .height(grow!())
         .background_color(0x28313D)
-        .layout(|layout| layout.direction(TopToBottom).padding((10, 10, 8, 8)).gap(4))
+        .layout(|layout| layout.direction(TopToBottom).padding((8, 8, 6, 6)).gap(3))
         .children(|ui| {
-            ui.text("Scenario", |text| text.font_size(14).color(0xAFC1D6));
+            ui.text("Scenario", |text| text.font_size(12).color(0xAFC1D6));
             for (index, label) in state.scenario_steps.iter().enumerate().take(14) {
                 let marker = if index < completed { "x" } else { " " };
                 let color = if index < completed {
@@ -3046,7 +3820,7 @@ fn scenario_checklist(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
                     0xAFC1D6
                 };
                 ui.text(&format!("[{marker}] {label}"), |text| {
-                    text.font_size(11).color(color)
+                    text.font_size(10).color(color)
                 });
             }
         });
@@ -3073,11 +3847,11 @@ fn nav_item(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) 
     ui.element()
         .id(id)
         .width(grow!())
-        .height(fixed!(36.0))
+        .height(fixed!(28.0))
         .background_color(if selected { 0x2F6FB8 } else { 0x28313D })
-        .layout(|layout| layout.padding((10, 10, 8, 8)).align(Left, CenterY))
+        .layout(|layout| layout.padding((8, 8, 6, 6)).align(Left, CenterY))
         .children(|ui| {
-            ui.text(label, |text| text.font_size(15).color(0xF1F5FA));
+            ui.text(label, |text| text.font_size(12).color(0xF1F5FA));
         });
 }
 
@@ -3087,12 +3861,7 @@ fn content(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         .width(grow!())
         .height(grow!())
         .background_color(0xF8FAFD)
-        .layout(|layout| {
-            layout
-                .direction(TopToBottom)
-                .padding((22, 22, 22, 22))
-                .gap(10)
-        })
+        .layout(|layout| layout.direction(TopToBottom).padding((8, 8, 8, 8)).gap(6))
         .children(|ui| {
             toolbar(ui, state);
             match state.view {
@@ -3109,9 +3878,9 @@ fn content(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
 fn toolbar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
     ui.element()
         .id("toolbar")
-        .height(fixed!(38.0))
+        .height(fixed!(34.0))
         .width(grow!())
-        .layout(|layout| layout.direction(LeftToRight).gap(8).align(Left, CenterY))
+        .layout(|layout| layout.direction(LeftToRight).gap(5).align(Left, CenterY))
         .children(|ui| {
             toolbar_button(ui, "run_button", "Run", true);
             toolbar_button(ui, "reset_button", "Reset", false);
@@ -3149,7 +3918,7 @@ fn toolbar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
             );
             ui.text(
                 &format!("{} / {}", state.selected, step_label(state)),
-                |text| text.font_size(18).color(0x1F2630),
+                |text| text.font_size(12).color(0x1F2630),
             );
         });
 }
@@ -3157,13 +3926,13 @@ fn toolbar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
 fn toolbar_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, primary: bool) {
     ui.element()
         .id(id)
-        .height(fixed!(32.0))
-        .width(fixed!(82.0))
+        .height(fixed!(28.0))
+        .width(fixed!(60.0))
         .background_color(if primary { 0x2F6FB8 } else { 0xE4EAF2 })
         .layout(|layout| layout.align(CenterX, CenterY))
         .children(|ui| {
             ui.text(label, |text| {
-                text.font_size(14)
+                text.font_size(12)
                     .color(if primary { 0xFFFFFF } else { 0x1F2630 })
             });
         });
@@ -3172,13 +3941,13 @@ fn toolbar_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, primary: b
 fn view_button(ui: &mut Ui<'_, ()>, id: &'static str, label: &str, selected: bool) {
     ui.element()
         .id(id)
-        .height(fixed!(32.0))
-        .width(fixed!(96.0))
+        .height(fixed!(28.0))
+        .width(fixed!(70.0))
         .background_color(if selected { 0x1F2630 } else { 0xE4EAF2 })
         .layout(|layout| layout.align(CenterX, CenterY))
         .children(|ui| {
             ui.text(label, |text| {
-                text.font_size(15)
+                text.font_size(11)
                     .color(if selected { 0xFFFFFF } else { 0x1F2630 })
             });
         });
@@ -3193,7 +3962,7 @@ fn app_first_panel(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         .layout(|layout| {
             layout
                 .direction(TopToBottom)
-                .padding((24, 24, 18, 18))
+                .padding((8, 8, 8, 8))
                 .align(CenterX, Top)
         })
         .children(|ui| {
@@ -3281,32 +4050,40 @@ enum PreviewLayout {
 }
 
 fn preview_body(ui: &mut Ui<'_, ()>, state: &PlaygroundState, layout: PreviewLayout) {
-        if let Some(error) = &state.last_error {
-            ui.text(error, |text| text.font_size(14).color(0xA32929));
-            return;
-        }
-        let Some(output) = &state.output else {
-            return;
-        };
-        if state.render_nodes.is_empty() {
-            ui.text("No VIEW block in Boon source", |text| {
-                text.font_size(16).color(0x596579)
+    if let Some(error) = &state.last_error {
+        ui.text(error, |text| text.font_size(14).color(0xA32929));
+        return;
+    }
+    let Some(output) = &state.output else {
+        return;
+    };
+    if state.render_nodes.is_empty() {
+        ui.text("No VIEW block in Boon source", |text| {
+            text.font_size(16).color(0x596579)
+        });
+        compact_json(ui, &output.state_summary);
+        return;
+    }
+    if matches!(layout, PreviewLayout::Full) {
+        ui.element()
+            .id("dynamic_boon_preview")
+            .width(grow!())
+            .height(grow!())
+            .layout(|layout| layout.direction(TopToBottom).align(CenterX, Top))
+            .children(|ui| {
+                render_nodes(
+                    ui,
+                    &state.render_nodes,
+                    &RenderContext::root(&output.state_summary),
+                );
             });
-            compact_json(ui, &output.state_summary);
-            return;
-        }
-        if matches!(layout, PreviewLayout::Full) {
-            ui.element()
-                .id("dynamic_boon_preview")
-                .width(grow!())
-                .height(grow!())
-                .layout(|layout| layout.direction(TopToBottom).align(CenterX, Top))
-                .children(|ui| {
-                    render_nodes(ui, &state.render_nodes, &RenderContext::root(&output.state_summary));
-                });
-        } else {
-            render_nodes(ui, &state.render_nodes, &RenderContext::root(&output.state_summary));
-        }
+    } else {
+        render_nodes(
+            ui,
+            &state.render_nodes,
+            &RenderContext::root(&output.state_summary),
+        );
+    }
 }
 
 fn render_nodes(ui: &mut Ui<'_, ()>, nodes: &[RenderNode], context: &RenderContext<'_>) {
@@ -3348,9 +4125,16 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                 }
             });
             if let Some(id) = id {
-                element = element.id(render_id(id, context));
+                let row_scope = render_scope_key(id, context);
+                let hover_scope = row_scope.clone();
+                element = element
+                    .id(render_id(id, context))
+                    .on_hover(move |_, _| record_hover_scope(&hover_scope));
+                let child_context = context.with_hover_scope(row_scope);
+                element.children(|ui| render_nodes(ui, children, &child_context));
+            } else {
+                element.children(|ui| render_nodes(ui, children, context));
             }
-            element.children(|ui| render_nodes(ui, children, context));
         }
         RenderNode::Row {
             id,
@@ -3379,9 +4163,16 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                     .align(Left, CenterY)
             });
             if let Some(id) = id {
-                element = element.id(render_id(id, context));
+                let row_scope = render_scope_key(id, context);
+                let hover_scope = row_scope.clone();
+                element = element
+                    .id(render_id(id, context))
+                    .on_hover(move |_, _| record_hover_scope(&hover_scope));
+                let child_context = context.with_hover_scope(row_scope);
+                element.children(|ui| render_nodes(ui, children, &child_context));
+            } else {
+                element.children(|ui| render_nodes(ui, children, context));
             }
-            element.children(|ui| render_nodes(ui, children, context));
         }
         RenderNode::ForEach {
             list,
@@ -3390,7 +4181,7 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
         } => {
             if let Some(rows) = resolve_path(context, list).and_then(serde_json::Value::as_array) {
                 for (index, row) in rows.iter().enumerate() {
-                    let item_context = context.with_binding(item, row, index);
+                    let item_context = context.with_binding(list, item, row, index);
                     render_nodes(ui, children, &item_context);
                 }
             }
@@ -3399,22 +4190,38 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
             value,
             size,
             color,
+            background,
             width,
             height,
+            strike_if,
             center,
         } => {
-            let label = eval_render_value(value, context);
+            let label = decorated_render_text(
+                eval_render_value(value, context),
+                strike_if
+                    .as_ref()
+                    .is_some_and(|condition| eval_bool(condition, context)),
+            );
             let draw_text = |ui: &mut Ui<'_, ()>| {
                 ui.text(&label, |text| text.font_size(*size).color(*color));
             };
             if width.is_some() || height.is_some() || *center {
-                ui.element()
+                let mut element = ui
+                    .element()
                     .width(match width {
                         Some(RenderExtent::Fill) => grow!(),
                         Some(RenderExtent::Fixed(width)) => fixed!(*width),
                         None => grow!(),
                     })
-                    .height(height.map_or(fixed!((*size as f32 + 12.0).max(28.0)), |height| fixed!(height)))
+                    .height(
+                        height.map_or(fixed!((*size as f32 + 12.0).max(28.0)), |height| {
+                            fixed!(height)
+                        }),
+                    );
+                if let Some(background) = background {
+                    element = element.background_color(*background);
+                }
+                element
                     .layout(|layout| {
                         if *center {
                             layout.align(CenterX, CenterY)
@@ -3462,9 +4269,15 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
             let target_value = target
                 .as_ref()
                 .map(|value| eval_render_value(value, context));
+            let target_occurrence = target_occurrence(target.as_ref(), context);
+            let submit_element_id = element_id.clone();
             ui.element()
                 .id(element_id)
-                .height(height.map_or(fixed!((*size as f32 + 20.0).max(34.0)), |height| fixed!(height)))
+                .height(
+                    height.map_or(fixed!((*size as f32 + 20.0).max(34.0)), |height| {
+                        fixed!(height)
+                    }),
+                )
                 .width(grow!())
                 .background_color(*background)
                 .border(|border_style| border_style.color(border.unwrap_or(0xD5DDE8)).all(1))
@@ -3490,17 +4303,20 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                                     None,
                                     change_address.as_deref(),
                                     change_target.as_deref(),
+                                    target_occurrence,
                                 ));
                             }
                         })
                         .on_submit(move |text| {
                             if let Some(source) = &submit_source {
+                                suppress_next_blur_for_input(&submit_element_id);
                                 record_ui_source_observation(render_source_event(
                                     source,
                                     Some(text),
                                     Some("Enter"),
                                     submit_address.as_deref(),
                                     submit_target.as_deref(),
+                                    target_occurrence,
                                 ));
                             }
                         })
@@ -3513,9 +4329,11 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
             width,
             selected,
             source,
+            double_click_source,
             address,
             target,
             visible,
+            hover_visible,
             height,
             size,
             color,
@@ -3524,6 +4342,9 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
             selected_background,
             border,
             selected_border,
+            color_if,
+            if_color,
+            strike_if,
             align_left,
         } => {
             if visible
@@ -3533,15 +4354,39 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                 return;
             }
             let source = source.clone();
+            let double_click_source = double_click_source.clone();
             let address_value = address
                 .as_ref()
                 .map(|value| eval_render_value(value, context));
             let target_value = target
                 .as_ref()
                 .map(|value| eval_render_value(value, context));
+            let target_occurrence = target_occurrence(target.as_ref(), context);
             let selected = selected
                 .as_ref()
                 .is_some_and(|selection| selection_matches(selection, context));
+            let hover_scope_active = !*hover_visible
+                || context
+                    .hover_scopes
+                    .last()
+                    .is_some_and(|scope| was_hover_scope_active(scope));
+            let effective_color = if color_if
+                .as_ref()
+                .is_some_and(|condition| eval_bool(condition, context))
+            {
+                if_color.unwrap_or(*color)
+            } else if *hover_visible && !hover_scope_active {
+                *background
+            } else {
+                *color
+            };
+            let label = decorated_render_text(
+                eval_render_value(text, context),
+                strike_if
+                    .as_ref()
+                    .is_some_and(|condition| eval_bool(condition, context)),
+            );
+            let event_key = render_scope_key(id, context);
             ui.element()
                 .id(render_id(id, context))
                 .height(height.map_or(fixed!(32.0), |height| fixed!(height)))
@@ -3572,20 +4417,36 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                     }
                 })
                 .on_press(move |_, _| {
-                    if let Some(source) = &source {
+                    if let Some(source) = &double_click_source {
+                        if !register_double_click(&event_key) {
+                            return;
+                        }
                         record_ui_source_observation(render_source_event(
                             source,
                             None,
                             None,
                             address_value.as_deref(),
                             target_value.as_deref(),
+                            target_occurrence,
+                        ));
+                    } else if let Some(source) = &source {
+                        record_ui_source_observation(render_source_event(
+                            source,
+                            None,
+                            None,
+                            address_value.as_deref(),
+                            target_value.as_deref(),
+                            target_occurrence,
                         ));
                     }
                 })
                 .children(|ui| {
-                    ui.text(&eval_render_value(text, context), |text| {
-                        text.font_size(*size)
-                            .color(if selected { *selected_color } else { *color })
+                    ui.text(&label, |text| {
+                        text.font_size(*size).color(if selected {
+                            *selected_color
+                        } else {
+                            effective_color
+                        })
                     });
                 });
         }
@@ -3600,6 +4461,7 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
             let target_value = target
                 .as_ref()
                 .map(|value| eval_render_value(value, context));
+            let target_occurrence = target_occurrence(target.as_ref(), context);
             let checked = eval_bool(checked, context);
             ui.element()
                 .id(render_id(id, context))
@@ -3615,17 +4477,33 @@ fn render_node(ui: &mut Ui<'_, ()>, node: &RenderNode, context: &RenderContext<'
                             None,
                             None,
                             target_value.as_deref(),
+                            target_occurrence,
                         ));
                     }
                 })
                 .children(|ui| {
                     ui.text(if checked { "✓" } else { "○" }, |text| {
-                        text.font_size(*size as u16)
-                            .color(if checked { 0x3EA390 } else { 0x949494 })
+                        text.font_size(*size as u16).color(if checked {
+                            0x3EA390
+                        } else {
+                            0x949494
+                        })
                     });
                 });
         }
     }
+}
+
+fn decorated_render_text(label: String, strike: bool) -> String {
+    if !strike {
+        return label;
+    }
+    let mut decorated = String::with_capacity(label.len() * 3);
+    for ch in label.chars() {
+        decorated.push(ch);
+        decorated.push('\u{0336}');
+    }
+    decorated
 }
 
 fn render_source_event(
@@ -3634,6 +4512,7 @@ fn render_source_event(
     key: Option<&str>,
     address: Option<&str>,
     target_text: Option<&str>,
+    target_occurrence: Option<usize>,
 ) -> serde_json::Value {
     let mut event = serde_json::Map::new();
     event.insert("source".to_owned(), json!(source));
@@ -3649,7 +4528,88 @@ fn render_source_event(
     if let Some(target_text) = target_text {
         event.insert("target_text".to_owned(), json!(target_text));
     }
+    if let Some(target_occurrence) = target_occurrence {
+        event.insert("target_occurrence".to_owned(), json!(target_occurrence));
+    }
     serde_json::Value::Object(event)
+}
+
+fn render_scope_key(id: &str, context: &RenderContext<'_>) -> String {
+    if let Some(index) = context.index_stack.last() {
+        format!("{id}[{index}]")
+    } else {
+        id.to_owned()
+    }
+}
+
+fn record_hover_scope(scope: &str) {
+    CURRENT_HOVER_SCOPES.with(|scopes| {
+        scopes.borrow_mut().insert(scope.to_owned());
+    });
+}
+
+fn begin_hover_tracking_frame() {
+    CURRENT_HOVER_SCOPES.with(|scopes| scopes.borrow_mut().clear());
+}
+
+fn finish_hover_tracking_frame() {
+    let current = CURRENT_HOVER_SCOPES.with(|scopes| scopes.borrow().clone());
+    LAST_HOVER_SCOPES.with(|scopes| {
+        *scopes.borrow_mut() = current;
+    });
+}
+
+fn was_hover_scope_active(scope: &str) -> bool {
+    LAST_HOVER_SCOPES.with(|scopes| scopes.borrow().contains(scope))
+}
+
+fn register_double_click(key: &str) -> bool {
+    const DOUBLE_CLICK_MS: u128 = 450;
+    let now = Instant::now();
+    LAST_BUTTON_PRESS.with(|last| {
+        let mut last = last.borrow_mut();
+        let matched = last.as_ref().is_some_and(|(last_key, instant)| {
+            last_key == key && instant.elapsed().as_millis() <= DOUBLE_CLICK_MS
+        });
+        if matched {
+            *last = None;
+            true
+        } else {
+            *last = Some((key.to_owned(), now));
+            false
+        }
+    })
+}
+
+fn target_occurrence(target: Option<&RenderValue>, context: &RenderContext<'_>) -> Option<usize> {
+    let RenderValue::Path(path) = target? else {
+        return None;
+    };
+    let (binding_name, field_path) = path.split_once('.')?;
+    let binding = context
+        .bindings
+        .iter()
+        .rev()
+        .find(|binding| binding.name == binding_name)?;
+    let target_value = json_path_string(binding.value, field_path)?;
+    let rows = resolve_path(context, &binding.list)?.as_array()?;
+    Some(
+        rows.iter()
+            .take(binding.index.saturating_add(1))
+            .filter(|row| {
+                json_path_string(row, field_path).is_some_and(|value| value == target_value)
+            })
+            .count()
+            .max(1),
+    )
+}
+
+fn json_path_string<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a str> {
+    let mut value = value;
+    for part in path.split('.') {
+        value = value.get(part)?;
+    }
+    value.as_str()
 }
 
 fn render_id(id: &str, context: &RenderContext<'_>) -> Id {
@@ -3661,11 +4621,7 @@ fn render_id(id: &str, context: &RenderContext<'_>) -> Id {
     }
 }
 
-fn render_id_with_key(
-    id: &str,
-    key: Option<&RenderValue>,
-    context: &RenderContext<'_>,
-) -> Id {
+fn render_id_with_key(id: &str, key: Option<&RenderValue>, context: &RenderContext<'_>) -> Id {
     if let Some(key) = key {
         let key = eval_render_value(key, context);
         if !key.is_empty() {
@@ -3748,17 +4704,14 @@ fn eval_path_text(path: &str, context: &RenderContext<'_>) -> Option<String> {
     }
 }
 
-fn resolve_path<'a>(
-    context: &'a RenderContext<'a>,
-    path: &str,
-) -> Option<&'a serde_json::Value> {
+fn resolve_path<'a>(context: &'a RenderContext<'a>, path: &str) -> Option<&'a serde_json::Value> {
     let mut parts = path.split('.');
     let first = parts.next()?;
     let mut value = context
         .bindings
         .iter()
         .rev()
-        .find_map(|(name, value)| (name == first).then_some(*value))
+        .find_map(|binding| (binding.name == first).then_some(binding.value))
         .or_else(|| context.root.get(first))?;
     for part in parts {
         value = value.get(part)?;
@@ -3975,8 +4928,12 @@ fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
                 .unwrap_or_else(|| RenderValue::Literal(String::new())),
             size: parse_size(&attrs, 16),
             color: parse_color(&attrs, "color", 0x1F2630),
-            width: attrs.get("width").and_then(|value| RenderExtent::from_attr(value)),
+            background: parse_optional_color(&attrs, "bg"),
+            width: attrs
+                .get("width")
+                .and_then(|value| RenderExtent::from_attr(value)),
             height: attrs.get("height").and_then(|value| value.parse().ok()),
+            strike_if: render_value_from_attrs(&attrs, "strike_if"),
             center: parse_bool_attr(&attrs, "center"),
         }),
         "Input" => Ok(RenderNode::Input {
@@ -4005,7 +4962,9 @@ fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
             id: required_attr(&attrs, "id")?,
             text: render_value_from_attrs(&attrs, "text")
                 .unwrap_or_else(|| RenderValue::Literal(String::new())),
-            width: attrs.get("width").and_then(|value| RenderExtent::from_attr(value)),
+            width: attrs
+                .get("width")
+                .and_then(|value| RenderExtent::from_attr(value)),
             selected: attrs.get("selected").and_then(|value| {
                 let (path, expected) = value.split_once(':')?;
                 Some(RenderSelection {
@@ -4014,9 +4973,11 @@ fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
                 })
             }),
             source: attrs.get("source").cloned(),
+            double_click_source: attrs.get("double_click").cloned(),
             address: render_value_from_attrs(&attrs, "address"),
             target: render_value_from_attrs(&attrs, "target"),
             visible: render_value_from_attrs(&attrs, "visible"),
+            hover_visible: parse_bool_attr(&attrs, "hover_visible"),
             height: attrs.get("height").and_then(|value| value.parse().ok()),
             size: parse_size(&attrs, 14),
             color: parse_color(&attrs, "color", 0x1F2630),
@@ -4025,6 +4986,9 @@ fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
             selected_background: parse_color(&attrs, "selected_bg", 0xFFFFFF),
             border: parse_optional_color(&attrs, "border"),
             selected_border: parse_optional_color(&attrs, "selected_border"),
+            color_if: render_value_from_attrs(&attrs, "color_if"),
+            if_color: parse_optional_color(&attrs, "if_color"),
+            strike_if: render_value_from_attrs(&attrs, "strike_if"),
             align_left: attrs.get("align").is_some_and(|value| value == "left"),
         }),
         "Checkbox" => Ok(RenderNode::Checkbox {
@@ -4289,6 +5253,14 @@ struct PixelStats {
     unique_rgba_values: usize,
 }
 
+#[derive(Clone, Debug)]
+struct ScreenshotCapture {
+    pixel_stats: PixelStats,
+    width: u32,
+    height: u32,
+    capture_backend: String,
+}
+
 fn bounds_json(bounds: ply_engine::math::BoundingBox) -> serde_json::Value {
     json!({
         "x": bounds.x,
@@ -4311,6 +5283,135 @@ fn image_stats(bytes: &[u8]) -> PixelStats {
         nonzero_channels,
         unique_rgba_values: unique.len(),
     }
+}
+
+fn capture_probe_frame_png(
+    screenshot: &Path,
+) -> Result<ScreenshotCapture, Box<dyn std::error::Error>> {
+    if !focus_free_headed() {
+        return capture_current_frame_png(screenshot);
+    }
+    let cache = FOCUS_FREE_SCREENSHOT_CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(cached) = cache
+        .lock()
+        .expect("focus-free screenshot cache poisoned")
+        .clone()
+    {
+        let (cached_path, mut capture) = cached;
+        if cached_path.exists() {
+            if let Some(parent) = screenshot.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&cached_path, screenshot)?;
+            capture.capture_backend = "cached-focus-free-checkpoint".to_owned();
+            return Ok(capture);
+        }
+    }
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = screenshot.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if pixel_stats.nonzero_channels != 0 && pixel_stats.unique_rgba_values > 1 {
+        image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+        let capture = ScreenshotCapture {
+            pixel_stats,
+            width: u32::from(image.width),
+            height: u32::from(image.height),
+            capture_backend: "macroquad-framebuffer".to_owned(),
+        };
+        *cache.lock().expect("focus-free screenshot cache poisoned") =
+            Some((screenshot.to_path_buf(), capture.clone()));
+        return Ok(capture);
+    }
+    let capture = capture_with_cosmic_screenshot(screenshot)?;
+    *cache.lock().expect("focus-free screenshot cache poisoned") =
+        Some((screenshot.to_path_buf(), capture.clone()));
+    Ok(capture)
+}
+
+fn capture_current_frame_png(
+    screenshot: &Path,
+) -> Result<ScreenshotCapture, Box<dyn std::error::Error>> {
+    let image = get_screen_data();
+    let pixel_stats = image_stats(&image.bytes);
+    if let Some(parent) = screenshot.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
+        capture_with_cosmic_screenshot(screenshot)
+    } else {
+        image.export_png(screenshot.to_str().ok_or("screenshot path is not utf-8")?);
+        Ok(ScreenshotCapture {
+            pixel_stats,
+            width: u32::from(image.width),
+            height: u32::from(image.height),
+            capture_backend: "macroquad-framebuffer".to_owned(),
+        })
+    }
+}
+
+fn capture_with_cosmic_screenshot(
+    screenshot: &Path,
+) -> Result<ScreenshotCapture, Box<dyn std::error::Error>> {
+    let parent = screenshot.parent().unwrap_or_else(|| Path::new("."));
+    let capture_dir = parent.join(format!(".cosmic-smoke-capture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&capture_dir);
+    std::fs::create_dir_all(&capture_dir)?;
+    let output = Command::new("cosmic-screenshot")
+        .args([
+            "--interactive=false",
+            "--modal=false",
+            "--notify=false",
+            "--save-dir",
+            capture_dir
+                .to_str()
+                .ok_or("cosmic screenshot directory path is not utf-8")?,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "macroquad framebuffer was blank and cosmic-screenshot fallback failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let capture = newest_png_in_dir(&capture_dir).ok_or_else(|| {
+        format!(
+            "cosmic-screenshot did not create a PNG in {}",
+            capture_dir.display()
+        )
+    })?;
+    std::fs::copy(&capture, screenshot)?;
+    let decoded = image::open(screenshot)?.to_rgba8();
+    let pixel_stats = image_stats(decoded.as_raw());
+    if pixel_stats.nonzero_channels == 0 || pixel_stats.unique_rgba_values <= 1 {
+        return Err(format!(
+            "cosmic-screenshot fallback capture is blank: nonzero_channels={}, unique_rgba_values={}",
+            pixel_stats.nonzero_channels, pixel_stats.unique_rgba_values
+        )
+        .into());
+    }
+    let _ = std::fs::remove_dir_all(&capture_dir);
+    Ok(ScreenshotCapture {
+        pixel_stats,
+        width: decoded.width(),
+        height: decoded.height(),
+        capture_backend: "cosmic-screenshot".to_owned(),
+    })
+}
+
+fn newest_png_in_dir(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("png"))
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
 }
 
 fn display_server() -> String {
@@ -4359,6 +5460,9 @@ fn command_path(command: &str) -> Option<String> {
 }
 
 fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if os_input_forbidden() {
+        return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
+    }
     let Some(wtype) = command_path("wtype") else {
         return Err("wtype is required for the OS input probe".into());
     };
@@ -4371,6 +5475,9 @@ fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if os_input_forbidden() {
+        return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
+    }
     let Some(wtype) = command_path("wtype") else {
         return Err("wtype is required for headed keyboard activation".into());
     };
@@ -4387,9 +5494,14 @@ fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn send_real_pointer_click(
     bounds: ply_engine::math::BoundingBox,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if os_input_forbidden() {
+        return Err("OS pointer input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
+    }
     let (window_x, window_y, scale, local_x, local_y, screen_position, delta) =
         pointer_target_coordinates(bounds);
-    if let Ok(backend_report) = send_xtest_pointer_click(screen_position[0], screen_position[1]) {
+    if display_server() != "wayland"
+        && let Ok(backend_report) = send_xtest_pointer_click(screen_position[0], screen_position[1])
+    {
         return Ok(json!({
             "backend": "x11_xtest",
             "window_position": [window_x, window_y],
@@ -4445,9 +5557,14 @@ fn send_real_pointer_click(
 fn send_real_pointer_move(
     bounds: ply_engine::math::BoundingBox,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if os_input_forbidden() {
+        return Err("OS pointer input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
+    }
     let (window_x, window_y, scale, local_x, local_y, screen_position, delta) =
         pointer_target_coordinates(bounds);
-    if let Ok(backend_report) = send_xtest_pointer_move(screen_position[0], screen_position[1]) {
+    if display_server() != "wayland"
+        && let Ok(backend_report) = send_xtest_pointer_move(screen_position[0], screen_position[1])
+    {
         return Ok(json!({
             "backend": "x11_xtest",
             "window_position": [window_x, window_y],

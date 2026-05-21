@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -248,6 +249,7 @@ pub struct LiveSourceEvent {
     pub key: Option<String>,
     pub address: Option<String>,
     pub target_text: Option<String>,
+    pub target_occurrence: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -642,7 +644,7 @@ impl LiveRuntime {
     ) -> RuntimeResult<LiveStepOutput> {
         event.assert_matches_step(step)?;
         let mut live_step = step.clone();
-        live_step.user_action = Some(live_source_user_action());
+        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
         live_step.expected_source_event = Some(event.into_expected_source_event());
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step(&live_step)
@@ -716,12 +718,24 @@ impl LiveSourceEvent {
     }
 
     fn into_step(self, sequence: usize) -> ScenarioStep {
+        let user_action = self.live_source_user_action_with_occurrence();
         ScenarioStep {
             id: format!("live-source-event-{sequence}"),
-            user_action: Some(live_source_user_action()),
+            user_action: Some(user_action),
             expected_source_event: Some(self.into_expected_source_event()),
             ..ScenarioStep::default()
         }
+    }
+
+    fn live_source_user_action_with_occurrence(&self) -> BTreeMap<String, toml::Value> {
+        let mut user_action = live_source_user_action();
+        if let Some(occurrence) = self.target_occurrence {
+            user_action.insert(
+                "target_occurrence".to_owned(),
+                toml::Value::Integer(occurrence as i64),
+            );
+        }
+        user_action
     }
 }
 
@@ -2260,6 +2274,41 @@ fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeRes
         .get("input_injection_method")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
+    let focus_free = injection_method == "ply_synthetic_focus_free_render_metadata";
+    if focus_free {
+        if report.get("input_backend").and_then(JsonValue::as_str)
+            != Some("ply-synthetic-focus-free")
+        {
+            return Err(format!(
+                "{} focus-free headed report must use ply-synthetic-focus-free input backend",
+                report_path.display()
+            )
+            .into());
+        }
+        if report.get("os_focus_required").and_then(JsonValue::as_bool) != Some(false)
+            || report
+                .get("os_keyboard_or_pointer_used")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+        {
+            return Err(format!(
+                "{} focus-free headed report must prove it used no OS keyboard or pointer injection",
+                report_path.display()
+            )
+            .into());
+        }
+        if !report
+            .get("os_input_tools_used")
+            .and_then(JsonValue::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(format!(
+                "{} focus-free headed report must have an empty os_input_tools_used list",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     if matches!(
         injection_method,
         "direct_source_event" | "semantic_scenario_replay_then_headed_render"
@@ -2301,7 +2350,7 @@ fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeRes
         )
         .into());
     }
-    if injection_method != "os_pointer_keyboard_to_visible_window" {
+    if injection_method != "os_pointer_keyboard_to_visible_window" && !focus_free {
         let limitation = report
             .get("os_input_limitation")
             .and_then(JsonValue::as_str)
@@ -3669,6 +3718,7 @@ impl LoadedRuntime {
             }
             GenericSourceRouteKind::IndexedTextOpen => {
                 let index = resolved_index?;
+                close_other_todomvc_editors(generic, index, deltas, patches)?;
                 let all_completed = generic.todomvc_all_completed();
                 let source_event = GenericSourceEvent {
                     text: Some(target_text),
@@ -3936,6 +3986,39 @@ fn find_todomvc_editing_index(generic: &GenericScheduledRuntime) -> RuntimeResul
                 .unwrap_or(false)
         })
         .ok_or_else(|| "no editing todo found".into())
+}
+
+fn close_other_todomvc_editors<'a>(
+    generic: &mut GenericScheduledRuntime,
+    active_index: usize,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    for index in 0..generic.list_len("todos")? {
+        if index == active_index
+            || !generic
+                .list_row_bool_opt("todos", index, "editing")
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let (key, generation) =
+            generic.commit_indexed_bool_field("todos", index, "editing", false)?;
+        let commit = GenericBoolFieldCommit {
+            list: "todos",
+            key,
+            generation,
+            field: "editing",
+            value: false,
+        };
+        deltas.push(commit.semantic_delta());
+        emit_todomvc_render_patch_for_mutation(
+            &GenericSourceMutation::BoolField(commit),
+            GenericRenderContext::default(),
+            patches,
+        )?;
+    }
+    Ok(())
 }
 
 fn initialize_loaded_todomvc_generic(
@@ -6431,6 +6514,11 @@ impl GenericScheduledRuntime {
             .list_rows_json("todos", &["title", "edit_text", "completed", "editing"])
             .unwrap_or_default()
             .into_iter()
+            .map(|mut todo| {
+                let editing = todo["editing"].as_bool().unwrap_or(false);
+                todo.insert("not_editing".to_owned(), json!(!editing));
+                JsonValue::Object(todo)
+            })
             .collect::<Vec<_>>();
         let selected_filter = self
             .storage
@@ -6555,8 +6643,13 @@ impl GenericScheduledRuntime {
         self.reserve_list("todos", append_count)?;
         let row_source_count = self.list_source_bindings.source_count("todos")?;
         self.reserve_source_bindings(append_count * row_source_count);
-        if append_count > 0 {
-            self.reserve_spare_rows_for_list_append_text("todos", append_count, max_text_len)?;
+        let removable_row_capacity = self.storage.list_len("todos")?.saturating_add(append_count);
+        if removable_row_capacity > 0 {
+            self.reserve_spare_rows_for_list_append_text(
+                "todos",
+                removable_row_capacity,
+                max_text_len,
+            )?;
         }
         self.reserve_list_row_textlike_fields("todos", "title", |_, current| {
             max_text_len.saturating_sub(current.len())
@@ -7664,7 +7757,7 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let additional = count - spare_len;
         let spare_rows = self.spare_rows.entry(list.to_owned()).or_default();
-        spare_rows.reserve(additional);
+        spare_rows.reserve(additional + count);
         for _ in 0..additional {
             let seed_fields = equations.append_seed_fields(list, trigger, "")?;
             let mut row = template.materialize(seed_fields)?;
@@ -8310,6 +8403,9 @@ impl GenericRowTemplate {
         mut seed_fields: BTreeMap<String, RuntimeValue>,
     ) -> RuntimeResult<GenericRow> {
         for field in &self.fields {
+            if seed_fields.contains_key(&field.field) {
+                continue;
+            }
             seed_fields.insert(
                 field.field.clone(),
                 runtime_value_from_initial(&field.initial_value, &seed_fields)?,
@@ -10381,6 +10477,7 @@ impl TodoRuntime {
                 target_occurrence,
             } if routed.route_kind == GenericSourceRouteKind::IndexedTextOpen => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
+                close_other_todomvc_editors(&mut self.generic, index, &mut deltas, &mut patches)?;
                 let all_completed = self.all_completed();
                 let source_event = GenericSourceEvent {
                     text: Some(target_text),
@@ -12921,21 +13018,31 @@ fn now_string() -> String {
 }
 
 fn git_commit() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+    static GIT_COMMIT: OnceLock<String> = OnceLock::new();
+    GIT_COMMIT
+        .get_or_init(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned())
+        })
+        .clone()
 }
 
 fn current_binary_hash() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| sha256_file(&path).ok())
-        .unwrap_or_else(|| "unknown".to_owned())
+    static BINARY_HASH: OnceLock<String> = OnceLock::new();
+    BINARY_HASH
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| sha256_file(&path).ok())
+                .unwrap_or_else(|| "unknown".to_owned())
+        })
+        .clone()
 }
 
 fn display_server() -> String {
@@ -12957,6 +13064,10 @@ mod tests {
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
         let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
         TodoRuntime::from_generic(generic).unwrap()
+    }
+
+    fn todo_index(runtime: &TodoRuntime, title: &str) -> usize {
+        runtime.find_index(title).unwrap()
     }
 
     #[test]
@@ -12984,7 +13095,7 @@ mod tests {
 
     #[test]
     fn profiled_list_capacity_rejects_overflow_append() {
-        let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[2] {");
+        let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[4] {");
         let error = run_scenario_source_with_step_limit(
             "capacity:todomvc",
             &source,
@@ -12995,7 +13106,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("generic list `todos` capacity 2 exceeded by append"),
+            error.contains("generic list `todos` capacity 4 exceeded by append"),
             "{error}"
         );
     }
@@ -13013,7 +13124,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("list `todos` initializes 2 rows beyond declared capacity 1"),
+            error.contains("list `todos` initializes 4 rows beyond declared capacity 1"),
             "{error}"
         );
     }
@@ -13216,7 +13327,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.report["total_ticks"], 3);
-        assert_eq!(output.state_summary["active_count"], 3);
+        assert_eq!(output.state_summary["active_count"], 4);
     }
 
     #[test]
@@ -13334,8 +13445,10 @@ mod tests {
         let todo_rows = todo_runtime
             .list_rows_json("todos", &["title", "completed", "editing"])
             .unwrap();
-        assert_eq!(todo_rows[0]["title"], "Buy groceries");
+        assert_eq!(todo_rows[0]["title"], "Read documentation");
         assert_eq!(todo_rows[0]["completed"], false);
+        assert_eq!(todo_rows[1]["title"], "Finish TodoMVC renderer");
+        assert_eq!(todo_rows[1]["completed"], true);
         assert!(todo_runtime.row_identity("todos", 0).is_ok());
         assert!(todo_runtime.row_identity("todos", 1).is_ok());
 
@@ -13387,13 +13500,98 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(submit.state_summary["todos"].as_array().unwrap().len(), 3);
+        assert_eq!(submit.state_summary["todos"].as_array().unwrap().len(), 5);
         assert!(
             submit
                 .semantic_deltas
                 .iter()
                 .any(|delta| delta.kind == "ListInsert")
         );
+    }
+
+    #[test]
+    fn live_runtime_routes_duplicate_todo_title_events_by_occurrence() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:todomvc",
+            source,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: "store.sources.new_todo_input.change".to_owned(),
+                    text: Some("Duplicate".to_owned()),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap();
+            runtime
+                .apply_source_event(LiveSourceEvent {
+                    source: "store.sources.new_todo_input.key_down".to_owned(),
+                    text: Some("Duplicate".to_owned()),
+                    key: Some("Enter".to_owned()),
+                    ..LiveSourceEvent::default()
+                })
+                .unwrap();
+        }
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "todo.sources.todo_checkbox.click".to_owned(),
+                target_text: Some("Duplicate".to_owned()),
+                target_occurrence: Some(2),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let duplicates = output
+            .state_summary
+            .get("todos")
+            .and_then(JsonValue::as_array)
+            .unwrap()
+            .iter()
+            .filter(|todo| todo["title"] == "Duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert_eq!(duplicates[0]["completed"], false);
+        assert_eq!(duplicates[1]["completed"], true);
+    }
+
+    #[test]
+    fn live_runtime_keeps_one_todomvc_row_in_edit_mode() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:todomvc",
+            source,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .unwrap();
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "todo.sources.todo_title_element.double_click".to_owned(),
+                target_text: Some("Read documentation".to_owned()),
+                target_occurrence: Some(1),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "todo.sources.todo_title_element.double_click".to_owned(),
+                target_text: Some("Finish TodoMVC renderer".to_owned()),
+                target_occurrence: Some(1),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let editing = output
+            .state_summary
+            .get("todos")
+            .and_then(JsonValue::as_array)
+            .unwrap()
+            .iter()
+            .filter(|todo| todo["editing"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(editing.len(), 1);
+        assert_eq!(editing[0]["title"], "Finish TodoMVC renderer");
     }
 
     #[test]
@@ -13518,13 +13716,18 @@ mod tests {
     #[test]
     fn source_initializers_are_read_from_boon_text() {
         let todo_source = include_str!("../../../examples/todomvc.bn")
-            .replace("Buy groceries", "Source title A")
-            .replace("Clean room", "Source title B");
+            .replace("Read documentation", "Source title A")
+            .replace("Buy groceries", "Source title B");
         let parsed = parse_source("examples/todomvc.bn", todo_source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert_eq!(
             todomvc_seed_titles_from_ir(&ir).unwrap(),
-            vec!["Source title A", "Source title B"]
+            vec![
+                "Source title A",
+                "Finish TodoMVC renderer",
+                "Walk the dog",
+                "Source title B"
+            ]
         );
 
         let cells_source = include_str!("../../../examples/cells.bn")
@@ -13537,11 +13740,17 @@ mod tests {
     #[test]
     fn duplicate_todo_titles_route_by_hidden_host_scope_not_visible_data_identity() {
         let source =
-            include_str!("../../../examples/todomvc.bn").replace("Clean room", "Buy groceries");
+            include_str!("../../../examples/todomvc.bn").replace("Walk the dog", "Buy groceries");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
         let mut runtime = todo_runtime_from_parsed(&parsed);
-        let target_key = runtime.todo_key(1);
-        let target_generation = runtime.todo_generation(1);
+        let target_index = runtime
+            .find_index_at_occurrence("Buy groceries", 2)
+            .unwrap();
+        let other_duplicate_index = runtime
+            .find_index_at_occurrence("Buy groceries", 1)
+            .unwrap();
+        let target_key = runtime.todo_key(target_index);
+        let target_generation = runtime.todo_generation(target_index);
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         action.insert(
@@ -13576,9 +13785,12 @@ mod tests {
         runtime
             .apply_step_into(&step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_completed_for_test(0), false);
-        assert_eq!(runtime.todo_completed_for_test(1), true);
-        assert_eq!(deltas.iter().find_map(|delta| delta.key), Some(2));
+        assert_eq!(
+            runtime.todo_completed_for_test(other_duplicate_index),
+            false
+        );
+        assert_eq!(runtime.todo_completed_for_test(target_index), true);
+        assert_eq!(deltas.iter().find_map(|delta| delta.key), Some(target_key));
     }
 
     #[test]
@@ -13796,11 +14008,12 @@ mod tests {
             expected_source_event: Some(row_expected),
             ..ScenarioStep::default()
         };
+        let buy_index = todo_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&row_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todo_completed_for_test(0));
-        assert!(!runtime.todo_completed_for_test(1));
+        assert!(runtime.todo_completed_for_test(buy_index));
+        assert!(!runtime.todo_completed_for_test(todo_index(&runtime, "Read documentation")));
 
         deltas.clear();
         patches.clear();
@@ -13830,7 +14043,7 @@ mod tests {
                 .iter()
                 .filter(|delta| delta.field_path == Some("completed"))
                 .count(),
-            2
+            runtime.todo_len()
         );
     }
 
@@ -13868,11 +14081,12 @@ mod tests {
             expected_source_event: Some(open_expected),
             ..ScenarioStep::default()
         };
+        let buy_index = todo_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&open_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todo_editing_for_test(0));
-        assert_eq!(runtime.todo_edit_text_for_test(0), "Buy groceries");
+        assert!(runtime.todo_editing_for_test(buy_index));
+        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Buy groceries");
 
         deltas.clear();
         patches.clear();
@@ -13911,7 +14125,7 @@ mod tests {
         runtime
             .apply_step_into(&change_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_edit_text_for_test(0), "Draft via IR");
+        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Draft via IR");
 
         deltas.clear();
         patches.clear();
@@ -13944,8 +14158,8 @@ mod tests {
         runtime
             .apply_step_into(&close_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(!runtime.todo_editing_for_test(0));
-        assert_eq!(runtime.todo_edit_text_for_test(0), "Buy groceries");
+        assert!(!runtime.todo_editing_for_test(buy_index));
+        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Buy groceries");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet"
                 && delta.field_path == Some("editing")
@@ -13987,6 +14201,7 @@ mod tests {
             expected_source_event: Some(open_expected),
             ..ScenarioStep::default()
         };
+        let buy_index = todo_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&open_step, &mut deltas, &mut patches)
             .unwrap();
@@ -14030,7 +14245,7 @@ mod tests {
         runtime
             .apply_step_into(&commit_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Committed via IR");
+        assert_eq!(runtime.todo_title_for_test(buy_index), "Committed via IR");
         assert!(
             deltas
                 .iter()
@@ -14139,7 +14354,7 @@ mod tests {
         runtime
             .apply_step_into(&blur_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Blur via IR");
+        assert_eq!(runtime.todo_title_for_test(buy_index), "Blur via IR");
         assert!(
             deltas
                 .iter()
@@ -14191,7 +14406,10 @@ mod tests {
         runtime
             .apply_step_into(&append_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(2), "Derived append");
+        assert_eq!(
+            runtime.todo_title_for_test(runtime.todo_len() - 1),
+            "Derived append"
+        );
 
         deltas.clear();
         patches.clear();
@@ -14242,7 +14460,9 @@ mod tests {
         runtime
             .apply_step_into(&clear_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Clean room");
+        assert_eq!(runtime.todo_title_for_test(0), "Read documentation");
+        assert_eq!(runtime.todo_title_for_test(1), "Walk the dog");
+        assert_eq!(runtime.todo_title_for_test(2), "Derived append");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
 
         deltas.clear();
@@ -14251,7 +14471,7 @@ mod tests {
         delete_action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         delete_action.insert(
             "target_text".to_owned(),
-            toml::Value::String("Clean room delete".to_owned()),
+            toml::Value::String("Walk the dog delete".to_owned()),
         );
         let mut delete_expected = BTreeMap::new();
         delete_expected.insert(
@@ -14260,7 +14480,7 @@ mod tests {
         );
         delete_expected.insert(
             "target_text".to_owned(),
-            toml::Value::String("Clean room".to_owned()),
+            toml::Value::String("Walk the dog".to_owned()),
         );
         let delete_step = ScenarioStep {
             id: "renamed-row-delete-list-remove".to_owned(),
@@ -14271,7 +14491,8 @@ mod tests {
         runtime
             .apply_step_into(&delete_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Derived append");
+        assert_eq!(runtime.todo_title_for_test(0), "Read documentation");
+        assert_eq!(runtime.todo_title_for_test(1), "Derived append");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
     }
 
@@ -14296,7 +14517,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(bad_append.contains("does not match IR trigger"));
-        assert_eq!(generic.list_len("todos").unwrap(), 2);
+        assert_eq!(generic.list_len("todos").unwrap(), 4);
 
         let clear_source = "store.sources.clear_completed_button.press";
         let clear_predicate = compiled
@@ -14320,7 +14541,7 @@ mod tests {
             .unwrap()
             .expect("completed row should match the IR-derived remove predicate");
         assert_eq!(removed.key, 1);
-        assert_eq!(generic.list_len("todos").unwrap(), 1);
+        assert_eq!(generic.list_len("todos").unwrap(), 3);
     }
 
     #[test]
@@ -14542,9 +14763,9 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert_eq!(runtime.todo_len(), 1);
-        assert_eq!(runtime.todo_title_for_test(0), "Clean room");
-        assert_eq!(runtime.todo_completed_for_test(0), false);
+        assert_eq!(runtime.todo_len(), 3);
+        assert_eq!(runtime.todo_title_for_test(0), "Finish TodoMVC renderer");
+        assert_eq!(runtime.todo_completed_for_test(0), true);
     }
 
     #[test]

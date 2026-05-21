@@ -4,8 +4,9 @@ use boon_runtime::{
     VerificationLayer, example_paths, run_scenario, run_scenario_source_with_step_limit,
     verify_report_schema, write_json,
 };
+use image::{ImageBuffer, Rgba, RgbaImage};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const XTASK_COMMANDS: &[&str] = &[
     "verify-example-headed-ply",
+    "verify-example-headed-focusless",
     "verify-example-human",
     "prepare-example-human-report",
     "verify-example-semantic",
@@ -27,6 +29,8 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-foundation",
     "verify-playground-launch",
     "verify-playground-background-launch",
+    "verify-todomvc-reference-parity",
+    "verify-playground-genericity",
     "bench-example",
     "verify-playground-custom-source",
     "write-manual-handoff",
@@ -34,6 +38,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "audit-goal-readiness",
     "audit-manual-readiness",
     "verify-todomvc-headed-ply",
+    "verify-todomvc-headed-focusless",
     "verify-todomvc-human",
     "prepare-todomvc-human-report",
     "verify-todomvc-semantic",
@@ -44,6 +49,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "bench-todomvc",
     "explain-todomvc-hardware",
     "verify-cells-headed-ply",
+    "verify-cells-headed-focusless",
     "verify-cells-human",
     "prepare-cells-human-report",
     "verify-cells-semantic",
@@ -74,6 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-semantic" => verify_named(&args, VerificationLayer::Semantic),
         "verify-example-ply-headless" => verify_named(&args, VerificationLayer::HeadlessPly),
         "verify-example-headed-ply" => verify_named(&args, VerificationLayer::HeadedPly),
+        "verify-example-headed-focusless" => verify_headed_focusless(named_arg(&args, 1)?, &args),
         "verify-example-human" => verify_human(named_arg(&args, 1)?, &args),
         "prepare-example-human-report" => prepare_human_report(named_arg(&args, 1)?, &args),
         "verify-example-speed" => verify_named(&args, VerificationLayer::Speed),
@@ -84,6 +91,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-foundation" => verify_foundation(&args),
         "verify-playground-launch" => verify_playground_launch(&args),
         "verify-playground-background-launch" => verify_playground_background_launch(&args),
+        "verify-todomvc-reference-parity" => verify_todomvc_reference_parity(&args),
+        "verify-playground-genericity" => verify_playground_genericity(&args),
         "verify-playground-custom-source" => verify_playground_custom_source(&args),
         "write-manual-handoff" => write_manual_handoff(&args),
         "verify-report-schema" => verify_reports_schema(),
@@ -96,6 +105,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-todomvc-headed-ply" => {
             verify_specific("todomvc", VerificationLayer::HeadedPly, &args)
         }
+        "verify-todomvc-headed-focusless" => verify_headed_focusless("todomvc", &args),
         "verify-todomvc-human" => verify_human("todomvc", &args),
         "prepare-todomvc-human-report" => prepare_human_report("todomvc", &args),
         "verify-todomvc-speed" => verify_specific("todomvc", VerificationLayer::Speed, &args),
@@ -108,6 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verify_specific("cells", VerificationLayer::HeadlessPly, &args)
         }
         "verify-cells-headed-ply" => verify_specific("cells", VerificationLayer::HeadedPly, &args),
+        "verify-cells-headed-focusless" => verify_headed_focusless("cells", &args),
         "verify-cells-human" => verify_human("cells", &args),
         "prepare-cells-human-report" => prepare_human_report("cells", &args),
         "verify-cells-speed" => verify_specific("cells", VerificationLayer::Speed, &args),
@@ -184,6 +195,125 @@ fn verify_specific(
         verify_budget_passed(&output.report)?;
     }
     verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn verify_headed_focusless(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let _headed_lock = HeadedVerifierLock::acquire()?;
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from(format!("target/reports/{name}-headed-focusless.json")));
+    let screenshot = report.with_extension("png");
+    let timeout = headed_verifier_timeout();
+    let mut build = Command::new("cargo");
+    build.args(["build", "-p", "boon_ply_playground"]);
+    let build_status = run_command_with_timeout(&mut build, timeout)?;
+    if !build_status.success() {
+        return Err("failed to build boon_ply_playground for focus-free headed verifier".into());
+    }
+    let _ = std::fs::remove_file(&report);
+    let _ = std::fs::remove_file(&screenshot);
+    let launched_after = SystemTime::now();
+    let output = Command::new("cosmic-background-launch")
+        .args([
+            "--workspace",
+            "boon-circuit",
+            "--",
+            "./target/debug/boon_ply_playground",
+            "--verify-headed-focusless",
+            "--example",
+            name,
+            "--report",
+            report
+                .to_str()
+                .ok_or("focus-free report path is not utf-8")?,
+        ])
+        .env("BOON_FORBID_OS_INPUT", "1")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cosmic background launch failed for focus-free {name}: {}",
+            text_tail(&String::from_utf8_lossy(&output.stderr), 1200)
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let mut stdout_parts = stdout.split_whitespace();
+    let launched_pid = stdout_parts
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .ok_or_else(|| {
+            format!("focus-free background launch for {name} did not print a child pid: `{stdout}`")
+        })?;
+    let launch_id = stdout_parts.next().ok_or_else(|| {
+        format!("focus-free background launch for {name} did not print a launch id: `{stdout}`")
+    })?;
+    if !launch_id.starts_with("background-launch-") {
+        return Err(format!(
+            "focus-free background launch for {name} printed unexpected launch id `{launch_id}`"
+        )
+        .into());
+    }
+    wait_for_fresh_report(&report, launched_after, timeout)?;
+    wait_for_pid_exit(launched_pid, Duration::from_secs(30))?;
+    verify_report_schema(&report)?;
+    let child_report = read_json(&report)?;
+    let checks = [
+        (
+            "status pass",
+            child_report
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass"),
+        ),
+        (
+            "window mode headed-focusless",
+            child_report
+                .get("window_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("headed-focusless"),
+        ),
+        (
+            "input backend focus-free",
+            child_report
+                .get("input_backend")
+                .and_then(serde_json::Value::as_str)
+                == Some("ply-synthetic-focus-free"),
+        ),
+        (
+            "no os input used",
+            child_report
+                .get("os_keyboard_or_pointer_used")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false),
+        ),
+        (
+            "os tools empty",
+            child_report
+                .get("os_input_tools_used")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+        ),
+        (
+            "native display pass",
+            child_report
+                .get("native_display_contract")
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("pass"),
+        ),
+    ];
+    let failed = checks
+        .into_iter()
+        .filter_map(|(label, pass)| (!pass).then_some(label))
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        return Err(format!(
+            "focus-free headed verifier report `{}` failed checks: {}",
+            report.display(),
+            failed.join(", ")
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1313,6 +1443,1357 @@ fn verify_playground_background_launch(args: &[String]) -> Result<(), Box<dyn st
     write_json(&aggregate_path, &aggregate)?;
     verify_report_schema(&aggregate_path)?;
     Ok(())
+}
+
+fn verify_todomvc_reference_parity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/todomvc-reference-parity.json"));
+    let reference_path = value_arg(args, "--reference")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png")
+        });
+    let capture_report = report_path.with_file_name("todomvc-reference-parity-smoke.json");
+    let capture_png = report_path.with_extension("png");
+    let smoke_png = capture_report.with_extension("png");
+
+    if !args.iter().any(|arg| arg == "--use-existing-capture") {
+        let mut command = Command::new("cargo");
+        command.args([
+            "run",
+            "-p",
+            "boon_ply_playground",
+            "--",
+            "--smoke-launch",
+            "--example",
+            "todomvc",
+            "--frames",
+            "4",
+            "--report",
+            capture_report
+                .to_str()
+                .ok_or("capture report path is not utf-8")?,
+        ]);
+        let status = run_command_with_timeout(&mut command, Duration::from_secs(90))?;
+        if !status.success() {
+            return Err("TodoMVC reference capture smoke launch failed".into());
+        }
+    }
+    verify_report_schema(&capture_report)?;
+    if !smoke_png.exists() {
+        return Err(format!("missing smoke screenshot `{}`", smoke_png.display()).into());
+    }
+    if let Some(parent) = capture_png.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&smoke_png, &capture_png)?;
+
+    let reference = image::open(&reference_path)?.to_rgba8();
+    let native = image::open(&capture_png)?.to_rgba8();
+    let (native_for_analysis, native_analysis_region) = isolate_boon_playground_window(&native)
+        .unwrap_or_else(|| {
+            (
+                native.clone(),
+                ImageRect {
+                    x: 0,
+                    y: 0,
+                    width: native.width(),
+                    height: native.height(),
+                },
+            )
+        });
+    let reference_analysis = analyze_todomvc_image(&reference, "reference")?;
+    let native_analysis = analyze_todomvc_image(&native_for_analysis, "boon")?;
+
+    let reference_crop = crop_image(&reference, reference_analysis.crop);
+    let native_crop = crop_image(&native_for_analysis, native_analysis.crop);
+    let scale = reference_analysis.panel.width as f32 / native_analysis.panel.width.max(1) as f32;
+    let scaled_native_width = ((native_crop.width() as f32 * scale).round() as u32).max(1);
+    let scaled_native_height = ((native_crop.height() as f32 * scale).round() as u32).max(1);
+    let scaled_native = image::imageops::resize(
+        &native_crop,
+        scaled_native_width,
+        scaled_native_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let native_normalized = fit_to_canvas(
+        &scaled_native,
+        reference_crop.width(),
+        reference_crop.height(),
+        background_color(
+            &reference,
+            reference_analysis.title.center_x(),
+            reference.height().saturating_sub(2),
+        ),
+    );
+
+    let reference_crop_path =
+        report_path.with_file_name("todomvc-reference-parity-reference-crop.png");
+    let native_crop_path = report_path.with_file_name("todomvc-reference-parity-boon-crop.png");
+    let heatmap_path = report_path.with_file_name("todomvc-reference-parity-heatmap.png");
+    reference_crop.save(&reference_crop_path)?;
+    native_normalized.save(&native_crop_path)?;
+
+    let reference_diff = image::imageops::blur(&reference_crop, 10.0);
+    let native_diff = image::imageops::blur(&native_normalized, 10.0);
+    let diff = diff_images(&reference_diff, &native_diff);
+    diff.heatmap.save(&heatmap_path)?;
+
+    let native_x_offset = reference_crop.width().saturating_sub(scaled_native_width) as f32 / 2.0;
+    let title_center_delta = distance(
+        reference_analysis
+            .title
+            .center_x()
+            .saturating_sub(reference_analysis.crop.x) as f32,
+        reference_analysis
+            .title
+            .center_y()
+            .saturating_sub(reference_analysis.crop.y) as f32,
+        native_analysis
+            .title
+            .center_x()
+            .saturating_sub(native_analysis.crop.x) as f32
+            * scale
+            + native_x_offset,
+        native_analysis
+            .title
+            .center_y()
+            .saturating_sub(native_analysis.crop.y) as f32
+            * scale,
+    );
+    let panel_width_delta =
+        (reference_analysis.panel.width as f32 - native_analysis.panel.width as f32 * scale).abs();
+    let row_height_delta = (reference_analysis.row_height_px as f32
+        - native_analysis.row_height_px as f32 * scale)
+        .abs();
+    let input_height_delta = (reference_analysis.input_height_px as f32
+        - native_analysis.input_height_px as f32 * scale)
+        .abs();
+    let footer_height_delta = (reference_analysis.footer_height_px as f32
+        - native_analysis.footer_height_px as f32 * scale)
+        .abs();
+
+    let checks = vec![
+        json!({"id": "title-center", "pass": title_center_delta <= 8.0, "actual": title_center_delta, "threshold": 8.0}),
+        json!({"id": "panel-width", "pass": panel_width_delta <= 8.0, "actual": panel_width_delta, "threshold": 8.0}),
+        json!({"id": "row-height", "pass": row_height_delta <= 6.0, "actual": row_height_delta, "threshold": 6.0}),
+        json!({"id": "input-height", "pass": input_height_delta <= 6.0, "actual": input_height_delta, "threshold": 6.0}),
+        json!({"id": "footer-height", "pass": footer_height_delta <= 6.0, "actual": footer_height_delta, "threshold": 6.0}),
+        json!({"id": "mean-pixel-error", "pass": diff.mean_abs_rgba_255 <= 8.0, "actual": diff.mean_abs_rgba_255, "threshold": 8.0}),
+        json!({"id": "p95-pixel-error", "pass": diff.p95_abs_rgba_255 <= 32.0, "actual": diff.p95_abs_rgba_255, "threshold": 32.0}),
+        json!({"id": "connected-mismatch-region", "pass": diff.largest_connected_mismatch_ratio <= 0.02, "actual": diff.largest_connected_mismatch_ratio, "threshold": 0.02}),
+    ];
+    let blockers = checks
+        .iter()
+        .filter(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+        .map(|check| {
+            format!(
+                "{} failed: actual={:?} threshold={:?}",
+                check
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                check.get("actual"),
+                check.get("threshold")
+            )
+        })
+        .collect::<Vec<_>>();
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let (source, scenario, budget) = example_paths("todomvc")?;
+    let artifacts = [
+        capture_report.clone(),
+        capture_png.clone(),
+        reference_crop_path.clone(),
+        native_crop_path.clone(),
+        heatmap_path.clone(),
+    ];
+    let report = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-todomvc-reference-parity",
+        "command_argv": args,
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source.display().to_string(),
+        "source_hash": boon_runtime::sha256_file(&source)?,
+        "scenario_path": scenario.display().to_string(),
+        "scenario_hash": boon_runtime::sha256_file(&scenario)?,
+        "program_hash": boon_runtime::sha256_file(&source)?,
+        "budget_hash": boon_runtime::sha256_file(&budget)?,
+        "graph_node_count": "see smoke report",
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifacts.iter().map(|path| json!({
+            "path": path.display().to_string(),
+            "sha256": boon_runtime::sha256_file(path).unwrap_or_else(|_| "missing".to_owned())
+        })).collect::<Vec<_>>(),
+        "reference_image": reference_path.display().to_string(),
+        "native_capture": capture_png.display().to_string(),
+        "native_analysis_region": native_analysis_region.to_json(),
+        "normalized_reference_crop": reference_crop_path.display().to_string(),
+        "normalized_boon_crop": native_crop_path.display().to_string(),
+        "heatmap_diff": heatmap_path.display().to_string(),
+        "visual_algorithm": {
+            "crop": "red title anchor plus local-background content mask",
+            "scale_basis": "main panel width",
+            "diff": "mean/p95 absolute RGBA channel error and largest 4-connected mismatch region after deterministic 10px antialiasing blur"
+        },
+        "metrics": {
+            "title_center_delta_px": title_center_delta,
+            "main_panel_width_delta_px": panel_width_delta,
+            "row_height_delta_px": row_height_delta,
+            "input_height_delta_px": input_height_delta,
+            "footer_height_delta_px": footer_height_delta,
+            "mean_abs_rgba_error_255": diff.mean_abs_rgba_255,
+            "p95_abs_rgba_error_255": diff.p95_abs_rgba_255,
+            "largest_connected_mismatch_region_px": diff.largest_connected_mismatch_region_px,
+            "largest_connected_mismatch_region_ratio": diff.largest_connected_mismatch_ratio
+        },
+        "reference_boxes": reference_analysis.to_json(),
+        "boon_boxes": native_analysis.to_json(),
+        "blockers": blockers
+    });
+    write_json(&report_path, &report)?;
+    if blockers.is_empty() {
+        verify_report_schema(&report_path)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "TodoMVC reference parity failed; report written to `{}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
+fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/playground-genericity.json"));
+    let source_path = PathBuf::from("crates/boon_ply_playground/src/lib.rs");
+    let source = std::fs::read_to_string(&source_path)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+
+    let forbidden_whole_file = [
+        "TodoMvcView",
+        "CellsView",
+        "todomvc_content",
+        "cells_content",
+        "render_todomvc",
+        "render_cells",
+        "todo_mvc_widget",
+        "cells_widget",
+    ];
+    for token in forbidden_whole_file {
+        let findings = find_token_lines(&source, token);
+        push_genericity_check(
+            &mut checks,
+            &mut blockers,
+            format!("whole-file-forbidden-token:{token}"),
+            findings.is_empty(),
+            json!({"token": token, "findings": findings}),
+        );
+    }
+
+    let render_slice = source_slice(&source, "fn render_nodes", "fn delta_panel", 0)
+        .ok_or("could not isolate generic render/parser slice")?;
+    let render_forbidden = [
+        "todomvc",
+        "todo_mvc",
+        "todos",
+        "What needs to be done?",
+        "Clear completed",
+        "todo_row",
+        "selected_filter",
+        "cells",
+        "cell_row",
+    ];
+    for token in render_forbidden {
+        let findings = find_token_lines(render_slice.text, token);
+        push_genericity_check(
+            &mut checks,
+            &mut blockers,
+            format!("render-slice-forbidden-token:{token}"),
+            findings.is_empty(),
+            json!({
+                "token": token,
+                "slice_start_line": render_slice.start_line,
+                "slice_end_line": render_slice.end_line,
+                "findings": findings.into_iter().map(|line| line + render_slice.start_line - 1).collect::<Vec<_>>()
+            }),
+        );
+    }
+
+    let enum_slice = source_slice(
+        &source,
+        "enum RenderNode",
+        "pub async fn run_app_from_args",
+        0,
+    )
+    .ok_or("could not isolate RenderNode IR slice")?;
+    for token in render_forbidden {
+        let findings = find_token_lines(enum_slice.text, token);
+        push_genericity_check(
+            &mut checks,
+            &mut blockers,
+            format!("render-ir-forbidden-token:{token}"),
+            findings.is_empty(),
+            json!({
+                "token": token,
+                "slice_start_line": enum_slice.start_line,
+                "slice_end_line": enum_slice.end_line,
+                "findings": findings.into_iter().map(|line| line + enum_slice.start_line - 1).collect::<Vec<_>>()
+            }),
+        );
+    }
+
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let report = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-playground-genericity",
+        "command_argv": args,
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source_path.display().to_string(),
+        "source_hash": boon_runtime::sha256_file(&source_path)?,
+        "scenario_path": "n/a",
+        "scenario_hash": "n/a",
+        "program_hash": boon_runtime::sha256_file(&source_path)?,
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": [{
+            "path": source_path.display().to_string(),
+            "sha256": boon_runtime::sha256_file(&source_path)?
+        }],
+        "allowed_example_specific_locations": [
+            "examples/*.bn",
+            "scenario files",
+            "report/test names",
+            "docs"
+        ],
+        "scanned_slices": [
+            {"path": source_path.display().to_string(), "start": "fn render_nodes", "end": "fn delta_panel"},
+            {"path": source_path.display().to_string(), "start": "enum RenderNode", "end": "pub async fn run_app_from_args"}
+        ],
+        "blockers": blockers
+    });
+    write_json(&report_path, &report)?;
+    if blockers.is_empty() {
+        verify_report_schema(&report_path)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "playground genericity failed; report written to `{}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImageRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl ImageRect {
+    fn right(self) -> u32 {
+        self.x.saturating_add(self.width)
+    }
+
+    fn bottom(self) -> u32 {
+        self.y.saturating_add(self.height)
+    }
+
+    fn center_x(self) -> u32 {
+        self.x.saturating_add(self.width / 2)
+    }
+
+    fn center_y(self) -> u32 {
+        self.y.saturating_add(self.height / 2)
+    }
+
+    fn expand(self, image_width: u32, image_height: u32, padding: u32) -> Self {
+        let x = self.x.saturating_sub(padding);
+        let y = self.y.saturating_sub(padding);
+        let right = self.right().saturating_add(padding).min(image_width);
+        let bottom = self.bottom().saturating_add(padding).min(image_height);
+        Self {
+            x,
+            y,
+            width: right.saturating_sub(x).max(1),
+            height: bottom.saturating_sub(y).max(1),
+        }
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        json!({
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "center": [self.center_x(), self.center_y()]
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TodoMvcImageAnalysis {
+    crop: ImageRect,
+    title: ImageRect,
+    panel: ImageRect,
+    input_height_px: u32,
+    row_height_px: u32,
+    footer_height_px: u32,
+    separator_rows: Vec<u32>,
+    checkbox_centers: Vec<(u32, u32)>,
+}
+
+impl TodoMvcImageAnalysis {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "crop": self.crop.to_json(),
+            "title": self.title.to_json(),
+            "panel": self.panel.to_json(),
+            "input_height_px": self.input_height_px,
+            "row_height_px": self.row_height_px,
+            "footer_height_px": self.footer_height_px,
+            "separator_rows": self.separator_rows,
+            "checkbox_centers": self.checkbox_centers.iter().map(|(x, y)| json!([x, y])).collect::<Vec<_>>()
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ImageDiff {
+    mean_abs_rgba_255: f64,
+    p95_abs_rgba_255: f64,
+    largest_connected_mismatch_region_px: usize,
+    largest_connected_mismatch_ratio: f64,
+    heatmap: RgbaImage,
+}
+
+#[derive(Clone, Copy)]
+struct SourceSlice<'a> {
+    text: &'a str,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn analyze_todomvc_image(
+    image: &RgbaImage,
+    label: &str,
+) -> Result<TodoMvcImageAnalysis, Box<dyn std::error::Error>> {
+    let title = find_red_title(image)
+        .ok_or_else(|| format!("could not find red TodoMVC title in {label} image"))?;
+    let half_width = ((title.width as f32 * 1.65).round() as u32).max(320);
+    let candidate = ImageRect {
+        x: title.center_x().saturating_sub(half_width),
+        y: title.y.saturating_sub(35),
+        width: half_width.saturating_mul(2).min(image.width()),
+        height: image.height().saturating_sub(title.y.saturating_sub(35)),
+    };
+    let candidate = ImageRect {
+        width: candidate
+            .width
+            .min(image.width().saturating_sub(candidate.x))
+            .max(1),
+        height: candidate
+            .height
+            .min(image.height().saturating_sub(candidate.y))
+            .max(1),
+        ..candidate
+    };
+    let background = background_color(image, title.center_x(), title.y.saturating_sub(8));
+    let content_mask = content_bbox(image, candidate, background, 8)
+        .ok_or_else(|| format!("could not find TodoMVC content bbox in {label} image"))?
+        .expand(image.width(), image.height(), 8);
+    let panel = panel_bbox(image, content_mask, background)
+        .ok_or_else(|| format!("could not find TodoMVC panel bbox in {label} image"))?;
+    let horizontal_margin = (panel.width / 62).max(4);
+    let vertical_margin = (title.height / 14).max(4);
+    let crop_y = title.y.saturating_sub(vertical_margin);
+    let crop_x = panel.x.saturating_sub(horizontal_margin);
+    let crop_right = panel
+        .right()
+        .saturating_add(horizontal_margin)
+        .min(image.width());
+    let crop_bottom = content_bottom_in_band(
+        image,
+        crop_x,
+        crop_right,
+        crop_y,
+        candidate.bottom(),
+        background,
+        8,
+        panel.bottom(),
+    )
+    .unwrap_or_else(|| content_mask.bottom())
+    .min(image.height())
+    .max(panel.bottom());
+    let content = ImageRect {
+        x: crop_x,
+        y: crop_y,
+        width: crop_right.saturating_sub(crop_x).max(1),
+        height: crop_bottom.saturating_sub(crop_y).max(1),
+    };
+    let separators = separator_rows(image, panel);
+    let checkbox_centers = checkbox_centers(image, panel);
+    let checkbox_row_height = checkbox_centers
+        .windows(2)
+        .map(|pair| pair[1].1.saturating_sub(pair[0].1))
+        .filter(|height| *height > 20)
+        .collect::<Vec<_>>();
+    let separator_input_height = separators
+        .get(1)
+        .zip(separators.first())
+        .map(|(second, first)| second.saturating_sub(*first))
+        .unwrap_or_else(|| (panel.height as f32 * 0.18).round() as u32);
+    let separator_footer_height = separators
+        .last()
+        .zip(separators.iter().rev().nth(1))
+        .map(|(last, previous)| last.saturating_sub(*previous))
+        .unwrap_or_else(|| (panel.height as f32 * 0.1).round() as u32);
+    let row_deltas = separators
+        .windows(2)
+        .skip(1)
+        .take(separators.len().saturating_sub(3))
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .filter(|height| *height > 20)
+        .collect::<Vec<_>>();
+    let row_height = median_u32(&checkbox_row_height)
+        .or_else(|| median_u32(&row_deltas))
+        .unwrap_or_else(|| {
+            (panel
+                .height
+                .saturating_sub(separator_input_height + separator_footer_height)
+                / 3)
+            .max(1)
+        });
+    let input_height = checkbox_centers
+        .first()
+        .map(|(_, y)| y.saturating_sub(panel.y).saturating_sub(row_height / 2))
+        .unwrap_or(separator_input_height);
+    let footer_height = checkbox_centers
+        .last()
+        .map(|(_, y)| {
+            content
+                .bottom()
+                .saturating_sub(*y)
+                .saturating_sub(row_height / 2)
+        })
+        .unwrap_or(separator_footer_height);
+    Ok(TodoMvcImageAnalysis {
+        crop: content,
+        title,
+        panel,
+        input_height_px: input_height,
+        row_height_px: row_height,
+        footer_height_px: footer_height,
+        separator_rows: separators,
+        checkbox_centers,
+    })
+}
+
+fn isolate_boon_playground_window(image: &RgbaImage) -> Option<(RgbaImage, ImageRect)> {
+    let sidebar = find_boon_sidebar_rect(image)?;
+    let x = sidebar.x.saturating_sub(8);
+    let y = sidebar.y.saturating_sub(48);
+    let right = image.width();
+    let bottom = sidebar
+        .bottom()
+        .saturating_add(24)
+        .min(image.height())
+        .max(y.saturating_add(1));
+    let region = ImageRect {
+        x,
+        y,
+        width: right.saturating_sub(x).max(1),
+        height: bottom.saturating_sub(y).max(1),
+    };
+    Some((crop_image(image, region), region))
+}
+
+fn find_boon_sidebar_rect(image: &RgbaImage) -> Option<ImageRect> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut mask = vec![false; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let [r, g, b, a] = image.get_pixel(x as u32, y as u32).0;
+            if a > 180 && (24..=50).contains(&r) && (30..=62).contains(&g) && (40..=76).contains(&b)
+            {
+                mask[y * width + x] = true;
+            }
+        }
+    }
+    let mut seen = vec![false; mask.len()];
+    let mut best = None::<(ImageRect, usize)>;
+    for index in 0..mask.len() {
+        if !mask[index] || seen[index] {
+            continue;
+        }
+        let mut queue = VecDeque::from([index]);
+        seen[index] = true;
+        let mut bbox = ImageRectAccumulator::new();
+        let mut area = 0usize;
+        while let Some(current) = queue.pop_front() {
+            area += 1;
+            let x = current % width;
+            let y = current / width;
+            bbox.push(x as u32, y as u32);
+            let neighbors = [
+                x.checked_sub(1).map(|_| current - 1),
+                (x + 1 < width).then_some(current + 1),
+                y.checked_sub(1).map(|_| current - width),
+                (y + 1 < height).then_some(current + width),
+            ];
+            for neighbor in neighbors.into_iter().flatten() {
+                if mask[neighbor] && !seen[neighbor] {
+                    seen[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let rect = bbox.finish()?;
+        let sidebar_like =
+            area > 12_000 && rect.width >= 120 && rect.width <= 360 && rect.height >= 300;
+        if sidebar_like && best.as_ref().is_none_or(|(_, best_area)| area > *best_area) {
+            best = Some((rect, area));
+        }
+    }
+    best.map(|(rect, _)| rect)
+}
+
+fn find_red_title(image: &RgbaImage) -> Option<ImageRect> {
+    let scan_width = image.width();
+    let scan_height = (image.height() / 3).max(1);
+    let mut row_counts = vec![0u32; scan_height as usize];
+    for y in 0..scan_height {
+        for x in 0..scan_width {
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            if !(a > 180 && r > 145 && g < 100 && b < 115 && r.saturating_sub(g) > 45) {
+                continue;
+            }
+            row_counts[y as usize] += 1;
+        }
+    }
+    let mut groups = Vec::<(u32, u32, u32)>::new();
+    let mut start = None;
+    let mut total = 0u32;
+    for (index, count) in row_counts.iter().copied().enumerate() {
+        if count > 5 {
+            if start.is_none() {
+                start = Some(index as u32);
+                total = 0;
+            }
+            total += count;
+        } else if let Some(start_y) = start.take() {
+            groups.push((start_y, index as u32, total));
+        }
+    }
+    if let Some(start_y) = start {
+        groups.push((start_y, scan_height, total));
+    }
+    let mut title_candidates = Vec::new();
+    for (start_y, end_y, _) in groups.iter().copied() {
+        if end_y.saturating_sub(start_y) <= 20 {
+            continue;
+        }
+        let group_height = end_y.saturating_sub(start_y).max(1);
+        let mut column_counts = vec![0u32; scan_width as usize];
+        for y in start_y..end_y {
+            for x in 0..scan_width {
+                let [r, g, b, a] = image.get_pixel(x, y).0;
+                if a > 180 && r > 145 && g < 100 && b < 115 && r.saturating_sub(g) > 45 {
+                    column_counts[x as usize] += 1;
+                }
+            }
+        }
+        let max_gap = (group_height / 2).max(18);
+        let mut x_groups = Vec::new();
+        let mut start_x = None;
+        let mut last_active_x = 0u32;
+        let mut gap = 0u32;
+        for x in 0..scan_width {
+            if column_counts[x as usize] > 0 {
+                if start_x.is_none() {
+                    start_x = Some(x);
+                }
+                last_active_x = x;
+                gap = 0;
+            } else if let Some(start) = start_x {
+                gap += 1;
+                if gap > max_gap {
+                    x_groups.push((start, last_active_x.saturating_add(1)));
+                    start_x = None;
+                    gap = 0;
+                }
+            }
+        }
+        if let Some(start) = start_x {
+            x_groups.push((start, last_active_x.saturating_add(1)));
+        }
+
+        for (start_x, end_x) in x_groups {
+            let mut bbox: Option<ImageRectAccumulator> = None;
+            let mut candidate_total = 0u32;
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    let [r, g, b, a] = image.get_pixel(x, y).0;
+                    if a > 180 && r > 145 && g < 100 && b < 115 && r.saturating_sub(g) > 45 {
+                        candidate_total += 1;
+                        bbox.get_or_insert_with(ImageRectAccumulator::new)
+                            .push(x, y);
+                    }
+                }
+            }
+            let Some(rect) = bbox.and_then(ImageRectAccumulator::finish) else {
+                continue;
+            };
+            let aspect = rect.width as f32 / rect.height.max(1) as f32;
+            let title_like = rect.width >= 80
+                && rect.width <= 760
+                && rect.height >= 20
+                && rect.height <= 170
+                && (1.2..=8.0).contains(&aspect)
+                && has_light_title_background_below(image, rect);
+            if title_like {
+                if let Some(score) = score_todomvc_title_candidate(image, rect) {
+                    title_candidates.push((rect, score.max(candidate_total)));
+                }
+            }
+        }
+    }
+    if let Some((rect, _)) = title_candidates
+        .into_iter()
+        .max_by_key(|(rect, total)| (*total, rect.width.saturating_mul(rect.height)))
+    {
+        return Some(rect);
+    }
+    let (start_y, end_y, _) = groups
+        .into_iter()
+        .filter(|(start_y, end_y, _)| end_y.saturating_sub(*start_y) > 20)
+        .max_by_key(|(_, _, total)| *total)?;
+    let mut bbox: Option<ImageRectAccumulator> = None;
+    for y in start_y..end_y {
+        for x in 0..scan_width {
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            if a > 180 && r > 145 && g < 100 && b < 115 && r.saturating_sub(g) > 45 {
+                bbox.get_or_insert_with(ImageRectAccumulator::new)
+                    .push(x, y);
+            }
+        }
+    }
+    bbox.and_then(ImageRectAccumulator::finish).filter(|rect| {
+        let aspect = rect.width as f32 / rect.height.max(1) as f32;
+        rect.width >= 80
+            && rect.width <= 760
+            && rect.height >= 20
+            && rect.height <= 170
+            && (1.2..=8.0).contains(&aspect)
+            && has_light_title_background_below(image, *rect)
+    })
+}
+
+fn has_light_title_background_below(image: &RgbaImage, rect: ImageRect) -> bool {
+    let x = rect.center_x().min(image.width().saturating_sub(1));
+    let y_offsets = [
+        rect.height / 2,
+        rect.height,
+        rect.height.saturating_mul(3) / 2,
+    ];
+    y_offsets.into_iter().any(|offset| {
+        let y = rect
+            .bottom()
+            .saturating_add(offset.max(12))
+            .min(image.height().saturating_sub(1));
+        let [r, g, b, a] = image.get_pixel(x, y).0;
+        a > 180 && r > 225 && g > 225 && b > 225 && max_channel_delta(r, g, b) < 30
+    })
+}
+
+fn score_todomvc_title_candidate(image: &RgbaImage, title: ImageRect) -> Option<u32> {
+    let half_width = ((title.width as f32 * 1.65).round() as u32).max(320);
+    let candidate = ImageRect {
+        x: title.center_x().saturating_sub(half_width),
+        y: title.y.saturating_sub(35),
+        width: half_width.saturating_mul(2).min(image.width()),
+        height: image.height().saturating_sub(title.y.saturating_sub(35)),
+    };
+    let candidate = ImageRect {
+        width: candidate
+            .width
+            .min(image.width().saturating_sub(candidate.x))
+            .max(1),
+        height: candidate
+            .height
+            .min(image.height().saturating_sub(candidate.y))
+            .max(1),
+        ..candidate
+    };
+    let background = background_color(image, title.center_x(), title.y.saturating_sub(8));
+    let content =
+        content_bbox(image, candidate, background, 8)?.expand(image.width(), image.height(), 8);
+    let panel = panel_bbox(image, content, background)?;
+    let checkbox_count = checkbox_centers(image, panel).len() as u32;
+    let panel_title_ratio = panel.width as f32 / title.width.max(1) as f32;
+    if !(1.5..=8.0).contains(&panel_title_ratio) {
+        return None;
+    }
+    Some(
+        1_000_000u32
+            .saturating_add(checkbox_count.saturating_mul(100_000))
+            .saturating_add(panel.width.min(10_000)),
+    )
+}
+
+fn content_bbox(
+    image: &RgbaImage,
+    area: ImageRect,
+    background: Rgba<u8>,
+    threshold: u16,
+) -> Option<ImageRect> {
+    let mut row_counts = vec![0u32; area.height as usize];
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let pixel = *image.get_pixel(x, y);
+            if pixel.0[3] > 0 && color_distance(pixel, background) > threshold {
+                row_counts[(y - area.y) as usize] += 1;
+            }
+        }
+    }
+    let mut groups = Vec::<(u32, u32, u32)>::new();
+    let mut group_start = None;
+    let mut group_total = 0u32;
+    for (offset, count) in row_counts.iter().copied().enumerate() {
+        let y = area.y + offset as u32;
+        if count > 5 {
+            if group_start.is_none() {
+                group_start = Some(y);
+                group_total = 0;
+            }
+            group_total += count;
+        } else if let Some(start_y) = group_start.take() {
+            groups.push((start_y, y.saturating_sub(1), group_total));
+        }
+    }
+    if let Some(start_y) = group_start {
+        groups.push((start_y, area.bottom().saturating_sub(1), group_total));
+    }
+    if groups.len() > 1
+        && let Some((start_y, end_y, total)) = groups.last().copied()
+    {
+        let height = end_y.saturating_sub(start_y).saturating_add(1).max(1);
+        let average_width = total / height;
+        if start_y > area.y.saturating_add(area.height / 2) && average_width > area.width * 65 / 100
+        {
+            groups.pop();
+        }
+    }
+    let first_active = groups.first()?.0;
+    let mut selected_end = groups.first()?.1;
+    for pair in groups.windows(2) {
+        let previous = pair[0];
+        let next = pair[1];
+        if next.0.saturating_sub(previous.1) > 145 && next.0.saturating_sub(first_active) > 240 {
+            break;
+        }
+        selected_end = next.1;
+    }
+    let mut bbox: Option<ImageRectAccumulator> = None;
+    for y in first_active..=selected_end {
+        for x in area.x..area.right() {
+            let pixel = *image.get_pixel(x, y);
+            if pixel.0[3] > 0 && color_distance(pixel, background) > threshold {
+                bbox.get_or_insert_with(ImageRectAccumulator::new)
+                    .push(x, y);
+            }
+        }
+    }
+    bbox.and_then(ImageRectAccumulator::finish)
+}
+
+fn content_bottom_in_band(
+    image: &RgbaImage,
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+    background: Rgba<u8>,
+    threshold: u16,
+    panel_bottom: u32,
+) -> Option<u32> {
+    let x_end = x_end.min(image.width());
+    let y_end = y_end.min(image.height());
+    if x_start >= x_end || y_start >= y_end {
+        return None;
+    }
+
+    let mut groups = Vec::<(u32, u32)>::new();
+    let mut group_start = None;
+    let band_width = x_end - x_start;
+    let row_activity_threshold = (band_width / 100).max(4);
+    let uniform_row_threshold = band_width * 9 / 10;
+    for y in y_start..y_end {
+        let mut active = 0u32;
+        for x in x_start..x_end {
+            let pixel = *image.get_pixel(x, y);
+            if pixel.0[3] > 0 && color_distance(pixel, background) > threshold {
+                active += 1;
+            }
+        }
+        if active > row_activity_threshold && active < uniform_row_threshold {
+            if group_start.is_none() {
+                group_start = Some(y);
+            }
+        } else if let Some(start) = group_start.take() {
+            groups.push((start, y.saturating_sub(1)));
+        }
+    }
+    if let Some(start) = group_start {
+        groups.push((start, y_end.saturating_sub(1)));
+    }
+
+    let first = groups.first().copied()?;
+    let mut selected_end = first.1;
+    for group in groups.into_iter().skip(1) {
+        let gap = group.0.saturating_sub(selected_end);
+        if gap > 150 && selected_end > panel_bottom {
+            break;
+        }
+        selected_end = group.1;
+    }
+    Some(selected_end.saturating_add(8).min(y_end))
+}
+
+fn panel_bbox(image: &RgbaImage, crop: ImageRect, background: Rgba<u8>) -> Option<ImageRect> {
+    let mut band_bbox: Option<ImageRectAccumulator> = None;
+    let mut sparse_bbox: Option<ImageRectAccumulator> = None;
+    let start_y = crop.y.saturating_add(crop.height / 5);
+    for y in start_y..crop.bottom() {
+        let mut row_pixels = Vec::new();
+        for x in crop.x..crop.right() {
+            let pixel = *image.get_pixel(x, y);
+            let [r, g, b, a] = pixel.0;
+            let light_panel =
+                a > 200 && r > 248 && g > 248 && b > 248 && color_distance(pixel, background) > 3;
+            let border = a > 200 && r > 215 && g > 190 && b > 190 && r > b;
+            if light_panel || border {
+                row_pixels.push(x);
+            }
+        }
+        if !row_pixels.is_empty() {
+            let sparse_bbox = sparse_bbox.get_or_insert_with(ImageRectAccumulator::new);
+            for x in row_pixels.iter().copied() {
+                sparse_bbox.push(x, y);
+            }
+        }
+        if row_pixels.len() as u32 > (crop.width / 25).max(20) {
+            let bbox = band_bbox.get_or_insert_with(ImageRectAccumulator::new);
+            for x in row_pixels {
+                bbox.push(x, y);
+            }
+        }
+    }
+    band_bbox
+        .or(sparse_bbox)
+        .and_then(ImageRectAccumulator::finish)
+        .map(|rect| rect.expand(image.width(), image.height(), 1))
+}
+
+fn separator_rows(image: &RgbaImage, panel: ImageRect) -> Vec<u32> {
+    let mut rows = Vec::new();
+    let width = panel.width.max(1);
+    for y in panel.y..panel.bottom() {
+        let mut line_pixels = 0u32;
+        for x in panel.x..panel.right() {
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            let pale_separator =
+                a > 150 && r >= 215 && g >= 215 && b >= 215 && (r < 249 || g < 249 || b < 249);
+            let pink_panel_edge =
+                a > 150 && r >= 220 && (185..=240).contains(&g) && (185..=240).contains(&b);
+            if pale_separator || pink_panel_edge {
+                line_pixels += 1;
+            }
+        }
+        if line_pixels > width * 55 / 100 {
+            rows.push(y);
+        }
+    }
+    let mut grouped = Vec::new();
+    let mut current = Vec::new();
+    for row in rows {
+        if current.last().is_some_and(|last| row > *last + 2) && !current.is_empty() {
+            grouped.push(current[current.len() / 2]);
+            current.clear();
+        }
+        current.push(row);
+    }
+    if !current.is_empty() {
+        grouped.push(current[current.len() / 2]);
+    }
+    if grouped.first().is_none_or(|row| *row > panel.y + 3) {
+        grouped.insert(0, panel.y);
+    }
+    if grouped.last().is_none_or(|row| *row + 3 < panel.bottom()) {
+        grouped.push(panel.bottom());
+    }
+    grouped
+}
+
+fn checkbox_centers(image: &RgbaImage, panel: ImageRect) -> Vec<(u32, u32)> {
+    let x_start = panel.x;
+    let control_column_width = (panel.width / 8).max(80);
+    let x_end = panel
+        .x
+        .saturating_add(control_column_width)
+        .min(image.width());
+    let y_start = panel
+        .y
+        .saturating_add(panel.height / 24)
+        .min(image.height());
+    let y_end = panel.bottom().min(image.height());
+    let width = x_end.saturating_sub(x_start) as usize;
+    let height = y_end.saturating_sub(y_start) as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut mask = vec![false; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let [r, g, b, a] = image.get_pixel(x_start + x as u32, y_start + y as u32).0;
+            let grey_circle =
+                a > 80 && r < 235 && g < 235 && b < 235 && max_channel_delta(r, g, b) < 50;
+            let green_check = a > 180 && g > 120 && r < 120 && b > 90 && b < 180;
+            if grey_circle || green_check {
+                mask[y * width + x] = true;
+            }
+        }
+    }
+
+    let mut seen = vec![false; mask.len()];
+    let mut centers = Vec::new();
+    for index in 0..mask.len() {
+        if !mask[index] || seen[index] {
+            continue;
+        }
+        let mut queue = VecDeque::from([index]);
+        seen[index] = true;
+        let mut bbox = ImageRectAccumulator::new();
+        let mut area = 0usize;
+        while let Some(current) = queue.pop_front() {
+            area += 1;
+            let x = current % width;
+            let y = current / width;
+            bbox.push(x_start + x as u32, y_start + y as u32);
+            let mut neighbors = Vec::with_capacity(4);
+            if x > 0 {
+                neighbors.push(current - 1);
+            }
+            if x + 1 < width {
+                neighbors.push(current + 1);
+            }
+            if y > 0 {
+                neighbors.push(current - width);
+            }
+            if y + 1 < height {
+                neighbors.push(current + width);
+            }
+            for neighbor in neighbors {
+                if mask[neighbor] && !seen[neighbor] {
+                    seen[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        if let Some(rect) = bbox.finish() {
+            let aspect = rect.width as f32 / rect.height.max(1) as f32;
+            if area > 8
+                && (10..=100).contains(&rect.width)
+                && (10..=100).contains(&rect.height)
+                && (0.55..=1.55).contains(&aspect)
+            {
+                centers.push((rect.center_x(), rect.center_y()));
+            }
+        }
+    }
+    centers.sort_by_key(|(_, y)| *y);
+    let mut clustered = Vec::<(u32, u32)>::new();
+    let mut cluster = Vec::<(u32, u32)>::new();
+    for center in centers {
+        if cluster
+            .last()
+            .is_some_and(|(_, y)| center.1.abs_diff(*y) > 45)
+            && !cluster.is_empty()
+        {
+            clustered.push(average_center(&cluster));
+            cluster.clear();
+        }
+        cluster.push(center);
+    }
+    if !cluster.is_empty() {
+        clustered.push(average_center(&cluster));
+    }
+    let min_todo_row_y = panel.y.saturating_add((panel.height / 12).max(55));
+    clustered.retain(|(_, y)| *y >= min_todo_row_y);
+    if clustered.len() > 4 {
+        clustered.truncate(4);
+    }
+    while clustered.len() < 4 {
+        let Some(row_height) = median_u32(
+            &clustered
+                .windows(2)
+                .map(|pair| pair[1].1.saturating_sub(pair[0].1))
+                .filter(|height| *height > 20)
+                .collect::<Vec<_>>(),
+        ) else {
+            break;
+        };
+        let Some((last_x, last_y)) = clustered.last().copied() else {
+            break;
+        };
+        let next_y = last_y.saturating_add(row_height);
+        if next_y >= panel.bottom().saturating_sub(row_height / 2) {
+            break;
+        }
+        clustered.push((last_x, next_y));
+    }
+    clustered
+}
+
+fn average_center(centers: &[(u32, u32)]) -> (u32, u32) {
+    let len = centers.len().max(1) as u32;
+    let x = centers.iter().map(|(x, _)| *x).sum::<u32>() / len;
+    let y = centers.iter().map(|(_, y)| *y).sum::<u32>() / len;
+    (x, y)
+}
+
+fn max_channel_delta(r: u8, g: u8, b: u8) -> u8 {
+    r.max(g).max(b).saturating_sub(r.min(g).min(b))
+}
+
+fn background_color(image: &RgbaImage, x: u32, y: u32) -> Rgba<u8> {
+    *image.get_pixel(
+        x.min(image.width().saturating_sub(1)),
+        y.min(image.height().saturating_sub(1)),
+    )
+}
+
+fn color_distance(a: Rgba<u8>, b: Rgba<u8>) -> u16 {
+    a.0.iter()
+        .take(3)
+        .zip(b.0.iter().take(3))
+        .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs())
+        .sum::<u16>()
+        / 3
+}
+
+fn crop_image(image: &RgbaImage, rect: ImageRect) -> RgbaImage {
+    image::imageops::crop_imm(image, rect.x, rect.y, rect.width, rect.height).to_image()
+}
+
+fn fit_to_canvas(image: &RgbaImage, width: u32, height: u32, background: Rgba<u8>) -> RgbaImage {
+    let mut canvas = ImageBuffer::from_pixel(width, height, background);
+    let x_offset = width.saturating_sub(image.width()) / 2;
+    let y_offset = 0;
+    for y in 0..image.height().min(height) {
+        for x in 0..image.width().min(width) {
+            canvas.put_pixel(x + x_offset, y + y_offset, *image.get_pixel(x, y));
+        }
+    }
+    canvas
+}
+
+fn diff_images(reference: &RgbaImage, native: &RgbaImage) -> ImageDiff {
+    let width = reference.width().min(native.width());
+    let height = reference.height().min(native.height());
+    let mut heatmap = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 255]));
+    let mut total = 0f64;
+    let mut values = Vec::with_capacity((width * height) as usize);
+    let mut mismatch = vec![false; (width * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let a = reference.get_pixel(x, y).0;
+            let b = native.get_pixel(x, y).0;
+            let mut channel_sum = 0u16;
+            let mut channel_max = 0u8;
+            for index in 0..4 {
+                let delta = (a[index] as i16 - b[index] as i16).unsigned_abs() as u8;
+                channel_sum += delta as u16;
+                channel_max = channel_max.max(delta);
+            }
+            let value = channel_sum as f64 / 4.0;
+            total += value;
+            values.push(value);
+            if channel_max > 32 {
+                mismatch[(y * width + x) as usize] = true;
+            }
+            heatmap.put_pixel(x, y, Rgba([channel_max, 0, 0, 255]));
+        }
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let p95_index =
+        ((values.len() as f64 * 0.95).floor() as usize).min(values.len().saturating_sub(1));
+    let largest = largest_connected_region(&mismatch, width as usize, height as usize);
+    let area = (width as usize).saturating_mul(height as usize).max(1);
+    ImageDiff {
+        mean_abs_rgba_255: total / area as f64,
+        p95_abs_rgba_255: values.get(p95_index).copied().unwrap_or(0.0),
+        largest_connected_mismatch_region_px: largest,
+        largest_connected_mismatch_ratio: largest as f64 / area as f64,
+        heatmap,
+    }
+}
+
+fn largest_connected_region(mask: &[bool], width: usize, height: usize) -> usize {
+    let mut seen = vec![false; mask.len()];
+    let mut largest = 0usize;
+    for index in 0..mask.len() {
+        if !mask[index] || seen[index] {
+            continue;
+        }
+        let mut queue = VecDeque::from([index]);
+        seen[index] = true;
+        let mut size = 0usize;
+        while let Some(current) = queue.pop_front() {
+            size += 1;
+            let x = current % width;
+            let y = current / width;
+            let mut neighbors = Vec::with_capacity(4);
+            if x > 0 {
+                neighbors.push(current - 1);
+            }
+            if x + 1 < width {
+                neighbors.push(current + 1);
+            }
+            if y > 0 {
+                neighbors.push(current - width);
+            }
+            if y + 1 < height {
+                neighbors.push(current + width);
+            }
+            for neighbor in neighbors {
+                if mask[neighbor] && !seen[neighbor] {
+                    seen[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        largest = largest.max(size);
+    }
+    largest
+}
+
+fn median_u32(values: &[u32]) -> Option<u32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
+}
+
+fn distance(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+}
+
+#[derive(Debug)]
+struct ImageRectAccumulator {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+}
+
+impl ImageRectAccumulator {
+    fn new() -> Self {
+        Self {
+            min_x: u32::MAX,
+            min_y: u32::MAX,
+            max_x: 0,
+            max_y: 0,
+        }
+    }
+
+    fn push(&mut self, x: u32, y: u32) {
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+
+    fn finish(self) -> Option<ImageRect> {
+        (self.min_x <= self.max_x && self.min_y <= self.max_y).then_some(ImageRect {
+            x: self.min_x,
+            y: self.min_y,
+            width: self.max_x.saturating_sub(self.min_x).saturating_add(1),
+            height: self.max_y.saturating_sub(self.min_y).saturating_add(1),
+        })
+    }
+}
+
+fn find_token_lines(source: &str, token: &str) -> Vec<usize> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains(token).then_some(index + 1))
+        .collect()
+}
+
+fn source_slice<'a>(
+    source: &'a str,
+    start_marker: &str,
+    end_marker: &str,
+    end_extra_lines: usize,
+) -> Option<SourceSlice<'a>> {
+    let start_byte = source.find(start_marker)?;
+    let after_start = &source[start_byte..];
+    let end_relative = after_start.find(end_marker)?;
+    let end_marker_relative = end_relative + end_marker.len();
+    let mut end_byte = start_byte + end_marker_relative;
+    let mut remaining = end_extra_lines;
+    while remaining > 0 && end_byte < source.len() {
+        if source.as_bytes()[end_byte] == b'\n' {
+            remaining -= 1;
+        }
+        end_byte += 1;
+    }
+    let start_line = source[..start_byte].lines().count() + 1;
+    let end_line = source[..end_byte.min(source.len())].lines().count();
+    Some(SourceSlice {
+        text: &source[start_byte..end_byte.min(source.len())],
+        start_line,
+        end_line,
+    })
+}
+
+fn push_genericity_check(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: impl Into<String>,
+    pass: bool,
+    detail: serde_json::Value,
+) {
+    let id = id.into();
+    checks.push(json!({
+        "id": id,
+        "pass": pass,
+        "detail": detail
+    }));
+    if !pass {
+        blockers.push(format!("genericity check `{id}` failed"));
+    }
 }
 
 fn wait_for_fresh_report(
@@ -5420,6 +6901,8 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "verify-foundation",
         "verify-playground-launch",
         "verify-playground-background-launch",
+        "verify-todomvc-reference-parity",
+        "verify-playground-genericity",
         "bench-example",
         "verify-playground-custom-source",
         "write-manual-handoff",
@@ -5687,6 +7170,8 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-foundation"
             | "verify-playground-launch"
             | "verify-playground-background-launch"
+            | "verify-todomvc-reference-parity"
+            | "verify-playground-genericity"
             | "verify-playground-custom-source"
             | "write-manual-handoff"
             | "verify-report-schema"

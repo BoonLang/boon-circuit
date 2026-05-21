@@ -3,9 +3,10 @@ source = "examples/todomvc.bn"
 
 [[step]]
 id = "initial"
-expect_titles = ["Buy groceries", "Clean room"]
-expect_active_count = 2
-expect_completed_count = 0
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries"]
+expect_completed_titles = ["Finish TodoMVC renderer"]
+expect_active_count = 3
+expect_completed_count = 1
 expect_filter = "All"
 
 [[step]]
@@ -20,9 +21,9 @@ expect_render_delta_contains = ["SetInputValue"]
 id = "add-test-todo-submit"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
 expected_source_event = { source = "store.sources.new_todo_input.key_down", key = "Enter", text = "Test todo" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo"]
-expect_active_count = 3
-expect_completed_count = 0
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
+expect_active_count = 4
+expect_completed_count = 1
 expect_new_text = ""
 expect_semantic_delta_contains = ["ListInsert", "SourceBind", "FieldSet:store.new_todo_text"]
 expect_render_delta_contains = ["InsertElement", "BindSource", "SetInputValue"]
@@ -31,16 +32,16 @@ expect_render_delta_contains = ["InsertElement", "BindSource", "SetInputValue"]
 id = "reject-empty-todo"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "   " }
 expected_source_event = { source = "store.sources.new_todo_input.key_down", key = "Enter", text = "   " }
-expect_titles = ["Buy groceries", "Clean room", "Test todo"]
-expect_active_count = 3
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
+expect_active_count = 4
 
 [[step]]
 id = "toggle-all-complete"
 user_action = { kind = "click", target = "Toggle all" }
 expected_source_event = { source = "store.sources.toggle_all_checkbox.click" }
-expect_completed_titles = ["Buy groceries", "Clean room", "Test todo"]
+expect_completed_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
 expect_active_count = 0
-expect_completed_count = 3
+expect_completed_count = 5
 expect_semantic_delta_contains = ["FieldSet:completed"]
 expect_render_delta_contains = ["SetProperty"]
 
@@ -49,7 +50,7 @@ id = "toggle-all-active"
 user_action = { kind = "click", target = "Toggle all" }
 expected_source_event = { source = "store.sources.toggle_all_checkbox.click" }
 expect_completed_titles = []
-expect_active_count = 3
+expect_active_count = 5
 expect_completed_count = 0
 expect_semantic_delta_contains = ["FieldSet:completed"]
 expect_render_delta_contains = ["SetProperty"]
@@ -59,7 +60,7 @@ id = "toggle-buy-groceries"
 user_action = { kind = "click", target_text = "Buy groceries checkbox" }
 expected_source_event = { source = "todo.sources.todo_checkbox.click", target_text = "Buy groceries" }
 expect_completed_titles = ["Buy groceries"]
-expect_active_count = 2
+expect_active_count = 4
 expect_completed_count = 1
 expect_semantic_delta_contains = ["FieldSet:completed"]
 expect_render_delta_contains = ["SetProperty"]
@@ -69,7 +70,7 @@ id = "filter-active"
 user_action = { kind = "click", target = "Active filter" }
 expected_source_event = { source = "store.sources.filter_active.press" }
 expect_filter = "Active"
-expect_visible_titles = ["Clean room", "Test todo"]
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Test todo"]
 expect_semantic_delta_contains = ["FieldSet:store.selected_filter"]
 expect_render_delta_contains = ["SetSelectedFilter"]
 
@@ -78,8 +79,8 @@ id = "toggle-dynamic-test-todo-under-active-filter"
 user_action = { kind = "click", target_text = "Test todo checkbox" }
 expected_source_event = { source = "todo.sources.todo_checkbox.click", target_text = "Test todo" }
 expect_completed_titles = ["Buy groceries", "Test todo"]
-expect_visible_titles = ["Clean room"]
-expect_active_count = 1
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"]
+expect_active_count = 3
 expect_completed_count = 2
 expect_semantic_delta_contains = ["FieldSet:completed"]
 expect_render_delta_contains = ["SetProperty"]
@@ -98,7 +99,7 @@ id = "filter-all"
 user_action = { kind = "click", target = "All filter" }
 expected_source_event = { source = "store.sources.filter_all.press" }
 expect_filter = "All"
-expect_visible_titles = ["Buy groceries", "Clean room", "Test todo"]
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
 expect_semantic_delta_contains = ["FieldSet:store.selected_filter"]
 expect_render_delta_contains = ["SetSelectedFilter"]
 
@@ -114,7 +115,7 @@ expect_render_delta_contains = ["ShowEditInput"]
 id = "edit-test-todo-change"
 user_action = { kind = "type_text", target = "editing todo input", text = "Test todo edited" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.change", target_text = "Test todo", text = "Test todo edited" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo"]
 expect_edit_text = "Test todo edited"
 expect_semantic_delta_contains = ["FieldSet:edit_text"]
 expect_render_delta_contains = ["SetEditInput"]
@@ -123,7 +124,7 @@ expect_render_delta_contains = ["SetEditInput"]
 id = "edit-test-todo-commit"
 user_action = { kind = "key_down", target = "editing todo input", key = "Enter" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.key_down", target_text = "Test todo", key = "Enter", text = "Test todo edited" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo edited"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo edited"]
 expect_no_editing = true
 expect_semantic_delta_contains = ["FieldSet:title", "FieldSet:editing"]
 expect_render_delta_contains = ["SetText", "HideEditInput"]
@@ -141,7 +142,7 @@ expect_render_delta_contains = ["ShowEditInput"]
 id = "edit-test-todo-cancel-change"
 user_action = { kind = "type_text", target = "editing todo input", text = "Cancelled title" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.change", target_text = "Test todo edited", text = "Cancelled title" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo edited"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo edited"]
 expect_edit_text = "Cancelled title"
 expect_semantic_delta_contains = ["FieldSet:edit_text"]
 expect_render_delta_contains = ["SetEditInput"]
@@ -150,7 +151,7 @@ expect_render_delta_contains = ["SetEditInput"]
 id = "edit-test-todo-cancel-escape"
 user_action = { kind = "key_down", target = "editing todo input", key = "Escape" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.key_down", target_text = "Test todo edited", key = "Escape" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo edited"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo edited"]
 expect_no_editing = true
 expect_semantic_delta_contains = ["FieldSet:edit_text", "FieldSet:editing"]
 expect_render_delta_contains = ["HideEditInput"]
@@ -168,7 +169,7 @@ expect_render_delta_contains = ["ShowEditInput"]
 id = "edit-test-todo-blur-change"
 user_action = { kind = "type_text", target = "editing todo input", text = "Blur saved title" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.change", target_text = "Test todo edited", text = "Blur saved title" }
-expect_titles = ["Buy groceries", "Clean room", "Test todo edited"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Test todo edited"]
 expect_edit_text = "Blur saved title"
 expect_semantic_delta_contains = ["FieldSet:edit_text"]
 expect_render_delta_contains = ["SetEditInput"]
@@ -177,7 +178,7 @@ expect_render_delta_contains = ["SetEditInput"]
 id = "edit-test-todo-blur-commit"
 user_action = { kind = "blur", target = "editing todo input", text = "Blur saved title" }
 expected_source_event = { source = "todo.sources.editing_todo_title_element.blur", target_text = "Test todo edited", text = "Blur saved title" }
-expect_titles = ["Buy groceries", "Clean room", "Blur saved title"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Blur saved title"]
 expect_no_editing = true
 expect_semantic_delta_contains = ["FieldSet:title", "FieldSet:editing"]
 expect_render_delta_contains = ["SetText", "HideEditInput"]
@@ -186,32 +187,32 @@ expect_render_delta_contains = ["SetText", "HideEditInput"]
 id = "clear-completed"
 user_action = { kind = "click", target = "Clear completed" }
 expected_source_event = { source = "store.sources.clear_completed_button.press" }
-expect_titles = ["Clean room"]
-expect_active_count = 1
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"]
+expect_active_count = 3
 expect_completed_count = 0
 expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
 expect_render_delta_contains = ["RemoveElement", "UnbindSource"]
 
 [[step]]
 id = "hover-delete-clean-room"
-user_action = { kind = "pointer_hover", target_text = "Clean room delete" }
-expect_titles = ["Clean room"]
+user_action = { kind = "pointer_hover", target_text = "Walk the dog delete" }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"]
 expect_render_delta_contains = ["ShowDeleteButton"]
 
 [[step]]
 id = "delete-clean-room"
-user_action = { kind = "click", target_text = "Clean room delete" }
-expected_source_event = { source = "todo.sources.remove_todo_button.press", target_text = "Clean room" }
-expect_titles = []
-expect_active_count = 0
+user_action = { kind = "click", target_text = "Walk the dog delete" }
+expected_source_event = { source = "todo.sources.remove_todo_button.press", target_text = "Walk the dog" }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer"]
+expect_active_count = 2
 expect_completed_count = 0
 expect_semantic_delta_contains = ["ListRemove", "SourceUnbind"]
 expect_render_delta_contains = ["RemoveElement", "UnbindSource"]
 
 [[step]]
 id = "empty-state"
-expect_titles = []
-expect_active_count = 0
+expect_titles = ["Read documentation", "Finish TodoMVC renderer"]
+expect_active_count = 2
 expect_completed_count = 0
 
 [[step]]
@@ -226,8 +227,8 @@ expect_render_delta_contains = ["SetInputValue"]
 id = "add-after-clear-submit"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
 expected_source_event = { source = "store.sources.new_todo_input.key_down", key = "Enter", text = "Fresh todo" }
-expect_titles = ["Fresh todo"]
-expect_active_count = 1
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Fresh todo"]
+expect_active_count = 3
 expect_completed_count = 0
 expect_new_text = ""
 expect_semantic_delta_contains = ["ListInsert", "SourceBind", "FieldSet:store.new_todo_text"]
@@ -237,9 +238,9 @@ expect_render_delta_contains = ["InsertElement", "BindSource", "SetInputValue"]
 id = "toggle-all-single-after-clear"
 user_action = { kind = "click", target = "Toggle all" }
 expected_source_event = { source = "store.sources.toggle_all_checkbox.click" }
-expect_completed_titles = ["Fresh todo"]
+expect_completed_titles = ["Read documentation", "Finish TodoMVC renderer", "Fresh todo"]
 expect_active_count = 0
-expect_completed_count = 1
+expect_completed_count = 3
 expect_semantic_delta_contains = ["FieldSet:completed"]
 expect_render_delta_contains = ["SetProperty"]
 

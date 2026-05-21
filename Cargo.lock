@@ -68,6 +68,7 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_runtime",
+ "image",
  "ply-engine",
  "serde",
  "serde_json",
@@ -575,6 +576,7 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_runtime",
+ "image",
  "serde_json",
 ]
 

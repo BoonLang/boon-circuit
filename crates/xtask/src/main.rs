@@ -2522,6 +2522,36 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
+        "reports:runtime-execution-mirrors-profile-capacity-coverage",
+        &runtime,
+        &[
+            "fn verify_runtime_execution_report_mirror(",
+            "\"runtime_profile\"",
+            "\"runtime_profile_detail\"",
+            "\"capacities\"",
+            "\"expression_coverage\"",
+            "runtime_execution `{key}` does not match top-level `{key}`",
+            "runtime_execution_schema_rejects_adapter_or_incomplete_generic_slices",
+        ],
+        "runtime_execution must mirror runtime profile, capacity, and expression coverage metadata from executable reports",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:readiness-audits-runtime-execution-metadata-mirror",
+        &xtask,
+        &[
+            "runtime_metadata_mirrored",
+            "runtime-execution-metadata-drift-rejected",
+            "runtime_execution mirrors runtime_profile, capacities, and expression_coverage",
+            "runtime_schema_fixture(",
+            "merge_json_object(",
+        ],
+        "readiness and negative fixtures must reject runtime_execution metadata drift instead of accepting mismatched profile/capacity/coverage claims",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
         "reports:human-pass-label-provenance",
         &runtime,
         &[
@@ -2779,6 +2809,9 @@ fn audit_runtime_finality_docs(
             "expression_coverage",
             "computed from parser AST plus",
             "`Unknown` expression",
+            "mirror the top-level",
+            "`runtime_profile`, `runtime_profile_detail`, `capacities`, and",
+            "reject drift",
         ],
         "README or architecture docs must document evidence-bound generic runtime and parser/lowering coverage claims",
     );

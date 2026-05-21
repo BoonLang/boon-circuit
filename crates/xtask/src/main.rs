@@ -6805,6 +6805,7 @@ fn audit_negative_report_contract(
         "missing-speed-resource-fields-rejected",
         "adapter-runtime-execution-rejected",
         "incomplete-generic-runtime-slice-rejected",
+        "runtime-execution-metadata-drift-rejected",
         "missing-delta-runtime-id-rejected",
         "bad-delta-server-tick-rejected",
         "missing-delta-step-id-rejected",
@@ -9885,6 +9886,23 @@ fn verify_negative_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             json!([valid_delta_batch_fixture(name, 0, 1)]),
         )?,
     )?)?;
+    let mut drifted_runtime_metadata_execution = generic_runtime_execution_fixture(name);
+    drifted_runtime_metadata_execution["runtime_profile"] = json!(if name == "todomvc" {
+        "software_bounded"
+    } else {
+        "software_dynamic"
+    });
+    let runtime_metadata_drift_rejected = schema_rejects(&negative_fixture(
+        name,
+        "runtime-execution-metadata-drift",
+        runtime_schema_fixture(
+            name,
+            &source,
+            &scenario,
+            drifted_runtime_metadata_execution,
+            json!([valid_delta_batch_fixture(name, 0, 1)]),
+        )?,
+    )?)?;
     let mut missing_runtime_id_batch = valid_delta_batch_fixture(name, 0, 1);
     missing_runtime_id_batch["runtime_id"] = serde_json::Value::Null;
     let missing_delta_runtime_id_rejected = schema_rejects(&negative_fixture(
@@ -10202,6 +10220,7 @@ fn verify_negative_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             {"id": "missing-runtime-report-contract-rejected", "pass": missing_runtime_contract_rejected},
             {"id": "adapter-runtime-execution-rejected", "pass": adapter_runtime_rejected},
             {"id": "incomplete-generic-runtime-slice-rejected", "pass": incomplete_generic_slice_rejected},
+            {"id": "runtime-execution-metadata-drift-rejected", "pass": runtime_metadata_drift_rejected},
             {"id": "missing-delta-runtime-id-rejected", "pass": missing_delta_runtime_id_rejected},
             {"id": "bad-delta-epoch-rejected", "pass": bad_delta_epoch_rejected},
             {"id": "bad-delta-server-tick-rejected", "pass": bad_delta_server_tick_rejected},
@@ -10392,50 +10411,50 @@ fn runtime_schema_fixture(
     runtime_execution: serde_json::Value,
     semantic_delta_protocol_batches: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    Ok(json!({
-        "status": "pass",
-        "report_version": 1,
-        "generated_at_utc": current_unix_seconds().to_string(),
-        "command": "semantic",
-        "command_argv": ["cargo", "xtask", format!("verify-{name}-semantic")],
-        "exit_status": 0,
-        "layer": "semantic",
-        "git_commit": git_commit(),
-        "binary_hash": current_binary_hash(),
-        "source_path": source,
-        "source_hash": file_hash(&format!("examples/{name}.bn")),
-        "scenario_path": scenario,
-        "scenario_hash": file_hash(&format!("examples/{name}.scn")),
-        "program_hash": file_hash(&format!("examples/{name}.bn")),
-        "budget_hash": file_hash(&format!("examples/{name}.budget.toml")),
-        "graph_node_count": 1,
-        "runtime_execution": runtime_execution,
-        "runtime_profile": "software_bounded",
-        "renderer": "semantic",
-        "window_mode": "none",
-        "window_backend": {"unavailable_reason": "negative fixture"},
-        "display_server": "negative",
-        "display_scale": "1",
-        "window_size": {"unavailable_reason": "negative fixture"},
-        "framebuffer_size": {"unavailable_reason": "negative fixture"},
-        "total_ticks": 1,
-        "total_source_events": 0,
-        "total_semantic_deltas": 0,
-        "total_render_deltas": 0,
-        "max_dirty_nodes": 0,
-        "max_dirty_keys": 0,
-        "allocations": {},
-        "latency_ms_p50_p95_p99_max": {"p50": 0, "p95": 0, "p99": 0, "max": 0},
-        "rss_delta_mib_steady_peak": {"steady": 0, "peak": 0, "baseline": 1, "measurement": "negative fixture"},
-        "baseline_rss_mib": 1,
-        "steady_rss_mib": 1,
-        "vram_delta_mib_steady_peak_or_unavailable_reason": {"unavailable_reason": "negative fixture"},
-        "semantic_delta_protocol_batches": semantic_delta_protocol_batches,
-        "render_patches": [],
-        "failure_artifacts": [],
-        "per_step_pass_fail": [{"id": "negative-fixture-shape", "pass": true}],
-        "artifact_sha256s": []
-    }))
+    let base = run_scenario(source, scenario, VerificationLayer::Semantic, None)?;
+    let mut report = base.report;
+    let base_execution = report
+        .get("runtime_execution")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let merged_execution = merge_json_object(base_execution, runtime_execution);
+    let object = report
+        .as_object_mut()
+        .ok_or("runtime schema fixture base report is not an object")?;
+    object.insert("command".to_owned(), json!("semantic"));
+    object.insert(
+        "command_argv".to_owned(),
+        json!(["cargo", "xtask", format!("verify-{name}-semantic")]),
+    );
+    object.insert("runtime_execution".to_owned(), merged_execution);
+    object.insert(
+        "semantic_delta_protocol_batches".to_owned(),
+        semantic_delta_protocol_batches,
+    );
+    object.insert("render_patches".to_owned(), json!([]));
+    object.insert("failure_artifacts".to_owned(), json!([]));
+    object.insert(
+        "per_step_pass_fail".to_owned(),
+        json!([{"id": "negative-fixture-shape", "pass": true}]),
+    );
+    object.insert("artifact_sha256s".to_owned(), json!([]));
+    Ok(report)
+}
+
+fn merge_json_object(mut base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+    match (&mut base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, overlay_value) in overlay {
+                let merged = match base.remove(&key) {
+                    Some(base_value) => merge_json_object(base_value, overlay_value),
+                    None => overlay_value,
+                };
+                base.insert(key, merged);
+            }
+            serde_json::Value::Object(base.clone())
+        }
+        (_, overlay) => overlay,
+    }
 }
 
 fn negative_fixture(

@@ -108,6 +108,10 @@ all checked against `compiled_schedule`. They also include
 `expression_coverage`, computed from parser AST plus
 typed IR; executable reports are rejected if parser/lowering coverage reaches
 any `Unknown` expression, initializer, update, or predicate fallback.
+Accepted executable reports also mirror `runtime_profile`,
+`runtime_profile_detail`, `capacities`, and `expression_coverage` inside
+`runtime_execution`; schema checks reject reports where the runtime block drifts
+from the top-level profile/capacity/coverage contract.
 The public IR uses transparent typed IDs such as `ExprId`, `NodeId`,
 `ScopeId`, `SourceId`, `StateId`, `ListId`, and `FieldId` for lowering/report
 boundaries while preserving numeric JSON output. Row scopes discovered from

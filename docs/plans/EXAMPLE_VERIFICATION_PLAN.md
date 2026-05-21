@@ -360,11 +360,14 @@ implementation
 source_loaded_from_boon
 typed_ir_loaded
 static_schedule_verified
+runtime_profile
+runtime_profile_detail
+capacities
+expression_coverage
 generic_interpreter_complete
 example_behavior_adapter
 generic_runtime_slices
 generic_runtime_slice_evidence
-expression_coverage
 ```
 
 This is an honesty field, not decorative metadata. During the prototype it may
@@ -375,7 +378,11 @@ and compiled program, and the checker must reject reports where the evidence
 counts do not match `compiled_schedule`. `expression_coverage` must be computed
 from parser AST plus typed IR, and executable reports must be rejected if any
 accepted semantic path relies on `Unknown` expression, initializer, update, or
-predicate fallback.
+predicate fallback. `runtime_execution.runtime_profile`,
+`runtime_execution.runtime_profile_detail`, `runtime_execution.capacities`, and
+`runtime_execution.expression_coverage` must mirror the top-level report fields
+exactly, so profile/capacity/coverage claims cannot drift between the summary
+and the runtime block.
 
 Hardware explanation reports are not exempt from profile honesty. The TodoMVC
 FPGA report must include `runtime_profile`, `runtime_profile_detail`, and

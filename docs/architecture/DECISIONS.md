@@ -709,7 +709,10 @@ static/runtime coverage instead of hardcoded booleans and backed by
 `generic_runtime_slice_evidence` that matches `compiled_schedule`. Runtime
 claims are also backed by `expression_coverage`, computed from parser AST plus
 typed IR, so accepted executable reports cannot silently depend on `Unknown`
-parser or lowering fallback paths. Any remaining
+parser or lowering fallback paths. The runtime block must mirror the top-level
+`runtime_profile`, `runtime_profile_detail`, `capacities`, and
+`expression_coverage` fields exactly; schema and readiness audits reject drift
+between those copies. Any remaining
 TodoMVC/Cells shell or report/assertion glue must stay visible through
 `remaining_example_specific_shells` in reports until removed.
 

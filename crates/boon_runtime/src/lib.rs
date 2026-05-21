@@ -15502,6 +15502,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_completeness_and_adapter_flags_are_derived_from_slices() {
+        let parsed = parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let slices = generic_runtime_slices_report(&ir, &compiled);
+
+        assert!(
+            derive_generic_interpreter_complete(&ir, &compiled, &slices),
+            "baseline TodoMVC slices should satisfy the generic interpreter contract"
+        );
+        assert!(
+            !derive_example_behavior_adapter(&compiled, &slices),
+            "baseline TodoMVC slices should not report an example behavior adapter"
+        );
+
+        let mut incomplete_slices = slices.clone();
+        incomplete_slices["generic_todomvc_source_route_classifier"] = json!(false);
+        assert!(
+            !derive_generic_interpreter_complete(&ir, &compiled, &incomplete_slices),
+            "generic_interpreter_complete must fail when a required current-example slice fails"
+        );
+
+        let mut adapter_slices = slices;
+        adapter_slices["surface_driver_borrows_generic_storage_for_tick"] = json!(true);
+        assert!(
+            derive_example_behavior_adapter(&compiled, &adapter_slices),
+            "example_behavior_adapter must reflect adapter evidence instead of staying hardcoded false"
+        );
+    }
+
+    #[test]
     fn remaining_shells_are_derived_from_generic_runtime_slices() {
         let parsed = parse_source(
             "examples/todomvc.bn",

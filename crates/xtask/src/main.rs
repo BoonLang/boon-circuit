@@ -4404,8 +4404,9 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 "cargo xtask verify-cells-human --write-template --report target/reports/manual-templates/cells-human.json"
             ],
             "launch_playgrounds": [
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc",
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example cells"
+                "cargo build -p boon_ply_playground",
+                "cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app",
+                "cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells --mode app"
             ],
             "background_launch_smoke": [
                 "cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json",
@@ -8861,7 +8862,7 @@ fn audit_repo_handoff_docs(
                 "docs/plans/MANUAL_TESTING_RUNBOOK.md",
                 "manual_report_prepared_by",
                 "BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply",
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc",
+                "cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app",
                 "cargo bench -p boon_runtime --bench todomvc",
                 "cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json",
             ],
@@ -8872,7 +8873,7 @@ fn audit_repo_handoff_docs(
                 "Do not commit or push unless the user explicitly asks.",
                 "Do not fabricate `target/reports/todomvc-human.json`",
                 "manual_report_prepared_by",
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc",
+                "cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app",
                 "BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply",
                 "cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json",
             ],

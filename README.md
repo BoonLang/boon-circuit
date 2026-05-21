@@ -173,8 +173,9 @@ unrelated focus by keeping the wrapper directly around the native window
 creator:
 
 ```bash
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example cells
+cargo build -p boon_ply_playground
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells --mode app
 ```
 
 Background launch is startup/focus-routing evidence only. Full headed OS input

@@ -73,14 +73,15 @@ during that manual session. Reusing only headed automation artifacts is rejected
 Launch the visible playground:
 
 ```bash
-cargo run -p boon_ply_playground -- --example todomvc
+cargo build -p boon_ply_playground
+./target/debug/boon_ply_playground --example todomvc --mode app
 ```
 
 On this COSMIC desktop, a background workspace launch is acceptable for opening
 the surface without stealing unrelated focus:
 
 ```bash
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app
 ```
 
 For a bounded background-launch smoke that exits by itself and writes evidence:
@@ -244,13 +245,14 @@ cargo xtask verify-todomvc-human --check --report target/reports/todomvc-human.j
 Launch the visible playground:
 
 ```bash
-cargo run -p boon_ply_playground -- --example cells
+cargo build -p boon_ply_playground
+./target/debug/boon_ply_playground --example cells --mode app
 ```
 
 Or, on this COSMIC desktop:
 
 ```bash
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example cells
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells --mode app
 ```
 
 The tester must interact with the visible Cells surface and verify every label

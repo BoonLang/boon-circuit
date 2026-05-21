@@ -134,6 +134,7 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   cargo xtask verify-runtime-finality
   cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
   cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+  cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
   cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
   cargo xtask verify-report-schema
   ```
@@ -147,12 +148,12 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   Readiness audits refresh the recursive schema summary before inspecting it, so
   this command order is valid even though earlier commands rewrite report
   artifacts.
-  `verify-examples-all` and `audit-goal-readiness` are final acceptance gates:
-  they require fresh checked `target/reports/todomvc-human.json` and
-  `target/reports/cells-human.json` reports from a real visible manual session,
-  plus the dependent `*-all.json` aggregates. If those human reports are
-  missing, the correct result is failure with explicit blockers, not a synthetic
-  pass or a weakened schema.
+  `verify-examples-all`, `audit-manual-readiness`, and
+  `audit-goal-readiness` are final acceptance gates: they require fresh checked
+  `target/reports/todomvc-human.json` and `target/reports/cells-human.json`
+  reports from a real visible manual session, plus the dependent `*-all.json`
+  aggregates. If those human reports are missing, the correct result is failure
+  with explicit blockers, not a synthetic pass or a weakened schema.
 
   Add negative fixtures for synthetic reports pretending to be full OS-input
   reports.
@@ -201,14 +202,16 @@ Implement completely:
 10. Update docs honestly. Architecture/plans/README must describe the implemented state. If anything remains prototype-only, name it as a blocker and make audit-goal-readiness fail until resolved.
 
 Do not stop until these pass from a clean tree, except that the final
-`verify-*-all`, `verify-examples-all`, and `audit-goal-readiness` commands must
-remain blocked when no real human TodoMVC/Cells reports exist:
+`verify-*-all`, `verify-examples-all`, `audit-manual-readiness`, and
+`audit-goal-readiness` commands must remain blocked when no real human
+TodoMVC/Cells reports exist:
 cargo fmt --check
 cargo test -p boon_parser -p boon_ir -p boon_runtime -p boon_ply_playground
 cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
 cargo xtask verify-runtime-finality
 cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 cargo xtask verify-report-schema
 

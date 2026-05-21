@@ -2026,19 +2026,14 @@ fn audit_runtime_finality(
         ],
         "verify-playground-genericity still reports only renderer slices, not source/headed/app-control probes",
     );
+    audit_playground_probe_specificity(checks, blockers, &playground);
     audit_runtime_finality_markers(
         checks,
         blockers,
-        "playground:no-example-specific-probe-branches",
+        "playground:no-example-specific-runtime-surface",
         &playground,
-        &[
-            "todo_new_input",
-            "todo_row",
-            "cell_editor_A1",
-            "todomvc",
-            "cells",
-        ],
-        "playground probe/runtime surface still contains example-specific control ids or branches outside fixtures",
+        &["TodoMvcView", "CellsView", "render_todomvc", "render_cells"],
+        "playground runtime surface still contains example-specific render branches outside fixtures",
     );
     let schema_readiness_overclaim = format!("{}{}", "full-pass", "-reports-schema-checked");
     audit_runtime_finality_markers(
@@ -2141,6 +2136,64 @@ fn audit_runtime_finality_required_tokens(
         missing.is_empty(),
         json!({"missing_required_tokens": missing}).to_string(),
         (!missing.is_empty()).then(|| blocker.to_owned()),
+    );
+}
+
+fn audit_playground_probe_specificity(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    source: &str,
+) {
+    let mut findings = Vec::new();
+    for (category, start, end) in [
+        (
+            "app-control-probes",
+            "async fn drive_visible_app_control_probe",
+            "async fn drive_visible_text_input_probe",
+        ),
+        (
+            "source-event-probes",
+            "async fn drive_visible_source_event_probe",
+            "async fn drive_visible_source_text_event_probe",
+        ),
+        (
+            "headed-probe-routing",
+            "async fn run_verify_headed",
+            "async fn drive_visible_app_control_probe",
+        ),
+    ] {
+        let Some(slice) = source_slice(source, start, end, 0) else {
+            findings.push(json!({
+                "category": category,
+                "missing_slice": {"start": start, "end": end}
+            }));
+            continue;
+        };
+        for token in [
+            "todo_new_input",
+            "todo_row",
+            "cell_editor_A1",
+            "todomvc",
+            "cells",
+        ] {
+            findings.extend(find_token_lines(slice.text, token).into_iter().map(|line| {
+                json!({
+                    "category": category,
+                    "marker": token,
+                    "line": line + slice.start_line - 1
+                })
+            }));
+        }
+    }
+    push_audit_check(
+        checks,
+        blockers,
+        "runtime-finality:playground:no-example-specific-probe-branches",
+        findings.is_empty(),
+        json!({"forbidden_findings": findings}).to_string(),
+        (!findings.is_empty()).then(|| {
+            "playground headed/source-event/app-control probes still contain example-specific control ids or branches outside fixtures".to_owned()
+        }),
     );
 }
 

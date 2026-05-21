@@ -1,3 +1,4 @@
+use chumsky::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -21,6 +22,7 @@ pub struct ParsedProgram {
     pub path: String,
     pub source: String,
     pub kind: ProgramKind,
+    pub ast: AstProgram,
     pub expressions: Vec<ParsedExpression>,
     pub sources: Vec<String>,
     pub source_ports: Vec<ParsedSourcePort>,
@@ -31,6 +33,41 @@ pub struct ParsedProgram {
     pub row_scope_functions: Vec<ParsedRowScopeFunction>,
     pub functions: Vec<String>,
     pub operators: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstProgram {
+    pub tokens: Vec<AstToken>,
+}
+
+impl AstProgram {
+    pub fn semantic_tokens(&self) -> impl Iterator<Item = &AstToken> {
+        self.tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstToken {
+    pub kind: AstTokenKind,
+    pub lexeme: String,
+    pub line: usize,
+    pub column: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstTokenKind {
+    Identifier,
+    Number,
+    String,
+    Comment,
+    Operator,
+    Symbol,
+    Newline,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,7 +136,8 @@ pub fn parse_source(
 ) -> Result<ParsedProgram, ParseError> {
     let path = path.into();
     let source = source.into();
-    let kind = detect_kind(&path, &source)?;
+    let ast = parse_ast(&path, &source)?;
+    let kind = detect_program_kind(&path, &ast)?;
     validate_balanced_brackets(&path, &source)?;
     validate_required_constructs(&path, &source)?;
     validate_list_capacities(&path, &source)?;
@@ -122,7 +160,107 @@ pub fn parse_source(
         path,
         source: semantic_source,
         kind,
+        ast,
     })
+}
+
+fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
+    let spanned = token_parser()
+        .repeated()
+        .then_ignore(end())
+        .parse(source)
+        .map_err(|errors| {
+            let message = errors
+                .into_iter()
+                .next()
+                .map(|error| format!("syntax error near {:?}", error.span()))
+                .unwrap_or_else(|| "syntax error".to_owned());
+            ParseError {
+                path: path.to_owned(),
+                message,
+            }
+        })?;
+    let tokens = spanned
+        .into_iter()
+        .map(|(kind, span)| {
+            let (line, column) = line_column(source, span.start);
+            let raw_lexeme = source.get(span.clone()).unwrap_or_default();
+            let lexeme = match kind {
+                AstTokenKind::String | AstTokenKind::Comment | AstTokenKind::Newline => raw_lexeme,
+                _ => raw_lexeme.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r')),
+            };
+            AstToken {
+                kind,
+                lexeme: lexeme.to_owned(),
+                line,
+                column,
+                start: span.start,
+                end: span.end,
+            }
+        })
+        .collect();
+    Ok(AstProgram { tokens })
+}
+
+fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), Error = Simple<char>>
+{
+    let horizontal_space = one_of(" \t\r").repeated().ignored();
+    let ident_start = filter(|ch: &char| ch.is_ascii_alphabetic() || *ch == '_');
+    let ident_tail =
+        filter(|ch: &char| ch.is_ascii_alphanumeric() || matches!(*ch, '_' | '-' | '/'));
+    let identifier = ident_start
+        .then(ident_tail.repeated())
+        .to(AstTokenKind::Identifier);
+    let number = text::int(10).to(AstTokenKind::Number);
+    let string = just('"')
+        .ignore_then(
+            choice((
+                just('\\').ignore_then(any()).ignored(),
+                none_of('"').ignored(),
+            ))
+            .repeated(),
+        )
+        .then_ignore(just('"'))
+        .to(AstTokenKind::String);
+    let comment = just('#')
+        .ignore_then(filter(|ch: &char| *ch != '\n').repeated())
+        .to(AstTokenKind::Comment);
+    let operator = choice((
+        just("=>").ignored(),
+        just("|>").ignored(),
+        just("==").ignored(),
+        just(">=").ignored(),
+        just("<=").ignored(),
+        just("!=").ignored(),
+        one_of("><=|").ignored(),
+    ))
+    .to(AstTokenKind::Operator);
+    let symbol = one_of("[]{}():,.$").to(AstTokenKind::Symbol);
+    let newline = just('\n').to(AstTokenKind::Newline);
+    let unknown = any().to(AstTokenKind::Unknown);
+
+    choice((
+        string, comment, identifier, number, operator, symbol, newline, unknown,
+    ))
+    .padded_by(horizontal_space)
+    .map_with_span(|kind, span| (kind, span))
+}
+
+fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for (index, ch) in source.char_indices() {
+        if index >= byte_index {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }
 
 fn strip_view_blocks(source: &str) -> String {
@@ -155,21 +293,24 @@ fn strip_view_blocks(source: &str) -> String {
     output
 }
 
-fn detect_kind(path: &str, source: &str) -> Result<ProgramKind, ParseError> {
-    if source.contains("EXAMPLE TodoMVC") {
-        Ok(ProgramKind::TodoMvc)
-    } else if source.contains("EXAMPLE Cells") {
-        Ok(ProgramKind::Cells)
-    } else if path.contains("todomvc") {
-        Ok(ProgramKind::TodoMvc)
-    } else if path.contains("cells") {
-        Ok(ProgramKind::Cells)
-    } else {
-        Err(ParseError {
-            path: path.to_owned(),
-            message: "missing `EXAMPLE TodoMVC` or `EXAMPLE Cells` marker".to_owned(),
-        })
+fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, ParseError> {
+    let semantic_tokens = ast.semantic_tokens().collect::<Vec<_>>();
+    for window in semantic_tokens.windows(2) {
+        if window[0].lexeme == "EXAMPLE" {
+            return match window[1].lexeme.as_str() {
+                "TodoMVC" => Ok(ProgramKind::TodoMvc),
+                "Cells" => Ok(ProgramKind::Cells),
+                other => Err(ParseError {
+                    path: path.to_owned(),
+                    message: format!("unknown EXAMPLE `{other}`"),
+                }),
+            };
+        }
     }
+    Err(ParseError {
+        path: path.to_owned(),
+        message: "missing `EXAMPLE TodoMVC` or `EXAMPLE Cells` marker".to_owned(),
+    })
 }
 
 fn validate_balanced_brackets(path: &str, source: &str) -> Result<(), ParseError> {
@@ -842,6 +983,35 @@ mod tests {
                 .iter()
                 .any(|list| list.name == "cells")
         );
+    }
+
+    #[test]
+    fn example_marker_ignores_comments_strings_and_paths() {
+        let source = r#"
+# EXAMPLE TodoMVC
+label: "EXAMPLE TodoMVC"
+EXAMPLE Cells
+cells:
+    Grid/cells(columns: 1, rows: 1)
+    |> List/map(seed, new: new_cell(seed: seed))
+SOURCE
+HOLD
+LATEST
+"#;
+        let program = parse_source("examples/todomvc-looking-path.bn", source).unwrap();
+        assert_eq!(program.kind, ProgramKind::Cells);
+
+        let missing = r#"
+# EXAMPLE TodoMVC
+label: "EXAMPLE Cells"
+SOURCE
+HOLD
+LATEST
+List/map
+LIST {}
+"#;
+        let err = parse_source("examples/todomvc.bn", missing).unwrap_err();
+        assert!(err.message.contains("missing `EXAMPLE"));
     }
 
     #[test]

@@ -1836,20 +1836,60 @@ mod tests {
             ListInitializer::RecordLiteral {
                 rows: vec![
                     ListSeedRecord {
-                        fields: vec![ListSeedField {
-                            name: "title".to_owned(),
-                            value: InitialValue::Text {
-                                value: "Buy groceries".to_owned(),
+                        fields: vec![
+                            ListSeedField {
+                                name: "title".to_owned(),
+                                value: InitialValue::Text {
+                                    value: "Read documentation".to_owned(),
+                                },
                             },
-                        }],
+                            ListSeedField {
+                                name: "completed".to_owned(),
+                                value: InitialValue::Bool { value: false },
+                            },
+                        ],
                     },
                     ListSeedRecord {
-                        fields: vec![ListSeedField {
-                            name: "title".to_owned(),
-                            value: InitialValue::Text {
-                                value: "Clean room".to_owned(),
+                        fields: vec![
+                            ListSeedField {
+                                name: "title".to_owned(),
+                                value: InitialValue::Text {
+                                    value: "Finish TodoMVC renderer".to_owned(),
+                                },
                             },
-                        }],
+                            ListSeedField {
+                                name: "completed".to_owned(),
+                                value: InitialValue::Bool { value: true },
+                            },
+                        ],
+                    },
+                    ListSeedRecord {
+                        fields: vec![
+                            ListSeedField {
+                                name: "title".to_owned(),
+                                value: InitialValue::Text {
+                                    value: "Walk the dog".to_owned(),
+                                },
+                            },
+                            ListSeedField {
+                                name: "completed".to_owned(),
+                                value: InitialValue::Bool { value: false },
+                            },
+                        ],
+                    },
+                    ListSeedRecord {
+                        fields: vec![
+                            ListSeedField {
+                                name: "title".to_owned(),
+                                value: InitialValue::Text {
+                                    value: "Buy groceries".to_owned(),
+                                },
+                            },
+                            ListSeedField {
+                                name: "completed".to_owned(),
+                                value: InitialValue::Bool { value: false },
+                            },
+                        ],
                     },
                 ],
             }

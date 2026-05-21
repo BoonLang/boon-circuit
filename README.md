@@ -89,6 +89,7 @@ cargo bench -p boon_runtime --bench todomvc -- --report target/reports/todomvc-b
 cargo xtask bench-todomvc
 cargo xtask bench-example cells
 cargo xtask verify-report-schema
+cargo xtask verify-runtime-finality
 cargo xtask audit-goal-readiness
 cargo xtask verify-todomvc-human --write-template
 cargo xtask verify-cells-human --write-template
@@ -96,14 +97,19 @@ cargo xtask verify-cells-human --write-template
 
 The speed aliases re-exec themselves through `cargo run --release -p xtask` and
 reports must contain `build_profile: "release"`.
-Executable reports contain `runtime_execution` metadata. The current accepted
-semantic/headless/headed/speed reports must show that Boon source and typed IR
-are loaded, the static schedule is verified, and `example_behavior_adapter` is
-`false`.
+Executable reports contain `runtime_execution` metadata, but those fields are
+not finality proof by themselves. `cargo xtask verify-runtime-finality` is the
+structural gate for the current parser, IR lowering, runtime storage,
+source-route indexes, RuntimeProfile/capacity reporting, report-claim
+derivation, headed-test honesty, and genericity-scan coverage. If that command
+or `cargo xtask audit-goal-readiness` fails, the implementation must still be
+treated as prototype-shaped even when TodoMVC and Cells behavior reports pass.
 The native playground sidebar shows the scenario checklist labels used by the
 manual-report templates.
-The headed Ply verifier must be run with `BOON_ALLOW_OS_POINTER_PROBE=1` for
-final evidence. The passing headed reports use
+Focusless headed reports are synthetic/focusless evidence. Full OS-input
+evidence requires canonical `target/reports/todomvc-headed-ply.json` and
+`target/reports/cells-headed-ply.json` reports from runs with
+`BOON_ALLOW_OS_POINTER_PROBE=1`. Passing full OS reports use
 `input_injection_method = "os_pointer_keyboard_to_visible_window"`, have no
 `os_input_limitation`, record per-step visible targets and screenshots, and are
 checked by `audit-goal-readiness`.

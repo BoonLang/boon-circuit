@@ -642,16 +642,29 @@ TodoMVC or Cells surface drivers for scenario execution. The remaining
 acceptance blockers are fresh human reports, aggregate all reports, and any
 future verification gaps found by the audit, not a semantic example adapter.
 
-Implementation note: the current IR cause table is source-derived, not a
-TodoMVC/Cells-specific Rust lookup table. It derives row scopes from
-`List/map(... new: function(...))`, then scans field equation bodies and local
-derived-field references such as `new_todo_text -> title_to_add` to build
-`possible_causes`. TodoMVC and Cells executable reports now identify the runtime
-as `static_graph_interpreter`, set `generic_interpreter_complete = true`, and
-set `example_behavior_adapter = false`. The headed reports now prove full
-OS pointer/keyboard coverage. The remaining acceptance blockers are fresh human
-reports, aggregate all reports, and any future verification gaps found by the
-readiness audit.
+Implementation note: the current IR cause table is still source-derived in a
+prototype sense. It derives row scopes from `List/map(... new: function(...))`,
+then scans field equation bodies and local derived-field references such as
+`new_todo_text -> title_to_add` to build `possible_causes`. That is useful
+evidence for the shipped TodoMVC and Cells scenarios, but it is not the final
+typed AST-to-IR lowering promised by the runtime model. The structural gate for
+that distinction is `cargo xtask verify-runtime-finality`, and
+`audit-goal-readiness` must fail while this gate reports blockers.
+
+Executable reports may identify the runtime as `static_graph_interpreter` and
+may include `generic_interpreter_complete` / `example_behavior_adapter` fields.
+Those fields are not accepted as finality proof unless they are derived from
+static/runtime coverage instead of hardcoded booleans. Any remaining
+TodoMVC/Cells shell or report/assertion glue must stay visible in reports until
+removed.
+
+Headed Ply evidence also has two categories. Focusless headed reports are
+synthetic/focusless evidence. Full OS pointer/keyboard claims require canonical
+`target/reports/todomvc-headed-ply.json` and
+`target/reports/cells-headed-ply.json` reports with
+`input_injection_method = "os_pointer_keyboard_to_visible_window"`, no
+`os_input_limitation`, current hashes, and real OS pointer/keyboard backend
+coverage for every user-action step.
 
 Headed Ply verification runs the native playground in release mode through
 `xtask`, because the debug build can take minutes to replay TodoMVC's visible

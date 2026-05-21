@@ -35,6 +35,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-playground-custom-source",
     "write-manual-handoff",
     "verify-report-schema",
+    "verify-runtime-finality",
     "audit-goal-readiness",
     "audit-manual-readiness",
     "verify-todomvc-headed-ply",
@@ -96,6 +97,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-playground-custom-source" => verify_playground_custom_source(&args),
         "write-manual-handoff" => write_manual_handoff(&args),
         "verify-report-schema" => verify_reports_schema(),
+        "verify-runtime-finality" => verify_runtime_finality(&args),
         "audit-goal-readiness" | "audit-manual-readiness" => audit_goal_readiness(&args),
         "bench-example" => bench_example(named_arg(&args, 1)?, &args),
         "verify-todomvc-semantic" => verify_specific("todomvc", VerificationLayer::Semantic, &args),
@@ -1795,6 +1797,366 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
     }
 }
 
+fn verify_runtime_finality(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/runtime-finality.json"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    audit_runtime_finality(&mut checks, &mut blockers)?;
+
+    let artifact_paths = [
+        "crates/boon_parser/src/lib.rs",
+        "crates/boon_ir/src/lib.rs",
+        "crates/boon_runtime/src/lib.rs",
+        "crates/boon_ply_playground/src/lib.rs",
+        "crates/xtask/src/main.rs",
+        "README.md",
+        "docs/architecture/DECISIONS.md",
+        "docs/plans/RUNTIME_FINALITY_HONESTY_PLAN.md",
+    ];
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .filter(|path| Path::new(path).exists())
+        .map(|path| artifact_hash(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let report = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-runtime-finality",
+        "command_argv": args,
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_hash": file_hash("crates/boon_parser/src/lib.rs"),
+        "scenario_hash": "n/a",
+        "program_hash": file_hash("crates/boon_ir/src/lib.rs"),
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "per_step_pass_fail": checks,
+        "blockers": blockers,
+        "artifact_sha256s": artifact_sha256s
+    });
+    write_json(&report_path, &report)?;
+
+    let blockers = report
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if blockers.is_empty() {
+        verify_report_schema(&report_path)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "runtime finality blockers written to `{}`: {}",
+            report_path.display(),
+            blockers.join("; ")
+        )
+        .into())
+    }
+}
+
+fn audit_runtime_finality(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parser = read_source_for_audit("crates/boon_parser/src/lib.rs", checks, blockers)?;
+    let ir = read_source_for_audit("crates/boon_ir/src/lib.rs", checks, blockers)?;
+    let runtime = read_source_for_audit("crates/boon_runtime/src/lib.rs", checks, blockers)?;
+    let playground =
+        read_source_for_audit("crates/boon_ply_playground/src/lib.rs", checks, blockers)?;
+    let xtask = read_source_for_audit("crates/xtask/src/main.rs", checks, blockers)?;
+    let readme = read_source_for_audit("README.md", checks, blockers)?;
+    let decisions = read_source_for_audit("docs/architecture/DECISIONS.md", checks, blockers)?;
+
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "parser:real-ast-not-text-lines",
+        &parser,
+        &[
+            "text: String",
+            "fn collect_expressions",
+            "fn detect_kind",
+            "source.contains(\"EXAMPLE TodoMVC\")",
+            "source.contains(\"EXAMPLE Cells\")",
+            "path.contains(\"todomvc\")",
+            "path.contains(\"cells\")",
+        ],
+        "parser still depends on line/text/path heuristics instead of a structured AST",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "ir:typed-ast-lowering-not-substrings",
+        &ir,
+        &[
+            "fn expression_node_kind",
+            "expression_node_kind(&expr.text)",
+            ".contains(\"SOURCE\")",
+            "field.body.contains",
+            "branch_text_for_source",
+            "text.contains(\"todo.\")",
+            "path.contains(\"todomvc\")",
+        ],
+        "IR lowering still depends on expression text/body substring heuristics",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "runtime:typed-columnar-storage",
+        &runtime,
+        &[
+            "enum RuntimeValue",
+            "struct GenericRow",
+            "fields: BTreeMap<String, RuntimeValue>",
+            "root: BTreeMap<String, RuntimeValue>",
+            "lists: BTreeMap<String, KeyedList<GenericRow>>",
+            "spare_rows: BTreeMap<String, Vec<GenericRow>>",
+        ],
+        "runtime hot state is still generic row/map storage instead of typed columnar storage",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "runtime:dense-source-route-indexes",
+        &runtime,
+        &[
+            "struct SourceRoutePlan",
+            "routes: Vec<SourceRoute>",
+            "self.routes.iter().find",
+            ".iter().position",
+            "struct SourceStore",
+            "bindings: Vec<SourceBinding>",
+            "self.bindings.iter().any",
+            "self.bindings.retain",
+        ],
+        "runtime source/list route lookup still uses Vec scans or position lookups",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "reports:derived-runtime-completeness",
+        &runtime,
+        &[
+            "let generic_interpreter_complete = true;",
+            "let example_behavior_adapter = false;",
+        ],
+        "runtime completeness report fields are still hardcoded instead of derived",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "playground:genericity-scans-all-probes",
+        &xtask,
+        &[
+            "{\"path\": source_path.display().to_string(), \"start\": \"fn render_nodes\", \"end\": \"fn delta_panel\"}",
+            "{\"path\": source_path.display().to_string(), \"start\": \"enum RenderNode\", \"end\": \"pub async fn run_app_from_args\"}",
+        ],
+        "verify-playground-genericity still reports only renderer slices, not source/headed/app-control probes",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "playground:no-example-specific-probe-branches",
+        &playground,
+        &[
+            "todo_new_input",
+            "todo_row",
+            "cell_editor_A1",
+            "todomvc",
+            "cells",
+        ],
+        "playground probe/runtime surface still contains example-specific control ids or branches outside fixtures",
+    );
+    let schema_readiness_overclaim = format!("{}{}", "full-pass", "-reports-schema-checked");
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "schema:validity-not-readiness-naming",
+        &xtask,
+        &[schema_readiness_overclaim.as_str()],
+        "report schema summary still uses naming that can be mistaken for final readiness",
+    );
+
+    audit_runtime_finality_docs(checks, blockers, &readme, &decisions);
+    audit_runtime_finality_reports(checks, blockers)?;
+    Ok(())
+}
+
+fn read_source_for_audit(
+    path: &str,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => {
+            push_audit_check(
+                checks,
+                blockers,
+                format!(
+                    "runtime-finality:source-present:{}",
+                    sanitize_audit_id(path)
+                ),
+                true,
+                format!("read {path}"),
+                None,
+            );
+            Ok(source)
+        }
+        Err(error) => {
+            push_audit_check(
+                checks,
+                blockers,
+                format!(
+                    "runtime-finality:source-present:{}",
+                    sanitize_audit_id(path)
+                ),
+                false,
+                error.to_string(),
+                Some(format!(
+                    "runtime finality audit cannot read `{path}`: {error}"
+                )),
+            );
+            Ok(String::new())
+        }
+    }
+}
+
+fn audit_runtime_finality_markers(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: &str,
+    source: &str,
+    forbidden_markers: &[&str],
+    blocker: &str,
+) {
+    let findings = forbidden_markers
+        .iter()
+        .flat_map(|marker| {
+            find_token_lines(source, marker)
+                .into_iter()
+                .map(move |line| json!({"marker": marker, "line": line}))
+        })
+        .collect::<Vec<_>>();
+    let pass = findings.is_empty();
+    push_audit_check(
+        checks,
+        blockers,
+        format!("runtime-finality:{id}"),
+        pass,
+        json!({"forbidden_findings": findings}).to_string(),
+        (!pass).then(|| blocker.to_owned()),
+    );
+}
+
+fn audit_runtime_finality_docs(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    readme: &str,
+    decisions: &str,
+) {
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "docs:no-final-runtime-overclaim",
+        &format!("{readme}\n{decisions}"),
+        &[
+            "Executable reports contain `runtime_execution` metadata. The current accepted semantic/headless/headed/speed reports must show that Boon source and typed IR are loaded, the static schedule is verified, and `example_behavior_adapter` is\n`false`.",
+            "set `generic_interpreter_complete = true`, and\nset `example_behavior_adapter = false`. The headed reports now prove full\nOS pointer/keyboard coverage.",
+        ],
+        "README or architecture docs still overstate runtime/headed finality",
+    );
+}
+
+fn audit_runtime_finality_reports(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for name in ["todomvc", "cells"] {
+        let path = PathBuf::from(format!("target/reports/{name}-headed-ply.json"));
+        if !path.exists() {
+            push_audit_check(
+                checks,
+                blockers,
+                format!("runtime-finality:{name}:full-os-headed-report-present"),
+                false,
+                format!("missing {}", path.display()),
+                Some(format!(
+                    "missing canonical full OS-input headed report `{}`",
+                    path.display()
+                )),
+            );
+            continue;
+        }
+        let report = read_json(&path)?;
+        let full_os = report
+            .get("input_injection_method")
+            .and_then(serde_json::Value::as_str)
+            == Some("os_pointer_keyboard_to_visible_window")
+            && report.get("os_input_limitation").is_none();
+        push_audit_check(
+            checks,
+            blockers,
+            format!("runtime-finality:{name}:full-os-headed-report-method"),
+            full_os,
+            format!(
+                "input_injection_method={:?}, os_input_limitation_present={}",
+                report
+                    .get("input_injection_method")
+                    .and_then(serde_json::Value::as_str),
+                report.get("os_input_limitation").is_some()
+            ),
+            (!full_os).then(|| {
+                format!(
+                    "`{}` is not canonical full OS pointer/keyboard evidence",
+                    path.display()
+                )
+            }),
+        );
+    }
+
+    let speed_path = PathBuf::from("target/reports/todomvc-speed.json");
+    if speed_path.exists() {
+        let report = read_json(&speed_path)?;
+        let text = report.to_string();
+        let bounded_claim_with_null_capacity = text.contains("\"runtime_profile\":\"bounded")
+            && text.contains("\"list_capacity\":null");
+        push_audit_check(
+            checks,
+            blockers,
+            "runtime-finality:todomvc-speed-bounded-capacity-honest",
+            !bounded_claim_with_null_capacity,
+            format!("bounded_claim_with_null_capacity={bounded_claim_with_null_capacity}"),
+            bounded_claim_with_null_capacity.then(|| {
+                format!(
+                    "`{}` claims bounded execution while a list_capacity is null",
+                    speed_path.display()
+                )
+            }),
+        );
+    } else {
+        push_audit_check(
+            checks,
+            blockers,
+            "runtime-finality:todomvc-speed-report-present",
+            false,
+            format!("missing {}", speed_path.display()),
+            Some(format!(
+                "missing TodoMVC speed report `{}` for RuntimeProfile/capacity audit",
+                speed_path.display()
+            )),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ImageRect {
     x: u32,
@@ -3176,6 +3538,7 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
     audit_manual_handoff(&mut checks, &mut blockers)?;
     audit_repo_handoff_docs(&mut checks, &mut blockers)?;
     audit_scope_control(&mut checks, &mut blockers)?;
+    audit_runtime_finality(&mut checks, &mut blockers)?;
     audit_xtask_command_surface(&mut checks, &mut blockers);
 
     let status = if blockers.is_empty() { "pass" } else { "fail" };
@@ -3394,7 +3757,7 @@ fn audit_recursive_report_schema_summary(
     );
 
     for id in [
-        "full-pass-reports-schema-checked",
+        "schema-valid-pass-reports-checked",
         "debug-failure-artifacts-accounted",
         "manual-template-artifacts-accounted",
         "debug-dump-artifacts-accounted",
@@ -6889,6 +7252,7 @@ fn audit_xtask_command_surface(checks: &mut Vec<serde_json::Value>, blockers: &m
 fn documented_xtask_commands() -> &'static [&'static str] {
     &[
         "verify-example-headed-ply",
+        "verify-example-headed-focusless",
         "verify-example-human",
         "prepare-example-human-report",
         "verify-example-semantic",
@@ -6907,9 +7271,11 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "verify-playground-custom-source",
         "write-manual-handoff",
         "verify-report-schema",
+        "verify-runtime-finality",
         "audit-goal-readiness",
         "audit-manual-readiness",
         "verify-todomvc-headed-ply",
+        "verify-todomvc-headed-focusless",
         "verify-todomvc-human",
         "prepare-todomvc-human-report",
         "verify-todomvc-semantic",
@@ -6920,6 +7286,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "bench-todomvc",
         "explain-todomvc-hardware",
         "verify-cells-headed-ply",
+        "verify-cells-headed-focusless",
         "verify-cells-human",
         "prepare-cells-human-report",
         "verify-cells-semantic",
@@ -7160,6 +7527,7 @@ fn xtask_command_supported(command: &str) -> bool {
         "verify-example-semantic"
             | "verify-example-ply-headless"
             | "verify-example-headed-ply"
+            | "verify-example-headed-focusless"
             | "verify-example-human"
             | "prepare-example-human-report"
             | "verify-example-speed"
@@ -7175,12 +7543,14 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-playground-custom-source"
             | "write-manual-handoff"
             | "verify-report-schema"
+            | "verify-runtime-finality"
             | "audit-goal-readiness"
             | "audit-manual-readiness"
             | "bench-example"
             | "verify-todomvc-semantic"
             | "verify-todomvc-ply-headless"
             | "verify-todomvc-headed-ply"
+            | "verify-todomvc-headed-focusless"
             | "verify-todomvc-human"
             | "prepare-todomvc-human-report"
             | "verify-todomvc-speed"
@@ -7191,6 +7561,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-cells-semantic"
             | "verify-cells-ply-headless"
             | "verify-cells-headed-ply"
+            | "verify-cells-headed-focusless"
             | "verify-cells-human"
             | "prepare-cells-human-report"
             | "verify-cells-speed"
@@ -9259,7 +9630,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
         "graph_node_count": 0,
         "per_step_pass_fail": [
             {"id": "report-json-files-seen-recursively", "pass": true, "count": seen},
-            {"id": "full-pass-reports-schema-checked", "pass": true, "count": checked},
+            {"id": "schema-valid-pass-reports-checked", "pass": true, "count": checked},
             {"id": "debug-failure-artifacts-accounted", "pass": true, "count": debug_failures},
             {"id": "manual-template-artifacts-accounted", "pass": true, "count": manual_templates},
             {"id": "debug-dump-artifacts-accounted", "pass": true, "count": debug_dumps},

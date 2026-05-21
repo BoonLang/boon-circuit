@@ -6053,7 +6053,7 @@ impl Default for SourceStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeValue {
+enum FieldValue {
     Text(String),
     Bool(bool),
     Enum(String),
@@ -6061,7 +6061,21 @@ enum RuntimeValue {
 
 #[derive(Clone, Debug, Default)]
 struct GenericRow {
-    fields: BTreeMap<String, RuntimeValue>,
+    columns: ValueColumns,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValueColumns {
+    text: BTreeMap<String, String>,
+    bools: BTreeMap<String, bool>,
+    enums: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FieldValueRef<'a> {
+    Text(&'a str),
+    Bool(bool),
+    Enum(&'a str),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -6077,12 +6091,78 @@ struct GenericRowFieldTemplate {
 
 #[derive(Clone, Debug, Default)]
 struct GenericCircuitRuntime {
-    root: BTreeMap<String, RuntimeValue>,
-    lists: BTreeMap<String, KeyedList<GenericRow>>,
+    root: ValueColumns,
+    lists: ListMemoryStore,
     list_capacities: BTreeMap<String, Option<usize>>,
     row_templates: BTreeMap<String, GenericRowTemplate>,
-    spare_rows: BTreeMap<String, Vec<GenericRow>>,
+    spare_rows: SpareRowStore,
     sources: SourceStore,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ListMemoryStore {
+    slots: BTreeMap<String, usize>,
+    memories: Vec<KeyedList<GenericRow>>,
+}
+
+impl ListMemoryStore {
+    fn insert(&mut self, name: String, memory: KeyedList<GenericRow>) {
+        if let Some(slot) = self.slots.get(&name).copied() {
+            self.memories[slot] = memory;
+            return;
+        }
+        let slot = self.memories.len();
+        self.slots.insert(name, slot);
+        self.memories.push(memory);
+    }
+
+    fn get(&self, name: &str) -> Option<&KeyedList<GenericRow>> {
+        self.slots
+            .get(name)
+            .and_then(|slot| self.memories.get(*slot))
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut KeyedList<GenericRow>> {
+        let slot = self.slots.get(name).copied()?;
+        self.memories.get_mut(slot)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpareRowStore {
+    slots: BTreeMap<String, usize>,
+    rows: Vec<Vec<GenericRow>>,
+}
+
+impl SpareRowStore {
+    fn len_for(&self, list: &str) -> usize {
+        self.slots
+            .get(list)
+            .and_then(|slot| self.rows.get(*slot))
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    fn rows_mut(&mut self, list: &str) -> &mut Vec<GenericRow> {
+        if let Some(slot) = self.slots.get(list).copied() {
+            return &mut self.rows[slot];
+        }
+        let slot = self.rows.len();
+        self.slots.insert(list.to_owned(), slot);
+        self.rows.push(Vec::new());
+        self.rows
+            .last_mut()
+            .expect("spare row slot was just pushed")
+    }
+
+    fn push(&mut self, list: &str, row: GenericRow) {
+        self.rows_mut(list).push(row);
+    }
+
+    fn pop(&mut self, list: &str) -> Option<GenericRow> {
+        let slot = self.slots.get(list).copied()?;
+        self.rows.get_mut(slot)?.pop()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -7093,9 +7173,9 @@ impl GenericCircuitRuntime {
     fn new(ir: &TypedProgram) -> RuntimeResult<Self> {
         let mut runtime = Self::default();
         for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
-            runtime.root.insert(
+            runtime.root.insert_value(
                 cell.path.clone(),
-                runtime_value_from_initial(&cell.initial_value, &BTreeMap::new())?,
+                runtime_value_from_initial(&cell.initial_value, &ValueColumns::default())?,
             );
         }
         for list in &ir.lists {
@@ -7126,8 +7206,9 @@ impl GenericCircuitRuntime {
                                     .ok_or("grid column label is out of range")?,
                                 row + 1
                             );
-                            let mut seed_fields = BTreeMap::new();
-                            seed_fields.insert("address".to_owned(), RuntimeValue::Text(address));
+                            let mut seed_fields = ValueColumns::default();
+                            seed_fields
+                                .insert_value("address".to_owned(), FieldValue::Text(address));
                             let mut row = row_template.materialize(seed_fields)?;
                             seed_indexed_formula_fields(ir, &row_scope, &mut row);
                             grid_rows.push(row);
@@ -7172,20 +7253,13 @@ impl GenericCircuitRuntime {
     }
 
     fn root_textlike_ref(&self, path: &str) -> RuntimeResult<&str> {
-        self.root
-            .get(path)
-            .and_then(RuntimeValue::as_textlike)
-            .ok_or_else(|| {
-                format!("generic runtime root value `{path}` is missing or non-text").into()
-            })
+        self.root.textlike(path).ok_or_else(|| {
+            format!("generic runtime root value `{path}` is missing or non-text").into()
+        })
     }
 
     fn set_root_textlike(&mut self, path: &str, value: &str) -> RuntimeResult<()> {
-        let slot = self
-            .root
-            .get_mut(path)
-            .ok_or_else(|| format!("generic runtime root value `{path}` is missing"))?;
-        slot.set_textlike(value)
+        self.root.set_textlike(path, value)
     }
 
     fn apply_root_text_source<'a>(
@@ -7251,11 +7325,7 @@ impl GenericCircuitRuntime {
     }
 
     fn reserve_root_textlike(&mut self, path: &str, additional: usize) -> RuntimeResult<()> {
-        let slot = self
-            .root
-            .get_mut(path)
-            .ok_or_else(|| format!("generic runtime root value `{path}` is missing"))?;
-        slot.reserve_textlike(additional)
+        self.root.reserve_textlike(path, additional)
     }
 
     fn reserve_list(&mut self, list: &str, additional: usize) -> RuntimeResult<()> {
@@ -7416,15 +7486,12 @@ impl GenericCircuitRuntime {
             .get_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         for (index, row) in rows.rows.iter_mut().enumerate() {
-            let value = row
-                .value
-                .fields
-                .get_mut(field)
-                .ok_or_else(|| format!("generic list `{list}` row missing field `{field}`"))?;
-            let current = value
-                .as_textlike()
-                .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like"))?;
-            value.reserve_textlike(additional_by_row(index, current))?;
+            let current =
+                row.value.columns.textlike(field).ok_or_else(|| {
+                    format!("generic list `{list}` field `{field}` is not text-like")
+                })?;
+            let additional = additional_by_row(index, current);
+            row.value.columns.reserve_textlike(field, additional)?;
         }
         Ok(())
     }
@@ -7446,35 +7513,32 @@ impl GenericCircuitRuntime {
             .rows
             .get_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        let source =
-            row.value.fields.get(source_field).ok_or_else(|| {
-                format!("generic list `{list}` row missing field `{source_field}`")
-            })? as *const RuntimeValue;
-        let target =
-            row.value.fields.get_mut(target_field).ok_or_else(|| {
-                format!("generic list `{list}` row missing field `{target_field}`")
-            })? as *mut RuntimeValue;
-        // BTreeMap nodes are not structurally changed here, and source/target
-        // fields were checked to be distinct before creating both pointers.
-        unsafe {
-            match &*source {
-                RuntimeValue::Text(source) | RuntimeValue::Enum(source) => {
-                    (*target).set_textlike(source).map_err(|_| {
-                        format!("generic list `{list}` field `{target_field}` is not text-like")
-                            .into()
-                    })
-                }
-                RuntimeValue::Bool(_) => Err(format!(
-                    "generic list `{list}` field `{source_field}` is not text-like"
-                )
-                .into()),
-            }
-        }
+        let source = row
+            .value
+            .columns
+            .textlike(source_field)
+            .ok_or_else(|| {
+                format!("generic list `{list}` field `{source_field}` is not text-like")
+            })?
+            .to_owned();
+        row.value
+            .columns
+            .set_textlike(target_field, &source)
+            .map_err(|_| {
+                format!("generic list `{list}` field `{target_field}` is not text-like").into()
+            })
     }
 
     fn list_row_textlike(&self, list: &str, index: usize, field: &str) -> RuntimeResult<&str> {
-        self.list_row_field(list, index, field)?
-            .as_textlike()
+        self.lists
+            .get(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .rows
+            .get(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
+            .value
+            .columns
+            .textlike(field)
             .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
     }
 
@@ -7502,9 +7566,8 @@ impl GenericCircuitRuntime {
             .rows
             .get(index)?
             .value
-            .fields
-            .get(field)?
-            .as_textlike()
+            .columns
+            .textlike(field)
     }
 
     fn list_row_bool(&self, list: &str, index: usize, field: &str) -> RuntimeResult<bool> {
@@ -7519,9 +7582,8 @@ impl GenericCircuitRuntime {
             .rows
             .get(index)?
             .value
-            .fields
-            .get(field)?
-            .as_bool()
+            .columns
+            .bool_value(field)
     }
 
     fn set_list_row_textlike(
@@ -7531,8 +7593,15 @@ impl GenericCircuitRuntime {
         field: &str,
         value: &str,
     ) -> RuntimeResult<()> {
-        self.list_row_field_mut(list, index, field)?
-            .set_textlike(value)
+        self.lists
+            .get_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .rows
+            .get_mut(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
+            .value
+            .columns
+            .set_textlike(field, value)
     }
 
     fn set_or_insert_list_row_textlike(
@@ -7549,15 +7618,7 @@ impl GenericCircuitRuntime {
             .rows
             .get_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        match row.value.fields.get_mut(field) {
-            Some(slot) => slot.set_textlike(value),
-            None => {
-                row.value
-                    .fields
-                    .insert(field.to_owned(), RuntimeValue::Text(value.to_owned()));
-                Ok(())
-            }
-        }
+        row.value.columns.set_or_insert_text(field, value)
     }
 
     fn set_list_row_bool(
@@ -7567,7 +7628,15 @@ impl GenericCircuitRuntime {
         field: &str,
         value: bool,
     ) -> RuntimeResult<()> {
-        self.list_row_field_mut(list, index, field)?.set_bool(value)
+        self.lists
+            .get_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .rows
+            .get_mut(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
+            .value
+            .columns
+            .set_bool(field, value)
     }
 
     fn commit_indexed_text_field(
@@ -7841,15 +7910,10 @@ impl GenericCircuitRuntime {
             .row_templates
             .get(list)
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
-        let mut row = self
-            .spare_rows
-            .get_mut(list)
-            .and_then(Vec::pop)
-            .map(Ok)
-            .unwrap_or_else(|| {
-                let seed_fields = equations.append_seed_fields(list, trigger, trigger_value)?;
-                template.materialize(seed_fields)
-            })?;
+        let mut row = self.spare_rows.pop(list).map(Ok).unwrap_or_else(|| {
+            let seed_fields = equations.append_seed_fields(list, trigger, trigger_value)?;
+            template.materialize(seed_fields)
+        })?;
         template.reset_from_text_seeds(&mut row, |seed_name| {
             append_fields
                 .iter()
@@ -7867,7 +7931,7 @@ impl GenericCircuitRuntime {
         count: usize,
         text_capacity: usize,
     ) -> RuntimeResult<()> {
-        let spare_len = self.spare_rows.get(list).map(Vec::len).unwrap_or(0);
+        let spare_len = self.spare_rows.len_for(list);
         if spare_len >= count {
             return Ok(());
         }
@@ -7876,7 +7940,7 @@ impl GenericCircuitRuntime {
             .get(list)
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let additional = count - spare_len;
-        let spare_rows = self.spare_rows.entry(list.to_owned()).or_default();
+        let spare_rows = self.spare_rows.rows_mut(list);
         spare_rows.reserve(additional + count);
         for _ in 0..additional {
             let seed_fields = equations.append_seed_fields(list, trigger, "")?;
@@ -7938,11 +8002,7 @@ impl GenericCircuitRuntime {
     }
 
     fn spare_row(&mut self, list: &'static str, row: GenericRow) {
-        if let Some(rows) = self.spare_rows.get_mut(list) {
-            rows.push(row);
-            return;
-        }
-        self.spare_rows.insert(list.to_owned(), vec![row]);
+        self.spare_rows.push(list, row);
     }
 
     fn remove_row_for_predicate(
@@ -8394,7 +8454,7 @@ impl GenericCircuitRuntime {
         list: &str,
         index: usize,
         field: &str,
-    ) -> RuntimeResult<&RuntimeValue> {
+    ) -> RuntimeResult<FieldValueRef<'_>> {
         self.lists
             .get(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
@@ -8402,42 +8462,17 @@ impl GenericCircuitRuntime {
             .get(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
             .value
-            .fields
-            .get(field)
-            .ok_or_else(|| format!("generic list `{list}` row missing field `{field}`").into())
-    }
-
-    fn list_row_field_mut(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-    ) -> RuntimeResult<&mut RuntimeValue> {
-        self.lists
-            .get_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get_mut(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
-            .value
-            .fields
-            .get_mut(field)
+            .columns
+            .value(field)
             .ok_or_else(|| format!("generic list `{list}` row missing field `{field}`").into())
     }
 }
 
-impl RuntimeValue {
+impl FieldValueRef<'_> {
     fn to_json(&self) -> JsonValue {
         match self {
             Self::Text(value) | Self::Enum(value) => json!(value),
             Self::Bool(value) => json!(value),
-        }
-    }
-
-    fn as_textlike(&self) -> Option<&str> {
-        match self {
-            Self::Text(value) | Self::Enum(value) => Some(value.as_str()),
-            Self::Bool(_) => None,
         }
     }
 
@@ -8447,53 +8482,136 @@ impl RuntimeValue {
             Self::Text(_) | Self::Enum(_) => None,
         }
     }
+}
 
-    fn set_textlike(&mut self, value: &str) -> RuntimeResult<()> {
-        match self {
-            Self::Text(current) | Self::Enum(current) => {
-                current.clear();
-                current.push_str(value);
-                Ok(())
+impl ValueColumns {
+    fn insert_value(&mut self, field: String, value: FieldValue) {
+        self.text.remove(&field);
+        self.bools.remove(&field);
+        self.enums.remove(&field);
+        match value {
+            FieldValue::Text(value) => {
+                self.text.insert(field, value);
             }
-            Self::Bool(_) => Err("cannot write text into bool runtime value".into()),
-        }
-    }
-
-    fn set_bool(&mut self, value: bool) -> RuntimeResult<()> {
-        match self {
-            Self::Bool(current) => {
-                *current = value;
-                Ok(())
+            FieldValue::Bool(value) => {
+                self.bools.insert(field, value);
             }
-            Self::Text(_) | Self::Enum(_) => {
-                Err("cannot write bool into text runtime value".into())
+            FieldValue::Enum(value) => {
+                self.enums.insert(field, value);
             }
         }
     }
 
-    fn reserve_textlike(&mut self, additional: usize) -> RuntimeResult<()> {
-        match self {
-            Self::Text(value) | Self::Enum(value) => {
-                value.reserve(additional);
-                Ok(())
-            }
-            Self::Bool(_) => Err("cannot reserve text capacity on bool runtime value".into()),
+    fn contains_key(&self, field: &str) -> bool {
+        self.text.contains_key(field)
+            || self.bools.contains_key(field)
+            || self.enums.contains_key(field)
+    }
+
+    fn value(&self, field: &str) -> Option<FieldValueRef<'_>> {
+        if let Some(value) = self.text.get(field) {
+            Some(FieldValueRef::Text(value))
+        } else if let Some(value) = self.bools.get(field) {
+            Some(FieldValueRef::Bool(*value))
+        } else {
+            self.enums
+                .get(field)
+                .map(|value| FieldValueRef::Enum(value))
+        }
+    }
+
+    fn owned_value(&self, field: &str) -> Option<FieldValue> {
+        if let Some(value) = self.text.get(field) {
+            Some(FieldValue::Text(value.clone()))
+        } else if let Some(value) = self.bools.get(field) {
+            Some(FieldValue::Bool(*value))
+        } else {
+            self.enums
+                .get(field)
+                .map(|value| FieldValue::Enum(value.clone()))
+        }
+    }
+
+    fn textlike(&self, field: &str) -> Option<&str> {
+        self.text
+            .get(field)
+            .map(String::as_str)
+            .or_else(|| self.enums.get(field).map(String::as_str))
+    }
+
+    fn bool_value(&self, field: &str) -> Option<bool> {
+        self.bools.get(field).copied()
+    }
+
+    fn set_textlike(&mut self, field: &str, value: &str) -> RuntimeResult<()> {
+        if let Some(current) = self.text.get_mut(field) {
+            current.clear();
+            current.push_str(value);
+            Ok(())
+        } else if let Some(current) = self.enums.get_mut(field) {
+            current.clear();
+            current.push_str(value);
+            Ok(())
+        } else if self.bools.contains_key(field) {
+            Err("cannot write text into bool runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn set_or_insert_text(&mut self, field: &str, value: &str) -> RuntimeResult<()> {
+        if self.contains_key(field) {
+            self.set_textlike(field, value)
+        } else {
+            self.text.insert(field.to_owned(), value.to_owned());
+            Ok(())
+        }
+    }
+
+    fn set_bool(&mut self, field: &str, value: bool) -> RuntimeResult<()> {
+        if let Some(current) = self.bools.get_mut(field) {
+            *current = value;
+            Ok(())
+        } else if self.text.contains_key(field) || self.enums.contains_key(field) {
+            Err("cannot write bool into text runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn reserve_textlike(&mut self, field: &str, additional: usize) -> RuntimeResult<()> {
+        if let Some(value) = self.text.get_mut(field) {
+            value.reserve(additional);
+            Ok(())
+        } else if let Some(value) = self.enums.get_mut(field) {
+            value.reserve(additional);
+            Ok(())
+        } else if self.bools.contains_key(field) {
+            Err("cannot reserve text capacity on bool runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn reserve_all_textlike(&mut self, additional: usize) {
+        for value in self.text.values_mut() {
+            value.reserve(additional);
+        }
+        for value in self.enums.values_mut() {
+            value.reserve(additional);
         }
     }
 }
 
-fn list_seed_fields(
-    row: &boon_ir::ListSeedRecord,
-) -> RuntimeResult<BTreeMap<String, RuntimeValue>> {
-    row.fields
-        .iter()
-        .map(|field| {
-            Ok((
-                field.name.clone(),
-                runtime_value_from_initial(&field.value, &BTreeMap::new())?,
-            ))
-        })
-        .collect()
+fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns> {
+    let mut columns = ValueColumns::default();
+    for field in &row.fields {
+        columns.insert_value(
+            field.name.clone(),
+            runtime_value_from_initial(&field.value, &ValueColumns::default())?,
+        );
+    }
+    Ok(columns)
 }
 
 impl GenericRowTemplate {
@@ -8518,21 +8636,16 @@ impl GenericRowTemplate {
         Ok(Self { fields })
     }
 
-    fn materialize(
-        &self,
-        mut seed_fields: BTreeMap<String, RuntimeValue>,
-    ) -> RuntimeResult<GenericRow> {
+    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<GenericRow> {
         for field in &self.fields {
             if seed_fields.contains_key(&field.field) {
                 continue;
             }
-            seed_fields.insert(
-                field.field.clone(),
-                runtime_value_from_initial(&field.initial_value, &seed_fields)?,
-            );
+            let value = runtime_value_from_initial(&field.initial_value, &seed_fields)?;
+            seed_fields.insert_value(field.field.clone(), value);
         }
         Ok(GenericRow {
-            fields: seed_fields,
+            columns: seed_fields,
         })
     }
 
@@ -8542,18 +8655,17 @@ impl GenericRowTemplate {
         seed_text: impl Fn(&str) -> Option<&'a str>,
     ) -> RuntimeResult<()> {
         for field in &self.fields {
-            let slot = row
-                .fields
-                .get_mut(&field.field)
-                .ok_or_else(|| format!("generic row missing field `{}`", field.field))?;
+            if !row.columns.contains_key(&field.field) {
+                return Err(format!("generic row missing field `{}`", field.field).into());
+            }
             match &field.initial_value {
-                InitialValue::Text { value } => slot.set_textlike(value)?,
-                InitialValue::Bool { value } => slot.set_bool(*value)?,
-                InitialValue::Enum { value } => slot.set_textlike(value)?,
+                InitialValue::Text { value } => row.columns.set_textlike(&field.field, value)?,
+                InitialValue::Bool { value } => row.columns.set_bool(&field.field, *value)?,
+                InitialValue::Enum { value } => row.columns.set_textlike(&field.field, value)?,
                 InitialValue::SeedField { path } => {
                     let value =
                         seed_text(path).ok_or_else(|| format!("seed field `{path}` is missing"))?;
-                    slot.set_textlike(value)?;
+                    row.columns.set_textlike(&field.field, value)?;
                 }
                 InitialValue::Unknown { summary } => {
                     return Err(format!("unsupported state initializer `{summary}`").into());
@@ -8566,26 +8678,21 @@ impl GenericRowTemplate {
 
 impl GenericRow {
     fn reserve_textlike_fields(&mut self, additional: usize) -> RuntimeResult<()> {
-        for value in self.fields.values_mut() {
-            if value.as_textlike().is_some() {
-                value.reserve_textlike(additional)?;
-            }
-        }
+        self.columns.reserve_all_textlike(additional);
         Ok(())
     }
 }
 
 fn runtime_value_from_initial(
     initial: &InitialValue,
-    seed_fields: &BTreeMap<String, RuntimeValue>,
-) -> RuntimeResult<RuntimeValue> {
+    seed_fields: &ValueColumns,
+) -> RuntimeResult<FieldValue> {
     match initial {
-        InitialValue::Text { value } => Ok(RuntimeValue::Text(value.clone())),
-        InitialValue::Bool { value } => Ok(RuntimeValue::Bool(*value)),
-        InitialValue::Enum { value } => Ok(RuntimeValue::Enum(value.clone())),
+        InitialValue::Text { value } => Ok(FieldValue::Text(value.clone())),
+        InitialValue::Bool { value } => Ok(FieldValue::Bool(*value)),
+        InitialValue::Enum { value } => Ok(FieldValue::Enum(value.clone())),
         InitialValue::SeedField { path } => seed_fields
-            .get(path)
-            .cloned()
+            .owned_value(path)
             .ok_or_else(|| format!("seed field `{path}` is missing").into()),
         InitialValue::Unknown { summary } => {
             Err(format!("unsupported state initializer `{summary}`").into())
@@ -8606,9 +8713,10 @@ fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut Gen
         else {
             continue;
         };
-        row.fields
-            .entry(field.to_owned())
-            .or_insert_with(|| RuntimeValue::Text(String::new()));
+        if !row.columns.contains_key(field) {
+            row.columns
+                .insert_value(field.to_owned(), FieldValue::Text(String::new()));
+        }
     }
 }
 
@@ -8632,12 +8740,12 @@ fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
 
 #[cfg(test)]
 fn todo_generic_row(title: &str) -> GenericRow {
-    let mut fields = BTreeMap::new();
-    fields.insert("title".to_owned(), RuntimeValue::Text(title.to_owned()));
-    fields.insert("edit_text".to_owned(), RuntimeValue::Text(title.to_owned()));
-    fields.insert("completed".to_owned(), RuntimeValue::Bool(false));
-    fields.insert("editing".to_owned(), RuntimeValue::Bool(false));
-    GenericRow { fields }
+    let mut columns = ValueColumns::default();
+    columns.insert_value("title".to_owned(), FieldValue::Text(title.to_owned()));
+    columns.insert_value("edit_text".to_owned(), FieldValue::Text(title.to_owned()));
+    columns.insert_value("completed".to_owned(), FieldValue::Bool(false));
+    columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
+    GenericRow { columns }
 }
 
 #[cfg(test)]
@@ -8661,15 +8769,15 @@ fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
 
 #[cfg(test)]
 fn cell_generic_row(address: &str) -> GenericRow {
-    let mut fields = BTreeMap::new();
-    fields.insert("address".to_owned(), RuntimeValue::Text(address.to_owned()));
-    fields.insert("editing_text".to_owned(), RuntimeValue::Text(String::new()));
-    fields.insert("formula_text".to_owned(), RuntimeValue::Text(String::new()));
-    fields.insert("value".to_owned(), RuntimeValue::Text(String::new()));
-    fields.insert("error".to_owned(), RuntimeValue::Text(String::new()));
-    fields.insert("dependencies".to_owned(), RuntimeValue::Text(String::new()));
-    fields.insert("editing".to_owned(), RuntimeValue::Bool(false));
-    GenericRow { fields }
+    let mut columns = ValueColumns::default();
+    columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
+    columns.insert_value("editing_text".to_owned(), FieldValue::Text(String::new()));
+    columns.insert_value("formula_text".to_owned(), FieldValue::Text(String::new()));
+    columns.insert_value("value".to_owned(), FieldValue::Text(String::new()));
+    columns.insert_value("error".to_owned(), FieldValue::Text(String::new()));
+    columns.insert_value("dependencies".to_owned(), FieldValue::Text(String::new()));
+    columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
+    GenericRow { columns }
 }
 
 #[derive(Clone, Debug)]
@@ -10241,7 +10349,7 @@ impl ListEquationPlan {
         list: &str,
         trigger: &str,
         trigger_value: &str,
-    ) -> RuntimeResult<BTreeMap<String, RuntimeValue>> {
+    ) -> RuntimeResult<ValueColumns> {
         let operation = self
             .operations
             .iter()
@@ -10257,7 +10365,7 @@ impl ListEquationPlan {
         let RuntimeListOperationKind::Append { fields, .. } = &operation.kind else {
             unreachable!();
         };
-        let mut seed_fields = BTreeMap::new();
+        let mut seed_fields = ValueColumns::default();
         for field in fields {
             if field.source != trigger {
                 return Err(format!(
@@ -10266,9 +10374,9 @@ impl ListEquationPlan {
                 )
                 .into());
             }
-            seed_fields.insert(
+            seed_fields.insert_value(
                 field.name.to_owned(),
-                RuntimeValue::Text(trigger_value.to_owned()),
+                FieldValue::Text(trigger_value.to_owned()),
             );
         }
         Ok(seed_fields)
@@ -10364,10 +10472,10 @@ fn seeded_todomvc_generic(
     let row_source_paths = runtime.list_source_bindings.source_paths("todos")?.to_vec();
     let mut rows = Vec::with_capacity(count);
     for index in 0..count {
-        let mut seed_fields = BTreeMap::new();
-        seed_fields.insert(
+        let mut seed_fields = ValueColumns::default();
+        seed_fields.insert_value(
             "title".to_owned(),
-            RuntimeValue::Text(format!("Todo {index}")),
+            FieldValue::Text(format!("Todo {index}")),
         );
         rows.push(row_template.materialize(seed_fields)?);
     }

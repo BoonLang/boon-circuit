@@ -1914,7 +1914,6 @@ fn audit_runtime_finality(
         &runtime,
         &[
             "enum RuntimeValue",
-            "struct GenericRow",
             "fields: BTreeMap<String, RuntimeValue>",
             "root: BTreeMap<String, RuntimeValue>",
             "lists: BTreeMap<String, KeyedList<GenericRow>>",

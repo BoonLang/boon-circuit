@@ -133,9 +133,9 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   `audit-machine-readiness` is the unattended implementation gate. It must pass
   before handoff and must not count missing real human reports as accepted.
   It also requires `target/reports/runtime-finality.json`,
-  `target/reports/playground-genericity.json`, and their debug mirrors to carry
-  the current git commit, while `verify-report-schema` remains only a
-  shape/hash-validity gate.
+  `target/reports/playground-genericity.json`, their debug mirrors, and every
+  TodoMVC/Cells machine report to carry the current git commit, while
+  `verify-report-schema` remains only a shape/hash-validity gate.
   Readiness audits refresh the recursive schema summary before inspecting it, so
   this command order is valid even though earlier commands rewrite report
   artifacts.

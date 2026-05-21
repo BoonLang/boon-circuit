@@ -193,8 +193,9 @@ TodoMVC/Cells shell is removed.
 without accepting missing human reports as done; it records those artifacts as
 deferred to the strict goal gate. It also requires the core machine evidence
 reports `target/reports/runtime-finality.json`,
-`target/reports/playground-genericity.json`, and their debug mirrors to carry
-the current git commit, so an old pass report cannot satisfy a new checkout.
+`target/reports/playground-genericity.json`, their debug mirrors, and every
+per-example machine report for TodoMVC and Cells to carry the current git
+commit, so an old pass report cannot satisfy a new checkout.
 `cargo xtask verify-report-schema` is only a report-shape and artifact-hash
 gate. It accepts failing readiness/finality audit reports when those reports
 have nonzero `exit_status`, explicit blockers, and failing checklist items, so

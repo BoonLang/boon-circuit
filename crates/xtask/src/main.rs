@@ -2608,6 +2608,20 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
+        "reports:readiness-example-git-commit-freshness",
+        &xtask,
+        &[
+            "fn audit_example_report_git_commit_current(",
+            "format!(\"{name}:{}:git-commit-current\", layer.as_str())",
+            "report_git_commit={actual}, current_git_commit={current}",
+            "{name} {} report `{}` was generated for git commit `{actual}`, current commit is `{current}`",
+            "audit_example_report_git_commit_current(",
+        ],
+        "machine and goal readiness must reject stale per-example evidence reports generated for a previous git commit",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
         "reports:human-pass-label-provenance",
         &runtime,
         &[
@@ -5094,6 +5108,14 @@ fn audit_example_readiness(
         }
 
         let report_json = read_json(&report)?;
+        audit_example_report_git_commit_current(
+            name,
+            layer,
+            &report,
+            &report_json,
+            checks,
+            blockers,
+        );
         if matches!(
             layer,
             VerificationLayer::Semantic
@@ -5196,6 +5218,14 @@ fn audit_example_machine_readiness(
         }
 
         let report_json = read_json(&report)?;
+        audit_example_report_git_commit_current(
+            name,
+            layer,
+            &report,
+            &report_json,
+            checks,
+            blockers,
+        );
         if matches!(
             layer,
             VerificationLayer::Semantic
@@ -5232,6 +5262,35 @@ fn audit_example_machine_readiness(
         None,
     );
     Ok(())
+}
+
+fn audit_example_report_git_commit_current(
+    name: &str,
+    layer: VerificationLayer,
+    report: &Path,
+    report_json: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let current = git_commit();
+    let actual = report_json
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>");
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:{}:git-commit-current", layer.as_str()),
+        actual == current,
+        format!("report_git_commit={actual}, current_git_commit={current}"),
+        (actual != current).then(|| {
+            format!(
+                "{name} {} report `{}` was generated for git commit `{actual}`, current commit is `{current}`",
+                layer.as_str(),
+                report.display()
+            )
+        }),
+    );
 }
 
 fn audit_examples_all_report(

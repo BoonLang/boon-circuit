@@ -340,6 +340,48 @@ fn os_input_forbidden() -> bool {
     focus_free_headed() || std::env::var("BOON_FORBID_OS_INPUT").as_deref() == Ok("1")
 }
 
+fn os_input_isolated() -> bool {
+    std::env::var("BOON_OS_INPUT_ISOLATED").as_deref() == Ok("xvfb")
+}
+
+fn live_desktop_input_allowed_from(allow: Option<&str>, accept: Option<&str>) -> bool {
+    allow == Some("1") && accept == Some("1")
+}
+
+fn live_desktop_input_allowed() -> bool {
+    live_desktop_input_allowed_from(
+        std::env::var("BOON_ALLOW_LIVE_DESKTOP_INPUT")
+            .ok()
+            .as_deref(),
+        std::env::var("BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn os_input_permission_granted() -> bool {
+    !os_input_forbidden() && (os_input_isolated() || live_desktop_input_allowed())
+}
+
+fn require_os_input_permission(action: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if os_input_forbidden() {
+        return Err(format!(
+            "{action} is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit isolated OS input probe"
+        )
+        .into());
+    }
+    if os_input_isolated() {
+        return Ok(());
+    }
+    if live_desktop_input_allowed() {
+        return Ok(());
+    }
+    Err(format!(
+        "{action} targets the live desktop; run through xtask for isolated Xvfb, or set both BOON_ALLOW_LIVE_DESKTOP_INPUT=1 and BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1"
+    )
+    .into())
+}
+
 async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_after(args, "--example").unwrap_or_else(default_example_name);
     let focus_free = focus_free_headed();
@@ -2970,7 +3012,7 @@ fn skipped_os_keyboard_probe(screenshot: &PathBuf) -> serde_json::Value {
 }
 
 fn use_real_pointer_probe() -> bool {
-    !os_input_forbidden() && std::env::var_os("BOON_ALLOW_OS_POINTER_PROBE").is_some()
+    os_input_permission_granted() && std::env::var_os("BOON_ALLOW_OS_POINTER_PROBE").is_some()
 }
 
 async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2980,6 +3022,7 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
                 .into(),
         );
     }
+    require_os_input_permission("standalone OS keyboard input probe")?;
     let report = value_after(args, "--report")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/reports/os-input-probe.json"));
@@ -5741,9 +5784,7 @@ fn command_path(command: &str) -> Option<String> {
 }
 
 fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if os_input_forbidden() {
-        return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
-    }
+    require_os_input_permission("OS keyboard text input")?;
     if display_server() == "x11" {
         let Some(xdotool) = command_path("xdotool") else {
             return Err("xdotool is required for isolated X11 OS text input".into());
@@ -5770,9 +5811,7 @@ fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if os_input_forbidden() {
-        return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
-    }
+    require_os_input_permission("OS keyboard key input")?;
     if display_server() == "x11" {
         let Some(xdotool) = command_path("xdotool") else {
             return Err("xdotool is required for isolated X11 OS key input".into());
@@ -5802,9 +5841,7 @@ fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn send_real_pointer_click(
     bounds: ply_engine::math::BoundingBox,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    if os_input_forbidden() {
-        return Err("OS pointer input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
-    }
+    require_os_input_permission("OS pointer click input")?;
     let (window_x, window_y, scale, local_x, local_y, screen_position, delta) =
         pointer_target_coordinates(bounds);
     if display_server() != "wayland"
@@ -5865,9 +5902,7 @@ fn send_real_pointer_click(
 fn send_real_pointer_move(
     bounds: ply_engine::math::BoundingBox,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    if os_input_forbidden() {
-        return Err("OS pointer input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
-    }
+    require_os_input_permission("OS pointer movement input")?;
     let (window_x, window_y, scale, local_x, local_y, screen_position, delta) =
         pointer_target_coordinates(bounds);
     if display_server() != "wayland"
@@ -6176,7 +6211,7 @@ fn current_binary_hash() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::PLAYGROUND_HELP;
+    use super::{PLAYGROUND_HELP, live_desktop_input_allowed_from};
 
     #[test]
     fn help_advertises_manual_launch_and_verifier_modes() {
@@ -6191,5 +6226,14 @@ mod tests {
                 "missing help item {needle}"
             );
         }
+    }
+
+    #[test]
+    fn live_desktop_input_requires_both_explicit_acknowledgements() {
+        assert!(live_desktop_input_allowed_from(Some("1"), Some("1")));
+        assert!(!live_desktop_input_allowed_from(Some("1"), None));
+        assert!(!live_desktop_input_allowed_from(None, Some("1")));
+        assert!(!live_desktop_input_allowed_from(Some("0"), Some("1")));
+        assert!(!live_desktop_input_allowed_from(Some("1"), Some("0")));
     }
 }

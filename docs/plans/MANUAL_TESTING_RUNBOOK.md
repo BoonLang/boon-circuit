@@ -44,7 +44,10 @@ desktop escape hatch also requires
 environment cannot accidentally send input into unrelated windows.
 The standalone `verify-os-input-probe` command follows the same rule: it owns an
 isolated Xvfb/X11 display by default and only targets the live desktop if
-both live-desktop variables are explicitly set.
+both live-desktop variables are explicitly set. Direct
+`boon_ply_playground --verify-headed` and `--verify-os-input-probe` runs also
+enforce isolated Xvfb or the same two-variable live-desktop acknowledgement, so
+the safety rule is not only an xtask convention.
 
 The aggregate commands reuse those full headed reports unless
 `BOON_ALLOW_OS_POINTER_PROBE=1` is explicitly set again. This prevents a final

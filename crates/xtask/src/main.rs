@@ -2626,6 +2626,26 @@ fn audit_runtime_finality(
         &["TodoMvcView", "CellsView", "render_todomvc", "render_cells"],
         "playground runtime surface still contains example-specific render branches outside fixtures",
     );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "playground:direct-live-desktop-input-double-ack",
+        &playground,
+        &[
+            "fn live_desktop_input_allowed_from(",
+            "BOON_ALLOW_LIVE_DESKTOP_INPUT",
+            "BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS",
+            "fn require_os_input_permission(",
+            "os_input_isolated() || live_desktop_input_allowed()",
+            "require_os_input_permission(\"standalone OS keyboard input probe\")?",
+            "require_os_input_permission(\"OS keyboard text input\")?",
+            "require_os_input_permission(\"OS keyboard key input\")?",
+            "require_os_input_permission(\"OS pointer click input\")?",
+            "require_os_input_permission(\"OS pointer movement input\")?",
+            "live_desktop_input_requires_both_explicit_acknowledgements",
+        ],
+        "direct boon_ply_playground OS input paths must enforce isolated Xvfb or both live-desktop acknowledgement environment variables",
+    );
     let schema_readiness_overclaim = format!("{}{}", "full-pass", "-reports-schema-checked");
     audit_runtime_finality_markers(
         checks,

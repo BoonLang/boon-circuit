@@ -156,8 +156,10 @@ isolated Xvfb/X11 by default and remove `WAYLAND_DISPLAY`, so verifier
 pointer/keyboard events are real OS events against the test window but cannot
 type into the live desktop. Live desktop injection is opt-in only with
 both `BOON_ALLOW_LIVE_DESKTOP_INPUT=1` and
-`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`. Passing full OS
-reports use
+`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`. The lower-level
+`boon_ply_playground --verify-headed` and `--verify-os-input-probe` paths
+enforce the same rule unless `BOON_OS_INPUT_ISOLATED=xvfb` is present from the
+isolated xtask wrapper. Passing full OS reports use
 `input_injection_method = "os_pointer_keyboard_to_visible_window"`, have no
 `os_input_limitation`, record per-step visible targets and screenshots, and are
 checked by `audit-goal-readiness`.

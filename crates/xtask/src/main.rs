@@ -2566,6 +2566,22 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
+        "reports:readiness-core-git-commit-freshness",
+        &xtask,
+        &[
+            "fn audit_core_machine_report_git_commit_fresh(",
+            "core-machine-report-git-commit-fresh",
+            "report_git_commit={actual}, current_git_commit={current}",
+            "target/reports/runtime-finality.json",
+            "target/reports/playground-genericity.json",
+            "target/reports/debug/runtime-finality.json",
+            "target/reports/debug/playground-genericity.json",
+        ],
+        "machine readiness must reject stale core evidence reports generated for a previous git commit",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
         "reports:human-pass-label-provenance",
         &runtime,
         &[
@@ -4338,6 +4354,7 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
 
     audit_top_level_report_schema(&mut checks, &mut blockers)?;
     audit_recursive_report_schema_summary(&mut checks, &mut blockers)?;
+    audit_core_machine_report_git_commit_fresh(&mut checks, &mut blockers)?;
     audit_debug_blocked_reports(&mut checks, &mut blockers)?;
     audit_foundation(&mut checks, &mut blockers)?;
     audit_playground_launch(&mut checks, &mut blockers)?;
@@ -4412,6 +4429,7 @@ fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Er
 
     audit_top_level_report_schema(&mut checks, &mut blockers)?;
     audit_recursive_report_schema_summary(&mut checks, &mut blockers)?;
+    audit_core_machine_report_git_commit_fresh(&mut checks, &mut blockers)?;
     audit_debug_blocked_reports(&mut checks, &mut blockers)?;
     audit_foundation(&mut checks, &mut blockers)?;
     audit_playground_launch(&mut checks, &mut blockers)?;
@@ -4762,6 +4780,54 @@ fn report_artifact_hash_entries_current(
         }
     }
     Ok(true)
+}
+
+fn audit_core_machine_report_git_commit_fresh(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current = git_commit();
+    for path in [
+        "target/reports/runtime-finality.json",
+        "target/reports/playground-genericity.json",
+        "target/reports/debug/runtime-finality.json",
+        "target/reports/debug/playground-genericity.json",
+    ] {
+        let path = Path::new(path);
+        if !path.exists() {
+            push_audit_check(
+                checks,
+                blockers,
+                format!("core-machine-report-git-commit-fresh:{}", path.display()),
+                false,
+                format!("missing {}", path.display()),
+                Some(format!(
+                    "core machine evidence report `{}` is missing",
+                    path.display()
+                )),
+            );
+            continue;
+        }
+        let report = read_json(path)?;
+        let actual = report
+            .get("git_commit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        push_audit_check(
+            checks,
+            blockers,
+            format!("core-machine-report-git-commit-fresh:{}", path.display()),
+            actual == current,
+            format!("report_git_commit={actual}, current_git_commit={current}"),
+            (actual != current).then(|| {
+                format!(
+                    "core machine evidence report `{}` was generated for git commit `{actual}`, current commit is `{current}`",
+                    path.display()
+                )
+            }),
+        );
+    }
+    Ok(())
 }
 
 fn blocked_report_completed_artifacts_hashed(report: &serde_json::Value, field: &str) -> bool {

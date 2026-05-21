@@ -59,7 +59,10 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   to `compiled_schedule` instead of accepting free-form capability claims. Any
   accepted executable report must also include `expression_coverage`, computed
   from parser AST plus typed IR, with zero `Unknown` expression, initializer,
-  update, or predicate fallback counts.
+  update, or predicate fallback counts. The runtime block must mirror the
+  top-level `runtime_profile`, `runtime_profile_detail`, `capacities`, and
+  `expression_coverage` fields exactly; schema and readiness audits must reject
+  drift between those copies.
   remaining TodoMVC/Cells shell must be listed explicitly as an
   allowed scenario/assertion/report shell through
   `remaining_example_specific_shells` until removed.

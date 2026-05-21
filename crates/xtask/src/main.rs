@@ -2014,6 +2014,7 @@ fn verify_runtime_finality(args: &[String]) -> Result<(), Box<dyn std::error::Er
         "README.md",
         "docs/architecture/DECISIONS.md",
         "docs/plans/RUNTIME_FINALITY_HONESTY_PLAN.md",
+        "docs/plans/EXAMPLE_VERIFICATION_PLAN.md",
     ];
     let artifact_sha256s = artifact_paths
         .iter()
@@ -2076,6 +2077,13 @@ fn audit_runtime_finality(
     let xtask = read_source_for_audit("crates/xtask/src/main.rs", checks, blockers)?;
     let readme = read_source_for_audit("README.md", checks, blockers)?;
     let decisions = read_source_for_audit("docs/architecture/DECISIONS.md", checks, blockers)?;
+    let runtime_plan = read_source_for_audit(
+        "docs/plans/RUNTIME_FINALITY_HONESTY_PLAN.md",
+        checks,
+        blockers,
+    )?;
+    let verification_plan =
+        read_source_for_audit("docs/plans/EXAMPLE_VERIFICATION_PLAN.md", checks, blockers)?;
     let ir_production = source_before_cfg_test(&ir);
 
     audit_runtime_finality_markers(
@@ -2622,7 +2630,14 @@ fn audit_runtime_finality(
         "report schema summary still uses naming that can be mistaken for final readiness",
     );
 
-    audit_runtime_finality_docs(checks, blockers, &readme, &decisions);
+    audit_runtime_finality_docs(
+        checks,
+        blockers,
+        &readme,
+        &decisions,
+        &runtime_plan,
+        &verification_plan,
+    );
     audit_runtime_finality_reports(checks, blockers)?;
     Ok(())
 }
@@ -2783,12 +2798,15 @@ fn audit_runtime_finality_docs(
     blockers: &mut Vec<String>,
     readme: &str,
     decisions: &str,
+    runtime_plan: &str,
+    verification_plan: &str,
 ) {
+    let docs = format!("{readme}\n{decisions}\n{runtime_plan}\n{verification_plan}");
     audit_runtime_finality_markers(
         checks,
         blockers,
         "docs:no-final-runtime-overclaim",
-        &format!("{readme}\n{decisions}"),
+        &docs,
         &[
             "Executable reports contain `runtime_execution` metadata. The current accepted semantic/headless/headed/speed reports must show that Boon source and typed IR are loaded, the static schedule is verified, and `example_behavior_adapter` is\n`false`.",
             "set `generic_interpreter_complete = true`, and\nset `example_behavior_adapter = false`. The headed reports now prove full\nOS pointer/keyboard coverage.",
@@ -2801,7 +2819,7 @@ fn audit_runtime_finality_docs(
         checks,
         blockers,
         "docs:runtime-slice-evidence-documented",
-        &format!("{readme}\n{decisions}"),
+        &docs,
         &[
             "generic_runtime_slice_evidence",
             "computed from typed IR plus the compiled",
@@ -2813,7 +2831,7 @@ fn audit_runtime_finality_docs(
             "`runtime_profile`, `runtime_profile_detail`, `capacities`, and",
             "reject drift",
         ],
-        "README or architecture docs must document evidence-bound generic runtime and parser/lowering coverage claims",
+        "README, architecture docs, and plan docs must document evidence-bound generic runtime and parser/lowering coverage claims",
     );
 }
 

@@ -35,6 +35,17 @@ input_injection_method = os_pointer_keyboard_to_visible_window
 os_input_coverage.missing_full_os_pointer_keyboard_steps = []
 ```
 
+The headed aliases run in an isolated Xvfb/X11 display by default. This still
+uses real OS pointer/keyboard events against a visible native Ply window, but it
+keeps those events away from the user's active desktop windows. Do not use
+`BOON_ALLOW_LIVE_DESKTOP_INPUT=1` during normal verification. The xtask live
+desktop escape hatch also requires
+`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`, so a stale shell
+environment cannot accidentally send input into unrelated windows.
+The standalone `verify-os-input-probe` command follows the same rule: it owns an
+isolated Xvfb/X11 display by default and only targets the live desktop if
+both live-desktop variables are explicitly set.
+
 The aggregate commands reuse those full headed reports unless
 `BOON_ALLOW_OS_POINTER_PROBE=1` is explicitly set again. This prevents a final
 aggregate run from overwriting full OS pointer/keyboard evidence with a partial
@@ -73,27 +84,26 @@ For a bounded background-launch smoke that exits by itself and writes evidence:
 
 ```bash
 cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --smoke-launch --example todomvc --frames 3 --report target/reports/playground-background-launch-todomvc.json
-cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --smoke-launch --example cells --frames 3 --report target/reports/playground-background-launch-cells.json
+cosmic-background-launch --workspace boon-circuit -- xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 3 --report target/reports/playground-background-launch-todomvc.json
+cosmic-background-launch --workspace boon-circuit -- xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example cells --frames 3 --report target/reports/playground-background-launch-cells.json
 ```
 
 Prefer the `cargo xtask verify-playground-background-launch` wrapper for
 evidence. It invokes `cosmic-background-launch`, captures the printed child
-PIDs/launch ids, waits for fresh TodoMVC and Cells smoke reports, validates
-their schemas, and verifies the bounded child processes have exited.
+PIDs/launch ids, runs the smoke child in isolated Xvfb/X11 so screenshots come
+from the macroquad framebuffer rather than the live desktop, waits for fresh
+TodoMVC and Cells smoke reports, validates their schemas, and verifies the
+bounded child processes have exited.
 
-Background launch only controls initial focus. Real keyboard and mouse
-interaction still has to target the visible playground window, because OS input
-is delivered to the active surface. That is acceptable when the machine is left
-for testing; it is not a substitute for a human report unless a real person
-performs the visible checklist and records the session artifacts.
+Background launch only controls initial focus. It must not be combined with an
+automated keyboard or pointer injector against the user's real desktop. Real
+keyboard and mouse interaction still has to target the visible playground window
+and is only acceptable for a manual session when a real person performs the
+visible checklist and records the session artifacts.
 
-Do not use background launch for the full automated headed verifier. A direct
-test of `cosmic-background-launch --workspace boon-circuit -- cargo run
---release -p boon_ply_playground -- --verify-headed --example todomvc` left the
-verifier process alive for 120 seconds without creating its report. That is a
-failure, not evidence. The full headed verifier should be run as a directly
-controlled foreground process on the dedicated testing workspace:
+Do not use background launch for the full automated headed verifier. The full
+headed verifier should be run directly through xtask so it owns the isolated
+display process, timeout, and report path:
 
 ```bash
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
@@ -171,6 +181,10 @@ cargo xtask prepare-todomvc-human-report \
   --finished "$TODO_MANUAL_FINISHED_AT" \
   --window-pid "replace-with-visible-playground-pid" \
   --focused-window-proof "replace-with-how-focus-was-confirmed-before-input" \
+  --display-server "replace-with-live-display-server-wayland-or-x11" \
+  --display-connection "replace-with-live-display-socket-or-display" \
+  --display-scale "replace-with-live-display-scale" \
+  --window-backend "replace-with-live-window-backend" \
   --notes "replace-with-visual-quality-notes-and-deviations" \
   --capture-method "import -window root, or name the desktop screenshot/video tool actually used" \
   --artifact "$TODO_ARTIFACT" \
@@ -204,6 +218,14 @@ verifier process copied into the template for binding context.
 The helper also writes `manual_report_prepared_by`,
 `manual_report_template_path`, and `manual_report_template_sha256`; checker mode
 rejects hand-written reports that do not come through that prepared template.
+The `--display-*` and `--window-backend` values must describe the visible manual
+session. They are required helper arguments so the final human report cannot
+silently inherit the isolated headed verifier display metadata from the
+template.
+The checker also compares the prepared command's `--pass-label` arguments with
+`manual_checklist_pass_fail`; they must match exactly, so a passing report cannot
+be created by editing checklist booleans after the helper runs or by omitting a
+verified scenario label from command provenance.
 
 Then check it:
 
@@ -271,6 +293,10 @@ cargo xtask prepare-cells-human-report \
   --finished "$CELLS_MANUAL_FINISHED_AT" \
   --window-pid "replace-with-visible-playground-pid" \
   --focused-window-proof "replace-with-how-focus-was-confirmed-before-input" \
+  --display-server "replace-with-live-display-server-wayland-or-x11" \
+  --display-connection "replace-with-live-display-socket-or-display" \
+  --display-scale "replace-with-live-display-scale" \
+  --window-backend "replace-with-live-window-backend" \
   --notes "replace-with-visual-quality-notes-and-deviations" \
   --capture-method "import -window root, or name the desktop screenshot/video tool actually used" \
   --artifact "$CELLS_ARTIFACT" \
@@ -293,15 +319,25 @@ Only after both human reports pass:
 cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
 cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
-cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json
+cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
 
-If a human report is missing or stale, the aggregate command writes a debug-only
-blocked report under `target/reports/debug/*-all-blocked.json` and deliberately
-does not create a passing top-level `*-all.json`.
+If a human report is missing or stale, the per-example aggregate commands write
+debug-only blocked reports under `target/reports/debug/*-all-blocked.json`. The
+cross-example aggregate also writes
+`target/reports/debug/examples-all-blocked.json` with every blocked example in
+the same report, and deliberately removes or avoids a passing top-level
+`target/reports/examples-all.json`.
 
 `audit-manual-readiness` runs the same readiness contract but writes a
 manual-specific report name. Before the real human pass exists, it should fail
 only on the missing human reports and the missing final aggregate reports. After
 both human reports pass, both readiness commands must pass.
+`audit-machine-readiness` is intentionally narrower: it verifies the automated
+reports, templates, handoff docs, and finality checks while recording the human
+and final aggregate reports as deferred to `audit-goal-readiness`.
+Both readiness audits refresh `target/reports/schema.json` before checking it,
+so they do not depend on a hidden extra schema command after a report-generating
+step.

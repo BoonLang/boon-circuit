@@ -23,7 +23,7 @@ pub struct ParsedProgram {
     pub source: String,
     pub kind: ProgramKind,
     pub ast: AstProgram,
-    pub expressions: Vec<ParsedExpression>,
+    pub expressions: Vec<AstExpr>,
     pub sources: Vec<String>,
     pub source_ports: Vec<ParsedSourcePort>,
     pub holds: Vec<String>,
@@ -38,14 +38,200 @@ pub struct ParsedProgram {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstProgram {
     pub tokens: Vec<AstToken>,
+    pub lines: Vec<ParserLine>,
+    pub items: Vec<ParserItem>,
+    pub statements: Vec<AstStatement>,
+    pub expressions: Vec<AstExpr>,
 }
 
 impl AstProgram {
     pub fn semantic_tokens(&self) -> impl Iterator<Item = &AstToken> {
-        self.tokens
-            .iter()
-            .filter(|token| !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String))
+        self.tokens.iter().filter(|token| {
+            !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
+                && !self.line_is_view(token.line)
+                && !self
+                    .lines
+                    .iter()
+                    .find(|line| line.line == token.line)
+                    .is_some_and(|line| line.symbols.first().map(String::as_str) == Some("#"))
+        })
     }
+
+    pub fn semantic_parser_lines(&self) -> impl Iterator<Item = &ParserLine> {
+        self.lines.iter().filter(|line| {
+            !line.symbols.is_empty()
+                && line.symbols.first().map(String::as_str) != Some("#")
+                && !self.line_is_view(line.line)
+        })
+    }
+
+    pub fn semantic_parser_items(&self) -> impl Iterator<Item = &ParserItem> {
+        self.items.iter().filter(|item| !item.is_view)
+    }
+
+    fn line_is_view(&self, line: usize) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.line == line && item.is_view)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParserLine {
+    pub line: usize,
+    pub indent: usize,
+    pub symbols: Vec<String>,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParserItem {
+    pub line: usize,
+    pub indent: usize,
+    pub start: usize,
+    pub end: usize,
+    pub symbols: Vec<String>,
+    pub field: Option<String>,
+    pub example: Option<String>,
+    pub function: Option<String>,
+    pub map_new_function: Option<String>,
+    pub source_event: Option<String>,
+    pub hold: Option<String>,
+    pub list_capacity: Option<usize>,
+    pub is_list: bool,
+    pub is_grid_list: bool,
+    pub is_view: bool,
+    pub opens_scope: bool,
+    pub closes_scope: bool,
+    pub operators: Vec<String>,
+}
+
+impl ParserItem {
+    pub fn has_lexeme(&self, lexeme: &str) -> bool {
+        self.symbols.iter().any(|candidate| candidate == lexeme)
+    }
+
+    pub fn contains_sequence(&self, sequence: &[&str]) -> bool {
+        if sequence.is_empty() {
+            return true;
+        }
+        self.symbols.windows(sequence.len()).any(|window| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(sequence.iter().copied())
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstStatement {
+    pub id: usize,
+    pub line: usize,
+    pub indent: usize,
+    pub start: usize,
+    pub end: usize,
+    pub kind: AstStatementKind,
+    pub expr: Option<usize>,
+    pub children: Vec<AstStatement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstStatementKind {
+    Example {
+        name: String,
+    },
+    Function {
+        name: String,
+        args: Vec<String>,
+    },
+    Field {
+        name: String,
+    },
+    Source {
+        field: Option<String>,
+        event: Option<String>,
+    },
+    Hold {
+        name: Option<String>,
+    },
+    List {
+        field: Option<String>,
+        capacity: Option<usize>,
+        grid: bool,
+    },
+    View,
+    Block,
+    Expression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstExpr {
+    pub id: usize,
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub kind: AstExprKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstExprKind {
+    Identifier(String),
+    Path(Vec<String>),
+    TextLiteral(String),
+    Number(String),
+    Bool(bool),
+    Enum(String),
+    Source,
+    Call {
+        function: String,
+        args: Vec<AstCallArg>,
+    },
+    Pipe {
+        input: usize,
+        op: String,
+        args: Vec<AstCallArg>,
+    },
+    Hold {
+        initial: usize,
+        name: String,
+    },
+    Latest,
+    When {
+        input: usize,
+    },
+    Then {
+        input: usize,
+        output: Option<usize>,
+    },
+    Infix {
+        left: usize,
+        op: String,
+        right: usize,
+    },
+    MatchArm {
+        pattern: Vec<String>,
+        output: Option<usize>,
+    },
+    Record(Vec<AstRecordField>),
+    ListLiteral {
+        capacity: Option<usize>,
+    },
+    Delimiter,
+    Unknown(Vec<String>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstCallArg {
+    pub name: Option<String>,
+    pub value: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstRecordField {
+    pub name: String,
+    pub value: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,15 +254,6 @@ pub enum AstTokenKind {
     Symbol,
     Newline,
     Unknown,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ParsedExpression {
-    pub id: usize,
-    pub line: usize,
-    pub kind: ParsedExpressionKind,
-    pub label: String,
-    pub indexed_hint: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,17 +281,8 @@ pub struct ParsedListMemory {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParsedRowScopeFunction {
     pub function: String,
+    pub list: String,
     pub row_scope: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ParsedExpressionKind {
-    Source,
-    Hold,
-    List,
-    Function,
-    Operator,
-    Field,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,34 +307,47 @@ pub fn parse_source(
     let source = source.into();
     let ast = parse_ast(&path, &source)?;
     let kind = detect_program_kind(&path, &ast)?;
-    validate_balanced_brackets(&path, &source)?;
-    validate_required_constructs(&path, &source)?;
-    validate_list_capacities(&path, &source)?;
-    validate_no_reducer_style_update(&path, &source)?;
-    validate_no_hidden_identity_leak(&path, &source, kind)?;
-    let semantic_source = strip_view_blocks(&source);
-    let semantic_ast = parse_ast(&path, &semantic_source)?;
-    let row_scope_functions = collect_row_scope_functions(&semantic_source);
-    let structure = collect_structure(&semantic_source, &row_scope_functions);
+    validate_balanced_brackets(&path, &ast)?;
+    validate_required_constructs(&path, &ast)?;
+    validate_list_capacities(&path, &ast)?;
+    validate_no_reducer_style_update(&path, &ast)?;
+    validate_no_hidden_identity_leak(&path, &ast, kind)?;
+    let row_scope_functions = collect_row_scope_functions(&ast);
+    let structure = derive_program_tables(&ast, &row_scope_functions);
     Ok(ParsedProgram {
-        expressions: collect_ast_expressions(&semantic_ast),
-        sources: collect_sources(&semantic_source),
+        expressions: ast.expressions.clone(),
+        sources: collect_sources(&ast),
         source_ports: structure.source_ports,
-        holds: collect_named_lines(&semantic_source, "HOLD"),
+        holds: collect_named_statements(&ast, "HOLD"),
         state_cells: structure.state_cells,
-        lists: collect_named_lines(&semantic_source, "LIST"),
+        lists: collect_named_statements(&ast, "LIST"),
         list_memories: structure.list_memories,
         row_scope_functions,
-        functions: collect_functions(&semantic_source),
-        operators: collect_operators(&semantic_source),
+        functions: collect_functions(&ast),
+        operators: collect_operators(&ast),
         path,
-        source: semantic_source,
+        source,
         kind,
         ast,
     })
 }
 
+pub fn parse_view_lines(
+    path: impl Into<String>,
+    source: impl Into<String>,
+) -> Result<Vec<String>, ParseError> {
+    let path = path.into();
+    let source = source.into();
+    let ast = parse_ast(&path, &source)?;
+    Ok(view_lines_from_ast(&ast))
+}
+
+pub fn parsed_view_lines(program: &ParsedProgram) -> Vec<String> {
+    view_lines_from_ast(&program.ast)
+}
+
 fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
+    let source_index = SourceIndex::new(source);
     let spanned = token_parser()
         .repeated()
         .then_ignore(end())
@@ -185,8 +366,10 @@ fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let tokens = spanned
         .into_iter()
         .map(|(kind, span)| {
-            let (line, column) = line_column(source, span.start);
-            let raw_lexeme = source.get(span.clone()).unwrap_or_default();
+            let start = source_index.char_offset_to_byte(span.start);
+            let end = source_index.char_offset_to_byte(span.end);
+            let (line, column) = source_index.line_column(source, start);
+            let raw_lexeme = source.get(start..end).unwrap_or_default();
             let lexeme = match kind {
                 AstTokenKind::String | AstTokenKind::Comment | AstTokenKind::Newline => raw_lexeme,
                 _ => raw_lexeme.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r')),
@@ -196,12 +379,85 @@ fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
                 lexeme: lexeme.to_owned(),
                 line,
                 column,
-                start: span.start,
-                end: span.end,
+                start,
+                end,
             }
         })
-        .collect();
-    Ok(AstProgram { tokens })
+        .collect::<Vec<_>>();
+    let lines = parser_lines(&tokens);
+    let items = parser_items(&lines);
+    let mut expressions = Vec::new();
+    let statements = ast_statement_tree(&items, &mut expressions);
+    Ok(AstProgram {
+        tokens,
+        lines,
+        items,
+        statements,
+        expressions,
+    })
+}
+
+fn view_lines_from_ast(ast: &AstProgram) -> Vec<String> {
+    let mut in_view = false;
+    let mut depth = 0i32;
+    let mut lines = Vec::new();
+    for item in ast.items.iter().filter(|item| item.is_view) {
+        let starts_view = !in_view
+            && item.symbols.first().map(String::as_str) == Some("VIEW")
+            && item.symbols.iter().any(|symbol| symbol == "{");
+        if starts_view {
+            in_view = true;
+            depth = symbol_brace_delta(&item.symbols);
+            continue;
+        }
+        if !in_view {
+            continue;
+        }
+        depth += symbol_brace_delta(&item.symbols);
+        if depth <= 0 {
+            return lines;
+        }
+        let line = view_line_from_ast_tokens(ast, item.line);
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn view_line_from_ast_tokens(ast: &AstProgram, line: usize) -> String {
+    let mut output = String::new();
+    for token in ast.tokens.iter().filter(|token| token.line == line) {
+        if matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
+            continue;
+        }
+        push_view_token(&mut output, &token.lexeme);
+    }
+    output
+}
+
+fn push_view_token(output: &mut String, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    if output.is_empty()
+        || view_token_no_space_before(token)
+        || output.chars().last().is_some_and(view_token_no_space_after)
+    {
+        output.push_str(token);
+    } else {
+        output.push(' ');
+        output.push_str(token);
+    }
+}
+
+fn view_token_no_space_before(token: &str) -> bool {
+    matches!(token, ")" | "]" | "}" | "," | "." | "=" | ":")
+}
+
+fn view_token_no_space_after(ch: char) -> bool {
+    matches!(ch, '$' | '#' | '.' | '=' | ':' | ',')
 }
 
 fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), Error = Simple<char>>
@@ -224,9 +480,6 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         )
         .then_ignore(just('"'))
         .to(AstTokenKind::String);
-    let comment = just('#')
-        .ignore_then(filter(|ch: &char| *ch != '\n').repeated())
-        .to(AstTokenKind::Comment);
     let operator = choice((
         just("=>").ignored(),
         just("|>").ignored(),
@@ -237,69 +490,680 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         one_of("><=|").ignored(),
     ))
     .to(AstTokenKind::Operator);
-    let symbol = one_of("[]{}():,.$").to(AstTokenKind::Symbol);
+    let symbol = one_of("[]{}():,.$#").to(AstTokenKind::Symbol);
     let newline = just('\n').to(AstTokenKind::Newline);
     let unknown = any().to(AstTokenKind::Unknown);
 
     choice((
-        string, comment, identifier, number, operator, symbol, newline, unknown,
+        string, identifier, number, operator, symbol, newline, unknown,
     ))
     .padded_by(horizontal_space)
     .map_with_span(|kind, span| (kind, span))
 }
 
-fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for (index, ch) in source.char_indices() {
-        if index >= byte_index {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    (line, column)
+struct SourceIndex {
+    char_to_byte: Vec<usize>,
+    line_starts: Vec<usize>,
 }
 
-fn strip_view_blocks(source: &str) -> String {
-    let mut output = String::new();
-    let mut in_view = false;
-    let mut depth = 0i32;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !in_view && trimmed == "VIEW {" {
-            in_view = true;
-            depth = 1;
-            continue;
+impl SourceIndex {
+    fn new(source: &str) -> Self {
+        let mut char_to_byte = source
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .collect::<Vec<_>>();
+        char_to_byte.push(source.len());
+        let mut line_starts = vec![0];
+        for (byte, ch) in source.char_indices() {
+            if ch == '\n' {
+                line_starts.push(byte + ch.len_utf8());
+            }
         }
-        if in_view {
-            for ch in trimmed.chars() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
+        Self {
+            char_to_byte,
+            line_starts,
+        }
+    }
+
+    fn char_offset_to_byte(&self, char_offset: usize) -> usize {
+        self.char_to_byte
+            .get(char_offset)
+            .copied()
+            .unwrap_or_else(|| *self.char_to_byte.last().unwrap_or(&0))
+    }
+
+    fn line_column(&self, source: &str, byte_index: usize) -> (usize, usize) {
+        let line_index = self
+            .line_starts
+            .partition_point(|start| *start <= byte_index);
+        let line = line_index.max(1);
+        let line_start = self.line_starts[line - 1];
+        let column = source
+            .get(line_start..byte_index)
+            .map(|slice| slice.chars().count() + 1)
+            .unwrap_or(1);
+        (line, column)
+    }
+}
+
+fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
+    let mut lines = Vec::new();
+    let mut current_line = None;
+    let mut indent = 0usize;
+    let mut start = 0usize;
+    let mut end = 0usize;
+    let mut symbols = Vec::new();
+    for token in tokens {
+        if current_line != Some(token.line) {
+            if let Some(line) = current_line {
+                lines.push(ParserLine {
+                    line,
+                    indent,
+                    symbols: std::mem::take(&mut symbols),
+                    start,
+                    end,
+                });
+            }
+            current_line = Some(token.line);
+            indent = token.column.saturating_sub(1);
+            start = token.start;
+        }
+        end = token.end;
+        if !matches!(
+            token.kind,
+            AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
+        ) && !token.lexeme.is_empty()
+        {
+            symbols.push(token.lexeme.clone());
+        }
+    }
+    if let Some(line) = current_line {
+        lines.push(ParserLine {
+            line,
+            indent,
+            symbols,
+            start,
+            end,
+        });
+    }
+    lines
+}
+
+fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
+    let mut view_depth = 0i32;
+    lines
+        .iter()
+        .filter(|line| {
+            !line.symbols.is_empty() && line.symbols.first().map(String::as_str) != Some("#")
+        })
+        .map(|line| {
+            let starts_view = view_depth == 0
+                && line.symbols.first().map(String::as_str) == Some("VIEW")
+                && line.symbols.iter().any(|symbol| symbol == "{");
+            let is_view = view_depth > 0 || starts_view;
+            let item = parser_item(line, is_view);
+            if is_view {
+                view_depth += symbol_brace_delta(&line.symbols);
+                if view_depth <= 0 {
+                    view_depth = 0;
                 }
             }
-            if depth <= 0 {
-                in_view = false;
-            }
+            item
+        })
+        .collect()
+}
+
+fn parser_item(line: &ParserLine, is_view: bool) -> ParserItem {
+    let symbols = line.symbols.clone();
+    let field = ast_field_name(&symbols).map(ToOwned::to_owned);
+    let example = (symbols.first().map(String::as_str) == Some("EXAMPLE"))
+        .then(|| symbols.get(1).cloned())
+        .flatten();
+    let function = (symbols.first().map(String::as_str) == Some("FUNCTION"))
+        .then(|| symbols.get(1).cloned())
+        .flatten();
+    let source_event = ast_insource_slice_event(&symbols).map(ToOwned::to_owned);
+    let operators = ast_expression_operators(&symbols);
+    let is_list = symbols.iter().any(|lexeme| lexeme == "LIST");
+    let is_grid_list = symbols.iter().any(|lexeme| lexeme == "Grid/cells");
+    ParserItem {
+        line: line.line,
+        indent: line.indent,
+        start: line.start,
+        end: line.end,
+        map_new_function: ast_map_new_function(&symbols).map(ToOwned::to_owned),
+        source_event,
+        hold: ast_hold_name(&symbols).map(ToOwned::to_owned),
+        list_capacity: ast_list_capacity(&symbols),
+        opens_scope: ast_opens_scope(&symbols),
+        closes_scope: symbols.len() == 1 && symbols.first().map(String::as_str) == Some("}"),
+        operators,
+        symbols,
+        field,
+        example,
+        function,
+        is_list,
+        is_grid_list,
+        is_view,
+    }
+}
+
+fn ast_statement_tree(items: &[ParserItem], expressions: &mut Vec<AstExpr>) -> Vec<AstStatement> {
+    let mut index = 0usize;
+    let mut next_id = 0usize;
+    ast_statement_block(items, &mut index, 0, expressions, &mut next_id)
+}
+
+fn ast_statement_block(
+    items: &[ParserItem],
+    index: &mut usize,
+    min_indent: usize,
+    expressions: &mut Vec<AstExpr>,
+    next_id: &mut usize,
+) -> Vec<AstStatement> {
+    let mut statements = Vec::new();
+    while let Some(item) = items.get(*index) {
+        if item.indent < min_indent {
+            break;
+        }
+        if item.closes_scope {
+            *index += 1;
             continue;
         }
-        output.push_str(line);
-        output.push('\n');
+        let indent = item.indent;
+        let mut statement = ast_statement(item, expressions, *next_id);
+        *next_id += 1;
+        *index += 1;
+        if item.opens_scope || items.get(*index).is_some_and(|next| next.indent > indent) {
+            statement.children =
+                ast_statement_block(items, index, indent + 1, expressions, next_id);
+        }
+        statements.push(statement);
     }
-    output
+    statements
+}
+
+fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -> AstStatement {
+    let kind = if let Some(example) = item.example.clone() {
+        AstStatementKind::Example { name: example }
+    } else if let Some(function) = item.function.clone() {
+        AstStatementKind::Function {
+            name: function,
+            args: ast_function_args(&item.symbols),
+        }
+    } else if item.has_lexeme("SOURCE") {
+        AstStatementKind::Source {
+            field: item.field.clone(),
+            event: item.source_event.clone(),
+        }
+    } else if item.has_lexeme("HOLD") {
+        AstStatementKind::Hold {
+            name: item.hold.clone(),
+        }
+    } else if item.is_list || item.is_grid_list {
+        AstStatementKind::List {
+            field: item.field.clone(),
+            capacity: item.list_capacity,
+            grid: item.is_grid_list,
+        }
+    } else if item.symbols.first().map(String::as_str) == Some("VIEW") {
+        AstStatementKind::View
+    } else if let Some(field) = item.field.clone() {
+        AstStatementKind::Field { name: field }
+    } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "]")) {
+        AstStatementKind::Block
+    } else {
+        AstStatementKind::Expression
+    };
+    let expr = if item.is_view
+        || matches!(
+            kind,
+            AstStatementKind::Example { .. }
+                | AstStatementKind::Function { .. }
+                | AstStatementKind::View
+                | AstStatementKind::Block
+        ) {
+        None
+    } else {
+        let expr_tokens = statement_expression_tokens(item);
+        (!expr_tokens.is_empty()).then(|| parse_ast_expr(&expr_tokens, item, expressions))
+    };
+    AstStatement {
+        id,
+        line: item.line,
+        indent: item.indent,
+        start: item.start,
+        end: item.end,
+        kind,
+        expr,
+        children: Vec::new(),
+    }
+}
+
+fn statement_expression_tokens(item: &ParserItem) -> Vec<String> {
+    if item.field.is_some() && item.symbols.get(1).map(String::as_str) == Some(":") {
+        if matches!(
+            item.symbols.get(2).map(String::as_str),
+            Some("[") | Some("{")
+        ) && item.symbols.len() == 3
+        {
+            return Vec::new();
+        }
+        return item.symbols[2..].to_vec();
+    }
+    item.symbols.clone()
+}
+
+fn parse_ast_expr(tokens: &[String], item: &ParserItem, expressions: &mut Vec<AstExpr>) -> usize {
+    let kind = ast_expr_kind(tokens, item, expressions);
+    push_ast_expr(item, expressions, kind)
+}
+
+fn push_ast_expr(item: &ParserItem, expressions: &mut Vec<AstExpr>, kind: AstExprKind) -> usize {
+    let id = expressions.len();
+    expressions.push(AstExpr {
+        id,
+        line: item.line,
+        start: item.start,
+        end: item.end,
+        kind,
+    });
+    id
+}
+
+fn ast_expr_kind(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> AstExprKind {
+    if tokens.is_empty() {
+        return AstExprKind::Delimiter;
+    }
+    if tokens
+        .iter()
+        .all(|token| matches!(token.as_str(), "[" | "]" | "{" | "}" | "(" | ")"))
+    {
+        return AstExprKind::Delimiter;
+    }
+    if tokens == ["SOURCE"] {
+        return AstExprKind::Source;
+    }
+    if tokens == ["True"] {
+        return AstExprKind::Bool(true);
+    }
+    if tokens == ["False"] {
+        return AstExprKind::Bool(false);
+    }
+    if tokens.len() == 1 && tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
+        return AstExprKind::Number(tokens[0].clone());
+    }
+    if let Some(text) = text_literal_value(tokens) {
+        return AstExprKind::TextLiteral(text);
+    }
+    if tokens == ["Text/empty"] {
+        return AstExprKind::TextLiteral(String::new());
+    }
+    if tokens.first().map(String::as_str) == Some("LATEST") {
+        return AstExprKind::Latest;
+    }
+    if tokens.first().map(String::as_str) == Some("LIST") {
+        return AstExprKind::ListLiteral {
+            capacity: ast_list_capacity(tokens),
+        };
+    }
+    if tokens.first().map(String::as_str) == Some("[")
+        && tokens.last().map(String::as_str) == Some("]")
+    {
+        return AstExprKind::Record(ast_record_fields(tokens, item, expressions));
+    }
+    if let Some((left, op, right)) = split_infix(tokens) {
+        let left = parse_ast_expr(left, item, expressions);
+        let right = parse_ast_expr(right, item, expressions);
+        return AstExprKind::Infix {
+            left,
+            op: op.to_owned(),
+            right,
+        };
+    }
+    if let Some(arrow) = find_top_level_token(tokens, "=>") {
+        return AstExprKind::MatchArm {
+            pattern: tokens[..arrow].to_vec(),
+            output: (!tokens[arrow + 1..].is_empty())
+                .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions)),
+        };
+    }
+    if let Some(pipe) = find_top_level_pipe(tokens) {
+        let input = parse_ast_expr(&tokens[..pipe], item, expressions);
+        let op = tokens
+            .get(pipe + 1)
+            .cloned()
+            .unwrap_or_else(|| "pipe".to_owned());
+        if op == "HOLD" {
+            let name = tokens
+                .get(pipe + 2)
+                .cloned()
+                .unwrap_or_else(|| "hold".to_owned());
+            return AstExprKind::Hold {
+                initial: input,
+                name,
+            };
+        }
+        if op == "WHEN" {
+            return AstExprKind::When { input };
+        }
+        if op == "THEN" {
+            return AstExprKind::Then {
+                input,
+                output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions),
+            };
+        }
+        return AstExprKind::Pipe {
+            input,
+            op,
+            args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions),
+        };
+    }
+    if let Some((function, args)) = ast_call(tokens, item, expressions) {
+        return AstExprKind::Call { function, args };
+    }
+    if tokens.len() == 1 && is_name(&tokens[0]) {
+        let token = tokens[0].clone();
+        if value_starts_uppercase_identifier(&token) {
+            AstExprKind::Enum(token)
+        } else {
+            AstExprKind::Identifier(token)
+        }
+    } else if tokens.iter().any(|token| token == ".") {
+        AstExprKind::Path(path_segments(tokens))
+    } else {
+        AstExprKind::Unknown(tokens.to_vec())
+    }
+}
+
+fn ast_record_fields(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> Vec<AstRecordField> {
+    split_top_level(&tokens[1..tokens.len() - 1], ",")
+        .into_iter()
+        .filter_map(|part| {
+            if part.len() < 3 || part.get(1).map(String::as_str) != Some(":") {
+                return None;
+            }
+            Some(AstRecordField {
+                name: part[0].clone(),
+                value: parse_ast_expr(&part[2..], item, expressions),
+            })
+        })
+        .collect()
+}
+
+fn ast_call(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> Option<(String, Vec<AstCallArg>)> {
+    let open = tokens.iter().position(|token| token == "(")?;
+    if open == 0 {
+        return None;
+    }
+    let function = tokens[..open].join("");
+    let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
+    Some((
+        function,
+        split_top_level(&tokens[open + 1..close], ",")
+            .into_iter()
+            .filter_map(|part| ast_call_arg(&part, item, expressions))
+            .collect(),
+    ))
+}
+
+fn ast_call_args_after_operator(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> Vec<AstCallArg> {
+    let Some(open) = tokens.iter().position(|token| token == "(") else {
+        return Vec::new();
+    };
+    let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
+    split_top_level(&tokens[open + 1..close], ",")
+        .into_iter()
+        .filter_map(|part| ast_call_arg(&part, item, expressions))
+        .collect()
+}
+
+fn ast_operator_block_expr(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> Option<usize> {
+    let open = tokens.iter().position(|token| token == "{")?;
+    let close = matching_close(tokens, open)?;
+    (close > open + 1).then(|| parse_ast_expr(&tokens[open + 1..close], item, expressions))
+}
+
+fn ast_call_arg(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+) -> Option<AstCallArg> {
+    if tokens.is_empty() {
+        return None;
+    }
+    if tokens.get(1).map(String::as_str) == Some(":") {
+        return Some(AstCallArg {
+            name: Some(tokens[0].clone()),
+            value: parse_ast_expr(&tokens[2..], item, expressions),
+        });
+    }
+    Some(AstCallArg {
+        name: None,
+        value: parse_ast_expr(tokens, item, expressions),
+    })
+}
+
+fn ast_function_args(tokens: &[String]) -> Vec<String> {
+    let Some(open) = tokens.iter().position(|token| token == "(") else {
+        return Vec::new();
+    };
+    let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
+    split_top_level(&tokens[open + 1..close], ",")
+        .into_iter()
+        .filter_map(|part| part.first().cloned())
+        .collect()
+}
+
+fn find_top_level_pipe(tokens: &[String]) -> Option<usize> {
+    find_top_level_token(tokens, "|>")
+}
+
+fn find_top_level_token(tokens: &[String], needle: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.as_str() {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            _ => {}
+        }
+        if token == needle && depth == 0 {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.as_str() {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            "==" | ">" | "<" | ">=" | "<=" | "!=" if depth == 0 => {
+                return Some((&tokens[..index], token, &tokens[index + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matching_close(tokens: &[String], open: usize) -> Option<usize> {
+    let close_token = match tokens.get(open).map(String::as_str)? {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => return None,
+    };
+    let mut stack = vec![close_token];
+    for (index, token) in tokens.iter().enumerate().skip(open + 1) {
+        match token.as_str() {
+            "(" => stack.push(")"),
+            "[" => stack.push("]"),
+            "{" => stack.push("}"),
+            ")" | "]" | "}" => {
+                if stack.pop() != Some(token.as_str()) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level(tokens: &[String], separator: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0i32;
+    for token in tokens {
+        match token.as_str() {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            _ => {}
+        }
+        if token == separator && depth == 0 {
+            groups.push(std::mem::take(&mut current));
+        } else {
+            current.push(token.clone());
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn path_segments(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|token| token.as_str() != ".")
+        .filter(|token| is_name(token))
+        .cloned()
+        .collect()
+}
+
+fn text_literal_value(tokens: &[String]) -> Option<String> {
+    if tokens.first().map(String::as_str) != Some("TEXT")
+        || tokens.get(1).map(String::as_str) != Some("{")
+    {
+        return None;
+    }
+    let close = tokens.iter().rposition(|token| token == "}")?;
+    Some(tokens[2..close].join(" "))
+}
+
+fn value_starts_uppercase_identifier(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+fn ast_field_name(symbols: &[String]) -> Option<&str> {
+    if symbols.get(1).map(String::as_str) != Some(":") {
+        return None;
+    }
+    let name = symbols.first()?.as_str();
+    is_name(name).then_some(name)
+}
+
+fn ast_insource_slice_event(symbols: &[String]) -> Option<&str> {
+    let open = symbols.iter().position(|lexeme| lexeme == "[")?;
+    let event = symbols.get(open + 1)?.as_str();
+    (symbols.get(open + 2).map(String::as_str) == Some(":")
+        && symbols.iter().any(|lexeme| lexeme == "SOURCE")
+        && is_name(event))
+    .then_some(event)
+}
+
+fn ast_hold_name(symbols: &[String]) -> Option<&str> {
+    let hold = symbols.iter().position(|lexeme| lexeme == "HOLD")?;
+    symbols
+        .get(hold + 1)
+        .map(String::as_str)
+        .filter(|name| is_name(name))
+}
+
+fn ast_list_capacity(symbols: &[String]) -> Option<usize> {
+    let list = symbols.iter().position(|lexeme| lexeme == "LIST")?;
+    (symbols.get(list + 1).map(String::as_str) == Some("["))
+        .then(|| symbols.get(list + 2))?
+        .and_then(|value| value.parse().ok())
+}
+
+fn ast_map_new_function(symbols: &[String]) -> Option<&str> {
+    let map = symbols.iter().position(|lexeme| lexeme == "List/map")?;
+    let new = symbols[map..].iter().position(|lexeme| lexeme == "new")? + map;
+    (symbols.get(new + 1).map(String::as_str) == Some(":"))
+        .then(|| symbols.get(new + 2))?
+        .map(String::as_str)
+        .filter(|name| is_name(name))
+}
+
+fn ast_opens_scope(symbols: &[String]) -> bool {
+    if symbols.iter().any(|lexeme| lexeme == "SOURCE") {
+        return false;
+    }
+    matches!(
+        symbols.last().map(String::as_str),
+        Some(":") | Some("[") | Some("{")
+    ) || symbols.windows(2).any(|window| {
+        window[0] == ":" && window[1] == "[" && !symbols.iter().any(|lexeme| lexeme == "]")
+    })
+}
+
+fn ast_expression_operators(symbols: &[String]) -> Vec<String> {
+    let refs = symbols.iter().map(String::as_str).collect::<Vec<_>>();
+    expression_operators(&refs)
+}
+
+fn is_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn symbol_brace_delta(symbols: &[String]) -> i32 {
+    symbols
+        .iter()
+        .map(|symbol| match symbol.as_str() {
+            "{" => 1,
+            "}" => -1,
+            _ => 0,
+        })
+        .sum()
 }
 
 fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, ParseError> {
-    let semantic_tokens = ast.semantic_tokens().collect::<Vec<_>>();
-    for window in semantic_tokens.windows(2) {
-        if window[0].lexeme == "EXAMPLE" {
-            return match window[1].lexeme.as_str() {
+    for item in ast.semantic_parser_items() {
+        if let Some(example) = item.example.as_deref() {
+            return match example {
                 "TodoMVC" => Ok(ProgramKind::TodoMvc),
                 "Cells" => Ok(ProgramKind::Cells),
                 other => Err(ParseError {
@@ -315,31 +1179,27 @@ fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, Pars
     })
 }
 
-fn validate_balanced_brackets(path: &str, source: &str) -> Result<(), ParseError> {
+fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     let mut stack = Vec::new();
-    for (line_index, line) in source.lines().enumerate() {
-        let line_number = line_index + 1;
-        for (column_index, ch) in line.chars().enumerate() {
-            let column_number = column_index + 1;
-            match ch {
-                '[' | '{' | '(' => stack.push((ch, line_number, column_number)),
-                ']' => {
-                    if stack.pop().map(|(ch, _, _)| ch) != Some('[') {
-                        return Err(error(path, line_number, column_number, "unbalanced `]`"));
-                    }
+    for token in ast.semantic_tokens() {
+        match token.lexeme.as_str() {
+            "[" | "{" | "(" => stack.push((token.lexeme.as_str(), token.line, token.column)),
+            "]" => {
+                if stack.pop().map(|(ch, _, _)| ch) != Some("[") {
+                    return Err(error(path, token.line, token.column, "unbalanced `]`"));
                 }
-                '}' => {
-                    if stack.pop().map(|(ch, _, _)| ch) != Some('{') {
-                        return Err(error(path, line_number, column_number, "unbalanced `}`"));
-                    }
-                }
-                ')' => {
-                    if stack.pop().map(|(ch, _, _)| ch) != Some('(') {
-                        return Err(error(path, line_number, column_number, "unbalanced `)`"));
-                    }
-                }
-                _ => {}
             }
+            "}" => {
+                if stack.pop().map(|(ch, _, _)| ch) != Some("{") {
+                    return Err(error(path, token.line, token.column, "unbalanced `}`"));
+                }
+            }
+            ")" => {
+                if stack.pop().map(|(ch, _, _)| ch) != Some("(") {
+                    return Err(error(path, token.line, token.column, "unbalanced `)`"));
+                }
+            }
+            _ => {}
         }
     }
     if stack.is_empty() {
@@ -356,16 +1216,16 @@ fn validate_balanced_brackets(path: &str, source: &str) -> Result<(), ParseError
     }
 }
 
-fn validate_required_constructs(path: &str, source: &str) -> Result<(), ParseError> {
+fn validate_required_constructs(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     for required in ["SOURCE", "HOLD", "LATEST", "List/map"] {
-        if !source.contains(required) {
+        if !ast_has_lexeme(ast, required) {
             return Err(ParseError {
                 path: path.to_owned(),
                 message: format!("required construct `{required}` is missing"),
             });
         }
     }
-    if !source.contains("LIST") && !source.contains("Grid/cells") {
+    if !ast_has_lexeme(ast, "LIST") && !ast_has_lexeme(ast, "Grid/cells") {
         return Err(ParseError {
             path: path.to_owned(),
             message: "required list source `LIST` or `Grid/cells` is missing".to_owned(),
@@ -374,41 +1234,47 @@ fn validate_required_constructs(path: &str, source: &str) -> Result<(), ParseErr
     Ok(())
 }
 
-fn validate_list_capacities(path: &str, source: &str) -> Result<(), ParseError> {
-    for (line_index, line) in source.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(index) = line.find("LIST[") else {
+fn validate_list_capacities(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    for line in ast.semantic_parser_lines() {
+        let Some(list_index) = line.symbols.iter().position(|lexeme| lexeme == "LIST") else {
             continue;
         };
-        let line_number = line_index + 1;
-        let capacity_column = index + "LIST[".len() + 1;
-        let rest = &line[index + "LIST[".len()..];
-        let Some((capacity, _)) = rest.split_once(']') else {
+        if line.symbols.get(list_index + 1).map(String::as_str) != Some("[") {
+            continue;
+        }
+        let capacity_column = ast_token_for_parser_line_symbol(ast, line, list_index + 2)
+            .map(|token| token.column)
+            .unwrap_or(line.indent + 1);
+        let Some(close_offset) = line.symbols[list_index + 2..]
+            .iter()
+            .position(|lexeme| lexeme == "]")
+        else {
             return Err(error(
                 path,
-                line_number,
+                line.line,
                 capacity_column,
                 "LIST capacity is missing closing `]`",
             ));
         };
-        let capacity = capacity.trim();
-        if capacity.is_empty() {
+        let capacity_parts = &line.symbols[list_index + 2..list_index + 2 + close_offset];
+        if capacity_parts.len() != 1
+            || capacity_parts
+                .first()
+                .is_none_or(|capacity| capacity.is_empty())
+        {
             return Err(error(
                 path,
-                line_number,
+                line.line,
                 capacity_column,
                 "LIST capacity must be a positive integer",
             ));
         }
-        match capacity.parse::<usize>() {
+        match capacity_parts[0].parse::<usize>() {
             Ok(value) if value > 0 => {}
             _ => {
                 return Err(error(
                     path,
-                    line_number,
+                    line.line,
                     capacity_column,
                     "LIST capacity must be a positive integer",
                 ));
@@ -418,17 +1284,20 @@ fn validate_list_capacities(path: &str, source: &str) -> Result<(), ParseError> 
     Ok(())
 }
 
-fn validate_no_reducer_style_update(path: &str, source: &str) -> Result<(), ParseError> {
-    if source
-        .lines()
-        .any(|line| reducer_update_signature(line.trim()))
-    {
+fn validate_no_reducer_style_update(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    if ast.semantic_parser_items().any(reducer_update_signature) {
         return Err(ParseError {
             path: path.to_owned(),
             message: "central reducer `FUNCTION update(state, event)` is not allowed; define local HOLD equations for each value".to_owned(),
         });
     }
-    if source.contains("event.source |> WHEN") && source.contains("state |>") {
+    let has_event_source_when = ast
+        .semantic_parser_items()
+        .any(|item| item.contains_sequence(&["event", ".", "source", "|>", "WHEN"]));
+    let has_state_pipe = ast
+        .semantic_parser_items()
+        .any(|item| item.contains_sequence(&["state", "|>"]));
+    if has_event_source_when && has_state_pipe {
         return Err(ParseError {
             path: path.to_owned(),
             message: "global event-source reducer over `state` is not allowed; each value must declare its own sources".to_owned(),
@@ -437,20 +1306,15 @@ fn validate_no_reducer_style_update(path: &str, source: &str) -> Result<(), Pars
     Ok(())
 }
 
-fn reducer_update_signature(trimmed: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix("FUNCTION update(") else {
-        return false;
-    };
-    let Some(args) = rest.split(')').next() else {
-        return false;
-    };
-    let args = args.split(',').map(str::trim).collect::<Vec<_>>();
-    args.contains(&"state") && args.contains(&"event")
+fn reducer_update_signature(item: &ParserItem) -> bool {
+    item.function.as_deref() == Some("update")
+        && item.has_lexeme("state")
+        && item.has_lexeme("event")
 }
 
 fn validate_no_hidden_identity_leak(
     path: &str,
-    source: &str,
+    ast: &AstProgram,
     kind: ProgramKind,
 ) -> Result<(), ParseError> {
     let forbidden = [
@@ -465,7 +1329,7 @@ fn validate_no_hidden_identity_leak(
         "source_id:",
     ];
     for needle in forbidden {
-        if source.contains(needle) {
+        if ast_has_lexeme(ast, needle) {
             return Err(ParseError {
                 path: path.to_owned(),
                 message: format!("Boon source exposes hidden runtime identity `{needle}`"),
@@ -473,23 +1337,22 @@ fn validate_no_hidden_identity_leak(
         }
     }
     if matches!(kind, ProgramKind::TodoMvc) {
-        for (line, text) in source.lines().enumerate() {
-            let trimmed = text.trim_start();
-            if trimmed.starts_with("id:") {
+        for item in ast.semantic_parser_items() {
+            if item.field.as_deref() == Some("id") {
                 return Err(ParseError {
                     path: path.to_owned(),
                     message: format!(
                         "TodoMVC must not expose app-visible `id` at line {}",
-                        line + 1
+                        item.line
                     ),
                 });
             }
-            if trimmed.starts_with("alive:") {
+            if item.field.as_deref() == Some("alive") {
                 return Err(ParseError {
                     path: path.to_owned(),
                     message: format!(
                         "TodoMVC must use list removal, not app-visible `alive`, at line {}",
-                        line + 1
+                        item.line
                     ),
                 });
             }
@@ -498,108 +1361,67 @@ fn validate_no_hidden_identity_leak(
     Ok(())
 }
 
-fn collect_sources(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter(|line| line.contains("SOURCE"))
-        .map(|line| line.trim().trim_end_matches(',').to_owned())
+fn collect_sources(ast: &AstProgram) -> Vec<String> {
+    ast.semantic_parser_items()
+        .filter(|item| item.has_lexeme("SOURCE"))
+        .map(|item| item.symbols.join(" "))
         .collect()
 }
 
-fn collect_ast_expressions(ast: &AstProgram) -> Vec<ParsedExpression> {
-    let mut expressions = Vec::new();
-    let mut line_tokens: Vec<&AstToken> = Vec::new();
-    let mut current_line = None;
-    for token in ast.semantic_tokens() {
-        if matches!(token.kind, AstTokenKind::Newline) {
-            push_ast_expression(&mut expressions, &line_tokens);
-            line_tokens.clear();
-            current_line = None;
-            continue;
+fn expression_operators(symbols: &[&str]) -> Vec<String> {
+    let mut operators = Vec::new();
+    for lexeme in symbols {
+        if is_operator_lexeme(lexeme) && !operators.iter().any(|operator| operator == lexeme) {
+            operators.push((*lexeme).to_owned());
         }
-        if current_line.is_none() {
-            current_line = Some(token.line);
-        }
-        line_tokens.push(token);
     }
-    push_ast_expression(&mut expressions, &line_tokens);
-    expressions
+    operators
 }
 
-fn push_ast_expression(expressions: &mut Vec<ParsedExpression>, tokens: &[&AstToken]) {
-    if tokens.is_empty() {
-        return;
-    }
-    let lexemes = tokens
-        .iter()
-        .map(|token| token.lexeme.as_str())
-        .filter(|lexeme| !lexeme.is_empty())
-        .collect::<Vec<_>>();
-    if lexemes.is_empty() {
-        return;
-    }
-    let Some(kind) = ast_expression_kind(&lexemes) else {
-        return;
-    };
-    let label = lexemes.join(" ");
-    let indexed_hint = lexemes.iter().any(|lexeme| {
-        matches!(
-            *lexeme,
-            "todo"
-                | "seed"
-                | "editor"
-                | "cell"
-                | "Formula/dependencies"
-                | "Formula/eval"
-                | "Formula/error"
-        )
-    });
-    expressions.push(ParsedExpression {
-        id: expressions.len(),
-        line: tokens.first().map(|token| token.line).unwrap_or_default(),
-        kind,
-        label,
-        indexed_hint,
-    });
+fn is_operator_lexeme(lexeme: &str) -> bool {
+    matches!(
+        lexeme,
+        "SOURCE"
+            | "HOLD"
+            | "THEN"
+            | "WHEN"
+            | "WHILE"
+            | "LATEST"
+            | "LIST"
+            | "List/map"
+            | "List/append"
+            | "List/remove"
+            | "List/retain"
+            | "List/count"
+            | "Formula/parse"
+            | "Formula/dependencies"
+            | "Formula/eval"
+            | "Formula/error"
+            | "Text/empty"
+            | "Text/trim"
+            | "Bool/not"
+    )
 }
 
-fn ast_expression_kind(lexemes: &[&str]) -> Option<ParsedExpressionKind> {
-    if lexemes.contains(&"SOURCE") {
-        Some(ParsedExpressionKind::Source)
-    } else if lexemes.contains(&"HOLD") {
-        Some(ParsedExpressionKind::Hold)
-    } else if lexemes.contains(&"LIST") || lexemes.contains(&"Grid/cells") {
-        Some(ParsedExpressionKind::List)
-    } else if lexemes.first() == Some(&"FUNCTION") {
-        Some(ParsedExpressionKind::Function)
-    } else if lexemes.iter().any(|lexeme| {
-        matches!(
-            *lexeme,
-            "THEN"
-                | "WHEN"
-                | "WHILE"
-                | "LATEST"
-                | "List/map"
-                | "List/append"
-                | "List/remove"
-                | "List/retain"
-                | "List/count"
-        )
-    }) {
-        Some(ParsedExpressionKind::Operator)
-    } else if lexemes.contains(&":") {
-        Some(ParsedExpressionKind::Field)
-    } else {
-        None
-    }
-}
-
-fn collect_named_lines(source: &str, needle: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter(|line| line.contains(needle))
-        .map(|line| line.trim().to_owned())
+fn collect_named_statements(ast: &AstProgram, needle: &str) -> Vec<String> {
+    ast.semantic_parser_items()
+        .filter(|item| item.has_lexeme(needle))
+        .map(parser_item_summary)
         .collect()
+}
+
+fn ast_has_lexeme(ast: &AstProgram, lexeme: &str) -> bool {
+    ast.semantic_tokens().any(|token| token.lexeme == lexeme)
+}
+
+fn ast_token_for_parser_line_symbol<'a>(
+    ast: &'a AstProgram,
+    line: &ParserLine,
+    lexeme_index: usize,
+) -> Option<&'a AstToken> {
+    ast.semantic_tokens()
+        .filter(|token| token.line == line.line)
+        .nth(lexeme_index)
 }
 
 #[derive(Default)]
@@ -609,101 +1431,157 @@ struct StructureTables {
     list_memories: Vec<ParsedListMemory>,
 }
 
-fn collect_structure(source: &str, row_scopes: &[ParsedRowScopeFunction]) -> StructureTables {
+fn derive_program_tables(
+    ast: &AstProgram,
+    row_scopes: &[ParsedRowScopeFunction],
+) -> StructureTables {
     let mut tables = StructureTables::default();
-    let mut scope: Vec<(usize, String)> = Vec::new();
-    for (line_index, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indent = line.chars().take_while(|ch| *ch == ' ').count();
-        while scope
-            .last()
-            .is_some_and(|(scope_indent, _)| *scope_indent >= indent)
-        {
-            scope.pop();
-        }
-        if trimmed.starts_with("EXAMPLE ") || matches!(trimmed, "[" | "]" | "{" | "}") {
-            continue;
-        }
-        if trimmed.starts_with("FUNCTION ") {
-            if let Some(row_scope) = function_name(trimmed)
-                .and_then(|function| row_scope_for_function(&row_scopes, function))
-            {
-                scope.push((indent, row_scope.to_owned()));
-            }
-            continue;
-        }
-        if trimmed.contains("SOURCE") {
-            collect_source_line(&scope, trimmed, line_index + 1, &mut tables.source_ports);
-        }
-        if trimmed.contains("HOLD") {
-            let path = scope_path(&scope).unwrap_or_else(|| format!("hold_{}", line_index + 1));
-            let hold_name = hold_name(trimmed).unwrap_or_else(|| path.clone());
-            tables.state_cells.push(ParsedStateCell {
-                indexed: path_has_indexed_scope(&path),
-                path,
-                hold_name,
-                line: line_index + 1,
-            });
-        }
-        if trimmed.contains("LIST") || trimmed.contains("Grid/cells") {
-            let name = leading_field_name(trimmed)
-                .map(ToOwned::to_owned)
-                .or_else(|| scope.last().map(|(_, name)| name.clone()))
-                .unwrap_or_else(|| format!("list_{}", tables.list_memories.len()));
-            tables.list_memories.push(ParsedListMemory {
-                name,
-                line: line_index + 1,
-                capacity: list_capacity(trimmed),
-            });
-        }
-        if let Some(field) = leading_field_name(trimmed)
-            && opens_scope(trimmed)
-        {
-            scope.push((indent, field.to_owned()));
-        }
-    }
+    derive_structure_from_statements(&ast.statements, row_scopes, &mut Vec::new(), &mut tables);
     tables
 }
 
-fn collect_row_scope_functions(source: &str) -> Vec<ParsedRowScopeFunction> {
+fn collect_row_scope_functions(ast: &AstProgram) -> Vec<ParsedRowScopeFunction> {
     let mut functions = Vec::new();
-    let mut scope: Vec<(usize, String)> = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+    collect_row_scope_statements(&ast.statements, ast, &mut Vec::new(), &mut functions);
+    functions
+}
+
+fn derive_structure_from_statements(
+    statements: &[AstStatement],
+    row_scopes: &[ParsedRowScopeFunction],
+    scope: &mut Vec<String>,
+    tables: &mut StructureTables,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { name, .. } => {
+                if let Some(row_scope) = row_scope_for_function(row_scopes, name) {
+                    scope.push(row_scope.to_owned());
+                    derive_structure_from_statements(
+                        &statement.children,
+                        row_scopes,
+                        scope,
+                        tables,
+                    );
+                    scope.pop();
+                }
+            }
+            AstStatementKind::Field { name } => {
+                if !statement.children.is_empty() {
+                    scope.push(name.clone());
+                    derive_structure_from_statements(
+                        &statement.children,
+                        row_scopes,
+                        scope,
+                        tables,
+                    );
+                    scope.pop();
+                }
+            }
+            AstStatementKind::Source { field, event } => {
+                if let Some(field) = field.as_deref() {
+                    let path = match event.as_deref() {
+                        Some(event) => join_path(scope, [field, event]),
+                        None => join_path(scope, [field]),
+                    };
+                    tables.source_ports.push(ParsedSourcePort {
+                        path,
+                        line: statement.line,
+                        scoped: source_scope_is_scoped(scope, row_scopes),
+                    });
+                }
+                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+            }
+            AstStatementKind::Hold { name } => {
+                let path = scope_path(scope).unwrap_or_else(|| format!("hold_{}", statement.line));
+                tables.state_cells.push(ParsedStateCell {
+                    indexed: scope_is_indexed(scope, row_scopes),
+                    hold_name: name.clone().unwrap_or_else(|| path.clone()),
+                    path,
+                    line: statement.line,
+                });
+                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+            }
+            AstStatementKind::List {
+                field,
+                capacity,
+                grid: _,
+            } => {
+                let name = field
+                    .clone()
+                    .or_else(|| scope.last().cloned())
+                    .unwrap_or_else(|| format!("list_{}", tables.list_memories.len()));
+                tables.list_memories.push(ParsedListMemory {
+                    name,
+                    line: statement.line,
+                    capacity: *capacity,
+                });
+                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+            }
+            AstStatementKind::Example { .. }
+            | AstStatementKind::Block
+            | AstStatementKind::Expression => {
+                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+            }
+            AstStatementKind::View => {}
         }
-        let indent = line.chars().take_while(|ch| *ch == ' ').count();
-        while scope
-            .last()
-            .is_some_and(|(scope_indent, _)| *scope_indent >= indent)
-        {
-            scope.pop();
-        }
-        if let Some(function) = map_function_name(trimmed)
-            && let Some((_, list_name)) = scope.last()
+    }
+}
+
+fn collect_row_scope_statements(
+    statements: &[AstStatement],
+    ast: &AstProgram,
+    scope: &mut Vec<String>,
+    functions: &mut Vec<ParsedRowScopeFunction>,
+) {
+    for statement in statements {
+        if let Some(function) = statement_map_new_function(statement, ast)
+            && let Some(list_name) = scope.last()
         {
             functions.push(ParsedRowScopeFunction {
-                function: function.to_owned(),
+                function,
+                list: list_name.clone(),
                 row_scope: singular_row_scope(list_name),
             });
         }
-        if trimmed.starts_with("EXAMPLE ") || matches!(trimmed, "[" | "]" | "{" | "}") {
-            continue;
-        }
-        if trimmed.starts_with("FUNCTION ") {
-            continue;
-        }
-        if let Some(field) = leading_field_name(trimmed)
-            && opens_scope(trimmed)
-        {
-            scope.push((indent, field.to_owned()));
+        match &statement.kind {
+            AstStatementKind::Field { name } => {
+                if !statement.children.is_empty() {
+                    scope.push(name.clone());
+                    collect_row_scope_statements(&statement.children, ast, scope, functions);
+                    scope.pop();
+                }
+            }
+            AstStatementKind::Function { .. } => {}
+            AstStatementKind::Example { .. }
+            | AstStatementKind::View
+            | AstStatementKind::Block
+            | AstStatementKind::Expression
+            | AstStatementKind::Hold { .. }
+            | AstStatementKind::List { .. }
+            | AstStatementKind::Source { .. } => {
+                collect_row_scope_statements(&statement.children, ast, scope, functions);
+            }
         }
     }
-    functions
+}
+
+fn statement_map_new_function(statement: &AstStatement, ast: &AstProgram) -> Option<String> {
+    let expr = ast.expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Pipe { op, args, .. } if op == "List/map" => args.iter().find_map(|arg| {
+            (arg.name.as_deref() == Some("new")).then(|| {
+                ast.expressions
+                    .get(arg.value)
+                    .and_then(|value| match &value.kind {
+                        AstExprKind::Call { function, .. } => Some(function.clone()),
+                        AstExprKind::Identifier(function) => Some(function.clone()),
+                        _ => None,
+                    })
+            })?
+        }),
+        _ => None,
+    }
 }
 
 fn row_scope_for_function<'a>(
@@ -716,33 +1594,9 @@ fn row_scope_for_function<'a>(
         .map(|scope| scope.row_scope.as_str())
 }
 
-fn collect_source_line(
-    scope: &[(usize, String)],
-    trimmed: &str,
-    line: usize,
-    ports: &mut Vec<ParsedSourcePort>,
-) {
-    let Some(field) = leading_field_name(trimmed) else {
-        return;
-    };
-    if let Some(event) = inline_source_event(trimmed) {
-        ports.push(ParsedSourcePort {
-            path: join_path(scope, [field, event]),
-            line,
-            scoped: source_scope_is_scoped(scope),
-        });
-    } else {
-        ports.push(ParsedSourcePort {
-            path: join_path(scope, [field]),
-            line,
-            scoped: source_scope_is_scoped(scope),
-        });
-    }
-}
-
-fn join_path<'a>(scope: &[(usize, String)], tail: impl IntoIterator<Item = &'a str>) -> String {
+fn join_path<'a>(scope: &[String], tail: impl IntoIterator<Item = &'a str>) -> String {
     let mut path = String::new();
-    for (_, name) in scope {
+    for name in scope {
         if !path.is_empty() {
             path.push('.');
         }
@@ -757,45 +1611,26 @@ fn join_path<'a>(scope: &[(usize, String)], tail: impl IntoIterator<Item = &'a s
     path
 }
 
-fn scope_path(scope: &[(usize, String)]) -> Option<String> {
+fn scope_path(scope: &[String]) -> Option<String> {
     (!scope.is_empty()).then(|| {
         scope
             .iter()
-            .map(|(_, name)| name.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(".")
     })
 }
 
-fn source_scope_is_scoped(scope: &[(usize, String)]) -> bool {
-    scope
-        .iter()
-        .any(|(_, name)| matches!(name.as_str(), "todo" | "cell" | "seed"))
+fn source_scope_is_scoped(scope: &[String], row_scopes: &[ParsedRowScopeFunction]) -> bool {
+    scope_is_indexed(scope, row_scopes)
 }
 
-fn function_name(trimmed: &str) -> Option<&str> {
-    trimmed
-        .strip_prefix("FUNCTION ")?
-        .split('(')
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-}
-
-fn map_function_name(trimmed: &str) -> Option<&str> {
-    let (_, rest) = trimmed.split_once("List/map")?;
-    let (_, after_new) = rest.split_once("new:")?;
-    after_new
-        .trim_start()
-        .split('(')
-        .next()
-        .map(str::trim)
-        .filter(|name| {
-            !name.is_empty()
-                && name
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        })
+fn scope_is_indexed(scope: &[String], row_scopes: &[ParsedRowScopeFunction]) -> bool {
+    scope.iter().any(|name| {
+        row_scopes
+            .iter()
+            .any(|row_scope| row_scope.row_scope == *name)
+    })
 }
 
 fn singular_row_scope(list_name: &str) -> String {
@@ -806,90 +1641,23 @@ fn singular_row_scope(list_name: &str) -> String {
         .unwrap_or_else(|| format!("{list_name}_item"))
 }
 
-fn leading_field_name(trimmed: &str) -> Option<&str> {
-    let (name, _) = trimmed.split_once(':')?;
-    let name = name.trim();
-    (!name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(name)
-}
-
-fn opens_scope(trimmed: &str) -> bool {
-    if trimmed.contains("SOURCE") {
-        return false;
-    }
-    trimmed.ends_with(':')
-        || trimmed.ends_with('[')
-        || trimmed.ends_with('{')
-        || trimmed
-            .split_once(':')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('[') && !rest.contains(']'))
-}
-
-fn inline_source_event(trimmed: &str) -> Option<&str> {
-    let (_, rest) = trimmed.split_once('[')?;
-    let event = rest.split_once(':')?.0.trim();
-    (!event.is_empty()
-        && event
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(event)
-}
-
-fn hold_name(trimmed: &str) -> Option<String> {
-    let (_, rest) = trimmed.split_once("|> HOLD ")?;
-    let name = rest
-        .split(|ch: char| ch.is_whitespace() || ch == '{' || ch == '(')
-        .next()?
-        .trim();
-    (!name.is_empty()).then(|| name.to_owned())
-}
-
-fn list_capacity(trimmed: &str) -> Option<usize> {
-    let (_, rest) = trimmed.split_once("LIST[")?;
-    rest.split_once(']')?.0.trim().parse().ok()
-}
-
-fn path_has_indexed_scope(path: &str) -> bool {
-    path.split('.')
-        .any(|segment| matches!(segment, "todo" | "cell" | "seed"))
-}
-
-fn collect_functions(source: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("FUNCTION ")
-                .and_then(|rest| rest.split('(').next())
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned)
-        })
+fn collect_functions(ast: &AstProgram) -> Vec<String> {
+    ast.semantic_parser_items()
+        .filter_map(|item| item.function.clone())
         .collect()
 }
 
-fn collect_operators(source: &str) -> Vec<String> {
+fn parser_item_summary(item: &ParserItem) -> String {
+    item.symbols.join(" ")
+}
+
+fn collect_operators(ast: &AstProgram) -> Vec<String> {
     let mut operators = Vec::new();
-    for name in [
-        "SOURCE",
-        "HOLD",
-        "THEN",
-        "WHEN",
-        "WHILE",
-        "LATEST",
-        "LIST",
-        "List/map",
-        "List/append",
-        "List/remove",
-        "List/retain",
-        "List/count",
-    ] {
-        if source.contains(name) {
-            operators.push(name.to_owned());
+    for token in ast.semantic_tokens() {
+        if is_operator_lexeme(&token.lexeme)
+            && !operators.iter().any(|operator| operator == &token.lexeme)
+        {
+            operators.push(token.lexeme.clone());
         }
     }
     operators
@@ -915,7 +1683,7 @@ mod tests {
             program
                 .expressions
                 .iter()
-                .any(|expr| expr.kind == ParsedExpressionKind::Hold)
+                .any(|expr| matches!(expr.kind, AstExprKind::Hold { .. }))
         );
         assert!(program.operators.contains(&"List/remove".to_owned()));
         assert!(program.functions.contains(&"new_todo".to_owned()));
@@ -961,12 +1729,172 @@ mod tests {
                 .iter()
                 .any(|list| list.name == "todos")
         );
+        assert!(program.row_scope_functions.iter().any(|scope| {
+            scope.function == "new_todo" && scope.list == "todos" && scope.row_scope == "todo"
+        }));
+        assert!(
+            !program
+                .expressions
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::Unknown(_)))
+        );
+    }
+
+    #[test]
+    fn builds_hierarchical_statement_and_expression_ast() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let program = parse_source("examples/todomvc.bn", source).unwrap();
+        let store = find_statement(&program.ast.statements, |statement| {
+            matches!(
+                &statement.kind,
+                AstStatementKind::Field { name } if name == "store"
+            )
+        })
+        .expect("store field statement should exist");
+        assert!(
+            !store.children.is_empty(),
+            "field block must own nested statements"
+        );
+        assert!(
+            find_statement(&store.children, |statement| {
+                matches!(&statement.kind, AstStatementKind::Source { .. })
+            })
+            .is_some(),
+            "nested SOURCE declarations should be structured statements"
+        );
+
+        let hold = program
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| matches!(expr.kind, AstExprKind::Hold { ref name, .. } if name == "text"))
+            .expect("new_todo_text HOLD expression should be parsed");
+        let AstExprKind::Hold { initial, .. } = hold.kind else {
+            panic!("expected HOLD expression");
+        };
+        assert!(matches!(
+            program.ast.expressions[initial].kind,
+            AstExprKind::TextLiteral(ref text) if text.is_empty()
+        ));
         assert!(
             program
-                .row_scope_functions
+                .ast
+                .expressions
                 .iter()
-                .any(|scope| { scope.function == "new_todo" && scope.row_scope == "todo" })
+                .any(|expr| matches!(expr.kind, AstExprKind::Latest)),
+            "LATEST should be a structured expression node"
         );
+        assert!(
+            program
+                .ast
+                .expressions
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::When { .. })),
+            "WHEN should be a structured expression node"
+        );
+        assert!(
+            program
+                .ast
+                .expressions
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::Then { .. })),
+            "THEN should be a structured expression node"
+        );
+        let nested_then = parse_source(
+            "nested-then-bool-not.bn",
+            r#"
+EXAMPLE TodoMVC
+store: [
+    sources: [button: [press: SOURCE]]
+    value:
+        False |> HOLD value {
+            LATEST {
+                sources.button.press |> THEN { value |> Bool/not() }
+            }
+        }
+    todos:
+        LIST {}
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    [
+        title:
+            Text/empty |> HOLD title { LATEST {} }
+    ]
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            program.ast.expressions.iter().any(|expr| {
+                let AstExprKind::Then {
+                    output: Some(output),
+                    ..
+                } = expr.kind
+                else {
+                    return false;
+                };
+                matches!(
+                    program.ast.expressions[output].kind,
+                    AstExprKind::Bool(true)
+                )
+            }),
+            "THEN should keep its output block as a structured expression"
+        );
+        assert!(
+            nested_then.ast.expressions.iter().any(|expr| {
+                let AstExprKind::Then {
+                    output: Some(output),
+                    ..
+                } = expr.kind
+                else {
+                    return false;
+                };
+                matches!(
+                    &nested_then.ast.expressions[output].kind,
+                    AstExprKind::Pipe { op, .. } if op == "Bool/not"
+                )
+            }),
+            "THEN should keep nested call output blocks such as Bool/not()"
+        );
+    }
+
+    #[test]
+    fn structured_expression_ast_ignores_comment_and_string_operators() {
+        let source = r#"
+EXAMPLE Cells
+# LATEST { fake |> THEN { bad } }
+label: "fake |> WHEN { SOURCE }"
+cells:
+    Grid/cells(columns: 1, rows: 1)
+    |> List/map(seed, new: new_cell(seed: seed))
+FUNCTION new_cell(seed) {
+    sources: [editor: [commit: SOURCE]]
+    [
+        value:
+            TEXT {} |> HOLD value {
+                LATEST {
+                    sources.editor.commit.text
+                }
+            }
+    ]
+}
+"#;
+        let program = parse_source("comments-and-strings.bn", source).unwrap();
+        let latest_count = program
+            .ast
+            .expressions
+            .iter()
+            .filter(|expr| matches!(expr.kind, AstExprKind::Latest))
+            .count();
+        let when_count = program
+            .ast
+            .expressions
+            .iter()
+            .filter(|expr| matches!(expr.kind, AstExprKind::When { .. }))
+            .count();
+        assert_eq!(latest_count, 1);
+        assert_eq!(when_count, 0);
     }
 
     #[test]
@@ -974,12 +1902,9 @@ mod tests {
         let source = include_str!("../../../examples/todomvc.bn").replace("new_todo", "make_item");
         let program = parse_source("examples/todomvc.bn", source).unwrap();
         assert!(program.functions.contains(&"make_item".to_owned()));
-        assert!(
-            program
-                .row_scope_functions
-                .iter()
-                .any(|scope| { scope.function == "make_item" && scope.row_scope == "todo" })
-        );
+        assert!(program.row_scope_functions.iter().any(|scope| {
+            scope.function == "make_item" && scope.list == "todos" && scope.row_scope == "todo"
+        }));
         assert!(
             program
                 .source_ports
@@ -995,6 +1920,55 @@ mod tests {
     }
 
     #[test]
+    fn indexed_scope_comes_from_list_map_row_scope_not_fixed_names() {
+        let source = r#"
+EXAMPLE TodoMVC
+store:
+    sources:
+        add_button: [press: SOURCE]
+    selected:
+        "All" |> HOLD selected { LATEST {} }
+    entries:
+        LIST[4] {}
+        |> List/map(entry, new: make_entry(seed: entry))
+FUNCTION make_entry(seed) {
+    sources:
+        checkbox: [click: SOURCE]
+    title:
+        seed.title |> HOLD title { LATEST {} }
+    completed:
+        False |> HOLD completed {
+            LATEST {
+                sources.checkbox.click |> THEN { completed |> Bool/not() }
+            }
+        }
+}
+"#;
+        let program = parse_source("renamed-row-scope.bn", source).unwrap();
+        assert!(program.row_scope_functions.iter().any(|scope| {
+            scope.function == "make_entry" && scope.list == "entries" && scope.row_scope == "entry"
+        }));
+        assert!(
+            program
+                .source_ports
+                .iter()
+                .any(|port| port.path == "entry.sources.checkbox.click" && port.scoped)
+        );
+        assert!(
+            program
+                .state_cells
+                .iter()
+                .any(|cell| cell.path == "entry.completed" && cell.indexed)
+        );
+        assert!(
+            program
+                .state_cells
+                .iter()
+                .any(|cell| cell.path == "store.selected" && !cell.indexed)
+        );
+    }
+
+    #[test]
     fn parses_cells_marker_and_constructs() {
         let source = include_str!("../../../examples/cells.bn");
         let program = parse_source("examples/cells.bn", source).unwrap();
@@ -1003,7 +1977,7 @@ mod tests {
             program
                 .expressions
                 .iter()
-                .any(|expr| expr.kind == ParsedExpressionKind::Source)
+                .any(|expr| matches!(expr.kind, AstExprKind::Source))
         );
         assert!(program.functions.contains(&"new_cell".to_owned()));
         assert!(
@@ -1023,6 +1997,12 @@ mod tests {
                 .list_memories
                 .iter()
                 .any(|list| list.name == "cells")
+        );
+        assert!(
+            !program
+                .expressions
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::Unknown(_)))
         );
     }
 
@@ -1114,6 +2094,86 @@ todos |> List/map(todo, new: new_todo(seed: todo))
     }
 
     #[test]
+    fn rejects_hidden_runtime_key_after_view_block() {
+        let source = format!(
+            "{}\nruntime_key: TEXT {{ leak }}\n",
+            include_str!("../../../examples/todomvc.bn")
+        );
+        let err = parse_source("bad-runtime-key.bn", source).unwrap_err();
+        assert!(err.message.contains("hidden runtime identity"));
+    }
+
+    #[test]
+    fn parses_view_structurally_without_semantic_source_leakage() {
+        let source = r#"
+EXAMPLE TodoMVC
+store:
+    sources:
+        new_todo_input: [
+            change: SOURCE
+        ]
+    new_todo_text: "" |> HOLD new_todo_text {
+        LATEST {
+            sources.new_todo_input.change.text |> THEN { text }
+        }
+    }
+todos: LIST[4] {}
+todos |> List/map(todo, new: new_todo(seed: todo))
+FUNCTION new_todo(seed) {
+    title: seed.title |> HOLD title { LATEST {} }
+}
+VIEW {
+    text id: "fake-source" value: "SOURCE runtime_key TodoId"
+}
+after_view: "" |> HOLD after_view { LATEST {} }
+"#;
+        let parsed = parse_source("view-structural.bn", source).unwrap();
+        assert!(parsed.source.contains("VIEW {"));
+        assert!(
+            parsed
+                .ast
+                .statements
+                .iter()
+                .any(|statement| matches!(statement.kind, AstStatementKind::View))
+        );
+        assert_eq!(parsed.source_ports.len(), 1);
+        assert_eq!(
+            parsed.source_ports[0].path,
+            "store.sources.new_todo_input.change"
+        );
+        assert!(parsed.holds.iter().any(|hold| hold.contains("after_view")));
+        assert!(
+            !parsed
+                .sources
+                .iter()
+                .any(|source| source.contains("fake-source") || source.contains("runtime_key"))
+        );
+    }
+
+    #[test]
+    fn extracts_view_lines_from_ast_tokens() {
+        let source = r##"
+EXAMPLE TodoMVC
+VIEW {
+    Column id=todomvc_surface bg=#ffffff {
+        Text text="todos" color=#b83f45
+        Input id=todo_new_input value=$new_todo_text placeholder="What needs to be done?"
+    }
+}
+"##;
+        let lines = parse_view_lines("view-lines.bn", source).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "Column id=todomvc_surface bg=#ffffff {",
+                "Text text=\"todos\" color=#b83f45",
+                "Input id=todo_new_input value=$new_todo_text placeholder=\"What needs to be done?\"",
+                "}",
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_app_visible_todomvc_id_field() {
         let source =
             "EXAMPLE TodoMVC\nLIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
@@ -1170,5 +2230,16 @@ List/map
         let err = parse_source("bad-unclosed.bn", source).unwrap_err();
         assert!(err.message.contains("unclosed `(`"));
         assert!(err.message.contains("line 4, column 15"));
+    }
+
+    fn find_statement<'a>(
+        statements: &'a [AstStatement],
+        predicate: impl Fn(&AstStatement) -> bool + Copy,
+    ) -> Option<&'a AstStatement> {
+        statements.iter().find_map(|statement| {
+            predicate(statement)
+                .then_some(statement)
+                .or_else(|| find_statement(&statement.children, predicate))
+        })
     }
 }

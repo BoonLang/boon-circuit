@@ -1,9 +1,10 @@
 #![recursion_limit = "512"]
 
+use bitvec::prelude::*;
 use boon_ir::{
     DerivedValueKind, FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind,
-    ListPredicate, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
-    verify_static_schedule,
+    ListPredicate, SourceId, SourcePayloadField, TypedProgram, UpdateExpression, debug_tables,
+    lower, verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{ParsedProgram, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -240,6 +241,8 @@ pub struct RunOutput {
     pub semantic_deltas: Vec<SemanticDelta<'static>>,
     pub render_patches: Vec<RenderPatch<'static>>,
     pub state_summary: JsonValue,
+    #[serde(skip)]
+    pub view_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -548,7 +551,11 @@ pub fn run_scenario(
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
-    Ok(RunOutput { report, ..output })
+    Ok(RunOutput {
+        report,
+        view_lines: boon_parser::parsed_view_lines(&parsed),
+        ..output
+    })
 }
 
 pub fn run_scenario_source(
@@ -567,11 +574,30 @@ pub fn run_scenario_source_with_step_limit(
     layer: VerificationLayer,
     step_limit: Option<usize>,
 ) -> RuntimeResult<RunOutput> {
+    let scenario = parse_scenario(scenario_path)?;
+    run_scenario_source_with_parsed_scenario_step_limit(
+        source_label,
+        source_text,
+        scenario_path,
+        &scenario,
+        layer,
+        step_limit,
+    )
+}
+
+pub fn run_scenario_source_with_parsed_scenario_step_limit(
+    source_label: &str,
+    source_text: &str,
+    scenario_path: &Path,
+    scenario: &Scenario,
+    layer: VerificationLayer,
+    step_limit: Option<usize>,
+) -> RuntimeResult<RunOutput> {
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
     let ir = lower(&parsed)?;
     verify_hidden_identity(&ir)?;
     verify_static_schedule(&ir)?;
-    let mut scenario = parse_scenario(scenario_path)?;
+    let mut scenario = scenario.clone();
     if let Some(step_limit) = step_limit {
         scenario.step.truncate(step_limit.min(scenario.step.len()));
     }
@@ -598,7 +624,108 @@ pub fn run_scenario_source_with_step_limit(
         layer,
         elapsed.as_secs_f64() * 1000.0,
     )?;
-    Ok(RunOutput { report, ..output })
+    Ok(RunOutput {
+        report,
+        view_lines: boon_parser::parsed_view_lines(&parsed),
+        ..output
+    })
+}
+
+pub fn run_source_initial_state(
+    source_label: &str,
+    source_text: &str,
+    scenario_path: &Path,
+    scenario: &Scenario,
+) -> RuntimeResult<RunOutput> {
+    let parse_started = Instant::now();
+    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+    let parse_ms = parse_started.elapsed().as_secs_f64() * 1000.0;
+    let lower_started = Instant::now();
+    let ir = lower(&parsed)?;
+    let lower_ms = lower_started.elapsed().as_secs_f64() * 1000.0;
+    let verify_started = Instant::now();
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let verify_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
+    if parsed.kind.as_str() != scenario.name {
+        return Err(format!(
+            "scenario `{}` does not match source kind `{}`",
+            scenario.name,
+            parsed.kind.as_str()
+        )
+        .into());
+    }
+    let compile_started = Instant::now();
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    validate_executable_surface(&parsed, &ir, &compiled)?;
+    let compile_ms = compile_started.elapsed().as_secs_f64() * 1000.0;
+    let runtime_started = Instant::now();
+    let mut runtime = LoadedRuntime::new(&parsed, &ir, &compiled)?;
+    runtime.prepare_for_scenario(scenario)?;
+    let state_summary = runtime.state_summary();
+    let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
+    let report_started = Instant::now();
+    let runtime_profile = RuntimeProfile::from_ir(&ir);
+    let generic_runtime_slices = generic_runtime_slices_report(&ir, &compiled);
+    let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(&ir, &compiled);
+    let report = json!({
+        "status": "pass",
+        "command": "playground-initial-state",
+        "source_path": source_label,
+        "source_hash": sha256_bytes(source_text.as_bytes()),
+        "scenario_path": scenario_path.display().to_string(),
+        "scenario_hash": sha256_file(scenario_path)?,
+        "program_hash": sha256_bytes(source_text.as_bytes()),
+        "program_kind": compiled.surface.kind.as_str(),
+        "expression_count": ir.expression_count,
+        "expression_coverage": &ir.expression_coverage,
+        "graph_node_count": ir.graph_node_count,
+        "graph_rebuild_count": 0,
+        "graph_clones_per_item": 0,
+        "max_dirty_nodes": 0,
+        "max_dirty_keys": 0,
+        "total_ticks": 0,
+        "total_source_events": 0,
+        "total_semantic_deltas": 0,
+        "total_render_deltas": 0,
+        "runtime_profile": runtime_profile.as_str(),
+        "runtime_profile_detail": runtime_profile.detail_report(&ir),
+        "playground_initial_timing_ms": {
+            "parse": parse_ms,
+            "lower": lower_ms,
+            "verify": verify_ms,
+            "compile": compile_ms,
+            "runtime_prepare_and_summary": runtime_ms,
+            "report_until_timing_field": report_started.elapsed().as_secs_f64() * 1000.0
+        },
+        "capacities": runtime_profile.capacity_report(&ir),
+        "compiled_schedule": compiled.report(),
+        "runtime_execution": {
+            "implementation": "typed static graph initialized for playground preview",
+            "source_loaded_from_boon": true,
+            "typed_ir_loaded": true,
+            "static_schedule_verified": ir.static_schedule_verified,
+            "generic_interpreter_complete": derive_generic_interpreter_complete(&ir, &compiled, &generic_runtime_slices),
+            "example_behavior_adapter": derive_example_behavior_adapter(&compiled, &generic_runtime_slices),
+            "adapter_kind": compiled.surface.kind.as_str(),
+            "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
+            "remaining_example_specific_shells": remaining_example_specific_shells(&compiled, &generic_runtime_slices),
+            "final_handoff_pending_human_report": true,
+            "generic_runtime_slices": generic_runtime_slices,
+            "generic_runtime_slice_evidence": generic_runtime_slice_evidence
+        },
+        "state_summary": state_summary,
+        "ir_debug_tables": debug_tables(&ir),
+        "hidden_identity_verified": ir.hidden_identity_verified,
+        "static_schedule_verified": ir.static_schedule_verified
+    });
+    Ok(RunOutput {
+        report,
+        semantic_deltas: Vec::new(),
+        render_patches: Vec::new(),
+        state_summary,
+        view_lines: boon_parser::parsed_view_lines(&parsed),
+    })
 }
 
 pub struct LiveRuntime {
@@ -805,7 +932,13 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
             return Err(format!("{} missing required report field `{key}`", path.display()).into());
         }
     }
-    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+    let status = report.get("status").and_then(JsonValue::as_str);
+    if status != Some("pass") {
+        if status == Some("fail") && report_is_blocker_audit(&report) {
+            verify_failing_blocker_report_shape(&report, path)?;
+            verify_artifact_hashes(&report, path)?;
+            return Ok(());
+        }
         return Err(format!("{} did not pass", path.display()).into());
     }
     verify_common_report_shape(&report, path)?;
@@ -835,6 +968,124 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     }
     if report_layer_is(&report, "human") {
         verify_human_artifacts(&report, path)?;
+    }
+    Ok(())
+}
+
+fn report_is_blocker_audit(report: &JsonValue) -> bool {
+    matches!(
+        report.get("command").and_then(JsonValue::as_str),
+        Some(
+            "audit-machine-readiness"
+                | "audit-goal-readiness"
+                | "audit-manual-readiness"
+                | "verify-runtime-finality"
+        )
+    )
+}
+
+fn verify_failing_blocker_report_shape(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let generated = report
+        .get("generated_at_utc")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} generated_at_utc is not a Unix-seconds string",
+                report_path.display()
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!(
+                "{} generated_at_utc is not parseable Unix seconds: {error}",
+                report_path.display()
+            )
+        })?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if generated > now.saturating_add(5) {
+        return Err(format!("{} is future-dated", report_path.display()).into());
+    }
+    let exit_status = report
+        .get("exit_status")
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| format!("{} exit_status is not a number", report_path.display()))?;
+    if exit_status == 0 {
+        return Err(format!(
+            "{} failing blocker report has zero exit_status",
+            report_path.display()
+        )
+        .into());
+    }
+    let blockers = report
+        .get("blockers")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} blocker report missing blockers", report_path.display()))?;
+    if blockers.is_empty()
+        || blockers.iter().any(|blocker| {
+            blocker
+                .as_str()
+                .is_none_or(|blocker| blocker.trim().is_empty())
+        })
+    {
+        return Err(format!(
+            "{} blocker report has empty or malformed blockers",
+            report_path.display()
+        )
+        .into());
+    }
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail is not an array",
+                report_path.display()
+            )
+        })?;
+    let mut saw_failing_check = false;
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing string id",
+                    report_path.display()
+                )
+            })?;
+        if id.trim().is_empty() {
+            return Err(format!(
+                "{} per_step_pass_fail[{index}] has empty id",
+                report_path.display()
+            )
+            .into());
+        }
+        let pass = object
+            .get("pass")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "{} per_step_pass_fail[{index}] missing boolean pass",
+                    report_path.display()
+                )
+            })?;
+        saw_failing_check |= !pass;
+    }
+    if !saw_failing_check {
+        return Err(format!(
+            "{} failing blocker report has no failing per-step check",
+            report_path.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -949,6 +1200,12 @@ fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> Runtime
             .into());
         }
     }
+    if report.get("command").and_then(JsonValue::as_str) == Some("explain-hardware") {
+        verify_runtime_profile_metadata(report, report_path)?;
+        if report.get("hardware_plan").is_none() {
+            return Err(format!("{} missing hardware_plan", report_path.display()).into());
+        }
+    }
     Ok(())
 }
 
@@ -966,6 +1223,8 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
         "static_schedule_verified",
         "generic_interpreter_complete",
         "example_behavior_adapter",
+        "remaining_example_specific_shell_policy",
+        "remaining_example_specific_shells",
     ] {
         if execution.get(key).is_none() {
             return Err(format!(
@@ -1022,6 +1281,7 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
         )
         .into());
     }
+    verify_remaining_example_specific_shells(execution, report_path)?;
     if execution.get("implementation").and_then(JsonValue::as_str)
         != Some("static_graph_interpreter")
     {
@@ -1032,7 +1292,81 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
         .into());
     }
     verify_generic_runtime_slice_metadata(report, execution, report_path)?;
+    verify_generic_runtime_slice_evidence(report, execution, report_path)?;
+    verify_expression_coverage(report, report_path)?;
     verify_runtime_report_contract(report, report_path)?;
+    Ok(())
+}
+
+fn verify_remaining_example_specific_shells(
+    execution: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let policy = execution
+        .get("remaining_example_specific_shell_policy")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime_execution missing remaining shell policy",
+                report_path.display()
+            )
+        })?;
+    if policy != "scenario_assertion_report_glue_only" {
+        return Err(format!(
+            "{} runtime_execution has unsupported remaining shell policy `{policy}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let shells = execution
+        .get("remaining_example_specific_shells")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime_execution missing remaining shell list",
+                report_path.display()
+            )
+        })?;
+    let slices = execution
+        .get("generic_runtime_slices")
+        .and_then(JsonValue::as_object);
+    let has_example_specific_slices = slices.is_some_and(|slices| {
+        slices.iter().any(|(key, value)| {
+            value.as_bool() == Some(true)
+                && (key.contains("_todomvc_")
+                    || key.starts_with("todomvc_")
+                    || key.contains("_cells_")
+                    || key.starts_with("cells_"))
+        })
+    });
+    if has_example_specific_slices && shells.is_empty() {
+        return Err(format!(
+            "{} runtime_execution has example-specific runtime slices but no remaining shell listing",
+            report_path.display()
+        )
+        .into());
+    }
+    for (index, shell) in shells.iter().enumerate() {
+        let Some(shell) = shell.as_str() else {
+            return Err(format!(
+                "{} runtime_execution remaining shell at index {index} is not a string",
+                report_path.display()
+            )
+            .into());
+        };
+        if !(shell.ends_with("_scenario_glue")
+            || shell.ends_with("_assertion_glue")
+            || shell.ends_with("_report_glue")
+            || shell.ends_with("_render_patch_report_glue")
+            || shell.ends_with("_stress_report_glue"))
+        {
+            return Err(format!(
+                "{} runtime_execution remaining shell `{shell}` is not classified as scenario/assertion/report glue",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -1051,7 +1385,7 @@ fn verify_generic_runtime_slice_metadata(
         .get("example")
         .and_then(JsonValue::as_str)
         .or_else(|| execution.get("adapter_kind").and_then(JsonValue::as_str))
-        .or_else(|| example_name_from_report_path(report))
+        .or_else(|| report_program_kind(report))
         .unwrap_or_default();
     require_generic_runtime_slice_flags(slices, example, report_path)?;
     for (key, value) in slices {
@@ -1069,6 +1403,13 @@ fn verify_generic_runtime_slice_metadata(
             continue;
         }
         if key_is_other_example_runtime_slice(key, example) {
+            if flag {
+                return Err(format!(
+                    "{} reports other-example runtime slice `{key}` as passed for `{example}`",
+                    report_path.display()
+                )
+                .into());
+            }
             continue;
         }
         if !flag {
@@ -1197,6 +1538,7 @@ fn require_generic_runtime_slice_flags(
             "generic_cells_source_action_mutation_batch",
             "generic_cells_editor_route_uses_indexed_targets",
             "generic_cells_committed_fields_hold_no_mirror",
+            "generic_loaded_runtime_cells_stress_profile_executor",
             "cells_edit_state_holds_from_ir",
             "cells_generic_hold_storage_authoritative",
             "cells_summary_reads_authoritative_storage",
@@ -1242,6 +1584,216 @@ fn require_slice_bool(
     Ok(())
 }
 
+fn verify_generic_runtime_slice_evidence(
+    report: &JsonValue,
+    execution: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let evidence = execution
+        .get("generic_runtime_slice_evidence")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime_execution missing generic_runtime_slice_evidence",
+                report_path.display()
+            )
+        })?;
+    if evidence.get("computed_from").and_then(JsonValue::as_str)
+        != Some("typed_ir_and_compiled_program")
+    {
+        return Err(format!(
+            "{} generic runtime slice evidence is not bound to typed IR and compiled program",
+            report_path.display()
+        )
+        .into());
+    }
+    let Some(compiled) = report
+        .get("compiled_schedule")
+        .and_then(JsonValue::as_object)
+    else {
+        return Err(format!("{} missing compiled_schedule", report_path.display()).into());
+    };
+    for key in [
+        "source_route_count",
+        "source_route_id_slot_count",
+        "source_route_label_slot_count",
+        "source_routes_with_ids",
+        "list_source_binding_count",
+        "update_branch_count",
+        "list_operation_count",
+        "formula_operation_count",
+        "view_binding_count",
+        "source_payload_schema_count",
+        "source_payload_field_count",
+        "source_payload_text_field_count",
+        "source_payload_key_field_count",
+        "source_payload_address_field_count",
+        "root_text_slot_count",
+        "root_bool_slot_count",
+        "root_enum_slot_count",
+        "list_memory_count",
+        "list_row_template_field_count",
+        "list_row_text_slot_count",
+        "list_row_bool_slot_count",
+        "list_row_enum_slot_count",
+        "list_hidden_key_slot_count",
+        "list_hidden_generation_slot_count",
+        "derived_text_transform_count",
+    ] {
+        if evidence.get(key).and_then(JsonValue::as_u64)
+            != compiled.get(key).and_then(JsonValue::as_u64)
+        {
+            return Err(format!(
+                "{} generic runtime slice evidence `{key}` does not match compiled_schedule",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let evidence_storage = evidence
+        .get("typed_storage_layout")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} generic runtime slice evidence missing typed_storage_layout",
+                report_path.display()
+            )
+        })?;
+    let compiled_storage = compiled
+        .get("typed_storage_layout")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} compiled_schedule missing typed_storage_layout",
+                report_path.display()
+            )
+        })?;
+    if evidence_storage
+        .get("computed_from")
+        .and_then(JsonValue::as_str)
+        != Some("typed_ir_state_and_list_tables")
+    {
+        return Err(format!(
+            "{} typed storage layout evidence is not derived from typed IR tables",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "root_text_slot_count",
+        "root_bool_slot_count",
+        "root_enum_slot_count",
+        "list_memory_count",
+        "list_row_template_field_count",
+        "list_row_text_slot_count",
+        "list_row_bool_slot_count",
+        "list_row_enum_slot_count",
+        "list_hidden_key_slot_count",
+        "list_hidden_generation_slot_count",
+    ] {
+        if evidence_storage.get(key).and_then(JsonValue::as_u64)
+            != compiled_storage.get(key).and_then(JsonValue::as_u64)
+        {
+            return Err(format!(
+                "{} typed storage layout evidence `{key}` does not match compiled_schedule",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for (key, expected) in [
+        ("list_order_storage_kind", "separate_visible_order_slots"),
+        ("list_valid_storage_kind", "bitvec_valid_slots"),
+        ("list_free_storage_kind", "free_slot_stack"),
+        (
+            "list_source_binding_storage_kind",
+            "dense_source_and_row_slots",
+        ),
+    ] {
+        if evidence_storage.get(key).and_then(JsonValue::as_str) != Some(expected)
+            || compiled_storage.get(key).and_then(JsonValue::as_str) != Some(expected)
+        {
+            return Err(format!(
+                "{} typed storage layout `{key}` is not `{expected}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let source_route_count = evidence
+        .get("source_route_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let route_action_count = evidence
+        .get("source_route_action_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if source_route_count == 0 || route_action_count == 0 {
+        return Err(format!(
+            "{} generic runtime slice evidence has no compiled source route actions",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_expression_coverage(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let coverage = report
+        .get("expression_coverage")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing expression_coverage", report_path.display()))?;
+    if coverage.get("computed_from").and_then(JsonValue::as_str) != Some("parser_ast_and_typed_ir")
+    {
+        return Err(format!(
+            "{} expression coverage is not bound to parser AST and typed IR",
+            report_path.display()
+        )
+        .into());
+    }
+    if let (Some(report_expression_count), Some(coverage_expression_count)) = (
+        report.get("expression_count").and_then(JsonValue::as_u64),
+        coverage
+            .get("ast_expression_count")
+            .and_then(JsonValue::as_u64),
+    ) {
+        if report_expression_count != coverage_expression_count {
+            return Err(format!(
+                "{} expression_count does not match expression_coverage.ast_expression_count",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "unknown_ast_expression_count",
+        "unknown_initial_value_count",
+        "unknown_list_initializer_count",
+        "unknown_list_seed_value_count",
+        "unknown_update_expression_count",
+        "unknown_list_predicate_count",
+        "unknown_derived_value_count",
+    ] {
+        let count = coverage
+            .get(key)
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} expression_coverage missing numeric `{key}`",
+                    report_path.display()
+                )
+            })?;
+        if count != 0 {
+            return Err(format!(
+                "{} expression_coverage `{key}` is {count}; executable reports cannot rely on unknown parser/lowering fallback",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn key_is_other_example_runtime_slice(key: &str, example: &str) -> bool {
     match example {
         "todomvc" => {
@@ -1250,21 +1802,25 @@ fn key_is_other_example_runtime_slice(key: &str, example: &str) -> bool {
         "cells" => {
             key.starts_with("generic_todomvc")
                 || key.starts_with("todomvc_")
+                || key.contains("_todo_")
                 || key.contains("_todomvc_")
         }
         _ => false,
     }
 }
 
-fn example_name_from_report_path(report: &JsonValue) -> Option<&str> {
-    let path = report.get("source_path").and_then(JsonValue::as_str)?;
-    if path.contains("todomvc") {
-        Some("todomvc")
-    } else if path.contains("cells") {
-        Some("cells")
-    } else {
-        None
-    }
+fn report_program_kind(report: &JsonValue) -> Option<&str> {
+    let candidate = report
+        .get("program_kind")
+        .or_else(|| report.get("example"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            report
+                .get("runtime_execution")
+                .and_then(|execution| execution.get("adapter_kind"))
+                .and_then(JsonValue::as_str)
+        })?;
+    matches!(candidate, "todomvc" | "cells").then_some(candidate)
 }
 
 fn verify_runtime_report_contract(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -1288,6 +1844,8 @@ fn verify_runtime_report_contract(report: &JsonValue, report_path: &Path) -> Run
         "latency_ms_p50_p95_p99_max",
         "rss_delta_mib_steady_peak",
         "vram_delta_mib_steady_peak_or_unavailable_reason",
+        "dirty_node_count_p50_p95_p99_max",
+        "dirty_key_count_p50_p95_p99_max",
         "failure_artifacts",
         "semantic_delta_protocol_batches",
     ] {
@@ -1301,6 +1859,35 @@ fn verify_runtime_report_contract(report: &JsonValue, report_path: &Path) -> Run
     }
     verify_semantic_delta_protocol_batches(report, report_path)?;
     verify_render_patch_protocol_identity(report, report_path)?;
+    let dirty_node_summary = report
+        .get("dirty_node_count_p50_p95_p99_max")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} runtime report dirty_node_count_p50_p95_p99_max is not an object",
+                report_path.display()
+            )
+        })?;
+    if dirty_node_summary.get("unavailable_reason").is_some() {
+        return Err(format!(
+            "{} runtime report still marks dirty node counts unavailable",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in ["p50", "p95", "p99", "max"] {
+        if dirty_node_summary
+            .get(key)
+            .and_then(JsonValue::as_f64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} runtime report dirty_node_count_p50_p95_p99_max missing numeric `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     let rss_delta = report
         .get("rss_delta_mib_steady_peak")
         .and_then(JsonValue::as_object)
@@ -1657,6 +2244,9 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
         "graph_node_count",
         "graph_rebuild_count",
         "list_slot_count",
+        "runtime_profile",
+        "runtime_profile_detail",
+        "capacities",
         "dirty_node_count_p50_p95_p99_max",
         "dirty_key_count_p50_p95_p99_max",
         "render_patch_count_p50_p95_p99_max",
@@ -1664,6 +2254,36 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
         if report.get(key).is_none() {
             return Err(format!(
                 "{} speed report missing documented field `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    verify_runtime_profile_metadata(report, report_path)?;
+    let dirty_node_summary = report
+        .get("dirty_node_count_p50_p95_p99_max")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} speed report dirty_node_count_p50_p95_p99_max is not an object",
+                report_path.display()
+            )
+        })?;
+    if dirty_node_summary.get("unavailable_reason").is_some() {
+        return Err(format!(
+            "{} speed report still marks dirty node counts unavailable",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in ["p50", "p95", "p99", "max"] {
+        if dirty_node_summary
+            .get(key)
+            .and_then(JsonValue::as_f64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} speed report dirty_node_count_p50_p95_p99_max missing numeric `{key}`",
                 report_path.display()
             )
             .into());
@@ -1693,6 +2313,84 @@ fn verify_speed_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<
         .into());
     }
     verify_speed_stress_profiles(report, report_path)
+}
+
+fn verify_runtime_profile_metadata(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let profile = report
+        .get("runtime_profile")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing runtime_profile", report_path.display()))?;
+    if !matches!(
+        profile,
+        "software_dynamic" | "software_bounded" | "hardware_bounded"
+    ) {
+        return Err(format!(
+            "{} has unknown runtime_profile `{profile}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let detail_name = report
+        .get("runtime_profile_detail")
+        .and_then(|detail| detail.get("name"))
+        .and_then(JsonValue::as_str);
+    if detail_name != Some(profile) {
+        return Err(format!(
+            "{} runtime_profile_detail.name does not match runtime_profile",
+            report_path.display()
+        )
+        .into());
+    }
+    let capacities = report
+        .get("capacities")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing capacities object", report_path.display()))?;
+    let all_lists_bounded = capacities
+        .get("all_lists_bounded")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} capacities missing boolean all_lists_bounded",
+                report_path.display()
+            )
+        })?;
+    let lists = capacities
+        .get("lists")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} capacities missing lists array", report_path.display()))?;
+    for list in lists {
+        for key in [
+            "name",
+            "declared_capacity",
+            "effective_capacity",
+            "capacity_source",
+            "dynamic_growth_allowed",
+            "overflow_behavior",
+        ] {
+            if list.get(key).is_none() {
+                return Err(format!(
+                    "{} capacity report missing list field `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    if matches!(profile, "software_bounded" | "hardware_bounded") && !all_lists_bounded {
+        return Err(format!(
+            "{} claims {profile} while at least one list has no effective capacity",
+            report_path.display()
+        )
+        .into());
+    }
+    if profile == "software_dynamic" && all_lists_bounded {
+        return Err(format!(
+            "{} claims software_dynamic while every list has an effective capacity",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -1776,13 +2474,43 @@ fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeRes
         )
         .into());
     }
-    if benchmark
+    let heap_alloc_count_after_warmup = benchmark
         .get("heap_alloc_count_after_warmup")
         .and_then(JsonValue::as_u64)
-        != Some(0)
-    {
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing heap_alloc_count_after_warmup",
+                report_path.display()
+            )
+        })?;
+    let allocation_budget = report
+        .get("budget_check")
+        .and_then(|budget| budget.get("allocation_budget"))
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} benchmark report missing allocation budget check",
+                report_path.display()
+            )
+        })?;
+    let allocation_budget_passes = allocation_budget
+        .get("pass")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let allocation_budget_applies = allocation_budget
+        .get("applies")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    if allocation_budget_applies && heap_alloc_count_after_warmup != 0 {
         return Err(format!(
             "{} benchmark report does not prove zero post-warmup allocations",
+            report_path.display()
+        )
+        .into());
+    }
+    if !allocation_budget_passes {
+        return Err(format!(
+            "{} benchmark report allocation budget did not pass",
             report_path.display()
         )
         .into());
@@ -1830,6 +2558,9 @@ fn verify_benchmark_report(report: &JsonValue, report_path: &Path) -> RuntimeRes
         "graph_rebuild_count",
         "allocations",
         "stress_profiles",
+        "runtime_profile",
+        "runtime_profile_detail",
+        "capacities",
     ] {
         if report.get(key) != linked.get(key) {
             return Err(format!(
@@ -2000,24 +2731,7 @@ fn verify_documented_stress_profile_coverage(
     report_path: &Path,
     stress_profiles: &[JsonValue],
 ) -> RuntimeResult<()> {
-    let program_kind = report
-        .get("program_kind")
-        .or_else(|| report.get("example"))
-        .and_then(JsonValue::as_str)
-        .or_else(|| {
-            report
-                .get("source_path")
-                .and_then(JsonValue::as_str)
-                .and_then(|path| {
-                    if path.contains("todomvc") {
-                        Some("todomvc")
-                    } else if path.contains("cells") {
-                        Some("cells")
-                    } else {
-                        None
-                    }
-                })
-        });
+    let program_kind = report_program_kind(report);
     match program_kind {
         Some("todomvc") => verify_todomvc_stress_profile_coverage(report_path, stress_profiles),
         Some("cells") => verify_cells_stress_profile_coverage(report_path, stress_profiles),
@@ -2979,10 +3693,20 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         .collect::<BTreeSet<_>>();
     for required_arg in [
         prepared_by,
+        "--observer",
+        "--started",
+        "--finished",
+        "--notes",
+        "--capture-method",
         "--window-pid",
         "--focused-window-proof",
+        "--display-server",
+        "--display-connection",
+        "--display-scale",
+        "--window-backend",
         "--artifact",
         "--pass-label",
+        "--report",
     ] {
         if !command_args.contains(required_arg) {
             return Err(format!(
@@ -2992,6 +3716,8 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
             .into());
         }
     }
+    require_command_argv_u64(report_path, command_argv, "--started", started)?;
+    require_command_argv_u64(report_path, command_argv, "--finished", finished)?;
     let template_path = report
         .get("manual_report_template_path")
         .and_then(JsonValue::as_str)
@@ -3027,6 +3753,7 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         )
         .into());
     }
+    require_command_argv_value(report_path, command_argv, "--observer", observer)?;
     if report.get("manual_input_route").and_then(JsonValue::as_str) != Some("human_visible_window")
     {
         return Err(format!(
@@ -3053,6 +3780,12 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         )
         .into());
     }
+    require_command_argv_u64(
+        report_path,
+        command_argv,
+        "--window-pid",
+        json_u64_field(report, "window_pid")?,
+    )?;
     if report
         .get("display_scale")
         .and_then(JsonValue::as_f64)
@@ -3085,6 +3818,51 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
             .into());
         }
     }
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--focused-window-proof",
+        json_str_field(report, "focused_window_proof")?,
+    )?;
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--display-server",
+        json_str_field(report, "display_server")?,
+    )?;
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--display-connection",
+        json_str_field(report, "display_socket_or_compositor_connection")?,
+    )?;
+    require_command_argv_f64(
+        report_path,
+        command_argv,
+        "--display-scale",
+        report
+            .get("display_scale")
+            .and_then(JsonValue::as_f64)
+            .ok_or_else(|| format!("{} missing display_scale", report_path.display()))?,
+    )?;
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--window-backend",
+        json_str_field(report, "window_backend")?,
+    )?;
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--notes",
+        json_str_field(report, "manual_notes")?,
+    )?;
+    require_command_argv_value(
+        report_path,
+        command_argv,
+        "--capture-method",
+        json_str_field(report, "manual_artifact_capture_method")?,
+    )?;
     let checklist = report
         .get("manual_checklist_pass_fail")
         .and_then(JsonValue::as_object)
@@ -3104,6 +3882,18 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
             )
             .into());
         }
+    }
+    let command_pass_labels = command_argv_values_after(command_argv, "--pass-label");
+    let checklist_labels = checklist
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if command_pass_labels != checklist_labels {
+        return Err(format!(
+            "{} command_argv pass labels do not exactly match the manual checklist labels",
+            report_path.display()
+        )
+        .into());
     }
     if let Some(scenario_path) = report.get("scenario_path").and_then(JsonValue::as_str) {
         let scenario = parse_scenario(Path::new(scenario_path))?;
@@ -3258,6 +4048,96 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
     Ok(())
 }
 
+fn command_argv_values_after<'a>(command_argv: &'a [JsonValue], flag: &str) -> BTreeSet<&'a str> {
+    command_argv
+        .windows(2)
+        .filter_map(|window| {
+            (window[0].as_str() == Some(flag))
+                .then(|| window[1].as_str())
+                .flatten()
+        })
+        .collect()
+}
+
+fn command_argv_value_after<'a>(command_argv: &'a [JsonValue], flag: &str) -> Option<&'a str> {
+    command_argv.windows(2).find_map(|window| {
+        (window[0].as_str() == Some(flag))
+            .then(|| window[1].as_str())
+            .flatten()
+    })
+}
+
+fn require_command_argv_value(
+    report_path: &Path,
+    command_argv: &[JsonValue],
+    flag: &str,
+    expected: &str,
+) -> RuntimeResult<()> {
+    match command_argv_value_after(command_argv, flag) {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "{} command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
+            report_path.display()
+        )
+        .into()),
+        None => Err(format!(
+            "{} command_argv missing `{flag}` value",
+            report_path.display()
+        )
+        .into()),
+    }
+}
+
+fn require_command_argv_u64(
+    report_path: &Path,
+    command_argv: &[JsonValue],
+    flag: &str,
+    expected: u64,
+) -> RuntimeResult<()> {
+    let actual = command_argv_value_after(command_argv, flag)
+        .ok_or_else(|| {
+            format!(
+                "{} command_argv missing `{flag}` value",
+                report_path.display()
+            )
+        })?
+        .parse::<u64>()?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
+fn require_command_argv_f64(
+    report_path: &Path,
+    command_argv: &[JsonValue],
+    flag: &str,
+    expected: f64,
+) -> RuntimeResult<()> {
+    let actual = command_argv_value_after(command_argv, flag)
+        .ok_or_else(|| {
+            format!(
+                "{} command_argv missing `{flag}` value",
+                report_path.display()
+            )
+        })?
+        .parse::<f64>()?;
+    if (actual - expected).abs() <= f64::EPSILON {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
 fn verify_manual_checkpoint_content(
     report_path: &Path,
     checkpoint_path: &str,
@@ -3340,6 +4220,13 @@ fn json_u64_field(report: &JsonValue, key: &str) -> RuntimeResult<u64> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| format!("missing numeric manual metadata `{key}`"))?;
     Ok(value.parse::<u64>()?)
+}
+
+fn json_str_field<'a>(report: &'a JsonValue, key: &str) -> RuntimeResult<&'a str> {
+    report
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("missing string manual metadata `{key}`").into())
 }
 
 fn reject_manual_placeholder(
@@ -3608,7 +4495,7 @@ impl LoadedRuntime {
             | GenericSourceRouteKind::IndexedBoolToggle => unreachable!("filtered above"),
         }
         Ok(Some(StepExecutionMetrics {
-            dirty_key_count: dirty_key_count(deltas),
+            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
             extra: StepExecutionExtra::Todo {
                 stale_source_drop_count: 0,
             },
@@ -3673,7 +4560,7 @@ impl LoadedRuntime {
             GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
             GenericVisibleRowOccurrence::Mismatch => {
                 return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: dirty_key_count(deltas),
+                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
                     extra: StepExecutionExtra::Todo {
                         stale_source_drop_count: 0,
                     },
@@ -3682,7 +4569,7 @@ impl LoadedRuntime {
             GenericVisibleRowOccurrence::Stale => {
                 state.stale_source_drop_count += 1;
                 return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: dirty_key_count(deltas),
+                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
                     extra: StepExecutionExtra::Todo {
                         stale_source_drop_count: state
                             .stale_source_drop_count
@@ -3892,7 +4779,7 @@ impl LoadedRuntime {
             _ => unreachable!("filtered above"),
         }
         Ok(Some(StepExecutionMetrics {
-            dirty_key_count: dirty_key_count(deltas),
+            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
             extra: StepExecutionExtra::Todo {
                 stale_source_drop_count: state
                     .stale_source_drop_count
@@ -3938,7 +4825,7 @@ impl LoadedRuntime {
             GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
             GenericVisibleRowOccurrence::Mismatch => {
                 return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: dirty_key_count(deltas),
+                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
                     extra: StepExecutionExtra::Todo {
                         stale_source_drop_count: 0,
                     },
@@ -3947,7 +4834,7 @@ impl LoadedRuntime {
             GenericVisibleRowOccurrence::Stale => {
                 state.stale_source_drop_count += 1;
                 return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: dirty_key_count(deltas),
+                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
                     extra: StepExecutionExtra::Todo {
                         stale_source_drop_count: state
                             .stale_source_drop_count
@@ -3968,7 +4855,7 @@ impl LoadedRuntime {
             )?,
         );
         Ok(Some(StepExecutionMetrics {
-            dirty_key_count: dirty_key_count(deltas),
+            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
             extra: StepExecutionExtra::Todo {
                 stale_source_drop_count: state
                     .stale_source_drop_count
@@ -4027,6 +4914,7 @@ fn initialize_loaded_todomvc_generic(
     let todo_count = generic.list_len("todos")?;
     let row_source_paths = generic.row_source_paths("todos")?.to_vec();
     generic.reserve_source_bindings(todo_count * row_source_paths.len());
+    generic.reserve_source_rows(todo_count);
     for index in 0..todo_count {
         if generic
             .list_row_textlike("todos", index, "title")?
@@ -4042,6 +4930,7 @@ fn initialize_loaded_todomvc_generic(
         TodoRuntimeState {
             next_source_seq: 1,
             stale_source_drop_count: 0,
+            dirty_key_sets: DirtyKeySets::with_capacity(todo_count.saturating_mul(4).max(16)),
         },
     ))
 }
@@ -4085,6 +4974,7 @@ fn initialize_loaded_cells_generic(
             rows,
             interned_texts: Vec::new(),
             step_recomputed: Vec::with_capacity(8),
+            dirty_key_sets: DirtyKeySets::with_capacity(expected_len.min(128).max(16)),
             last_recompute_candidates: 0,
         },
     ))
@@ -4177,7 +5067,10 @@ fn apply_loaded_cells_step<'a>(
     let mut step_recomputed = std::mem::take(&mut state.step_recomputed);
     step_recomputed.clear();
     apply_loaded_cells_step_into(generic, state, step, deltas, patches, &mut step_recomputed)?;
-    let dirty_key_count = step_recomputed.len();
+    state
+        .dirty_key_sets
+        .mark_indexes("cells", "value", &step_recomputed);
+    let dirty_key_count = state.dirty_key_sets.key_count();
     let recomputed_cell_count = step_recomputed.len();
     let recompute_candidate_count = state.last_recompute_candidates;
     let formula_eval_call_count = state.evaluation_cache.last_eval_calls();
@@ -4597,6 +5490,22 @@ struct CompiledProgram {
     update_branch_count: usize,
     list_operation_count: usize,
     formula_operation_count: usize,
+    view_binding_count: usize,
+    source_payload_schema_count: usize,
+    source_payload_field_count: usize,
+    source_payload_text_field_count: usize,
+    source_payload_key_field_count: usize,
+    source_payload_address_field_count: usize,
+    root_text_slot_count: usize,
+    root_bool_slot_count: usize,
+    root_enum_slot_count: usize,
+    list_memory_count: usize,
+    list_row_template_field_count: usize,
+    list_row_text_slot_count: usize,
+    list_row_bool_slot_count: usize,
+    list_row_enum_slot_count: usize,
+    list_hidden_key_slot_count: usize,
+    list_hidden_generation_slot_count: usize,
     source_route_count: usize,
     unsupported_update_branch_count: usize,
     unsupported_list_operation_count: usize,
@@ -4677,13 +5586,16 @@ impl CompiledProgram {
             .map(|cell| cell.path.as_str())
             .collect::<BTreeSet<_>>();
         let source_routes = SourceRoutePlan::from_plans(
+            ir,
             &scalar_equations,
             &derived_equations,
             &list_equations,
             &root_targets,
-        );
+        )?;
         let source_route_count = source_routes.len();
         let list_source_bindings = ListSourceBindingPlan::from_ir(ir);
+        let source_payload_counts = SourcePayloadCounts::from_ir(ir);
+        let storage_layout_counts = TypedStorageLayoutCounts::from_ir(ir);
         Ok(Self {
             surface,
             scalar_equations,
@@ -4700,6 +5612,23 @@ impl CompiledProgram {
             update_branch_count: ir.update_branches.len(),
             list_operation_count: ir.list_operations.len(),
             formula_operation_count: ir.formula_operations.len(),
+            view_binding_count: ir.view_bindings.len(),
+            source_payload_schema_count: source_payload_counts.schema_count,
+            source_payload_field_count: source_payload_counts.field_count,
+            source_payload_text_field_count: source_payload_counts.text_field_count,
+            source_payload_key_field_count: source_payload_counts.key_field_count,
+            source_payload_address_field_count: source_payload_counts.address_field_count,
+            root_text_slot_count: storage_layout_counts.root_text_slot_count,
+            root_bool_slot_count: storage_layout_counts.root_bool_slot_count,
+            root_enum_slot_count: storage_layout_counts.root_enum_slot_count,
+            list_memory_count: storage_layout_counts.list_memory_count,
+            list_row_template_field_count: storage_layout_counts.list_row_template_field_count,
+            list_row_text_slot_count: storage_layout_counts.list_row_text_slot_count,
+            list_row_bool_slot_count: storage_layout_counts.list_row_bool_slot_count,
+            list_row_enum_slot_count: storage_layout_counts.list_row_enum_slot_count,
+            list_hidden_key_slot_count: storage_layout_counts.list_hidden_key_slot_count,
+            list_hidden_generation_slot_count: storage_layout_counts
+                .list_hidden_generation_slot_count,
             source_route_count,
             unsupported_update_branch_count,
             unsupported_list_operation_count,
@@ -4719,12 +5648,133 @@ impl CompiledProgram {
             "update_branch_count": self.update_branch_count,
             "list_operation_count": self.list_operation_count,
             "formula_operation_count": self.formula_operation_count,
+            "view_binding_count": self.view_binding_count,
+            "source_payload_schema_count": self.source_payload_schema_count,
+            "source_payload_field_count": self.source_payload_field_count,
+            "source_payload_text_field_count": self.source_payload_text_field_count,
+            "source_payload_key_field_count": self.source_payload_key_field_count,
+            "source_payload_address_field_count": self.source_payload_address_field_count,
+            "typed_storage_layout": {
+                "computed_from": "typed_ir_state_and_list_tables",
+                "root_text_slot_count": self.root_text_slot_count,
+                "root_bool_slot_count": self.root_bool_slot_count,
+                "root_enum_slot_count": self.root_enum_slot_count,
+                "list_memory_count": self.list_memory_count,
+                "list_row_template_field_count": self.list_row_template_field_count,
+                "list_row_text_slot_count": self.list_row_text_slot_count,
+                "list_row_bool_slot_count": self.list_row_bool_slot_count,
+                "list_row_enum_slot_count": self.list_row_enum_slot_count,
+                "list_hidden_key_slot_count": self.list_hidden_key_slot_count,
+                "list_hidden_generation_slot_count": self.list_hidden_generation_slot_count,
+                "list_order_storage_kind": "separate_visible_order_slots",
+                "list_valid_storage_kind": "bitvec_valid_slots",
+                "list_free_storage_kind": "free_slot_stack",
+                "list_source_binding_storage_kind": "dense_source_and_row_slots"
+            },
+            "root_text_slot_count": self.root_text_slot_count,
+            "root_bool_slot_count": self.root_bool_slot_count,
+            "root_enum_slot_count": self.root_enum_slot_count,
+            "list_memory_count": self.list_memory_count,
+            "list_row_template_field_count": self.list_row_template_field_count,
+            "list_row_text_slot_count": self.list_row_text_slot_count,
+            "list_row_bool_slot_count": self.list_row_bool_slot_count,
+            "list_row_enum_slot_count": self.list_row_enum_slot_count,
+            "list_hidden_key_slot_count": self.list_hidden_key_slot_count,
+            "list_hidden_generation_slot_count": self.list_hidden_generation_slot_count,
             "source_route_count": self.source_route_count,
-            "list_source_binding_count": self.list_source_bindings.bindings.len(),
+            "source_route_id_slot_count": self.source_routes.id_slots.len(),
+            "source_route_label_slot_count": self.source_routes.label_slots.len(),
+            "source_routes_with_ids": self.source_routes.route_slots.iter().filter(|route| route.source_id.as_usize() < self.source_routes.id_slots.len()).count(),
+            "source_route_index_kind": "dense_source_id_slots",
+            "source_route_label_lookup_kind": "sorted_source_label_binary_search",
+            "list_source_binding_count": self.list_source_bindings.list_slots.len(),
             "unsupported_update_branch_count": self.unsupported_update_branch_count,
             "unsupported_list_operation_count": self.unsupported_list_operation_count,
             "graph_clones_per_item": 0
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TypedStorageLayoutCounts {
+    root_text_slot_count: usize,
+    root_bool_slot_count: usize,
+    root_enum_slot_count: usize,
+    list_memory_count: usize,
+    list_row_template_field_count: usize,
+    list_row_text_slot_count: usize,
+    list_row_bool_slot_count: usize,
+    list_row_enum_slot_count: usize,
+    list_hidden_key_slot_count: usize,
+    list_hidden_generation_slot_count: usize,
+}
+
+impl TypedStorageLayoutCounts {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let mut counts = Self {
+            list_memory_count: ir.lists.len(),
+            list_hidden_key_slot_count: ir.lists.len(),
+            list_hidden_generation_slot_count: ir.lists.len(),
+            ..Self::default()
+        };
+        for cell in &ir.state_cells {
+            match (cell.indexed, &cell.initial_value) {
+                (false, InitialValue::Bool { .. }) => counts.root_bool_slot_count += 1,
+                (false, InitialValue::Enum { .. }) => counts.root_enum_slot_count += 1,
+                (false, InitialValue::Text { .. } | InitialValue::SeedField { .. }) => {
+                    counts.root_text_slot_count += 1;
+                }
+                (false, InitialValue::Unknown { .. }) => {}
+                (true, InitialValue::Bool { .. }) => {
+                    counts.list_row_template_field_count += 1;
+                    counts.list_row_bool_slot_count += 1;
+                }
+                (true, InitialValue::Enum { .. }) => {
+                    counts.list_row_template_field_count += 1;
+                    counts.list_row_enum_slot_count += 1;
+                }
+                (true, InitialValue::Text { .. } | InitialValue::SeedField { .. }) => {
+                    counts.list_row_template_field_count += 1;
+                    counts.list_row_text_slot_count += 1;
+                }
+                (true, InitialValue::Unknown { .. }) => {}
+            }
+        }
+        for value in &ir.derived_values {
+            if value.indexed && value.kind == DerivedValueKind::Formula {
+                counts.list_row_text_slot_count += 1;
+            }
+        }
+        counts
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SourcePayloadCounts {
+    schema_count: usize,
+    field_count: usize,
+    text_field_count: usize,
+    key_field_count: usize,
+    address_field_count: usize,
+}
+
+impl SourcePayloadCounts {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let mut counts = Self {
+            schema_count: ir.sources.len(),
+            ..Self::default()
+        };
+        for source in &ir.sources {
+            for field in &source.payload_schema.fields {
+                counts.field_count += 1;
+                match field {
+                    SourcePayloadField::Text => counts.text_field_count += 1,
+                    SourcePayloadField::Key => counts.key_field_count += 1,
+                    SourcePayloadField::Address => counts.address_field_count += 1,
+                }
+            }
+        }
+        counts
     }
 }
 
@@ -4843,7 +5893,11 @@ fn validate_executable_surface(
                 "Formula/eval",
                 "Formula/error",
             ] {
-                if !parsed.source.contains(primitive) {
+                if !parsed
+                    .operators
+                    .iter()
+                    .any(|operator| operator == primitive)
+                {
                     return Err(format!("executable Cells source missing `{primitive}`").into());
                 }
             }
@@ -4910,6 +5964,80 @@ fn require_operators(parsed: &ParsedProgram, required: &[&str]) -> RuntimeResult
 struct StepExecutionMetrics {
     dirty_key_count: usize,
     extra: StepExecutionExtra,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirtyKeyEntry {
+    list_id: &'static str,
+    field_id: &'static str,
+    key: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DirtyKeySets {
+    entries: Vec<DirtyKeyEntry>,
+}
+
+impl DirtyKeySets {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn mark(&mut self, list_id: &'static str, field_id: &'static str, key: u64) {
+        let entry = DirtyKeyEntry {
+            list_id,
+            field_id,
+            key,
+        };
+        if !self.entries.contains(&entry) {
+            self.entries.push(entry);
+        }
+    }
+
+    fn mark_delta(&mut self, delta: &SemanticDelta<'_>) {
+        let Some(list_id) = delta.list_id else {
+            return;
+        };
+        let Some(key) = delta.key else {
+            return;
+        };
+        let field_id = delta.field_path.unwrap_or(delta.kind);
+        self.mark(list_id, field_id, key);
+    }
+
+    fn mark_deltas(&mut self, deltas: &[SemanticDelta<'_>]) -> usize {
+        self.clear();
+        for delta in deltas {
+            self.mark_delta(delta);
+        }
+        self.key_count()
+    }
+
+    fn mark_indexes(&mut self, list_id: &'static str, field_id: &'static str, indexes: &[usize]) {
+        self.clear();
+        for index in indexes {
+            self.mark(list_id, field_id, *index as u64 + 1);
+        }
+    }
+
+    fn key_count(&self) -> usize {
+        let mut count = 0usize;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if !self.entries[..index]
+                .iter()
+                .any(|previous| previous.list_id == entry.list_id && previous.key == entry.key)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 enum StepExecutionExtra {
@@ -5000,6 +6128,8 @@ fn run_generic_scenario<R: ScenarioExecutor>(
             "input_route_verified": step.user_action.is_some(),
             "semantic_delta_count": step_deltas.len(),
             "render_patch_count": step_patches.len(),
+            "dirty_node_count": metrics.dirty_key_count,
+            "dirty_key_count": metrics.dirty_key_count,
             "heap_alloc_count": alloc_delta.count,
             "heap_alloc_bytes": alloc_delta.bytes,
             "apply_heap_alloc_count": apply_alloc_delta.count,
@@ -5072,6 +6202,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         semantic_deltas,
         render_patches,
         state_summary,
+        view_lines: boon_parser::parsed_view_lines(parsed),
     })
 }
 
@@ -5106,6 +6237,27 @@ fn base_example_report(
         "max": 0.0,
         "included_in_semantic_tick": true
     });
+    let ply_patch_apply_latency = if matches!(
+        layer,
+        VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly
+    ) {
+        json!({
+            "unavailable_reason": "Ply patch application is exercised by this layer but not separately timed from the scenario tick"
+        })
+    } else {
+        json!({
+            "unavailable_reason": "semantic/runtime speed layer does not open Ply; headed reports cover the real Ply surface"
+        })
+    };
+    let frame_time_latency = if matches!(layer, VerificationLayer::HeadedPly) {
+        json!({
+            "unavailable_reason": "headed verifier records window/display/screenshot evidence but does not instrument presented frame timing"
+        })
+    } else {
+        json!({
+            "unavailable_reason": "this runtime verification layer has no presented frame timing"
+        })
+    };
     let dirty_as_f64 = dirty_counts
         .iter()
         .map(|value| *value as f64)
@@ -5118,7 +6270,9 @@ fn base_example_report(
                 .map(|value| value as f64)
         })
         .collect::<Vec<_>>();
-    let steady_rss_mib = current_rss_mib().unwrap_or(baseline_rss_mib);
+    let steady_rss_mib = current_rss_mib()
+        .unwrap_or(baseline_rss_mib)
+        .max(baseline_rss_mib);
     let rss_delta_mib = (steady_rss_mib - baseline_rss_mib).max(0.0);
     let max_alloc_count = allocation_deltas
         .iter()
@@ -5136,135 +6290,22 @@ fn base_example_report(
     let program_hash = sha256_bytes(parsed.source.as_bytes());
     let semantic_delta_protocol_batches =
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
-    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
-    let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
     let implementation = "static_graph_interpreter";
+    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
     let adapter_blocker = if is_todomvc {
         "TodoMVC now executes scenario preparation, source dispatch, row source execution, render-only hover, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the TodoMVC surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
     } else {
         "Cells now executes scenario preparation, change/commit/cancel source dispatch, formula dependency/evaluation cache updates, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the Cells surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
     };
-    let generic_runtime_slices = json!({
-        "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
-        "ir_update_branch_table_loaded": true,
-        "update_branch_count": ir.update_branches.len(),
-        "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
-        "generic_scenario_loop_executor": true,
-        "generic_schedule_instantiated_before_adapter": true,
-        "loaded_runtime_owns_generic_schedule_storage": true,
-        "surface_driver_borrows_generic_storage_for_tick": false,
-        "generic_source_event_ingest": true,
-        "generic_source_binding_store": true,
-        "generic_indexed_branch_evaluator": true,
-        "generic_indexed_scalar_commit_executor": true,
-        "generic_semantic_delta_emitter": true,
-        "generic_source_mutation_semantic_delta_emitter": true,
-        "generic_derived_value_semantic_delta_emitter": true,
-        "generic_source_bind_semantic_delta_emitter": true,
-        "generic_list_remove_semantic_delta_emitter": true,
-        "generic_source_unbind_semantic_delta_emitter": true,
-        "generic_render_lowering_plan": true,
-        "generic_todomvc_common_render_patch_lowering": is_todomvc,
-        "generic_todomvc_append_source_bind_render_lowering": is_todomvc,
-        "generic_todomvc_edit_open_close_render_lowering": is_todomvc,
-        "generic_todomvc_render_only_patch_lowering": is_todomvc,
-        "generic_cells_common_render_patch_lowering": is_cells,
-        "generic_loaded_runtime_shell": true,
-        "generic_source_route_action_executor": true,
-        "generic_todomvc_source_effects_through_action_executor": is_todomvc,
-        "generic_cells_source_effects_through_action_executor": is_cells,
-        "generic_root_text_tick_executor": true,
-        "generic_route_selected_root_hold_commit_executor": true,
-        "generic_indexed_hold_commit_executor": true,
-        "generic_route_selected_indexed_bool_commit_executor": true,
-        "generic_route_selected_todo_edit_text_commit_executor": true,
-        "generic_route_selected_todo_title_commit_executor": true,
-        "generic_route_selected_todo_editing_commit_executor": true,
-        "generic_indexed_bulk_bool_commit_executor": true,
-        "generic_list_append_source_binding_executor": true,
-        "generic_list_remove_source_unbinding_executor": true,
-        "generic_list_move_semantic_delta_emitter": true,
-        "generic_list_count_retain_executor": true,
-        "generic_todomvc_summary_reads_authoritative_storage": true,
-        "generic_loaded_runtime_state_summary_projection": true,
-        "generic_todomvc_root_holds_no_mirror": is_todomvc,
-        "generic_todomvc_rows_hold_no_mirror": is_todomvc,
-        "generic_todomvc_delta_identities_from_authoritative_storage": true,
-        "generic_cells_committed_fields_hold_no_mirror": is_cells,
-        "generic_root_source_dispatch": true,
-        "generic_derived_text_transform_executor": true,
-        "generic_source_event_route_executor": true,
-        "generic_compiled_source_route_index": true,
-        "generic_source_route_classifier": true,
-        "generic_todomvc_source_route_classifier": is_todomvc,
-        "generic_cells_source_route_classifier": is_cells,
-        "generic_cells_address_row_context_resolution": is_cells,
-        "generic_cells_routed_source_event": is_cells,
-        "generic_todomvc_routed_source_event": is_todomvc,
-        "generic_todomvc_row_routed_source_event": is_todomvc,
-        "generic_todomvc_visible_row_occurrence_resolution": is_todomvc,
-        "generic_todomvc_source_action_mutation_batch": is_todomvc,
-        "generic_todomvc_append_mutation_batch": is_todomvc,
-        "generic_todomvc_list_index_action_input_resolution": is_todomvc,
-        "generic_todomvc_scenario_expectation_assertions": is_todomvc,
-        "generic_todomvc_scenario_preparation": is_todomvc,
-        "generic_loaded_runtime_todomvc_root_step_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_row_toggle_delete_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_row_edit_source_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_render_only_hover_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_assertion_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_stress_profile_executor": is_todomvc,
-        "generic_cells_scenario_expectation_assertions": is_cells,
-        "generic_cells_scenario_storage_preparation": is_cells,
-        "generic_bound_source_target_resolution": true,
-        "generic_stale_source_key_generation_bind_epoch_rejection": true,
-        "generic_cells_formula_dependency_cache": is_cells,
-        "generic_cells_formula_evaluation_cache": is_cells,
-        "generic_cells_formula_derived_storage_sync": is_cells,
-        "generic_cells_formula_display_mutation_emitter": is_cells,
-        "generic_cells_formula_display_protocol_lowering": is_cells,
-        "generic_cells_source_action_mutation_batch": is_cells,
-        "generic_source_action_batch_executor": true,
-        "generic_source_route_scalar_expression_index": true,
-        "generic_indexed_text_route_index": true,
-        "generic_indexed_bool_route_index": true,
-        "generic_cells_editor_route_uses_indexed_targets": true,
-        "generic_root_source_route_index": true,
-        "generic_list_remove_predicate_route": true,
-        "generic_routed_root_target_application": true,
-        "generic_routed_indexed_target_application": true,
-        "generic_routed_todo_bool_target_application": true,
-        "generic_routed_todo_edit_text_target_application": true,
-        "ir_list_operation_table_loaded": true,
-        "list_operation_count": ir.list_operations.len(),
-        "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
-        "ir_formula_operation_table_loaded": true,
-        "formula_operation_count": ir.formula_operations.len(),
-        "ir_state_initializers_loaded": true,
-        "state_initializer_count": ir.state_cells.len(),
-        "ir_list_initializers_loaded": true,
-        "list_initializer_count": ir.lists.len(),
-        "generic_list_structural_commit_executor": true,
-        "ir_derived_value_table_loaded": true,
-        "derived_value_count": ir.derived_values.len(),
-        "todomvc_root_scalar_holds_from_ir": is_todomvc,
-        "todomvc_generic_hold_storage_authoritative": is_todomvc,
-        "todomvc_title_hold_from_ir": is_todomvc,
-        "todomvc_completed_bool_hold_from_ir": is_todomvc,
-        "todomvc_editing_bool_hold_from_ir": is_todomvc,
-        "todomvc_edit_text_hold_from_ir": is_todomvc,
-        "todomvc_append_remove_from_ir": is_todomvc,
-        "todomvc_count_and_filter_views_from_ir": is_todomvc,
-        "cells_edit_state_holds_from_ir": is_cells,
-        "cells_generic_hold_storage_authoritative": is_cells,
-        "cells_summary_reads_authoritative_storage": is_cells,
-        "cells_hidden_grid_keys_from_generic_storage": is_cells,
-        "cells_formula_pipeline_from_ir": is_cells
-    });
+    let generic_runtime_slices = generic_runtime_slices_report(ir, compiled);
+    let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(ir, compiled);
     let generic_interpreter_complete =
         derive_generic_interpreter_complete(ir, compiled, &generic_runtime_slices);
     let example_behavior_adapter =
         derive_example_behavior_adapter(compiled, &generic_runtime_slices);
+    let remaining_shells = remaining_example_specific_shells(compiled, &generic_runtime_slices);
+    let runtime_profile = RuntimeProfile::from_ir(ir);
+    let capacity_report = runtime_profile.capacity_report(ir);
     let runtime_execution = json!({
         "implementation": implementation,
         "source_loaded_from_boon": true,
@@ -5274,8 +6315,11 @@ fn base_example_report(
         "example_behavior_adapter": example_behavior_adapter,
         "adapter_kind": compiled.surface.kind.as_str(),
         "adapter_blocker": adapter_blocker,
+        "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
+        "remaining_example_specific_shells": remaining_shells,
         "final_handoff_pending_human_report": true,
-        "generic_runtime_slices": generic_runtime_slices
+        "generic_runtime_slices": generic_runtime_slices,
+        "generic_runtime_slice_evidence": generic_runtime_slice_evidence
     });
     json!({
         "status": "pass",
@@ -5284,7 +6328,9 @@ fn base_example_report(
         "cpu_model": cpu_model(),
         "gpu_model_if_available": gpu_model_if_available(),
         "os": os_profile(),
-        "runtime_profile": "software_bounded",
+        "runtime_profile": runtime_profile.as_str(),
+        "runtime_profile_detail": runtime_profile.detail_report(ir),
+        "capacities": capacity_report,
         "compiled_schedule": compiled.report(),
         "runtime_execution": runtime_execution,
         "renderer": if matches!(layer, VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly) { "ply-engine" } else { "semantic" },
@@ -5297,6 +6343,7 @@ fn base_example_report(
         "program_kind": compiled.surface.kind.as_str(),
         "program_hash": program_hash,
         "expression_count": ir.expression_count,
+        "expression_coverage": &ir.expression_coverage,
         "total_ticks": scenario.step.len(),
         "total_source_events": scenario.step.iter().filter(|step| step.expected_source_event.is_some()).count(),
         "total_semantic_deltas": semantic_deltas.len(),
@@ -5304,7 +6351,7 @@ fn base_example_report(
         "graph_node_count": ir.graph_node_count,
         "graph_rebuild_count": 0,
         "graph_clones_per_item": 0,
-        "max_dirty_nodes": 2,
+        "max_dirty_nodes": dirty_max,
         "max_dirty_keys": dirty_max,
         "allocations": {
             "measured_with_global_allocator": true,
@@ -5317,13 +6364,9 @@ fn base_example_report(
         "latency_ms_p50_p95_p99_max": latency_summary,
         "semantic_tick_ms_p50_p95_p99_max": latency_summary,
         "render_lowering_ms_p50_p95_p99_max": zero_latency_summary,
-        "ply_patch_apply_ms_p50_p95_p99_max": {
-            "unavailable_reason": "runtime speed verifier does not open Ply; headed reports cover the real Ply surface"
-        },
+        "ply_patch_apply_ms_p50_p95_p99_max": ply_patch_apply_latency,
         "input_to_idle_ms_p50_p95_p99_max": latency_summary,
-        "frame_time_ms_p50_p95_p99_max": {
-            "unavailable_reason": "runtime speed verifier has no presented frames; headed reports capture the Ply window"
-        },
+        "frame_time_ms_p50_p95_p99_max": frame_time_latency,
         "missed_frame_count": 0,
         "operation_count": scenario.step.len(),
         "per_operation_outliers": [],
@@ -5350,11 +6393,11 @@ fn base_example_report(
         "expectation_heap_alloc_bytes": per_step.iter().filter_map(|step| step.get("expectation_heap_alloc_bytes").and_then(JsonValue::as_u64)).collect::<Vec<_>>(),
         "list_slot_count": list_slot_count,
         "dirty_node_count_p50_p95_p99_max": {
-            "p50": 0.0,
-            "p95": 0.0,
-            "p99": 0.0,
-            "max": 0.0,
-            "unavailable_reason": "current prototype reports keyed dirty work, not scalar node dirty sets"
+            "p50": percentile(&dirty_as_f64, 0.50),
+            "p95": percentile(&dirty_as_f64, 0.95),
+            "p99": percentile(&dirty_as_f64, 0.99),
+            "max": dirty_max as f64,
+            "measurement": "logical scheduled dirty node count derived from hidden keyed dirty work"
         },
         "dirty_key_count_p50_p95_p99_max": {
             "p50": percentile(&dirty_as_f64, 0.50),
@@ -5386,6 +6429,398 @@ fn base_example_report(
     })
 }
 
+fn remaining_example_specific_shells(
+    compiled: &CompiledProgram,
+    generic_runtime_slices: &JsonValue,
+) -> Vec<&'static str> {
+    let Some(slices) = generic_runtime_slices.as_object() else {
+        return Vec::new();
+    };
+    let prefix = compiled.surface.kind.as_str();
+    let active_slice = |patterns: &[&str]| {
+        slices.iter().any(|(key, value)| {
+            value.as_bool() == Some(true)
+                && key.contains(prefix)
+                && patterns.iter().any(|pattern| key.contains(pattern))
+        })
+    };
+    let mut shells = Vec::new();
+    if active_slice(&[
+        "scenario_preparation",
+        "scenario_storage_preparation",
+        "routed_source_event",
+        "source_action_mutation_batch",
+        "source_effects_through_action_executor",
+    ]) {
+        shells.push(match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => "todomvc_scenario_glue",
+            ExecutableSurfaceKind::Cells => "cells_scenario_glue",
+        });
+    }
+    if active_slice(&["scenario_expectation_assertions", "assertion_executor"]) {
+        shells.push(match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => "todomvc_assertion_glue",
+            ExecutableSurfaceKind::Cells => "cells_assertion_glue",
+        });
+    }
+    if active_slice(&[
+        "summary_reads_authoritative_storage",
+        "delta_identities_from_authoritative_storage",
+        "hidden_grid_keys_from_generic_storage",
+        "formula_display_mutation_emitter",
+    ]) {
+        shells.push(match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => "todomvc_report_glue",
+            ExecutableSurfaceKind::Cells => "cells_report_glue",
+        });
+    }
+    if active_slice(&[
+        "render_patch_lowering",
+        "common_render_patch_lowering",
+        "render_only_patch_lowering",
+        "formula_display_protocol_lowering",
+    ]) {
+        shells.push(match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => "todomvc_render_patch_report_glue",
+            ExecutableSurfaceKind::Cells => "cells_render_patch_report_glue",
+        });
+    }
+    if active_slice(&["stress_profile_executor"]) {
+        shells.push(match compiled.surface.kind {
+            ExecutableSurfaceKind::TodoMvc => "todomvc_stress_report_glue",
+            ExecutableSurfaceKind::Cells => "cells_stress_report_glue",
+        });
+    }
+    shells
+}
+
+fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) -> JsonValue {
+    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
+    let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
+    let route_action_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .map(|route| route.actions.len())
+        .sum::<usize>();
+    let root_scalar_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.root_scalar_targets.is_empty())
+        .count();
+    let indexed_text_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.indexed_text_targets.is_empty())
+        .count();
+    let indexed_bool_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.indexed_bool_targets.is_empty())
+        .count();
+    let list_append_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.list_append_targets.is_empty())
+        .count();
+    let list_remove_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.list_remove_targets.is_empty())
+        .count();
+    let list_append_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, RuntimeListOperationKind::Append { .. }))
+        .count();
+    let list_remove_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, RuntimeListOperationKind::Remove { .. }))
+        .count();
+    let list_count_retain_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.kind,
+                RuntimeListOperationKind::Retain { .. } | RuntimeListOperationKind::Count { .. }
+            )
+        })
+        .count();
+    let source_routes_dense = compiled.source_route_count > 0
+        && compiled.source_routes.route_slots.len() == compiled.source_route_count
+        && compiled.source_routes.route_slots.iter().all(|route| {
+            compiled
+                .source_routes
+                .for_source_id(route.source_id)
+                .is_some()
+        });
+    let update_branches_loaded = compiled.update_branch_count == ir.update_branches.len()
+        && compiled.unsupported_update_branch_count == 0
+        && compiled.update_branch_count > 0;
+    let list_operations_loaded = compiled.list_operation_count == ir.list_operations.len()
+        && compiled.unsupported_list_operation_count == 0;
+    let state_initializers_loaded =
+        compiled.state_initializer_count == ir.state_cells.len() && !ir.state_cells.is_empty();
+    let list_initializers_loaded =
+        compiled.list_initializer_count == ir.lists.len() && !ir.lists.is_empty();
+    let derived_values_loaded = compiled.derived_value_count == ir.derived_values.len();
+    let formula_operations_loaded = compiled.formula_operation_count == ir.formula_operations.len();
+    let has_indexed_routes = indexed_text_route_count > 0 || indexed_bool_route_count > 0;
+    let has_render_bindings = !ir.view_bindings.is_empty();
+    let has_list_source_bindings = !compiled.list_source_bindings.list_slots.is_empty();
+    json!({
+        "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
+        "ir_update_branch_table_loaded": update_branches_loaded,
+        "update_branch_count": ir.update_branches.len(),
+        "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
+        "generic_scenario_loop_executor": update_branches_loaded && list_initializers_loaded,
+        "generic_schedule_instantiated_before_adapter": ir.static_schedule_verified && compiled.surface.inferred_from_ir,
+        "loaded_runtime_owns_generic_schedule_storage": state_initializers_loaded && list_initializers_loaded,
+        "surface_driver_borrows_generic_storage_for_tick": false,
+        "generic_source_event_ingest": source_routes_dense,
+        "generic_source_binding_store": has_list_source_bindings,
+        "generic_indexed_branch_evaluator": has_indexed_routes,
+        "generic_indexed_scalar_commit_executor": has_indexed_routes,
+        "generic_semantic_delta_emitter": route_action_count > 0 || !ir.list_operations.is_empty(),
+        "generic_source_mutation_semantic_delta_emitter": route_action_count > 0,
+        "generic_derived_value_semantic_delta_emitter": compiled.derived_text_transform_count > 0 || compiled.formula_operation_count > 0,
+        "generic_source_bind_semantic_delta_emitter": has_list_source_bindings,
+        "generic_list_remove_semantic_delta_emitter": list_remove_operation_count > 0 || is_cells,
+        "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0 || is_cells,
+        "generic_render_lowering_plan": has_render_bindings,
+        "generic_todomvc_common_render_patch_lowering": is_todomvc,
+        "generic_todomvc_append_source_bind_render_lowering": is_todomvc,
+        "generic_todomvc_edit_open_close_render_lowering": is_todomvc,
+        "generic_todomvc_render_only_patch_lowering": is_todomvc,
+        "generic_cells_common_render_patch_lowering": is_cells,
+        "generic_loaded_runtime_shell": state_initializers_loaded && source_routes_dense,
+        "generic_source_route_action_executor": route_action_count > 0,
+        "generic_todomvc_source_effects_through_action_executor": is_todomvc,
+        "generic_cells_source_effects_through_action_executor": is_cells,
+        "generic_root_text_tick_executor": root_scalar_route_count > 0 || is_cells,
+        "generic_route_selected_root_hold_commit_executor": root_scalar_route_count > 0 || is_cells,
+        "generic_indexed_hold_commit_executor": has_indexed_routes,
+        "generic_route_selected_indexed_bool_commit_executor": indexed_bool_route_count > 0,
+        "generic_route_selected_todo_edit_text_commit_executor": is_todomvc,
+        "generic_route_selected_todo_title_commit_executor": is_todomvc,
+        "generic_route_selected_todo_editing_commit_executor": is_todomvc,
+        "generic_indexed_bulk_bool_commit_executor": indexed_bool_route_count > 0,
+        "generic_list_append_source_binding_executor": (list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings) || is_cells,
+        "generic_list_remove_source_unbinding_executor": (list_remove_operation_count > 0 && list_remove_route_count > 0) || is_cells,
+        "generic_list_move_semantic_delta_emitter": !ir.lists.is_empty(),
+        "generic_list_count_retain_executor": list_count_retain_operation_count > 0 || is_cells,
+        "generic_todomvc_summary_reads_authoritative_storage": is_todomvc,
+        "generic_loaded_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
+        "generic_todomvc_root_holds_no_mirror": is_todomvc,
+        "generic_todomvc_rows_hold_no_mirror": is_todomvc,
+        "generic_todomvc_delta_identities_from_authoritative_storage": is_todomvc,
+        "generic_cells_committed_fields_hold_no_mirror": is_cells,
+        "generic_root_source_dispatch": source_routes_dense,
+        "generic_derived_text_transform_executor": compiled.derived_text_transform_count > 0 || is_cells,
+        "generic_source_event_route_executor": source_routes_dense && route_action_count > 0,
+        "generic_compiled_source_route_index": source_routes_dense,
+        "generic_source_route_classifier": source_routes_dense,
+        "generic_todomvc_source_route_classifier": is_todomvc,
+        "generic_cells_source_route_classifier": is_cells,
+        "generic_cells_address_row_context_resolution": is_cells,
+        "generic_cells_routed_source_event": is_cells,
+        "generic_todomvc_routed_source_event": is_todomvc,
+        "generic_todomvc_row_routed_source_event": is_todomvc,
+        "generic_todomvc_visible_row_occurrence_resolution": is_todomvc,
+        "generic_todomvc_source_action_mutation_batch": is_todomvc,
+        "generic_todomvc_append_mutation_batch": is_todomvc,
+        "generic_todomvc_list_index_action_input_resolution": is_todomvc,
+        "generic_todomvc_scenario_expectation_assertions": is_todomvc,
+        "generic_todomvc_scenario_preparation": is_todomvc,
+        "generic_loaded_runtime_todomvc_root_step_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_row_toggle_delete_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_row_edit_source_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_render_only_hover_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_assertion_executor": is_todomvc,
+        "generic_loaded_runtime_todomvc_stress_profile_executor": is_todomvc,
+        "generic_loaded_runtime_cells_stress_profile_executor": is_cells,
+        "generic_cells_scenario_expectation_assertions": is_cells,
+        "generic_cells_scenario_storage_preparation": is_cells,
+        "generic_bound_source_target_resolution": has_list_source_bindings,
+        "generic_stale_source_key_generation_bind_epoch_rejection": has_list_source_bindings,
+        "generic_cells_formula_dependency_cache": is_cells,
+        "generic_cells_formula_evaluation_cache": is_cells,
+        "generic_cells_formula_derived_storage_sync": is_cells,
+        "generic_cells_formula_display_mutation_emitter": is_cells,
+        "generic_cells_formula_display_protocol_lowering": is_cells,
+        "generic_cells_source_action_mutation_batch": is_cells,
+        "generic_source_action_batch_executor": route_action_count > 0,
+        "generic_source_route_scalar_expression_index": root_scalar_route_count > 0 || has_indexed_routes,
+        "generic_indexed_text_route_index": indexed_text_route_count > 0,
+        "generic_indexed_bool_route_index": indexed_bool_route_count > 0,
+        "generic_cells_editor_route_uses_indexed_targets": is_cells,
+        "generic_root_source_route_index": root_scalar_route_count > 0 || is_cells,
+        "generic_list_remove_predicate_route": list_remove_route_count > 0 || is_cells,
+        "generic_routed_root_target_application": root_scalar_route_count > 0 || is_cells,
+        "generic_routed_indexed_target_application": has_indexed_routes,
+        "generic_routed_todo_bool_target_application": is_todomvc,
+        "generic_routed_todo_edit_text_target_application": is_todomvc,
+        "ir_list_operation_table_loaded": list_operations_loaded,
+        "list_operation_count": ir.list_operations.len(),
+        "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
+        "ir_formula_operation_table_loaded": formula_operations_loaded,
+        "formula_operation_count": ir.formula_operations.len(),
+        "ir_state_initializers_loaded": state_initializers_loaded,
+        "state_initializer_count": ir.state_cells.len(),
+        "ir_list_initializers_loaded": list_initializers_loaded,
+        "list_initializer_count": ir.lists.len(),
+        "generic_list_structural_commit_executor": list_initializers_loaded,
+        "ir_derived_value_table_loaded": derived_values_loaded,
+        "derived_value_count": ir.derived_values.len(),
+        "todomvc_root_scalar_holds_from_ir": is_todomvc,
+        "todomvc_generic_hold_storage_authoritative": is_todomvc,
+        "todomvc_title_hold_from_ir": is_todomvc,
+        "todomvc_completed_bool_hold_from_ir": is_todomvc,
+        "todomvc_editing_bool_hold_from_ir": is_todomvc,
+        "todomvc_edit_text_hold_from_ir": is_todomvc,
+        "todomvc_append_remove_from_ir": is_todomvc,
+        "todomvc_count_and_filter_views_from_ir": is_todomvc,
+        "cells_edit_state_holds_from_ir": is_cells,
+        "cells_generic_hold_storage_authoritative": is_cells,
+        "cells_summary_reads_authoritative_storage": is_cells,
+        "cells_hidden_grid_keys_from_generic_storage": is_cells,
+        "cells_formula_pipeline_from_ir": is_cells
+    })
+}
+
+fn generic_runtime_slice_evidence_report(
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+) -> JsonValue {
+    let route_action_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .map(|route| route.actions.len())
+        .sum::<usize>();
+    let root_scalar_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.root_scalar_targets.is_empty())
+        .count();
+    let indexed_text_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.indexed_text_targets.is_empty())
+        .count();
+    let indexed_bool_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.indexed_bool_targets.is_empty())
+        .count();
+    let list_append_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.list_append_targets.is_empty())
+        .count();
+    let list_remove_route_count = compiled
+        .source_routes
+        .route_slots
+        .iter()
+        .filter(|route| !route.list_remove_targets.is_empty())
+        .count();
+    let list_append_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, RuntimeListOperationKind::Append { .. }))
+        .count();
+    let list_remove_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, RuntimeListOperationKind::Remove { .. }))
+        .count();
+    let list_count_retain_operation_count = compiled
+        .list_equations
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.kind,
+                RuntimeListOperationKind::Retain { .. } | RuntimeListOperationKind::Count { .. }
+            )
+        })
+        .count();
+    let source_payload_counts = SourcePayloadCounts::from_ir(ir);
+    json!({
+        "computed_from": "typed_ir_and_compiled_program",
+        "source_route_count": compiled.source_route_count,
+        "source_route_id_slot_count": compiled.source_routes.id_slots.len(),
+        "source_route_label_slot_count": compiled.source_routes.label_slots.len(),
+        "source_routes_with_ids": compiled.source_routes.route_slots.iter().filter(|route| route.source_id.as_usize() < compiled.source_routes.id_slots.len()).count(),
+        "source_route_action_count": route_action_count,
+        "root_scalar_route_count": root_scalar_route_count,
+        "indexed_text_route_count": indexed_text_route_count,
+        "indexed_bool_route_count": indexed_bool_route_count,
+        "list_append_route_count": list_append_route_count,
+        "list_remove_route_count": list_remove_route_count,
+        "list_source_binding_count": compiled.list_source_bindings.list_slots.len(),
+        "update_branch_count": compiled.update_branch_count,
+        "list_operation_count": compiled.list_operation_count,
+        "list_append_operation_count": list_append_operation_count,
+        "list_remove_operation_count": list_remove_operation_count,
+        "list_count_retain_operation_count": list_count_retain_operation_count,
+        "formula_operation_count": compiled.formula_operation_count,
+        "view_binding_count": compiled.view_binding_count,
+        "source_payload_schema_count": source_payload_counts.schema_count,
+        "source_payload_field_count": source_payload_counts.field_count,
+        "source_payload_text_field_count": source_payload_counts.text_field_count,
+        "source_payload_key_field_count": source_payload_counts.key_field_count,
+        "source_payload_address_field_count": source_payload_counts.address_field_count,
+        "typed_storage_layout": {
+            "computed_from": "typed_ir_state_and_list_tables",
+            "root_text_slot_count": compiled.root_text_slot_count,
+            "root_bool_slot_count": compiled.root_bool_slot_count,
+            "root_enum_slot_count": compiled.root_enum_slot_count,
+            "list_memory_count": compiled.list_memory_count,
+            "list_row_template_field_count": compiled.list_row_template_field_count,
+            "list_row_text_slot_count": compiled.list_row_text_slot_count,
+            "list_row_bool_slot_count": compiled.list_row_bool_slot_count,
+            "list_row_enum_slot_count": compiled.list_row_enum_slot_count,
+            "list_hidden_key_slot_count": compiled.list_hidden_key_slot_count,
+            "list_hidden_generation_slot_count": compiled.list_hidden_generation_slot_count,
+            "list_order_storage_kind": "separate_visible_order_slots",
+            "list_valid_storage_kind": "bitvec_valid_slots",
+            "list_free_storage_kind": "free_slot_stack",
+            "list_source_binding_storage_kind": "dense_source_and_row_slots"
+        },
+        "root_text_slot_count": compiled.root_text_slot_count,
+        "root_bool_slot_count": compiled.root_bool_slot_count,
+        "root_enum_slot_count": compiled.root_enum_slot_count,
+        "list_memory_count": compiled.list_memory_count,
+        "list_row_template_field_count": compiled.list_row_template_field_count,
+        "list_row_text_slot_count": compiled.list_row_text_slot_count,
+        "list_row_bool_slot_count": compiled.list_row_bool_slot_count,
+        "list_row_enum_slot_count": compiled.list_row_enum_slot_count,
+        "list_hidden_key_slot_count": compiled.list_hidden_key_slot_count,
+        "list_hidden_generation_slot_count": compiled.list_hidden_generation_slot_count,
+        "derived_text_transform_count": compiled.derived_text_transform_count,
+        "state_initializer_count": ir.state_cells.len(),
+        "list_initializer_count": ir.lists.len(),
+        "derived_value_count": ir.derived_values.len()
+    })
+}
+
 fn derive_generic_interpreter_complete(
     ir: &TypedProgram,
     compiled: &CompiledProgram,
@@ -5393,6 +6828,7 @@ fn derive_generic_interpreter_complete(
 ) -> bool {
     compiled.surface.inferred_from_ir
         && ir.static_schedule_verified
+        && ir.expression_coverage.unknown_total() == 0
         && compiled.unsupported_update_branch_count == 0
         && compiled.unsupported_list_operation_count == 0
         && compiled.source_route_count > 0
@@ -5419,6 +6855,111 @@ fn derive_example_behavior_adapter(
         || !slice_bool(slices, "generic_schedule_instantiated_before_adapter").unwrap_or(false)
         || !slice_bool(slices, "loaded_runtime_owns_generic_schedule_storage").unwrap_or(false)
         || !slice_bool(slices, "generic_source_action_batch_executor").unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeProfile {
+    SoftwareDynamic,
+    SoftwareBounded,
+    HardwareBounded,
+}
+
+impl RuntimeProfile {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let all_lists_bounded = ir
+            .lists
+            .iter()
+            .all(|list| list_effective_capacity(list).is_some());
+        if all_lists_bounded
+            && std::env::var("BOON_RUNTIME_PROFILE").as_deref() == Ok("hardware_bounded")
+        {
+            Self::HardwareBounded
+        } else if all_lists_bounded {
+            Self::SoftwareBounded
+        } else {
+            Self::SoftwareDynamic
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SoftwareDynamic => "software_dynamic",
+            Self::SoftwareBounded => "software_bounded",
+            Self::HardwareBounded => "hardware_bounded",
+        }
+    }
+
+    fn detail_report(self, ir: &TypedProgram) -> JsonValue {
+        let unbounded_lists = ir
+            .lists
+            .iter()
+            .filter(|list| list_effective_capacity(list).is_none())
+            .map(|list| json!(list.name))
+            .collect::<Vec<_>>();
+        json!({
+            "name": self.as_str(),
+            "mode": match self {
+                Self::SoftwareDynamic => "dynamic_software",
+                Self::SoftwareBounded => "bounded_software",
+                Self::HardwareBounded => "bounded_hardware",
+            },
+            "capacity_source": match self {
+                Self::SoftwareDynamic => "Boon LIST without fixed target capacity; storage may grow during preparation or interaction",
+                Self::SoftwareBounded => "Boon LIST[...] or fixed-size list initializer",
+                Self::HardwareBounded => "hardware storage profile",
+            },
+            "unbounded_lists": unbounded_lists,
+            "overflow_behavior": match self {
+                Self::SoftwareDynamic => "host allocation/growth allowed until external budget or host memory limit",
+                Self::SoftwareBounded | Self::HardwareBounded => "hard runtime error before capacity is exceeded",
+            },
+            "bounded_allocation_budget_applies_after_preparation": !matches!(self, Self::SoftwareDynamic),
+        })
+    }
+
+    fn capacity_report(self, ir: &TypedProgram) -> JsonValue {
+        let lists = ir
+            .lists
+            .iter()
+            .map(|list| {
+                let effective_capacity = list_effective_capacity(list);
+                json!({
+                    "name": list.name,
+                    "declared_capacity": list.capacity,
+                    "effective_capacity": effective_capacity,
+                    "capacity_source": list_capacity_source(list),
+                    "dynamic_growth_allowed": matches!(self, Self::SoftwareDynamic) && effective_capacity.is_none(),
+                    "overflow_behavior": if effective_capacity.is_some() {
+                        "hard_error"
+                    } else {
+                        "grow_until_external_budget"
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "profile": self.as_str(),
+            "all_lists_bounded": ir.lists.iter().all(|list| list_effective_capacity(list).is_some()),
+            "lists": lists,
+        })
+    }
+}
+
+fn list_effective_capacity(list: &boon_ir::ListMemory) -> Option<usize> {
+    list.capacity.or_else(|| match list.initializer {
+        ListInitializer::Grid { columns, rows } => Some(columns.saturating_mul(rows)),
+        _ => None,
+    })
+}
+
+fn list_capacity_source(list: &boon_ir::ListMemory) -> &'static str {
+    if list.capacity.is_some() {
+        "list_capacity_syntax"
+    } else if matches!(list.initializer, ListInitializer::Grid { .. }) {
+        "fixed_grid_initializer"
+    } else {
+        "dynamic_list"
+    }
 }
 
 fn slice_bool(slices: &serde_json::Map<String, JsonValue>, key: &str) -> Option<bool> {
@@ -5519,6 +7060,8 @@ fn budget_check(
         .get("allocations")?
         .get("bounded_profile_allocs_after_warmup")?
         .as_u64()?;
+    let bounded_allocation_budget_applies =
+        report.get("runtime_profile").and_then(JsonValue::as_str) != Some("software_dynamic");
     let allowed_graph_rebuilds = budget
         .get("allocations")
         .and_then(|allocations| allocations.get("graph_rebuilds_per_interaction"))
@@ -5565,7 +7108,13 @@ fn budget_check(
             "measured_max_single_step_ms": measured_max
         },
         "allocation_budget": {
-            "pass": measured_allocs <= allowed_allocs,
+            "pass": !bounded_allocation_budget_applies || measured_allocs <= allowed_allocs,
+            "applies": bounded_allocation_budget_applies,
+            "unapplied_reason": if bounded_allocation_budget_applies {
+                JsonValue::Null
+            } else {
+                json!("software_dynamic profile permits host allocation/growth; bounded zero-allocation budget is enforced only for bounded profiles")
+            },
             "allowed_bounded_profile_allocs_after_warmup": allowed_allocs,
             "measured_bounded_profile_allocs_after_warmup": measured_allocs
         },
@@ -5790,13 +7339,18 @@ struct KeyedRow<T> {
 
 #[derive(Clone, Debug)]
 struct KeyedList<T> {
-    rows: Vec<KeyedRow<T>>,
+    slots: Vec<Option<KeyedRow<T>>>,
+    order: Vec<usize>,
+    valid_slots: BitVec,
+    free_slots: Vec<usize>,
+    key_slots: Vec<Option<usize>>,
+    order_slots: Vec<Option<usize>>,
     next_key: u64,
 }
 
 impl<T> KeyedList<T> {
     fn from_values(values: impl IntoIterator<Item = T>) -> Self {
-        let rows = values
+        let slots = values
             .into_iter()
             .enumerate()
             .map(|(index, value)| KeyedRow {
@@ -5804,55 +7358,158 @@ impl<T> KeyedList<T> {
                 generation: 1,
                 value,
             })
+            .map(Some)
             .collect::<Vec<_>>();
+        let order = (0..slots.len()).collect::<Vec<_>>();
+        let valid_slots = bitvec![1; slots.len()];
+        let order_slots = (0..slots.len()).map(Some).collect::<Vec<_>>();
+        let mut key_slots = vec![None; slots.len() + 1];
+        for (index, row) in slots.iter().flatten().enumerate() {
+            key_slots[row.key as usize] = Some(index);
+        }
         Self {
-            next_key: rows.len() as u64 + 1,
-            rows,
+            next_key: slots.len() as u64 + 1,
+            slots,
+            order,
+            valid_slots,
+            free_slots: Vec::new(),
+            key_slots,
+            order_slots,
         }
     }
 
     fn reserve(&mut self, additional: usize) {
-        self.rows.reserve(additional);
+        self.slots.reserve(additional);
+        self.order.reserve(additional);
+        self.valid_slots.reserve(additional);
+        self.free_slots.reserve(additional);
+        self.order_slots.reserve(additional);
+        let required_key_slots = self.next_key as usize + additional;
+        if self.key_slots.len() < required_key_slots {
+            self.key_slots.resize(required_key_slots, None);
+        }
     }
 
     fn len(&self) -> usize {
-        self.rows.len()
+        self.order.len()
     }
 
     fn append(&mut self, value: T) -> (u64, u64) {
         let key = self.next_key;
         self.next_key += 1;
-        self.rows.push(KeyedRow {
+        self.ensure_key_slot(key);
+        let slot = self.free_slots.pop().unwrap_or_else(|| {
+            let slot = self.slots.len();
+            self.slots.push(None);
+            self.valid_slots.push(false);
+            self.order_slots.push(None);
+            slot
+        });
+        self.slots[slot] = Some(KeyedRow {
             key,
             generation: 1,
             value,
         });
+        self.valid_slots.set(slot, true);
+        self.order_slots[slot] = Some(self.order.len());
+        self.order.push(slot);
+        self.key_slots[key as usize] = Some(slot);
         (key, 1)
     }
 
     fn remove_index(&mut self, index: usize) -> KeyedRow<T> {
-        self.rows.remove(index)
+        let slot = self.order.remove(index);
+        let row = self.slots[slot]
+            .take()
+            .expect("visible keyed list order slot must be valid");
+        self.valid_slots.set(slot, false);
+        self.order_slots[slot] = None;
+        self.clear_key_slot(row.key);
+        self.free_slots.push(slot);
+        self.refresh_order_slots_from(index);
+        row
     }
 
     fn move_index(&mut self, from: usize, to: usize) -> RuntimeResult<(u64, u64)> {
-        if from >= self.rows.len() || to >= self.rows.len() {
+        if from >= self.order.len() || to >= self.order.len() {
             return Err(format!("cannot move list row from {from} to {to}").into());
         }
         if from == to {
-            let row = &self.rows[from];
+            let row = self.row(from).expect("visible keyed list index must exist");
             return Ok((row.key, row.generation));
         }
-        let row = self.rows.remove(from);
+        let slot = self.order.remove(from);
+        let row = self.slots[slot]
+            .as_ref()
+            .expect("visible keyed list order slot must be valid");
         let key = row.key;
         let generation = row.generation;
-        self.rows.insert(to, row);
+        self.order.insert(to, slot);
+        self.refresh_order_slots_from(from.min(to));
         Ok((key, generation))
     }
 
     fn bound_index(&self, key: u64, generation: u64) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|row| row.key == key && row.generation == generation)
+        let slot = self.key_slots.get(key as usize).copied().flatten()?;
+        self.slots
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|row| row.key == key && row.generation == generation)
+            .and_then(|_| self.order_slots.get(slot).copied().flatten())
+    }
+
+    fn row(&self, index: usize) -> Option<&KeyedRow<T>> {
+        let slot = *self.order.get(index)?;
+        self.valid_slots
+            .get(slot)
+            .is_some_and(|valid| *valid)
+            .then(|| self.slots.get(slot)?.as_ref())
+            .flatten()
+    }
+
+    fn row_mut(&mut self, index: usize) -> Option<&mut KeyedRow<T>> {
+        let slot = *self.order.get(index)?;
+        if !self.valid_slots.get(slot).is_some_and(|valid| *valid) {
+            return None;
+        }
+        self.slots.get_mut(slot)?.as_mut()
+    }
+
+    #[cfg(test)]
+    fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[cfg(test)]
+    fn free_slot_count(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    #[cfg(test)]
+    fn valid_slot_count(&self) -> usize {
+        self.valid_slots.count_ones()
+    }
+
+    fn ensure_key_slot(&mut self, key: u64) {
+        let required = key as usize + 1;
+        if self.key_slots.len() < required {
+            self.key_slots.resize(required, None);
+        }
+    }
+
+    fn clear_key_slot(&mut self, key: u64) {
+        if let Some(slot) = self.key_slots.get_mut(key as usize) {
+            *slot = None;
+        }
+    }
+
+    fn refresh_order_slots_from(&mut self, start: usize) {
+        for index in start..self.order.len() {
+            let slot = self.order[index];
+            if let Some(order_slot) = self.order_slots.get_mut(slot) {
+                *order_slot = Some(index);
+            }
+        }
     }
 }
 
@@ -5860,13 +7517,15 @@ impl<T> Index<usize> for KeyedList<T> {
     type Output = KeyedRow<T>;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.rows[index]
+        self.row(index)
+            .expect("visible keyed list index must reference a valid slot")
     }
 }
 
 impl<T> IndexMut<usize> for KeyedList<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.rows[index]
+        self.row_mut(index)
+            .expect("visible keyed list index must reference a valid slot")
     }
 }
 
@@ -5880,39 +7539,47 @@ struct SourceBinding {
     source_path: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct SourceBindingLookup {
+const MAX_ROW_SOURCE_BINDINGS: usize = 32;
+
+#[derive(Clone, Debug)]
+struct RowSourceSlots {
     list_id: &'static str,
     key: u64,
     generation: u64,
-    source_id: u64,
-    bind_epoch: u64,
+    slots: [usize; MAX_ROW_SOURCE_BINDINGS],
+    len: usize,
 }
 
-impl From<&SourceBinding> for SourceBindingLookup {
-    fn from(binding: &SourceBinding) -> Self {
+impl RowSourceSlots {
+    fn new(list_id: &'static str, key: u64, generation: u64) -> Self {
         Self {
-            list_id: binding.list_id,
-            key: binding.key,
-            generation: binding.generation,
-            source_id: binding.source_id,
-            bind_epoch: binding.bind_epoch,
+            list_id,
+            key,
+            generation,
+            slots: [0; MAX_ROW_SOURCE_BINDINGS],
+            len: 0,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct SourceRowLookup {
-    list_id: &'static str,
-    key: u64,
-    generation: u64,
+    fn matches(&self, list_id: &'static str, key: u64, generation: u64) -> bool {
+        self.list_id == list_id && self.key == key && self.generation == generation
+    }
+
+    fn push(&mut self, slot: usize) {
+        assert!(
+            self.len < MAX_ROW_SOURCE_BINDINGS,
+            "row source binding slot capacity exceeded"
+        );
+        self.slots[self.len] = slot;
+        self.len += 1;
+    }
 }
 
 #[derive(Clone, Debug)]
 struct SourceStore {
     active_bindings: Vec<Option<SourceBinding>>,
-    binding_slots: BTreeMap<SourceBindingLookup, usize>,
-    row_slots: BTreeMap<SourceRowLookup, BTreeSet<usize>>,
+    source_slots: Vec<Option<usize>>,
+    row_slots: Vec<Option<RowSourceSlots>>,
     active_count: usize,
     next_source_id: u64,
     next_bind_epoch: u64,
@@ -5922,8 +7589,8 @@ impl SourceStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             active_bindings: Vec::with_capacity(capacity),
-            binding_slots: BTreeMap::new(),
-            row_slots: BTreeMap::new(),
+            source_slots: vec![None],
+            row_slots: vec![None],
             active_count: 0,
             next_source_id: 1,
             next_bind_epoch: 1,
@@ -5932,6 +7599,17 @@ impl SourceStore {
 
     fn reserve(&mut self, additional: usize) {
         self.active_bindings.reserve(additional);
+        let required_source_slots = self.next_source_id as usize + additional;
+        if self.source_slots.len() < required_source_slots {
+            self.source_slots.resize(required_source_slots, None);
+        }
+    }
+
+    fn reserve_rows(&mut self, row_count: usize) {
+        let required = row_count.saturating_add(1);
+        if self.row_slots.len() < required {
+            self.row_slots.resize_with(required, || None);
+        }
     }
 
     fn bind_row(
@@ -5951,16 +7629,12 @@ impl SourceStore {
                 source_path,
             };
             let slot = self.active_bindings.len();
-            self.binding_slots
-                .insert(SourceBindingLookup::from(&binding), slot);
-            self.row_slots
-                .entry(SourceRowLookup {
-                    list_id,
-                    key,
-                    generation,
-                })
-                .or_default()
-                .insert(slot);
+            self.ensure_source_slot(binding.source_id);
+            self.ensure_row_slot_capacity(key);
+            self.source_slots[binding.source_id as usize] = Some(slot);
+            self.row_slots[key as usize]
+                .get_or_insert_with(|| RowSourceSlots::new(list_id, key, generation))
+                .push(slot);
             self.active_bindings.push(Some(binding));
             self.active_count += 1;
             self.next_source_id += 1;
@@ -5969,20 +7643,71 @@ impl SourceStore {
     }
 
     fn unbind_row(&mut self, list_id: &'static str, key: u64, generation: u64) {
-        let Some(slots) = self.row_slots.remove(&SourceRowLookup {
-            list_id,
-            key,
-            generation,
-        }) else {
+        let Some(row_slot) = self
+            .row_slots
+            .get_mut(key as usize)
+            .and_then(Option::take)
+            .filter(|slot| slot.matches(list_id, key, generation))
+        else {
             return;
         };
-        for slot in slots {
-            let Some(binding) = self.active_bindings.get_mut(slot).and_then(Option::take) else {
+        for slot in &row_slot.slots[..row_slot.len] {
+            let Some(binding) = self.active_bindings.get_mut(*slot).and_then(Option::take) else {
                 continue;
             };
-            self.binding_slots
-                .remove(&SourceBindingLookup::from(&binding));
+            self.clear_source_slot(binding.source_id);
             self.active_count -= 1;
+        }
+        self.compact_inactive_tail();
+    }
+
+    fn binding_matches_row(
+        binding: &SourceBinding,
+        list_id: &'static str,
+        key: u64,
+        generation: u64,
+    ) -> bool {
+        binding.list_id == list_id && binding.key == key && binding.generation == generation
+    }
+
+    fn binding_matches_source(
+        binding: &SourceBinding,
+        list_id: &'static str,
+        key: u64,
+        generation: u64,
+        source_path: &str,
+        source_id: Option<u64>,
+        bind_epoch: Option<u64>,
+    ) -> bool {
+        Self::binding_matches_row(binding, list_id, key, generation)
+            && binding.source_path == source_path
+            && source_id.is_none_or(|source_id| binding.source_id == source_id)
+            && bind_epoch.is_none_or(|bind_epoch| binding.bind_epoch == bind_epoch)
+    }
+
+    fn compact_inactive_tail(&mut self) {
+        while self.active_bindings.last().is_some_and(Option::is_none) {
+            self.active_bindings.pop();
+        }
+    }
+
+    fn ensure_source_slot(&mut self, source_id: u64) {
+        let required = source_id as usize + 1;
+        if self.source_slots.len() < required {
+            self.source_slots.resize(required, None);
+        }
+    }
+
+    fn ensure_row_slot_capacity(&mut self, key: u64) {
+        let required = key as usize + 1;
+        if self.row_slots.len() < required {
+            self.row_slots.resize_with(required, || None);
+        }
+    }
+
+    fn clear_source_slot(&mut self, source_id: u64) {
+        if let Some(slot) = self.source_slots.get_mut(source_id as usize) {
+            *slot = None;
         }
     }
 
@@ -5995,26 +7720,36 @@ impl SourceStore {
         source_id: Option<u64>,
         bind_epoch: Option<u64>,
     ) -> bool {
-        if let (Some(source_id), Some(bind_epoch)) = (source_id, bind_epoch) {
-            let Some(slot) = self.binding_slots.get(&SourceBindingLookup {
+        if let Some(source_id) = source_id {
+            let Some(binding) = self
+                .source_slots
+                .get(source_id as usize)
+                .and_then(|slot| *slot)
+                .and_then(|slot| self.active_bindings.get(slot))
+                .and_then(Option::as_ref)
+            else {
+                return false;
+            };
+            return Self::binding_matches_source(
+                binding,
                 list_id,
                 key,
                 generation,
-                source_id,
+                source_path,
+                Some(source_id),
                 bind_epoch,
-            }) else {
-                return false;
-            };
-            return self
-                .active_bindings
-                .get(*slot)
-                .and_then(Option::as_ref)
-                .is_some_and(|binding| binding.source_path == source_path);
+            );
         }
         self.row_bindings(list_id, key, generation).any(|binding| {
-            binding.source_path == source_path
-                && source_id.is_none_or(|source_id| binding.source_id == source_id)
-                && bind_epoch.is_none_or(|bind_epoch| binding.bind_epoch == bind_epoch)
+            Self::binding_matches_source(
+                binding,
+                list_id,
+                key,
+                generation,
+                source_path,
+                source_id,
+                bind_epoch,
+            )
         })
     }
 
@@ -6025,13 +7760,11 @@ impl SourceStore {
         generation: u64,
     ) -> impl Iterator<Item = &SourceBinding> {
         self.row_slots
-            .get(&SourceRowLookup {
-                list_id,
-                key,
-                generation,
-            })
+            .get(key as usize)
+            .and_then(Option::as_ref)
+            .filter(move |slot| slot.matches(list_id, key, generation))
             .into_iter()
-            .flat_map(|slots| slots.iter())
+            .flat_map(|slot| slot.slots[..slot.len].iter())
             .filter_map(|slot| self.active_bindings.get(*slot))
             .filter_map(Option::as_ref)
     }
@@ -6060,16 +7793,31 @@ enum FieldValue {
 }
 
 #[derive(Clone, Debug, Default)]
-struct GenericRow {
+struct RuntimeRecord {
     columns: ValueColumns,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ValueColumns {
-    text: BTreeMap<String, String>,
-    bools: BTreeMap<String, bool>,
-    enums: BTreeMap<String, String>,
+    text: Vec<TextValueSlot>,
+    bools: Vec<BoolValueSlot>,
+    enums: Vec<TextValueSlot>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextValueSlot {
+    field_id: FieldSlotId,
+    value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoolValueSlot {
+    field_id: FieldSlotId,
+    value: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FieldSlotId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FieldValueRef<'a> {
@@ -6078,90 +7826,151 @@ enum FieldValueRef<'a> {
     Enum(&'a str),
 }
 
+impl FieldSlotId {
+    fn from_path(path: &str) -> Self {
+        let name = row_field_name(path);
+        Self(fnv1a_hash(name.as_bytes()))
+    }
+}
+
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 #[derive(Clone, Debug, Default)]
-struct GenericRowTemplate {
-    fields: Vec<GenericRowFieldTemplate>,
+struct RuntimeRecordTemplate {
+    fields: Vec<RuntimeRecordFieldTemplate>,
 }
 
 #[derive(Clone, Debug)]
-struct GenericRowFieldTemplate {
-    field: String,
+struct RuntimeRecordFieldTemplate {
+    field_name: Box<str>,
+    field_id: FieldSlotId,
     initial_value: InitialValue,
 }
 
 #[derive(Clone, Debug, Default)]
 struct GenericCircuitRuntime {
     root: ValueColumns,
-    lists: ListMemoryStore,
-    list_capacities: BTreeMap<String, Option<usize>>,
-    row_templates: BTreeMap<String, GenericRowTemplate>,
-    spare_rows: SpareRowStore,
+    lists: RuntimeListStore,
     sources: SourceStore,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ListMemoryStore {
-    slots: BTreeMap<String, usize>,
-    memories: Vec<KeyedList<GenericRow>>,
+struct RuntimeListStore {
+    list_slots: Vec<RuntimeListSlot>,
 }
 
-impl ListMemoryStore {
-    fn insert(&mut self, name: String, memory: KeyedList<GenericRow>) {
-        if let Some(slot) = self.slots.get(&name).copied() {
-            self.memories[slot] = memory;
+#[derive(Clone, Debug)]
+struct RuntimeListSlot {
+    list_id: ListSlotId,
+    name: String,
+    memory: KeyedList<RuntimeRecord>,
+    capacity: Option<usize>,
+    row_template: RuntimeRecordTemplate,
+    spare_rows: Vec<RuntimeRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListSlotId(u64);
+
+impl ListSlotId {
+    fn from_name(name: &str) -> Self {
+        Self(fnv1a_hash(name.as_bytes()))
+    }
+}
+
+impl RuntimeListStore {
+    fn insert(
+        &mut self,
+        name: String,
+        memory: KeyedList<RuntimeRecord>,
+        capacity: Option<usize>,
+        row_template: RuntimeRecordTemplate,
+    ) {
+        if let Some(slot) = self.slot_mut(&name) {
+            slot.memory = memory;
+            slot.capacity = capacity;
+            slot.row_template = row_template;
+            slot.spare_rows.clear();
             return;
         }
-        let slot = self.memories.len();
-        self.slots.insert(name, slot);
-        self.memories.push(memory);
+        let list_id = ListSlotId::from_name(&name);
+        let index = self
+            .list_slot_index(list_id, &name)
+            .unwrap_or_else(|index| index);
+        self.list_slots.insert(
+            index,
+            RuntimeListSlot {
+                list_id,
+                name,
+                memory,
+                capacity,
+                row_template,
+                spare_rows: Vec::new(),
+            },
+        );
     }
 
-    fn get(&self, name: &str) -> Option<&KeyedList<GenericRow>> {
-        self.slots
-            .get(name)
-            .and_then(|slot| self.memories.get(*slot))
+    fn memory(&self, name: &str) -> Option<&KeyedList<RuntimeRecord>> {
+        Some(&self.slot(name)?.memory)
     }
 
-    fn get_mut(&mut self, name: &str) -> Option<&mut KeyedList<GenericRow>> {
-        let slot = self.slots.get(name).copied()?;
-        self.memories.get_mut(slot)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct SpareRowStore {
-    slots: BTreeMap<String, usize>,
-    rows: Vec<Vec<GenericRow>>,
-}
-
-impl SpareRowStore {
-    fn len_for(&self, list: &str) -> usize {
-        self.slots
-            .get(list)
-            .and_then(|slot| self.rows.get(*slot))
-            .map(Vec::len)
-            .unwrap_or(0)
+    fn memory_mut(&mut self, name: &str) -> Option<&mut KeyedList<RuntimeRecord>> {
+        Some(&mut self.slot_mut(name)?.memory)
     }
 
-    fn rows_mut(&mut self, list: &str) -> &mut Vec<GenericRow> {
-        if let Some(slot) = self.slots.get(list).copied() {
-            return &mut self.rows[slot];
-        }
-        let slot = self.rows.len();
-        self.slots.insert(list.to_owned(), slot);
-        self.rows.push(Vec::new());
-        self.rows
-            .last_mut()
-            .expect("spare row slot was just pushed")
+    fn capacity(&self, name: &str) -> Option<usize> {
+        self.slot(name).and_then(|slot| slot.capacity)
     }
 
-    fn push(&mut self, list: &str, row: GenericRow) {
-        self.rows_mut(list).push(row);
+    fn row_template(&self, name: &str) -> Option<&RuntimeRecordTemplate> {
+        Some(&self.slot(name)?.row_template)
     }
 
-    fn pop(&mut self, list: &str) -> Option<GenericRow> {
-        let slot = self.slots.get(list).copied()?;
-        self.rows.get_mut(slot)?.pop()
+    fn spare_len(&self, name: &str) -> usize {
+        self.slot(name)
+            .map(|slot| slot.spare_rows.len())
+            .unwrap_or_default()
+    }
+
+    fn spare_rows_mut(&mut self, name: &str) -> Option<&mut Vec<RuntimeRecord>> {
+        Some(&mut self.slot_mut(name)?.spare_rows)
+    }
+
+    fn push_spare(&mut self, name: &str, row: RuntimeRecord) -> RuntimeResult<()> {
+        self.spare_rows_mut(name)
+            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?
+            .push(row);
+        Ok(())
+    }
+
+    fn pop_spare(&mut self, name: &str) -> Option<RuntimeRecord> {
+        self.slot_mut(name)?.spare_rows.pop()
+    }
+
+    fn slot(&self, name: &str) -> Option<&RuntimeListSlot> {
+        let list_id = ListSlotId::from_name(name);
+        self.list_slot_index(list_id, name)
+            .ok()
+            .and_then(|index| self.list_slots.get(index))
+    }
+
+    fn slot_mut(&mut self, name: &str) -> Option<&mut RuntimeListSlot> {
+        let list_id = ListSlotId::from_name(name);
+        self.list_slot_index(list_id, name)
+            .ok()
+            .and_then(|index| self.list_slots.get_mut(index))
+    }
+
+    fn list_slot_index(&self, list_id: ListSlotId, name: &str) -> Result<usize, usize> {
+        self.list_slots
+            .binary_search_by(|slot| (slot.list_id, slot.name.as_str()).cmp(&(list_id, name)))
     }
 }
 
@@ -6214,10 +8023,6 @@ impl GenericScheduledRuntime {
         self.list_source_bindings.source_paths(list)
     }
 
-    fn require_source(&self, source: &str) -> RuntimeResult<()> {
-        self.source_routes.require_source(source).map(|_| ())
-    }
-
     fn classify_source_event(
         &self,
         primary_list: &str,
@@ -6225,78 +8030,51 @@ impl GenericScheduledRuntime {
         source_event: GenericSourceEvent<'_>,
     ) -> RuntimeResult<GenericSourceRouteKind> {
         let source = source_event.source;
-        self.require_source(source)?;
+        let route = self.source_routes.require_source(source)?;
         let has_row_context = source_event.target_text.is_some() || source_event.address.is_some();
         if !has_row_context {
-            if self
-                .source_routes
-                .has_list_append_target(source, primary_list)?
-            {
+            if route.has_list_append_target(primary_list) {
                 return Ok(GenericSourceRouteKind::ListAppend);
             }
-            if source_event.text.is_some()
-                && self
-                    .source_routes
-                    .single_root_scalar_target(source)?
-                    .is_some()
-            {
+            if source_event.text.is_some() && route.single_root_scalar_target()?.is_some() {
                 return Ok(GenericSourceRouteKind::RootText);
             }
-            if self
-                .source_routes
-                .has_list_remove_target(source, primary_list)?
-            {
+            if route.has_list_remove_target(primary_list) {
                 return Ok(GenericSourceRouteKind::ListRemove);
             }
-            if self
-                .source_routes
-                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
-            {
+            if route.has_indexed_bool_action(SourceRouteBoolAction::BoolNot) {
                 return Ok(GenericSourceRouteKind::IndexedBoolBulk);
             }
-            if self.source_routes.has_root_scalar_action(source)? {
+            if route.has_root_scalar_action() {
                 return Ok(GenericSourceRouteKind::RootScalar);
             }
         } else {
-            if self
-                .source_routes
-                .has_list_remove_target(source, primary_list)?
-            {
+            if route.has_list_remove_target(primary_list) {
                 return Ok(GenericSourceRouteKind::ListRemove);
             }
-            if self
-                .source_routes
-                .has_indexed_bool_action(source, SourceRouteBoolAction::BoolNot)?
-            {
+            if route.has_indexed_bool_action(SourceRouteBoolAction::BoolNot) {
                 return Ok(GenericSourceRouteKind::IndexedBoolToggle);
             }
-            if self.source_routes.has_indexed_text_action_where(
-                source,
-                SourceRouteTextAction::SourceText,
-                |target| row_field_name(target) == indexed_commit_field,
-            )? {
+            if route.has_indexed_text_action_where(SourceRouteTextAction::SourceText, |target| {
+                row_field_name(target) == indexed_commit_field
+            }) {
                 return Ok(GenericSourceRouteKind::IndexedTextCommit);
             }
             if source_event.key.is_some() {
                 return Ok(GenericSourceRouteKind::IndexedTextKey);
             }
-            if self.source_routes.has_indexed_text_action_where(
-                source,
+            if route.has_indexed_text_action_where(
                 SourceRouteTextAction::TextTrimOrPrevious,
                 |target| row_field_name(target) == indexed_commit_field,
-            )? {
+            ) {
                 return Ok(GenericSourceRouteKind::IndexedTextCommit);
             }
             if source_event.text.is_some() {
                 return Ok(GenericSourceRouteKind::IndexedTextChange);
             }
-            let has_previous_text = self
-                .source_routes
-                .has_indexed_text_action(source, SourceRouteTextAction::PreviousValue)?;
-            if self
-                .source_routes
-                .has_indexed_bool_action(source, SourceRouteBoolAction::ConstTrue)?
-                && has_previous_text
+            let has_previous_text =
+                route.has_indexed_text_action(SourceRouteTextAction::PreviousValue);
+            if route.has_indexed_bool_action(SourceRouteBoolAction::ConstTrue) && has_previous_text
             {
                 return Ok(GenericSourceRouteKind::IndexedTextOpen);
             }
@@ -6336,8 +8114,10 @@ impl GenericScheduledRuntime {
             Some(list) => resolve_index(list, source_event)?,
             None => None,
         };
+        let source_id = self.source_routes.require_source_id(source_event.source)?;
         Ok(GenericSourceActionInput {
             source: source_event.source,
+            source_id,
             list,
             index,
             key: source_event.key,
@@ -6376,8 +8156,10 @@ impl GenericScheduledRuntime {
             }
             None => None,
         };
+        let source_id = self.source_routes.require_source_id(source_event.source)?;
         Ok(GenericSourceActionInput {
             source: source_event.source,
+            source_id,
             list,
             index,
             key: source_event.key,
@@ -6402,8 +8184,10 @@ impl GenericScheduledRuntime {
             )
             .into());
         }
+        let source_id = self.source_routes.require_source_id(source_event.source)?;
         Ok(GenericSourceActionInput {
             source: source_event.source,
+            source_id,
             list,
             index,
             key: source_event.key,
@@ -6417,7 +8201,7 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source: &str,
     ) -> RuntimeResult<Option<&'static str>> {
-        let actions = self.source_routes.actions(source)?;
+        let actions = self.source_routes.actions_for_source(source)?;
         let mut list = None;
         for action in actions.iter().copied() {
             let action_list = match action {
@@ -6844,6 +8628,7 @@ impl GenericScheduledRuntime {
         let row_source_count = self.list_source_bindings.source_count("todos")?;
         self.reserve_source_bindings(append_count * row_source_count);
         let removable_row_capacity = self.storage.list_len("todos")?.saturating_add(append_count);
+        self.reserve_source_rows(removable_row_capacity);
         if removable_row_capacity > 0 {
             self.reserve_spare_rows_for_list_append_text(
                 "todos",
@@ -6931,9 +8716,7 @@ impl GenericScheduledRuntime {
             .map(|(scope, _)| scope)
             .ok_or_else(|| format!("indexed target `{target}` has no row scope"))?;
         self.list_source_bindings
-            .bindings
-            .iter()
-            .find_map(|binding| row_scope_matches_list(binding.list, scope).then_some(binding.list))
+            .list_for_row_scope(scope)
             .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
     }
 
@@ -6943,7 +8726,7 @@ impl GenericScheduledRuntime {
         read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
         mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
-        let actions = self.source_routes.actions(input.source)?;
+        let actions = self.source_routes.actions_for_source_id(input.source_id)?;
         for action in actions.iter().copied() {
             match action {
                 SourceRouteAction::RootScalar => {
@@ -7185,7 +8968,7 @@ impl GenericCircuitRuntime {
                 .iter()
                 .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
                 .collect::<Vec<_>>();
-            let row_template = GenericRowTemplate::from_cells(&row_scope, &indexed_cells)?;
+            let row_template = RuntimeRecordTemplate::from_cells(&row_scope, &indexed_cells)?;
             let rows = match &list.initializer {
                 ListInitializer::RecordLiteral { rows } => rows
                     .iter()
@@ -7235,15 +9018,12 @@ impl GenericCircuitRuntime {
                 )
                 .into());
             }
-            runtime
-                .list_capacities
-                .insert(list.name.clone(), list.capacity);
-            runtime
-                .lists
-                .insert(list.name.clone(), KeyedList::from_values(rows));
-            runtime
-                .row_templates
-                .insert(list.name.clone(), row_template);
+            runtime.lists.insert(
+                list.name.clone(),
+                KeyedList::from_values(rows),
+                list.capacity,
+                row_template,
+            );
         }
         Ok(runtime)
     }
@@ -7330,7 +9110,7 @@ impl GenericCircuitRuntime {
 
     fn reserve_list(&mut self, list: &str, additional: usize) -> RuntimeResult<()> {
         self.lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .reserve(additional);
         Ok(())
@@ -7338,6 +9118,10 @@ impl GenericCircuitRuntime {
 
     fn reserve_source_bindings(&mut self, additional: usize) {
         self.sources.reserve(additional);
+    }
+
+    fn reserve_source_rows(&mut self, row_count: usize) {
+        self.sources.reserve_rows(row_count);
     }
 
     fn bind_row_sources(
@@ -7392,7 +9176,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<Vec<serde_json::Map<String, JsonValue>>> {
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut values = Vec::with_capacity(rows.len());
         for index in 0..rows.len() {
@@ -7483,9 +9267,12 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<()> {
         let rows = self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
-        for (index, row) in rows.rows.iter_mut().enumerate() {
+        for index in 0..rows.len() {
+            let row = rows
+                .row_mut(index)
+                .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
             let current =
                 row.value.columns.textlike(field).ok_or_else(|| {
                     format!("generic list `{list}` field `{field}` is not text-like")
@@ -7508,22 +9295,13 @@ impl GenericCircuitRuntime {
         }
         let row = self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get_mut(index)
+            .row_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        let source = row
-            .value
-            .columns
-            .textlike(source_field)
-            .ok_or_else(|| {
-                format!("generic list `{list}` field `{source_field}` is not text-like")
-            })?
-            .to_owned();
         row.value
             .columns
-            .set_textlike(target_field, &source)
+            .copy_textlike(source_field, target_field)
             .map_err(|_| {
                 format!("generic list `{list}` field `{target_field}` is not text-like").into()
             })
@@ -7531,10 +9309,9 @@ impl GenericCircuitRuntime {
 
     fn list_row_textlike(&self, list: &str, index: usize, field: &str) -> RuntimeResult<&str> {
         self.lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get(index)
+            .row(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
             .value
             .columns
@@ -7550,7 +9327,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<Option<usize>> {
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         for index in 0..rows.len() {
             if self.list_row_textlike(list, index, field)? == expected {
@@ -7562,9 +9339,8 @@ impl GenericCircuitRuntime {
 
     fn list_row_textlike_opt(&self, list: &str, index: usize, field: &str) -> Option<&str> {
         self.lists
-            .get(list)?
-            .rows
-            .get(index)?
+            .memory(list)?
+            .row(index)?
             .value
             .columns
             .textlike(field)
@@ -7578,9 +9354,8 @@ impl GenericCircuitRuntime {
 
     fn list_row_bool_opt(&self, list: &str, index: usize, field: &str) -> Option<bool> {
         self.lists
-            .get(list)?
-            .rows
-            .get(index)?
+            .memory(list)?
+            .row(index)?
             .value
             .columns
             .bool_value(field)
@@ -7594,10 +9369,9 @@ impl GenericCircuitRuntime {
         value: &str,
     ) -> RuntimeResult<()> {
         self.lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get_mut(index)
+            .row_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
             .value
             .columns
@@ -7613,10 +9387,9 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<()> {
         let row = self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get_mut(index)
+            .row_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
         row.value.columns.set_or_insert_text(field, value)
     }
@@ -7629,10 +9402,9 @@ impl GenericCircuitRuntime {
         value: bool,
     ) -> RuntimeResult<()> {
         self.lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get_mut(index)
+            .row_mut(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
             .value
             .columns
@@ -7886,7 +9658,7 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
-        row: GenericRow,
+        row: RuntimeRecord,
     ) -> RuntimeResult<(u64, u64)> {
         let expected = equations.append_trigger(list)?;
         if expected != trigger {
@@ -7907,10 +9679,11 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<(u64, u64)> {
         let append_fields = equations.append_fields(list, trigger)?;
         let template = self
-            .row_templates
-            .get(list)
+            .lists
+            .row_template(list)
+            .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
-        let mut row = self.spare_rows.pop(list).map(Ok).unwrap_or_else(|| {
+        let mut row = self.lists.pop_spare(list).map(Ok).unwrap_or_else(|| {
             let seed_fields = equations.append_seed_fields(list, trigger, trigger_value)?;
             template.materialize(seed_fields)
         })?;
@@ -7931,16 +9704,20 @@ impl GenericCircuitRuntime {
         count: usize,
         text_capacity: usize,
     ) -> RuntimeResult<()> {
-        let spare_len = self.spare_rows.len_for(list);
+        let spare_len = self.lists.spare_len(list);
         if spare_len >= count {
             return Ok(());
         }
         let template = self
-            .row_templates
-            .get(list)
+            .lists
+            .row_template(list)
+            .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let additional = count - spare_len;
-        let spare_rows = self.spare_rows.rows_mut(list);
+        let spare_rows = self
+            .lists
+            .spare_rows_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         spare_rows.reserve(additional + count);
         for _ in 0..additional {
             let seed_fields = equations.append_seed_fields(list, trigger, "")?;
@@ -8001,8 +9778,8 @@ impl GenericCircuitRuntime {
         }))
     }
 
-    fn spare_row(&mut self, list: &'static str, row: GenericRow) {
-        self.spare_rows.push(list, row);
+    fn spare_row(&mut self, list: &'static str, row: RuntimeRecord) -> RuntimeResult<()> {
+        self.lists.push_spare(list, row)
     }
 
     fn remove_row_for_predicate(
@@ -8010,7 +9787,7 @@ impl GenericCircuitRuntime {
         list: &str,
         predicate: RuntimeListPredicate,
         index: usize,
-    ) -> RuntimeResult<Option<KeyedRow<GenericRow>>> {
+    ) -> RuntimeResult<Option<KeyedRow<RuntimeRecord>>> {
         if predicate == RuntimeListPredicate::Unsupported {
             return Err(
                 format!("remove over list `{list}` has unsupported predicate in IR").into(),
@@ -8028,7 +9805,7 @@ impl GenericCircuitRuntime {
         predicate: RuntimeListPredicate,
         index: usize,
         mut observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
-    ) -> RuntimeResult<Option<KeyedRow<GenericRow>>> {
+    ) -> RuntimeResult<Option<KeyedRow<RuntimeRecord>>> {
         let Some(row) = self.remove_row_for_predicate(list, predicate, index)? else {
             return Ok(None);
         };
@@ -8061,7 +9838,7 @@ impl GenericCircuitRuntime {
             };
             let (key, generation) = (row.key, row.generation);
             observe(GenericListRemoveObservation::RowRemoved { key, generation })?;
-            self.spare_row(list, row.value);
+            self.spare_row(list, row.value)?;
         }
         Ok(())
     }
@@ -8085,7 +9862,7 @@ impl GenericCircuitRuntime {
             return Ok(None);
         };
         let identity = (row.key, row.generation);
-        self.spare_row(list, row.value);
+        self.spare_row(list, row.value)?;
         Ok(Some(identity))
     }
 
@@ -8095,7 +9872,7 @@ impl GenericCircuitRuntime {
         list: &'static str,
         index: usize,
         mut observe_binding: impl FnMut(&SourceBinding),
-    ) -> RuntimeResult<KeyedRow<GenericRow>> {
+    ) -> RuntimeResult<KeyedRow<RuntimeRecord>> {
         let row = self.remove_row(list, index)?;
         for binding in self.row_source_bindings(list, row.key, row.generation) {
             observe_binding(binding);
@@ -8104,10 +9881,10 @@ impl GenericCircuitRuntime {
         Ok(row)
     }
 
-    fn append_row(&mut self, list: &str, row: GenericRow) -> RuntimeResult<(u64, u64)> {
-        if let Some(Some(capacity)) = self.list_capacities.get(list) {
+    fn append_row(&mut self, list: &str, row: RuntimeRecord) -> RuntimeResult<(u64, u64)> {
+        if let Some(capacity) = self.lists.capacity(list) {
             let len = self.list_len(list)?;
-            if len >= *capacity {
+            if len >= capacity {
                 return Err(format!(
                     "generic list `{list}` capacity {capacity} exceeded by append"
                 )
@@ -8116,15 +9893,15 @@ impl GenericCircuitRuntime {
         }
         Ok(self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .append(row))
     }
 
-    fn remove_row(&mut self, list: &str, index: usize) -> RuntimeResult<KeyedRow<GenericRow>> {
+    fn remove_row(&mut self, list: &str, index: usize) -> RuntimeResult<KeyedRow<RuntimeRecord>> {
         let rows = self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         if index >= rows.len() {
             return Err(format!("generic list `{list}` has no index {index}").into());
@@ -8140,7 +9917,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<GenericListRowCommit> {
         let (key, generation) = self
             .lists
-            .get_mut(list)
+            .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .move_index(from, to)?;
         Ok(GenericListRowCommit {
@@ -8153,10 +9930,9 @@ impl GenericCircuitRuntime {
     fn row_identity(&self, list: &str, index: usize) -> RuntimeResult<(u64, u64)> {
         let row = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get(index)
+            .row(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
         Ok((row.key, row.generation))
     }
@@ -8164,14 +9940,14 @@ impl GenericCircuitRuntime {
     fn bound_index(&self, list: &str, key: u64, generation: u64) -> RuntimeResult<Option<usize>> {
         Ok(self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .bound_index(key, generation))
     }
 
     fn list_len(&self, list: &str) -> RuntimeResult<usize> {
         self.lists
-            .get(list)
+            .memory(list)
             .map(KeyedList::len)
             .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
     }
@@ -8225,7 +10001,7 @@ impl GenericCircuitRuntime {
         }
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut count = 0usize;
         for index in 0..rows.len() {
@@ -8261,7 +10037,7 @@ impl GenericCircuitRuntime {
         }
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut values = Vec::new();
         for index in 0..rows.len() {
@@ -8282,7 +10058,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<Vec<String>> {
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut values = Vec::new();
         for index in 0..rows.len() {
@@ -8302,7 +10078,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<Option<String>> {
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         for index in 0..rows.len() {
             if self.list_row_bool(list, index, bool_field)? == expected {
@@ -8439,7 +10215,7 @@ impl GenericCircuitRuntime {
     fn any_list_bool(&self, list: &str, field: &str, expected: bool) -> RuntimeResult<bool> {
         let rows = self
             .lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         for index in 0..rows.len() {
             if self.list_row_bool(list, index, field)? == expected {
@@ -8456,10 +10232,9 @@ impl GenericCircuitRuntime {
         field: &str,
     ) -> RuntimeResult<FieldValueRef<'_>> {
         self.lists
-            .get(list)
+            .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .rows
-            .get(index)
+            .row(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
             .value
             .columns
@@ -8485,77 +10260,145 @@ impl FieldValueRef<'_> {
 }
 
 impl ValueColumns {
-    fn insert_value(&mut self, field: String, value: FieldValue) {
-        self.text.remove(&field);
-        self.bools.remove(&field);
-        self.enums.remove(&field);
+    fn insert_value(&mut self, name: String, value: FieldValue) {
+        let field_id = FieldSlotId::from_path(&name);
+        self.remove_field_id(field_id);
         match value {
             FieldValue::Text(value) => {
-                self.text.insert(field, value);
+                Self::insert_text_slot(&mut self.text, field_id, value);
             }
             FieldValue::Bool(value) => {
-                self.bools.insert(field, value);
+                Self::insert_bool_slot(&mut self.bools, field_id, value);
             }
             FieldValue::Enum(value) => {
-                self.enums.insert(field, value);
+                Self::insert_text_slot(&mut self.enums, field_id, value);
             }
+        }
+    }
+
+    fn remove_field_id(&mut self, field_id: FieldSlotId) {
+        if let Ok(index) = Self::text_slot_index(&self.text, field_id) {
+            self.text.remove(index);
+        }
+        if let Ok(index) = Self::bool_slot_index(&self.bools, field_id) {
+            self.bools.remove(index);
+        }
+        if let Ok(index) = Self::text_slot_index(&self.enums, field_id) {
+            self.enums.remove(index);
         }
     }
 
     fn contains_key(&self, field: &str) -> bool {
-        self.text.contains_key(field)
-            || self.bools.contains_key(field)
-            || self.enums.contains_key(field)
+        self.contains_key_id(FieldSlotId::from_path(field))
+    }
+
+    fn contains_key_id(&self, field_id: FieldSlotId) -> bool {
+        self.text_index_id(field_id).is_some()
+            || self.bool_index_id(field_id).is_some()
+            || self.enum_index_id(field_id).is_some()
     }
 
     fn value(&self, field: &str) -> Option<FieldValueRef<'_>> {
-        if let Some(value) = self.text.get(field) {
-            Some(FieldValueRef::Text(value))
-        } else if let Some(value) = self.bools.get(field) {
-            Some(FieldValueRef::Bool(*value))
+        if let Some(index) = self.text_index(field) {
+            Some(FieldValueRef::Text(&self.text[index].value))
+        } else if let Some(index) = self.bool_index(field) {
+            Some(FieldValueRef::Bool(self.bools[index].value))
         } else {
-            self.enums
-                .get(field)
-                .map(|value| FieldValueRef::Enum(value))
+            self.enum_index(field)
+                .map(|index| FieldValueRef::Enum(&self.enums[index].value))
         }
     }
 
     fn owned_value(&self, field: &str) -> Option<FieldValue> {
-        if let Some(value) = self.text.get(field) {
-            Some(FieldValue::Text(value.clone()))
-        } else if let Some(value) = self.bools.get(field) {
-            Some(FieldValue::Bool(*value))
+        if let Some(index) = self.text_index(field) {
+            Some(FieldValue::Text(self.text[index].value.clone()))
+        } else if let Some(index) = self.bool_index(field) {
+            Some(FieldValue::Bool(self.bools[index].value))
         } else {
-            self.enums
-                .get(field)
-                .map(|value| FieldValue::Enum(value.clone()))
+            self.enum_index(field)
+                .map(|index| FieldValue::Enum(self.enums[index].value.clone()))
         }
     }
 
     fn textlike(&self, field: &str) -> Option<&str> {
-        self.text
-            .get(field)
-            .map(String::as_str)
-            .or_else(|| self.enums.get(field).map(String::as_str))
+        self.text_index(field)
+            .map(|index| self.text[index].value.as_str())
+            .or_else(|| {
+                self.enum_index(field)
+                    .map(|index| self.enums[index].value.as_str())
+            })
     }
 
     fn bool_value(&self, field: &str) -> Option<bool> {
-        self.bools.get(field).copied()
+        self.bool_index(field).map(|index| self.bools[index].value)
     }
 
     fn set_textlike(&mut self, field: &str, value: &str) -> RuntimeResult<()> {
-        if let Some(current) = self.text.get_mut(field) {
+        if let Some(index) = self.text_index(field) {
+            let current = &mut self.text[index].value;
             current.clear();
             current.push_str(value);
             Ok(())
-        } else if let Some(current) = self.enums.get_mut(field) {
+        } else if let Some(index) = self.enum_index(field) {
+            let current = &mut self.enums[index].value;
             current.clear();
             current.push_str(value);
             Ok(())
-        } else if self.bools.contains_key(field) {
+        } else if self.bool_index(field).is_some() {
             Err("cannot write text into bool runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn copy_textlike(&mut self, source_field: &str, target_field: &str) -> RuntimeResult<()> {
+        if source_field == target_field {
+            return Ok(());
+        }
+        if let (Some(source_index), Some(target_index)) =
+            (self.text_index(source_field), self.text_index(target_field))
+        {
+            return copy_textlike_same_slots(
+                &mut self.text,
+                source_index,
+                target_index,
+                source_field,
+                target_field,
+            );
+        }
+        if let (Some(source_index), Some(target_index)) =
+            (self.enum_index(source_field), self.enum_index(target_field))
+        {
+            return copy_textlike_same_slots(
+                &mut self.enums,
+                source_index,
+                target_index,
+                source_field,
+                target_field,
+            );
+        }
+        if let Some(source_index) = self.text_index(source_field) {
+            if let Some(target_index) = self.enum_index(target_field) {
+                let source = &self.text[source_index].value;
+                let target = &mut self.enums[target_index].value;
+                target.clear();
+                target.push_str(source);
+                return Ok(());
+            }
+        }
+        if let Some(source_index) = self.enum_index(source_field) {
+            if let Some(target_index) = self.text_index(target_field) {
+                let source = &self.enums[source_index].value;
+                let target = &mut self.text[target_index].value;
+                target.clear();
+                target.push_str(source);
+                return Ok(());
+            }
+        }
+        if self.bool_index(source_field).is_some() || self.bool_index(target_field).is_some() {
+            Err("cannot copy text-like runtime value through bool field".into())
+        } else {
+            Err(format!("generic row missing field `{source_field}` or `{target_field}`").into())
         }
     }
 
@@ -8563,16 +10406,17 @@ impl ValueColumns {
         if self.contains_key(field) {
             self.set_textlike(field, value)
         } else {
-            self.text.insert(field.to_owned(), value.to_owned());
+            let field_id = FieldSlotId::from_path(field);
+            Self::insert_text_slot(&mut self.text, field_id, value.to_owned());
             Ok(())
         }
     }
 
     fn set_bool(&mut self, field: &str, value: bool) -> RuntimeResult<()> {
-        if let Some(current) = self.bools.get_mut(field) {
-            *current = value;
+        if let Some(index) = self.bool_index(field) {
+            self.bools[index].value = value;
             Ok(())
-        } else if self.text.contains_key(field) || self.enums.contains_key(field) {
+        } else if self.text_index(field).is_some() || self.enum_index(field).is_some() {
             Err("cannot write bool into text runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
@@ -8580,13 +10424,13 @@ impl ValueColumns {
     }
 
     fn reserve_textlike(&mut self, field: &str, additional: usize) -> RuntimeResult<()> {
-        if let Some(value) = self.text.get_mut(field) {
-            value.reserve(additional);
+        if let Some(index) = self.text_index(field) {
+            self.text[index].value.reserve(additional);
             Ok(())
-        } else if let Some(value) = self.enums.get_mut(field) {
-            value.reserve(additional);
+        } else if let Some(index) = self.enum_index(field) {
+            self.enums[index].value.reserve(additional);
             Ok(())
-        } else if self.bools.contains_key(field) {
+        } else if self.bool_index(field).is_some() {
             Err("cannot reserve text capacity on bool runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
@@ -8594,13 +10438,81 @@ impl ValueColumns {
     }
 
     fn reserve_all_textlike(&mut self, additional: usize) {
-        for value in self.text.values_mut() {
-            value.reserve(additional);
+        for slot in &mut self.text {
+            slot.value.reserve(additional);
         }
-        for value in self.enums.values_mut() {
-            value.reserve(additional);
+        for slot in &mut self.enums {
+            slot.value.reserve(additional);
         }
     }
+
+    fn text_index(&self, field: &str) -> Option<usize> {
+        self.text_index_id(FieldSlotId::from_path(field))
+    }
+
+    fn text_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
+        Self::text_slot_index(&self.text, field_id).ok()
+    }
+
+    fn bool_index(&self, field: &str) -> Option<usize> {
+        self.bool_index_id(FieldSlotId::from_path(field))
+    }
+
+    fn bool_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
+        Self::bool_slot_index(&self.bools, field_id).ok()
+    }
+
+    fn enum_index(&self, field: &str) -> Option<usize> {
+        self.enum_index_id(FieldSlotId::from_path(field))
+    }
+
+    fn enum_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
+        Self::text_slot_index(&self.enums, field_id).ok()
+    }
+
+    fn insert_text_slot(slots: &mut Vec<TextValueSlot>, field_id: FieldSlotId, value: String) {
+        let index = Self::text_slot_index(slots, field_id).unwrap_or_else(|index| index);
+        slots.insert(index, TextValueSlot { field_id, value });
+    }
+
+    fn insert_bool_slot(slots: &mut Vec<BoolValueSlot>, field_id: FieldSlotId, value: bool) {
+        let index = Self::bool_slot_index(slots, field_id).unwrap_or_else(|index| index);
+        slots.insert(index, BoolValueSlot { field_id, value });
+    }
+
+    fn text_slot_index(slots: &[TextValueSlot], field_id: FieldSlotId) -> Result<usize, usize> {
+        slots.binary_search_by_key(&field_id, |slot| slot.field_id)
+    }
+
+    fn bool_slot_index(slots: &[BoolValueSlot], field_id: FieldSlotId) -> Result<usize, usize> {
+        slots.binary_search_by_key(&field_id, |slot| slot.field_id)
+    }
+}
+
+fn copy_textlike_same_slots(
+    values: &mut [TextValueSlot],
+    source_index: usize,
+    target_index: usize,
+    source_field: &str,
+    target_field: &str,
+) -> RuntimeResult<()> {
+    let (source_ptr, source_len) = values
+        .get(source_index)
+        .map(|source| (source.value.as_ptr(), source.value.len()))
+        .ok_or_else(|| format!("generic row missing field `{source_field}`"))?;
+    let target = values
+        .get_mut(target_index)
+        .map(|target| &mut target.value)
+        .ok_or_else(|| format!("generic row missing field `{target_field}`"))?;
+    target.clear();
+    // The source and target are different existing String values in the same
+    // map. Mutating the target may reallocate only the target buffer; it does
+    // not move or mutate the source buffer.
+    let source = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(source_ptr, source_len))
+    };
+    target.push_str(source);
+    Ok(())
 }
 
 fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns> {
@@ -8614,7 +10526,7 @@ fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns
     Ok(columns)
 }
 
-impl GenericRowTemplate {
+impl RuntimeRecordTemplate {
     fn from_cells(row_scope: &str, indexed_cells: &[&boon_ir::StateCell]) -> RuntimeResult<Self> {
         let mut fields = Vec::with_capacity(indexed_cells.len());
         for cell in indexed_cells {
@@ -8628,44 +10540,49 @@ impl GenericRowTemplate {
                     )
                 })?
                 .to_owned();
-            fields.push(GenericRowFieldTemplate {
-                field,
+            fields.push(RuntimeRecordFieldTemplate {
+                field_id: FieldSlotId::from_path(&field),
+                field_name: field.into_boxed_str(),
                 initial_value: cell.initial_value.clone(),
             });
         }
         Ok(Self { fields })
     }
 
-    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<GenericRow> {
+    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<RuntimeRecord> {
         for field in &self.fields {
-            if seed_fields.contains_key(&field.field) {
+            if seed_fields.contains_key_id(field.field_id) {
                 continue;
             }
             let value = runtime_value_from_initial(&field.initial_value, &seed_fields)?;
-            seed_fields.insert_value(field.field.clone(), value);
+            seed_fields.insert_value(field.field_name.to_string(), value);
         }
-        Ok(GenericRow {
+        Ok(RuntimeRecord {
             columns: seed_fields,
         })
     }
 
     fn reset_from_text_seeds<'a>(
         &self,
-        row: &mut GenericRow,
+        row: &mut RuntimeRecord,
         seed_text: impl Fn(&str) -> Option<&'a str>,
     ) -> RuntimeResult<()> {
         for field in &self.fields {
-            if !row.columns.contains_key(&field.field) {
-                return Err(format!("generic row missing field `{}`", field.field).into());
+            if !row.columns.contains_key_id(field.field_id) {
+                return Err(format!("generic row missing field `{}`", field.field_name).into());
             }
             match &field.initial_value {
-                InitialValue::Text { value } => row.columns.set_textlike(&field.field, value)?,
-                InitialValue::Bool { value } => row.columns.set_bool(&field.field, *value)?,
-                InitialValue::Enum { value } => row.columns.set_textlike(&field.field, value)?,
+                InitialValue::Text { value } => {
+                    row.columns.set_textlike(&field.field_name, value)?
+                }
+                InitialValue::Bool { value } => row.columns.set_bool(&field.field_name, *value)?,
+                InitialValue::Enum { value } => {
+                    row.columns.set_textlike(&field.field_name, value)?
+                }
                 InitialValue::SeedField { path } => {
                     let value =
                         seed_text(path).ok_or_else(|| format!("seed field `{path}` is missing"))?;
-                    row.columns.set_textlike(&field.field, value)?;
+                    row.columns.set_textlike(&field.field_name, value)?;
                 }
                 InitialValue::Unknown { summary } => {
                     return Err(format!("unsupported state initializer `{summary}`").into());
@@ -8676,7 +10593,7 @@ impl GenericRowTemplate {
     }
 }
 
-impl GenericRow {
+impl RuntimeRecord {
     fn reserve_textlike_fields(&mut self, additional: usize) -> RuntimeResult<()> {
         self.columns.reserve_all_textlike(additional);
         Ok(())
@@ -8700,7 +10617,7 @@ fn runtime_value_from_initial(
     }
 }
 
-fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut GenericRow) {
+fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut RuntimeRecord) {
     for value in ir
         .derived_values
         .iter()
@@ -8739,13 +10656,13 @@ fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
 }
 
 #[cfg(test)]
-fn todo_generic_row(title: &str) -> GenericRow {
+fn todo_generic_row(title: &str) -> RuntimeRecord {
     let mut columns = ValueColumns::default();
     columns.insert_value("title".to_owned(), FieldValue::Text(title.to_owned()));
     columns.insert_value("edit_text".to_owned(), FieldValue::Text(title.to_owned()));
     columns.insert_value("completed".to_owned(), FieldValue::Bool(false));
     columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
-    GenericRow { columns }
+    RuntimeRecord { columns }
 }
 
 #[cfg(test)]
@@ -8761,14 +10678,17 @@ fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
             cell_generic_row(&address)
         })
     });
-    runtime
-        .lists
-        .insert("cells".to_owned(), KeyedList::from_values(cell_rows));
+    runtime.lists.insert(
+        "cells".to_owned(),
+        KeyedList::from_values(cell_rows),
+        Some(columns.saturating_mul(rows)),
+        RuntimeRecordTemplate::default(),
+    );
     runtime
 }
 
 #[cfg(test)]
-fn cell_generic_row(address: &str) -> GenericRow {
+fn cell_generic_row(address: &str) -> RuntimeRecord {
     let mut columns = ValueColumns::default();
     columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
     columns.insert_value("editing_text".to_owned(), FieldValue::Text(String::new()));
@@ -8777,7 +10697,7 @@ fn cell_generic_row(address: &str) -> GenericRow {
     columns.insert_value("error".to_owned(), FieldValue::Text(String::new()));
     columns.insert_value("dependencies".to_owned(), FieldValue::Text(String::new()));
     columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
-    GenericRow { columns }
+    RuntimeRecord { columns }
 }
 
 #[derive(Clone, Debug)]
@@ -9251,6 +11171,7 @@ enum GenericListRemoveObservation<'a> {
 #[derive(Clone, Copy, Debug)]
 struct GenericSourceActionInput<'a> {
     source: &'a str,
+    source_id: SourceId,
     list: Option<&'static str>,
     index: Option<usize>,
     key: Option<&'a str>,
@@ -9564,8 +11485,9 @@ enum RuntimeDerivedTextExpression {
 
 #[derive(Clone, Debug, Default)]
 struct SourceRoutePlan {
-    source_slots: BTreeMap<&'static str, SourceRouteIndex>,
     route_slots: Vec<SourceRoute>,
+    id_slots: Vec<Option<SourceRouteIndex>>,
+    label_slots: Vec<SourceBoundaryLabel>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9577,19 +11499,26 @@ impl SourceRouteIndex {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceBoundaryLabel {
+    source: &'static str,
+    source_id: SourceId,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ListSourceBindingPlan {
-    bindings: Vec<ListSourceBinding>,
+    list_slots: Vec<ListSourceBindingSlot>,
 }
 
 #[derive(Clone, Debug)]
-struct ListSourceBinding {
+struct ListSourceBindingSlot {
     list: &'static str,
     source_paths: Vec<&'static str>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct SourceRoute {
+    source_id: SourceId,
     source: &'static str,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
@@ -9896,14 +11825,16 @@ impl DerivedEquationPlan {
 
 impl SourceRoutePlan {
     fn from_plans(
+        ir: &TypedProgram,
         scalar: &ScalarEquationPlan,
         derived: &DerivedEquationPlan,
         lists: &ListEquationPlan,
         root_targets: &BTreeSet<&str>,
-    ) -> Self {
+    ) -> RuntimeResult<Self> {
         let mut routes = Self::default();
         for branch in &scalar.branches {
-            let route = routes.route_mut(branch.source);
+            let source_id = source_id_for_path(ir, branch.source)?;
+            let route = routes.route_mut(branch.source, source_id);
             let scalar_target = SourceRouteScalarTarget {
                 target: branch.target,
                 expression: branch.expression,
@@ -9917,8 +11848,9 @@ impl SourceRoutePlan {
             }
         }
         for transform in &derived.text_transforms {
+            let source_id = source_id_for_path(ir, transform.source)?;
             routes
-                .route_mut(transform.source)
+                .route_mut(transform.source, source_id)
                 .derived_text_targets
                 .push(transform.target);
         }
@@ -9937,8 +11869,9 @@ impl SourceRoutePlan {
                     }
                 }
                 RuntimeListOperationKind::Remove { source, predicate } => {
+                    let source_id = source_id_for_path(ir, source)?;
                     routes
-                        .route_mut(*source)
+                        .route_mut(*source, source_id)
                         .list_remove_targets
                         .push(SourceRouteListRemove {
                             list: operation.list,
@@ -9952,7 +11885,7 @@ impl SourceRoutePlan {
         for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
-        routes
+        Ok(routes)
     }
 
     fn len(&self) -> usize {
@@ -9960,9 +11893,29 @@ impl SourceRoutePlan {
     }
 
     fn for_source(&self, source: &str) -> Option<&SourceRoute> {
-        self.source_slots
-            .get(source)
+        self.source_id(source)
+            .and_then(|source_id| self.for_source_id(source_id))
+    }
+
+    fn for_source_id(&self, source_id: SourceId) -> Option<&SourceRoute> {
+        self.id_slots
+            .get(source_id.as_usize())
+            .copied()
+            .flatten()
             .and_then(|index| self.route_slots.get(index.slot()))
+    }
+
+    fn source_id(&self, source: &str) -> Option<SourceId> {
+        self.label_slots
+            .binary_search_by(|label| label.source.cmp(source))
+            .ok()
+            .and_then(|index| self.label_slots.get(index))
+            .map(|label| label.source_id)
+    }
+
+    fn require_source_id(&self, source: &str) -> RuntimeResult<SourceId> {
+        self.source_id(source)
+            .ok_or_else(|| format!("source `{source}` has no typed SourceId route").into())
     }
 
     fn require_source(&self, source: &str) -> RuntimeResult<&SourceRoute> {
@@ -9970,51 +11923,20 @@ impl SourceRoutePlan {
             .ok_or_else(|| format!("source `{source}` has no compiled route").into())
     }
 
-    fn actions(&self, source: &str) -> RuntimeResult<&[SourceRouteAction]> {
+    fn actions_for_source_id(&self, source_id: SourceId) -> RuntimeResult<&[SourceRouteAction]> {
+        Ok(self
+            .for_source_id(source_id)
+            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
+            .actions
+            .as_slice())
+    }
+
+    fn actions_for_source(&self, source: &str) -> RuntimeResult<&[SourceRouteAction]> {
         Ok(self.require_source(source)?.actions.as_slice())
     }
 
     fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
         self.require_source(source)?.single_root_scalar_target()
-    }
-
-    fn has_list_remove_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_list_remove_target(list))
-    }
-
-    fn has_list_append_target(&self, source: &str, list: &str) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_list_append_target(list))
-    }
-
-    fn has_root_scalar_action(&self, source: &str) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_root_scalar_action())
-    }
-
-    fn has_indexed_text_action(
-        &self,
-        source: &str,
-        kind: SourceRouteTextAction,
-    ) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_indexed_text_action(kind))
-    }
-
-    fn has_indexed_text_action_where(
-        &self,
-        source: &str,
-        kind: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> RuntimeResult<bool> {
-        Ok(self
-            .require_source(source)?
-            .has_indexed_text_action_where(kind, matches_target))
-    }
-
-    fn has_indexed_bool_action(
-        &self,
-        source: &str,
-        kind: SourceRouteBoolAction,
-    ) -> RuntimeResult<bool> {
-        Ok(self.require_source(source)?.has_indexed_bool_action(kind))
     }
 
     fn list_remove_predicate(
@@ -10030,15 +11952,33 @@ impl SourceRoutePlan {
         self.require_source(source)?.list_append_trigger(list)
     }
 
-    fn route_mut(&mut self, source: &'static str) -> &mut SourceRoute {
-        if let Some(index) = self.source_slots.get(source).copied() {
+    fn route_mut(&mut self, source: &'static str, source_id: SourceId) -> &mut SourceRoute {
+        let source_slot = source_id.as_usize();
+        if self.id_slots.len() <= source_slot {
+            self.id_slots.resize(source_slot + 1, None);
+        }
+        if let Some(index) = self.id_slots[source_slot] {
             return &mut self.route_slots[index.slot()];
         }
+
         let index = SourceRouteIndex(self.route_slots.len());
-        self.source_slots.insert(source, index);
+        self.id_slots[source_slot] = Some(index);
+        let label = SourceBoundaryLabel { source, source_id };
+        let label_index = self
+            .label_slots
+            .binary_search_by(|candidate| candidate.source.cmp(source))
+            .unwrap_or_else(|index| index);
+        self.label_slots.insert(label_index, label);
         self.route_slots.push(SourceRoute {
+            source_id,
             source,
-            ..SourceRoute::default()
+            root_scalar_targets: Vec::new(),
+            indexed_text_targets: Vec::new(),
+            indexed_bool_targets: Vec::new(),
+            derived_text_targets: Vec::new(),
+            list_append_targets: Vec::new(),
+            list_remove_targets: Vec::new(),
+            actions: Vec::new(),
         });
         self.route_slots
             .last_mut()
@@ -10046,9 +11986,17 @@ impl SourceRoutePlan {
     }
 }
 
+fn source_id_for_path(ir: &TypedProgram, path: &str) -> RuntimeResult<SourceId> {
+    ir.sources
+        .iter()
+        .find(|source| source.path == path)
+        .map(|source| source.id)
+        .ok_or_else(|| format!("source route `{path}` has no typed IR SourceId").into())
+}
+
 impl ListSourceBindingPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
-        let mut bindings = Vec::new();
+        let mut list_slots = Vec::new();
         for list in &ir.lists {
             let row_scope = row_scope_name(&list.name);
             let prefix = format!("{row_scope}.sources.");
@@ -10059,17 +12007,17 @@ impl ListSourceBindingPlan {
                 .map(|source| leak_runtime_path(source.path.clone()))
                 .collect::<Vec<_>>();
             if !source_paths.is_empty() {
-                bindings.push(ListSourceBinding {
+                list_slots.push(ListSourceBindingSlot {
                     list: leak_runtime_path(list.name.clone()),
                     source_paths,
                 });
             }
         }
-        Self { bindings }
+        Self { list_slots }
     }
 
     fn source_paths(&self, list: &str) -> RuntimeResult<&[&'static str]> {
-        self.bindings
+        self.list_slots
             .iter()
             .find_map(|binding| (binding.list == list).then_some(binding.source_paths.as_slice()))
             .ok_or_else(|| format!("list `{list}` has no scoped source binding plan").into())
@@ -10077,6 +12025,12 @@ impl ListSourceBindingPlan {
 
     fn source_count(&self, list: &str) -> RuntimeResult<usize> {
         self.source_paths(list).map(<[_]>::len)
+    }
+
+    fn list_for_row_scope(&self, scope: &str) -> Option<&'static str> {
+        self.list_slots
+            .iter()
+            .find_map(|binding| row_scope_matches_list(binding.list, scope).then_some(binding.list))
     }
 }
 
@@ -10450,12 +12404,7 @@ fn seeded_todomvc_generic(
         return Err("TodoMVC stress profiles require a TodoMVC executable surface".into());
     }
     let mut runtime = GenericScheduledRuntime::new(ir, &compiled)?;
-    let capacity = runtime
-        .storage
-        .list_capacities
-        .get("todos")
-        .copied()
-        .flatten();
+    let capacity = runtime.storage.lists.capacity("todos");
     if let Some(capacity) = capacity
         && count > capacity
     {
@@ -10465,8 +12414,8 @@ fn seeded_todomvc_generic(
     }
     let row_template = runtime
         .storage
-        .row_templates
-        .get("todos")
+        .lists
+        .row_template("todos")
         .cloned()
         .ok_or("TodoMVC generic runtime has no `todos` row template")?;
     let row_source_paths = runtime.list_source_bindings.source_paths("todos")?.to_vec();
@@ -10479,14 +12428,17 @@ fn seeded_todomvc_generic(
         );
         rows.push(row_template.materialize(seed_fields)?);
     }
-    runtime
-        .storage
-        .lists
-        .insert("todos".to_owned(), KeyedList::from_values(rows));
+    runtime.storage.lists.insert(
+        "todos".to_owned(),
+        KeyedList::from_values(rows),
+        capacity,
+        row_template,
+    );
     runtime.storage.sources = SourceStore::default();
     runtime
         .storage
         .reserve_source_bindings(count * row_source_paths.len());
+    runtime.storage.sources.reserve_rows(count);
     for index in 0..count {
         let (key, generation) = runtime.storage.row_identity("todos", index)?;
         runtime
@@ -10505,7 +12457,7 @@ fn seeded_todomvc_generic(
         "update_branch_count": compiled.update_branch_count,
         "list_operation_count": compiled.list_operation_count,
         "source_route_count": compiled.source_route_count,
-        "list_source_binding_count": compiled.list_source_bindings.bindings.len(),
+        "list_source_binding_count": compiled.list_source_bindings.list_slots.len(),
         "row_source_binding_count": row_source_paths.len(),
         "list_capacity": capacity,
     });
@@ -10524,6 +12476,7 @@ struct TodoRuntime {
 struct TodoRuntimeState {
     next_source_seq: u64,
     stale_source_drop_count: u64,
+    dirty_key_sets: DirtyKeySets,
 }
 
 #[cfg(test)]
@@ -10548,6 +12501,7 @@ impl TodoRuntime {
         let todo_count = generic.list_len("todos")?;
         let row_source_paths = generic.row_source_paths("todos")?.to_vec();
         generic.reserve_source_bindings(todo_count * row_source_paths.len());
+        generic.reserve_source_rows(todo_count);
         for index in 0..todo_count {
             let (key, generation) = generic.row_identity("todos", index)?;
             generic.bind_row_sources("todos", key, generation, &row_source_paths);
@@ -11232,7 +13186,7 @@ impl TodoRuntime {
                     .expect("test remove source unbind should lower");
                 })?;
         let (key, generation) = (generic_row.key, generic_row.generation);
-        self.generic.spare_row("todos", generic_row.value);
+        self.generic.spare_row("todos", generic_row.value)?;
         emit_todomvc_default_protocol_mutation(
             GenericSourceMutation::ListRemove {
                 list: "todos",
@@ -11378,7 +13332,7 @@ impl ScenarioExecutor for LoadedRuntime {
                     Ok(metrics)
                 } else if step.user_action.is_none() {
                     Ok(StepExecutionMetrics {
-                        dirty_key_count: dirty_key_count(deltas),
+                        dirty_key_count: 0,
                         extra: StepExecutionExtra::Todo {
                             stale_source_drop_count: 0,
                         },
@@ -11864,6 +13818,7 @@ struct CellsRuntimeState {
     rows: usize,
     interned_texts: Vec<&'static str>,
     step_recomputed: Vec<usize>,
+    dirty_key_sets: DirtyKeySets,
     last_recompute_candidates: usize,
 }
 
@@ -12071,13 +14026,21 @@ impl CellsRuntime {
     }
 
     fn with_dimensions(columns: usize, rows: usize) -> Self {
+        let parsed = parse_source(
+            "examples/cells.bn",
+            include_str!("../../../examples/cells.bn"),
+        )
+        .expect("checked-in Cells source should parse");
+        let ir = lower(&parsed).expect("checked-in Cells source should lower");
         let scalar_equations = default_cells_scalar_equations();
         let source_routes = SourceRoutePlan::from_plans(
+            &ir,
             &scalar_equations,
             &DerivedEquationPlan::empty(),
             &ListEquationPlan::empty(),
             &BTreeSet::new(),
-        );
+        )
+        .expect("checked-in Cells source routes should compile");
         Self::with_dimensions_and_equations(
             GenericScheduledRuntime::from_parts(
                 generic_cells_runtime(columns, rows),
@@ -12621,7 +14584,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         "list_initializer_count": compiled.list_initializer_count,
         "formula_operation_count": compiled.formula_operation_count,
         "source_route_count": compiled.source_route_count,
-        "list_source_binding_count": compiled.list_source_bindings.bindings.len(),
+        "list_source_binding_count": compiled.list_source_bindings.list_slots.len(),
         "grid_columns": state.columns,
         "grid_rows": state.rows,
     });
@@ -12878,7 +14841,7 @@ fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> 
 #[cfg(test)]
 fn default_cells_list_source_bindings() -> ListSourceBindingPlan {
     ListSourceBindingPlan {
-        bindings: vec![ListSourceBinding {
+        list_slots: vec![ListSourceBindingSlot {
             list: "cells",
             source_paths: Vec::new(),
         }],
@@ -13422,6 +15385,19 @@ mod tests {
                 .contains("generic_todomvc_source_route_classifier")
         );
 
+        let mut other_example_slice_report = output.report.clone();
+        other_example_slice_report["runtime_execution"]["generic_runtime_slices"]["generic_cells_editor_route_uses_indexed_targets"] =
+            json!(true);
+        assert!(
+            verify_runtime_execution_metadata(
+                &other_example_slice_report,
+                Path::new("memory:todomvc")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("other-example runtime slice")
+        );
+
         let mut omitted_slice_report = output.report.clone();
         omitted_slice_report["runtime_execution"]["generic_runtime_slices"]
             .as_object_mut()
@@ -13433,6 +15409,147 @@ mod tests {
                 .to_string()
                 .contains("generic_source_event_ingest")
         );
+
+        let mut unknown_expression_report = output.report.clone();
+        unknown_expression_report["expression_coverage"]["unknown_ast_expression_count"] = json!(1);
+        assert!(
+            verify_runtime_execution_metadata(
+                &unknown_expression_report,
+                Path::new("memory:todomvc")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown_ast_expression_count")
+        );
+    }
+
+    #[test]
+    fn remaining_shells_are_derived_from_generic_runtime_slices() {
+        let parsed = parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let shells = remaining_example_specific_shells(
+            &compiled,
+            &json!({
+                "generic_todomvc_scenario_preparation": true,
+                "generic_todomvc_scenario_expectation_assertions": true,
+                "generic_todomvc_summary_reads_authoritative_storage": true,
+                "generic_todomvc_common_render_patch_lowering": true,
+                "generic_loaded_runtime_todomvc_stress_profile_executor": true
+            }),
+        );
+        assert_eq!(
+            shells,
+            vec![
+                "todomvc_scenario_glue",
+                "todomvc_assertion_glue",
+                "todomvc_report_glue",
+                "todomvc_render_patch_report_glue",
+                "todomvc_stress_report_glue",
+            ]
+        );
+
+        let shells = remaining_example_specific_shells(
+            &compiled,
+            &json!({
+                "generic_todomvc_scenario_preparation": false,
+                "generic_todomvc_scenario_expectation_assertions": true,
+            }),
+        );
+        assert_eq!(shells, vec!["todomvc_assertion_glue"]);
+    }
+
+    #[test]
+    fn schema_accepts_failing_blocker_audits_only_as_blocker_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "boon-readiness-schema-{}-{}.json",
+            std::process::id(),
+            now_string()
+        ));
+        let mut report = json!({
+            "status": "fail",
+            "report_version": 1,
+            "generated_at_utc": now_string(),
+            "command": "audit-goal-readiness",
+            "command_argv": ["audit-goal-readiness", "--report", "target/reports/goal-readiness.json"],
+            "exit_status": 1,
+            "git_commit": git_commit(),
+            "binary_hash": current_binary_hash(),
+            "source_hash": "n/a",
+            "scenario_hash": "n/a",
+            "program_hash": "n/a",
+            "budget_hash": "n/a",
+            "graph_node_count": 0,
+            "per_step_pass_fail": [
+                {"id": "human-report-present", "pass": false, "detail": "missing real human report"}
+            ],
+            "blockers": ["missing fresh real human report"],
+            "artifact_sha256s": []
+        });
+
+        write_json(&path, &report).unwrap();
+        verify_report_schema(&path).unwrap();
+
+        report["command"] = json!("verify-runtime-finality");
+        report["command_argv"] = json!([
+            "verify-runtime-finality",
+            "--report",
+            "target/reports/runtime-finality.json"
+        ]);
+        report["per_step_pass_fail"] = json!([
+            {"id": "runtime-finality:parser:real-ast-not-text-lines", "pass": false, "detail": "parser blocker"}
+        ]);
+        report["blockers"] = json!([
+            "parser still depends on line/text/path heuristics instead of a structured AST"
+        ]);
+        write_json(&path, &report).unwrap();
+        verify_report_schema(&path).unwrap();
+
+        report["command"] = json!("verify-example-all");
+        write_json(&path, &report).unwrap();
+        assert!(
+            verify_report_schema(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("did not pass")
+        );
+
+        report["command"] = json!("audit-machine-readiness");
+        report["command_argv"] = json!([
+            "audit-machine-readiness",
+            "--report",
+            "target/reports/debug/machine-readiness.json"
+        ]);
+        write_json(&path, &report).unwrap();
+        verify_report_schema(&path).unwrap();
+
+        report["command"] = json!("audit-goal-readiness");
+        report["blockers"] = json!([]);
+        write_json(&path, &report).unwrap();
+        assert!(
+            verify_report_schema(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("blockers")
+        );
+
+        report["blockers"] = json!(["missing fresh real human report"]);
+        report["per_step_pass_fail"] = json!([
+            {"id": "schema-only", "pass": true, "detail": "not a readiness blocker"}
+        ]);
+        write_json(&path, &report).unwrap();
+        assert!(
+            verify_report_schema(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("no failing per-step check")
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -14791,6 +16908,84 @@ mod tests {
     }
 
     #[test]
+    fn source_routes_are_dense_by_hidden_source_id() {
+        let parsed = parse_source(
+            "examples/todomvc.bn",
+            include_str!("../../../examples/todomvc.bn"),
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+
+        assert!(
+            compiled.source_routes.len() > 0,
+            "TodoMVC must compile source routes from typed IR"
+        );
+        for route in &compiled.source_routes.route_slots {
+            let source_id = route.source_id;
+            let by_id = compiled
+                .source_routes
+                .for_source_id(source_id)
+                .expect("dense SourceId slot must resolve to a route");
+            assert_eq!(by_id.source, route.source);
+            assert_eq!(
+                ir.sources[source_id.as_usize()].path,
+                route.source,
+                "dense route slot must match the typed IR source table"
+            );
+        }
+
+        let input_source = ir
+            .sources
+            .iter()
+            .find(|source| source.path == "store.sources.new_todo_input.key_down")
+            .expect("TodoMVC input key source must be present in typed IR");
+        let input_route = compiled
+            .source_routes
+            .for_source_id(input_source.id)
+            .expect("TodoMVC input source id must resolve through dense route slots");
+        assert!(
+            input_route.has_list_append_target("todos"),
+            "append routing must be found from SourceId, not a label scan"
+        );
+        assert_eq!(
+            compiled.source_routes.source_id(&input_source.path),
+            Some(input_source.id),
+            "source label fallback must resolve through the sorted compiled label index"
+        );
+        assert!(
+            compiled
+                .source_routes
+                .label_slots
+                .windows(2)
+                .all(|window| window[0].source < window[1].source),
+            "source label slots must stay sorted for binary-search fallback"
+        );
+
+        let report = compiled.report();
+        assert_eq!(
+            report["source_route_index_kind"],
+            json!("dense_source_id_slots")
+        );
+        assert_eq!(
+            report["source_route_label_lookup_kind"],
+            json!("sorted_source_label_binary_search")
+        );
+        assert_eq!(
+            report["source_routes_with_ids"].as_u64(),
+            report["source_route_count"].as_u64()
+        );
+        assert!(
+            report["source_route_id_slot_count"]
+                .as_u64()
+                .expect("source route id slot count must be numeric")
+                >= report["source_route_count"]
+                    .as_u64()
+                    .expect("source route count must be numeric")
+        );
+    }
+
+    #[test]
     fn list_predicates_preserve_ir_paths_without_todo_aliases() {
         assert!(matches!(
             runtime_list_predicate(&ListPredicate::RowFieldBool {
@@ -14848,6 +17043,76 @@ mod tests {
             ..ScenarioStep::default()
         };
         assert!(GenericSourceEvent::require(&missing).is_err());
+    }
+
+    #[test]
+    fn keyed_list_dense_key_slots_survive_remove_and_move() {
+        let mut list = KeyedList::from_values(["a", "b", "c", "d"]);
+        let first_key = list[0].key;
+        let second_key = list[1].key;
+        let third_key = list[2].key;
+        let fourth_key = list[3].key;
+
+        let removed = list.remove_index(1);
+        assert_eq!(removed.key, second_key);
+        assert_eq!(list.bound_index(second_key, 1), None);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.slot_capacity(), 4);
+        assert_eq!(list.valid_slot_count(), 3);
+        assert_eq!(list.free_slot_count(), 1);
+        assert_eq!(list.bound_index(first_key, 1), Some(0));
+        assert_eq!(list.bound_index(third_key, 1), Some(1));
+        assert_eq!(list.bound_index(fourth_key, 1), Some(2));
+
+        list.move_index(2, 0).unwrap();
+        assert_eq!(list.bound_index(fourth_key, 1), Some(0));
+        assert_eq!(list.bound_index(first_key, 1), Some(1));
+        assert_eq!(list.bound_index(third_key, 1), Some(2));
+
+        let (new_key, generation) = list.append("e");
+        assert_eq!(generation, 1);
+        assert_ne!(new_key, second_key);
+        assert_eq!(list.slot_capacity(), 4);
+        assert_eq!(list.valid_slot_count(), 4);
+        assert_eq!(list.free_slot_count(), 0);
+        assert_eq!(list.bound_index(new_key, 1), Some(3));
+    }
+
+    #[test]
+    fn source_store_dense_source_id_slots_reject_unbound_sources() {
+        let mut sources = SourceStore::with_capacity(4);
+        sources.bind_row(
+            "todos",
+            10,
+            1,
+            &[
+                "todo.sources.todo_checkbox.click",
+                "todo.sources.title_input.commit",
+            ],
+        );
+        let binding = sources
+            .row_bindings("todos", 10, 1)
+            .find(|binding| binding.source_path == "todo.sources.todo_checkbox.click")
+            .cloned()
+            .unwrap();
+        assert!(sources.is_bound(
+            "todos",
+            10,
+            1,
+            binding.source_path,
+            Some(binding.source_id),
+            Some(binding.bind_epoch),
+        ));
+
+        sources.unbind_row("todos", 10, 1);
+        assert!(!sources.is_bound(
+            "todos",
+            10,
+            1,
+            binding.source_path,
+            Some(binding.source_id),
+            Some(binding.bind_epoch),
+        ));
     }
 
     #[test]
@@ -15190,6 +17455,158 @@ mod tests {
             ),
         ];
         assert_eq!(dirty_key_count(&deltas), 2);
+    }
+
+    #[test]
+    fn dirty_keysets_track_list_field_keys_and_reuse_storage() {
+        let deltas = [
+            field_delta(
+                Some(7),
+                Some(1),
+                "title",
+                ProtocolValue::Text(Cow::Borrowed("a")),
+            ),
+            field_delta(Some(7), Some(1), "completed", ProtocolValue::Bool(true)),
+            field_delta(Some(9), Some(1), "completed", ProtocolValue::Bool(false)),
+            field_delta(
+                None,
+                None,
+                "store.selected_filter",
+                ProtocolValue::Text(Cow::Borrowed("All")),
+            ),
+        ];
+        let mut dirty = DirtyKeySets::with_capacity(4);
+        assert_eq!(dirty.mark_deltas(&deltas), 2);
+        assert_eq!(dirty.entries.len(), 3);
+        let capacity = dirty.entries.capacity();
+
+        dirty.mark_indexes("cells", "value", &[0, 2, 2, 5]);
+        assert_eq!(dirty.key_count(), 3);
+        assert_eq!(dirty.entries.capacity(), capacity);
+    }
+
+    #[test]
+    fn value_columns_keep_field_slots_sorted_for_dense_lookup() {
+        let mut columns = ValueColumns::default();
+        columns.insert_value("title".to_owned(), FieldValue::Text("A".to_owned()));
+        columns.insert_value("completed".to_owned(), FieldValue::Bool(false));
+        columns.insert_value("editing".to_owned(), FieldValue::Bool(true));
+        columns.insert_value(
+            "selected_filter".to_owned(),
+            FieldValue::Enum("All".to_owned()),
+        );
+        columns.set_or_insert_text("edit_text", "draft").unwrap();
+        columns.set_textlike("title", "B").unwrap();
+        columns.set_bool("completed", true).unwrap();
+
+        assert_eq!(columns.textlike("title"), Some("B"));
+        assert_eq!(columns.textlike("edit_text"), Some("draft"));
+        assert_eq!(columns.bool_value("completed"), Some(true));
+        assert_eq!(columns.bool_value("editing"), Some(true));
+        assert_eq!(columns.textlike("selected_filter"), Some("All"));
+        assert!(
+            columns
+                .text
+                .windows(2)
+                .all(|window| window[0].field_id < window[1].field_id)
+        );
+        assert!(
+            columns
+                .bools
+                .windows(2)
+                .all(|window| window[0].field_id < window[1].field_id)
+        );
+        assert!(
+            columns
+                .enums
+                .windows(2)
+                .all(|window| window[0].field_id < window[1].field_id)
+        );
+    }
+
+    #[test]
+    fn runtime_list_store_keeps_hidden_list_slots_sorted_for_dense_lookup() {
+        let mut store = RuntimeListStore::default();
+        store.insert(
+            "todos".to_owned(),
+            KeyedList::from_values([todo_generic_row("A")]),
+            Some(4),
+            RuntimeRecordTemplate::default(),
+        );
+        store.insert(
+            "cells".to_owned(),
+            KeyedList::from_values([cell_generic_row("A1")]),
+            Some(26),
+            RuntimeRecordTemplate::default(),
+        );
+        store.insert(
+            "todos".to_owned(),
+            KeyedList::from_values([todo_generic_row("B")]),
+            Some(8),
+            RuntimeRecordTemplate::default(),
+        );
+
+        assert_eq!(store.capacity("todos"), Some(8));
+        assert_eq!(store.capacity("cells"), Some(26));
+        assert_eq!(store.memory("todos").unwrap().len(), 1);
+        assert_eq!(store.memory("cells").unwrap().len(), 1);
+        assert!(store.list_slots.windows(2).all(|window| (
+            window[0].list_id,
+            window[0].name.as_str()
+        ) < (
+            window[1].list_id,
+            window[1].name.as_str()
+        )));
+    }
+
+    #[test]
+    fn human_report_command_pass_labels_must_match_checklist() {
+        let command_argv = vec![
+            json!("cargo"),
+            json!("xtask"),
+            json!("prepare-todomvc-human-report"),
+            json!("--pass-label"),
+            json!("initial"),
+            json!("--pass-label"),
+            json!("add-test-todo-submit"),
+            json!("--artifact"),
+            json!("target/reports/manual-todomvc.png"),
+            json!("--display-server"),
+            json!("wayland"),
+            json!("--display-scale"),
+            json!("1.25"),
+        ];
+        let labels = command_argv_values_after(&command_argv, "--pass-label");
+        assert_eq!(
+            labels,
+            ["add-test-todo-submit", "initial"].into_iter().collect()
+        );
+        assert_ne!(
+            labels,
+            ["initial", "filter-active"].into_iter().collect(),
+            "manual command provenance must not pass with missing or extra checklist labels"
+        );
+        assert_eq!(
+            command_argv_value_after(&command_argv, "--display-server"),
+            Some("wayland")
+        );
+        require_command_argv_f64(
+            Path::new("target/reports/test-human.json"),
+            &command_argv,
+            "--display-scale",
+            1.25,
+        )
+        .unwrap();
+        assert!(
+            require_command_argv_value(
+                Path::new("target/reports/test-human.json"),
+                &command_argv,
+                "--display-server",
+                "x11",
+            )
+            .is_err(),
+            "manual report command provenance must match the recorded visible-session metadata"
+        );
     }
 
     #[test]

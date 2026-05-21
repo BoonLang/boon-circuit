@@ -2,6 +2,10 @@ use boon_ply_playground::run_app_from_args;
 use ply_engine::prelude::*;
 
 fn window_conf() -> macroquad::conf::Conf {
+    let linux_backend = match std::env::var("BOON_PLY_LINUX_BACKEND").as_deref() {
+        Ok("x11") | Ok("X11") => miniquad::conf::LinuxBackend::X11Only,
+        _ => miniquad::conf::LinuxBackend::WaylandOnly,
+    };
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
             window_title: "Boon Circuit Ply Playground".to_owned(),
@@ -10,7 +14,7 @@ fn window_conf() -> macroquad::conf::Conf {
             high_dpi: false,
             sample_count: 1,
             platform: miniquad::conf::Platform {
-                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly,
+                linux_backend,
                 linux_wm_class: "boon-circuit-ply-playground",
                 ..Default::default()
             },

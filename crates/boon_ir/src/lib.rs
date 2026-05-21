@@ -1,13 +1,19 @@
-use boon_parser::{ParsedExpression, ParsedExpressionKind, ParsedProgram, ProgramKind};
+use boon_parser::{
+    AstExpr, AstExprKind, AstStatement, AstStatementKind, ParsedProgram, ParserItem as AstItem,
+    ProgramKind,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypedProgram {
     pub kind: ProgramKind,
     pub expression_count: usize,
+    pub expression_coverage: ExpressionCoverage,
     pub graph_node_count: usize,
     pub nodes: Vec<IrNode>,
+    pub row_scopes: Vec<RowScope>,
     pub sources: Vec<SourcePort>,
     pub state_cells: Vec<StateCell>,
     pub lists: Vec<ListMemory>,
@@ -17,17 +23,191 @@ pub struct TypedProgram {
     pub update_branches: Vec<UpdateBranch>,
     pub list_operations: Vec<ListOperation>,
     pub formula_operations: Vec<FormulaOperation>,
+    pub view_bindings: Vec<ViewBinding>,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExprId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScopeId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ListId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FieldId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ViewBindingId(pub usize);
+
+impl ExprId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl NodeId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl ScopeId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl SourceId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl StateId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl ListId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl FieldId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl ViewBindingId {
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for ExprId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ScopeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for SourceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for StateId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ListId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for FieldId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ViewBindingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExpressionCoverage {
+    pub computed_from: String,
+    pub ast_expression_count: usize,
+    pub unknown_ast_expression_count: usize,
+    pub ignored_unknown_ast_expression_count: usize,
+    pub unknown_initial_value_count: usize,
+    pub unknown_list_initializer_count: usize,
+    pub unknown_list_seed_value_count: usize,
+    pub unknown_update_expression_count: usize,
+    pub unknown_list_predicate_count: usize,
+    pub unknown_derived_value_count: usize,
+    pub unknown_labels: Vec<String>,
+    pub ignored_unknown_labels: Vec<String>,
+}
+
+impl ExpressionCoverage {
+    pub fn empty() -> Self {
+        Self {
+            computed_from: "parser_ast_and_typed_ir".to_owned(),
+            ast_expression_count: 0,
+            unknown_ast_expression_count: 0,
+            ignored_unknown_ast_expression_count: 0,
+            unknown_initial_value_count: 0,
+            unknown_list_initializer_count: 0,
+            unknown_list_seed_value_count: 0,
+            unknown_update_expression_count: 0,
+            unknown_list_predicate_count: 0,
+            unknown_derived_value_count: 0,
+            unknown_labels: Vec::new(),
+            ignored_unknown_labels: Vec::new(),
+        }
+    }
+
+    pub fn unknown_total(&self) -> usize {
+        self.unknown_ast_expression_count
+            + self.unknown_initial_value_count
+            + self.unknown_list_initializer_count
+            + self.unknown_list_seed_value_count
+            + self.unknown_update_expression_count
+            + self.unknown_list_predicate_count
+            + self.unknown_derived_value_count
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IrNode {
-    pub id: usize,
+    pub id: NodeId,
     pub name: String,
     pub kind: IrNodeKind,
     pub indexed: bool,
-    pub expr_id: Option<usize>,
+    pub expr_id: Option<ExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,13 +229,38 @@ pub enum IrNodeKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePort {
+    pub id: SourceId,
     pub path: String,
     pub scoped: bool,
+    pub scope_id: Option<ScopeId>,
+    pub payload_schema: SourcePayloadSchema,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RowScope {
+    pub id: ScopeId,
+    pub list: String,
+    pub function: String,
+    pub row_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcePayloadSchema {
+    pub fields: Vec<SourcePayloadField>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum SourcePayloadField {
+    Address,
+    Key,
+    Text,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListMemory {
+    pub id: ListId,
     pub name: String,
+    pub row_scope_id: Option<ScopeId>,
     pub hidden_key_type: String,
     pub has_generation: bool,
     pub graph_clones_per_item: usize,
@@ -65,7 +270,9 @@ pub struct ListMemory {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateCell {
+    pub id: StateId,
     pub path: String,
+    pub scope_id: Option<ScopeId>,
     pub hold_name: String,
     pub initial_value: InitialValue,
     pub indexed: bool,
@@ -102,10 +309,12 @@ pub struct ListSeedField {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DerivedValue {
+    pub id: FieldId,
     pub path: String,
     pub kind: DerivedValueKind,
     pub sources: Vec<String>,
     pub indexed: bool,
+    pub scope_id: Option<ScopeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -204,30 +413,56 @@ pub enum FormulaOperationKind {
     Error { formula: String, value: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewBinding {
+    pub id: ViewBindingId,
+    pub node_kind: String,
+    pub attr: String,
+    pub path: String,
+    pub kind: ViewBindingKind,
+    pub scope_id: Option<ScopeId>,
+    pub source_id: Option<SourceId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ViewBindingKind {
+    Data,
+    Source,
+    Target,
+}
+
 pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let nodes = source_driven_nodes(program);
-    let fields = collect_field_defs(program);
+    let fields = typed_field_defs(program);
+    let row_scopes = row_scopes(program);
     let sources = program
         .source_ports
         .iter()
-        .map(|source| SourcePort {
+        .enumerate()
+        .map(|(id, source)| SourcePort {
+            id: SourceId(id),
             scoped: source.scoped,
+            scope_id: scope_id_for_path(&row_scopes, &source.path),
+            payload_schema: source_payload_schema(program, &source.path),
             path: source.path.clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
     let state_cells = program
         .state_cells
         .iter()
-        .map(|cell| StateCell {
+        .enumerate()
+        .map(|(id, cell)| StateCell {
+            id: StateId(id),
             path: cell.path.clone(),
+            scope_id: scope_id_for_path(&row_scopes, &cell.path),
             hold_name: cell.hold_name.clone(),
-            initial_value: state_initial_value(
-                fields
-                    .iter()
-                    .find(|field| field.path == cell.path)
-                    .map(|field| field.body.as_str())
-                    .unwrap_or_default(),
-            ),
+            initial_value: fields
+                .iter()
+                .find(|field| field.path == cell.path)
+                .map(field_initial_value)
+                .unwrap_or_else(|| InitialValue::Unknown {
+                    summary: "missing initial value".to_owned(),
+                }),
             indexed: cell.indexed,
             source_line: cell.line,
         })
@@ -236,8 +471,11 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let lists = program
         .list_memories
         .iter()
-        .map(|list| ListMemory {
+        .enumerate()
+        .map(|(id, list)| ListMemory {
+            id: ListId(id),
             name: list.name.clone(),
+            row_scope_id: scope_id_for_list(&row_scopes, &list.name),
             hidden_key_type: hidden_key_type(&list.name),
             has_generation: true,
             graph_clones_per_item: 0,
@@ -251,18 +489,37 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     {
         return Err("List/map node must be indexed".to_owned());
     }
+    let dependencies = dependency_edges(program, &state_cells);
+    let possible_causes = possible_causes(program, &state_cells);
+    let update_branches = update_branches(program, &state_cells);
+    let list_operations = list_operations(program);
+    let formula_operations = formula_operations(program);
+    let derived_values = derived_values(program, &row_scopes, &fields, &state_cells);
+    let view_bindings = view_bindings(program, &row_scopes, &sources);
+    let expression_coverage = expression_coverage(
+        program,
+        &nodes,
+        &state_cells,
+        &lists,
+        &derived_values,
+        &update_branches,
+        &list_operations,
+    );
     let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
+        expression_coverage,
         graph_node_count: nodes.len(),
         nodes,
+        row_scopes,
         sources,
-        dependencies: dependency_edges(program, &state_cells),
-        possible_causes: possible_causes(program, &state_cells),
-        update_branches: update_branches(program, &state_cells),
-        list_operations: list_operations(program),
-        formula_operations: formula_operations(program),
-        derived_values: derived_values(program, &fields, &state_cells),
+        dependencies,
+        possible_causes,
+        update_branches,
+        list_operations,
+        formula_operations,
+        view_bindings,
+        derived_values,
         state_cells,
         lists,
         hidden_identity_verified: true,
@@ -296,7 +553,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         ));
     }
     for (index, node) in program.nodes.iter().enumerate() {
-        if node.id != index {
+        if node.id.as_usize() != index {
             return Err(format!(
                 "scheduled node `{}` has id {}, expected {index}",
                 node.name, node.id
@@ -304,7 +561,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         }
         if node
             .expr_id
-            .is_some_and(|expr_id| expr_id >= program.expression_count)
+            .is_some_and(|expr_id| expr_id.as_usize() >= program.expression_count)
         {
             return Err(format!(
                 "scheduled node `{}` references missing ExprId {:?}",
@@ -332,11 +589,77 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         "source port",
         program.sources.iter().map(|source| source.path.as_str()),
     )?;
+    for (index, source) in program.sources.iter().enumerate() {
+        if source.id.as_usize() != index {
+            return Err(format!(
+                "source port `{}` has SourceId {}, expected {index}",
+                source.path, source.id
+            ));
+        }
+        if source.scoped && source.scope_id.is_none() {
+            return Err(format!(
+                "scoped source port `{}` has no typed ScopeId",
+                source.path
+            ));
+        }
+    }
     let state_paths = unique_strings(
         "state cell",
         program.state_cells.iter().map(|cell| cell.path.as_str()),
     )?;
+    for (index, cell) in program.state_cells.iter().enumerate() {
+        if cell.id.as_usize() != index {
+            return Err(format!(
+                "state cell `{}` has StateId {}, expected {index}",
+                cell.path, cell.id
+            ));
+        }
+    }
     let list_names = unique_strings("list", program.lists.iter().map(|list| list.name.as_str()))?;
+    let row_scope_names = unique_strings(
+        "row scope",
+        program
+            .row_scopes
+            .iter()
+            .map(|scope| scope.row_scope.as_str()),
+    )?;
+    for (index, scope) in program.row_scopes.iter().enumerate() {
+        if scope.id.as_usize() != index {
+            return Err(format!(
+                "row scope `{}` has ScopeId {}, expected {index}",
+                scope.row_scope, scope.id
+            ));
+        }
+        if !list_names.contains(scope.list.as_str()) {
+            return Err(format!(
+                "row scope `{}` references unknown list `{}`",
+                scope.row_scope, scope.list
+            ));
+        }
+        if scope.function.trim().is_empty() {
+            return Err(format!(
+                "row scope `{}` has empty function",
+                scope.row_scope
+            ));
+        }
+    }
+    for (index, list) in program.lists.iter().enumerate() {
+        if list.id.as_usize() != index {
+            return Err(format!(
+                "list memory `{}` has ListId {}, expected {index}",
+                list.name, list.id
+            ));
+        }
+        if list.row_scope_id.is_some_and(|scope_id| {
+            scope_id.as_usize() >= program.row_scopes.len()
+                || program.row_scopes[scope_id.as_usize()].list != list.name
+        }) {
+            return Err(format!(
+                "list memory `{}` has invalid row ScopeId {:?}",
+                list.name, list.row_scope_id
+            ));
+        }
+    }
     let derived_paths = unique_strings(
         "derived value",
         program
@@ -344,6 +667,89 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             .iter()
             .map(|value| value.path.as_str()),
     )?;
+    for (index, value) in program.derived_values.iter().enumerate() {
+        if value.id.as_usize() != index {
+            return Err(format!(
+                "derived value `{}` has FieldId {}, expected {index}",
+                value.path, value.id
+            ));
+        }
+    }
+    for (index, binding) in program.view_bindings.iter().enumerate() {
+        if binding.id.as_usize() != index {
+            return Err(format!(
+                "view binding `{}.{}` has ViewBindingId {}, expected {index}",
+                binding.node_kind, binding.attr, binding.id
+            ));
+        }
+        if let Some(scope_id) = binding.scope_id
+            && scope_id.as_usize() >= program.row_scopes.len()
+        {
+            return Err(format!(
+                "view binding `{}.{}` references missing ScopeId {}",
+                binding.node_kind,
+                binding.attr,
+                scope_id.as_usize()
+            ));
+        }
+        match binding.kind {
+            ViewBindingKind::Source => {
+                let Some(source_id) = binding.source_id else {
+                    return Err(format!(
+                        "view source binding `{}.{}` has no SourceId",
+                        binding.node_kind, binding.attr
+                    ));
+                };
+                if source_id.as_usize() >= program.sources.len()
+                    || program.sources[source_id.as_usize()].path != binding.path
+                {
+                    return Err(format!(
+                        "view source binding `{}.{}` does not match SourceId {:?}",
+                        binding.node_kind, binding.attr, binding.source_id
+                    ));
+                }
+            }
+            ViewBindingKind::Data | ViewBindingKind::Target => {
+                if binding.source_id.is_some() {
+                    return Err(format!(
+                        "view data binding `{}.{}` unexpectedly has SourceId {:?}",
+                        binding.node_kind, binding.attr, binding.source_id
+                    ));
+                }
+            }
+        }
+    }
+    verify_scope_refs(
+        "source",
+        program.sources.iter().filter_map(|source| source.scope_id),
+        program,
+    )?;
+    verify_scope_refs(
+        "state cell",
+        program.state_cells.iter().filter_map(|cell| cell.scope_id),
+        program,
+    )?;
+    verify_scope_refs(
+        "derived value",
+        program
+            .derived_values
+            .iter()
+            .filter_map(|value| value.scope_id),
+        program,
+    )?;
+    for cell in &program.state_cells {
+        if cell.indexed
+            && cell.scope_id.is_none()
+            && row_scope_names
+                .iter()
+                .any(|scope| cell.path.split('.').any(|segment| segment == *scope))
+        {
+            return Err(format!(
+                "indexed state cell `{}` did not resolve to a typed ScopeId",
+                cell.path
+            ));
+        }
+    }
     let known_symbols = source_paths
         .iter()
         .chain(state_paths.iter())
@@ -351,6 +757,14 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         .chain(derived_paths.iter())
         .copied()
         .collect::<BTreeSet<_>>();
+    for binding in &program.view_bindings {
+        if !matches!(binding.kind, ViewBindingKind::Source)
+            && binding.scope_id.is_none()
+            && !symbol_known(&binding.path, &known_symbols)
+        {
+            require_known_symbol("view binding path", &binding.path, &known_symbols)?;
+        }
+    }
 
     for edge in &program.dependencies {
         require_known_symbol("dependency source", &edge.from, &known_symbols)?;
@@ -407,6 +821,161 @@ fn unique_strings<'a>(
         }
     }
     Ok(set)
+}
+
+fn verify_scope_refs(
+    label: &str,
+    refs: impl IntoIterator<Item = ScopeId>,
+    program: &TypedProgram,
+) -> Result<(), String> {
+    for scope_id in refs {
+        if scope_id.as_usize() >= program.row_scopes.len() {
+            return Err(format!(
+                "{label} references missing ScopeId {}",
+                scope_id.as_usize()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn row_scopes(program: &ParsedProgram) -> Vec<RowScope> {
+    program
+        .row_scope_functions
+        .iter()
+        .enumerate()
+        .map(|(id, scope)| RowScope {
+            id: ScopeId(id),
+            list: scope.list.clone(),
+            function: scope.function.clone(),
+            row_scope: scope.row_scope.clone(),
+        })
+        .collect()
+}
+
+fn scope_id_for_path(row_scopes: &[RowScope], path: &str) -> Option<ScopeId> {
+    path.split('.').find_map(|segment| {
+        row_scopes
+            .iter()
+            .find(|scope| scope.row_scope == segment)
+            .map(|scope| scope.id)
+    })
+}
+
+fn scope_id_for_list(row_scopes: &[RowScope], list: &str) -> Option<ScopeId> {
+    row_scopes
+        .iter()
+        .find(|scope| scope.list == list)
+        .map(|scope| scope.id)
+}
+
+fn source_payload_schema(program: &ParsedProgram, source: &str) -> SourcePayloadSchema {
+    let fields = typed_field_defs(program);
+    let variants = source_ref_variants(source);
+    let mut payload_fields = BTreeSet::new();
+    for field in &fields {
+        if !direct_source_refs(field, program)
+            .iter()
+            .any(|direct_source| direct_source == source)
+        {
+            continue;
+        }
+        for variant in &variants {
+            if field.references_payload_path(variant, "text")
+                || field.match_arm_destructures_payload("text")
+            {
+                payload_fields.insert(SourcePayloadField::Text);
+            }
+            if field.references_payload_path(variant, "key")
+                || field.match_arm_destructures_payload("key")
+            {
+                payload_fields.insert(SourcePayloadField::Key);
+            }
+        }
+    }
+    if source_is_in_address_scope(program, source) {
+        payload_fields.insert(SourcePayloadField::Address);
+    }
+    SourcePayloadSchema {
+        fields: payload_fields.into_iter().collect(),
+    }
+}
+
+fn source_is_in_address_scope(program: &ParsedProgram, source: &str) -> bool {
+    let Some(source_scope) = source.split('.').next() else {
+        return false;
+    };
+    program.row_scope_functions.iter().any(|scope| {
+        scope.row_scope == source_scope
+            && typed_field_defs(program).iter().any(|field| {
+                field.path == format!("{}.address", scope.row_scope)
+                    || field
+                        .path
+                        .ends_with(&format!(".{}.address", scope.row_scope))
+            })
+    })
+}
+
+fn view_bindings(
+    program: &ParsedProgram,
+    row_scopes: &[RowScope],
+    sources: &[SourcePort],
+) -> Vec<ViewBinding> {
+    let source_paths = sources
+        .iter()
+        .map(|source| (source.path.as_str(), source.id))
+        .collect::<Vec<_>>();
+    let mut bindings = Vec::new();
+    for line in boon_parser::parsed_view_lines(program) {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        let Some(node_kind) = tokens.first() else {
+            continue;
+        };
+        if matches!(*node_kind, "}" | "{") {
+            continue;
+        }
+        for token in tokens.iter().skip(1) {
+            let Some((attr, raw_value)) = token.split_once('=') else {
+                continue;
+            };
+            let value = raw_value.trim_matches('"');
+            if let Some(path) = view_data_path(value) {
+                bindings.push(ViewBinding {
+                    id: ViewBindingId(bindings.len()),
+                    node_kind: (*node_kind).to_owned(),
+                    attr: attr.to_owned(),
+                    scope_id: scope_id_for_path(row_scopes, &path),
+                    source_id: None,
+                    kind: if attr == "target" {
+                        ViewBindingKind::Target
+                    } else {
+                        ViewBindingKind::Data
+                    },
+                    path,
+                });
+            } else if let Some((path, source_id)) = source_paths
+                .iter()
+                .find(|(source_path, _)| *source_path == value)
+            {
+                bindings.push(ViewBinding {
+                    id: ViewBindingId(bindings.len()),
+                    node_kind: (*node_kind).to_owned(),
+                    attr: attr.to_owned(),
+                    path: (*path).to_owned(),
+                    kind: ViewBindingKind::Source,
+                    scope_id: scope_id_for_path(row_scopes, path),
+                    source_id: Some(*source_id),
+                });
+            }
+        }
+    }
+    bindings
+}
+
+fn view_data_path(value: &str) -> Option<String> {
+    let path = value.strip_prefix('$')?;
+    let path = path.split_once(':').map_or(path, |(path, _)| path);
+    (!path.trim().is_empty()).then(|| path.to_owned())
 }
 
 fn require_known_symbol(
@@ -563,10 +1132,11 @@ fn verify_combinational_field_cycles_from<'a>(
         return Ok(());
     }
     visiting.push(field.path.as_str());
-    let body = field_dependency_body(&field.body);
     for dependency in fields.iter().filter(|candidate| {
         candidate.parent_path == field.parent_path
-            && text_mentions_unqualified_identifier(&body, &candidate.local_name)
+            && candidate.path != field.path
+            && candidate.local_name != field.local_name
+            && field.mentions_identifier(&candidate.local_name)
     }) {
         if state_paths.contains(dependency.path.as_str()) {
             continue;
@@ -575,44 +1145,6 @@ fn verify_combinational_field_cycles_from<'a>(
     }
     visiting.pop();
     Ok(())
-}
-
-fn field_dependency_body(body: &str) -> String {
-    let mut lines = body.lines();
-    let first = lines
-        .next()
-        .and_then(|line| line.split_once(':').map(|(_, rest)| rest))
-        .unwrap_or_default();
-    std::iter::once(first)
-        .chain(lines)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn text_mentions_unqualified_identifier(text: &str, identifier: &str) -> bool {
-    let bytes = text.as_bytes();
-    let needle = identifier.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return false;
-    }
-    bytes
-        .windows(needle.len())
-        .enumerate()
-        .any(|(index, window)| {
-            window == needle
-                && index.checked_sub(1).is_none_or(|before| {
-                    !is_identifier_byte(bytes[before])
-                        && bytes[before] != b'.'
-                        && bytes[before] != b'/'
-                })
-                && bytes
-                    .get(index + needle.len())
-                    .is_none_or(|after| !is_identifier_byte(*after))
-        })
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), String> {
@@ -808,6 +1340,8 @@ fn hidden_identity_token(value: &str) -> Option<&'static str> {
 
 pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
     serde_json::json!({
+        "expression_coverage": program.expression_coverage,
+        "row_scopes": program.row_scopes,
         "sources": program.sources,
         "state_cells": program.state_cells,
         "lists": program.lists,
@@ -817,7 +1351,127 @@ pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
         "update_branches": program.update_branches,
         "list_operations": program.list_operations,
         "formula_operations": program.formula_operations,
+        "view_bindings": program.view_bindings,
     })
+}
+
+fn expression_coverage(
+    program: &ParsedProgram,
+    nodes: &[IrNode],
+    state_cells: &[StateCell],
+    lists: &[ListMemory],
+    derived_values: &[DerivedValue],
+    update_branches: &[UpdateBranch],
+    list_operations: &[ListOperation],
+) -> ExpressionCoverage {
+    let mut coverage = ExpressionCoverage {
+        ast_expression_count: program.expressions.len(),
+        ..ExpressionCoverage::empty()
+    };
+    let scheduled_expr_ids = nodes
+        .iter()
+        .filter_map(|node| node.expr_id)
+        .map(ExprId::as_usize)
+        .collect::<BTreeSet<_>>();
+    for expr in &program.expressions {
+        if let AstExprKind::Unknown(tokens) = &expr.kind {
+            if scheduled_expr_ids.contains(&expr.id) {
+                coverage.unknown_ast_expression_count += 1;
+                coverage.unknown_labels.push(format!(
+                    "scheduled ast expression line {}: {}",
+                    expr.line,
+                    if tokens.is_empty() {
+                        "<empty>".to_owned()
+                    } else {
+                        tokens.join(" ")
+                    }
+                ));
+            } else {
+                coverage.ignored_unknown_ast_expression_count += 1;
+                coverage.ignored_unknown_labels.push(format!(
+                    "ignored ast expression line {}: {}",
+                    expr.line,
+                    if tokens.is_empty() {
+                        "<empty>".to_owned()
+                    } else {
+                        tokens.join(" ")
+                    }
+                ));
+            }
+        }
+    }
+    for cell in state_cells {
+        if let InitialValue::Unknown { summary } = &cell.initial_value {
+            coverage.unknown_initial_value_count += 1;
+            coverage
+                .unknown_labels
+                .push(format!("initial value {}: {summary}", cell.path));
+        }
+    }
+    for list in lists {
+        match &list.initializer {
+            ListInitializer::Unknown { summary } => {
+                coverage.unknown_list_initializer_count += 1;
+                coverage
+                    .unknown_labels
+                    .push(format!("list initializer {}: {summary}", list.name));
+            }
+            ListInitializer::RecordLiteral { rows } => {
+                for row in rows {
+                    for field in &row.fields {
+                        if let InitialValue::Unknown { summary } = &field.value {
+                            coverage.unknown_list_seed_value_count += 1;
+                            coverage
+                                .unknown_labels
+                                .push(format!("list seed {}.{}: {summary}", list.name, field.name));
+                        }
+                    }
+                }
+            }
+            ListInitializer::Grid { .. } | ListInitializer::Empty => {}
+        }
+    }
+    for branch in update_branches {
+        if let UpdateExpression::Unknown { summary } = &branch.expression {
+            coverage.unknown_update_expression_count += 1;
+            coverage.unknown_labels.push(format!(
+                "update branch {} from {}: {summary}",
+                branch.target, branch.source
+            ));
+        }
+    }
+    for operation in list_operations {
+        for summary in unknown_predicate_summaries(&operation.kind) {
+            coverage.unknown_list_predicate_count += 1;
+            coverage
+                .unknown_labels
+                .push(format!("list operation {}: {summary}", operation.list));
+        }
+    }
+    for value in derived_values {
+        if matches!(value.kind, DerivedValueKind::Unknown) {
+            coverage.unknown_derived_value_count += 1;
+            coverage
+                .unknown_labels
+                .push(format!("derived value {}: unknown", value.path));
+        }
+    }
+    coverage
+}
+
+fn unknown_predicate_summaries(kind: &ListOperationKind) -> Vec<&str> {
+    match kind {
+        ListOperationKind::Remove { predicate, .. }
+        | ListOperationKind::Retain { predicate, .. }
+        | ListOperationKind::Count { predicate, .. } => match predicate {
+            ListPredicate::Unknown { summary } => vec![summary.as_str()],
+            ListPredicate::AlwaysTrue
+            | ListPredicate::RowFieldBool { .. }
+            | ListPredicate::RowFieldBoolNot { .. }
+            | ListPredicate::SelectedFilterVisibility { .. } => Vec::new(),
+        },
+        ListOperationKind::Append { .. } => Vec::new(),
+    }
 }
 
 fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
@@ -827,11 +1481,15 @@ fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
         .filter_map(expression_node)
         .enumerate()
         .map(|(id, mut node)| {
-            node.id = id;
+            node.id = NodeId(id);
             node
         })
         .collect::<Vec<_>>();
-    if program.source.contains("Formula/dependencies") {
+    if program
+        .operators
+        .iter()
+        .any(|operator| operator == "Formula/dependencies")
+    {
         push_generated(&mut nodes, "dependency_index", IrNodeKind::Aggregate, true);
     }
     for list in &program.list_memories {
@@ -845,55 +1503,77 @@ fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
     nodes
 }
 
-fn expression_node(expr: &ParsedExpression) -> Option<IrNode> {
-    let kind = ast_expression_node_kind(expr)?;
+fn expression_node(expr: &AstExpr) -> Option<IrNode> {
+    let kind = expression_ir_node_kind(expr)?;
     Some(IrNode {
-        id: 0,
-        name: format!("expr_{}_{}", expr.id, sanitize_node_name(&expr.label)),
+        id: NodeId(0),
+        name: format!(
+            "expr_{}_{}",
+            expr.id,
+            sanitize_node_name(&ast_expr_label(expr))
+        ),
         indexed: expression_is_indexed(expr, &kind),
         kind,
-        expr_id: Some(expr.id),
+        expr_id: Some(ExprId(expr.id)),
     })
 }
 
-fn ast_expression_node_kind(expr: &ParsedExpression) -> Option<IrNodeKind> {
-    match expr.kind {
-        ParsedExpressionKind::Source => Some(IrNodeKind::SourceRead),
-        ParsedExpressionKind::Hold => Some(IrNodeKind::Hold),
-        ParsedExpressionKind::List => Some(IrNodeKind::ListMap),
-        ParsedExpressionKind::Function => Some(IrNodeKind::PureCall),
-        ParsedExpressionKind::Field => Some(IrNodeKind::PureCall),
-        ParsedExpressionKind::Operator => expression_operator_node_kind(&expr.label),
+fn expression_ir_node_kind(expr: &AstExpr) -> Option<IrNodeKind> {
+    match &expr.kind {
+        AstExprKind::Source => Some(IrNodeKind::SourceRead),
+        AstExprKind::Hold { .. } => Some(IrNodeKind::Hold),
+        AstExprKind::ListLiteral { .. } => Some(IrNodeKind::ListMap),
+        AstExprKind::Latest => Some(IrNodeKind::Latest),
+        AstExprKind::When { .. } => Some(IrNodeKind::When),
+        AstExprKind::Then { .. } => Some(IrNodeKind::Then),
+        AstExprKind::Pipe { op, .. } => expression_operator_node_kind(std::slice::from_ref(op)),
+        AstExprKind::Call { function, .. } => {
+            expression_operator_node_kind(std::slice::from_ref(function))
+                .or(Some(IrNodeKind::PureCall))
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Infix { .. }
+        | AstExprKind::Record(_) => Some(IrNodeKind::PureCall),
+        AstExprKind::MatchArm { .. } | AstExprKind::Delimiter | AstExprKind::Unknown(_) => None,
     }
 }
 
-fn expression_operator_node_kind(label: &str) -> Option<IrNodeKind> {
-    if label.contains("List/append") {
+fn expression_operator_node_kind(operators: &[String]) -> Option<IrNodeKind> {
+    if operators.iter().any(|operator| operator == "List/append") {
         Some(IrNodeKind::ListAppend)
-    } else if label.contains("List/remove") {
+    } else if operators.iter().any(|operator| operator == "List/remove") {
         Some(IrNodeKind::ListRemove)
-    } else if label.contains("List/map") {
+    } else if operators.iter().any(|operator| operator == "List/map") {
         Some(IrNodeKind::ListMap)
-    } else if label.contains("List/retain") {
+    } else if operators.iter().any(|operator| operator == "List/retain") {
         Some(IrNodeKind::ListRetain)
-    } else if label.contains("List/count") {
+    } else if operators.iter().any(|operator| operator == "List/count") {
         Some(IrNodeKind::Aggregate)
-    } else if label.contains("LATEST") {
+    } else if operators.iter().any(|operator| operator == "LATEST") {
         Some(IrNodeKind::Latest)
-    } else if label.contains("WHILE") {
+    } else if operators.iter().any(|operator| operator == "WHILE") {
         Some(IrNodeKind::While)
-    } else if label.contains("THEN") {
+    } else if operators.iter().any(|operator| operator == "THEN") {
         Some(IrNodeKind::Then)
-    } else if label.contains("WHEN") {
+    } else if operators.iter().any(|operator| operator == "WHEN") {
         Some(IrNodeKind::When)
-    } else if label.contains("Formula/") || label.contains("Text/") || label.contains("Bool/") {
+    } else if operators.iter().any(|operator| {
+        operator.starts_with("Formula/")
+            || operator.starts_with("Text/")
+            || operator.starts_with("Bool/")
+    }) {
         Some(IrNodeKind::PureCall)
     } else {
         None
     }
 }
 
-fn expression_is_indexed(expr: &ParsedExpression, kind: &IrNodeKind) -> bool {
+fn expression_is_indexed(_expr: &AstExpr, kind: &IrNodeKind) -> bool {
     matches!(
         kind,
         IrNodeKind::ListAppend
@@ -902,12 +1582,36 @@ fn expression_is_indexed(expr: &ParsedExpression, kind: &IrNodeKind) -> bool {
             | IrNodeKind::ListRetain
             | IrNodeKind::Aggregate
             | IrNodeKind::RenderLowering
-    ) || expr.indexed_hint
+    )
+}
+
+fn ast_expr_label(expr: &AstExpr) -> String {
+    match &expr.kind {
+        AstExprKind::Identifier(name) | AstExprKind::Number(name) | AstExprKind::Enum(name) => {
+            format!("{:?}", name)
+        }
+        AstExprKind::Unknown(tokens) => tokens.join("_"),
+        AstExprKind::Delimiter => "delimiter".to_owned(),
+        AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::TextLiteral(_) => "text_literal".to_owned(),
+        AstExprKind::Bool(value) => format!("bool_{value}"),
+        AstExprKind::Source => "source".to_owned(),
+        AstExprKind::Call { function, .. } => function.clone(),
+        AstExprKind::Pipe { op, .. } => op.clone(),
+        AstExprKind::Hold { name, .. } => format!("hold_{name}"),
+        AstExprKind::Latest => "latest".to_owned(),
+        AstExprKind::When { .. } => "when".to_owned(),
+        AstExprKind::Then { .. } => "then".to_owned(),
+        AstExprKind::Infix { op, .. } => format!("infix_{op}"),
+        AstExprKind::MatchArm { .. } => "match_arm".to_owned(),
+        AstExprKind::Record(_) => "record".to_owned(),
+        AstExprKind::ListLiteral { .. } => "list".to_owned(),
+    }
 }
 
 fn push_generated(nodes: &mut Vec<IrNode>, name: &str, kind: IrNodeKind, indexed: bool) {
     nodes.push(IrNode {
-        id: nodes.len(),
+        id: NodeId(nodes.len()),
         name: name.to_owned(),
         kind,
         indexed,
@@ -920,7 +1624,7 @@ fn dependency_edges(program: &ParsedProgram, cells: &[StateCell]) -> Vec<Depende
     for cell in cells {
         for source in candidate_sources(program, &cell.path) {
             edges.push(DependencyEdge {
-                indexed: cell.indexed || source.contains(".todo_") || source.starts_with("todo."),
+                indexed: cell.indexed || path_has_parsed_row_scope(program, &source),
                 from: source,
                 to: cell.path.clone(),
             });
@@ -940,7 +1644,7 @@ fn possible_causes(program: &ParsedProgram, cells: &[StateCell]) -> Vec<Possible
 }
 
 fn update_branches(program: &ParsedProgram, cells: &[StateCell]) -> Vec<UpdateBranch> {
-    let fields = collect_field_defs(program);
+    let fields = typed_field_defs(program);
     cells
         .iter()
         .flat_map(|cell| {
@@ -950,7 +1654,7 @@ fn update_branches(program: &ParsedProgram, cells: &[StateCell]) -> Vec<UpdateBr
             let mut branches = direct_source_refs(field, program)
                 .into_iter()
                 .map(|source| UpdateBranch {
-                    expression: update_expression_for_source(&cell.path, &field.body, &source),
+                    expression: update_expression_for_source(program, &cell.path, field, &source),
                     indexed: cell.indexed,
                     target: cell.path.clone(),
                     source,
@@ -974,9 +1678,8 @@ fn derived_then_empty_update_branches(
     for dependency in fields.iter().filter(|dependency| {
         dependency.parent_path == field.parent_path
             && dependency.path != field.path
-            && field.mentions_identifier(&dependency.local_name)
-            && field.has_then_from_local(&dependency.local_name)
-            && field.has_token("Text/empty")
+            && field.mentions_identifier_expr(&dependency.local_name)
+            && field.has_then_from_local_with_empty_output(&dependency.local_name)
     }) {
         for source in direct_source_refs(dependency, program) {
             if branches
@@ -999,7 +1702,7 @@ fn derived_then_empty_update_branches(
 }
 
 fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
-    let fields = collect_field_defs(program);
+    let fields = typed_field_defs(program);
     let mut operations = Vec::new();
     for field in &fields {
         let Some(list_name) = field.path.strip_prefix("store.") else {
@@ -1012,47 +1715,50 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
         {
             continue;
         }
-        if let Some(trigger) = list_append_trigger(&field.body, &field.parent_path) {
-            let fields = list_append_fields(&field.body, &field.parent_path);
+        if let Some(trigger) = list_append_trigger(field) {
+            let fields = list_append_fields(field);
             operations.push(ListOperation {
                 list: list_name.to_owned(),
                 kind: ListOperationKind::Append { trigger, fields },
             });
         }
         for source in direct_source_refs(field, program) {
-            let variants = source_ref_variants(&source);
-            let branch = variants
-                .iter()
-                .find_map(|variant| branch_text_for_source(&field.body, variant))
-                .unwrap_or_default();
-            if branch.contains("List/remove") || field.has_token("List/remove") {
+            let branch = field.source_branch(&source).unwrap_or_default();
+            if branch.has_token("List/remove") || field.has_token("List/remove") {
+                let row_scope = row_scope_for_list(program, list_name);
                 operations.push(ListOperation {
                     list: list_name.to_owned(),
                     kind: ListOperationKind::Remove {
+                        predicate: list_remove_predicate(field, &source, &branch, row_scope),
                         source,
-                        predicate: list_remove_predicate(&branch),
                     },
                 });
             }
         }
     }
     for field in &fields {
-        if field.has_token("List/count") {
+        if field.has_operator("List/count") {
+            let Some(list) = count_or_retain_source_list(field) else {
+                continue;
+            };
+            let row_scope = row_scope_for_list(program, &list);
             operations.push(ListOperation {
-                list: count_or_retain_source_list(&field.body)
-                    .unwrap_or_else(|| "todos".to_owned()),
+                list,
                 kind: ListOperationKind::Count {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(&field.body),
+                    predicate: list_retain_predicate(field, row_scope),
                 },
             });
-        } else if field.has_token("List/retain") {
+        } else if field.has_operator("List/retain") {
+            let Some(list) = count_or_retain_source_list(field) else {
+                continue;
+            };
+            let row_scope = row_scope_for_list(program, &list);
             operations.push(ListOperation {
-                list: count_or_retain_source_list(&field.body)
-                    .unwrap_or_else(|| "todos".to_owned()),
+                list,
                 kind: ListOperationKind::Retain {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(&field.body),
+                    predicate: list_retain_predicate(field, row_scope),
                 },
             });
         }
@@ -1061,37 +1767,36 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
 }
 
 fn formula_operations(program: &ParsedProgram) -> Vec<FormulaOperation> {
-    collect_field_defs(program)
+    typed_field_defs(program)
         .into_iter()
         .filter_map(|field| {
-            let body = field.body.replace('\n', " ");
-            if let Some(argument) = call_argument(&body, "Formula/parse") {
+            if let Some(argument) = ast_call_argument(&field, "Formula/parse") {
                 return Some(FormulaOperation {
-                    target: field.path,
+                    target: field.path.clone(),
                     kind: FormulaOperationKind::Parse { input: argument },
                 });
             }
-            if let Some(argument) = call_argument(&body, "Formula/dependencies") {
+            if let Some(argument) = ast_call_argument(&field, "Formula/dependencies") {
                 return Some(FormulaOperation {
-                    target: field.path,
+                    target: field.path.clone(),
                     kind: FormulaOperationKind::Dependencies { input: argument },
                 });
             }
-            if body.contains("Formula/eval") {
+            if field.has_operator("Formula/eval") {
                 return Some(FormulaOperation {
-                    target: field.path,
+                    target: field.path.clone(),
                     kind: FormulaOperationKind::Eval {
-                        formula: named_call_argument(&body, "formula")
+                        formula: ast_named_call_argument(&field, "Formula/eval", "formula")
                             .unwrap_or_else(|| "parsed_formula".to_owned()),
-                        read: named_call_argument(&body, "read")
+                        read: ast_named_call_argument(&field, "Formula/eval", "read")
                             .unwrap_or_else(|| "cell_value_reader".to_owned()),
                     },
                 });
             }
-            if body.contains("Formula/error") {
-                let args = call_arguments(&body, "Formula/error");
+            if field.has_operator("Formula/error") {
+                let args = ast_call_arguments(&field, "Formula/error");
                 return Some(FormulaOperation {
-                    target: field.path,
+                    target: field.path.clone(),
                     kind: FormulaOperationKind::Error {
                         formula: args
                             .first()
@@ -1108,6 +1813,7 @@ fn formula_operations(program: &ParsedProgram) -> Vec<FormulaOperation> {
 
 fn derived_values(
     program: &ParsedProgram,
+    row_scopes: &[RowScope],
     fields: &[FieldDef],
     state_cells: &[StateCell],
 ) -> Vec<DerivedValue> {
@@ -1119,11 +1825,14 @@ fn derived_values(
                     field.path.ends_with(&format!(".{}", list.name)) || field.path == list.name
                 })
         })
-        .map(|field| {
+        .enumerate()
+        .map(|(id, field)| {
             let sources = direct_source_refs(field, program);
             DerivedValue {
-                indexed: path_has_indexed_scope(&field.path),
-                kind: derived_value_kind(&field.body, &sources),
+                id: FieldId(id),
+                indexed: path_has_parsed_row_scope(program, &field.path),
+                scope_id: scope_id_for_path(row_scopes, &field.path),
+                kind: derived_value_kind(field, &sources),
                 path: field.path.clone(),
                 sources,
             }
@@ -1131,137 +1840,176 @@ fn derived_values(
         .collect()
 }
 
-fn derived_value_kind(body: &str, sources: &[String]) -> DerivedValueKind {
-    if body.contains("Formula/") {
+fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
+    if field.has_any_operator(&[
+        "Formula/parse",
+        "Formula/dependencies",
+        "Formula/eval",
+        "Formula/error",
+    ]) {
         DerivedValueKind::Formula
-    } else if body.contains("List/count") {
+    } else if field.has_operator("List/count") {
         DerivedValueKind::Aggregate
-    } else if body.contains("List/retain") || body.contains("List/map") {
+    } else if field.has_any_operator(&["List/retain", "List/map"]) {
         DerivedValueKind::ListView
-    } else if !sources.is_empty() || body.contains("|> WHEN") || body.contains("|> THEN") {
+    } else if !sources.is_empty() || field.has_when_or_then_expr() {
         DerivedValueKind::SourceEventTransform
-    } else if body.trim().is_empty() {
+    } else if field.ast_items.is_empty() {
         DerivedValueKind::Unknown
     } else {
         DerivedValueKind::Pure
     }
 }
 
-fn state_initial_value(body: &str) -> InitialValue {
-    let first = body
-        .lines()
-        .map(str::trim)
-        .find(|line| line.contains("|> HOLD"))
-        .unwrap_or_default();
-    let initial = first
-        .split_once("|> HOLD")
-        .map(|(initial, _)| initial.trim())
-        .unwrap_or(first);
-    if matches!(initial, "Text/empty" | "TEXT {}") {
-        return InitialValue::Text {
-            value: String::new(),
-        };
-    }
-    if let Some(text) = text_literal_value(initial) {
-        return InitialValue::Text { value: text };
-    }
-    match initial {
-        "True" => InitialValue::Bool { value: true },
-        "False" => InitialValue::Bool { value: false },
-        value if value.starts_with("seed.") => InitialValue::SeedField {
-            path: value.trim_start_matches("seed.").to_owned(),
-        },
-        value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
-            value: value.to_owned(),
-        },
-        value if !value.is_empty() => InitialValue::Unknown {
-            summary: value.to_owned(),
-        },
-        _ => InitialValue::Unknown {
+fn field_initial_value(field: &FieldDef) -> InitialValue {
+    let initial_expr = if let Some(initial) =
+        field.ast_exprs.iter().find_map(|expr| match expr.kind {
+            AstExprKind::Hold { initial, .. } => Some(initial),
+            _ => None,
+        }) {
+        field.ast_exprs.iter().find(|expr| expr.id == initial)
+    } else {
+        field
+            .ast_exprs
+            .iter()
+            .find(|expr| !matches!(expr.kind, AstExprKind::Latest))
+    };
+    let Some(expr) = initial_expr else {
+        return InitialValue::Unknown {
             summary: "missing initial value".to_owned(),
+        };
+    };
+    ast_initial_value(expr)
+}
+
+fn ast_initial_value(expr: &AstExpr) -> InitialValue {
+    match &expr.kind {
+        AstExprKind::TextLiteral(value) => InitialValue::Text {
+            value: value.clone(),
+        },
+        AstExprKind::Bool(value) => InitialValue::Bool { value: *value },
+        AstExprKind::Enum(value) if value == "Text/empty" => InitialValue::Text {
+            value: String::new(),
+        },
+        AstExprKind::Enum(value) => InitialValue::Enum {
+            value: value.clone(),
+        },
+        AstExprKind::Path(parts) if parts.as_slice() == ["Text/empty"] => InitialValue::Text {
+            value: String::new(),
+        },
+        AstExprKind::Path(parts) if parts.first().map(String::as_str) == Some("seed") => {
+            InitialValue::SeedField {
+                path: parts[1..].join("."),
+            }
+        }
+        AstExprKind::Path(parts)
+            if parts.len() == 1 && value_starts_uppercase_identifier(&parts[0]) =>
+        {
+            InitialValue::Enum {
+                value: parts[0].clone(),
+            }
+        }
+        AstExprKind::Identifier(value) if value_starts_uppercase_identifier(value) => {
+            InitialValue::Enum {
+                value: value.clone(),
+            }
+        }
+        _ => InitialValue::Unknown {
+            summary: ast_expr_label(expr),
         },
     }
 }
 
 fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer {
-    let Some(body) = list_body(program, list_name) else {
+    let Some(items) = list_body_items(program, list_name) else {
         return ListInitializer::Unknown {
             summary: "list body not found".to_owned(),
         };
     };
-    if body.contains("Grid/cells") {
+    if items.iter().any(|item| item_has_symbol(item, "Grid/cells")) {
         return ListInitializer::Grid {
-            columns: extract_usize_arg(&body, "columns").unwrap_or(26),
-            rows: extract_usize_arg(&body, "rows").unwrap_or(100),
+            columns: extract_usize_arg_from_items(&items, "columns").unwrap_or(26),
+            rows: extract_usize_arg_from_items(&items, "rows").unwrap_or(100),
         };
     }
-    let rows = list_record_literal_rows(&body);
+    let rows = list_record_literal_rows(&items);
     if !rows.is_empty() {
         return ListInitializer::RecordLiteral { rows };
     }
-    if body.contains("LIST") {
+    if items.iter().any(|item| item_has_symbol(item, "LIST")) {
         ListInitializer::Empty
     } else {
         ListInitializer::Unknown {
-            summary: body.lines().next().unwrap_or_default().to_owned(),
+            summary: items.first().map(item_summary).unwrap_or_default(),
         }
     }
 }
 
-fn list_body(program: &ParsedProgram, list_name: &str) -> Option<String> {
-    let lines = program.source.lines().collect::<Vec<_>>();
-    for (line_index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let Some(field) = leading_field_name(trimmed) else {
-            continue;
-        };
-        if field == list_name {
-            let indent = line.chars().take_while(|ch| *ch == ' ').count();
-            return Some(field_body(&lines, line_index, indent));
+fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstItem>> {
+    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
+    for (item_index, item) in items.iter().enumerate() {
+        if item.field.as_deref() == Some(list_name) {
+            return Some(collect_field_ast_items(&items, item_index, item.indent));
         }
     }
     None
 }
 
-fn list_record_literal_rows(body: &str) -> Vec<ListSeedRecord> {
+fn list_record_literal_rows(items: &[AstItem]) -> Vec<ListSeedRecord> {
     let mut rows = Vec::new();
     let mut in_literal = false;
-    for line in body.lines().map(str::trim) {
-        if line.contains("LIST") {
+    for item in items {
+        if item_has_symbol(item, "LIST") {
             in_literal = true;
             continue;
         }
-        if line.contains("|> List/") {
+        if item_has_symbol(item, "|>")
+            && item
+                .symbols
+                .iter()
+                .any(|lexeme| symbol_is_list_operator(lexeme))
+        {
             break;
         }
         if !in_literal {
             continue;
         }
-        if let Some(record) = list_record_literal_line(line) {
+        if let Some(record) = list_record_literal_item(item) {
             rows.push(record);
         }
     }
     rows
 }
 
-fn list_record_literal_line(line: &str) -> Option<ListSeedRecord> {
-    let row = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+fn list_record_literal_item(item: &AstItem) -> Option<ListSeedRecord> {
+    if item.symbols.first().map(String::as_str) != Some("[")
+        || item.symbols.last().map(String::as_str) != Some("]")
+    {
+        return None;
+    }
     let mut fields = Vec::new();
-    for part in row.split(',') {
-        let (name, value) = part.split_once(':')?;
+    for part in split_top_level(&item.symbols[1..item.symbols.len() - 1], ",") {
+        if part.len() < 3 || part.get(1).map(String::as_str) != Some(":") {
+            continue;
+        }
+        let name = part[0].as_str();
+        if !is_name(name) {
+            continue;
+        }
         fields.push(ListSeedField {
-            name: name.trim().to_owned(),
-            value: literal_initial_value(value.trim()),
+            name: name.to_owned(),
+            value: literal_initial_value(&part[2..]),
         });
     }
     (!fields.is_empty()).then_some(ListSeedRecord { fields })
 }
 
-fn literal_initial_value(text: &str) -> InitialValue {
-    if let Some(value) = text_literal_value(text) {
+fn literal_initial_value(tokens: &[String]) -> InitialValue {
+    if let Some(value) = text_literal_value(tokens) {
         return InitialValue::Text { value };
     }
-    match text {
+    let value = tokens_to_path(tokens);
+    match value.as_str() {
         "True" => InitialValue::Bool { value: true },
         "False" => InitialValue::Bool { value: false },
         value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
@@ -1273,146 +2021,446 @@ fn literal_initial_value(text: &str) -> InitialValue {
     }
 }
 
-fn text_literal_value(text: &str) -> Option<String> {
-    let (_, rest) = text.split_once("TEXT {")?;
-    let (value, _) = rest.split_once('}')?;
-    Some(value.trim().to_owned())
+fn text_literal_value(tokens: &[String]) -> Option<String> {
+    if tokens.first().map(String::as_str) != Some("TEXT")
+        || tokens.get(1).map(String::as_str) != Some("{")
+    {
+        return None;
+    }
+    let close = tokens.iter().rposition(|token| token == "}")?;
+    Some(tokens[2..close].join(" "))
 }
 
-fn extract_usize_arg(source: &str, name: &str) -> Option<usize> {
-    let start = source.find(&format!("{name}:"))? + name.len() + 1;
-    let rest = &source[start..];
-    let digits = rest
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().ok()
-}
-
-fn call_argument(body: &str, function: &str) -> Option<String> {
-    call_arguments(body, function).into_iter().next()
-}
-
-fn call_arguments(body: &str, function: &str) -> Vec<String> {
-    let Some((_, rest)) = body.split_once(function) else {
-        return Vec::new();
-    };
-    let Some((_, args)) = rest.split_once('(') else {
-        return Vec::new();
-    };
-    let args = args.split_once(')').map(|(args, _)| args).unwrap_or(args);
-    args.split(',')
-        .map(str::trim)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| {
-            arg.split_once(':')
-                .map(|(_, value)| value.trim())
-                .unwrap_or(arg)
-                .to_owned()
+fn extract_usize_arg_from_items(items: &[AstItem], name: &str) -> Option<usize> {
+    items.iter().find_map(|item| {
+        item.symbols.windows(3).find_map(|window| {
+            (window[0] == name && window[1] == ":")
+                .then(|| window[2].parse().ok())
+                .flatten()
         })
-        .collect()
-}
-
-fn named_call_argument(body: &str, name: &str) -> Option<String> {
-    let (_, rest) = body.split_once("Formula/eval")?;
-    let (_, args) = rest.split_once('(')?;
-    let args = args.split_once(')').map(|(args, _)| args).unwrap_or(args);
-    args.split(',').find_map(|arg| {
-        let (candidate, value) = arg.split_once(':')?;
-        (candidate.trim() == name).then(|| value.trim().to_owned())
     })
 }
 
-fn list_append_trigger(body: &str, parent_path: &str) -> Option<String> {
-    let (_, rest) = body.split_once("List/append")?;
-    let (_, item) = rest.split_once("item:")?;
-    let trigger = item
-        .split("|> THEN")
-        .next()
-        .map(str::trim)
-        .filter(|trigger| !trigger.is_empty())?;
-    Some(canonical_local_path(trigger, parent_path))
+fn ast_call_argument(field: &FieldDef, function: &str) -> Option<String> {
+    ast_call_arguments(field, function).into_iter().next()
 }
 
-fn list_append_fields(body: &str, parent_path: &str) -> Vec<ListAppendField> {
-    let Some((_, rest)) = body.split_once("List/append") else {
-        return Vec::new();
-    };
-    let Some((_, then_body)) = rest.split_once("|> THEN") else {
-        return Vec::new();
-    };
-    let Some((_, record)) = then_body.split_once('[') else {
-        return Vec::new();
-    };
-    let Some((record, _)) = record.split_once(']') else {
-        return Vec::new();
-    };
-    record
-        .split(',')
-        .filter_map(|entry| {
-            let (name, source) = entry.split_once(':')?;
-            let name = name.trim();
-            let source = source.trim();
-            (!name.is_empty() && !source.is_empty()).then(|| ListAppendField {
-                name: name.to_owned(),
-                source: canonical_local_path(source, parent_path),
-            })
+fn ast_call_arguments(field: &FieldDef, function: &str) -> Vec<String> {
+    field
+        .ast_exprs
+        .iter()
+        .find_map(|expr| match &expr.kind {
+            AstExprKind::Call {
+                function: call_function,
+                args,
+            } if call_function == function => Some(args.as_slice()),
+            AstExprKind::Pipe { op, args, .. } if op == function => Some(args.as_slice()),
+            _ => None,
         })
+        .into_iter()
+        .flatten()
+        .filter(|arg| arg.name.is_none())
+        .filter_map(|arg| ast_argument_value(field, arg.value))
         .collect()
 }
 
-fn list_remove_predicate(branch: &str) -> ListPredicate {
-    if branch.contains("THEN { True }") || branch.contains("THEN {True}") {
+fn ast_named_call_argument(field: &FieldDef, function: &str, name: &str) -> Option<String> {
+    field
+        .ast_exprs
+        .iter()
+        .find_map(|expr| match &expr.kind {
+            AstExprKind::Call {
+                function: call_function,
+                args,
+            } if call_function == function => Some(args.as_slice()),
+            AstExprKind::Pipe { op, args, .. } if op == function => Some(args.as_slice()),
+            _ => None,
+        })?
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .and_then(|arg| ast_argument_value(field, arg.value))
+}
+
+fn ast_argument_value(field: &FieldDef, expr_id: usize) -> Option<String> {
+    ast_argument_value_in_exprs(&field.ast_exprs, expr_id)
+}
+
+fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    Some(match &expr.kind {
+        AstExprKind::Identifier(value) | AstExprKind::Enum(value) | AstExprKind::Number(value) => {
+            value.clone()
+        }
+        AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::Bool(true) => "True".to_owned(),
+        AstExprKind::Bool(false) => "False".to_owned(),
+        AstExprKind::TextLiteral(value) => value.clone(),
+        AstExprKind::Unknown(tokens) => tokens_to_path(tokens),
+        AstExprKind::Delimiter => String::new(),
+        AstExprKind::Source
+        | AstExprKind::Call { .. }
+        | AstExprKind::Pipe { .. }
+        | AstExprKind::Hold { .. }
+        | AstExprKind::Latest
+        | AstExprKind::When { .. }
+        | AstExprKind::Then { .. }
+        | AstExprKind::Infix { .. }
+        | AstExprKind::MatchArm { .. }
+        | AstExprKind::Record(_)
+        | AstExprKind::ListLiteral { .. } => ast_expr_label(expr),
+    })
+}
+
+fn ast_simple_update_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(value)
+        | AstExprKind::Enum(value)
+        | AstExprKind::Number(value)
+        | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Bool(true) => Some("True".to_owned()),
+        AstExprKind::Bool(false) => Some("False".to_owned()),
+        AstExprKind::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
+fn list_append_trigger(field: &FieldDef) -> Option<String> {
+    let AstExprKind::Pipe { args, .. } = &list_append_expr(field)?.kind else {
+        return None;
+    };
+    let item_arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("item"))?;
+    let value = field
+        .ast_exprs
+        .iter()
+        .find(|expr| expr.id == item_arg.value)?;
+    let trigger = match &value.kind {
+        AstExprKind::Then { input, .. } => ast_argument_value(field, *input)?,
+        _ => ast_argument_value(field, item_arg.value)?,
+    };
+    (!trigger.is_empty()).then(|| canonical_local_path(&trigger, &field.parent_path))
+}
+
+fn list_append_fields(field: &FieldDef) -> Vec<ListAppendField> {
+    let Some(append_expr) = list_append_expr(field) else {
+        return Vec::new();
+    };
+    field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.id > append_expr.id)
+        .find_map(|expr| match &expr.kind {
+            AstExprKind::Record(fields) => Some(
+                fields
+                    .iter()
+                    .filter_map(|record_field| {
+                        let source = ast_argument_value(field, record_field.value)?;
+                        (!record_field.name.is_empty() && !source.is_empty()).then(|| {
+                            ListAppendField {
+                                name: record_field.name.clone(),
+                                source: canonical_local_path(&source, &field.parent_path),
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn list_append_expr(field: &FieldDef) -> Option<&AstExpr> {
+    field.ast_exprs.iter().find(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Pipe { op, .. } if op == "List/append"
+        )
+    })
+}
+
+fn list_remove_predicate(
+    field: &FieldDef,
+    source: &str,
+    branch: &RoutedBranch,
+    row_scope: Option<&str>,
+) -> ListPredicate {
+    if let Some(predicate) = list_remove_predicate_from_then_output(field, source, row_scope) {
+        return predicate;
+    }
+    if branch.has_bool_expr(true) {
         return ListPredicate::AlwaysTrue;
     }
-    if branch.contains("todo.completed |> Bool/not") {
-        return ListPredicate::RowFieldBoolNot {
-            path: "todo.completed".to_owned(),
-        };
+    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope)
+        && branch.bool_not_path().as_deref() == Some(path.as_str())
+    {
+        return ListPredicate::RowFieldBoolNot { path };
     }
-    if branch.contains("todo.completed") {
-        return ListPredicate::RowFieldBool {
-            path: "todo.completed".to_owned(),
-        };
+    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope) {
+        return ListPredicate::RowFieldBool { path };
     }
     ListPredicate::Unknown {
-        summary: branch.to_owned(),
+        summary: branch.summary(),
     }
 }
 
-fn list_retain_predicate(body: &str) -> ListPredicate {
-    if body.contains("selected_filter |> WHEN") {
+fn list_remove_predicate_from_then_output(
+    field: &FieldDef,
+    source: &str,
+    row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    field.ast_exprs.iter().find_map(|expr| {
+        let AstExprKind::Then {
+            input,
+            output: Some(output),
+        } = expr.kind
+        else {
+            return None;
+        };
+        let input_path = ast_argument_value(field, input)?;
+        let matches_source = source_ref_variants(source).iter().any(|variant| {
+            input_path == *variant
+                || canonical_local_path(&input_path, &field.parent_path) == *variant
+        });
+        if !matches_source {
+            return None;
+        }
+        list_predicate_from_expr(field, output, row_scope)
+    })
+}
+
+fn list_predicate_from_expr(
+    field: &FieldDef,
+    expr_id: usize,
+    row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Bool(true) => Some(ListPredicate::AlwaysTrue),
+        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
+            row_field_path_from_expr(field, *input, row_scope)
+                .map(|path| ListPredicate::RowFieldBoolNot { path })
+        }
+        _ => row_field_path_from_expr(field, expr_id, row_scope)
+            .map(|path| ListPredicate::RowFieldBool { path }),
+    }
+}
+
+fn row_field_path_from_expr(
+    field: &FieldDef,
+    expr_id: usize,
+    row_scope: Option<&str>,
+) -> Option<String> {
+    let row_scope = row_scope?;
+    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
+    let AstExprKind::Path(parts) = &expr.kind else {
+        return None;
+    };
+    row_field_path_from_parts(parts, row_scope)
+}
+
+fn list_retain_predicate(field: &FieldDef, row_scope: Option<&str>) -> ListPredicate {
+    if let Some(selector) = selected_filter_selector(field)
+        && let Some(row_field) = row_field_path_in_exprs(&field.ast_exprs, row_scope)
+    {
         return ListPredicate::SelectedFilterVisibility {
-            selector: "store.selected_filter".to_owned(),
-            row_field: "todo.completed".to_owned(),
+            selector,
+            row_field,
         };
     }
-    if body.contains("todo.completed |> Bool/not") {
-        return ListPredicate::RowFieldBoolNot {
-            path: "todo.completed".to_owned(),
-        };
+    if let Some(predicate) = list_retain_predicate_from_ast_arg(field, row_scope) {
+        return predicate;
     }
-    if body.contains("if: todo.completed") {
-        return ListPredicate::RowFieldBool {
-            path: "todo.completed".to_owned(),
-        };
+    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope)
+        && bool_not_path_in_exprs(&field.ast_exprs).as_deref() == Some(path.as_str())
+    {
+        return ListPredicate::RowFieldBoolNot { path };
+    }
+    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope) {
+        return ListPredicate::RowFieldBool { path };
     }
     ListPredicate::Unknown {
-        summary: body.lines().next().unwrap_or_default().to_owned(),
+        summary: field
+            .ast_items
+            .first()
+            .map(item_summary)
+            .unwrap_or_default(),
     }
 }
 
-fn count_or_retain_source_list(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim)
-        .find(|line| {
-            !line.is_empty()
-                && line
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+fn list_retain_predicate_from_ast_arg(
+    field: &FieldDef,
+    row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let retain = field.ast_exprs.iter().find(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Pipe { op, .. } if op == "List/retain"
+        )
+    })?;
+    let AstExprKind::Pipe { args, .. } = &retain.kind else {
+        return None;
+    };
+    let predicate_arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("if"))
+        .or_else(|| args.get(1))?;
+    list_predicate_from_expr(field, predicate_arg.value, row_scope)
+}
+
+fn count_or_retain_source_list(field: &FieldDef) -> Option<String> {
+    let count_or_retain = field.ast_exprs.iter().find(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Pipe { op, .. } if op == "List/count" || op == "List/retain"
+        )
+    })?;
+    source_list_from_expr(field, count_or_retain.id)
+}
+
+fn source_list_from_expr(field: &FieldDef, expr_id: usize) -> Option<String> {
+    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
+        AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
+        AstExprKind::Pipe { input, .. } => source_list_from_expr(field, *input)
+            .or_else(|| previous_source_list_expr(field, *input)),
+        _ => None,
+    }
+}
+
+fn previous_source_list_expr(field: &FieldDef, before_id: usize) -> Option<String> {
+    field
+        .ast_exprs
+        .iter()
+        .filter(|candidate| candidate.id < before_id)
+        .rev()
+        .find_map(|candidate| match &candidate.kind {
+            AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
+            AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
+            AstExprKind::Pipe { .. } => source_list_from_expr(field, candidate.id),
+            _ => None,
         })
-        .map(str::to_owned)
+}
+
+fn row_scope_for_list<'a>(program: &'a ParsedProgram, list_name: &str) -> Option<&'a str> {
+    program
+        .row_scope_functions
+        .iter()
+        .find(|scope| scope.list == list_name)
+        .map(|scope| scope.row_scope.as_str())
+}
+
+fn row_field_path_in_exprs(exprs: &[AstExpr], row_scope: Option<&str>) -> Option<String> {
+    let row_scope = row_scope?;
+    exprs.iter().find_map(|expr| match &expr.kind {
+        AstExprKind::Path(parts) => row_field_path_from_parts(parts, row_scope),
+        _ => None,
+    })
+}
+
+fn selected_filter_selector(field: &FieldDef) -> Option<String> {
+    field.ast_exprs.iter().find_map(|expr| {
+        let AstExprKind::When { input } = expr.kind else {
+            return None;
+        };
+        let selector = ast_argument_value(field, input)?;
+        (!selector.is_empty()).then(|| canonical_local_path(&selector, &field.parent_path))
+    })
+}
+
+fn row_field_path_from_parts(parts: &[String], row_scope: &str) -> Option<String> {
+    parts.windows(2).find_map(|window| {
+        (window[0] == row_scope && is_name(&window[1]))
+            .then(|| format!("{row_scope}.{}", window[1]))
+    })
+}
+
+fn split_top_level(tokens: &[String], separator: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0i32;
+    for token in tokens {
+        match token.as_str() {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            _ => {}
+        }
+        if token == separator && depth == 0 {
+            groups.push(std::mem::take(&mut current));
+        } else {
+            current.push(token.clone());
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn tokens_to_path(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .filter(|token| !matches!(token.as_str(), "{" | "}" | "[" | "]"))
+        .fold(String::new(), |mut output, token| {
+            if token == "." || output.ends_with('.') || output.is_empty() {
+                output.push_str(token);
+            } else if matches!(token.as_str(), ":" | "(" | ")") {
+                output.push_str(token);
+            } else if output.ends_with('(') || output.ends_with(':') {
+                output.push_str(token);
+            } else {
+                output.push(' ');
+                output.push_str(token);
+            }
+            output
+        })
+        .trim()
+        .to_owned()
+}
+
+fn dotted_path_parts(path: &str) -> Vec<&str> {
+    path.split('.').filter(|part| !part.is_empty()).collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathMatch {
+    Exact,
+    Prefix,
+}
+
+fn path_parts_match(candidate: &[String], expected: &[&str], path_match: PathMatch) -> bool {
+    (match path_match {
+        PathMatch::Exact => candidate.len() == expected.len(),
+        PathMatch::Prefix => candidate.len() >= expected.len(),
+    }) && candidate
+        .iter()
+        .take(expected.len())
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+}
+
+fn item_summary(item: &AstItem) -> String {
+    tokens_to_path(&item.symbols)
+}
+
+fn is_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn item_has_symbol(item: &AstItem, symbol: &str) -> bool {
+    item.symbols.iter().any(|candidate| candidate == symbol)
+}
+
+fn symbol_is_list_operator(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "List/map" | "List/append" | "List/remove" | "List/retain" | "List/count"
+    )
 }
 
 fn canonical_local_path(path: &str, parent_path: &str) -> String {
@@ -1423,34 +2471,42 @@ fn canonical_local_path(path: &str, parent_path: &str) -> String {
     }
 }
 
-fn update_expression_for_source(target: &str, body: &str, source: &str) -> UpdateExpression {
+fn update_expression_for_source(
+    program: &ParsedProgram,
+    target: &str,
+    field: &FieldDef,
+    source: &str,
+) -> UpdateExpression {
     let variants = source_ref_variants(source);
-    let branch = variants
-        .iter()
-        .find_map(|variant| branch_text_for_source(body, variant))
-        .unwrap_or_default();
-    if branch.contains("=> False") && !branch.contains("=> True") {
+    let branch = field.source_branch(source).unwrap_or_default();
+    if branch.has_token("=>") && branch.has_token("False") && !branch.has_token("True") {
         return UpdateExpression::Const {
             value: "False".to_owned(),
         };
     }
-    if let Some((_, value)) = branch.split_once("Escape =>") {
-        let value = value
-            .split(|ch: char| ch.is_whitespace() || ch == '}')
-            .find(|part| !part.is_empty())
-            .unwrap_or_default();
+    if let Some(value) = branch_value_after_match(&branch, "Escape") {
         if value_starts_lowercase_identifier(value) {
             return UpdateExpression::PreviousValue {
                 path: value.to_owned(),
             };
         }
     }
-    if let Some(expression) = text_trim_or_previous_expression(target, &branch) {
+    if let Some(path) = branch.bool_not_path() {
+        return UpdateExpression::BoolNot { path };
+    }
+    if let Some(expression) = text_trim_or_previous_update(program, target, &branch) {
         return expression;
+    }
+    if let Some(value) = branch.then_simple_value() {
+        return if value_starts_lowercase_identifier(&value) {
+            UpdateExpression::PreviousValue { path: value }
+        } else {
+            UpdateExpression::Const { value }
+        };
     }
     if variants
         .iter()
-        .any(|variant| body.contains(&format!("{variant}.text")))
+        .any(|variant| field.references_payload_path(variant, "text"))
     {
         return UpdateExpression::SourcePayload {
             path: "text".to_owned(),
@@ -1458,88 +2514,71 @@ fn update_expression_for_source(target: &str, body: &str, source: &str) -> Updat
     }
     if variants
         .iter()
-        .any(|variant| body.contains(&format!("{variant}.key")))
+        .any(|variant| field.references_payload_path(variant, "key"))
     {
         return UpdateExpression::SourcePayload {
             path: "key".to_owned(),
         };
     }
-    if let Some(value) = then_simple_value(&branch) {
-        return if value_starts_lowercase_identifier(&value) {
-            UpdateExpression::PreviousValue { path: value }
-        } else {
-            UpdateExpression::Const { value }
-        };
-    }
-    if let Some(path) = bool_not_path(&branch) {
-        return UpdateExpression::BoolNot { path };
-    }
     if !branch.is_empty() {
-        return UpdateExpression::Unknown { summary: branch };
+        return UpdateExpression::Unknown {
+            summary: branch.summary(),
+        };
     }
     UpdateExpression::Unknown {
         summary: "source reaches target through derived local field".to_owned(),
     }
 }
 
-fn text_trim_or_previous_expression(target: &str, branch: &str) -> Option<UpdateExpression> {
-    if !target.starts_with("todo.") || !branch.contains("|> Text/trim") {
+fn text_trim_or_previous_update(
+    program: &ParsedProgram,
+    target: &str,
+    branch: &RoutedBranch,
+) -> Option<UpdateExpression> {
+    if !path_has_parsed_row_scope(program, target) || !branch.has_operator("Text/trim") {
         return None;
     }
-    let (_, after_empty) = branch.split_once("TEXT {} =>")?;
-    let mut previous = after_empty
-        .split_whitespace()
-        .next()
-        .map(|value| value.trim_matches(|ch| ch == '}' || ch == ','))
-        .filter(|value| !value.is_empty())?;
-    let (before_trim, _) = branch.split_once("|> Text/trim")?;
-    let mut path = before_trim
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .filter(|part| !part.is_empty())
-        .next_back()?;
-    if !value_starts_lowercase_identifier(path) || !value_starts_lowercase_identifier(previous) {
+    let mut previous = branch_value_after_match(branch, "TEXT")?;
+    let mut path = branch.text_trim_input_path()?;
+    if !value_starts_lowercase_identifier(&path) || !value_starts_lowercase_identifier(previous) {
         return None;
     }
     let target_field = target.rsplit_once('.').map(|(_, field)| field)?;
-    if previous != target_field && !branch.contains(&format!("{previous}:")) {
+    if previous != target_field
+        && !branch
+            .items
+            .iter()
+            .any(|item| item.field.as_deref() == Some(previous))
+    {
         previous = target_field;
     }
-    if path != "text" && !branch.contains(&format!("{path}:")) && branch.contains(".text") {
-        path = "text";
+    if path.as_str() != "text"
+        && !branch
+            .items
+            .iter()
+            .any(|item| item.field.as_deref() == Some(path.as_str()))
+        && branch.references_path_tail("text")
+    {
+        path = "text".to_owned();
     }
     Some(UpdateExpression::TextTrimOrPrevious {
-        path: path.to_owned(),
+        path,
         previous: previous.to_owned(),
     })
 }
 
-fn branch_text_for_source(body: &str, source_variant: &str) -> Option<String> {
-    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
-    let start = lines
-        .iter()
-        .position(|line| line.contains(source_variant))?;
-    let mut text = String::new();
-    for line in lines.iter().skip(start).take(6) {
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(line);
-        if line.contains('}') && text.matches('{').count() <= text.matches('}').count() {
-            break;
-        }
-    }
-    Some(text)
-}
-
-fn then_simple_value(line: &str) -> Option<String> {
-    let (_, rest) = line.split_once("|> THEN")?;
-    let (_, body) = rest.split_once('{')?;
-    let value = body.split_once('}').map(|(value, _)| value).unwrap_or(body);
-    let value = value.trim();
-    if value.is_empty() || value.contains('|') || value.contains('(') {
-        return None;
-    }
-    Some(value.to_owned())
+fn branch_value_after_match<'a>(branch: &'a RoutedBranch, label: &str) -> Option<&'a str> {
+    branch.items.iter().find_map(|item| {
+        let label_index = item.symbols.iter().position(|lexeme| lexeme == label)?;
+        let arrow_index = item.symbols[label_index..]
+            .iter()
+            .position(|lexeme| lexeme == "=>")
+            .map(|offset| label_index + offset)?;
+        item.symbols[arrow_index + 1..]
+            .iter()
+            .find(|lexeme| is_name(lexeme))
+            .map(String::as_str)
+    })
 }
 
 fn value_starts_lowercase_identifier(value: &str) -> bool {
@@ -1556,27 +2595,37 @@ fn value_starts_uppercase_identifier(value: &str) -> bool {
         .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
-fn path_has_indexed_scope(path: &str) -> bool {
-    path.split('.')
-        .any(|segment| matches!(segment, "todo" | "cell" | "seed"))
+fn path_has_parsed_row_scope(program: &ParsedProgram, path: &str) -> bool {
+    path.split('.').any(|segment| {
+        program
+            .row_scope_functions
+            .iter()
+            .any(|scope| scope.row_scope == segment)
+    })
 }
 
-fn bool_not_path(line: &str) -> Option<String> {
-    let (path, _) = line.split_once("|> Bool/not")?;
-    let path = path
-        .split('{')
-        .next_back()
-        .unwrap_or(path)
-        .trim()
-        .trim_start_matches("THEN")
-        .trim()
-        .trim_start_matches('{')
-        .trim();
-    (!path.is_empty()).then(|| path.to_owned())
+fn bool_not_path_in_exprs(exprs: &[AstExpr]) -> Option<String> {
+    exprs
+        .iter()
+        .find_map(|expr| bool_not_path_from_expr(exprs, expr.id))
+}
+
+fn bool_not_path_from_expr(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
+            ast_argument_value_in_exprs(exprs, *input)
+        }
+        AstExprKind::Then {
+            output: Some(output),
+            ..
+        } => bool_not_path_from_expr(exprs, *output),
+        _ => None,
+    }
 }
 
 fn candidate_sources(program: &ParsedProgram, target: &str) -> Vec<String> {
-    let fields = collect_field_defs(program);
+    let fields = typed_field_defs(program);
     let mut visited = Vec::new();
     candidate_sources_for_path(target, &fields, program, &mut visited)
 }
@@ -1586,27 +2635,236 @@ struct FieldDef {
     path: String,
     local_name: String,
     parent_path: String,
-    body: String,
+    ast_items: Vec<AstItem>,
+    ast_exprs: Vec<AstExpr>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RoutedBranch {
+    items: Vec<AstItem>,
+    ast_exprs: Vec<AstExpr>,
+}
+
+impl RoutedBranch {
+    fn ast_exprs(&self) -> &[AstExpr] {
+        &self.ast_exprs
+    }
+
+    fn summary(&self) -> String {
+        self.items
+            .iter()
+            .map(item_summary)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn has_token(&self, token: &str) -> bool {
+        self.items.iter().any(|item| item_has_symbol(item, token))
+    }
+
+    fn has_operator(&self, operator: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Pipe { op, .. } => op == operator,
+            AstExprKind::Call { function, .. } => function == operator,
+            _ => false,
+        })
+    }
+
+    fn has_bool_expr(&self, value: bool) -> bool {
+        self.ast_exprs.iter().any(|expr| {
+            matches!(
+                expr.kind,
+                AstExprKind::Bool(candidate) if candidate == value
+            )
+        })
+    }
+
+    fn references_path_tail(&self, path_tail: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Path(parts) => parts.last().map(String::as_str) == Some(path_tail),
+            _ => false,
+        })
+    }
+
+    fn then_simple_value(&self) -> Option<String> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then { output, .. } = expr.kind else {
+                return None;
+            };
+            if let Some(output) = output {
+                return ast_simple_update_value_in_exprs(&self.ast_exprs, output);
+            }
+            self.ast_exprs
+                .iter()
+                .filter(|candidate| candidate.line > expr.line)
+                .find_map(|candidate| {
+                    ast_simple_update_value_in_exprs(&self.ast_exprs, candidate.id)
+                })
+        })
+    }
+
+    fn text_trim_input_path(&self) -> Option<String> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
+                return None;
+            };
+            (op == "Text/trim").then(|| ast_argument_value_in_exprs(&self.ast_exprs, *input))?
+        })
+    }
+
+    fn bool_not_path(&self) -> Option<String> {
+        bool_not_path_in_exprs(&self.ast_exprs)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 impl FieldDef {
     fn has_token(&self, token: &str) -> bool {
-        text_has_token(&self.body, token)
+        self.ast_items
+            .iter()
+            .any(|item| item_has_symbol(item, token))
+    }
+
+    fn has_operator(&self, operator: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Pipe { op, .. } => op == operator,
+            AstExprKind::Call { function, .. } => function == operator,
+            _ => false,
+        })
+    }
+
+    fn has_any_operator(&self, operators: &[&str]) -> bool {
+        operators.iter().any(|operator| self.has_operator(operator))
+    }
+
+    fn has_when_or_then_expr(&self) -> bool {
+        self.ast_exprs.iter().any(|expr| {
+            matches!(
+                expr.kind,
+                AstExprKind::When { .. } | AstExprKind::Then { .. }
+            )
+        })
     }
 
     fn mentions_identifier(&self, identifier: &str) -> bool {
-        text_mentions_identifier(&self.body, identifier)
+        self.ast_items
+            .iter()
+            .any(|item| item.symbols.iter().any(|lexeme| lexeme == identifier))
     }
 
-    fn has_then_from_local(&self, local_name: &str) -> bool {
-        self.body
-            .lines()
-            .map(str::trim)
-            .any(|line| line.starts_with(local_name) && line.contains("|> THEN"))
+    fn mentions_identifier_expr(&self, identifier: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Identifier(value) => value == identifier,
+            AstExprKind::Path(parts) => parts.iter().any(|part| part == identifier),
+            _ => false,
+        })
+    }
+
+    fn has_then_from_local_with_empty_output(&self, local_name: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| {
+            let AstExprKind::Then {
+                input,
+                output: Some(output),
+            } = expr.kind
+            else {
+                return false;
+            };
+            ast_argument_value(self, input).as_deref() == Some(local_name)
+                && self
+                    .ast_exprs
+                    .iter()
+                    .find(|candidate| candidate.id == output)
+                    .is_some_and(|output| {
+                        ast_initial_value(output)
+                            == InitialValue::Text {
+                                value: String::new(),
+                            }
+                    })
+        })
     }
 
     fn references_source_variant(&self, source_variant: &str) -> bool {
-        self.body.contains(source_variant)
+        self.references_path_expr(source_variant, PathMatch::Prefix)
+    }
+
+    fn references_payload_path(&self, source_variant: &str, payload_field: &str) -> bool {
+        let payload_path = format!("{source_variant}.{payload_field}");
+        self.references_path_expr(&payload_path, PathMatch::Exact)
+    }
+
+    fn match_arm_destructures_payload(&self, payload_field: &str) -> bool {
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::MatchArm { pattern, .. } => {
+                pattern.iter().any(|part| part == payload_field)
+            }
+            _ => false,
+        })
+    }
+
+    fn references_path_expr(&self, path: &str, path_match: PathMatch) -> bool {
+        let path_parts = dotted_path_parts(path);
+        self.ast_exprs.iter().any(|expr| match &expr.kind {
+            AstExprKind::Path(parts) => path_parts_match(parts, &path_parts, path_match),
+            _ => false,
+        })
+    }
+
+    fn source_branch(&self, source: &str) -> Option<RoutedBranch> {
+        source_ref_variants(source)
+            .iter()
+            .find_map(|variant| self.source_branch_variant(variant))
+    }
+
+    fn source_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
+        let source_parts = dotted_path_parts(source_variant);
+        let start_line = self.ast_exprs.iter().find_map(|expr| match &expr.kind {
+            AstExprKind::Path(parts)
+                if path_parts_match(parts, &source_parts, PathMatch::Prefix) =>
+            {
+                Some(expr.line)
+            }
+            _ => None,
+        })?;
+        let start = self
+            .ast_items
+            .iter()
+            .position(|item| item.line == start_line)?;
+        let start_indent = self.ast_items[start].indent;
+        let mut depth = 0i32;
+        let mut items = Vec::new();
+        for (offset, item) in self.ast_items.iter().skip(start).take(6).enumerate() {
+            if offset > 0 && item.indent <= start_indent {
+                break;
+            }
+            items.push(item.clone());
+            let scope_delta = item
+                .symbols
+                .iter()
+                .map(|lexeme| match lexeme.as_str() {
+                    "{" => 1,
+                    "}" => -1,
+                    _ => 0,
+                })
+                .sum::<i32>();
+            depth += scope_delta;
+            if offset == 0 && depth == 0 && scope_delta == 0 {
+                break;
+            }
+            if depth <= 0 && item_has_symbol(item, "}") {
+                break;
+            }
+        }
+        let lines = items.iter().map(|item| item.line).collect::<Vec<_>>();
+        let ast_exprs = self
+            .ast_exprs
+            .iter()
+            .filter(|expr| lines.iter().any(|line| *line == expr.line))
+            .cloned()
+            .collect();
+        Some(RoutedBranch { items, ast_exprs })
     }
 }
 
@@ -1628,6 +2886,7 @@ fn candidate_sources_for_path(
     for dependency in fields.iter().filter(|candidate| {
         candidate.parent_path == field.parent_path
             && candidate.path != field.path
+            && candidate.local_name != field.local_name
             && field.mentions_identifier(&candidate.local_name)
     }) {
         for source in candidate_sources_for_path(&dependency.path, fields, program, visited) {
@@ -1659,134 +2918,229 @@ fn source_ref_variants(path: &str) -> Vec<String> {
     variants
 }
 
-fn collect_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
-    let lines = program.source.lines().collect::<Vec<_>>();
-    let mut scope: Vec<(usize, String)> = Vec::new();
+fn typed_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
     let mut fields = Vec::new();
-    for (line_index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indent = line.chars().take_while(|ch| *ch == ' ').count();
-        while scope
-            .last()
-            .is_some_and(|(scope_indent, _)| *scope_indent >= indent)
-        {
-            scope.pop();
-        }
-        if trimmed.starts_with("EXAMPLE ") || matches!(trimmed, "[" | "]" | "{" | "}") {
-            continue;
-        }
-        if trimmed.starts_with("FUNCTION ") {
-            if let Some(row_scope) = function_row_scope(trimmed, program) {
-                scope.push((indent, row_scope.to_owned()));
-            }
-            continue;
-        }
-        if let Some(local_name) = leading_field_name(trimmed) {
-            if should_record_field(trimmed, local_name, &scope) {
-                let parent_path = scope_path(&scope).unwrap_or_default();
-                let path = if parent_path.is_empty() {
-                    local_name.to_owned()
-                } else {
-                    format!("{parent_path}.{local_name}")
-                };
-                fields.push(FieldDef {
-                    path,
-                    local_name: local_name.to_owned(),
-                    parent_path,
-                    body: field_body(&lines, line_index, indent),
-                });
-            }
-            if opens_scope(trimmed) {
-                scope.push((indent, local_name.to_owned()));
-            }
-        }
-    }
+    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
+    gather_field_defs_from_statements(
+        &program.ast.statements,
+        &mut Vec::new(),
+        program,
+        &items,
+        &mut fields,
+    );
     fields
 }
 
-fn should_record_field(trimmed: &str, local_name: &str, scope: &[(usize, String)]) -> bool {
-    !line_has_token(trimmed, "SOURCE")
-        && local_name != "sources"
-        && !scope.iter().any(|(_, name)| name == "sources")
-        && scope
-            .iter()
-            .any(|(_, name)| matches!(name.as_str(), "store" | "todo" | "cell"))
+fn gather_field_defs_from_statements(
+    statements: &[AstStatement],
+    scope: &mut Vec<String>,
+    program: &ParsedProgram,
+    items: &[&AstItem],
+    fields: &mut Vec<FieldDef>,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { name, .. } => {
+                if let Some(row_scope) = function_row_scope(name, program) {
+                    scope.push(row_scope.to_owned());
+                    gather_field_defs_from_statements(
+                        &statement.children,
+                        scope,
+                        program,
+                        items,
+                        fields,
+                    );
+                    scope.pop();
+                }
+            }
+            AstStatementKind::Field { name } => {
+                if should_record_field_statement(name, scope, program) {
+                    let parent_path = scope.join(".");
+                    let path = if parent_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{parent_path}.{name}")
+                    };
+                    fields.push(FieldDef {
+                        path,
+                        local_name: name.clone(),
+                        parent_path,
+                        ast_items: collect_statement_ast_items(statement, items),
+                        ast_exprs: collect_statement_ast_exprs(statement, program),
+                    });
+                }
+                if !statement.children.is_empty() {
+                    scope.push(name.clone());
+                    gather_field_defs_from_statements(
+                        &statement.children,
+                        scope,
+                        program,
+                        items,
+                        fields,
+                    );
+                    scope.pop();
+                }
+            }
+            AstStatementKind::Example { .. }
+            | AstStatementKind::View
+            | AstStatementKind::Block
+            | AstStatementKind::Expression
+            | AstStatementKind::Hold { .. }
+            | AstStatementKind::List { .. }
+            | AstStatementKind::Source { .. } => {
+                gather_field_defs_from_statements(
+                    &statement.children,
+                    scope,
+                    program,
+                    items,
+                    fields,
+                );
+            }
+        }
+    }
 }
 
-fn field_body(lines: &[&str], start: usize, indent: usize) -> String {
-    let mut body = String::new();
-    for line in &lines[start..] {
-        let trimmed = line.trim();
-        let current_indent = line.chars().take_while(|ch| *ch == ' ').count();
+fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
+    let mut expr_ids = Vec::new();
+    collect_statement_expr_ids(statement, program, &mut Vec::new(), &mut expr_ids);
+    expr_ids
+        .into_iter()
+        .filter_map(|id| program.ast.expressions.get(id).cloned())
+        .collect()
+}
+
+fn collect_statement_expr_ids(
+    statement: &AstStatement,
+    program: &ParsedProgram,
+    seen: &mut Vec<usize>,
+    exprs: &mut Vec<usize>,
+) {
+    if let Some(expr) = statement.expr {
+        collect_expr_tree(expr, program, seen, exprs);
+    }
+    for child in &statement.children {
+        collect_statement_expr_ids(child, program, seen, exprs);
+    }
+}
+
+fn collect_expr_tree(
+    id: usize,
+    program: &ParsedProgram,
+    seen: &mut Vec<usize>,
+    exprs: &mut Vec<usize>,
+) {
+    if seen.contains(&id) {
+        return;
+    }
+    seen.push(id);
+    exprs.push(id);
+    let Some(expr) = program.ast.expressions.get(id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_expr_tree(arg.value, program, seen, exprs);
+            }
+        }
+        AstExprKind::Pipe { input, args, .. } => {
+            collect_expr_tree(*input, program, seen, exprs);
+            for arg in args {
+                collect_expr_tree(arg.value, program, seen, exprs);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_expr_tree(*initial, program, seen, exprs);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_expr_tree(*input, program, seen, exprs);
+            if let Some(output) = output {
+                collect_expr_tree(*output, program, seen, exprs);
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            collect_expr_tree(*left, program, seen, exprs);
+            collect_expr_tree(*right, program, seen, exprs);
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_expr_tree(*output, program, seen, exprs);
+            }
+        }
+        AstExprKind::Record(fields) => {
+            for field in fields {
+                collect_expr_tree(field.value, program, seen, exprs);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::ListLiteral { .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+}
+
+fn should_record_field_statement(
+    local_name: &str,
+    scope: &[String],
+    program: &ParsedProgram,
+) -> bool {
+    local_name != "sources"
+        && !scope.iter().any(|name| name == "sources")
+        && scope.iter().any(|name| {
+            name == "store"
+                || program
+                    .row_scope_functions
+                    .iter()
+                    .any(|scope| scope.row_scope == *name)
+        })
+}
+
+fn collect_statement_ast_items(statement: &AstStatement, items: &[&AstItem]) -> Vec<AstItem> {
+    let mut lines = Vec::new();
+    collect_statement_lines(statement, &mut lines);
+    items
+        .iter()
+        .filter(|item| lines.iter().any(|line| line == &item.line))
+        .map(|item| (*item).clone())
+        .collect()
+}
+
+fn collect_statement_lines(statement: &AstStatement, lines: &mut Vec<usize>) {
+    lines.push(statement.line);
+    for child in &statement.children {
+        collect_statement_lines(child, lines);
+    }
+}
+
+fn collect_field_ast_items(items: &[&AstItem], start: usize, indent: usize) -> Vec<AstItem> {
+    let mut body = Vec::new();
+    for item in &items[start..] {
+        let current_indent = item.indent;
         if current_indent <= indent
             && !body.is_empty()
-            && leading_field_name(trimmed).is_some()
-            && !trimmed.contains("=>")
+            && item.field.is_some()
+            && !item_has_symbol(item, "=>")
         {
             break;
         }
-        body.push_str(trimmed);
-        body.push('\n');
+        body.push((*item).clone());
     }
     body
 }
 
-fn function_row_scope<'a>(trimmed: &str, program: &'a ParsedProgram) -> Option<&'a str> {
-    let name = trimmed.strip_prefix("FUNCTION ")?.split('(').next()?.trim();
+fn function_row_scope<'a>(name: &str, program: &'a ParsedProgram) -> Option<&'a str> {
     program
         .row_scope_functions
         .iter()
         .find(|scope| scope.function == name)
         .map(|scope| scope.row_scope.as_str())
-}
-
-fn leading_field_name(trimmed: &str) -> Option<&str> {
-    let (name, _) = trimmed.split_once(':')?;
-    let name = name.trim();
-    (!name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(name)
-}
-
-fn opens_scope(trimmed: &str) -> bool {
-    if line_has_token(trimmed, "SOURCE") {
-        return false;
-    }
-    trimmed.ends_with(':')
-        || trimmed.ends_with('[')
-        || trimmed.ends_with('{')
-        || trimmed
-            .split_once(':')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('[') && !rest.contains(']'))
-}
-
-fn scope_path(scope: &[(usize, String)]) -> Option<String> {
-    (!scope.is_empty()).then(|| {
-        scope
-            .iter()
-            .map(|(_, name)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(".")
-    })
-}
-
-fn text_mentions_identifier(text: &str, identifier: &str) -> bool {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .any(|part| part == identifier)
-}
-
-fn line_has_token(line: &str, token: &str) -> bool {
-    text_has_token(line, token)
-}
-
-fn text_has_token(text: &str, token: &str) -> bool {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '/' | '-')))
-        .any(|part| part == token)
 }
 
 fn push_unique(output: &mut Vec<String>, value: String) {
@@ -1925,6 +3279,58 @@ mod tests {
                 .iter()
                 .any(|cell| cell.path == "todo.completed" && cell.indexed)
         );
+        let todo_scope = ir
+            .row_scopes
+            .iter()
+            .find(|scope| scope.list == "todos" && scope.row_scope == "todo")
+            .expect("TodoMVC row scope must lower into typed IR");
+        assert!(
+            ir.lists
+                .iter()
+                .any(|list| list.name == "todos" && list.row_scope_id == Some(todo_scope.id))
+        );
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "todo.sources.todo_checkbox.click"
+                && source.scoped
+                && source.scope_id == Some(todo_scope.id)
+        }));
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "store.sources.new_todo_input.key_down"
+                && source.payload_schema.fields
+                    == vec![SourcePayloadField::Key, SourcePayloadField::Text]
+        }));
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "store.sources.new_todo_input.change"
+                && source.payload_schema.fields == vec![SourcePayloadField::Text]
+        }));
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "todo.sources.todo_checkbox.click"
+                && source.payload_schema.fields.is_empty()
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Input"
+                && binding.attr == "change"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.sources.new_todo_input.change"
+                && binding.source_id.is_some()
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Checkbox"
+                && binding.attr == "checked"
+                && binding.kind == ViewBindingKind::Data
+                && binding.path == "todo.completed"
+                && binding.scope_id == Some(todo_scope.id)
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Button"
+                && binding.attr == "target"
+                && binding.kind == ViewBindingKind::Target
+                && binding.path == "todo.title"
+                && binding.scope_id == Some(todo_scope.id)
+        }));
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "todo.completed" && cell.indexed && cell.scope_id == Some(todo_scope.id)
+        }));
         assert!(ir.state_cells.iter().any(|cell| {
             cell.path == "todo.title"
                 && cell.initial_value
@@ -2066,6 +3472,232 @@ mod tests {
     }
 
     #[test]
+    fn state_initial_values_are_lowered_from_ast_exprs() {
+        let source = r#"
+EXAMPLE TodoMVC
+# True False TEXT { comment } seed.title must not become an initializer
+store: [
+    sources: [
+        click: SOURCE
+    ]
+    empty_text:
+        Text/empty |> HOLD empty_text { LATEST {} }
+    flag:
+        False |> HOLD flag { LATEST {} }
+    filter:
+        All |> HOLD filter { LATEST {} }
+    todos:
+        LIST { [title: TEXT { Seeded }, completed: False] }
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    [
+        title:
+            seed.title |> HOLD title { LATEST {} }
+        completed:
+            False |> HOLD completed { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("ast-initial-values.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "store.empty_text"
+                && cell.initial_value
+                    == InitialValue::Text {
+                        value: String::new(),
+                    }
+        }));
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "store.flag" && cell.initial_value == InitialValue::Bool { value: false }
+        }));
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "store.filter"
+                && cell.initial_value
+                    == InitialValue::Enum {
+                        value: "All".to_owned(),
+                    }
+        }));
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "todo.title"
+                && cell.initial_value
+                    == InitialValue::SeedField {
+                        path: "title".to_owned(),
+                    }
+        }));
+    }
+
+    #[test]
+    fn derived_value_kind_uses_ast_operators_not_text_tokens() {
+        let source = r#"
+EXAMPLE TodoMVC
+store: [
+    sources: [
+        click: SOURCE
+    ]
+    note:
+        TEXT { Formula/eval List/count List/retain WHEN THEN }
+    todos:
+        LIST {}
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    [
+        title:
+            Text/empty |> HOLD title { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("ast-derived-kind.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            ir.derived_values.iter().any(|value| {
+                value.path == "store.note" && value.kind == DerivedValueKind::Pure
+            })
+        );
+    }
+
+    #[test]
+    fn direct_source_refs_use_ast_paths_not_text_literals() {
+        let source = r#"
+EXAMPLE TodoMVC
+store: [
+    sources: [
+        real_button: [press: SOURCE]
+        fake_button: [press: SOURCE]
+    ]
+    note:
+        TEXT { sources.fake_button.press }
+    changed:
+        sources.real_button.press |> THEN { True }
+    todos:
+        LIST {}
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    [
+        title:
+            Text/empty |> HOLD title { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("ast-source-refs.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let note = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.note")
+            .expect("note derived value");
+        assert!(note.sources.is_empty());
+        let changed = ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.changed")
+            .expect("changed derived value");
+        assert_eq!(
+            changed.sources,
+            vec!["store.sources.real_button.press".to_owned()]
+        );
+    }
+
+    #[test]
+    fn list_append_lowering_uses_ast_then_record() {
+        let source = r#"
+EXAMPLE TodoMVC
+store: [
+    sources: [
+        input: [
+            key_down: SOURCE
+        ]
+    ]
+    misleading_text:
+        TEXT { List/append item: title_to_add |> THEN { [title: wrong] } }
+    pending_title:
+        sources.input.key_down |> THEN { typed_title }
+    todos:
+        LIST {}
+        |> List/append(item: pending_title |> THEN {
+            [title: pending_title]
+        })
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    [
+        title:
+            seed.title |> HOLD title { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("ast-list-append.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Append {
+                        trigger: "store.pending_title".to_owned(),
+                        fields: vec![ListAppendField {
+                            name: "title".to_owned(),
+                            source: "store.pending_title".to_owned(),
+                        }],
+                    }
+        }));
+    }
+
+    #[test]
+    fn list_remove_predicates_use_ast_then_outputs() {
+        let source = r#"
+EXAMPLE TodoMVC
+store: [
+    sources: [
+        clear_done: [press: SOURCE]
+    ]
+    misleading_text:
+        TEXT { todo.sources.delete_button.press |> THEN { True } sources.clear_done.press |> THEN { todo.completed } }
+    todos:
+        LIST { [title: TEXT { A }, completed: False] }
+        |> List/remove(todo, when:
+            LATEST {
+                todo.sources.delete_button.press |> THEN { True }
+                sources.clear_done.press |> THEN { todo.completed }
+            }
+        )
+        |> List/map(seed, new: new_todo(seed: seed))
+]
+FUNCTION new_todo(seed) {
+    sources: [
+        delete_button: [press: SOURCE]
+    ]
+    [
+        title:
+            seed.title |> HOLD title { LATEST {} }
+        completed:
+            seed.completed |> HOLD completed { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("ast-list-remove.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Remove {
+                        source: "todo.sources.delete_button.press".to_owned(),
+                        predicate: ListPredicate::AlwaysTrue,
+                    }
+        }));
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Remove {
+                        source: "store.sources.clear_done.press".to_owned(),
+                        predicate: ListPredicate::RowFieldBool {
+                            path: "todo.completed".to_owned(),
+                        },
+                    }
+        }));
+    }
+
+    #[test]
     fn cells_lowering_has_dependency_index() {
         let parsed = boon_parser::parse_source(
             "examples/cells.bn",
@@ -2081,6 +3713,29 @@ mod tests {
                 rows: 100,
             }
         );
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "cell.sources.editor.commit"
+                && source.payload_schema.fields
+                    == vec![SourcePayloadField::Address, SourcePayloadField::Text]
+        }));
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "cell.sources.editor.cancel"
+                && source.payload_schema.fields == vec![SourcePayloadField::Address]
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Input"
+                && binding.attr == "submit"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "cell.sources.editor.commit"
+                && binding.source_id.is_some()
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Input"
+                && binding.attr == "key"
+                && binding.kind == ViewBindingKind::Data
+                && binding.path == "cell.address"
+                && binding.scope_id.is_some()
+        }));
         assert!(ir.nodes.iter().any(|node| node.name == "dependency_index"));
         assert!(ir.nodes.iter().any(|node| {
             matches!(node.kind, IrNodeKind::RenderLowering) && node.name == "render_cells_template"
@@ -2153,7 +3808,7 @@ mod tests {
             ir.nodes
                 .iter()
                 .filter(|node| node.expr_id.is_some())
-                .all(|node| node.expr_id.unwrap() < parsed.expressions.len())
+                .all(|node| node.expr_id.unwrap().as_usize() < parsed.expressions.len())
         );
         verify_hidden_identity(&ir).unwrap();
     }
@@ -2225,7 +3880,7 @@ mod tests {
         verify_static_schedule(&ir).unwrap();
 
         let mut bad_node_order = ir.clone();
-        bad_node_order.nodes[0].id = 99;
+        bad_node_order.nodes[0].id = NodeId(99);
         assert!(
             verify_static_schedule(&bad_node_order)
                 .unwrap_err()
@@ -2233,7 +3888,7 @@ mod tests {
         );
 
         let mut bad_expr_id = ir.clone();
-        bad_expr_id.nodes[0].expr_id = Some(ir.expression_count);
+        bad_expr_id.nodes[0].expr_id = Some(ExprId(ir.expression_count));
         assert!(
             verify_static_schedule(&bad_expr_id)
                 .unwrap_err()
@@ -2254,6 +3909,14 @@ mod tests {
             verify_static_schedule(&bad_list_target)
                 .unwrap_err()
                 .contains("unknown list")
+        );
+
+        let mut bad_scope_ref = ir.clone();
+        bad_scope_ref.sources[0].scope_id = Some(ScopeId(ir.row_scopes.len()));
+        assert!(
+            verify_static_schedule(&bad_scope_ref)
+                .unwrap_err()
+                .contains("missing ScopeId")
         );
     }
 
@@ -2334,12 +3997,9 @@ mod tests {
             );
         let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
-        assert!(
-            parsed
-                .row_scope_functions
-                .iter()
-                .any(|scope| { scope.function == "make_item" && scope.row_scope == "todo" })
-        );
+        assert!(parsed.row_scope_functions.iter().any(|scope| {
+            scope.function == "make_item" && scope.list == "todos" && scope.row_scope == "todo"
+        }));
         assert!(
             ir.state_cells
                 .iter()
@@ -2350,6 +4010,95 @@ mod tests {
                 && entry
                     .sources
                     .contains(&"todo.sources.todo_checkbox.click".to_owned())
+        }));
+    }
+
+    #[test]
+    fn indexed_lowering_uses_parsed_row_scopes_not_fixed_names() {
+        let source = r#"
+EXAMPLE TodoMVC
+	store:
+	    selected:
+	        "All" |> HOLD selected { LATEST {} }
+	    entries:
+	        LIST[4] {}
+	        |> List/map(entry, new: make_entry(seed: entry))
+	    visible_entries:
+	        entries
+	        |> List/retain(entry, if:
+	            selected |> WHEN {
+	                All => True
+	                Active => entry.completed |> Bool/not
+	                Completed => entry.completed
+	            }
+	        )
+	    active_count:
+	        entries
+	        |> List/retain(entry, if: entry.completed |> Bool/not)
+	        |> List/count
+	FUNCTION make_entry(seed) {
+    sources:
+        checkbox: [click: SOURCE]
+    title:
+        seed.title |> HOLD title { LATEST {} }
+    completed:
+        False |> HOLD completed {
+            LATEST {
+                sources.checkbox.click |> THEN { completed |> Bool/not() }
+            }
+        }
+}
+VIEW {}
+"#;
+        let parsed = boon_parser::parse_source("renamed-row-scope.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(parsed.row_scope_functions.iter().any(|scope| {
+            scope.function == "make_entry" && scope.list == "entries" && scope.row_scope == "entry"
+        }));
+        assert!(
+            ir.state_cells
+                .iter()
+                .any(|cell| cell.path == "entry.completed" && cell.indexed)
+        );
+        assert!(ir.dependencies.iter().any(|edge| {
+            edge.from == "entry.sources.checkbox.click"
+                && edge.to == "entry.completed"
+                && edge.indexed
+        }));
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "entry.completed"
+                && branch.source == "entry.sources.checkbox.click"
+                && branch.indexed
+                && branch.expression
+                    == UpdateExpression::BoolNot {
+                        path: "completed".to_owned(),
+                    }
+        }));
+        assert!(
+            ir.state_cells
+                .iter()
+                .any(|cell| cell.path == "store.selected" && !cell.indexed)
+        );
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "entries"
+                && operation.kind
+                    == ListOperationKind::Retain {
+                        target: "store.visible_entries".to_owned(),
+                        predicate: ListPredicate::SelectedFilterVisibility {
+                            selector: "store.selected".to_owned(),
+                            row_field: "entry.completed".to_owned(),
+                        },
+                    }
+        }));
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "entries"
+                && operation.kind
+                    == ListOperationKind::Count {
+                        target: "store.active_count".to_owned(),
+                        predicate: ListPredicate::RowFieldBoolNot {
+                            path: "entry.completed".to_owned(),
+                        },
+                    }
         }));
     }
 }

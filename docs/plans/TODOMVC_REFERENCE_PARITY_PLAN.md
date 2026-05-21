@@ -199,9 +199,9 @@ Run before claiming done:
 ```sh
 cargo fmt --check
 cargo test -p boon_parser -p boon_runtime -p boon_ply_playground
-cargo run -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-reference-parity-smoke.json
-cargo run -p boon_ply_playground -- --smoke-launch --example cells --frames 4 --report target/reports/cells-reference-parity-smoke.json
-cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-release-switch-smoke.json
+xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-reference-parity-smoke.json
+xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example cells --frames 4 --report target/reports/cells-reference-parity-smoke.json
+xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-release-switch-smoke.json
 cargo xtask verify-todomvc-reference-parity --report target/reports/todomvc-reference-parity.json
 cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
 cargo xtask verify-todomvc-headed-focusless --report target/reports/todomvc-headed-focusless.json

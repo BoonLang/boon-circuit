@@ -30,7 +30,8 @@ Hot-path storage requirements:
 
 ```text
 Bool/Text/Int/etc. columns are typed.
-List order, valid bits, generations, and source bindings are separate columns.
+List order, `BitVec` valid bits, generations, and source bindings are separate
+columns.
 Text is bounded or interned according to the runtime profile.
 Record/list snapshots are not the unit of change detection.
 Release verification reports heap allocations and graph rebuilds.

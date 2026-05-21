@@ -9,7 +9,7 @@ usage:
   boon_cli run <source> [--scenario <path>] [--report <path>]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli dump-ir <source>
-  boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli explain-hardware <source> [--profile <software_bounded|fpga_todomvc>] [--target <software_bounded|fpga_todomvc>] [--report <path>]
 
 Bundled examples default to target/reports/<example>-cli-run.json when --report is omitted.
 ";
@@ -62,7 +62,10 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown run argument `{other}`").into()),
         }
     }
-    let scenario = scenario.unwrap_or_else(|| default_scenario(source));
+    let scenario = match scenario {
+        Some(scenario) => scenario,
+        None => default_scenario(source)?,
+    };
     let report = report.or_else(|| default_cli_report(source, &scenario));
     let output = run_scenario(
         Path::new(source),
@@ -85,7 +88,7 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("missing source path")?;
     let profile = args
         .windows(2)
-        .find(|window| window[0] == "--profile")
+        .find(|window| window[0] == "--profile" || window[0] == "--target")
         .map(|window| window[1].clone())
         .unwrap_or_else(|| "software_bounded".to_owned());
     let hardware_profile = HardwareProfile::for_name(&profile)?;
@@ -98,6 +101,8 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let row_source_ports = indexed_row_source_ports(&ir);
     let list_operations = serde_json::to_value(&ir.list_operations)?;
     let list_memories = hardware_profile.list_memories(&ir)?;
+    let runtime_profile = hardware_profile.runtime_profile();
+    let capacities = hardware_profile.capacity_report(&ir, runtime_profile);
     let state_cells = serde_json::to_value(&ir.state_cells)?;
     let report = json!({
         "status": "pass",
@@ -115,6 +120,9 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "budget_hash": boon_runtime::sha256_file(&Path::new(source).with_extension("budget.toml")).unwrap_or_else(|_| "missing-budget".to_owned()),
         "source": source,
         "profile": profile,
+        "runtime_profile": runtime_profile,
+        "runtime_profile_detail": hardware_profile.runtime_profile_detail(runtime_profile),
+        "capacities": capacities,
         "program_kind": parsed.kind.as_str(),
         "graph_node_count": ir.graph_node_count,
         "per_step_pass_fail": [
@@ -318,6 +326,58 @@ impl HardwareProfile {
         }
         Ok(memories)
     }
+
+    fn runtime_profile(&self) -> &'static str {
+        match self.name {
+            "fpga_todomvc" => "hardware_bounded",
+            "software_bounded" => "software_bounded",
+            _ => "hardware_bounded",
+        }
+    }
+
+    fn runtime_profile_detail(&self, runtime_profile: &str) -> serde_json::Value {
+        json!({
+            "name": runtime_profile,
+            "mode": match runtime_profile {
+                "hardware_bounded" => "hardware_style_bounded",
+                "software_bounded" => "bounded_software",
+                _ => "bounded",
+            },
+            "target_profile": self.name,
+            "capacity_source": self.capacity_source,
+            "overflow_behavior": self.overflow_policy,
+            "bounded_allocation_budget_applies_after_preparation": true,
+            "unbounded_lists": [],
+            "unbounded_text_allowed": self.unbounded_text_allowed
+        })
+    }
+
+    fn capacity_report(
+        &self,
+        ir: &boon_ir::TypedProgram,
+        runtime_profile: &str,
+    ) -> serde_json::Value {
+        json!({
+            "profile": runtime_profile,
+            "all_lists_bounded": true,
+            "lists": ir.lists.iter().map(|list| {
+                let declared_capacity = list.capacity.map(|capacity| capacity as u64);
+                let effective_capacity = declared_capacity.unwrap_or(self.todos_capacity as u64);
+                json!({
+                    "name": list.name,
+                    "declared_capacity": declared_capacity,
+                    "effective_capacity": effective_capacity,
+                    "capacity_source": if declared_capacity.is_some() {
+                        "LIST[n] syntax"
+                    } else {
+                        self.capacity_source
+                    },
+                    "dynamic_growth_allowed": false,
+                    "overflow_behavior": self.overflow_policy
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
 }
 
 fn indexed_register_fields(ir: &boon_ir::TypedProgram) -> Vec<String> {
@@ -344,12 +404,14 @@ fn indexed_row_source_ports(ir: &boon_ir::TypedProgram) -> Vec<String> {
     ports
 }
 
-fn default_scenario(source: &str) -> String {
-    if source.contains("cells") {
-        "examples/cells.scn".to_owned()
-    } else {
-        "examples/todomvc.scn".to_owned()
-    }
+fn default_scenario(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let source_text = std::fs::read_to_string(source)?;
+    let parsed = boon_parser::parse_source(source.to_owned(), source_text)?;
+    let scenario = match parsed.kind {
+        boon_parser::ProgramKind::TodoMvc => "examples/todomvc.scn",
+        boon_parser::ProgramKind::Cells => "examples/cells.scn",
+    };
+    Ok(scenario.to_owned())
 }
 
 fn default_cli_report(source: &str, scenario: &str) -> Option<PathBuf> {
@@ -400,7 +462,9 @@ fn current_binary_hash() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::CLI_HELP;
+    use super::{CLI_HELP, default_scenario};
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn help_advertises_supported_commands() {
@@ -417,5 +481,26 @@ mod tests {
         assert!(CLI_HELP.contains("target/reports/<example>-cli-run.json"));
         assert!(CLI_HELP.contains("--scenario <path>"));
         assert!(CLI_HELP.contains("--report <path>"));
+    }
+
+    #[test]
+    fn default_scenario_uses_parsed_example_marker_not_text_substrings() {
+        let path = temp_file_path("boon-cli-todomvc-looking-cells-path.bn");
+        let source = include_str!("../../../examples/todomvc.bn").replace(
+            "EXAMPLE TodoMVC",
+            "# EXAMPLE Cells\nlabel: \"cells\"\nEXAMPLE TodoMVC",
+        );
+        fs::write(&path, source).unwrap();
+
+        let scenario = default_scenario(path.to_str().unwrap()).unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(scenario, "examples/todomvc.scn");
+    }
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("{}-{name}", std::process::id()));
+        path
     }
 }

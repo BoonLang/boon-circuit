@@ -288,9 +288,54 @@ source-derived initial values for `HOLD` cells, `ir_debug_tables.lists` includes
 record-literal and `Grid/cells` initializers plus optional `LIST[n]` capacity,
 and `ir_debug_tables.derived_values` records non-state values such as
 `store.title_to_add`, aggregate counts, list views, and formula projections.
-These tables are not enough to claim the generic interpreter is complete, but
-they are the handoff artifacts the runtime should consume while replacing the
-current TodoMVC/Cells adapters.
+These tables are not accepted as proof by themselves. The runtime consumes them
+through `CompiledProgram`, `GenericScheduledRuntime`, and `LoadedRuntime`, and
+the executable reports derive `generic_interpreter_complete` /
+`example_behavior_adapter` from the loaded static/runtime slice coverage. The
+same reports include `generic_runtime_slice_evidence`, which is computed from
+the typed IR and compiled program and checked against `compiled_schedule`
+counts such as source routes, route actions, list operations, formula
+operations, source bindings, source payload schemas, and typed storage layout.
+The storage evidence is intentionally count-based: root text/bool/enum slots,
+list memories, row-template text/bool/enum slots, hidden key/generation slots,
+and list order/valid/free/source-binding storage kinds must match the compiled
+schedule. They also include `expression_coverage`,
+computed from parser AST plus typed IR, and the schema rejects executable
+reports if any parser/lowering `Unknown` expression, initializer, update, or
+predicate fallback reaches the accepted runtime surface.
+The parser keeps the full source, including `VIEW`, in one tokenized AST.
+Semantic iterators skip structurally marked `VIEW` subtrees instead of using a
+separate text-stripping pass, so `VIEW` metadata cannot create hidden semantic
+sources or state cells while still remaining available to the renderer.
+Public IR tables now expose transparent typed IDs (`ExprId`, `NodeId`,
+`ScopeId`, `SourceId`, `StateId`, `ListId`, and `FieldId`) rather than raw
+public `usize` slots for the identifiers that cross lowering/report boundaries.
+The JSON shape stays numeric, but code cannot casually mix source, scope, node,
+and expression ids. Row scopes discovered from `List/map` functions are emitted
+as typed `row_scopes` entries, and scoped sources/state/derived values point to
+those entries by `ScopeId`.
+`SourcePort` entries also carry typed payload schemas. The schema is derived
+from AST source references and match-arm payload destructuring, so requirements
+such as `text`, `key`, and row address payloads are visible in typed IR and
+reports instead of being implicit in scenario code.
+`VIEW` bindings now have a typed IR table too. Layout drawing still uses the
+parsed VIEW lines in the native playground, but data bindings, source bindings,
+and row target bindings are exposed as compiler output with `ViewBindingId`,
+binding kind, scope id, and source id where applicable.
+Runtime list memories keep row slots, visible order, `BitVec` valid bits, and a
+free-list as separate storage. A remove tombstones the slot and clears key
+lookup while the visible order vector shrinks; later appends may reuse the free
+slot with a new hidden key/generation. Boon code still compares only row data
+and never sees slots, keys, generations, source ids, or bind epochs.
+Runtime steps also keep reusable dirty keyset storage for keyed list work.
+TodoMVC marks dirty keys from semantic list mutations, and Cells marks dirty
+cell keys from the recomputation set; per-step dirty counts are derived from
+those keysets instead of being only an after-the-fact report scan.
+Compiled source-route plans now carry typed IR `SourceId` values in route
+slots, source label fallback entries, and event action inputs. Dense vector
+indexing happens only by converting that typed id at the storage boundary, so
+runtime dispatch cannot accidentally mix a source id with a visible row index or
+route slot.
 
 Current implementation note: TodoMVC root scalar `HOLD` fields such as
 `store.new_todo_text` and `store.selected_filter` now execute through those
@@ -309,9 +354,17 @@ Cells edit-state `HOLD` fields such as
 `cell.editing_text`, `cell.formula_text`, and `cell.editing` use the same branch
 table for change/commit/cancel handling. The Cells formula evaluator checks the
 IR-derived formula-operation pipeline before parsing, dependency extraction,
-evaluation, and error projection. The evaluator itself is still a generic Rust
-primitive inside the current runtime, so reports keep
-`example_behavior_adapter: true` and the readiness audit still fails.
+evaluation, and error projection. Formula parsing/evaluation remains a generic
+runtime primitive, not Boon-visible state; current executable reports derive
+`generic_interpreter_complete` and `example_behavior_adapter` from compiled
+runtime slice coverage and include `generic_runtime_slice_evidence` to show the
+typed-IR/compiled-plan counts behind those claims. They also include
+`remaining_example_specific_shell_policy` and
+`remaining_example_specific_shells` so the residual TodoMVC/Cells scenario,
+assertion, summary, render-patch, and stress-report glue is visible instead of
+being hidden behind the adapter-free claim.
+Readiness still fails until the real human reports and dependent aggregate
+reports exist.
 
 Implementation note: a generic initialization runtime now materializes root
 state cells and keyed list rows from `TypedProgram` initializers. TodoMVC seed
@@ -642,21 +695,34 @@ TodoMVC or Cells surface drivers for scenario execution. The remaining
 acceptance blockers are fresh human reports, aggregate all reports, and any
 future verification gaps found by the audit, not a semantic example adapter.
 
-Implementation note: the current IR cause table is still source-derived in a
-prototype sense. It derives row scopes from `List/map(... new: function(...))`,
-then scans field equation bodies and local derived-field references such as
-`new_todo_text -> title_to_add` to build `possible_causes`. That is useful
-evidence for the shipped TodoMVC and Cells scenarios, but it is not the final
-typed AST-to-IR lowering promised by the runtime model. The structural gate for
-that distinction is `cargo xtask verify-runtime-finality`, and
-`audit-goal-readiness` must fail while this gate reports blockers.
+Implementation note: the IR cause table is now built from parsed AST items,
+typed field definitions, source-port declarations, and local derived-field
+references such as `new_todo_text -> title_to_add`. It must not be built from
+raw source substring searches, file path names, comments, or example markers.
+The structural gate for that distinction is `cargo xtask verify-runtime-finality`;
+`audit-goal-readiness` must fail if that gate reports blockers.
 
 Executable reports may identify the runtime as `static_graph_interpreter` and
 may include `generic_interpreter_complete` / `example_behavior_adapter` fields.
 Those fields are not accepted as finality proof unless they are derived from
-static/runtime coverage instead of hardcoded booleans. Any remaining
-TodoMVC/Cells shell or report/assertion glue must stay visible in reports until
-removed.
+static/runtime coverage instead of hardcoded booleans and backed by
+`generic_runtime_slice_evidence` that matches `compiled_schedule`. Runtime
+claims are also backed by `expression_coverage`, computed from parser AST plus
+typed IR, so accepted executable reports cannot silently depend on `Unknown`
+parser or lowering fallback paths. Any remaining
+TodoMVC/Cells shell or report/assertion glue must stay visible through
+`remaining_example_specific_shells` in reports until removed.
+
+Hardware explanation reports use the same bounded-profile vocabulary. A
+TodoMVC FPGA report must expose `runtime_profile = "hardware_bounded"`,
+`runtime_profile_detail`, and `capacities` with effective list/FIFO/text
+limits and overflow behavior derived from the selected target profile. The CLI
+accepts both `--profile fpga_todomvc` and `--target fpga_todomvc`; the latter is
+kept because verifier commands describe hardware targets rather than only
+software profiles. This
+keeps hardware-style claims comparable with dynamic and bounded software
+reports, and prevents an unbounded software run from being mistaken for a fixed
+hardware allocation.
 
 Headed Ply evidence also has two categories. Focusless headed reports are
 synthetic/focusless evidence. Full OS pointer/keyboard claims require canonical
@@ -669,11 +735,20 @@ coverage for every user-action step.
 Headed Ply verification runs the native playground in release mode through
 `xtask`, because the debug build can take minutes to replay TodoMVC's visible
 control probes and can hit the wrapper timeout before writing the final report.
+The headed aliases run in an isolated Xvfb/X11 display by default. They remove
+`WAYLAND_DISPLAY`, request the playground's X11 backend, and use XTest/xdotool
+inside that private display so automated OS input cannot reach the user's
+active COSMIC windows. Normal manual playground launches still use Wayland by
+default; live desktop input for the automated verifier requires an explicit
+two-variable override:
+`BOON_ALLOW_LIVE_DESKTOP_INPUT=1` and
+`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`.
 It records three intermediate OS-input slices. First, it focuses one real
 visible application text control in the preview
 (`todo_new_input` for TodoMVC or `cell_editor_A1` for Cells), sends real OS
-keyboard text through `wtype`, observes the text through Ply state, captures the
-control screenshot, and stores the control bounds and artifact hash. Second,
+keyboard text through the selected OS keyboard backend, observes the text
+through Ply state, captures the control screenshot, and stores the control
+bounds and artifact hash. Second,
 visible controls emit observed Boon `SOURCE` events and the headed report
 records the observed payloads, bounds, screenshots, and runtime mutation result.
 When `BOON_ALLOW_OS_POINTER_PROBE=1` is set, click/press-style source probes use
@@ -713,17 +788,20 @@ That keeps the native playground on the `boon-circuit` workspace while the user
 continues other work. It does not make real input focus-free: human-like
 keyboard and mouse testing must eventually target the visible playground window,
 because the compositor routes those events to the active surface. Verifiers that
-send real desktop input must stay explicit: keyboard probes use `wtype`, and the
-pointer probe is opt-in with
-`BOON_ALLOW_OS_POINTER_PROBE=1` because it moves and clicks the real pointer.
+send live desktop input must stay explicit. The default verifier no longer sends
+input to the live desktop; it drives an isolated Xvfb/X11 window. The pointer
+probe still requires `BOON_ALLOW_OS_POINTER_PROBE=1` because it moves and clicks
+within the verifier display. Both `BOON_ALLOW_LIVE_DESKTOP_INPUT=1` and
+`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1` are required for
+the exceptional unsafe live-desktop route.
 Reports may include `os_pointer_probe.status = "skip"` for normal headed runs;
 that is evidence that the run avoided pointer injection, not a pass for the
 final full-OS-input gate. When the pointer probe is attempted, a failed hit is a
 schema failure rather than an accepted warning.
 
-The current reliable pointer backend on this COSMIC/Wayland machine is
-X11/XWayland XTest. The Ply process loads X11/XWayland libraries, and the
-headed probe now tries XTest absolute screen coordinates first and records
+The current reliable pointer backend for automated headed verification is
+Xvfb/X11 XTest. The Ply process requests X11 for verifier runs, and the headed
+probe now tries XTest absolute screen coordinates first and records
 `os_pointer_probe.click_target.backend = "x11_xtest"` when Ply observes the
 button click. The older `ydotool` path remains as a fallback but exited
 successfully without producing a Ply-observed hit with either relative-delta or
@@ -731,14 +809,10 @@ absolute-screen-coordinate attempts; `ydotoold` is not available as a user
 service here.
 
 `cosmic-background-launch --workspace boon-circuit -- cargo xtask
-verify-todomvc-headed-ply` is not a valid full headed-verifier mode today. A
-direct lower-level attempt with `cosmic-background-launch --workspace
-boon-circuit -- cargo run --release -p boon_ply_playground -- --verify-headed
---example todomvc` also left the verifier process alive for 120 seconds without
-creating its report. That is a failed verification, not a pass. Background
+verify-todomvc-headed-ply` is not a valid full headed-verifier mode. Background
 launch is appropriate for manual playground surfaces and bounded smoke launches;
-automated headed verification still needs a directly controlled process and a
-real focused input route.
+automated headed verification should be started directly through xtask so it can
+own the isolated display process, timeout, and report path.
 
 The bounded background smoke should be run through:
 
@@ -848,3 +922,8 @@ The readiness audit enforces both sides:
   the IR row template instead of a default source-binding helper;
 - report shape: TodoMVC and Cells stress profiles must carry IR-derived runtime
   proof with operation counts and source routes.
+
+Readiness audits also refresh the recursive schema summary before checking it.
+That keeps stale artifact hashes from becoming an order-dependent blocker after
+another verification command rewrites a report, while preserving
+`verify-report-schema` as the explicit report-shape gate.

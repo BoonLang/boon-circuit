@@ -29,13 +29,16 @@ Implement:
 8. Cells in Boon source, with generic formula primitives only, real edit/commit/cancel state in Boon, dependency tracking, cycle errors, and no hardcoded app behavior.
 9. Shared example verification harness and all documented xtask commands.
 
-Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are real implementation blockers:
+Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are handoff/verification blockers:
 - aggregate all reports and fresh human reports are still missing
-- if `cargo xtask audit-goal-readiness` reports any additional blocker, treat it as authoritative current evidence
+- if `cargo xtask audit-goal-readiness` or `cargo xtask verify-runtime-finality` reports any additional blocker, treat it as authoritative current evidence
 
 Do not make these blockers green by weakening reports, schemas, docs, or audits. Make them green only by completing the implementation and verification they describe.
 
-Verification must be honest and runnable:
+Verification must be honest and runnable. The machine-side commands must pass
+unattended; the final `verify-*-all`, `verify-examples-all`, and
+`audit-goal-readiness` commands must remain blocked when fresh real human
+TodoMVC/Cells reports do not exist:
 - cargo test -p boon_parser
 - cargo test -p boon_ir
 - cargo test -p boon_runtime
@@ -43,11 +46,12 @@ Verification must be honest and runnable:
 - cargo xtask verify-foundation
 - cargo xtask verify-playground-launch
 - cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --report target/reports/todomvc-cli-run.json
-- cargo xtask verify-todomvc-all --report target/reports/todomvc-all.json
+- cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 - cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/cells-cli-run.json
-- cargo xtask verify-cells-all --report target/reports/cells-all.json
+- cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 - cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
 - cargo xtask verify-report-schema
+- cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
 - cargo xtask audit-goal-readiness
 
 The headed Ply checks must open a real native window and prove real OS input, focus, screenshots or video artifacts, display backend and scale metadata, window pid/title, nonblank screenshots, and no direct source-event injection. Do not mark headed verification complete if it only does an OS keyboard probe plus scenario replay. It must drive each scenario step through real OS pointer/keyboard interaction with visible controls, or report that as a blocker.
@@ -57,10 +61,13 @@ Manual report checks must reject stale, hand-written, scripted, placeholder, or 
 Performance is part of correctness. Normal interactions should complete in a couple of milliseconds in release mode, with bounded RAM/VRAM growth, zero graph rebuilds per interaction, no post-warmup allocations in bounded profiles, and proportional dirty-key/render-patch counts. Large TodoMVC and Cells stress scenarios must prove the graph topology stays static and only affected keys/cells are recomputed.
 
 When finished, leave the repo ready for manual testing:
-- all verification commands pass
+- all machine-side verification commands pass
+- strict human/all gates either pass from real checked human reports or fail only
+  with those missing-human-report blockers
 - reports are written under target/reports
 - the native Ply playground can be launched for TodoMVC and Cells
 - `cargo xtask audit-goal-readiness` passes without suppressing any blocker
+  after the real manual reports have been produced
 - provide the exact commands I should run for manual testing
 - clearly report any remaining blocker or unimplemented planned item instead of treating it as a pass
 ```

@@ -25,20 +25,29 @@ cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playg
 ```
 
 Background launch is not evidence for full OS input. Full headed verification
-must run as a controlled focused session:
+runs in an isolated Xvfb/X11 session by default, so OS pointer/keyboard events
+cannot land in the user's active desktop windows. Do not set
+`BOON_ALLOW_LIVE_DESKTOP_INPUT=1` or
+`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1` unless the user
+explicitly asks for live desktop input. Both variables are required before an
+xtask verifier may target the live desktop:
 
 ```bash
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
 ```
 
+Launch-smoke verifiers also use isolated Xvfb/X11. Do not accept whole-desktop
+COSMIC screenshots as launch evidence; they can capture unrelated user windows.
+
 Before claiming handoff readiness, run:
 
 ```bash
 cargo xtask verify-report-schema
-cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json
+cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
 
-If `audit-goal-readiness` reports only missing human/all reports, report that
-honestly as the remaining blocker instead of weakening schemas, reports, or
-manual checks.
+If `audit-machine-readiness` passes but `audit-goal-readiness` reports only
+missing human/all reports, report that honestly as the remaining blocker instead
+of weakening schemas, reports, or manual checks.

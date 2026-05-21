@@ -138,6 +138,10 @@ cargo xtask prepare-todomvc-human-report \
   --finished <unix-finish> \
   --window-pid <visible-playground-pid> \
   --focused-window-proof <how-focus-was-confirmed> \
+  --display-server <wayland-or-x11> \
+  --display-connection <socket-or-display> \
+  --display-scale <scale> \
+  --window-backend <backend> \
   --notes <visual-notes> \
   --capture-method <tool-used> \
   --artifact <manual-png-or-video> \

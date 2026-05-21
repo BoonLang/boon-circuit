@@ -3,7 +3,8 @@
 use boon_runtime::{
     LiveRuntime, LiveSourceEvent, LiveStepOutput, RunOutput, Scenario, ScenarioStep,
     VerificationLayer, example_paths, parse_scenario, run_scenario,
-    run_scenario_source_with_step_limit, sha256_file, write_json,
+    run_scenario_source_with_parsed_scenario_step_limit, run_source_initial_state, sha256_file,
+    write_json,
 };
 use ply_engine::prelude::*;
 use serde_json::json;
@@ -79,6 +80,57 @@ impl PlaygroundView {
             _ => Self::App,
         }
     }
+}
+
+struct ExampleNavSpec {
+    name: &'static str,
+    nav_id: &'static str,
+    label: &'static str,
+}
+
+fn example_nav_specs() -> &'static [ExampleNavSpec] {
+    &[
+        ExampleNavSpec {
+            name: "todomvc",
+            nav_id: "nav_todomvc",
+            label: "1 TodoMVC",
+        },
+        ExampleNavSpec {
+            name: "cells",
+            nav_id: "nav_cells",
+            label: "2 Cells",
+        },
+    ]
+}
+
+fn default_example_name() -> String {
+    example_name_for_slot(0).to_owned()
+}
+
+fn alternate_example_name(original: &str) -> &'static str {
+    if original == example_name_for_slot(0) {
+        example_name_for_slot(1)
+    } else {
+        example_name_for_slot(0)
+    }
+}
+
+fn example_name_for_slot(index: usize) -> &'static str {
+    example_nav_specs()
+        .get(index)
+        .map(|example| example.name)
+        .unwrap_or_else(|| example_nav_specs()[0].name)
+}
+
+fn example_nav_id_for_slot(index: usize) -> &'static str {
+    example_nav_specs()
+        .get(index)
+        .map(|example| example.nav_id)
+        .unwrap_or_else(|| example_nav_specs()[0].nav_id)
+}
+
+fn example_nav_ids() -> &'static [&'static str] {
+    &["nav_todomvc", "nav_cells"]
 }
 
 #[derive(Clone, Debug)]
@@ -289,7 +341,7 @@ fn os_input_forbidden() -> bool {
 }
 
 async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let example = value_after(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let example = value_after(args, "--example").unwrap_or_else(default_example_name);
     let focus_free = focus_free_headed();
     let report = value_after(args, "--report")
         .map(PathBuf::from)
@@ -302,9 +354,10 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         });
     let (source, scenario, _) = example_paths(&example)?;
     let screenshot = report.with_extension("png");
-    let os_probe_screenshot = report.with_file_name(format!("{example}-headed-os-input.png"));
+    let artifact_prefix = report_artifact_prefix(&report, &example);
+    let os_probe_screenshot = report.with_file_name(format!("{artifact_prefix}-os-input.png"));
     let os_pointer_probe_screenshot =
-        report.with_file_name(format!("{example}-headed-os-pointer.png"));
+        report.with_file_name(format!("{artifact_prefix}-os-pointer.png"));
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let os_probe_token = format!("boon-headed-os-{}-{example}", std::process::id());
@@ -440,6 +493,8 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "input_backend".to_owned(),
             json!(if focus_free {
                 "ply-synthetic-focus-free"
+            } else if display_server() == "x11" {
+                "macroquad-os-events + xdotool-real-keyboard-events + xtest-pointer-probe"
             } else {
                 "macroquad-os-events + wtype-real-keyboard-events + ydotool-pointer-probe"
             }),
@@ -450,8 +505,10 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             "os_input_tools_used".to_owned(),
             json!(if focus_free {
                 Vec::<&str>::new()
+            } else if display_server() == "x11" {
+                vec!["xdotool", "xtest"]
             } else {
-                vec!["wtype"]
+                vec!["wtype", "ydotool"]
             }),
         );
         object.insert("capture_backend".to_owned(), json!(capture_backend));
@@ -652,30 +709,66 @@ async fn drive_visible_app_control_probe(
     report: &std::path::Path,
     example: &str,
 ) -> Vec<serde_json::Value> {
-    let (element_id, label, typed_text, contract) = if example == "cells" {
-        (
-            "cell_editor_A1",
-            "cells-a1-editor",
-            "41",
-            "OS keyboard text reached the visible Cells A1 editor text input",
-        )
-    } else {
-        (
-            "todo_new_input",
-            "todomvc-new-todo-input",
-            "Visible todo probe",
-            "OS keyboard text reached the visible TodoMVC new-todo text input",
-        )
+    let scenario = match parse_scenario(&PathBuf::from(format!("examples/{example}.scn"))) {
+        Ok(scenario) => scenario,
+        Err(error) => {
+            return vec![json!({
+                "id": "scenario-derived-app-control",
+                "pass": false,
+                "error": error.to_string()
+            })];
+        }
     };
-    let screenshot = report.with_file_name(format!("{example}-headed-app-control-{label}.png"));
+    let Some(step) = scenario.step.iter().find(|step| {
+        step.user_action
+            .as_ref()
+            .and_then(|action| toml_str(action, "kind"))
+            == Some("type_text")
+            && step.expected_source_event.is_some()
+    }) else {
+        return vec![json!({
+            "id": "scenario-derived-app-control",
+            "pass": false,
+            "error": "no text-input scenario step with expected SOURCE event"
+        })];
+    };
+    let expected = step.expected_source_event.as_ref();
+    let text = step
+        .user_action
+        .as_ref()
+        .and_then(|action| toml_str(action, "text"))
+        .or_else(|| expected.and_then(|expected| toml_str(expected, "text")))
+        .unwrap_or_default();
+    let target = match find_visible_probe_target(
+        state,
+        expected,
+        ScenarioProbeAction::Change,
+        Some(text),
+        None,
+        step.user_action.as_ref(),
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            return vec![json!({
+                "id": step.id,
+                "pass": false,
+                "error": error
+            })];
+        }
+    };
+    let artifact_prefix = report_artifact_prefix(report, example);
+    let screenshot = report.with_file_name(format!(
+        "{artifact_prefix}-app-control-{}.png",
+        sanitize_artifact_label(&step.id)
+    ));
     vec![
         drive_visible_text_input_probe(
             ply,
             state,
-            element_id,
-            label,
-            typed_text,
-            contract,
+            target.element_id,
+            &target.element_label,
+            text,
+            "OS keyboard text reached a scenario-selected visible Boon VIEW text input",
             &screenshot,
         )
         .await,
@@ -685,21 +778,21 @@ async fn drive_visible_app_control_probe(
 async fn drive_visible_text_input_probe(
     ply: &mut Ply<()>,
     state: &mut PlaygroundState,
-    element_id: &'static str,
+    element_id: Id,
     label: &str,
     typed_text: &str,
     contract: &str,
     screenshot: &PathBuf,
 ) -> serde_json::Value {
     let focus_free = focus_free_headed();
-    ply.set_text_value(element_id, "");
+    ply.set_text_value(element_id.clone(), "");
     let mut typed = false;
     let mut send_error = None;
     let mut observed_value = String::new();
     let mut bounds = serde_json::Value::Null;
     for frame in 0..120 {
         draw_frame(ply, state).await;
-        if let Some(app_bounds) = ply.bounding_box(element_id) {
+        if let Some(app_bounds) = ply.bounding_box(element_id.clone()) {
             bounds = json!({
                 "x": app_bounds.x,
                 "y": app_bounds.y,
@@ -707,16 +800,16 @@ async fn drive_visible_text_input_probe(
                 "height": app_bounds.height
             });
         }
-        ply.set_focus(element_id);
+        ply.set_focus(element_id.clone());
         if ((focus_free && frame == 0) || (!focus_free && frame == 8)) && !typed {
             typed = true;
             if focus_free {
-                ply.set_text_value(element_id, typed_text);
+                ply.set_text_value(element_id.clone(), typed_text);
             } else if let Err(error) = send_real_keyboard_text(typed_text) {
                 send_error = Some(error.to_string());
             }
         }
-        observed_value = ply.get_text_value(element_id).to_owned();
+        observed_value = ply.get_text_value(element_id.clone()).to_owned();
         if os_probe_observed_token(&observed_value, typed_text) {
             break;
         }
@@ -743,11 +836,11 @@ async fn drive_visible_text_input_probe(
     } else {
         "missing"
     };
-    ply.set_text_value(element_id, "");
+    ply.set_text_value(element_id.clone(), "");
     json!({
         "id": label,
         "pass": pass,
-        "target_element_id": element_id,
+        "target_element_id": label,
         "visible_bounds": bounds,
         "input_route_contract": if focus_free {
             "focus-free verifier set visible Ply text input state directly inside the headed process; no desktop keyboard event was sent"
@@ -755,8 +848,8 @@ async fn drive_visible_text_input_probe(
             contract
         },
         "input_backend": if focus_free { "ply-synthetic-focus-free" } else { "os_keyboard" },
-        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
-        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!(os_keyboard_tool_name()) },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path(os_keyboard_tool_name())) },
         "typed": typed,
         "send_error": send_error,
         "typed_text_sha256": boon_runtime::sha256_bytes(typed_text.as_bytes()),
@@ -778,571 +871,623 @@ async fn drive_visible_source_event_probe(
     example: &str,
     scenario: &Scenario,
 ) -> Vec<serde_json::Value> {
-    if example == "cells" {
-        let edit_screenshot =
-            report.with_file_name("cells-headed-source-event-edit-a1-literal.png");
-        let commit_screenshot =
-            report.with_file_name("cells-headed-source-event-commit-a1-literal.png");
-        let draft_screenshot =
-            report.with_file_name("cells-headed-source-event-edit-a1-cancel-draft.png");
-        let mut observations = vec![
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-a1-literal",
-                    element_id: Id::new("cell_editor_A1"),
-                    element_label: "cell_editor_A1",
-                    text: "41",
-                    expected_text: Some("41"),
-                    source: "cell.sources.editor.change",
-                    key: None,
-                    address: Some("A1"),
-                    target_text: None,
-                    screenshot: edit_screenshot,
-                    scenario_step: scenario_step_by_id(scenario, "edit-a1-literal"),
-                },
-            )
-            .await,
-            drive_visible_source_submit_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "commit-a1-literal",
-                    element_id: Id::new("cell_editor_A1"),
-                    element_label: "cell_editor_A1",
-                    text: "41",
-                    expected_text: Some("41"),
-                    source: "cell.sources.editor.commit",
-                    key: Some("Enter"),
-                    address: Some("A1"),
-                    target_text: None,
-                    screenshot: commit_screenshot,
-                    scenario_step: scenario_step_by_id(scenario, "commit-a1-literal"),
-                },
-            )
-            .await,
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-a1-cancel-draft",
-                    element_id: Id::new("cell_editor_A1"),
-                    element_label: "cell_editor_A1",
-                    text: "123",
-                    expected_text: Some("123"),
-                    source: "cell.sources.editor.change",
-                    key: None,
-                    address: Some("A1"),
-                    target_text: None,
-                    screenshot: draft_screenshot,
-                    scenario_step: scenario_step_by_id(scenario, "edit-a1-cancel-draft"),
-                },
-            )
-            .await,
-        ];
-        observations.push(
-            drive_visible_source_escape_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "cancel-a1-draft",
-                    element_id: Id::new("cell_editor_A1"),
-                    element_label: "cell_editor_A1",
-                    text: "123",
-                    expected_text: None,
-                    source: "cell.sources.editor.cancel",
-                    key: None,
-                    address: Some("A1"),
-                    target_text: None,
-                    screenshot: report
-                        .with_file_name("cells-headed-source-event-cancel-a1-draft.png"),
-                    scenario_step: scenario_step_by_id(scenario, "cancel-a1-draft"),
-                },
-            )
-            .await,
-        );
-        for (id, editor, address, text) in [
-            ("commit-b1-formula", "cell_editor_B1", "B1", "=A1+1"),
-            ("change-a1-updates-b1", "cell_editor_A1", "A1", "99"),
-            ("cycle-error", "cell_editor_A1", "A1", "=B1+1"),
-            (
-                "replace-b1-formula-removes-stale-cycle-edge",
-                "cell_editor_B1",
-                "B1",
-                "5",
-            ),
-            (
-                "change-a1-after-edge-replacement-does-not-recompute-b1",
-                "cell_editor_A1",
-                "A1",
-                "10",
-            ),
-            ("commit-c1-fanout-formula", "cell_editor_C1", "C1", "=A1+1"),
-            ("commit-d1-fanout-formula", "cell_editor_D1", "D1", "=A1+2"),
-            (
-                "change-a1-fanout-recomputes-dependents-only",
-                "cell_editor_A1",
-                "A1",
-                "20",
-            ),
-        ] {
-            observations.push(
-                drive_visible_source_submit_event_probe(
-                    ply,
-                    state,
-                    VisibleSourceTextProbe {
-                        id,
-                        element_id: Id::new(editor),
-                        element_label: editor,
-                        text,
-                        expected_text: Some(text),
-                        source: "cell.sources.editor.commit",
-                        key: Some("Enter"),
-                        address: Some(address),
-                        target_text: None,
-                        screenshot: report.with_file_name(format!(
-                            "cells-headed-source-event-{}.png",
-                            sanitize_artifact_label(id)
-                        )),
-                        scenario_step: scenario_step_by_id(scenario, id),
-                    },
-                )
-                .await,
-            );
-        }
-        observations
-    } else {
-        let mut observations = vec![
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "add-test-todo-type",
-                    element_id: Id::new("todo_new_input"),
-                    element_label: "todo_new_input",
-                    text: "Test todo",
-                    expected_text: Some("Test todo"),
-                    source: "store.sources.new_todo_input.change",
-                    key: None,
-                    address: None,
-                    target_text: None,
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-add-test-todo-type.png"),
-                    scenario_step: scenario_step_by_id(scenario, "add-test-todo-type"),
-                },
-            )
-            .await,
-            drive_visible_source_submit_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "add-test-todo-submit",
-                    element_id: Id::new("todo_new_input"),
-                    element_label: "todo_new_input",
-                    text: "Test todo",
-                    expected_text: Some("Test todo"),
-                    source: "store.sources.new_todo_input.key_down",
-                    key: Some("Enter"),
-                    address: None,
-                    target_text: None,
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-add-test-todo-submit.png"),
-                    scenario_step: scenario_step_by_id(scenario, "add-test-todo-submit"),
-                },
-            )
-            .await,
-            drive_visible_source_submit_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "reject-empty-todo",
-                    element_id: Id::new("todo_new_input"),
-                    element_label: "todo_new_input",
-                    text: "   ",
-                    expected_text: Some("   "),
-                    source: "store.sources.new_todo_input.key_down",
-                    key: Some("Enter"),
-                    address: None,
-                    target_text: None,
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-reject-empty-todo.png"),
-                    scenario_step: scenario_step_by_id(scenario, "reject-empty-todo"),
-                },
-            )
-            .await,
-        ];
-        for probe in [
-            VisibleSourcePressProbe {
-                id: "toggle-all-complete",
-                element_id: Id::new("todo_toggle_all"),
-                element_label: "todo_toggle_all",
-                source: "store.sources.toggle_all_checkbox.click",
-                target_text: None,
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-toggle-all-complete.png"),
-                scenario_step: scenario_step_by_id(scenario, "toggle-all-complete"),
-            },
-            VisibleSourcePressProbe {
-                id: "toggle-all-active",
-                element_id: Id::new("todo_toggle_all"),
-                element_label: "todo_toggle_all",
-                source: "store.sources.toggle_all_checkbox.click",
-                target_text: None,
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-toggle-all-active.png"),
-                scenario_step: scenario_step_by_id(scenario, "toggle-all-active"),
-            },
-            VisibleSourcePressProbe {
-                id: "toggle-buy-groceries",
-                element_id: Id::new_index("todo_row_checkbox", 3),
-                element_label: "todo_row_checkbox[3]",
-                source: "todo.sources.todo_checkbox.click",
-                target_text: Some("Buy groceries"),
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-toggle-buy-groceries.png"),
-                scenario_step: scenario_step_by_id(scenario, "toggle-buy-groceries"),
-            },
-            VisibleSourcePressProbe {
-                id: "filter-active",
-                element_id: Id::new("todo_filter_active"),
-                element_label: "todo_filter_active",
-                source: "store.sources.filter_active.press",
-                target_text: None,
-                screenshot: report.with_file_name("todomvc-headed-source-event-filter-active.png"),
-                scenario_step: scenario_step_by_id(scenario, "filter-active"),
-            },
-            VisibleSourcePressProbe {
-                id: "toggle-dynamic-test-todo-under-active-filter",
-                element_id: Id::new_index("todo_row_checkbox", 3),
-                element_label: "todo_row_checkbox[3]",
-                source: "todo.sources.todo_checkbox.click",
-                target_text: Some("Test todo"),
-                screenshot: report.with_file_name(
-                    "todomvc-headed-source-event-toggle-dynamic-test-todo-under-active-filter.png",
-                ),
-                scenario_step: scenario_step_by_id(
-                    scenario,
-                    "toggle-dynamic-test-todo-under-active-filter",
-                ),
-            },
-            VisibleSourcePressProbe {
-                id: "filter-completed",
-                element_id: Id::new("todo_filter_completed"),
-                element_label: "todo_filter_completed",
-                source: "store.sources.filter_completed.press",
-                target_text: None,
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-filter-completed.png"),
-                scenario_step: scenario_step_by_id(scenario, "filter-completed"),
-            },
-            VisibleSourcePressProbe {
-                id: "filter-all",
-                element_id: Id::new("todo_filter_all"),
-                element_label: "todo_filter_all",
-                source: "store.sources.filter_all.press",
-                target_text: None,
-                screenshot: report.with_file_name("todomvc-headed-source-event-filter-all.png"),
-                scenario_step: scenario_step_by_id(scenario, "filter-all"),
-            },
-            VisibleSourcePressProbe {
-                id: "edit-test-todo",
-                element_id: Id::new_index("todo_row_title", 4),
-                element_label: "todo_row_title[4]",
-                source: "todo.sources.todo_title_element.double_click",
-                target_text: Some("Test todo"),
-                screenshot: report.with_file_name("todomvc-headed-source-event-edit-open.png"),
-                scenario_step: scenario_step_by_id(scenario, "edit-test-todo"),
-            },
-        ] {
-            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
-        }
-        observations.push(
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-change",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Test todo edited",
-                    expected_text: Some("Test todo edited"),
-                    source: "todo.sources.editing_todo_title_element.change",
-                    key: None,
-                    address: None,
-                    target_text: Some("Test todo"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-change.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-change"),
-                },
-            )
-            .await,
-        );
-        observations.push(
-            drive_visible_source_submit_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-commit",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Test todo edited",
-                    expected_text: Some("Test todo edited"),
-                    source: "todo.sources.editing_todo_title_element.key_down",
-                    key: Some("Enter"),
-                    address: None,
-                    target_text: Some("Test todo"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-commit.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-commit"),
-                },
-            )
-            .await,
-        );
-        for probe in [VisibleSourcePressProbe {
-            id: "edit-test-todo-cancel-open",
-            element_id: Id::new_index("todo_row_title", 4),
-            element_label: "todo_row_title[4]",
-            source: "todo.sources.todo_title_element.double_click",
-            target_text: Some("Test todo edited"),
-            screenshot: report.with_file_name("todomvc-headed-source-event-edit-cancel-open.png"),
-            scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-open"),
-        }] {
-            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
-        }
-        observations.push(
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-cancel-change",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Cancelled title",
-                    expected_text: Some("Cancelled title"),
-                    source: "todo.sources.editing_todo_title_element.change",
-                    key: None,
-                    address: None,
-                    target_text: Some("Test todo edited"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-cancel-change.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-change"),
-                },
-            )
-            .await,
-        );
-        observations.push(
-            drive_visible_source_submit_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-cancel-escape",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Cancelled title",
-                    expected_text: None,
-                    source: "todo.sources.editing_todo_title_element.key_down",
-                    key: Some("Escape"),
-                    address: None,
-                    target_text: Some("Test todo edited"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-cancel-escape.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-cancel-escape"),
-                },
-            )
-            .await,
-        );
-        for probe in [VisibleSourcePressProbe {
-            id: "edit-test-todo-blur-open",
-            element_id: Id::new_index("todo_row_title", 4),
-            element_label: "todo_row_title[4]",
-            source: "todo.sources.todo_title_element.double_click",
-            target_text: Some("Test todo edited"),
-            screenshot: report.with_file_name("todomvc-headed-source-event-edit-blur-open.png"),
-            scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-open"),
-        }] {
-            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
-        }
-        observations.push(
-            drive_visible_source_text_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-blur-change",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Blur saved title",
-                    expected_text: Some("Blur saved title"),
-                    source: "todo.sources.editing_todo_title_element.change",
-                    key: None,
-                    address: None,
-                    target_text: Some("Test todo edited"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-blur-change.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-change"),
-                },
-            )
-            .await,
-        );
-        observations.push(
-            drive_visible_source_blur_event_probe(
-                ply,
-                state,
-                VisibleSourceTextProbe {
-                    id: "edit-test-todo-blur-commit",
-                    element_id: Id::new_index("todo_row_edit", 4),
-                    element_label: "todo_row_edit[4]",
-                    text: "Blur saved title",
-                    expected_text: Some("Blur saved title"),
-                    source: "todo.sources.editing_todo_title_element.blur",
-                    key: None,
-                    address: None,
-                    target_text: Some("Test todo edited"),
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-edit-blur-commit.png"),
-                    scenario_step: scenario_step_by_id(scenario, "edit-test-todo-blur-commit"),
-                },
-            )
-            .await,
-        );
-        for probe in [VisibleSourcePressProbe {
-            id: "clear-completed",
-            element_id: Id::new("todo_clear_completed"),
-            element_label: "todo_clear_completed",
-            source: "store.sources.clear_completed_button.press",
-            target_text: None,
-            screenshot: report.with_file_name("todomvc-headed-source-event-clear-completed.png"),
-            scenario_step: scenario_step_by_id(scenario, "clear-completed"),
-        }] {
-            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
-        }
-        observations.push(
-            drive_visible_hover_probe(
-                ply,
-                state,
-                VisibleHoverProbe {
-                    id: "hover-delete-clean-room",
-                    element_id: Id::new_index("todo_row_delete", 2),
-                    element_label: "todo_row_delete[2]",
-                    screenshot: report
-                        .with_file_name("todomvc-headed-source-event-hover-delete-clean-room.png"),
-                    scenario_step: scenario_step_by_id(scenario, "hover-delete-clean-room"),
-                },
-            )
-            .await,
-        );
-        for probe in [
-            VisibleSourcePressProbe {
-                id: "delete-clean-room",
-                element_id: Id::new_index("todo_row_delete", 2),
-                element_label: "todo_row_delete[2]",
-                source: "todo.sources.remove_todo_button.press",
-                target_text: Some("Walk the dog"),
-                screenshot: report
-                    .with_file_name("todomvc-headed-source-event-delete-clean-room.png"),
-                scenario_step: scenario_step_by_id(scenario, "delete-clean-room"),
-            },
-            VisibleSourcePressProbe {
-                id: "toggle-all-single-after-clear",
-                element_id: Id::new("todo_toggle_all"),
-                element_label: "todo_toggle_all",
-                source: "store.sources.toggle_all_checkbox.click",
-                target_text: None,
-                screenshot: report.with_file_name(
-                    "todomvc-headed-source-event-toggle-all-single-after-clear.png",
-                ),
-                scenario_step: scenario_step_by_id(scenario, "toggle-all-single-after-clear"),
-            },
-            VisibleSourcePressProbe {
-                id: "clear-all-rows",
-                element_id: Id::new("todo_clear_completed"),
-                element_label: "todo_clear_completed",
-                source: "store.sources.clear_completed_button.press",
-                target_text: None,
-                screenshot: report.with_file_name("todomvc-headed-source-event-clear-all-rows.png"),
-                scenario_step: scenario_step_by_id(scenario, "clear-all-rows"),
-            },
-        ] {
-            if probe.id == "toggle-all-single-after-clear" {
+    let mut observations = Vec::new();
+    for step in &scenario.step {
+        let Some(action) = scenario_probe_action(step) else {
+            continue;
+        };
+        let expected = step.expected_source_event.as_ref();
+        let target = match find_visible_probe_target(
+            state,
+            expected,
+            action,
+            scenario_probe_text(step).as_deref(),
+            scenario_probe_key(step).as_deref(),
+            step.user_action.as_ref(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                observations.push(json!({
+                    "id": step.id,
+                    "pass": false,
+                    "scenario_step_id": step.id,
+                    "error": error
+                }));
+                continue;
+            }
+        };
+        let artifact_prefix = report_artifact_prefix(report, example);
+        let screenshot = report.with_file_name(format!(
+            "{artifact_prefix}-source-event-{}.png",
+            sanitize_artifact_label(&step.id)
+        ));
+        match action {
+            ScenarioProbeAction::Change => {
+                let text = scenario_probe_text(step).unwrap_or_default();
                 observations.push(
                     drive_visible_source_text_event_probe(
                         ply,
                         state,
-                        VisibleSourceTextProbe {
-                            id: "add-after-clear-type",
-                            element_id: Id::new("todo_new_input"),
-                            element_label: "todo_new_input",
-                            text: "Fresh todo",
-                            expected_text: Some("Fresh todo"),
-                            source: "store.sources.new_todo_input.change",
-                            key: None,
-                            address: None,
-                            target_text: None,
-                            screenshot: report.with_file_name(
-                                "todomvc-headed-source-event-add-after-clear-type.png",
-                            ),
-                            scenario_step: scenario_step_by_id(scenario, "add-after-clear-type"),
-                        },
+                        VisibleSourceTextProbe::from_step(
+                            step,
+                            target,
+                            text,
+                            scenario_probe_expected_text(step),
+                            scenario_probe_key(step),
+                            screenshot,
+                        ),
                     )
                     .await,
                 );
+            }
+            ScenarioProbeAction::Submit => {
+                let text = scenario_probe_text(step)
+                    .unwrap_or_else(|| ply.get_text_value(target.element_id.clone()).to_owned());
                 observations.push(
                     drive_visible_source_submit_event_probe(
                         ply,
                         state,
-                        VisibleSourceTextProbe {
-                            id: "add-after-clear-submit",
-                            element_id: Id::new("todo_new_input"),
-                            element_label: "todo_new_input",
-                            text: "Fresh todo",
-                            expected_text: Some("Fresh todo"),
-                            source: "store.sources.new_todo_input.key_down",
-                            key: Some("Enter"),
-                            address: None,
-                            target_text: None,
-                            screenshot: report.with_file_name(
-                                "todomvc-headed-source-event-add-after-clear-submit.png",
-                            ),
-                            scenario_step: scenario_step_by_id(scenario, "add-after-clear-submit"),
+                        VisibleSourceTextProbe::from_step(
+                            step,
+                            target,
+                            text,
+                            scenario_probe_expected_text(step),
+                            scenario_probe_key(step),
+                            screenshot,
+                        ),
+                    )
+                    .await,
+                );
+            }
+            ScenarioProbeAction::Escape => {
+                let text = scenario_probe_text(step)
+                    .unwrap_or_else(|| ply.get_text_value(target.element_id.clone()).to_owned());
+                observations.push(
+                    drive_visible_source_escape_event_probe(
+                        ply,
+                        state,
+                        VisibleSourceTextProbe::from_step(
+                            step,
+                            target,
+                            text,
+                            scenario_probe_expected_text(step),
+                            scenario_probe_expected_key(step),
+                            screenshot,
+                        ),
+                    )
+                    .await,
+                );
+            }
+            ScenarioProbeAction::Blur => {
+                let text = scenario_probe_text(step)
+                    .unwrap_or_else(|| ply.get_text_value(target.element_id.clone()).to_owned());
+                observations.push(
+                    drive_visible_source_blur_event_probe(
+                        ply,
+                        state,
+                        VisibleSourceTextProbe::from_step(
+                            step,
+                            target,
+                            text,
+                            scenario_probe_expected_text(step),
+                            scenario_probe_key(step),
+                            screenshot,
+                        ),
+                    )
+                    .await,
+                );
+            }
+            ScenarioProbeAction::Press | ScenarioProbeAction::DoubleClick => {
+                observations.push(
+                    drive_visible_source_press_event_probe(
+                        ply,
+                        state,
+                        VisibleSourcePressProbe::from_step(step, target, screenshot),
+                    )
+                    .await,
+                );
+            }
+            ScenarioProbeAction::Hover => {
+                observations.push(
+                    drive_visible_hover_probe(
+                        ply,
+                        state,
+                        VisibleHoverProbe {
+                            id: step.id.clone(),
+                            element_id: target.element_id,
+                            element_label: target.element_label,
+                            screenshot,
+                            scenario_step: Some(step.clone()),
                         },
                     )
                     .await,
                 );
             }
-            observations.push(drive_visible_source_press_event_probe(ply, state, probe).await);
         }
-        observations
+    }
+    observations
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScenarioProbeAction {
+    Change,
+    Submit,
+    Escape,
+    Blur,
+    Press,
+    DoubleClick,
+    Hover,
+}
+
+#[derive(Clone, Debug)]
+struct RenderProbeTarget {
+    element_id: Id,
+    element_label: String,
+}
+
+impl VisibleSourceTextProbe {
+    fn from_step(
+        step: &ScenarioStep,
+        target: RenderProbeTarget,
+        text: String,
+        expected_text: Option<String>,
+        key: Option<String>,
+        screenshot: PathBuf,
+    ) -> Self {
+        let expected = step.expected_source_event.as_ref();
+        Self {
+            id: step.id.clone(),
+            element_id: target.element_id,
+            element_label: target.element_label,
+            text,
+            expected_text,
+            source: expected
+                .and_then(|expected| toml_str(expected, "source"))
+                .unwrap_or_default()
+                .to_owned(),
+            key,
+            address: expected
+                .and_then(|expected| toml_str(expected, "address"))
+                .map(ToOwned::to_owned),
+            target_text: expected
+                .and_then(|expected| toml_str(expected, "target_text"))
+                .map(ToOwned::to_owned),
+            screenshot,
+            scenario_step: Some(step.clone()),
+        }
+    }
+}
+
+impl VisibleSourcePressProbe {
+    fn from_step(step: &ScenarioStep, target: RenderProbeTarget, screenshot: PathBuf) -> Self {
+        let expected = step.expected_source_event.as_ref();
+        let double_click = step
+            .user_action
+            .as_ref()
+            .and_then(|action| toml_str(action, "kind"))
+            == Some("double_click");
+        Self {
+            id: step.id.clone(),
+            element_id: target.element_id,
+            element_label: target.element_label,
+            source: expected
+                .and_then(|expected| toml_str(expected, "source"))
+                .unwrap_or_default()
+                .to_owned(),
+            target_text: expected
+                .and_then(|expected| toml_str(expected, "target_text"))
+                .map(ToOwned::to_owned),
+            double_click,
+            screenshot,
+            scenario_step: Some(step.clone()),
+        }
+    }
+}
+
+fn scenario_probe_action(step: &ScenarioStep) -> Option<ScenarioProbeAction> {
+    let action = step.user_action.as_ref()?;
+    match toml_str(action, "kind")? {
+        "type_text" => Some(ScenarioProbeAction::Change),
+        "key_down" if toml_str(action, "key") == Some("Escape") => {
+            Some(ScenarioProbeAction::Escape)
+        }
+        "key_down" => Some(ScenarioProbeAction::Submit),
+        "blur" => Some(ScenarioProbeAction::Blur),
+        "click" => Some(ScenarioProbeAction::Press),
+        "double_click" => Some(ScenarioProbeAction::DoubleClick),
+        "pointer_hover" => Some(ScenarioProbeAction::Hover),
+        _ => None,
+    }
+}
+
+fn scenario_probe_text(step: &ScenarioStep) -> Option<String> {
+    step.expected_source_event
+        .as_ref()
+        .and_then(|expected| toml_str(expected, "text"))
+        .or_else(|| {
+            step.user_action
+                .as_ref()
+                .and_then(|action| toml_str(action, "text"))
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn scenario_probe_expected_text(step: &ScenarioStep) -> Option<String> {
+    step.expected_source_event
+        .as_ref()
+        .and_then(|expected| toml_str(expected, "text"))
+        .map(ToOwned::to_owned)
+}
+
+fn scenario_probe_expected_key(step: &ScenarioStep) -> Option<String> {
+    step.expected_source_event
+        .as_ref()
+        .and_then(|expected| toml_str(expected, "key"))
+        .map(ToOwned::to_owned)
+}
+
+fn scenario_probe_key(step: &ScenarioStep) -> Option<String> {
+    step.expected_source_event
+        .as_ref()
+        .and_then(|expected| toml_str(expected, "key"))
+        .or_else(|| {
+            step.user_action
+                .as_ref()
+                .and_then(|action| toml_str(action, "key"))
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn toml_str<'a>(table: &'a BTreeMap<String, toml::Value>, key: &str) -> Option<&'a str> {
+    table.get(key)?.as_str()
+}
+
+fn find_visible_probe_target(
+    state: &PlaygroundState,
+    expected: Option<&BTreeMap<String, toml::Value>>,
+    action: ScenarioProbeAction,
+    text: Option<&str>,
+    key: Option<&str>,
+    user_action: Option<&BTreeMap<String, toml::Value>>,
+) -> Result<RenderProbeTarget, String> {
+    let output = state
+        .output
+        .as_ref()
+        .ok_or_else(|| "playground output is not initialized".to_owned())?;
+    let context = RenderContext::root(&output.state_summary);
+    find_visible_probe_target_in_nodes(
+        &state.render_nodes,
+        &context,
+        expected,
+        action,
+        text,
+        key,
+        user_action,
+    )
+    .ok_or_else(|| {
+        let expected = expected
+            .map(|expected| format!("{expected:?}"))
+            .unwrap_or_else(|| "render-only action".to_owned());
+        format!("no visible Boon VIEW element matched scenario action {action:?} with {expected}")
+    })
+}
+
+fn find_visible_probe_target_in_nodes(
+    nodes: &[RenderNode],
+    context: &RenderContext<'_>,
+    expected: Option<&BTreeMap<String, toml::Value>>,
+    action: ScenarioProbeAction,
+    text: Option<&str>,
+    key: Option<&str>,
+    user_action: Option<&BTreeMap<String, toml::Value>>,
+) -> Option<RenderProbeTarget> {
+    for node in nodes {
+        match node {
+            RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
+                if let Some(target) = find_visible_probe_target_in_nodes(
+                    children,
+                    context,
+                    expected,
+                    action,
+                    text,
+                    key,
+                    user_action,
+                ) {
+                    return Some(target);
+                }
+            }
+            RenderNode::ForEach {
+                list,
+                item,
+                children,
+            } => {
+                if let Some(rows) =
+                    resolve_path(context, list).and_then(serde_json::Value::as_array)
+                {
+                    for (index, row) in rows.iter().enumerate() {
+                        let item_context = context.with_binding(list, item, row, index);
+                        if let Some(target) = find_visible_probe_target_in_nodes(
+                            children,
+                            &item_context,
+                            expected,
+                            action,
+                            text,
+                            key,
+                            user_action,
+                        ) {
+                            return Some(target);
+                        }
+                    }
+                }
+            }
+            RenderNode::Input {
+                id,
+                key: render_key,
+                change_source,
+                submit_source,
+                cancel_source,
+                escape_source,
+                blur_source,
+                address,
+                target,
+                visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                let element_id = render_id_with_key(id, render_key.as_ref(), context);
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let address = address
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                let target_text = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                let event = match action {
+                    ScenarioProbeAction::Change => change_source.as_ref().map(|source| {
+                        render_source_event(
+                            source,
+                            text,
+                            None,
+                            address.as_deref(),
+                            target_text.as_deref(),
+                            occurrence,
+                        )
+                    }),
+                    ScenarioProbeAction::Submit => submit_source.as_ref().map(|source| {
+                        render_source_event(
+                            source,
+                            text,
+                            key,
+                            address.as_deref(),
+                            target_text.as_deref(),
+                            occurrence,
+                        )
+                    }),
+                    ScenarioProbeAction::Blur => blur_source.as_ref().map(|source| {
+                        render_source_event(
+                            source,
+                            text,
+                            None,
+                            address.as_deref(),
+                            target_text.as_deref(),
+                            occurrence,
+                        )
+                    }),
+                    ScenarioProbeAction::Escape => escape_source
+                        .as_ref()
+                        .map(|source| {
+                            render_source_event(
+                                source,
+                                None,
+                                Some("Escape"),
+                                address.as_deref(),
+                                target_text.as_deref(),
+                                occurrence,
+                            )
+                        })
+                        .or_else(|| {
+                            cancel_source.as_ref().map(|source| {
+                                render_source_event(
+                                    source,
+                                    None,
+                                    None,
+                                    address.as_deref(),
+                                    target_text.as_deref(),
+                                    occurrence,
+                                )
+                            })
+                        }),
+                    ScenarioProbeAction::Press
+                    | ScenarioProbeAction::DoubleClick
+                    | ScenarioProbeAction::Hover => None,
+                };
+                if event
+                    .as_ref()
+                    .is_some_and(|event| expected_event_matches(event, expected))
+                {
+                    return Some(RenderProbeTarget {
+                        element_id,
+                        element_label: render_target_label(id, context, render_key.as_ref()),
+                    });
+                }
+            }
+            RenderNode::Button {
+                id,
+                text: label,
+                source,
+                double_click_source,
+                address,
+                target,
+                visible,
+                hover_visible,
+                ..
+            } => {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                let element_id = render_id(id, context);
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let address = address
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                let target_text = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                if matches!(
+                    action,
+                    ScenarioProbeAction::Press | ScenarioProbeAction::DoubleClick
+                ) {
+                    let source_candidates = match action {
+                        ScenarioProbeAction::DoubleClick => vec![double_click_source.as_ref()],
+                        _ => vec![source.as_ref(), double_click_source.as_ref()],
+                    };
+                    for source in source_candidates.into_iter().flatten() {
+                        let event = render_source_event(
+                            source,
+                            None,
+                            None,
+                            address.as_deref(),
+                            target_text.as_deref(),
+                            occurrence,
+                        );
+                        if expected_event_matches(&event, expected) {
+                            return Some(RenderProbeTarget {
+                                element_id,
+                                element_label: render_target_label(id, context, None),
+                            });
+                        }
+                    }
+                }
+                if action == ScenarioProbeAction::Hover && *hover_visible {
+                    let label_text = eval_render_value(label, context);
+                    if hover_target_matches(user_action, target_text.as_deref(), Some(&label_text))
+                    {
+                        return Some(RenderProbeTarget {
+                            element_id,
+                            element_label: render_target_label(id, context, None),
+                        });
+                    }
+                }
+            }
+            RenderNode::Checkbox {
+                id, source, target, ..
+            } => {
+                if action != ScenarioProbeAction::Press {
+                    continue;
+                }
+                let element_id = render_id(id, context);
+                let occurrence = target_occurrence(target.as_ref(), context);
+                let target_text = target
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                if let Some(source) = source {
+                    let event = render_source_event(
+                        source,
+                        None,
+                        None,
+                        None,
+                        target_text.as_deref(),
+                        occurrence,
+                    );
+                    if expected_event_matches(&event, expected) {
+                        return Some(RenderProbeTarget {
+                            element_id,
+                            element_label: render_target_label(id, context, None),
+                        });
+                    }
+                }
+            }
+            RenderNode::Text { .. } => {}
+        }
+    }
+    None
+}
+
+fn expected_event_matches(
+    event: &serde_json::Value,
+    expected: Option<&BTreeMap<String, toml::Value>>,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    for key in ["source", "text", "key", "address", "target_text"] {
+        if let Some(expected_value) = toml_str(expected, key)
+            && event.get(key).and_then(serde_json::Value::as_str) != Some(expected_value)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn hover_target_matches(
+    user_action: Option<&BTreeMap<String, toml::Value>>,
+    target_text: Option<&str>,
+    label_text: Option<&str>,
+) -> bool {
+    let Some(hint) = user_action
+        .and_then(|action| toml_str(action, "target_text"))
+        .or_else(|| user_action.and_then(|action| toml_str(action, "target")))
+    else {
+        return true;
+    };
+    [target_text, label_text]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty() && (hint.contains(value) || value.contains(hint)))
+}
+
+fn render_target_label(id: &str, context: &RenderContext<'_>, key: Option<&RenderValue>) -> String {
+    if let Some(key) = key {
+        let key = eval_render_value(key, context);
+        if !key.is_empty() {
+            return format!("{id}_{key}");
+        }
+    }
+    if let Some(index) = context.index_stack.last() {
+        format!("{id}[{index}]")
+    } else {
+        id.to_owned()
     }
 }
 
 struct VisibleSourceTextProbe {
-    id: &'static str,
+    id: String,
     element_id: Id,
-    element_label: &'static str,
-    text: &'static str,
-    expected_text: Option<&'static str>,
-    source: &'static str,
-    key: Option<&'static str>,
-    address: Option<&'static str>,
-    target_text: Option<&'static str>,
+    element_label: String,
+    text: String,
+    expected_text: Option<String>,
+    source: String,
+    key: Option<String>,
+    address: Option<String>,
+    target_text: Option<String>,
     screenshot: PathBuf,
     scenario_step: Option<ScenarioStep>,
 }
 
 struct VisibleSourcePressProbe {
-    id: &'static str,
+    id: String,
     element_id: Id,
-    element_label: &'static str,
-    source: &'static str,
-    target_text: Option<&'static str>,
+    element_label: String,
+    source: String,
+    target_text: Option<String>,
+    double_click: bool,
     screenshot: PathBuf,
     scenario_step: Option<ScenarioStep>,
 }
 
 struct VisibleHoverProbe {
-    id: &'static str,
+    id: String,
     element_id: Id,
-    element_label: &'static str,
+    element_label: String,
     screenshot: PathBuf,
     scenario_step: Option<ScenarioStep>,
 }
@@ -1613,7 +1758,7 @@ async fn drive_visible_source_text_event_probe(
     let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     ply.set_text_value(probe.element_id.clone(), "");
-    let text_to_send = reverse_text(probe.text);
+    let text_to_send = reverse_text(&probe.text);
     let mut clicked = false;
     let mut typed = false;
     let mut send_error = None;
@@ -1650,11 +1795,11 @@ async fn drive_visible_source_text_event_probe(
         if should_type && !typed {
             typed = true;
             if focus_free {
-                ply.set_text_value(probe.element_id.clone(), probe.text);
+                ply.set_text_value(probe.element_id.clone(), &probe.text);
                 match focus_free_render_event(
                     state,
                     &probe.element_id,
-                    FocusFreeRenderAction::Change { text: probe.text },
+                    FocusFreeRenderAction::Change { text: &probe.text },
                 ) {
                     Ok(event) => {
                         record_ui_source_observation(event.clone());
@@ -1671,11 +1816,11 @@ async fn drive_visible_source_text_event_probe(
         }
         if typed
             && let Some(event) = matching_ui_source_observation(
-                probe.source,
-                probe.expected_text,
-                probe.key,
-                probe.address,
-                probe.target_text,
+                &probe.source,
+                probe.expected_text.as_deref(),
+                probe.key.as_deref(),
+                probe.address.as_deref(),
+                probe.target_text.as_deref(),
             )
         {
             observed_event = Some(event);
@@ -1715,7 +1860,7 @@ async fn drive_visible_source_submit_event_probe(
     let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     if !use_real_pointer {
-        ply.set_text_value(probe.element_id.clone(), probe.text);
+        ply.set_text_value(probe.element_id.clone(), &probe.text);
     } else {
         ply.set_text_value(probe.element_id.clone(), "");
     }
@@ -1753,7 +1898,7 @@ async fn drive_visible_source_submit_event_probe(
         if use_real_pointer && frame == 44 && !text_sent {
             text_sent = true;
             if send_error.is_none() && !probe.text.is_empty() {
-                if let Err(error) = send_real_keyboard_text(&reverse_text(probe.text)) {
+                if let Err(error) = send_real_keyboard_text(&reverse_text(&probe.text)) {
                     send_error = Some(error.to_string());
                 }
             }
@@ -1764,13 +1909,13 @@ async fn drive_visible_source_submit_event_probe(
         if should_send_key && !key_sent {
             key_sent = true;
             if focus_free {
-                ply.set_text_value(probe.element_id.clone(), probe.text);
+                ply.set_text_value(probe.element_id.clone(), &probe.text);
                 match focus_free_render_event(
                     state,
                     &probe.element_id,
                     FocusFreeRenderAction::Submit {
-                        text: probe.text,
-                        key: probe.key,
+                        text: &probe.text,
+                        key: probe.key.as_deref(),
                     },
                 ) {
                     Ok(event) => {
@@ -1780,7 +1925,7 @@ async fn drive_visible_source_submit_event_probe(
                     }
                     Err(error) => send_error = Some(error),
                 }
-            } else if let Some(key) = probe.key {
+            } else if let Some(key) = probe.key.as_deref() {
                 if send_error.is_none()
                     && let Err(error) = send_real_key(os_key_name(key))
                 {
@@ -1790,11 +1935,11 @@ async fn drive_visible_source_submit_event_probe(
         }
         if key_sent
             && let Some(event) = matching_ui_source_observation(
-                probe.source,
-                probe.expected_text,
-                probe.key,
-                probe.address,
-                probe.target_text,
+                &probe.source,
+                probe.expected_text.as_deref(),
+                probe.key.as_deref(),
+                probe.address.as_deref(),
+                probe.target_text.as_deref(),
             )
         {
             observed_event = Some(event);
@@ -1834,7 +1979,7 @@ async fn drive_visible_source_blur_event_probe(
     let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     if !use_real_pointer {
-        ply.set_text_value(probe.element_id.clone(), probe.text);
+        ply.set_text_value(probe.element_id.clone(), &probe.text);
         ply.set_focus(probe.element_id.clone());
     }
     let mut bounds = serde_json::Value::Null;
@@ -1861,7 +2006,7 @@ async fn drive_visible_source_blur_event_probe(
         match focus_free_render_event(
             state,
             &probe.element_id,
-            FocusFreeRenderAction::Blur { text: probe.text },
+            FocusFreeRenderAction::Blur { text: &probe.text },
         ) {
             Ok(event) => {
                 record_ui_source_observation(event.clone());
@@ -1875,11 +2020,11 @@ async fn drive_visible_source_blur_event_probe(
     for _ in 0..60 {
         draw_frame(ply, state).await;
         if let Some(event) = matching_ui_source_observation(
-            probe.source,
-            probe.expected_text,
-            probe.key,
-            probe.address,
-            probe.target_text,
+            &probe.source,
+            probe.expected_text.as_deref(),
+            probe.key.as_deref(),
+            probe.address.as_deref(),
+            probe.target_text.as_deref(),
         ) {
             observed_event = Some(event);
             break;
@@ -1916,7 +2061,7 @@ async fn drive_visible_source_escape_event_probe(
 ) -> serde_json::Value {
     clear_ui_source_observations();
     let focus_free = focus_free_headed();
-    ply.set_text_value(probe.element_id.clone(), probe.text);
+    ply.set_text_value(probe.element_id.clone(), &probe.text);
     let mut key_sent = false;
     let mut send_error = None;
     let mut observed_event = None;
@@ -1951,12 +2096,12 @@ async fn drive_visible_source_escape_event_probe(
                     let mut event = json!({
                         "source": probe.source
                     });
-                    if let Some(address) = probe.address
+                    if let Some(address) = probe.address.as_deref()
                         && let Some(object) = event.as_object_mut()
                     {
                         object.insert("address".to_owned(), json!(address));
                     }
-                    if let Some(target_text) = probe.target_text
+                    if let Some(target_text) = probe.target_text.as_deref()
                         && let Some(object) = event.as_object_mut()
                     {
                         object.insert("target_text".to_owned(), json!(target_text));
@@ -1966,11 +2111,11 @@ async fn drive_visible_source_escape_event_probe(
             }
         }
         if let Some(event) = matching_ui_source_observation(
-            probe.source,
-            probe.expected_text,
-            probe.key,
-            probe.address,
-            probe.target_text,
+            &probe.source,
+            probe.expected_text.as_deref(),
+            probe.key.as_deref(),
+            probe.address.as_deref(),
+            probe.target_text.as_deref(),
         ) {
             observed_event = Some(event);
             break;
@@ -2021,10 +2166,27 @@ async fn drive_visible_source_press_event_probe(
             input_sent = true;
             if use_real_pointer {
                 match element_bounds {
-                    Some(element_bounds) => match send_real_pointer_click(element_bounds) {
-                        Ok(target) => input_target = target,
-                        Err(error) => send_error = Some(error.to_string()),
-                    },
+                    Some(element_bounds) => {
+                        match send_real_pointer_click(element_bounds) {
+                            Ok(target) => input_target = target,
+                            Err(error) => send_error = Some(error.to_string()),
+                        }
+                        if probe.double_click && send_error.is_none() {
+                            for _ in 0..3 {
+                                draw_frame(ply, state).await;
+                                next_frame().await;
+                            }
+                            match send_real_pointer_click(element_bounds) {
+                                Ok(target) => {
+                                    input_target = json!({
+                                        "first_click": input_target,
+                                        "second_click": target
+                                    });
+                                }
+                                Err(error) => send_error = Some(error.to_string()),
+                            }
+                        }
+                    }
                     None => send_error = Some("visible target bounds were unavailable".to_owned()),
                 }
             } else {
@@ -2048,8 +2210,13 @@ async fn drive_visible_source_press_event_probe(
             }
         }
         if input_sent
-            && let Some(event) =
-                matching_ui_source_observation(probe.source, None, None, None, probe.target_text)
+            && let Some(event) = matching_ui_source_observation(
+                &probe.source,
+                None,
+                None,
+                None,
+                probe.target_text.as_deref(),
+            )
         {
             observed_event = Some(event);
             break;
@@ -2098,8 +2265,8 @@ async fn drive_visible_source_press_event_probe(
             "real OS keyboard activation reached a visible app control and the control emitted the expected Boon SOURCE event observation"
         },
         "input_backend": if focus_free { "ply-synthetic-focus-free" } else if use_real_pointer { "os_pointer" } else { "os_keyboard" },
-        "keyboard_tool": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!("wtype") },
-        "keyboard_tool_path": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!(command_path("wtype")) },
+        "keyboard_tool": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!(os_keyboard_tool_name()) },
+        "keyboard_tool_path": if focus_free || use_real_pointer { serde_json::Value::Null } else { json!(command_path(os_keyboard_tool_name())) },
         "pointer_tool": use_real_pointer.then_some("xtest-or-ydotool"),
         "pointer_tool_path": if use_real_pointer { json!(command_path("ydotool")) } else { serde_json::Value::Null },
         "input_sent": input_sent,
@@ -2277,8 +2444,8 @@ async fn capture_visible_source_probe_result(
             "real OS keyboard input reached a visible app control and the control emitted the expected Boon SOURCE event observation"
         },
         "input_backend": input_backend,
-        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
-        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!(os_keyboard_tool_name()) },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path(os_keyboard_tool_name())) },
         "pointer_tool": matches!(input_backend, "os_pointer_then_keyboard" | "os_pointer_blur").then_some("xtest-or-ydotool"),
         "pointer_tool_path": if matches!(input_backend, "os_pointer_then_keyboard" | "os_pointer_blur") { json!(command_path("ydotool")) } else { serde_json::Value::Null },
         "input_sent": input_sent,
@@ -2286,7 +2453,7 @@ async fn capture_visible_source_probe_result(
         "send_error": send_error,
         "expected_source_event": {
             "source": probe.source,
-            "text": probe.text,
+            "text": probe.expected_text,
             "key": probe.key,
             "address": probe.address,
             "target_text": probe.target_text
@@ -2307,10 +2474,6 @@ async fn capture_visible_source_probe_result(
         "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
         "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
     })
-}
-
-fn scenario_step_by_id(scenario: &Scenario, id: &str) -> Option<ScenarioStep> {
-    scenario.step.iter().find(|step| step.id == id).cloned()
 }
 
 fn live_output_summary(output: Option<&LiveStepOutput>) -> serde_json::Value {
@@ -2449,7 +2612,7 @@ async fn playground_surface_visible_bounds_for_all_views(
 
 fn playground_surface_visible_bounds(ply: &Ply<()>) -> serde_json::Value {
     let groups: [(&str, &[&str]); 7] = [
-        ("example_selector", &["nav_todomvc", "nav_cells"]),
+        ("example_selector", example_nav_ids()),
         ("code_editor", &["source_editor"]),
         (
             "run_reset_step_controls",
@@ -2541,8 +2704,9 @@ async fn drive_visible_step_control_sequence(
     let mut observations = Vec::new();
     for step_index in 1..scenario.step.len() {
         let step = &scenario.step[step_index];
+        let artifact_prefix = report_artifact_prefix(report, example);
         let screenshot = report.with_file_name(format!(
-            "{example}-headed-step-{step_index:02}-{}.png",
+            "{artifact_prefix}-step-{step_index:02}-{}.png",
             sanitize_artifact_label(&step.id)
         ));
         let observation =
@@ -2618,8 +2782,8 @@ async fn drive_visible_step_control_once(
             "OS keyboard Enter reached focused visible Ply Step control, which advanced the scenario prefix in the playground"
         },
         "input_backend": if focus_free { "ply-synthetic-focus-free" } else { "os_keyboard" },
-        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!("wtype") },
-        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path("wtype")) },
+        "keyboard_tool": if focus_free { serde_json::Value::Null } else { json!(os_keyboard_tool_name()) },
+        "keyboard_tool_path": if focus_free { serde_json::Value::Null } else { json!(command_path(os_keyboard_tool_name())) },
         "key_sent": key_sent,
         "send_error": send_error,
         "observed_step_limit": observed_limit,
@@ -2747,7 +2911,7 @@ async fn run_os_pointer_probe_in_window(
         "click_target": click_target,
         "pointer_over_after_attempt": pointer_over,
         "observed_mouse_position": observed_mouse_position,
-        "coordinate_contract": "target screen coordinates are reported from macroquad window position plus Ply element center; XTest receives absolute X11/XWayland screen coordinates first, then ydotool receives the same absolute screen coordinates as fallback; the report records the selected backend and relative delta for diagnosis",
+        "coordinate_contract": "target screen coordinates are reported from macroquad window position plus Ply element center; XTest receives absolute X11/XWayland screen coordinates when DISPLAY is available, then ydotool receives the relative move delta as fallback; the report records the selected backend and coordinates for diagnosis",
         "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         "input_route_contract": "OS pointer event should hit a visible Ply button and be observed through Ply is_just_pressed",
         "artifact": {
@@ -2773,7 +2937,7 @@ fn skipped_os_pointer_probe(screenshot: &PathBuf) -> serde_json::Value {
         "click_target": null,
         "pointer_over_after_attempt": false,
         "observed_mouse_position": null,
-        "coordinate_contract": "target screen coordinates are reported from macroquad window position plus Ply element center; XTest receives absolute X11/XWayland screen coordinates first, then ydotool receives the same absolute screen coordinates as fallback; the report records the selected backend and relative delta for diagnosis",
+        "coordinate_contract": "target screen coordinates are reported from macroquad window position plus Ply element center; XTest receives absolute X11/XWayland screen coordinates when DISPLAY is available, then ydotool receives the relative move delta as fallback; the report records the selected backend and coordinates for diagnosis",
         "xtest_available": xtest_pointer_backend_available(),
         "input_route_contract": "OS pointer event should hit a visible Ply button and be observed through Ply is_just_pressed",
         "skip_reason": "BOON_ALLOW_OS_POINTER_PROBE=1 is required because this probe moves and clicks the real desktop pointer",
@@ -2826,6 +2990,12 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
     ply.set_debug_mode(false);
     let probe = run_os_keyboard_probe_in_window(&mut ply, &token, &screenshot).await?;
     let passed = probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let display_server = display_server();
+    let input_backend = if display_server == "x11" {
+        "xdotool-real-keyboard-events"
+    } else {
+        "wtype-real-keyboard-events"
+    };
     let report_json = json!({
         "status": if passed { "pass" } else { "fail" },
         "report_version": 1,
@@ -2836,14 +3006,15 @@ async fn run_verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::e
         "exit_status": if passed { 0 } else { 1 },
         "binary_hash": current_binary_hash(),
         "input_injection_method": "os_keyboard_to_visible_window",
-        "input_backend": "wtype-real-keyboard-events",
+        "input_backend": input_backend,
+        "input_isolation": std::env::var("BOON_OS_INPUT_ISOLATED").unwrap_or_else(|_| "live-desktop".to_owned()),
         "input_route_contract": "focused Ply text input receives token from OS keyboard event path",
         "focused_window_proof": "probe set Ply focus to os_probe_input and received the exact token through text input state",
         "window_mode": "headed",
         "window_backend": "ply-engine/macroquad",
         "window_pid": std::process::id(),
         "window_title": "Boon Circuit Ply Playground",
-        "display_server": display_server(),
+        "display_server": display_server,
         "display_socket_or_compositor_connection": display_socket(),
         "native_display_contract": native_display_contract(),
         "display_scale": screen_dpi_scale(),
@@ -2963,7 +3134,7 @@ fn reverse_text(value: &str) -> String {
 }
 
 async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let example = value_after(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let example = value_after(args, "--example").unwrap_or_else(default_example_name);
     let report = value_after(args, "--report")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -3094,16 +3265,12 @@ fn measure_example_switch_latency(
     ply: &mut Ply<()>,
     original: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let alternate = if original == "todomvc" {
-        "cells"
-    } else {
-        "todomvc"
-    };
+    let alternate = alternate_example_name(original);
     state.load_example(alternate, ply)?;
     state.load_example(original, ply)?;
     let mut samples = Vec::new();
     let mut switches = Vec::new();
-    for iteration in 0..16 {
+    for iteration in 0..32 {
         let target = if iteration % 2 == 0 {
             alternate
         } else {
@@ -3112,11 +3279,13 @@ fn measure_example_switch_latency(
         let started = Instant::now();
         state.load_example(target, ply)?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let stage_timing = state.last_load_timing.clone().unwrap_or_else(|| json!({}));
         samples.push(elapsed_ms);
         switches.push(json!({
             "iteration": iteration,
             "target": target,
-            "elapsed_ms": elapsed_ms
+            "elapsed_ms": elapsed_ms,
+            "stage_timing": stage_timing
         }));
     }
     if state.selected != original {
@@ -3170,16 +3339,19 @@ fn float_stats(mut values: Vec<f64>) -> serde_json::Value {
 async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
-    let selected = value_after(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let selected = value_after(args, "--example").unwrap_or_else(default_example_name);
     let view = PlaygroundView::from_mode_arg(args);
     let mut state = PlaygroundState::new(&selected, &mut ply)?;
     state.view = view;
+    if state.view == PlaygroundView::Source {
+        state.sync_source_editor(&mut ply);
+    }
     loop {
         if is_key_pressed(KeyCode::Key1) {
-            state.load_example("todomvc", &mut ply)?;
+            state.load_example(example_name_for_slot(0), &mut ply)?;
         }
         if is_key_pressed(KeyCode::Key2) {
-            state.load_example("cells", &mut ply)?;
+            state.load_example(example_name_for_slot(1), &mut ply)?;
         }
         if is_key_pressed(KeyCode::F5) {
             state.step_limit = None;
@@ -3193,6 +3365,7 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         }
         if is_key_pressed(KeyCode::S) {
             state.view = PlaygroundView::Source;
+            state.sync_source_editor(&mut ply);
         }
         if is_key_pressed(KeyCode::D) {
             state.view = PlaygroundView::Deltas;
@@ -3213,11 +3386,11 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             break;
         }
         draw_frame(&mut ply, &state).await;
-        if ply.is_just_pressed("nav_todomvc") {
-            state.load_example("todomvc", &mut ply)?;
+        if ply.is_just_pressed(example_nav_id_for_slot(0)) {
+            state.load_example(example_name_for_slot(0), &mut ply)?;
         }
-        if ply.is_just_pressed("nav_cells") {
-            state.load_example("cells", &mut ply)?;
+        if ply.is_just_pressed(example_nav_id_for_slot(1)) {
+            state.load_example(example_name_for_slot(1), &mut ply)?;
         }
         if ply.is_just_pressed("run_button") {
             state.step_limit = None;
@@ -3234,6 +3407,7 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         }
         if ply.is_just_pressed("view_source") {
             state.view = PlaygroundView::Source;
+            state.sync_source_editor(&mut ply);
         }
         if ply.is_just_pressed("view_deltas") {
             state.view = PlaygroundView::Deltas;
@@ -3248,7 +3422,7 @@ async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             state.view = PlaygroundView::Scenario;
         }
         state.apply_observed_ui_source_events();
-        state.run_editor_text_if_changed(&ply);
+        state.run_editor_text_if_changed(&mut ply);
         next_frame().await;
     }
     Ok(())
@@ -3319,14 +3493,17 @@ struct PlaygroundState {
     selected: String,
     view: PlaygroundView,
     scenario_path: PathBuf,
+    scenario: Option<Scenario>,
     scenario_len: usize,
     scenario_steps: Vec<String>,
     source_text_snapshot: String,
+    source_editor_synced: bool,
     render_nodes: Vec<RenderNode>,
     step_limit: Option<usize>,
     output: Option<RunOutput>,
     live_runtime: Option<LiveRuntime>,
     last_error: Option<String>,
+    last_load_timing: Option<serde_json::Value>,
 }
 
 impl PlaygroundState {
@@ -3335,14 +3512,17 @@ impl PlaygroundState {
             selected: example.to_owned(),
             view: PlaygroundView::App,
             scenario_path: PathBuf::new(),
+            scenario: None,
             scenario_len: 0,
             scenario_steps: Vec::new(),
             source_text_snapshot: String::new(),
+            source_editor_synced: false,
             render_nodes: Vec::new(),
             step_limit: None,
             output: None,
             live_runtime: None,
             last_error: None,
+            last_load_timing: None,
         };
         state.load_example(example, ply)?;
         Ok(state)
@@ -3358,14 +3538,17 @@ impl PlaygroundState {
             selected,
             view: PlaygroundView::App,
             scenario_path,
+            scenario: None,
             scenario_len,
             scenario_steps: Vec::new(),
             source_text_snapshot: String::new(),
+            source_editor_synced: false,
             render_nodes: Vec::new(),
             step_limit: None,
             output: Some(output),
             live_runtime: None,
             last_error: None,
+            last_load_timing: None,
         }
     }
 
@@ -3374,9 +3557,14 @@ impl PlaygroundState {
         example: &str,
         ply: &mut Ply<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let total_started = Instant::now();
         let (source, scenario, _) = example_paths(example)?;
+        let source_read_started = Instant::now();
         let source_text = std::fs::read_to_string(&source)?;
+        let source_read_ms = source_read_started.elapsed().as_secs_f64() * 1000.0;
+        let scenario_parse_started = Instant::now();
         let scenario_data = parse_scenario(&scenario)?;
+        let scenario_parse_ms = scenario_parse_started.elapsed().as_secs_f64() * 1000.0;
         self.selected = example.to_owned();
         self.scenario_steps = scenario_data
             .step
@@ -3385,29 +3573,72 @@ impl PlaygroundState {
             .collect();
         self.scenario_len = self.scenario_steps.len();
         self.scenario_path = scenario;
+        self.scenario = Some(scenario_data);
         self.step_limit = Some(1);
-        ply.set_text_value("source_editor", &source_text);
         self.source_text_snapshot = source_text.clone();
-        self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
-        self.run_text(&source_text);
+        self.source_editor_synced = false;
+        let runtime_init_started = Instant::now();
+        self.run_initial_text(&source_text)?;
+        let runtime_init_ms = runtime_init_started.elapsed().as_secs_f64() * 1000.0;
+        let view_parse_started = Instant::now();
+        self.render_nodes = self
+            .output
+            .as_ref()
+            .map(render_nodes_from_output)
+            .unwrap_or_default();
+        let view_parse_ms = view_parse_started.elapsed().as_secs_f64() * 1000.0;
+        let runtime_stage_timing = self
+            .output
+            .as_ref()
+            .and_then(|output| output.report.get("playground_initial_timing_ms"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if self.view == PlaygroundView::Source {
+            self.sync_source_editor(ply);
+        }
+        self.last_load_timing = Some(json!({
+            "example": example,
+            "source_read_ms": source_read_ms,
+            "scenario_parse_ms": scenario_parse_ms,
+            "view_parse_ms": view_parse_ms,
+            "runtime_initial_state_ms": runtime_init_ms,
+            "runtime_initial_stage_timing_ms": runtime_stage_timing,
+            "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
+        }));
         Ok(())
     }
 
     fn run_editor_text(&mut self, ply: &Ply<()>) {
-        let source_text = ply.get_text_value("source_editor").to_owned();
+        let source_text = if self.view == PlaygroundView::Source {
+            ply.get_text_value("source_editor").to_owned()
+        } else {
+            self.source_text_snapshot.clone()
+        };
         self.source_text_snapshot = source_text.clone();
-        self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
+        self.source_editor_synced = self.view == PlaygroundView::Source;
         self.run_text(&source_text);
     }
 
-    fn run_editor_text_if_changed(&mut self, ply: &Ply<()>) {
+    fn run_editor_text_if_changed(&mut self, ply: &mut Ply<()>) {
+        if self.view != PlaygroundView::Source {
+            return;
+        }
+        if !self.source_editor_synced {
+            self.sync_source_editor(ply);
+            return;
+        }
         let source_text = ply.get_text_value("source_editor").to_owned();
         if source_text != self.source_text_snapshot {
             self.source_text_snapshot = source_text.clone();
+            self.source_editor_synced = true;
             self.step_limit = Some(1);
-            self.render_nodes = parse_render_view(&source_text).unwrap_or_default();
             self.run_text(&source_text);
         }
+    }
+
+    fn sync_source_editor(&mut self, ply: &mut Ply<()>) {
+        ply.set_text_value("source_editor", &self.source_text_snapshot);
+        self.source_editor_synced = true;
     }
 
     fn reset_to_initial(&mut self, ply: &Ply<()>) {
@@ -3431,31 +3662,66 @@ impl PlaygroundState {
     }
 
     fn run_text(&mut self, source_text: &str) {
-        match run_scenario_source_with_step_limit(
-            &format!("playground-editor:{}", self.selected),
+        let output = self
+            .scenario
+            .as_ref()
+            .ok_or_else(|| {
+                format!(
+                    "playground scenario metadata is missing for {}",
+                    self.selected
+                )
+            })
+            .and_then(|scenario| {
+                run_scenario_source_with_parsed_scenario_step_limit(
+                    &format!("playground-editor:{}", self.selected),
+                    source_text,
+                    &self.scenario_path,
+                    scenario,
+                    VerificationLayer::Semantic,
+                    self.step_limit,
+                )
+                .map_err(|error| error.to_string())
+            });
+        match output {
+            Ok(output) => {
+                self.render_nodes = render_nodes_from_output(&output);
+                self.output = Some(output);
+                self.live_runtime = None;
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.render_nodes = Vec::new();
+                self.output = None;
+                self.live_runtime = None;
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn run_initial_text(&mut self, source_text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let scenario = self.scenario.as_ref().ok_or_else(|| {
+            format!(
+                "playground scenario metadata is missing for {}",
+                self.selected
+            )
+        })?;
+        match run_source_initial_state(
+            &format!("playground-initial:{}", self.selected),
             source_text,
             &self.scenario_path,
-            VerificationLayer::Semantic,
-            self.step_limit,
+            scenario,
         ) {
             Ok(output) => {
                 self.output = Some(output);
-                self.live_runtime = if self.step_limit == Some(1) {
-                    LiveRuntime::new(
-                        &format!("playground-live:{}", self.selected),
-                        source_text,
-                        &self.scenario_path,
-                    )
-                    .ok()
-                } else {
-                    None
-                };
+                self.live_runtime = None;
                 self.last_error = None;
+                Ok(())
             }
             Err(error) => {
                 self.output = None;
                 self.live_runtime = None;
                 self.last_error = Some(error.to_string());
+                Err(error)
             }
         }
     }
@@ -3465,6 +3731,7 @@ impl PlaygroundState {
         event: LiveSourceEvent,
         scenario_step: Option<&ScenarioStep>,
     ) -> Result<LiveStepOutput, String> {
+        self.ensure_live_runtime()?;
         let live_runtime = self
             .live_runtime
             .as_mut()
@@ -3482,6 +3749,24 @@ impl PlaygroundState {
         } else {
             Err("playground output is not initialized".to_owned())
         }
+    }
+
+    fn ensure_live_runtime(&mut self) -> Result<(), String> {
+        if self.live_runtime.is_some() {
+            return Ok(());
+        }
+        if self.step_limit != Some(1) {
+            return Err("playground live runtime can only start from the initial step".to_owned());
+        }
+        self.live_runtime = Some(
+            LiveRuntime::new(
+                &format!("playground-live:{}", self.selected),
+                &self.source_text_snapshot,
+                &self.scenario_path,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(())
     }
 
     fn apply_observed_ui_source_events(&mut self) {
@@ -3533,7 +3818,7 @@ fn sync_render_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
     );
     for (id, value) in values {
         let is_focused = focused.as_ref() == Some(&id);
-        if is_focused && !value.is_empty() {
+        if is_focused {
             continue;
         }
         if ply.get_text_value(id.clone()) != value {
@@ -3790,8 +4075,14 @@ fn sidebar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
         .children(|ui| {
             ui.text("Boon Circuit", |text| text.font_size(20).color(0xF1F5FA));
             ui.text("Ply playground", |text| text.font_size(11).color(0xAFC1D6));
-            nav_item(ui, "nav_todomvc", "1 TodoMVC", state.selected == "todomvc");
-            nav_item(ui, "nav_cells", "2 Cells", state.selected == "cells");
+            for example in example_nav_specs() {
+                nav_item(
+                    ui,
+                    example.nav_id,
+                    example.label,
+                    state.selected == example.name,
+                );
+            }
             ui.text(&format!("step {}", step_label(state)), |text| {
                 text.font_size(11).color(0xAFC1D6)
             });
@@ -4719,39 +5010,15 @@ fn resolve_path<'a>(context: &'a RenderContext<'a>, path: &str) -> Option<&'a se
     Some(value)
 }
 
-fn parse_render_view(source: &str) -> Result<Vec<RenderNode>, String> {
-    let Some(lines) = render_view_lines(source) else {
-        return Ok(Vec::new());
-    };
-    parse_render_nodes(&lines)
+fn render_nodes_from_output(output: &RunOutput) -> Vec<RenderNode> {
+    parse_render_view_lines(&output.view_lines).unwrap_or_default()
 }
 
-fn render_view_lines(source: &str) -> Option<Vec<String>> {
-    let mut in_view = false;
-    let mut depth = 0i32;
-    let mut lines = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !in_view {
-            if trimmed == "VIEW {" {
-                in_view = true;
-                depth = 1;
-            }
-            continue;
-        }
-        for ch in trimmed.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if depth <= 0 {
-            return Some(lines);
-        }
-        lines.push(trimmed.to_owned());
+fn parse_render_view_lines(lines: &[String]) -> Result<Vec<RenderNode>, String> {
+    if lines.is_empty() {
+        return Ok(Vec::new());
     }
-    None
+    parse_render_nodes(&lines)
 }
 
 #[derive(Debug)]
@@ -5424,6 +5691,14 @@ fn display_server() -> String {
     }
 }
 
+fn os_keyboard_tool_name() -> &'static str {
+    if std::env::var("DISPLAY").is_ok() && std::env::var("WAYLAND_DISPLAY").is_err() {
+        "xdotool"
+    } else {
+        "wtype"
+    }
+}
+
 fn display_socket() -> String {
     std::env::var("WAYLAND_DISPLAY")
         .or_else(|_| std::env::var("DISPLAY"))
@@ -5434,9 +5709,14 @@ fn native_display_contract() -> serde_json::Value {
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
     let display = std::env::var("DISPLAY").ok();
+    let isolated_backend = std::env::var("BOON_OS_INPUT_ISOLATED").ok();
+    let isolated_x11 = isolated_backend.as_deref() == Some("xvfb")
+        && session_type.as_deref() == Some("x11")
+        && display.is_some();
+    let wayland_native = session_type.as_deref() == Some("wayland") && wayland_display.is_some();
     json!({
         "required": true,
-        "status": if session_type.as_deref() == Some("wayland") && wayland_display.is_some() {
+        "status": if wayland_native || isolated_x11 {
             "pass"
         } else {
             "fail"
@@ -5444,7 +5724,8 @@ fn native_display_contract() -> serde_json::Value {
         "xdg_session_type": session_type,
         "wayland_display": wayland_display,
         "display": display,
-        "contract": "native playground runs in a Wayland desktop session with WAYLAND_DISPLAY set; stricter socket-level proof is a follow-up gate"
+        "isolated_backend": isolated_backend,
+        "contract": "interactive native playground runs in a Wayland desktop session with WAYLAND_DISPLAY set; automated smoke and headed verifiers may use isolated Xvfb/X11 to avoid live desktop input or screenshots"
     })
 }
 
@@ -5463,6 +5744,20 @@ fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>>
     if os_input_forbidden() {
         return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
     }
+    if display_server() == "x11" {
+        let Some(xdotool) = command_path("xdotool") else {
+            return Err("xdotool is required for isolated X11 OS text input".into());
+        };
+        let status = std::process::Command::new(xdotool)
+            .args(["type", "--delay", "1", "--"])
+            .arg(text)
+            .status()?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("xdotool type exited with {status}").into())
+        };
+    }
     let Some(wtype) = command_path("wtype") else {
         return Err("wtype is required for the OS input probe".into());
     };
@@ -5477,6 +5772,19 @@ fn send_real_keyboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>>
 fn send_real_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
     if os_input_forbidden() {
         return Err("OS keyboard input is forbidden; use --verify-headed-focusless or unset BOON_FORBID_OS_INPUT only for an explicit OS input probe".into());
+    }
+    if display_server() == "x11" {
+        let Some(xdotool) = command_path("xdotool") else {
+            return Err("xdotool is required for isolated X11 OS key input".into());
+        };
+        let status = std::process::Command::new(xdotool)
+            .args(["key", "--delay", "1", os_key_name(key)])
+            .status()?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("xdotool key {key} exited with {status}").into())
+        };
     }
     let Some(wtype) = command_path("wtype") else {
         return Err("wtype is required for headed keyboard activation".into());
@@ -5519,16 +5827,16 @@ fn send_real_pointer_click(
                 .into(),
         );
     };
-    let screen_x_arg = format!("{}", screen_position[0]);
-    let screen_y_arg = format!("{}", screen_position[1]);
+    let delta_x_arg = format!("{}", delta[0]);
+    let delta_y_arg = format!("{}", delta[1]);
     let move_status = std::process::Command::new(&ydotool)
         .args([
             "mousemove",
             "--delay",
             "30",
             "--",
-            &screen_x_arg,
-            &screen_y_arg,
+            &delta_x_arg,
+            &delta_y_arg,
         ])
         .status()?;
     if !move_status.success() {
@@ -5548,7 +5856,7 @@ fn send_real_pointer_click(
         "element_center_local": [local_x, local_y],
         "screen_position": screen_position,
         "relative_move_delta": delta,
-        "mousemove_coordinate_mode": "absolute_screen",
+        "mousemove_coordinate_mode": "relative_delta",
         "mousemove_status": move_status.to_string(),
         "click_status": click_status.to_string()
     }))
@@ -5581,16 +5889,16 @@ fn send_real_pointer_move(
                 .into(),
         );
     };
-    let screen_x_arg = format!("{}", screen_position[0]);
-    let screen_y_arg = format!("{}", screen_position[1]);
+    let delta_x_arg = format!("{}", delta[0]);
+    let delta_y_arg = format!("{}", delta[1]);
     let move_status = std::process::Command::new(&ydotool)
         .args([
             "mousemove",
             "--delay",
             "30",
             "--",
-            &screen_x_arg,
-            &screen_y_arg,
+            &delta_x_arg,
+            &delta_y_arg,
         ])
         .status()?;
     if !move_status.success() {
@@ -5603,7 +5911,7 @@ fn send_real_pointer_move(
         "element_center_local": [local_x, local_y],
         "screen_position": screen_position,
         "relative_move_delta": delta,
-        "mousemove_coordinate_mode": "absolute_screen",
+        "mousemove_coordinate_mode": "relative_delta",
         "mousemove_status": move_status.to_string()
     }))
 }
@@ -5829,6 +6137,15 @@ fn sanitize_artifact_label(label: &str) -> String {
             }
         })
         .collect()
+}
+
+fn report_artifact_prefix(report: &Path, fallback: &str) -> String {
+    report
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{fallback}-headed"))
 }
 
 fn unix_seconds_string() -> String {

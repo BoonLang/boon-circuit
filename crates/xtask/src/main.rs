@@ -36,6 +36,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "write-manual-handoff",
     "verify-report-schema",
     "verify-runtime-finality",
+    "audit-machine-readiness",
     "audit-goal-readiness",
     "audit-manual-readiness",
     "verify-todomvc-headed-ply",
@@ -98,6 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "write-manual-handoff" => write_manual_handoff(&args),
         "verify-report-schema" => verify_reports_schema(),
         "verify-runtime-finality" => verify_runtime_finality(&args),
+        "audit-machine-readiness" => audit_machine_readiness(&args),
         "audit-goal-readiness" | "audit-manual-readiness" => audit_goal_readiness(&args),
         "bench-example" => bench_example(named_arg(&args, 1)?, &args),
         "verify-todomvc-semantic" => verify_specific("todomvc", VerificationLayer::Semantic, &args),
@@ -165,19 +167,53 @@ fn verify_specific(
     if matches!(layer, VerificationLayer::HeadedPly) {
         let _headed_lock = HeadedVerifierLock::acquire()?;
         let timeout = headed_verifier_timeout();
-        let mut command = Command::new("cargo");
-        command.args([
-            "run",
-            "--release",
-            "-p",
-            "boon_ply_playground",
-            "--",
-            "--verify-headed",
-            "--example",
-            name,
-            "--report",
-            report.to_str().ok_or("report path is not utf-8")?,
-        ]);
+        let report_path = report.to_str().ok_or("report path is not utf-8")?;
+        let mut command = if live_desktop_input_allowed() {
+            let mut command = Command::new("cargo");
+            command.args([
+                "run",
+                "--release",
+                "-p",
+                "boon_ply_playground",
+                "--",
+                "--verify-headed",
+                "--example",
+                name,
+                "--report",
+                report_path,
+            ]);
+            command
+        } else {
+            if command_path("xvfb-run").is_none() || command_path("xdotool").is_none() {
+                return Err(
+                    "headed OS-input verification runs in isolated Xvfb by default; install xvfb and xdotool, or set both BOON_ALLOW_LIVE_DESKTOP_INPUT=1 and BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1 for explicit live desktop input"
+                        .into(),
+                );
+            }
+            let mut command = Command::new("xvfb-run");
+            command.args([
+                "-a",
+                "-s",
+                "-screen 0 1600x1000x24",
+                "cargo",
+                "run",
+                "--release",
+                "-p",
+                "boon_ply_playground",
+                "--",
+                "--verify-headed",
+                "--example",
+                name,
+                "--report",
+                report_path,
+            ]);
+            command.env_remove("WAYLAND_DISPLAY");
+            command.env("XDG_SESSION_TYPE", "x11");
+            command.env("BOON_PLY_LINUX_BACKEND", "x11");
+            command.env("BOON_OS_INPUT_ISOLATED", "xvfb");
+            command.env("BOON_ALLOW_OS_POINTER_PROBE", "1");
+            command
+        };
         let status = match run_command_with_timeout(&mut command, timeout) {
             Ok(status) => status,
             Err(error) => {
@@ -426,6 +462,21 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         .get("stress_profiles")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let runtime_profile = speed_output
+        .report
+        .get("runtime_profile")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let runtime_profile_detail = speed_output
+        .report
+        .get("runtime_profile_detail")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let capacities = speed_output
+        .report
+        .get("capacities")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let bounded_allocs = speed_output
         .report
         .get("allocations")
@@ -460,6 +511,9 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
         "graph_rebuild_count": graph_rebuild_count,
         "allocations": allocations,
         "stress_profiles": stress_profiles,
+        "runtime_profile": runtime_profile,
+        "runtime_profile_detail": runtime_profile_detail,
+        "capacities": capacities,
         "per_step_pass_fail": [
             {
                 "id": "bench-iterations",
@@ -801,7 +855,7 @@ fn write_manual_template(name: &str, path: PathBuf) -> Result<(), Box<dyn std::e
         "source_hash": file_hash(&format!("examples/{name}.bn")),
         "scenario_path": scenario,
         "scenario_hash": file_hash(&format!("examples/{name}.scn")),
-        "program_hash": file_hash(&format!("examples/{name}.bn")),
+        "program_hash": headed_field("program_hash"),
         "budget_hash": file_hash(&format!("examples/{name}.budget.toml")),
         "graph_node_count": headed_field("graph_node_count"),
         "headed_report_path": headed_report_path,
@@ -860,6 +914,10 @@ fn prepare_human_report(name: &str, args: &[String]) -> Result<(), Box<dyn std::
     let capture_method = required_value_arg(args, "--capture-method")?;
     let window_pid = required_value_arg(args, "--window-pid")?;
     let focused_window_proof = required_value_arg(args, "--focused-window-proof")?;
+    let display_server = required_value_arg(args, "--display-server")?;
+    let display_connection = required_value_arg(args, "--display-connection")?;
+    let display_scale = required_value_arg(args, "--display-scale")?;
+    let window_backend = required_value_arg(args, "--window-backend")?;
     let artifacts = value_args(args, "--artifact");
     let passed_labels = value_args(args, "--pass-label")
         .into_iter()
@@ -933,21 +991,16 @@ fn prepare_human_report(name: &str, args: &[String]) -> Result<(), Box<dyn std::
                 .unwrap_or_else(|| "Boon Circuit Ply Playground".to_owned())
         ),
     );
-    if let Some(value) = value_arg(args, "--display-server") {
-        object.insert("display_server".to_owned(), json!(value));
-    }
-    if let Some(value) = value_arg(args, "--display-connection") {
-        object.insert(
-            "display_socket_or_compositor_connection".to_owned(),
-            json!(value),
-        );
-    }
-    if let Some(value) = value_arg(args, "--display-scale") {
-        object.insert("display_scale".to_owned(), json!(value.parse::<f64>()?));
-    }
-    if let Some(value) = value_arg(args, "--window-backend") {
-        object.insert("window_backend".to_owned(), json!(value));
-    }
+    object.insert("display_server".to_owned(), json!(display_server));
+    object.insert(
+        "display_socket_or_compositor_connection".to_owned(),
+        json!(display_connection),
+    );
+    object.insert(
+        "display_scale".to_owned(),
+        json!(display_scale.parse::<f64>()?),
+    );
+    object.insert("window_backend".to_owned(), json!(window_backend));
     object.insert(
         "input_backend".to_owned(),
         json!(
@@ -1044,20 +1097,31 @@ fn verify_examples_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let check_existing = args.iter().any(|arg| arg == "--check-existing");
     let aggregate_path =
         report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/examples-all.json"));
-    let example_reports = [
-        PathBuf::from("target/reports/todomvc-all.json"),
-        PathBuf::from("target/reports/cells-all.json"),
+    let examples = [
+        ("todomvc", PathBuf::from("target/reports/todomvc-all.json")),
+        ("cells", PathBuf::from("target/reports/cells-all.json")),
     ];
-    let todomvc_args = example_all_command_args("todomvc", &example_reports[0], check_existing);
-    if let Err(error) = verify_all_with_optional_report("todomvc", &todomvc_args) {
-        write_examples_all_blocked_debug_report(args, "todomvc", &error.to_string())?;
-        return Err(error);
+    let mut blockers = Vec::new();
+    for (name, report) in &examples {
+        let example_args = example_all_command_args(name, report, check_existing);
+        if let Err(error) = verify_all_with_optional_report(name, &example_args) {
+            blockers.push(((*name).to_owned(), error.to_string()));
+        }
     }
-    let cells_args = example_all_command_args("cells", &example_reports[1], check_existing);
-    if let Err(error) = verify_all_with_optional_report("cells", &cells_args) {
-        write_examples_all_blocked_debug_report(args, "cells", &error.to_string())?;
-        return Err(error);
+    if !blockers.is_empty() {
+        let _ = std::fs::remove_file(&aggregate_path);
+        write_examples_all_blocked_debug_report(args, &blockers)?;
+        return Err(blockers
+            .iter()
+            .map(|(name, error)| format!("{name}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+            .into());
     }
+    let example_reports = examples
+        .iter()
+        .map(|(_, report)| report.clone())
+        .collect::<Vec<_>>();
     for report in &example_reports {
         verify_report_schema(report)?;
     }
@@ -1105,18 +1169,36 @@ fn example_all_command_args(name: &str, report: &Path, check_existing: bool) -> 
 
 fn write_examples_all_blocked_debug_report(
     args: &[String],
-    blocked_example: &str,
-    error: &str,
+    blockers: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from("target/reports/debug/examples-all-blocked.json");
-    let blocked_debug_report = PathBuf::from(format!(
-        "target/reports/debug/{blocked_example}-all-blocked.json"
-    ));
-    let artifact_sha256s = if blocked_debug_report.exists() {
-        vec![artifact_hash(&blocked_debug_report)?]
-    } else {
-        Vec::new()
-    };
+    let artifact_sha256s = blockers
+        .iter()
+        .filter_map(|(name, _)| {
+            let path = PathBuf::from(format!("target/reports/debug/{name}-all-blocked.json"));
+            path.exists().then_some(path)
+        })
+        .map(|path| artifact_hash(&path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let per_step_pass_fail = blockers
+        .iter()
+        .map(|(name, error)| {
+            json!({
+                "id": format!("{name}:all:blocked"),
+                "pass": false,
+                "detail": error
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked_example_debug_reports = blockers
+        .iter()
+        .map(|(name, _)| PathBuf::from(format!("target/reports/debug/{name}-all-blocked.json")))
+        .collect::<Vec<_>>();
+    let blocker = blockers
+        .iter()
+        .map(|(name, error)| format!("{name}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
     let report = json!({
         "status": "fail",
         "report_version": 1,
@@ -1131,15 +1213,11 @@ fn write_examples_all_blocked_debug_report(
         "program_hash": "see blocked example",
         "budget_hash": "see blocked example",
         "graph_node_count": "see blocked example",
-        "per_step_pass_fail": [{
-            "id": format!("{blocked_example}:all:blocked"),
-            "pass": false,
-            "detail": error
-        }],
+        "per_step_pass_fail": per_step_pass_fail,
         "artifact_sha256s": artifact_sha256s,
-        "blocked_example": blocked_example,
-        "blocked_example_debug_report": blocked_debug_report,
-        "blocker": error,
+        "blocked_examples": blockers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "blocked_example_debug_reports": blocked_example_debug_reports,
+        "blocker": blocker,
         "note": "debug-only failure artifact; target/reports/examples-all.json is intentionally not written until every accepted example all report passes"
     });
     write_json(&path, &report)?;
@@ -1149,18 +1227,51 @@ fn write_examples_all_blocked_debug_report(
 fn verify_os_input_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report =
         report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/os-input-probe.json"));
-    let status = Command::new("cargo")
-        .args([
+    let _headed_lock = HeadedVerifierLock::acquire()?;
+    let report_path = report.to_str().ok_or("report path is not utf-8")?;
+    let mut command = if live_desktop_input_allowed() {
+        let mut command = Command::new("cargo");
+        command.args([
             "run",
+            "--release",
             "-p",
             "boon_ply_playground",
             "--",
             "--verify-os-input-probe",
             "--report",
-            report.to_str().ok_or("report path is not utf-8")?,
-        ])
-        .env("BOON_ALLOW_OS_INPUT_PROBE", "1")
-        .status()?;
+            report_path,
+        ]);
+        command
+    } else {
+        if command_path("xvfb-run").is_none() || command_path("xdotool").is_none() {
+            return Err(
+                "standalone OS-input probe runs in isolated Xvfb by default; install xvfb and xdotool, or set both BOON_ALLOW_LIVE_DESKTOP_INPUT=1 and BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1 for explicit live desktop input"
+                    .into(),
+            );
+        }
+        let mut command = Command::new("xvfb-run");
+        command.args([
+            "-a",
+            "-s",
+            "-screen 0 1200x800x24",
+            "cargo",
+            "run",
+            "--release",
+            "-p",
+            "boon_ply_playground",
+            "--",
+            "--verify-os-input-probe",
+            "--report",
+            report_path,
+        ]);
+        command.env_remove("WAYLAND_DISPLAY");
+        command.env("XDG_SESSION_TYPE", "x11");
+        command.env("BOON_PLY_LINUX_BACKEND", "x11");
+        command.env("BOON_OS_INPUT_ISOLATED", "xvfb");
+        command
+    };
+    command.env("BOON_ALLOW_OS_INPUT_PROBE", "1");
+    let status = run_command_with_timeout(&mut command, headed_verifier_timeout())?;
     if !status.success() {
         return Err("OS input probe failed".into());
     }
@@ -1254,25 +1365,51 @@ fn text_tail(text: &str, max_chars: usize) -> String {
     text.chars().skip(char_count - max_chars).collect()
 }
 
+fn isolated_smoke_launch_command(
+    example: &str,
+    report: &str,
+    frames: Option<&str>,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    if command_path("xvfb-run").is_none() {
+        return Err("playground smoke launch requires xvfb-run so screenshots do not capture the live desktop".into());
+    }
+    let mut command = Command::new("xvfb-run");
+    command.args([
+        "-a",
+        "-s",
+        "-screen 0 1600x1000x24",
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "boon_ply_playground",
+        "--",
+        "--smoke-launch",
+        "--example",
+        example,
+    ]);
+    if let Some(frames) = frames {
+        command.args(["--frames", frames]);
+    }
+    command.args(["--report", report]);
+    command.env_remove("WAYLAND_DISPLAY");
+    command.env("XDG_SESSION_TYPE", "x11");
+    command.env("BOON_PLY_LINUX_BACKEND", "x11");
+    command.env("BOON_OS_INPUT_ISOLATED", "xvfb");
+    Ok(command)
+}
+
 fn verify_playground_launch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let aggregate_path =
         report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/playground-launch.json"));
     let mut reports = Vec::new();
     for example in ["todomvc", "cells"] {
         let report = PathBuf::from(format!("target/reports/playground-launch-{example}.json"));
-        let mut command = Command::new("cargo");
-        command.args([
-            "run",
-            "--release",
-            "-p",
-            "boon_ply_playground",
-            "--",
-            "--smoke-launch",
-            "--example",
+        let mut command = isolated_smoke_launch_command(
             example,
-            "--report",
             report.to_str().ok_or("launch report path is not utf-8")?,
-        ]);
+            None,
+        )?;
         let status = run_command_with_timeout(&mut command, Duration::from_secs(60))?;
         if !status.success() {
             return Err(format!("playground launch smoke failed for {example}").into());
@@ -1345,8 +1482,13 @@ fn verify_playground_background_launch(args: &[String]) -> Result<(), Box<dyn st
                 "--workspace",
                 "boon-circuit",
                 "--",
+                "xvfb-run",
+                "-a",
+                "-s",
+                "-screen 0 1600x1000x24",
                 "cargo",
                 "run",
+                "--release",
                 "-p",
                 "boon_ply_playground",
                 "--",
@@ -1360,6 +1502,10 @@ fn verify_playground_background_launch(args: &[String]) -> Result<(), Box<dyn st
                     .to_str()
                     .ok_or("background report path is not utf-8")?,
             ])
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("BOON_PLY_LINUX_BACKEND", "x11")
+            .env("BOON_OS_INPUT_ISOLATED", "xvfb")
             .output()?;
         if !output.status.success() {
             return Err(format!(
@@ -1460,22 +1606,13 @@ fn verify_todomvc_reference_parity(args: &[String]) -> Result<(), Box<dyn std::e
     let smoke_png = capture_report.with_extension("png");
 
     if !args.iter().any(|arg| arg == "--use-existing-capture") {
-        let mut command = Command::new("cargo");
-        command.args([
-            "run",
-            "-p",
-            "boon_ply_playground",
-            "--",
-            "--smoke-launch",
-            "--example",
+        let mut command = isolated_smoke_launch_command(
             "todomvc",
-            "--frames",
-            "4",
-            "--report",
             capture_report
                 .to_str()
                 .ok_or("capture report path is not utf-8")?,
-        ]);
+            Some("4"),
+        )?;
         let status = run_command_with_timeout(&mut command, Duration::from_secs(90))?;
         if !status.success() {
             return Err("TodoMVC reference capture smoke launch failed".into());
@@ -1933,11 +2070,13 @@ fn audit_runtime_finality(
     let parser = read_source_for_audit("crates/boon_parser/src/lib.rs", checks, blockers)?;
     let ir = read_source_for_audit("crates/boon_ir/src/lib.rs", checks, blockers)?;
     let runtime = read_source_for_audit("crates/boon_runtime/src/lib.rs", checks, blockers)?;
+    let cli = read_source_for_audit("crates/boon_cli/src/main.rs", checks, blockers)?;
     let playground =
         read_source_for_audit("crates/boon_ply_playground/src/lib.rs", checks, blockers)?;
     let xtask = read_source_for_audit("crates/xtask/src/main.rs", checks, blockers)?;
     let readme = read_source_for_audit("README.md", checks, blockers)?;
     let decisions = read_source_for_audit("docs/architecture/DECISIONS.md", checks, blockers)?;
+    let ir_production = source_before_cfg_test(&ir);
 
     audit_runtime_finality_markers(
         checks,
@@ -1946,30 +2085,255 @@ fn audit_runtime_finality(
         &parser,
         &[
             "text: String",
+            "fn collect_ast_expressions",
+            "fn collect_structure",
+            "line_trimmed(source",
+            "trimmed.starts_with",
+            "line_has_lexeme",
+            "leading_field_name(trimmed)",
             "fn collect_expressions",
             "fn detect_kind",
             "source.contains(\"EXAMPLE TodoMVC\")",
             "source.contains(\"EXAMPLE Cells\")",
             "path.contains(\"todomvc\")",
             "path.contains(\"cells\")",
+            "source.lines()",
+            "pub lines: Vec<AstLine>",
+            "pub struct AstLine",
+            "pub struct AstItem",
+            "pub struct ParsedExpression",
+            "fn ast_lines(",
+            "fn ast_items(",
+            "fn ast_item(",
+            "line.lexemes",
+            "semantic_lines",
+            "collect_named_lines",
+            "line_source(source, line)",
+            "source_slice(source, line)",
+            "fn source_slice",
+            "trimmed.contains(\"SOURCE\")",
+            "trimmed.contains(\"HOLD\")",
+            "trimmed.contains(\"LIST\")",
+            "strip_view_blocks",
+            "strip_view_blocks_text",
+            "split_inclusive('\\n')",
+            "trimmed.split_whitespace().next() == Some(\"VIEW\")",
+            "matches!(name.as_str(), \"todo\" | \"cell\" | \"seed\")",
+            "matches!(segment, \"todo\" | \"cell\" | \"seed\")",
         ],
         "parser still depends on line/text/path heuristics instead of a structured AST",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "parser:structural-view-ast-boundary",
+        &parser,
+        &[
+            "AstStatementKind::View",
+            "pub is_view: bool",
+            "self.items.iter().filter(|item| !item.is_view)",
+            "&& !self.line_is_view(token.line)",
+            "AstStatementKind::View => {}",
+            "parses_view_structurally_without_semantic_source_leakage",
+        ],
+        "parser must keep VIEW in the AST and exclude it from semantic tables structurally, not by text stripping",
     );
     audit_runtime_finality_markers(
         checks,
         blockers,
         "ir:typed-ast-lowering-not-substrings",
-        &ir,
+        ir_production,
         &[
+            "fn ast_expression_node_kind",
+            "fn collect_field_defs",
+            "fn field_body",
+            "fn state_initial_value(body: &str)",
+            "fn list_append_trigger(body: &str",
+            "fn list_append_trigger_from_items",
+            "fn list_append_fields_from_items",
+            "fn record_append_fields",
+            "fn list_retain_predicate(body: &str)",
+            "fn call_arguments(body: &str",
+            "fn call_arguments_from_items",
+            "fn named_call_argument_from_items",
+            "field.has_then_from_local(&dependency.local_name)",
+            "field.has_token(\"Text/empty\")",
+            "fn field_initial_value_from_tokens",
+            "let initial = &item.symbols[..pipe_index]",
+            "fn text_trim_or_previous_expression",
+            "SourceBranch",
+            "field.body",
             "fn expression_node_kind",
             "expression_node_kind(&expr.text)",
             ".contains(\"SOURCE\")",
             "field.body.contains",
             "branch_text_for_source",
             "text.contains(\"todo.\")",
+            "source.contains(\".todo_\")",
+            "source.starts_with(\"todo.\")",
+            "target.starts_with(\"todo.\")",
+            "path_has_scope(target, \"todo\")",
+            "item_has_path(item, \"todo.completed\")",
+            "row_field: \"todo.completed\".to_owned()",
+            "selector: \"store.selected_filter\".to_owned()",
+            "unwrap_or_else(|| \"todos\".to_owned())",
+            "item.has_lexeme(",
+            "contains_sequence(",
+            "branch.contains(",
+            "lexeme.starts_with(\"List/\")",
             "path.contains(\"todomvc\")",
+            "program.source.lines()",
+            "body.contains(\"Formula/",
+            "body.contains(\"List/",
+            "body.contains(\"|> WHEN\")",
+            "body.contains(\"|> THEN\")",
+            "self.body.contains",
+            "fn path_has_indexed_scope",
+            "matches!(segment, \"todo\" | \"cell\" | \"seed\")",
+            "matches!(name.as_str(), \"store\" | \"todo\" | \"cell\")",
         ],
         "IR lowering still depends on expression text/body substring heuristics",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:typed-ids-not-raw-usize",
+        &ir,
+        &[
+            "pub struct ExprId(pub usize)",
+            "pub struct NodeId(pub usize)",
+            "pub struct ScopeId(pub usize)",
+            "pub struct SourceId(pub usize)",
+            "pub struct StateId(pub usize)",
+            "pub struct ListId(pub usize)",
+            "pub struct FieldId(pub usize)",
+            "pub row_scopes: Vec<RowScope>",
+            "pub id: NodeId",
+            "pub expr_id: Option<ExprId>",
+            "pub id: ScopeId",
+            "pub scope_id: Option<ScopeId>",
+            "pub row_scope_id: Option<ScopeId>",
+            "pub id: SourceId",
+            "pub id: StateId",
+            "pub id: ListId",
+            "pub id: FieldId",
+            "ScopeId(id)",
+            "StateId(id)",
+            "ListId(id)",
+            "FieldId(id)",
+        ],
+        "typed IR identifiers must be represented as typed newtypes instead of public raw usize slots",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:indexed-scope-derived-from-row-scope",
+        &ir,
+        &[
+            "fn path_has_parsed_row_scope(program: &ParsedProgram, path: &str) -> bool",
+            "fn row_scope_for_list",
+            "fn row_field_path_in_exprs",
+            "scope.list == list_name",
+            ".row_scope_functions",
+            "indexed_lowering_uses_parsed_row_scopes_not_fixed_names",
+        ],
+        "IR indexed/scoped lowering must be derived from parsed List/map row scopes, not fixed todo/cell/seed path names",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:source-refs-from-ast-paths",
+        &ir,
+        &[
+            "fn direct_source_refs(field: &FieldDef, program: &ParsedProgram) -> Vec<String>",
+            "fn references_path_expr(&self, path: &str, path_match: PathMatch) -> bool",
+            "AstExprKind::Path(parts) => path_parts_match(parts, &path_parts, path_match)",
+            "enum PathMatch",
+            "fn source_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch>",
+            "ast_exprs: Vec<AstExpr>",
+            "direct_source_refs_use_ast_paths_not_text_literals",
+        ],
+        "direct source reference discovery must use typed AST paths and ignore text literals",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:source-payload-schemas",
+        &ir,
+        &[
+            "pub payload_schema: SourcePayloadSchema",
+            "pub struct SourcePayloadSchema",
+            "pub enum SourcePayloadField",
+            "fn source_payload_schema(program: &ParsedProgram, source: &str) -> SourcePayloadSchema",
+            "fn match_arm_destructures_payload(&self, payload_field: &str) -> bool",
+            "SourcePayloadField::Text",
+            "SourcePayloadField::Key",
+            "SourcePayloadField::Address",
+        ],
+        "typed IR source ports must include payload schemas derived from AST source references and match-arm payload destructuring",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:view-bindings",
+        &ir,
+        &[
+            "pub view_bindings: Vec<ViewBinding>",
+            "pub struct ViewBinding",
+            "pub struct ViewBindingId(pub usize)",
+            "pub enum ViewBindingKind",
+            "fn view_bindings(",
+            "fn view_data_path(value: &str) -> Option<String>",
+            "ViewBindingKind::Source",
+            "ViewBindingKind::Data",
+            "ViewBindingKind::Target",
+        ],
+        "typed IR must expose VIEW data/source/target bindings instead of leaving all binding discovery to playground-side view-line parsing",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "parser:nested-operator-block-brackets",
+        &parser,
+        &[
+            "let mut stack = vec![close_token]",
+            "AstExprKind::Then {",
+            "output: ast_operator_block_expr",
+            "builds_hierarchical_statement_and_expression_ast",
+        ],
+        "parser must preserve THEN block outputs even when the block contains nested calls such as Bool/not()",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:list-remove-predicate-from-then-output",
+        &format!("{parser}\n{ir}"),
+        &[
+            "Then {",
+            "output: Option<usize>",
+            "fn list_remove_predicate_from_then_output",
+            "fn list_predicate_from_expr",
+            "list_remove_predicates_use_ast_then_outputs",
+        ],
+        "List/remove predicates must read structured THEN outputs before falling back to legacy branch token summaries",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "ir:list-source-from-ast-pipe-input",
+        &ir,
+        &[
+            "fn count_or_retain_source_list(field: &FieldDef) -> Option<String>",
+            "fn source_list_from_expr",
+            "field.has_operator(\"List/count\")",
+            "field.has_operator(\"List/retain\")",
+            "AstExprKind::Pipe { input, .. } => source_list_from_expr(field, *input)",
+            "fn previous_source_list_expr",
+            "fn list_retain_predicate_from_ast_arg",
+            "fn row_field_path_in_exprs",
+            "fn selected_filter_selector(field: &FieldDef) -> Option<String>",
+        ],
+        "List/count/List/retain source lists and simple predicates must be derived from typed AST pipe inputs, not bare parser item lines",
     );
     audit_runtime_finality_markers(
         checks,
@@ -1982,8 +2346,31 @@ fn audit_runtime_finality(
             "root: BTreeMap<String, RuntimeValue>",
             "lists: BTreeMap<String, KeyedList<GenericRow>>",
             "spare_rows: BTreeMap<String, Vec<GenericRow>>",
+            "struct GenericRow",
+            "struct RuntimeRow",
+            "field: String",
+            "BTreeMap<String, String>",
+            "list_capacities: BTreeMap<String, Option<usize>>",
+            "row_templates: BTreeMap<String, RuntimeRowTemplate>",
+            "slots: BTreeMap<String, usize>",
+            "memories: Vec<KeyedList<GenericRow>>",
+            "rows: Vec<Vec<GenericRow>>",
+            "self.list_slots.iter().find(|slot| slot.name == name)",
+            "self.list_slots.iter_mut().find(|slot| slot.name == name)",
         ],
         "runtime hot state is still generic row/map storage instead of typed columnar storage",
+    );
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "runtime:no-path-or-source-text-example-detection",
+        &runtime,
+        &[
+            "path.contains(\"todomvc\")",
+            "path.contains(\"cells\")",
+            "parsed.source.contains",
+        ],
+        "runtime validation still infers semantics from paths or raw source text instead of parsed/report metadata",
     );
     audit_runtime_finality_markers(
         checks,
@@ -1992,13 +2379,78 @@ fn audit_runtime_finality(
         &runtime,
         &[
             "routes: Vec<SourceRoute>",
+            "source_slots: BTreeMap<&'static str, SourceRouteIndex>",
             "self.routes.iter().find",
+            "boundary_labels",
+            "boundary_labels.iter",
             ".iter().position",
+            "source_id: Option<SourceId>",
+            "fn source_id_for_path(ir: &TypedProgram, path: &str) -> Option<SourceId>",
             "bindings: Vec<SourceBinding>",
+            "bindings: Vec<ListSourceBinding>",
             "self.bindings.iter().any",
             "self.bindings.retain",
         ],
         "runtime source/list route lookup still uses Vec scans or position lookups",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "runtime:dense-source-route-typed-source-ids",
+        &runtime,
+        &[
+            "source_id: SourceId",
+            "fn route_mut(&mut self, source: &'static str, source_id: SourceId)",
+            "fn for_source_id(&self, source_id: SourceId) -> Option<&SourceRoute>",
+            "fn actions_for_source_id(&self, source_id: SourceId)",
+            "fn source_id_for_path(ir: &TypedProgram, path: &str) -> RuntimeResult<SourceId>",
+        ],
+        "runtime source-route planning must carry typed IR SourceId values instead of public raw usize route ids",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "runtime:keyed-list-separate-order-valid-free-storage",
+        &runtime,
+        &[
+            "slots: Vec<Option<KeyedRow<T>>>",
+            "order: Vec<usize>",
+            "valid_slots: BitVec",
+            "free_slots: Vec<usize>",
+            "order_slots: Vec<Option<usize>>",
+            "fn row(&self, index: usize) -> Option<&KeyedRow<T>>",
+            "fn row_mut(&mut self, index: usize) -> Option<&mut KeyedRow<T>>",
+        ],
+        "KeyedList storage must use separate row slots, visible order, valid bits, and free-list storage instead of physically removing row values from the hot array",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "runtime:dirty-keysets-explicit-storage",
+        &runtime,
+        &[
+            "struct DirtyKeySets",
+            "struct DirtyKeyEntry",
+            "entries: Vec<DirtyKeyEntry>",
+            "dirty_key_sets: DirtyKeySets",
+            "fn mark_delta(&mut self, delta: &SemanticDelta<'_>)",
+            "fn mark_deltas(&mut self, deltas: &[SemanticDelta<'_>]) -> usize",
+            "fn mark_indexes(&mut self, list_id: &'static str, field_id: &'static str, indexes: &[usize])",
+        ],
+        "runtime dirty work must be represented as reusable dirty keyset storage, not only inferred after the fact from report deltas",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "runtime:sorted-source-label-fallback",
+        &runtime,
+        &[
+            "label_slots: Vec<SourceBoundaryLabel>",
+            ".binary_search_by(|label| label.source.cmp(source))",
+            "\"source_route_label_lookup_kind\": \"sorted_source_label_binary_search\"",
+            "source label slots must stay sorted for binary-search fallback",
+        ],
+        "runtime source label fallback must use a compiled sorted index instead of a linear label scan",
     );
     audit_runtime_finality_markers(
         checks,
@@ -2008,8 +2460,95 @@ fn audit_runtime_finality(
         &[
             "let generic_interpreter_complete = true;",
             "let example_behavior_adapter = false;",
+            "current prototype reports keyed dirty work, not scalar node dirty sets",
+            "runtime speed verifier does not open Ply; headed reports cover the real Ply surface",
+            "runtime speed verifier has no presented frames; headed reports capture the Ply window",
         ],
         "runtime completeness report fields are still hardcoded instead of derived",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:hardware-runtime-profile-capacities",
+        &cli,
+        &[
+            "\"runtime_profile\": runtime_profile",
+            "\"runtime_profile_detail\": hardware_profile.runtime_profile_detail(runtime_profile)",
+            "\"capacities\": capacities",
+            "\"hardware_bounded\"",
+            "fn capacity_report(",
+        ],
+        "hardware explanation reports must expose the same RuntimeProfile/capacity contract as executable reports",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:remaining-shells-derived-from-runtime-slices",
+        &runtime,
+        &[
+            "fn remaining_example_specific_shells(",
+            "generic_runtime_slices: &JsonValue",
+            "let active_slice = |patterns: &[&str]|",
+            "\"remaining_example_specific_shells\": remaining_shells",
+            "remaining_shells_are_derived_from_generic_runtime_slices",
+        ],
+        "remaining example-specific shell listings must be derived from generic runtime slice evidence, not hardcoded by example kind",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:generic-runtime-slices-derived-from-counts",
+        &runtime,
+        &[
+            "let source_routes_dense = compiled.source_route_count > 0",
+            "let update_branches_loaded = compiled.update_branch_count == ir.update_branches.len()",
+            "let list_operations_loaded = compiled.list_operation_count == ir.list_operations.len()",
+            "let has_indexed_routes = indexed_text_route_count > 0 || indexed_bool_route_count > 0",
+            "\"generic_source_event_ingest\": source_routes_dense",
+            "\"generic_source_route_action_executor\": route_action_count > 0",
+            "\"generic_render_lowering_plan\": has_render_bindings",
+            "\"view_binding_count\": compiled.view_binding_count",
+            "SourcePayloadCounts::from_ir(ir)",
+            "\"source_payload_schema_count\": source_payload_counts.schema_count",
+            "\"source_payload_text_field_count\": source_payload_counts.text_field_count",
+            "TypedStorageLayoutCounts::from_ir(ir)",
+            "\"typed_storage_layout\"",
+            "\"computed_from\": \"typed_ir_state_and_list_tables\"",
+            "\"list_order_storage_kind\": \"separate_visible_order_slots\"",
+            "\"list_valid_storage_kind\": \"bitvec_valid_slots\"",
+        ],
+        "generic runtime slice booleans must be derived from typed IR and compiled route/list counts instead of free-form true flags",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:human-pass-label-provenance",
+        &runtime,
+        &[
+            "fn command_argv_values_after",
+            "fn command_argv_value_after",
+            "command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
+            "command_argv pass labels do not exactly match the manual checklist labels",
+            "human_report_command_pass_labels_must_match_checklist",
+            "\"--display-server\"",
+            "\"--display-connection\"",
+            "\"--display-scale\"",
+            "\"--window-backend\"",
+        ],
+        "human reports must prove every passed manual checklist label and visible-session display metadata through prepare-human-report command provenance",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:prepare-human-visible-session-required",
+        &xtask,
+        &[
+            "let display_server = required_value_arg(args, \"--display-server\")?",
+            "let display_connection = required_value_arg(args, \"--display-connection\")?",
+            "let display_scale = required_value_arg(args, \"--display-scale\")?",
+            "let window_backend = required_value_arg(args, \"--window-backend\")?",
+        ],
+        "prepare-human-report must require explicit visible-session display metadata instead of inheriting headed verifier template values",
     );
     audit_runtime_finality_required_tokens(
         checks,
@@ -2027,6 +2566,14 @@ fn audit_runtime_finality(
         "verify-playground-genericity still reports only renderer slices, not source/headed/app-control probes",
     );
     audit_playground_probe_specificity(checks, blockers, &playground);
+    audit_runtime_finality_markers(
+        checks,
+        blockers,
+        "cli:default-scenario-from-parser-not-substrings",
+        &cli,
+        &["source.contains(\"cells\")", "source.contains(\"todomvc\")"],
+        "boon_cli default scenario selection still depends on source text substrings instead of the parsed EXAMPLE marker",
+    );
     audit_runtime_finality_markers(
         checks,
         blockers,
@@ -2087,6 +2634,10 @@ fn read_source_for_audit(
             Ok(String::new())
         }
     }
+}
+
+fn source_before_cfg_test(source: &str) -> &str {
+    source.split("\n#[cfg(test)]").next().unwrap_or(source)
 }
 
 fn audit_runtime_finality_markers(
@@ -2211,8 +2762,25 @@ fn audit_runtime_finality_docs(
         &[
             "Executable reports contain `runtime_execution` metadata. The current accepted semantic/headless/headed/speed reports must show that Boon source and typed IR are loaded, the static schedule is verified, and `example_behavior_adapter` is\n`false`.",
             "set `generic_interpreter_complete = true`, and\nset `example_behavior_adapter = false`. The headed reports now prove full\nOS pointer/keyboard coverage.",
+            "Live desktop injection is opt-in only with\n`BOON_ALLOW_LIVE_DESKTOP_INPUT=1`.",
+            "requested with `BOON_ALLOW_LIVE_DESKTOP_INPUT=1`. `verify-report-schema`",
         ],
         "README or architecture docs still overstate runtime/headed finality",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "docs:runtime-slice-evidence-documented",
+        &format!("{readme}\n{decisions}"),
+        &[
+            "generic_runtime_slice_evidence",
+            "computed from typed IR plus the compiled",
+            "checked against `compiled_schedule`",
+            "expression_coverage",
+            "computed from parser AST plus",
+            "`Unknown` expression",
+        ],
+        "README or architecture docs must document evidence-bound generic runtime and parser/lowering coverage claims",
     );
 }
 
@@ -2266,15 +2834,44 @@ fn audit_runtime_finality_reports(
     let speed_path = PathBuf::from("target/reports/todomvc-speed.json");
     if speed_path.exists() {
         let report = read_json(&speed_path)?;
-        let text = report.to_string();
-        let bounded_claim_with_null_capacity = text.contains("\"runtime_profile\":\"bounded")
-            && text.contains("\"list_capacity\":null");
+        let runtime_profile = report
+            .get("runtime_profile")
+            .and_then(serde_json::Value::as_str);
+        let bounded_claim = matches!(
+            runtime_profile,
+            Some("software_bounded" | "hardware_bounded")
+        );
+        let null_effective_capacity = report
+            .get("capacities")
+            .and_then(|capacities| capacities.get("lists"))
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|lists| {
+                lists.iter().any(|list| {
+                    list.get("effective_capacity")
+                        .is_none_or(serde_json::Value::is_null)
+                })
+            });
+        let legacy_null_capacity = report
+            .get("stress_profiles")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|profiles| {
+                profiles.iter().any(|profile| {
+                    profile
+                        .get("ir_runtime_proof")
+                        .and_then(|proof| proof.get("list_capacity"))
+                        .is_some_and(serde_json::Value::is_null)
+                })
+            });
+        let bounded_claim_with_null_capacity =
+            bounded_claim && (null_effective_capacity || legacy_null_capacity);
         push_audit_check(
             checks,
             blockers,
             "runtime-finality:todomvc-speed-bounded-capacity-honest",
             !bounded_claim_with_null_capacity,
-            format!("bounded_claim_with_null_capacity={bounded_claim_with_null_capacity}"),
+            format!(
+                "runtime_profile={runtime_profile:?}, null_effective_capacity={null_effective_capacity}, legacy_null_capacity={legacy_null_capacity}"
+            ),
             bounded_claim_with_null_capacity.then(|| {
                 format!(
                     "`{}` claims bounded execution while a list_capacity is null",
@@ -3599,7 +4196,8 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 "cargo xtask explain-todomvc-hardware --report target/reports/todomvc-hardware.json",
                 "cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --report target/reports/todomvc-cli-run.json",
                 "cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/cells-cli-run.json",
-                "cargo xtask verify-report-schema"
+                "cargo xtask verify-report-schema",
+                "cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json"
             ],
             "write_templates": [
                 "cargo xtask verify-todomvc-human --write-template --report target/reports/manual-templates/todomvc-human.json",
@@ -3611,19 +4209,19 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
             ],
             "background_launch_smoke": [
                 "cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json",
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --smoke-launch --example todomvc --frames 3 --report target/reports/playground-background-launch-todomvc.json",
-                "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --smoke-launch --example cells --frames 3 --report target/reports/playground-background-launch-cells.json"
+                "cosmic-background-launch --workspace boon-circuit -- xvfb-run -a -s \"-screen 0 1600x1000x24\" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 3 --report target/reports/playground-background-launch-todomvc.json",
+                "cosmic-background-launch --workspace boon-circuit -- xvfb-run -a -s \"-screen 0 1600x1000x24\" cargo run --release -p boon_ply_playground -- --smoke-launch --example cells --frames 3 --report target/reports/playground-background-launch-cells.json"
             ],
             "prepare_human_reports": [
-                "cargo xtask prepare-todomvc-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-todomvc-scenario-label> --report target/reports/todomvc-human.json",
-                "cargo xtask prepare-cells-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-cells-scenario-label> --report target/reports/cells-human.json"
+                "cargo xtask prepare-todomvc-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --display-server <wayland-or-x11> --display-connection <socket-or-display> --display-scale <scale> --window-backend <backend> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-todomvc-scenario-label> --report target/reports/todomvc-human.json",
+                "cargo xtask prepare-cells-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --display-server <wayland-or-x11> --display-connection <socket-or-display> --display-scale <scale> --window-backend <backend> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-cells-scenario-label> --report target/reports/cells-human.json"
             ],
             "final_aggregate": [
                 "cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json",
                 "cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json",
                 "cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json",
                 "cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json",
-                "cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json"
+                "cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json"
             ]
         }
     });
@@ -3651,12 +4249,13 @@ fn current_handoff_blockers() -> Vec<String> {
 }
 
 fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let report_path = report_arg(args)
-        .unwrap_or_else(|| PathBuf::from("target/reports/debug/goal-readiness.json"));
+    let report_path =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/goal-readiness.json"));
     let command_name = args
         .first()
         .map(String::as_str)
         .unwrap_or("audit-goal-readiness");
+    refresh_schema_summary_for_readiness_audit()?;
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
 
@@ -3721,6 +4320,101 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
         )
         .into())
     }
+}
+
+fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/debug/machine-readiness.json"));
+    let command_name = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("audit-machine-readiness");
+    refresh_schema_summary_for_readiness_audit()?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+
+    audit_top_level_report_schema(&mut checks, &mut blockers)?;
+    audit_recursive_report_schema_summary(&mut checks, &mut blockers)?;
+    audit_debug_blocked_reports(&mut checks, &mut blockers)?;
+    audit_foundation(&mut checks, &mut blockers)?;
+    audit_playground_launch(&mut checks, &mut blockers)?;
+    audit_playground_background_launch(&mut checks, &mut blockers)?;
+    audit_example_source_contracts(&mut checks, &mut blockers)?;
+    audit_scenario_coverage(&mut checks, &mut blockers)?;
+    audit_cli_scenario_reports(&mut checks, &mut blockers)?;
+    for name in ["todomvc", "cells"] {
+        audit_example_machine_readiness(name, &mut checks, &mut blockers)?;
+    }
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "machine-readiness:human-reports-deferred",
+        true,
+        "real human reports and final all aggregates are intentionally checked only by audit-goal-readiness",
+        None,
+    );
+    audit_benchmark_reports(&mut checks, &mut blockers)?;
+    audit_todomvc_hardware_plan(&mut checks, &mut blockers)?;
+    audit_playground_custom_source(&mut checks, &mut blockers)?;
+    audit_manual_handoff(&mut checks, &mut blockers)?;
+    audit_repo_handoff_docs(&mut checks, &mut blockers)?;
+    audit_scope_control(&mut checks, &mut blockers)?;
+    audit_runtime_finality(&mut checks, &mut blockers)?;
+    audit_xtask_command_surface(&mut checks, &mut blockers);
+
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let report = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": command_name,
+        "command_argv": args,
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_hash": "n/a",
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "per_step_pass_fail": checks,
+        "blockers": blockers,
+        "deferred_to_goal_readiness": [
+            "target/reports/todomvc-human.json",
+            "target/reports/cells-human.json",
+            "target/reports/todomvc-all.json",
+            "target/reports/cells-all.json",
+            "target/reports/examples-all.json"
+        ],
+        "artifact_sha256s": []
+    });
+    write_json(&report_path, &report)?;
+
+    let blockers = report
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command_name} blockers written to `{}`: {}",
+            report_path.display(),
+            blockers.join("; ")
+        )
+        .into())
+    }
+}
+
+fn refresh_schema_summary_for_readiness_audit() -> Result<(), Box<dyn std::error::Error>> {
+    if Path::new("target/reports").exists() {
+        verify_reports_schema()?;
+    }
+    Ok(())
 }
 
 fn audit_top_level_report_schema(
@@ -3816,17 +4510,24 @@ fn audit_recursive_report_schema_summary(
     }
 
     let summary = read_json(&summary_path)?;
-    let readiness_path = dir.join("debug/goal-readiness.json");
     let report_paths = collect_report_json_paths(dir)?;
     let expected_seen = report_paths
         .iter()
         .filter(|path| *path != &summary_path)
         .count() as u64;
-    let expected_artifact_paths = report_paths
-        .iter()
-        .filter(|path| *path != &summary_path && *path != &readiness_path)
-        .map(|path| path.display().to_string())
-        .collect::<BTreeSet<_>>();
+    let mut expected_artifact_paths = BTreeSet::new();
+    let mut readiness_paths = BTreeSet::new();
+    for path in &report_paths {
+        if path == &summary_path {
+            continue;
+        }
+        let report = read_json(path)?;
+        if report_is_readiness_audit(&report) {
+            readiness_paths.insert(path.display().to_string());
+            continue;
+        }
+        expected_artifact_paths.insert(path.display().to_string());
+    }
     let seen_count = report_check_count(&summary, "report-json-files-seen-recursively");
     push_audit_check(
         checks,
@@ -3881,18 +4582,21 @@ fn audit_recursive_report_schema_summary(
             )
         }),
     );
-    let readiness_hashed = artifact_paths.contains(&readiness_path.display().to_string());
+    let hashed_readiness_paths = readiness_paths
+        .intersection(&artifact_paths)
+        .cloned()
+        .collect::<Vec<_>>();
     push_audit_check(
         checks,
         blockers,
         "recursive-report-schema-summary:goal-readiness-excluded-from-artifacts",
-        !readiness_hashed,
-        "goal-readiness report is intentionally excluded from schema artifact hashes".to_owned(),
-        readiness_hashed.then(|| {
+        hashed_readiness_paths.is_empty(),
+        "readiness reports are intentionally excluded from schema artifact hashes".to_owned(),
+        (!hashed_readiness_paths.is_empty()).then(|| {
             format!(
-                "recursive schema summary `{}` hashes self-mutating readiness report `{}`",
+                "recursive schema summary `{}` hashes self-mutating readiness reports: {}",
                 summary_path.display(),
-                readiness_path.display()
+                hashed_readiness_paths.join(", ")
             )
         }),
     );
@@ -4056,7 +4760,11 @@ fn audit_debug_blocked_reports(
         let completed_reports_hashed =
             blocked_report_completed_artifacts_hashed(&report, "completed_layer_reports");
         let blocked_example_report_hashed =
-            blocked_report_completed_artifacts_hashed(&report, "blocked_example_debug_report");
+            blocked_report_completed_artifacts_hashed(&report, "blocked_example_debug_report")
+                || blocked_report_completed_artifacts_hashed(
+                    &report,
+                    "blocked_example_debug_reports",
+                );
         let pass = status_fail
             && exit_nonzero
             && command_blocked
@@ -4192,6 +4900,101 @@ fn audit_example_readiness(
             )),
         ),
     }
+    Ok(())
+}
+
+fn audit_example_machine_readiness(
+    name: &str,
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let required_layers = [
+        VerificationLayer::Semantic,
+        VerificationLayer::HeadlessPly,
+        VerificationLayer::HeadedPly,
+        VerificationLayer::Speed,
+        VerificationLayer::Negative,
+    ];
+    for layer in required_layers {
+        let report = report_path(name, layer);
+        if !report.exists() {
+            push_audit_check(
+                checks,
+                blockers,
+                format!("{name}:{}:report-present", layer.as_str()),
+                false,
+                format!("missing {}", report.display()),
+                Some(format!(
+                    "{name} missing {} report `{}`",
+                    layer.as_str(),
+                    report.display()
+                )),
+            );
+            continue;
+        }
+
+        match verify_report_schema(&report) {
+            Ok(()) => push_audit_check(
+                checks,
+                blockers,
+                format!("{name}:{}:schema", layer.as_str()),
+                true,
+                format!("{} schema valid", report.display()),
+                None,
+            ),
+            Err(error) => {
+                push_audit_check(
+                    checks,
+                    blockers,
+                    format!("{name}:{}:schema", layer.as_str()),
+                    false,
+                    error.to_string(),
+                    Some(format!(
+                        "{name} {} report `{}` is not schema-valid: {error}",
+                        layer.as_str(),
+                        report.display()
+                    )),
+                );
+                continue;
+            }
+        }
+
+        let report_json = read_json(&report)?;
+        if matches!(
+            layer,
+            VerificationLayer::Semantic
+                | VerificationLayer::HeadlessPly
+                | VerificationLayer::HeadedPly
+                | VerificationLayer::Speed
+        ) {
+            audit_runtime_execution(name, layer, &report, &report_json, checks, blockers);
+        }
+        if matches!(layer, VerificationLayer::HeadedPly) {
+            audit_headed_input(name, &report, &report_json, checks, blockers)?;
+            audit_playground_surface(name, &report, &report_json, checks, blockers);
+        }
+        if matches!(layer, VerificationLayer::Negative) {
+            audit_negative_report_contract(name, &report, &report_json, checks, blockers);
+        }
+    }
+
+    audit_manual_template_readiness(name, checks, blockers)?;
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:human:fresh-real-report-deferred"),
+        true,
+        "real human report is deliberately outside audit-machine-readiness and remains required by audit-goal-readiness",
+        None,
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:all:aggregate-report-deferred"),
+        true,
+        "final aggregate all report is deliberately outside audit-machine-readiness and remains required by audit-goal-readiness",
+        None,
+    );
     Ok(())
 }
 
@@ -4490,6 +5293,9 @@ fn audit_benchmark_reports(
                 "allocations",
                 "graph_rebuild_count",
                 "stress_profiles",
+                "runtime_profile",
+                "runtime_profile_detail",
+                "capacities",
             ] {
                 let copied_field_matches = report.get(field) == linked.get(field);
                 push_audit_check(
@@ -5288,20 +6094,20 @@ fn audit_todomvc_list_capacity_contract(
     .is_some_and(|error| {
         error
             .to_string()
-            .contains("list `todos` initializes 2 rows beyond declared capacity 1")
+            .contains("list `todos` initializes 4 rows beyond declared capacity 1")
     });
     push_audit_check(
         checks,
         blockers,
         "source-contract:todomvc:list-capacity-initializer-overflow-rejected",
         oversized_initializer_rejected,
-        "checked TodoMVC LIST[1] rejects two-row initializer overflow",
+        "checked TodoMVC LIST[1] rejects four-row initializer overflow",
         (!oversized_initializer_rejected).then(|| {
             "TodoMVC bounded LIST capacity does not reject oversized initializers".to_owned()
         }),
     );
 
-    let append_overflow_source = source.replacen("LIST {", "LIST[2] {", 1);
+    let append_overflow_source = source.replacen("LIST {", "LIST[4] {", 1);
     let append_overflow_rejected = run_scenario_source_with_step_limit(
         "capacity-audit:todomvc",
         &append_overflow_source,
@@ -5313,14 +6119,14 @@ fn audit_todomvc_list_capacity_contract(
     .is_some_and(|error| {
         error
             .to_string()
-            .contains("generic list `todos` capacity 2 exceeded by append")
+            .contains("generic list `todos` capacity 4 exceeded by append")
     });
     push_audit_check(
         checks,
         blockers,
         "source-contract:todomvc:list-capacity-append-overflow-rejected",
         append_overflow_rejected,
-        "checked TodoMVC LIST[2] rejects append overflow",
+        "checked TodoMVC LIST[4] rejects append overflow",
         (!append_overflow_rejected)
             .then(|| "TodoMVC bounded LIST capacity does not reject append overflow".to_owned()),
     );
@@ -5823,6 +6629,33 @@ fn audit_runtime_execution(
             layer.as_str()
         )),
     );
+    let shell_policy = execution
+        .get("remaining_example_specific_shell_policy")
+        .and_then(serde_json::Value::as_str)
+        == Some("scenario_assertion_report_glue_only");
+    let shell_listed = execution
+        .get("remaining_example_specific_shells")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|shells| !shells.is_empty());
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:{}:remaining-shell-listed", layer.as_str()),
+        shell_policy && shell_listed,
+        format!(
+            "remaining_example_specific_shell_policy={:?}, shell_count={}",
+            execution.get("remaining_example_specific_shell_policy"),
+            execution
+                .get("remaining_example_specific_shells")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+        ),
+        (!(shell_policy && shell_listed)).then_some(format!(
+            "{name} {} report does not explicitly list the remaining example-specific scenario/assertion/report glue",
+            layer.as_str()
+        )),
+    );
 
     let implementation = execution
         .get("implementation")
@@ -5837,6 +6670,51 @@ fn audit_runtime_execution(
         format!("implementation={implementation}"),
         (!implementation_final).then_some(format!(
             "{name} {} report implementation still says `{implementation}`",
+            layer.as_str()
+        )),
+    );
+
+    let coverage = report
+        .get("expression_coverage")
+        .and_then(serde_json::Value::as_object);
+    let coverage_source = coverage
+        .and_then(|coverage| coverage.get("computed_from"))
+        .and_then(serde_json::Value::as_str)
+        == Some("parser_ast_and_typed_ir");
+    let unknown_count = coverage
+        .map(|coverage| {
+            [
+                "unknown_ast_expression_count",
+                "unknown_initial_value_count",
+                "unknown_list_initializer_count",
+                "unknown_list_seed_value_count",
+                "unknown_update_expression_count",
+                "unknown_list_predicate_count",
+                "unknown_derived_value_count",
+            ]
+            .iter()
+            .map(|key| {
+                coverage
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+            })
+            .sum::<u64>()
+        })
+        .unwrap_or(1);
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:{}:expression-coverage", layer.as_str()),
+        coverage_source && unknown_count == 0,
+        format!(
+            "computed_from={:?}, unknown_count={unknown_count}",
+            coverage
+                .and_then(|coverage| coverage.get("computed_from"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!(coverage_source && unknown_count == 0)).then_some(format!(
+            "{name} {} report does not prove parser/IR expression coverage without unknown fallback",
             layer.as_str()
         )),
     );
@@ -7210,6 +8088,39 @@ fn audit_todomvc_hardware_plan(
     let bounded_profile = plan
         .get("bounded_storage_profile")
         .unwrap_or(&serde_json::Value::Null);
+    let runtime_profile_is_hardware_bounded = report
+        .get("runtime_profile")
+        .and_then(serde_json::Value::as_str)
+        == Some("hardware_bounded")
+        && report
+            .get("runtime_profile_detail")
+            .and_then(|detail| detail.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("hardware_bounded")
+        && report
+            .get("capacities")
+            .and_then(|capacities| capacities.get("all_lists_bounded"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    push_audit_check(
+        checks,
+        blockers,
+        "todomvc:hardware-plan:runtime-profile-hardware-bounded",
+        runtime_profile_is_hardware_bounded,
+        format!(
+            "runtime_profile={:?}, runtime_profile_detail.name={:?}, all_lists_bounded={:?}",
+            report.get("runtime_profile"),
+            report
+                .get("runtime_profile_detail")
+                .and_then(|detail| detail.get("name")),
+            report
+                .get("capacities")
+                .and_then(|capacities| capacities.get("all_lists_bounded"))
+        ),
+        (!runtime_profile_is_hardware_bounded).then(|| {
+            "TodoMVC hardware report must expose runtime_profile=hardware_bounded with bounded capacities".to_owned()
+        }),
+    );
     let fpga_profile_selected = bounded_profile
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -7413,6 +8324,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "write-manual-handoff",
         "verify-report-schema",
         "verify-runtime-finality",
+        "audit-machine-readiness",
         "audit-goal-readiness",
         "audit-manual-readiness",
         "verify-todomvc-headed-ply",
@@ -7567,8 +8479,9 @@ fn audit_manual_handoff(
         "cargo xtask verify-todomvc-all --check-existing",
         "cargo xtask verify-cells-all --check-existing",
         "cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json",
+        "cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json",
         "cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json",
-        "cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json",
+        "cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json",
     ] {
         let present = report
             .get("manual_testing_commands")
@@ -7614,7 +8527,7 @@ fn audit_repo_handoff_docs(
                 "manual_report_prepared_by",
                 "cosmic-background-launch --workspace boon-circuit -- cargo run -p boon_ply_playground -- --example todomvc",
                 "BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply",
-                "cargo xtask audit-goal-readiness --report target/reports/debug/goal-readiness.json",
+                "cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json",
             ],
         ),
     ];
@@ -7685,6 +8598,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "write-manual-handoff"
             | "verify-report-schema"
             | "verify-runtime-finality"
+            | "audit-machine-readiness"
             | "audit-goal-readiness"
             | "audit-manual-readiness"
             | "bench-example"
@@ -9386,6 +10300,24 @@ fn generic_runtime_execution_fixture(name: &str) -> serde_json::Value {
         "generic_interpreter_complete": true,
         "example_behavior_adapter": false,
         "adapter_kind": name,
+        "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
+        "remaining_example_specific_shells": match name {
+            "todomvc" => json!([
+                "todomvc_scenario_glue",
+                "todomvc_assertion_glue",
+                "todomvc_report_glue",
+                "todomvc_render_patch_report_glue",
+                "todomvc_stress_report_glue"
+            ]),
+            "cells" => json!([
+                "cells_scenario_glue",
+                "cells_assertion_glue",
+                "cells_report_glue",
+                "cells_render_patch_report_glue",
+                "cells_stress_report_glue"
+            ]),
+            _ => json!([])
+        },
         "generic_runtime_slices": slices
     })
 }
@@ -9605,6 +10537,14 @@ fn prepare_human_report_rejects_bad_pass_labels(
         std::process::id().to_string(),
         "--focused-window-proof".to_owned(),
         "negative fixture supplied focus proof so pass-label validation is reached".to_owned(),
+        "--display-server".to_owned(),
+        "wayland".to_owned(),
+        "--display-connection".to_owned(),
+        "wayland-1".to_owned(),
+        "--display-scale".to_owned(),
+        "1.0".to_owned(),
+        "--window-backend".to_owned(),
+        "ply-engine/macroquad".to_owned(),
         "--notes".to_owned(),
         "manual label negative fixture".to_owned(),
         "--capture-method".to_owned(),
@@ -9713,7 +10653,6 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
     let mut debug_dumps = 0usize;
     let mut debug_auxiliary = 0usize;
     let summary_path = dir.join("schema.json");
-    let readiness_path = dir.join("debug/goal-readiness.json");
     let mut artifact_hashes = Vec::new();
     for path in collect_report_json_paths(dir)? {
         if path == summary_path {
@@ -9725,7 +10664,7 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if path != readiness_path {
+        if schema_summary_should_hash_report(&path, &report, &summary_path) {
             artifact_hashes.push(artifact_hash(&path)?);
         }
         let full_pass_report = status == "pass"
@@ -9741,7 +10680,12 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(error) => return Err(error),
             }
-        } else if status == "fail" && path.starts_with(dir.join("debug")) {
+        } else if status == "fail"
+            && (path.starts_with(dir.join("debug")) || report_is_blocker_audit(&report))
+        {
+            if report_is_blocker_audit(&report) {
+                verify_report_schema(&path)?;
+            }
             debug_failures += 1;
         } else if status == "needs_manual" && path.starts_with(dir.join("manual-templates")) {
             manual_templates += 1;
@@ -9782,6 +10726,33 @@ fn verify_reports_schema() -> Result<(), Box<dyn std::error::Error>> {
     write_json(&summary_path, &summary)?;
     verify_report_schema(&summary_path)?;
     Ok(())
+}
+
+fn report_is_readiness_audit(report: &serde_json::Value) -> bool {
+    matches!(
+        report.get("command").and_then(serde_json::Value::as_str),
+        Some("audit-machine-readiness" | "audit-goal-readiness" | "audit-manual-readiness")
+    )
+}
+
+fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
+    matches!(
+        report.get("command").and_then(serde_json::Value::as_str),
+        Some(
+            "audit-machine-readiness"
+                | "audit-goal-readiness"
+                | "audit-manual-readiness"
+                | "verify-runtime-finality"
+        )
+    )
+}
+
+fn schema_summary_should_hash_report(
+    path: &Path,
+    report: &serde_json::Value,
+    summary_path: &Path,
+) -> bool {
+    path != summary_path && !report_is_readiness_audit(report)
 }
 
 fn is_debug_auxiliary_report(
@@ -9905,6 +10876,23 @@ fn report_arg(args: &[String]) -> Option<PathBuf> {
     args.windows(2)
         .find(|window| window[0] == "--report")
         .map(|window| PathBuf::from(&window[1]))
+}
+
+fn command_path(command: &str) -> Option<String> {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {command}")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+}
+
+fn live_desktop_input_allowed() -> bool {
+    std::env::var("BOON_ALLOW_LIVE_DESKTOP_INPUT").as_deref() == Ok("1")
+        && std::env::var("BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS").as_deref()
+            == Ok("1")
 }
 
 fn value_arg(args: &[String], flag: &str) -> Option<String> {

@@ -433,7 +433,7 @@ delta output FIFO
 Hard gate:
 
 ```text
-cargo run -p boon_cli -- explain-hardware examples/todomvc.bn --profile fpga_todomvc
+cargo run -p boon_cli -- explain-hardware examples/todomvc.bn --target fpga_todomvc
 ```
 
 The output should show that row retention and source routing are implemented as

@@ -118,6 +118,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .get("allocations")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let runtime_profile = speed_output
+        .report
+        .get("runtime_profile")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let runtime_profile_detail = speed_output
+        .report
+        .get("runtime_profile_detail")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let capacities = speed_output
+        .report
+        .get("capacities")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let stress_profiles = speed_output
         .report
         .get("stress_profiles")
@@ -156,6 +171,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "render_patch_count_p50_p95_p99_max": render_patch_count,
         "graph_rebuild_count": graph_rebuild_count,
         "allocations": allocations,
+        "runtime_profile": runtime_profile,
+        "runtime_profile_detail": runtime_profile_detail,
+        "capacities": capacities,
         "stress_profiles": stress_profiles,
         "per_step_pass_fail": [
             {

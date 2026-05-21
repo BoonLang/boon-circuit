@@ -54,16 +54,30 @@ by `docs/architecture/RUNTIME_MODEL.md` and
 - Make report claims derived, not self-attested.
   `generic_interpreter_complete`, `example_behavior_adapter = false`, and
   similar fields must be computed from static/runtime coverage, not hardcoded
-  booleans. Any remaining TodoMVC/Cells shell must be listed explicitly as an
-  allowed scenario/assertion shell until removed.
+  booleans. Reports must include `generic_runtime_slice_evidence` derived from
+  typed IR plus the compiled program, and schema checks must bind that evidence
+  to `compiled_schedule` instead of accepting free-form capability claims. Any
+  accepted executable report must also include `expression_coverage`, computed
+  from parser AST plus typed IR, with zero `Unknown` expression, initializer,
+  update, or predicate fallback counts.
+  remaining TodoMVC/Cells shell must be listed explicitly as an
+  allowed scenario/assertion/report shell through
+  `remaining_example_specific_shells` until removed.
 
 - Separate verification categories honestly.
   Focusless headed reports must say they are synthetic/focusless. Full OS-input
   claims require canonical `todomvc-headed-ply.json` and `cells-headed-ply.json`,
   current hashes, real OS pointer/keyboard backend per user-action step, and no
-  synthetic observations. `verify-report-schema` should be renamed or
+  synthetic observations. Those canonical headed aliases run in isolated
+  Xvfb/X11 by default; live desktop injection is not allowed unless explicitly
+  requested with both `BOON_ALLOW_LIVE_DESKTOP_INPUT=1` and
+  `BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`.
+  `verify-report-schema`
+  should be renamed or
   supplemented so it means "existing reports are schema-valid", not "readiness
-  passed".
+  passed". Failing readiness/finality audit reports are schema-valid only as
+  blocker evidence: they must have nonzero `exit_status`, explicit blockers,
+  and failing checks.
 
 - Extend genericity gates.
   `verify-playground-genericity` must scan renderer, `VIEW` parser,
@@ -103,12 +117,25 @@ by `docs/architecture/RUNTIME_MODEL.md` and
 - Audits/reports:
 
   ```bash
-  cargo xtask verify-examples-all
   cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
   cargo xtask verify-runtime-finality
+  cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+  cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
   cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
   cargo xtask verify-report-schema
   ```
+
+  `audit-machine-readiness` is the unattended implementation gate. It must pass
+  before handoff and must not count missing real human reports as accepted.
+  Readiness audits refresh the recursive schema summary before inspecting it, so
+  this command order is valid even though earlier commands rewrite report
+  artifacts.
+  `verify-examples-all` and `audit-goal-readiness` are final acceptance gates:
+  they require fresh checked `target/reports/todomvc-human.json` and
+  `target/reports/cells-human.json` reports from a real visible manual session,
+  plus the dependent `*-all.json` aggregates. If those human reports are
+  missing, the correct result is failure with explicit blockers, not a synthetic
+  pass or a weakened schema.
 
   Add negative fixtures for synthetic reports pretending to be full OS-input
   reports.
@@ -156,12 +183,15 @@ Implement completely:
 
 10. Update docs honestly. Architecture/plans/README must describe the implemented state. If anything remains prototype-only, name it as a blocker and make audit-goal-readiness fail until resolved.
 
-Do not stop until these pass from a clean tree:
+Do not stop until these pass from a clean tree, except that the final
+`verify-*-all`, `verify-examples-all`, and `audit-goal-readiness` commands must
+remain blocked when no real human TodoMVC/Cells reports exist:
 cargo fmt --check
 cargo test -p boon_parser -p boon_ir -p boon_runtime -p boon_ply_playground
-cargo xtask verify-examples-all
 cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
 cargo xtask verify-runtime-finality
+cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 cargo xtask verify-report-schema
 

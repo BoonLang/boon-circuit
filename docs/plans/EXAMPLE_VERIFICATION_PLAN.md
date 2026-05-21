@@ -73,10 +73,12 @@ the parser, IR, runtime, and whole workspace test suites. It writes
 `target/reports/foundation.json`, and readiness auditing treats that report as
 required evidence alongside the example reports.
 
-`verify-playground-launch` opens the real native Ply playground for TodoMVC and
-Cells in bounded smoke mode. It captures nonblank screenshots and records the
-surface controls that should be visible before manual testing. It is not an
-input or manual acceptance substitute.
+`verify-playground-launch` opens the native Ply playground for TodoMVC and
+Cells in bounded smoke mode inside isolated Xvfb/X11. It captures nonblank
+macroquad framebuffer screenshots and records the surface controls that should
+be visible before manual testing. It is not an input or manual acceptance
+substitute, and it must not fall back to whole-desktop COSMIC screenshots for
+accepted launch artifacts.
 
 `audit-goal-readiness` also enforces interpreter-phase scope. It rejects
 forbidden first-pass substrates such as Differential Dataflow, actor runtimes,
@@ -360,12 +362,26 @@ typed_ir_loaded
 static_schedule_verified
 generic_interpreter_complete
 example_behavior_adapter
+generic_runtime_slices
+generic_runtime_slice_evidence
+expression_coverage
 ```
 
 This is an honesty field, not decorative metadata. During the prototype it may
 say that the run is still adapter-backed, but that must remain visible in the
 report until the generic static-graph interpreter executes the source equations
-directly.
+directly. `generic_runtime_slice_evidence` must be computed from the typed IR
+and compiled program, and the checker must reject reports where the evidence
+counts do not match `compiled_schedule`. `expression_coverage` must be computed
+from parser AST plus typed IR, and executable reports must be rejected if any
+accepted semantic path relies on `Unknown` expression, initializer, update, or
+predicate fallback.
+
+Hardware explanation reports are not exempt from profile honesty. The TodoMVC
+FPGA report must include `runtime_profile`, `runtime_profile_detail`, and
+`capacities` using the same schema as runtime reports, with
+`runtime_profile = "hardware_bounded"` and fixed effective capacities derived
+from the selected target profile.
 
 If VRAM cannot be read on a platform, the report must say so explicitly and the
 headed/manual visual pass still remains required.

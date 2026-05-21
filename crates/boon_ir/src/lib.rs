@@ -974,11 +974,9 @@ fn derived_then_empty_update_branches(
     for dependency in fields.iter().filter(|dependency| {
         dependency.parent_path == field.parent_path
             && dependency.path != field.path
-            && text_mentions_identifier(&field.body, &dependency.local_name)
-            && field
-                .body
-                .contains(&format!("{} |> THEN", dependency.local_name))
-            && field.body.contains("Text/empty")
+            && field.mentions_identifier(&dependency.local_name)
+            && field.has_then_from_local(&dependency.local_name)
+            && field.has_token("Text/empty")
     }) {
         for source in direct_source_refs(dependency, program) {
             if branches
@@ -1027,7 +1025,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                 .iter()
                 .find_map(|variant| branch_text_for_source(&field.body, variant))
                 .unwrap_or_default();
-            if branch.contains("List/remove") || field.body.contains("List/remove") {
+            if branch.contains("List/remove") || field.has_token("List/remove") {
                 operations.push(ListOperation {
                     list: list_name.to_owned(),
                     kind: ListOperationKind::Remove {
@@ -1039,7 +1037,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
         }
     }
     for field in &fields {
-        if field.body.contains("List/count") {
+        if field.has_token("List/count") {
             operations.push(ListOperation {
                 list: count_or_retain_source_list(&field.body)
                     .unwrap_or_else(|| "todos".to_owned()),
@@ -1048,7 +1046,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                     predicate: list_retain_predicate(&field.body),
                 },
             });
-        } else if field.body.contains("List/retain") {
+        } else if field.has_token("List/retain") {
             operations.push(ListOperation {
                 list: count_or_retain_source_list(&field.body)
                     .unwrap_or_else(|| "todos".to_owned()),
@@ -1591,6 +1589,27 @@ struct FieldDef {
     body: String,
 }
 
+impl FieldDef {
+    fn has_token(&self, token: &str) -> bool {
+        text_has_token(&self.body, token)
+    }
+
+    fn mentions_identifier(&self, identifier: &str) -> bool {
+        text_mentions_identifier(&self.body, identifier)
+    }
+
+    fn has_then_from_local(&self, local_name: &str) -> bool {
+        self.body
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with(local_name) && line.contains("|> THEN"))
+    }
+
+    fn references_source_variant(&self, source_variant: &str) -> bool {
+        self.body.contains(source_variant)
+    }
+}
+
 fn candidate_sources_for_path(
     target: &str,
     fields: &[FieldDef],
@@ -1609,7 +1628,7 @@ fn candidate_sources_for_path(
     for dependency in fields.iter().filter(|candidate| {
         candidate.parent_path == field.parent_path
             && candidate.path != field.path
-            && text_mentions_identifier(&field.body, &candidate.local_name)
+            && field.mentions_identifier(&candidate.local_name)
     }) {
         for source in candidate_sources_for_path(&dependency.path, fields, program, visited) {
             push_unique(&mut candidates, source);
@@ -1624,7 +1643,7 @@ fn direct_source_refs(field: &FieldDef, program: &ParsedProgram) -> Vec<String> 
     for source in &program.source_ports {
         if source_ref_variants(&source.path)
             .iter()
-            .any(|variant| field.body.contains(variant))
+            .any(|variant| field.references_source_variant(variant))
         {
             push_unique(&mut sources, source.path.clone());
         }
@@ -1689,7 +1708,7 @@ fn collect_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
 }
 
 fn should_record_field(trimmed: &str, local_name: &str, scope: &[(usize, String)]) -> bool {
-    !trimmed.contains("SOURCE")
+    !line_has_token(trimmed, "SOURCE")
         && local_name != "sources"
         && !scope.iter().any(|(_, name)| name == "sources")
         && scope
@@ -1735,7 +1754,7 @@ fn leading_field_name(trimmed: &str) -> Option<&str> {
 }
 
 fn opens_scope(trimmed: &str) -> bool {
-    if trimmed.contains("SOURCE") {
+    if line_has_token(trimmed, "SOURCE") {
         return false;
     }
     trimmed.ends_with(':')
@@ -1759,6 +1778,15 @@ fn scope_path(scope: &[(usize, String)]) -> Option<String> {
 fn text_mentions_identifier(text: &str, identifier: &str) -> bool {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .any(|part| part == identifier)
+}
+
+fn line_has_token(line: &str, token: &str) -> bool {
+    text_has_token(line, token)
+}
+
+fn text_has_token(text: &str, token: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '/' | '-')))
+        .any(|part| part == token)
 }
 
 fn push_unique(output: &mut Vec<String>, value: String) {

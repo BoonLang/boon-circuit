@@ -880,6 +880,7 @@ fn write_manual_template(name: &str, path: PathBuf) -> Result<(), Box<dyn std::e
         "window_backend": headed_string("window_backend", "ply-engine/macroquad"),
         "display_scale": headed_field("display_scale"),
         "window_pid": "fill-visible-playground-window-pid",
+        "window_pid_cmdline": "filled-by-prepare-human-report-from-proc-cmdline",
         "window_title": "Boon Circuit Ply Playground",
         "input_backend": "human-visible-window-pointer-keyboard",
         "capture_backend": "fill-manual-capture-backend",
@@ -1038,9 +1039,11 @@ fn prepare_human_report(name: &str, args: &[String]) -> Result<(), Box<dyn std::
         )
         .into());
     }
+    let window_pid_cmdline = visible_playground_process_cmdline(window_pid_value)?;
     for (label, value) in checklist {
         *value = json!(passed_labels.contains(label));
     }
+    object.insert("window_pid_cmdline".to_owned(), json!(window_pid_cmdline));
     object.insert(
         "checkpoint_screenshot_or_video_paths".to_owned(),
         json!(artifacts),
@@ -1091,6 +1094,29 @@ fn prepare_human_report(name: &str, args: &[String]) -> Result<(), Box<dyn std::
         template.display()
     );
     Ok(())
+}
+
+fn visible_playground_process_cmdline(pid: u64) -> Result<String, Box<dyn std::error::Error>> {
+    let cmdline_path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+    let raw = std::fs::read(&cmdline_path).map_err(|error| {
+        format!(
+            "manual visible window pid `{pid}` is not inspectable through `{}`: {error}",
+            cmdline_path.display()
+        )
+    })?;
+    let cmdline = raw
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !cmdline.contains("boon_ply_playground") {
+        return Err(format!(
+            "manual visible window pid `{pid}` is not a boon_ply_playground process: `{cmdline}`"
+        )
+        .into());
+    }
+    Ok(cmdline)
 }
 
 fn verify_examples_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2596,6 +2622,21 @@ fn audit_runtime_finality(
             "\"--window-backend\"",
         ],
         "human reports must prove every passed manual checklist label and visible-session display metadata through prepare-human-report command provenance",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
+        "reports:human-visible-pid-cmdline-provenance",
+        &format!("{runtime}\n{xtask}"),
+        &[
+            "fn visible_playground_process_cmdline(",
+            "/proc/{pid}/cmdline",
+            "not a boon_ply_playground process",
+            "\"window_pid_cmdline\"",
+            "manual report window_pid_cmdline does not prove a Boon playground process",
+            "visible_playground_pid_rejects_non_playground_process",
+        ],
+        "prepare-human-report must prove the supplied visible-window pid is a running Boon playground process and carry that cmdline into the checked human report",
     );
     audit_runtime_finality_required_tokens(
         checks,
@@ -11186,5 +11227,17 @@ mod tests {
                 "documented xtask command `{command}` is missing from help"
             );
         }
+    }
+
+    #[test]
+    fn visible_playground_pid_rejects_non_playground_process() {
+        let error = visible_playground_process_cmdline(u64::from(std::process::id()))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            error.contains("not a boon_ply_playground process"),
+            "unexpected error: {error}"
+        );
     }
 }

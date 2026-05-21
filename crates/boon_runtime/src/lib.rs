@@ -3540,6 +3540,7 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         "window_backend",
         "display_scale",
         "window_pid",
+        "window_pid_cmdline",
         "window_title",
         "input_backend",
         "capture_backend",
@@ -3572,6 +3573,7 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
         "display_socket_or_compositor_connection",
         "window_backend",
         "display_scale",
+        "window_pid_cmdline",
         "window_title",
         "input_backend",
         "capture_backend",
@@ -3821,6 +3823,14 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
     if json_u64_field(report, "window_pid")? == 0 {
         return Err(format!(
             "{} manual report has invalid visible-window pid",
+            report_path.display()
+        )
+        .into());
+    }
+    let window_pid_cmdline = json_str_field(report, "window_pid_cmdline")?;
+    if !window_pid_cmdline.contains("boon_ply_playground") {
+        return Err(format!(
+            "{} manual report window_pid_cmdline does not prove a Boon playground process",
             report_path.display()
         )
         .into());

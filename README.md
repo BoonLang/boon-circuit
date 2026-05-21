@@ -208,7 +208,9 @@ target/reports/cells-human.json
 
 Use the manual helper from `docs/plans/MANUAL_TESTING_RUNBOOK.md`; it requires
 the visible manual playground process id and a short focus proof, not the older
-headed verifier process id:
+headed verifier process id. The helper inspects `/proc/<pid>/cmdline`, requires
+that pid to be a running `boon_ply_playground` process, and stores the cmdline
+as `window_pid_cmdline` in the checked human report:
 
 ```bash
 cargo xtask prepare-todomvc-human-report --observer <real-name> --started <unix-start> --finished <unix-finish> --window-pid <visible-playground-pid> --focused-window-proof <how-focus-was-confirmed> --display-server <wayland-or-x11> --display-connection <socket-or-display> --display-scale <scale> --window-backend <backend> --notes <visual-notes> --capture-method <tool-used> --artifact <manual-png-or-video> --pass-label <each-todomvc-scenario-label> --report target/reports/todomvc-human.json

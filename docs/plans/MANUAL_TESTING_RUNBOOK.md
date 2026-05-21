@@ -217,7 +217,10 @@ The helper writes `visual_checkpoint_pass_fail` entries for every supplied
 manual artifact, and the checker rejects checkpoints that are hashed but not
 listed as visually passed.
 `--window-pid` is the visible manual playground process, not the earlier headed
-verifier process copied into the template for binding context.
+verifier process copied into the template for binding context. The helper reads
+`/proc/<pid>/cmdline`, requires the process to be `boon_ply_playground`, and
+writes `window_pid_cmdline` into the report so checker mode can reject reports
+that did not bind the manual pass to a visible playground process.
 The helper also writes `manual_report_prepared_by`,
 `manual_report_template_path`, and `manual_report_template_sha256`; checker mode
 rejects hand-written reports that do not come through that prepared template.

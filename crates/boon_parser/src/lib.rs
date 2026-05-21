@@ -75,7 +75,8 @@ pub struct ParsedExpression {
     pub id: usize,
     pub line: usize,
     pub kind: ParsedExpressionKind,
-    pub text: String,
+    pub label: String,
+    pub indexed_hint: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,10 +145,11 @@ pub fn parse_source(
     validate_no_reducer_style_update(&path, &source)?;
     validate_no_hidden_identity_leak(&path, &source, kind)?;
     let semantic_source = strip_view_blocks(&source);
+    let semantic_ast = parse_ast(&path, &semantic_source)?;
     let row_scope_functions = collect_row_scope_functions(&semantic_source);
     let structure = collect_structure(&semantic_source, &row_scope_functions);
     Ok(ParsedProgram {
-        expressions: collect_expressions(&semantic_source),
+        expressions: collect_ast_expressions(&semantic_ast),
         sources: collect_sources(&semantic_source),
         source_ports: structure.source_ports,
         holds: collect_named_lines(&semantic_source, "HOLD"),
@@ -504,53 +506,92 @@ fn collect_sources(source: &str) -> Vec<String> {
         .collect()
 }
 
-fn collect_expressions(source: &str) -> Vec<ParsedExpression> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(line, text)| {
-            let trimmed = text.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-            let kind = if trimmed.contains("SOURCE") {
-                ParsedExpressionKind::Source
-            } else if trimmed.contains("HOLD") {
-                ParsedExpressionKind::Hold
-            } else if trimmed.contains("LIST") || trimmed.contains("Grid/cells") {
-                ParsedExpressionKind::List
-            } else if trimmed.starts_with("FUNCTION ") {
-                ParsedExpressionKind::Function
-            } else if [
-                "THEN",
-                "WHEN",
-                "WHILE",
-                "LATEST",
-                "List/map",
-                "List/append",
-                "List/remove",
-                "List/retain",
-                "List/count",
-            ]
-            .iter()
-            .any(|operator| trimmed.contains(operator))
-            {
-                ParsedExpressionKind::Operator
-            } else if trimmed.ends_with(':') || trimmed.contains(": ") {
-                ParsedExpressionKind::Field
-            } else {
-                return None;
-            };
-            Some((line, kind, trimmed.to_owned()))
-        })
-        .enumerate()
-        .map(|(id, (line, kind, text))| ParsedExpression {
-            id,
-            line: line + 1,
-            kind,
-            text,
-        })
-        .collect()
+fn collect_ast_expressions(ast: &AstProgram) -> Vec<ParsedExpression> {
+    let mut expressions = Vec::new();
+    let mut line_tokens: Vec<&AstToken> = Vec::new();
+    let mut current_line = None;
+    for token in ast.semantic_tokens() {
+        if matches!(token.kind, AstTokenKind::Newline) {
+            push_ast_expression(&mut expressions, &line_tokens);
+            line_tokens.clear();
+            current_line = None;
+            continue;
+        }
+        if current_line.is_none() {
+            current_line = Some(token.line);
+        }
+        line_tokens.push(token);
+    }
+    push_ast_expression(&mut expressions, &line_tokens);
+    expressions
+}
+
+fn push_ast_expression(expressions: &mut Vec<ParsedExpression>, tokens: &[&AstToken]) {
+    if tokens.is_empty() {
+        return;
+    }
+    let lexemes = tokens
+        .iter()
+        .map(|token| token.lexeme.as_str())
+        .filter(|lexeme| !lexeme.is_empty())
+        .collect::<Vec<_>>();
+    if lexemes.is_empty() {
+        return;
+    }
+    let Some(kind) = ast_expression_kind(&lexemes) else {
+        return;
+    };
+    let label = lexemes.join(" ");
+    let indexed_hint = lexemes.iter().any(|lexeme| {
+        matches!(
+            *lexeme,
+            "todo"
+                | "seed"
+                | "editor"
+                | "cell"
+                | "Formula/dependencies"
+                | "Formula/eval"
+                | "Formula/error"
+        )
+    });
+    expressions.push(ParsedExpression {
+        id: expressions.len(),
+        line: tokens.first().map(|token| token.line).unwrap_or_default(),
+        kind,
+        label,
+        indexed_hint,
+    });
+}
+
+fn ast_expression_kind(lexemes: &[&str]) -> Option<ParsedExpressionKind> {
+    if lexemes.contains(&"SOURCE") {
+        Some(ParsedExpressionKind::Source)
+    } else if lexemes.contains(&"HOLD") {
+        Some(ParsedExpressionKind::Hold)
+    } else if lexemes.contains(&"LIST") || lexemes.contains(&"Grid/cells") {
+        Some(ParsedExpressionKind::List)
+    } else if lexemes.first() == Some(&"FUNCTION") {
+        Some(ParsedExpressionKind::Function)
+    } else if lexemes.iter().any(|lexeme| {
+        matches!(
+            *lexeme,
+            "THEN"
+                | "WHEN"
+                | "WHILE"
+                | "LATEST"
+                | "List/map"
+                | "List/append"
+                | "List/remove"
+                | "List/retain"
+                | "List/count"
+        )
+    }) {
+        Some(ParsedExpressionKind::Operator)
+    } else if lexemes.contains(&":") {
+        Some(ParsedExpressionKind::Field)
+    } else {
+        None
+    }
 }
 
 fn collect_named_lines(source: &str, needle: &str) -> Vec<String> {

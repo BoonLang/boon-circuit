@@ -1928,11 +1928,9 @@ fn audit_runtime_finality(
         "runtime:dense-source-route-indexes",
         &runtime,
         &[
-            "struct SourceRoutePlan",
             "routes: Vec<SourceRoute>",
             "self.routes.iter().find",
             ".iter().position",
-            "struct SourceStore",
             "bindings: Vec<SourceBinding>",
             "self.bindings.iter().any",
             "self.bindings.retain",

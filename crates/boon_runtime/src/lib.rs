@@ -4682,7 +4682,7 @@ impl CompiledProgram {
             &list_equations,
             &root_targets,
         );
-        let source_route_count = source_routes.routes.len();
+        let source_route_count = source_routes.len();
         let list_source_bindings = ListSourceBindingPlan::from_ir(ir);
         Ok(Self {
             surface,
@@ -5138,8 +5138,6 @@ fn base_example_report(
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
     let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
     let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
-    let generic_interpreter_complete = true;
-    let example_behavior_adapter = false;
     let implementation = "static_graph_interpreter";
     let adapter_blocker = if is_todomvc {
         "TodoMVC now executes scenario preparation, source dispatch, row source execution, render-only hover, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the TodoMVC surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
@@ -5263,6 +5261,10 @@ fn base_example_report(
         "cells_hidden_grid_keys_from_generic_storage": is_cells,
         "cells_formula_pipeline_from_ir": is_cells
     });
+    let generic_interpreter_complete =
+        derive_generic_interpreter_complete(ir, compiled, &generic_runtime_slices);
+    let example_behavior_adapter =
+        derive_example_behavior_adapter(compiled, &generic_runtime_slices);
     let runtime_execution = json!({
         "implementation": implementation,
         "source_loaded_from_boon": true,
@@ -5382,6 +5384,45 @@ fn base_example_report(
         "artifact_sha256s": [],
         "failure_artifacts": [],
     })
+}
+
+fn derive_generic_interpreter_complete(
+    ir: &TypedProgram,
+    compiled: &CompiledProgram,
+    generic_runtime_slices: &JsonValue,
+) -> bool {
+    compiled.surface.inferred_from_ir
+        && ir.static_schedule_verified
+        && compiled.unsupported_update_branch_count == 0
+        && compiled.unsupported_list_operation_count == 0
+        && compiled.source_route_count > 0
+        && compiled.update_branch_count > 0
+        && generic_runtime_slices.as_object().is_some_and(|slices| {
+            require_generic_runtime_slice_flags(
+                slices,
+                compiled.surface.kind.as_str(),
+                Path::new("generated-runtime-execution"),
+            )
+            .is_ok()
+        })
+}
+
+fn derive_example_behavior_adapter(
+    compiled: &CompiledProgram,
+    generic_runtime_slices: &JsonValue,
+) -> bool {
+    let Some(slices) = generic_runtime_slices.as_object() else {
+        return true;
+    };
+    !compiled.surface.inferred_from_ir
+        || slice_bool(slices, "surface_driver_borrows_generic_storage_for_tick").unwrap_or(true)
+        || !slice_bool(slices, "generic_schedule_instantiated_before_adapter").unwrap_or(false)
+        || !slice_bool(slices, "loaded_runtime_owns_generic_schedule_storage").unwrap_or(false)
+        || !slice_bool(slices, "generic_source_action_batch_executor").unwrap_or(false)
+}
+
+fn slice_bool(slices: &serde_json::Map<String, JsonValue>, key: &str) -> Option<bool> {
+    slices.get(key).and_then(JsonValue::as_bool)
 }
 
 fn enrich_report(
@@ -5839,9 +5880,40 @@ struct SourceBinding {
     source_path: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SourceBindingLookup {
+    list_id: &'static str,
+    key: u64,
+    generation: u64,
+    source_id: u64,
+    bind_epoch: u64,
+}
+
+impl From<&SourceBinding> for SourceBindingLookup {
+    fn from(binding: &SourceBinding) -> Self {
+        Self {
+            list_id: binding.list_id,
+            key: binding.key,
+            generation: binding.generation,
+            source_id: binding.source_id,
+            bind_epoch: binding.bind_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SourceRowLookup {
+    list_id: &'static str,
+    key: u64,
+    generation: u64,
+}
+
 #[derive(Clone, Debug)]
 struct SourceStore {
-    bindings: Vec<SourceBinding>,
+    active_bindings: Vec<Option<SourceBinding>>,
+    binding_slots: BTreeMap<SourceBindingLookup, usize>,
+    row_slots: BTreeMap<SourceRowLookup, BTreeSet<usize>>,
+    active_count: usize,
     next_source_id: u64,
     next_bind_epoch: u64,
 }
@@ -5849,14 +5921,17 @@ struct SourceStore {
 impl SourceStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            bindings: Vec::with_capacity(capacity),
+            active_bindings: Vec::with_capacity(capacity),
+            binding_slots: BTreeMap::new(),
+            row_slots: BTreeMap::new(),
+            active_count: 0,
             next_source_id: 1,
             next_bind_epoch: 1,
         }
     }
 
     fn reserve(&mut self, additional: usize) {
-        self.bindings.reserve(additional);
+        self.active_bindings.reserve(additional);
     }
 
     fn bind_row(
@@ -5867,23 +5942,48 @@ impl SourceStore {
         source_paths: &[&'static str],
     ) {
         for source_path in source_paths {
-            self.bindings.push(SourceBinding {
+            let binding = SourceBinding {
                 list_id,
                 key,
                 generation,
                 source_id: self.next_source_id,
                 bind_epoch: self.next_bind_epoch,
                 source_path,
-            });
+            };
+            let slot = self.active_bindings.len();
+            self.binding_slots
+                .insert(SourceBindingLookup::from(&binding), slot);
+            self.row_slots
+                .entry(SourceRowLookup {
+                    list_id,
+                    key,
+                    generation,
+                })
+                .or_default()
+                .insert(slot);
+            self.active_bindings.push(Some(binding));
+            self.active_count += 1;
             self.next_source_id += 1;
             self.next_bind_epoch += 1;
         }
     }
 
     fn unbind_row(&mut self, list_id: &'static str, key: u64, generation: u64) {
-        self.bindings.retain(|binding| {
-            !(binding.list_id == list_id && binding.key == key && binding.generation == generation)
-        });
+        let Some(slots) = self.row_slots.remove(&SourceRowLookup {
+            list_id,
+            key,
+            generation,
+        }) else {
+            return;
+        };
+        for slot in slots {
+            let Some(binding) = self.active_bindings.get_mut(slot).and_then(Option::take) else {
+                continue;
+            };
+            self.binding_slots
+                .remove(&SourceBindingLookup::from(&binding));
+            self.active_count -= 1;
+        }
     }
 
     fn is_bound(
@@ -5895,11 +5995,24 @@ impl SourceStore {
         source_id: Option<u64>,
         bind_epoch: Option<u64>,
     ) -> bool {
-        self.bindings.iter().any(|binding| {
-            binding.list_id == list_id
-                && binding.key == key
-                && binding.generation == generation
-                && binding.source_path == source_path
+        if let (Some(source_id), Some(bind_epoch)) = (source_id, bind_epoch) {
+            let Some(slot) = self.binding_slots.get(&SourceBindingLookup {
+                list_id,
+                key,
+                generation,
+                source_id,
+                bind_epoch,
+            }) else {
+                return false;
+            };
+            return self
+                .active_bindings
+                .get(*slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|binding| binding.source_path == source_path);
+        }
+        self.row_bindings(list_id, key, generation).any(|binding| {
+            binding.source_path == source_path
                 && source_id.is_none_or(|source_id| binding.source_id == source_id)
                 && bind_epoch.is_none_or(|bind_epoch| binding.bind_epoch == bind_epoch)
         })
@@ -5911,9 +6024,16 @@ impl SourceStore {
         key: u64,
         generation: u64,
     ) -> impl Iterator<Item = &SourceBinding> {
-        self.bindings.iter().filter(move |binding| {
-            binding.list_id == list_id && binding.key == key && binding.generation == generation
-        })
+        self.row_slots
+            .get(&SourceRowLookup {
+                list_id,
+                key,
+                generation,
+            })
+            .into_iter()
+            .flat_map(|slots| slots.iter())
+            .filter_map(|slot| self.active_bindings.get(*slot))
+            .filter_map(Option::as_ref)
     }
 
     #[cfg(test)]
@@ -5922,7 +6042,7 @@ impl SourceStore {
     }
 
     fn len(&self) -> usize {
-        self.bindings.len()
+        self.active_count
     }
 }
 
@@ -9336,7 +9456,17 @@ enum RuntimeDerivedTextExpression {
 
 #[derive(Clone, Debug, Default)]
 struct SourceRoutePlan {
-    routes: Vec<SourceRoute>,
+    source_slots: BTreeMap<&'static str, SourceRouteIndex>,
+    route_slots: Vec<SourceRoute>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceRouteIndex(usize);
+
+impl SourceRouteIndex {
+    fn slot(self) -> usize {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -9688,7 +9818,7 @@ impl SourceRoutePlan {
             match &operation.kind {
                 RuntimeListOperationKind::Append { trigger, .. } => {
                     for route in routes
-                        .routes
+                        .route_slots
                         .iter_mut()
                         .filter(|route| route.derived_text_targets.contains(trigger))
                     {
@@ -9711,14 +9841,20 @@ impl SourceRoutePlan {
                 | RuntimeListOperationKind::Count { .. } => {}
             }
         }
-        for route in &mut routes.routes {
+        for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
         routes
     }
 
+    fn len(&self) -> usize {
+        self.route_slots.len()
+    }
+
     fn for_source(&self, source: &str) -> Option<&SourceRoute> {
-        self.routes.iter().find(|route| route.source == source)
+        self.source_slots
+            .get(source)
+            .and_then(|index| self.route_slots.get(index.slot()))
     }
 
     fn require_source(&self, source: &str) -> RuntimeResult<&SourceRoute> {
@@ -9787,14 +9923,16 @@ impl SourceRoutePlan {
     }
 
     fn route_mut(&mut self, source: &'static str) -> &mut SourceRoute {
-        if let Some(index) = self.routes.iter().position(|route| route.source == source) {
-            return &mut self.routes[index];
+        if let Some(index) = self.source_slots.get(source).copied() {
+            return &mut self.route_slots[index.slot()];
         }
-        self.routes.push(SourceRoute {
+        let index = SourceRouteIndex(self.route_slots.len());
+        self.source_slots.insert(source, index);
+        self.route_slots.push(SourceRoute {
             source,
             ..SourceRoute::default()
         });
-        self.routes
+        self.route_slots
             .last_mut()
             .expect("route was just pushed and must exist")
     }

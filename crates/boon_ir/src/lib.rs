@@ -1,4 +1,4 @@
-use boon_parser::{ParsedExpression, ParsedProgram, ProgramKind};
+use boon_parser::{ParsedExpression, ParsedExpressionKind, ParsedProgram, ProgramKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -846,53 +846,54 @@ fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
 }
 
 fn expression_node(expr: &ParsedExpression) -> Option<IrNode> {
-    let kind = expression_node_kind(&expr.text)?;
+    let kind = ast_expression_node_kind(expr)?;
     Some(IrNode {
         id: 0,
-        name: format!("expr_{}_{}", expr.id, sanitize_node_name(&expr.text)),
-        indexed: expression_is_indexed(&expr.text, &kind),
+        name: format!("expr_{}_{}", expr.id, sanitize_node_name(&expr.label)),
+        indexed: expression_is_indexed(expr, &kind),
         kind,
         expr_id: Some(expr.id),
     })
 }
 
-fn expression_node_kind(text: &str) -> Option<IrNodeKind> {
-    if text.contains("SOURCE") {
-        Some(IrNodeKind::SourceRead)
-    } else if text.contains("HOLD") {
-        Some(IrNodeKind::Hold)
-    } else if text.contains("List/append") {
+fn ast_expression_node_kind(expr: &ParsedExpression) -> Option<IrNodeKind> {
+    match expr.kind {
+        ParsedExpressionKind::Source => Some(IrNodeKind::SourceRead),
+        ParsedExpressionKind::Hold => Some(IrNodeKind::Hold),
+        ParsedExpressionKind::List => Some(IrNodeKind::ListMap),
+        ParsedExpressionKind::Function => Some(IrNodeKind::PureCall),
+        ParsedExpressionKind::Field => Some(IrNodeKind::PureCall),
+        ParsedExpressionKind::Operator => expression_operator_node_kind(&expr.label),
+    }
+}
+
+fn expression_operator_node_kind(label: &str) -> Option<IrNodeKind> {
+    if label.contains("List/append") {
         Some(IrNodeKind::ListAppend)
-    } else if text.contains("List/remove") {
+    } else if label.contains("List/remove") {
         Some(IrNodeKind::ListRemove)
-    } else if text.contains("List/map") {
+    } else if label.contains("List/map") {
         Some(IrNodeKind::ListMap)
-    } else if text.contains("List/retain") {
+    } else if label.contains("List/retain") {
         Some(IrNodeKind::ListRetain)
-    } else if text.contains("List/count") {
+    } else if label.contains("List/count") {
         Some(IrNodeKind::Aggregate)
-    } else if text.contains("LATEST") {
+    } else if label.contains("LATEST") {
         Some(IrNodeKind::Latest)
-    } else if text.contains("WHILE") {
+    } else if label.contains("WHILE") {
         Some(IrNodeKind::While)
-    } else if text.contains("THEN") {
+    } else if label.contains("THEN") {
         Some(IrNodeKind::Then)
-    } else if text.contains("WHEN") {
+    } else if label.contains("WHEN") {
         Some(IrNodeKind::When)
-    } else if text.contains("Formula/")
-        || text.contains("Text/")
-        || text.contains("Bool/")
-        || text.starts_with("FUNCTION ")
-    {
+    } else if label.contains("Formula/") || label.contains("Text/") || label.contains("Bool/") {
         Some(IrNodeKind::PureCall)
-    } else if text.contains("Grid/cells") || text.contains("LIST") {
-        Some(IrNodeKind::ListMap)
     } else {
         None
     }
 }
 
-fn expression_is_indexed(text: &str, kind: &IrNodeKind) -> bool {
+fn expression_is_indexed(expr: &ParsedExpression, kind: &IrNodeKind) -> bool {
     matches!(
         kind,
         IrNodeKind::ListAppend
@@ -901,10 +902,7 @@ fn expression_is_indexed(text: &str, kind: &IrNodeKind) -> bool {
             | IrNodeKind::ListRetain
             | IrNodeKind::Aggregate
             | IrNodeKind::RenderLowering
-    ) || text.contains("todo.")
-        || text.contains("seed.")
-        || text.contains("editor.")
-        || text.contains("Formula/")
+    ) || expr.indexed_hint
 }
 
 fn push_generated(nodes: &mut Vec<IrNode>, name: &str, kind: IrNodeKind, indexed: bool) {

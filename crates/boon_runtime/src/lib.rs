@@ -666,6 +666,8 @@ pub fn run_source_initial_state(
     let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
     let report_started = Instant::now();
     let runtime_profile = RuntimeProfile::from_ir(&ir);
+    let runtime_profile_detail = runtime_profile.detail_report(&ir);
+    let capacity_report = runtime_profile.capacity_report(&ir);
     let generic_runtime_slices = generic_runtime_slices_report(&ir, &compiled);
     let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(&ir, &compiled);
     let report = json!({
@@ -689,7 +691,7 @@ pub fn run_source_initial_state(
         "total_semantic_deltas": 0,
         "total_render_deltas": 0,
         "runtime_profile": runtime_profile.as_str(),
-        "runtime_profile_detail": runtime_profile.detail_report(&ir),
+        "runtime_profile_detail": runtime_profile_detail,
         "playground_initial_timing_ms": {
             "parse": parse_ms,
             "lower": lower_ms,
@@ -698,13 +700,17 @@ pub fn run_source_initial_state(
             "runtime_prepare_and_summary": runtime_ms,
             "report_until_timing_field": report_started.elapsed().as_secs_f64() * 1000.0
         },
-        "capacities": runtime_profile.capacity_report(&ir),
+        "capacities": capacity_report,
         "compiled_schedule": compiled.report(),
         "runtime_execution": {
             "implementation": "typed static graph initialized for playground preview",
             "source_loaded_from_boon": true,
             "typed_ir_loaded": true,
             "static_schedule_verified": ir.static_schedule_verified,
+            "runtime_profile": runtime_profile.as_str(),
+            "runtime_profile_detail": runtime_profile_detail,
+            "capacities": capacity_report,
+            "expression_coverage": &ir.expression_coverage,
             "generic_interpreter_complete": derive_generic_interpreter_complete(&ir, &compiled, &generic_runtime_slices),
             "example_behavior_adapter": derive_example_behavior_adapter(&compiled, &generic_runtime_slices),
             "adapter_kind": compiled.surface.kind.as_str(),
@@ -1221,6 +1227,10 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
         "source_loaded_from_boon",
         "typed_ir_loaded",
         "static_schedule_verified",
+        "runtime_profile",
+        "runtime_profile_detail",
+        "capacities",
+        "expression_coverage",
         "generic_interpreter_complete",
         "example_behavior_adapter",
         "remaining_example_specific_shell_policy",
@@ -1282,6 +1292,7 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
         .into());
     }
     verify_remaining_example_specific_shells(execution, report_path)?;
+    verify_runtime_execution_report_mirror(report, execution, report_path)?;
     if execution.get("implementation").and_then(JsonValue::as_str)
         != Some("static_graph_interpreter")
     {
@@ -1295,6 +1306,40 @@ fn verify_runtime_execution_metadata(report: &JsonValue, report_path: &Path) -> 
     verify_generic_runtime_slice_evidence(report, execution, report_path)?;
     verify_expression_coverage(report, report_path)?;
     verify_runtime_report_contract(report, report_path)?;
+    Ok(())
+}
+
+fn verify_runtime_execution_report_mirror(
+    report: &JsonValue,
+    execution: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    for key in [
+        "runtime_profile",
+        "runtime_profile_detail",
+        "capacities",
+        "expression_coverage",
+    ] {
+        let top_level = report.get(key).ok_or_else(|| {
+            format!(
+                "{} executable report missing top-level `{key}`",
+                report_path.display()
+            )
+        })?;
+        let execution_level = execution.get(key).ok_or_else(|| {
+            format!(
+                "{} runtime_execution missing mirrored `{key}`",
+                report_path.display()
+            )
+        })?;
+        if execution_level != top_level {
+            return Err(format!(
+                "{} runtime_execution `{key}` does not match top-level `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -6306,11 +6351,16 @@ fn base_example_report(
     let remaining_shells = remaining_example_specific_shells(compiled, &generic_runtime_slices);
     let runtime_profile = RuntimeProfile::from_ir(ir);
     let capacity_report = runtime_profile.capacity_report(ir);
+    let runtime_profile_detail = runtime_profile.detail_report(ir);
     let runtime_execution = json!({
         "implementation": implementation,
         "source_loaded_from_boon": true,
         "typed_ir_loaded": true,
         "static_schedule_verified": ir.static_schedule_verified,
+        "runtime_profile": runtime_profile.as_str(),
+        "runtime_profile_detail": runtime_profile_detail,
+        "capacities": capacity_report,
+        "expression_coverage": &ir.expression_coverage,
         "generic_interpreter_complete": generic_interpreter_complete,
         "example_behavior_adapter": example_behavior_adapter,
         "adapter_kind": compiled.surface.kind.as_str(),
@@ -6329,7 +6379,7 @@ fn base_example_report(
         "gpu_model_if_available": gpu_model_if_available(),
         "os": os_profile(),
         "runtime_profile": runtime_profile.as_str(),
-        "runtime_profile_detail": runtime_profile.detail_report(ir),
+        "runtime_profile_detail": runtime_profile_detail,
         "capacities": capacity_report,
         "compiled_schedule": compiled.report(),
         "runtime_execution": runtime_execution,
@@ -15410,8 +15460,23 @@ mod tests {
                 .contains("generic_source_event_ingest")
         );
 
+        let mut drifted_runtime_metadata_report = output.report.clone();
+        drifted_runtime_metadata_report["runtime_execution"]["runtime_profile"] =
+            json!("software_bounded");
+        assert!(
+            verify_runtime_execution_metadata(
+                &drifted_runtime_metadata_report,
+                Path::new("memory:todomvc")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("runtime_execution `runtime_profile` does not match")
+        );
+
         let mut unknown_expression_report = output.report.clone();
         unknown_expression_report["expression_coverage"]["unknown_ast_expression_count"] = json!(1);
+        unknown_expression_report["runtime_execution"]["expression_coverage"]["unknown_ast_expression_count"] =
+            json!(1);
         assert!(
             verify_runtime_execution_metadata(
                 &unknown_expression_report,

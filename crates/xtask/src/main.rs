@@ -6674,14 +6674,62 @@ fn audit_runtime_execution(
         )),
     );
 
+    let runtime_metadata_mirrored = [
+        "runtime_profile",
+        "runtime_profile_detail",
+        "capacities",
+        "expression_coverage",
+    ]
+    .iter()
+    .all(|key| report.get(*key).is_some() && execution.get(*key) == report.get(*key));
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{name}:{}:runtime-metadata-mirrored", layer.as_str()),
+        runtime_metadata_mirrored,
+        "runtime_execution mirrors runtime_profile, capacities, and expression_coverage from the accepted executable report".to_owned(),
+        (!runtime_metadata_mirrored).then_some(format!(
+            "{name} {} report does not mirror runtime profile/capacity/expression coverage inside runtime_execution",
+            layer.as_str()
+        )),
+    );
+
     let coverage = report
+        .get("expression_coverage")
+        .and_then(serde_json::Value::as_object);
+    let execution_coverage = execution
         .get("expression_coverage")
         .and_then(serde_json::Value::as_object);
     let coverage_source = coverage
         .and_then(|coverage| coverage.get("computed_from"))
         .and_then(serde_json::Value::as_str)
-        == Some("parser_ast_and_typed_ir");
+        == Some("parser_ast_and_typed_ir")
+        && execution_coverage
+            .and_then(|coverage| coverage.get("computed_from"))
+            .and_then(serde_json::Value::as_str)
+            == Some("parser_ast_and_typed_ir");
     let unknown_count = coverage
+        .map(|coverage| {
+            [
+                "unknown_ast_expression_count",
+                "unknown_initial_value_count",
+                "unknown_list_initializer_count",
+                "unknown_list_seed_value_count",
+                "unknown_update_expression_count",
+                "unknown_list_predicate_count",
+                "unknown_derived_value_count",
+            ]
+            .iter()
+            .map(|key| {
+                coverage
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+            })
+            .sum::<u64>()
+        })
+        .unwrap_or(1);
+    let execution_unknown_count = execution_coverage
         .map(|coverage| {
             [
                 "unknown_ast_expression_count",
@@ -6706,14 +6754,17 @@ fn audit_runtime_execution(
         checks,
         blockers,
         format!("{name}:{}:expression-coverage", layer.as_str()),
-        coverage_source && unknown_count == 0,
+        coverage_source && unknown_count == 0 && execution_unknown_count == 0,
         format!(
-            "computed_from={:?}, unknown_count={unknown_count}",
+            "computed_from={:?}, runtime_execution_computed_from={:?}, unknown_count={unknown_count}, runtime_execution_unknown_count={execution_unknown_count}",
             coverage
+                .and_then(|coverage| coverage.get("computed_from"))
+                .and_then(serde_json::Value::as_str),
+            execution_coverage
                 .and_then(|coverage| coverage.get("computed_from"))
                 .and_then(serde_json::Value::as_str)
         ),
-        (!(coverage_source && unknown_count == 0)).then_some(format!(
+        (!(coverage_source && unknown_count == 0 && execution_unknown_count == 0)).then_some(format!(
             "{name} {} report does not prove parser/IR expression coverage without unknown fallback",
             layer.as_str()
         )),

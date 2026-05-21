@@ -3697,6 +3697,21 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
     let started = json_u64_field(report, "manual_started_at_utc")?;
     let finished = json_u64_field(report, "manual_finished_at_utc")?;
     let duration = json_u64_field(report, "manual_session_duration_seconds")?;
+    let headed_generated = json_u64_field(&headed_report, "generated_at_utc")?;
+    if headed_generated > started {
+        return Err(format!(
+            "{} linked headed report was generated after the recorded manual session started",
+            report_path.display()
+        )
+        .into());
+    }
+    if started.saturating_sub(headed_generated) > 24 * 60 * 60 {
+        return Err(format!(
+            "{} linked headed report was not refreshed within 24h before the manual session",
+            report_path.display()
+        )
+        .into());
+    }
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     if started > now || finished > now {
         return Err(format!(

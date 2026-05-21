@@ -164,7 +164,9 @@ isolated xtask wrapper. Passing full OS reports use
 `os_input_limitation`, record per-step visible targets and screenshots, and are
 checked by `audit-goal-readiness`. Canonical full headed reports and the human
 reports linked to them must carry the current git commit; rerun the headed
-aliases after changing code.
+aliases after changing code. Full headed reports are accepted only while they
+are less than 24 hours old, and a human report must link to a headed report
+refreshed within 24 hours before that manual session.
 
 On this COSMIC desktop, open the manual playground surface without stealing
 unrelated focus by keeping the wrapper directly around the native window

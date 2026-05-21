@@ -70,8 +70,9 @@ by `docs/architecture/RUNTIME_MODEL.md` and
 - Separate verification categories honestly.
   Focusless headed reports must say they are synthetic/focusless. Full OS-input
   claims require canonical `todomvc-headed-ply.json` and `cells-headed-ply.json`,
-  current hashes, the current git commit, real OS pointer/keyboard backend per
-  user-action step, and no synthetic observations. Those canonical headed
+  current hashes, the current git commit, a generated timestamp no older than
+  24 hours, real OS pointer/keyboard backend per user-action step, and no
+  synthetic observations. Those canonical headed
   aliases run in isolated
   Xvfb/X11 by default; live desktop injection is not allowed unless explicitly
   requested with both `BOON_ALLOW_LIVE_DESKTOP_INPUT=1` and

@@ -2648,6 +2648,8 @@ fn audit_runtime_finality(
             "linked headed report git_commit `{headed_commit}` does not match current git commit",
             "full-os-headed-report-current-git",
             "was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+            "full-os-headed-report-fresh",
+            "linked headed report was not refreshed within 24h before the manual session",
         ],
         "human and full headed reports must be rejected when they were generated for an older git commit",
     );
@@ -2957,6 +2959,12 @@ fn audit_runtime_finality_reports(
             .get("git_commit")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<missing>");
+        let generated = report
+            .get("generated_at_utc")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let age_seconds = current_unix_seconds().saturating_sub(generated);
         push_audit_check(
             checks,
             blockers,
@@ -2966,6 +2974,19 @@ fn audit_runtime_finality_reports(
             (report_commit != current_commit).then(|| {
                 format!(
                     "`{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+                    path.display()
+                )
+            }),
+        );
+        push_audit_check(
+            checks,
+            blockers,
+            format!("runtime-finality:{name}:full-os-headed-report-fresh"),
+            generated > 0 && age_seconds <= 24 * 60 * 60,
+            format!("generated_at_utc={generated}, age_seconds={age_seconds}"),
+            (!(generated > 0 && age_seconds <= 24 * 60 * 60)).then(|| {
+                format!(
+                    "`{}` is older than 24h or missing generated_at_utc; rerun `BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-{name}-headed-ply`",
                     path.display()
                 )
             }),
@@ -9035,6 +9056,24 @@ fn verify_existing_full_headed_report(
     if report_commit != current_commit {
         return Err(format!(
             "{name} headed report `{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`; rerun `BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-{name}-headed-ply`",
+            report.display()
+        )
+        .into());
+    }
+    let generated = report_json
+        .get("generated_at_utc")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{name} headed report `{}` is missing generated_at_utc",
+                report.display()
+            )
+        })?
+        .parse::<u64>()?;
+    let age_seconds = current_unix_seconds().saturating_sub(generated);
+    if age_seconds > 24 * 60 * 60 {
+        return Err(format!(
+            "{name} headed report `{}` is {age_seconds}s old; rerun `BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-{name}-headed-ply`",
             report.display()
         )
         .into());

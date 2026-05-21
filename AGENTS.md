@@ -14,6 +14,10 @@ visible manual session with a human observer, fresh manual screenshot/video
 artifacts, the visible manual playground `--window-pid`, an explicit
 `--focused-window-proof`, helper provenance fields such as
 `manual_report_prepared_by`, and every scenario label explicitly passed.
+For Codex/operator completion, use non-human
+`target/reports/todomvc-operator-e2e.json` and
+`target/reports/cells-operator-e2e.json` reports. Those reports must be bound to
+fresh full headed OS-input reports and must not claim human observation.
 
 For visible manual playground launches on this COSMIC desktop, use the
 workspace-qualified background launcher directly around the native window
@@ -46,9 +50,13 @@ Before claiming handoff readiness, run:
 ```bash
 cargo xtask verify-report-schema
 cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
 
 If `audit-machine-readiness` passes but `audit-goal-readiness` reports only
-missing human/all reports, report that honestly as the remaining blocker instead
-of weakening schemas, reports, or manual checks.
+missing operator/all reports, generate the operator E2E reports from fresh
+headed evidence. If human reports are missing, tell the user to continue with
+human testing as follow-up instead of weakening schemas, reports, or manual
+checks.

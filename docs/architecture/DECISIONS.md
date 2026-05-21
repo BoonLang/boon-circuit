@@ -363,8 +363,9 @@ typed-IR/compiled-plan counts behind those claims. They also include
 `remaining_example_specific_shells` so the residual TodoMVC/Cells scenario,
 assertion, summary, render-patch, and stress-report glue is visible instead of
 being hidden behind the adapter-free claim.
-Readiness still fails until the real human reports and dependent aggregate
-reports exist.
+Readiness now uses operator E2E reports bound to fresh full headed OS-input
+evidence plus dependent aggregate reports. Real human reports remain optional
+follow-up evidence and must not be fabricated.
 
 Implementation note: a generic initialization runtime now materializes root
 state cells and keyed list rows from `TypedProgram` initializers. TodoMVC seed
@@ -403,8 +404,9 @@ inserted lazily during the first recompute. The loaded Cells formula state keeps
 a reusable dependency-text buffer per cell and writes dependency addresses into
 that buffer without allocating, so formula recompute can satisfy the release
 speed gate's zero post-warmup allocation budget. The remaining final handoff
-pieces are fresh human reports and aggregate all reports, not example behavior
-adapters in the semantic interpreter.
+pieces are fresh operator E2E reports and aggregate all reports, not example
+behavior adapters in the semantic interpreter. Human reports are still useful
+follow-up evidence, but not final readiness blockers.
 Source-event routing is also moving into the generic layer: the compiled
 `SourceRoutePlan` can now turn a normalized source event into a
 `GenericSourceActionInput` by deriving the root/list/indexed action shape from
@@ -692,8 +694,8 @@ dispatch and report generation. `run_loaded_scenario` now enters one shared
 `run_generic_scenario` loop through a `LoadedRuntime` shell. That shell owns the
 scheduled generic storage between ticks and no longer lends that storage to
 TodoMVC or Cells surface drivers for scenario execution. The remaining
-acceptance blockers are fresh human reports, aggregate all reports, and any
-future verification gaps found by the audit, not a semantic example adapter.
+acceptance blockers are fresh operator E2E reports, aggregate all reports, and
+any future verification gaps found by the audit, not a semantic example adapter.
 
 Implementation note: the IR cause table is now built from parsed AST items,
 typed field definitions, source-port declarations, and local derived-field

@@ -66,8 +66,10 @@ The first implementation is only convincing if these are true:
 
 The repo intentionally keeps the final aggregate gate honest. Semantic,
 headless, headed Ply, speed, negative, and report-schema checks can be generated
-by automation, but `verify-*-all` must still fail until a real human fills a
-fresh manual report from a visible headed session.
+by automation. The final aggregate gate now uses explicit `operator-e2e`
+reports generated from current full headed OS-input evidence, so Codex/operator
+verification does not get stuck waiting for human-only JSON. Real human reports
+remain separate follow-up evidence and must not be fabricated.
 
 Useful commands while iterating:
 
@@ -79,6 +81,8 @@ cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
 cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 cargo xtask verify-todomvc-speed
 cargo xtask verify-cells-speed
 cargo xtask verify-todomvc-negative
@@ -162,11 +166,12 @@ enforce the same rule unless `BOON_OS_INPUT_ISOLATED=xvfb` is present from the
 isolated xtask wrapper. Passing full OS reports use
 `input_injection_method = "os_pointer_keyboard_to_visible_window"`, have no
 `os_input_limitation`, record per-step visible targets and screenshots, and are
-checked by `audit-goal-readiness`. Canonical full headed reports and the human
-reports linked to them must carry the current git commit; rerun the headed
-aliases after changing code. Full headed reports are accepted only while they
-are less than 24 hours old, and a human report must link to a headed report
-refreshed within 24 hours before that manual session.
+checked by `audit-goal-readiness`. Canonical full headed reports and the
+operator E2E reports linked to them must carry the current git commit; rerun the
+headed aliases after changing code. Full headed and operator E2E reports are
+accepted only while they are less than 24 hours old. Optional human follow-up
+reports must link to a headed report refreshed within 24 hours before that
+manual session.
 
 On this COSMIC desktop, open the manual playground surface without stealing
 unrelated focus by keeping the wrapper directly around the native window
@@ -179,20 +184,22 @@ cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_pla
 ```
 
 Background launch is startup/focus-routing evidence only. Full headed OS input
-verification is isolated by default; real manual reports still require a
-focused visible playground session.
+verification is isolated by default. Operator E2E reports bind that headed
+evidence to the final aggregate gate; real human reports still require a
+focused visible playground session and remain follow-up evidence.
 
 `cargo xtask audit-goal-readiness` is the strict handoff gate. It writes
 `target/reports/goal-readiness.json` by default and exits non-zero while any final
 acceptance blocker remains, including adapter-backed runtime execution, partial
-headed input, missing aggregate reports, or missing fresh human reports.
+headed input, missing operator E2E reports, or missing aggregate reports. It
+does not treat missing optional human follow-up reports as blockers.
 Executable reports also expose `remaining_example_specific_shells`; those entries
 must stay classified as scenario/assertion/report glue until that residual
 TodoMVC/Cells shell is removed.
 `cargo xtask audit-machine-readiness` writes
 `target/reports/debug/machine-readiness.json` and checks the automated side
-without accepting missing human reports as done; it records those artifacts as
-deferred to the strict goal gate. It also requires the core machine evidence
+while deferring operator E2E and final aggregate reports to the strict goal
+gate. It also requires the core machine evidence
 reports `target/reports/runtime-finality.json`,
 `target/reports/playground-genericity.json`, their debug mirrors, and every
 per-example machine report for TodoMVC and Cells to carry the current git
@@ -205,7 +212,19 @@ The readiness audits refresh the recursive schema summary before they inspect
 it, so the documented command order remains deterministic after earlier report
 commands rewrite artifacts.
 
-After a real manual pass, fill:
+For final automated/operator acceptance, generate and check:
+
+```bash
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
+cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
+cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
+cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
+cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
+```
+
+After a real manual follow-up pass, fill:
 
 ```text
 target/reports/todomvc-human.json
@@ -232,9 +251,4 @@ Then check them with:
 ```bash
 cargo xtask verify-todomvc-human --check --report target/reports/todomvc-human.json
 cargo xtask verify-cells-human --check --report target/reports/cells-human.json
-cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
-cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
-cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
-cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
-cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```

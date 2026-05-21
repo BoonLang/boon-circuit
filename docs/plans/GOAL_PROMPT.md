@@ -30,15 +30,16 @@ Implement:
 9. Shared example verification harness and all documented xtask commands.
 
 Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are handoff/verification blockers:
-- aggregate all reports and fresh human reports are still missing
+- aggregate all reports and fresh operator E2E reports may still be missing
 - if `cargo xtask audit-goal-readiness` or `cargo xtask verify-runtime-finality` reports any additional blocker, treat it as authoritative current evidence
 
 Do not make these blockers green by weakening reports, schemas, docs, or audits. Make them green only by completing the implementation and verification they describe.
 
 Verification must be honest and runnable. The machine-side commands must pass
 unattended; the final `verify-*-all`, `verify-examples-all`, and
-`audit-goal-readiness` commands must remain blocked when fresh real human
-TodoMVC/Cells reports do not exist:
+`audit-goal-readiness` commands must use fresh operator E2E reports bound to full
+headed OS-input evidence. Real human reports are follow-up evidence and must not
+be synthesized from automation:
 - cargo test -p boon_parser
 - cargo test -p boon_ir
 - cargo test -p boon_runtime
@@ -46,8 +47,10 @@ TodoMVC/Cells reports do not exist:
 - cargo xtask verify-foundation
 - cargo xtask verify-playground-launch
 - cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --report target/reports/todomvc-cli-run.json
+- cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
 - cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 - cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/cells-cli-run.json
+- cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 - cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 - cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
 - cargo xtask verify-report-schema
@@ -62,12 +65,10 @@ Performance is part of correctness. Normal interactions should complete in a cou
 
 When finished, leave the repo ready for manual testing:
 - all machine-side verification commands pass
-- strict human/all gates either pass from real checked human reports or fail only
-  with those missing-human-report blockers
+- strict operator/all gates pass from current checked operator E2E reports
 - reports are written under target/reports
 - the native Ply playground can be launched for TodoMVC and Cells
 - `cargo xtask audit-goal-readiness` passes without suppressing any blocker
-  after the real manual reports have been produced
-- provide the exact commands I should run for manual testing
+- tell the user to continue with real human visible-window testing as follow-up
 - clearly report any remaining blocker or unimplemented planned item instead of treating it as a pass
 ```

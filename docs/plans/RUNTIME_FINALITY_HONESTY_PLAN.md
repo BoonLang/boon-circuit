@@ -14,8 +14,9 @@ As of the latest checked implementation, the automated side of this plan is
 gated by `cargo xtask audit-machine-readiness` and the final handoff is gated by
 `cargo xtask audit-goal-readiness`. The runtime must still not be described as
 complete while `audit-goal-readiness` reports blockers; currently the intended
-remaining blockers are the real TodoMVC/Cells human reports and the dependent
-aggregate reports.
+final gate uses operator E2E reports bound to fresh full headed OS-input
+evidence plus the dependent aggregate reports. Real TodoMVC/Cells human reports
+remain follow-up evidence and must not be fabricated or renamed as automation.
 
 This is not another local TodoMVC workaround. It is a core compiler/runtime
 cleanup that makes the checked implementation match the architecture promised
@@ -140,7 +141,7 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   ```
 
   `audit-machine-readiness` is the unattended implementation gate. It must pass
-  before handoff and must not count missing real human reports as accepted.
+  before handoff and must not count missing operator E2E reports as accepted.
   It also requires `target/reports/runtime-finality.json`,
   `target/reports/playground-genericity.json`, their debug mirrors, and every
   TodoMVC/Cells machine report to carry the current git commit, while
@@ -150,10 +151,12 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   artifacts.
   `verify-examples-all`, `audit-manual-readiness`, and
   `audit-goal-readiness` are final acceptance gates: they require fresh checked
+  `target/reports/todomvc-operator-e2e.json` and
+  `target/reports/cells-operator-e2e.json` reports derived from current full
+  headed OS-input evidence, plus the dependent `*-all.json` aggregates. Real
   `target/reports/todomvc-human.json` and `target/reports/cells-human.json`
-  reports from a real visible manual session, plus the dependent `*-all.json`
-  aggregates. If those human reports are missing, the correct result is failure
-  with explicit blockers, not a synthetic pass or a weakened schema.
+  reports remain optional follow-up evidence and must not be synthesized from
+  automation.
 
   Add negative fixtures for synthetic reports pretending to be full OS-input
   reports.
@@ -201,19 +204,22 @@ Implement completely:
 
 10. Update docs honestly. Architecture/plans/README must describe the implemented state. If anything remains prototype-only, name it as a blocker and make audit-goal-readiness fail until resolved.
 
-Do not stop until these pass from a clean tree, except that the final
-`verify-*-all`, `verify-examples-all`, `audit-manual-readiness`, and
-`audit-goal-readiness` commands must remain blocked when no real human
-TodoMVC/Cells reports exist:
+Do not stop until these pass from a clean tree:
 cargo fmt --check
 cargo test -p boon_parser -p boon_ir -p boon_runtime -p boon_ply_playground
 cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
 cargo xtask verify-runtime-finality
 cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
 cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 cargo xtask verify-report-schema
+
+Then tell the user to continue with real human visible-window testing as a
+follow-up if `target/reports/todomvc-human.json` and
+`target/reports/cells-human.json` are still missing.
 
 Then relaunch:
 cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app

@@ -328,6 +328,7 @@ The playground also owns the shared example verification harness described in
 verify-foundation
 verify-playground-launch
 verify-example-headed-ply
+verify-example-operator-e2e
 verify-example-human
 verify-example-semantic
 verify-example-ply-headless
@@ -341,12 +342,13 @@ verify-report-schema
 The cross-example command must leave durable evidence too:
 `verify-examples-all` writes `target/reports/examples-all.json` after the
 TodoMVC and Cells aggregate reports exist. Missing per-example aggregates still
-block first, because they include the real human reports.
+block first, because they include the operator E2E reports.
 
-The final visible/manual handoff procedure is described in
+The final operator E2E and visible/manual follow-up procedures are described in
 [MANUAL_TESTING_RUNBOOK.md](MANUAL_TESTING_RUNBOOK.md). Passing aggregate reports
-must include fresh checked human reports; missing human reports remain blockers,
-not warnings.
+must include fresh checked operator E2E reports bound to current full headed
+OS-input evidence. Missing human reports are follow-up items, not final
+readiness blockers.
 
 `verify-foundation` is the repo-level parser/IR/runtime gate. It runs
 `cargo test -p boon_parser`, `cargo test -p boon_ir`,

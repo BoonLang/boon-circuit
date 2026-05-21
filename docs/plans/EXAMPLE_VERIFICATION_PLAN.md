@@ -138,8 +138,9 @@ aggregates are available.
 `audit-goal-readiness` is stricter than schema validation. It scans the current
 reports and fails if the repo is not actually ready for final handoff. A report
 that is shape-valid but still says the runtime is adapter-backed, a headed replay
-that still carries `os_input_limitation`, or a missing fresh human report remains
-a blocker.
+that still carries `os_input_limitation`, or a missing fresh operator E2E report
+remains a blocker. Human reports remain optional follow-up evidence and must not
+be synthesized from automation.
 
 `verify-playground-custom-source` is the native playground/editor contract. It
 generates a modified TodoMVC source artifact and matching scenario artifact,

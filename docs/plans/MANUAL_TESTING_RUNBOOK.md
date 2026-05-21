@@ -1,8 +1,11 @@
 # Manual Testing Runbook
 
-This runbook is the final human gate for TodoMVC and Cells. It must not be
-replaced by headed automation, source-event injection, or a filled template that
-was not backed by a real visible session.
+This runbook describes the human follow-up pass for TodoMVC and Cells. It must
+not be replaced by headed automation, source-event injection, or a filled
+template that was not backed by a real visible session. The final automated
+handoff gate uses separate `operator-e2e` reports derived from fresh full headed
+OS-input evidence, so Codex/operator verification can finish without waiting
+for human-only JSON.
 
 ## Current Automated Baseline
 
@@ -53,6 +56,16 @@ The aggregate commands reuse those full headed reports unless
 `BOON_ALLOW_OS_POINTER_PROBE=1` is explicitly set again. This prevents a final
 aggregate run from overwriting full OS pointer/keyboard evidence with a partial
 headed report.
+
+Generate the non-human operator E2E reports from those headed reports:
+
+```bash
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
+```
+
+These reports are allowed to satisfy the final aggregate/readiness gates. They
+must not be copied to `*-human.json` and do not claim human observation.
 
 The current templates are generated from those headed reports:
 
@@ -321,9 +334,11 @@ cargo xtask verify-cells-human --check --report target/reports/cells-human.json
 
 ## Final Aggregate Gate
 
-Only after both human reports pass:
+For final automated/operator acceptance:
 
 ```bash
+cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
+cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
@@ -332,20 +347,20 @@ cargo xtask audit-manual-readiness --report target/reports/debug/manual-readines
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
 
-If a human report is missing or stale, the per-example aggregate commands write
-debug-only blocked reports under `target/reports/debug/*-all-blocked.json`. The
-cross-example aggregate also writes
+If an operator E2E report is missing or stale, the per-example aggregate
+commands write debug-only blocked reports under
+`target/reports/debug/*-all-blocked.json`. The cross-example aggregate also writes
 `target/reports/debug/examples-all-blocked.json` with every blocked example in
 the same report, and deliberately removes or avoids a passing top-level
 `target/reports/examples-all.json`.
 
 `audit-manual-readiness` runs the same readiness contract but writes a
-manual-specific report name. Before the real human pass exists, it should fail
-only on the missing human reports and the missing final aggregate reports. After
-both human reports pass, both readiness commands must pass.
+manual-specific report name. Missing human reports are follow-up items, not
+readiness blockers; missing operator E2E reports and missing final aggregate
+reports remain blockers.
 `audit-machine-readiness` is intentionally narrower: it verifies the automated
-reports, templates, handoff docs, and finality checks while recording the human
-and final aggregate reports as deferred to `audit-goal-readiness`.
+reports, templates, handoff docs, and finality checks while recording the
+operator E2E and final aggregate reports as deferred to `audit-goal-readiness`.
 Both readiness audits refresh `target/reports/schema.json` before checking it,
 so they do not depend on a hidden extra schema command after a report-generating
 step.

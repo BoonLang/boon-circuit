@@ -215,6 +215,7 @@ pub enum VerificationLayer {
     Semantic,
     HeadlessPly,
     HeadedPly,
+    OperatorE2e,
     Human,
     Speed,
     Negative,
@@ -227,6 +228,7 @@ impl VerificationLayer {
             Self::Semantic => "semantic",
             Self::HeadlessPly => "ply-headless",
             Self::HeadedPly => "headed-ply",
+            Self::OperatorE2e => "operator-e2e",
             Self::Human => "human",
             Self::Speed => "speed",
             Self::Negative => "negative",
@@ -7320,7 +7322,9 @@ fn runtime_window_mode(layer: VerificationLayer) -> JsonValue {
         VerificationLayer::HeadedPly | VerificationLayer::Human => json!("headed"),
         VerificationLayer::HeadlessPly => json!("headless"),
         VerificationLayer::Semantic | VerificationLayer::Speed => json!("none"),
-        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
+            json!("not-applicable")
+        }
     }
 }
 
@@ -7331,7 +7335,9 @@ fn runtime_window_backend(layer: VerificationLayer) -> JsonValue {
         VerificationLayer::Semantic | VerificationLayer::Speed => {
             json!({"unavailable_reason": "semantic/runtime layer does not open a window"})
         }
-        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
+            json!("not-applicable")
+        }
     }
 }
 
@@ -7345,7 +7351,9 @@ fn runtime_window_size(layer: VerificationLayer) -> JsonValue {
         VerificationLayer::Semantic | VerificationLayer::Speed => {
             json!({"unavailable_reason": "semantic/runtime layer does not open a window"})
         }
-        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
+            json!("not-applicable")
+        }
     }
 }
 
@@ -7359,7 +7367,9 @@ fn runtime_framebuffer_size(layer: VerificationLayer) -> JsonValue {
         VerificationLayer::Semantic | VerificationLayer::Speed => {
             json!({"unavailable_reason": "semantic/runtime layer does not capture a framebuffer"})
         }
-        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
+        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
+            json!("not-applicable")
+        }
     }
 }
 

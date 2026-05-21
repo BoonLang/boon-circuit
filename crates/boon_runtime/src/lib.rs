@@ -8080,7 +8080,11 @@ impl GenericScheduledRuntime {
         source_event: GenericSourceEvent<'_>,
     ) -> RuntimeResult<GenericSourceRouteKind> {
         let source = source_event.source;
-        let route = self.source_routes.require_source(source)?;
+        let source_id = self.source_routes.require_source_id(source)?;
+        let route = self
+            .source_routes
+            .for_source_id(source_id)
+            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?;
         let has_row_context = source_event.target_text.is_some() || source_event.address.is_some();
         if !has_row_context {
             if route.has_list_append_target(primary_list) {
@@ -8251,7 +8255,8 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source: &str,
     ) -> RuntimeResult<Option<&'static str>> {
-        let actions = self.source_routes.actions_for_source(source)?;
+        let source_id = self.source_routes.require_source_id(source)?;
+        let actions = self.source_routes.actions_for_source_id(source_id)?;
         let mut list = None;
         for action in actions.iter().copied() {
             let action_list = match action {
@@ -8784,6 +8789,7 @@ impl GenericScheduledRuntime {
                         &self.source_routes,
                         &self.scalar_equations,
                         input.source,
+                        input.source_id,
                         input.text,
                         input.seq,
                     )? {
@@ -8825,7 +8831,7 @@ impl GenericScheduledRuntime {
                             self.storage.remove_index_source_action_and_unbind_sources(
                                 &self.source_routes,
                                 list,
-                                input.source,
+                                input.source_id,
                                 index,
                                 |binding| {
                                     observe(GenericSourceMutation::SourceUnbind(binding.clone()))
@@ -8843,7 +8849,7 @@ impl GenericScheduledRuntime {
                         self.storage.remove_where_source_action_and_unbind_sources(
                             &self.source_routes,
                             list,
-                            input.source,
+                            input.source_id,
                             |observation| match observation {
                                 GenericListRemoveObservation::SourceUnbind(binding) => {
                                     observe(GenericSourceMutation::SourceUnbind(binding.clone()))
@@ -9117,10 +9123,11 @@ impl GenericCircuitRuntime {
         routes: &SourceRoutePlan,
         equations: &ScalarEquationPlan,
         source: &str,
+        source_id: SourceId,
         payload_text: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
-        let Some(target) = routes.single_root_scalar_target(source)? else {
+        let Some(target) = routes.single_root_scalar_target_for_source_id(source_id)? else {
             return Ok(None);
         };
         let Some(value) =
@@ -9870,10 +9877,10 @@ impl GenericCircuitRuntime {
         &mut self,
         routes: &SourceRoutePlan,
         list: &'static str,
-        source: &str,
+        source_id: SourceId,
         mut observe: impl FnMut(GenericListRemoveObservation<'_>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
-        let predicate = routes.list_remove_predicate(source, list)?;
+        let predicate = routes.list_remove_predicate_for_source_id(source_id, list)?;
         let mut index = 0;
         while index < self.list_len(list)? {
             let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
@@ -9897,11 +9904,11 @@ impl GenericCircuitRuntime {
         &mut self,
         routes: &SourceRoutePlan,
         list: &'static str,
-        source: &str,
+        source_id: SourceId,
         index: usize,
         observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
     ) -> RuntimeResult<Option<(u64, u64)>> {
-        let predicate = routes.list_remove_predicate(source, list)?;
+        let predicate = routes.list_remove_predicate_for_source_id(source_id, list)?;
         let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
             list,
             predicate,
@@ -11942,6 +11949,7 @@ impl SourceRoutePlan {
         self.route_slots.len()
     }
 
+    #[cfg(test)]
     fn for_source(&self, source: &str) -> Option<&SourceRoute> {
         self.source_id(source)
             .and_then(|source_id| self.for_source_id(source_id))
@@ -11968,6 +11976,7 @@ impl SourceRoutePlan {
             .ok_or_else(|| format!("source `{source}` has no typed SourceId route").into())
     }
 
+    #[cfg(test)]
     fn require_source(&self, source: &str) -> RuntimeResult<&SourceRoute> {
         self.for_source(source)
             .ok_or_else(|| format!("source `{source}` has no compiled route").into())
@@ -11981,20 +11990,24 @@ impl SourceRoutePlan {
             .as_slice())
     }
 
-    fn actions_for_source(&self, source: &str) -> RuntimeResult<&[SourceRouteAction]> {
-        Ok(self.require_source(source)?.actions.as_slice())
-    }
-
-    fn single_root_scalar_target(&self, source: &str) -> RuntimeResult<Option<&'static str>> {
-        self.require_source(source)?.single_root_scalar_target()
-    }
-
-    fn list_remove_predicate(
+    fn single_root_scalar_target_for_source_id(
         &self,
-        source: &str,
+        source_id: SourceId,
+    ) -> RuntimeResult<Option<&'static str>> {
+        Ok(self
+            .for_source_id(source_id)
+            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
+            .single_root_scalar_target()?)
+    }
+
+    fn list_remove_predicate_for_source_id(
+        &self,
+        source_id: SourceId,
         list: &str,
     ) -> RuntimeResult<RuntimeListPredicate> {
-        self.require_source(source)?.list_remove_predicate(list)
+        self.for_source_id(source_id)
+            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
+            .list_remove_predicate(list)
     }
 
     #[cfg(test)]

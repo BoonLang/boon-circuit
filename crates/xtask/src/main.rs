@@ -1676,6 +1676,7 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
     let source = std::fs::read_to_string(&source_path)?;
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
+    let mut scanned_slices = Vec::new();
 
     let forbidden_whole_file = [
         "TodoMvcView",
@@ -1700,6 +1701,12 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
 
     let render_slice = source_slice(&source, "fn render_nodes", "fn delta_panel", 0)
         .ok_or("could not isolate generic render/parser slice")?;
+    scanned_slices.push(json!({
+        "category": "renderer",
+        "path": source_path.display().to_string(),
+        "start": "fn render_nodes",
+        "end": "fn delta_panel"
+    }));
     let render_forbidden = [
         "todomvc",
         "todo_mvc",
@@ -1734,6 +1741,12 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
         0,
     )
     .ok_or("could not isolate RenderNode IR slice")?;
+    scanned_slices.push(json!({
+        "category": "view-parser-and-render-ir",
+        "path": source_path.display().to_string(),
+        "start": "enum RenderNode",
+        "end": "pub async fn run_app_from_args"
+    }));
     for token in render_forbidden {
         let findings = find_token_lines(enum_slice.text, token);
         push_genericity_check(
@@ -1748,6 +1761,60 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
                 "findings": findings.into_iter().map(|line| line + enum_slice.start_line - 1).collect::<Vec<_>>()
             }),
         );
+    }
+
+    let probe_forbidden = [
+        "todomvc",
+        "todo_new_input",
+        "todo_row",
+        "cells",
+        "cell_editor_A1",
+    ];
+    for (category, start, end) in [
+        (
+            "headed-probes",
+            "async fn run_verify_headed",
+            "async fn drive_visible_app_control_probe",
+        ),
+        (
+            "app-control-probes",
+            "async fn drive_visible_app_control_probe",
+            "async fn drive_visible_text_input_probe",
+        ),
+        (
+            "source-event-probes",
+            "async fn drive_visible_source_event_probe",
+            "async fn drive_visible_source_text_event_probe",
+        ),
+        (
+            "app-control-runtime",
+            "pub async fn run_app_from_args",
+            "fn render_nodes",
+        ),
+    ] {
+        let slice = source_slice(&source, start, end, 0)
+            .ok_or_else(|| format!("could not isolate {category} slice"))?;
+        scanned_slices.push(json!({
+            "category": category,
+            "path": source_path.display().to_string(),
+            "start": start,
+            "end": end
+        }));
+        for token in probe_forbidden {
+            let findings = find_token_lines(slice.text, token);
+            push_genericity_check(
+                &mut checks,
+                &mut blockers,
+                format!("{category}-forbidden-token:{token}"),
+                findings.is_empty(),
+                json!({
+                    "token": token,
+                    "slice_start_line": slice.start_line,
+                    "slice_end_line": slice.end_line,
+                    "findings": findings.into_iter().map(|line| line + slice.start_line - 1).collect::<Vec<_>>()
+                }),
+            );
+        }
     }
 
     let status = if blockers.is_empty() { "pass" } else { "fail" };
@@ -1778,10 +1845,7 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
             "report/test names",
             "docs"
         ],
-        "scanned_slices": [
-            {"path": source_path.display().to_string(), "start": "fn render_nodes", "end": "fn delta_panel"},
-            {"path": source_path.display().to_string(), "start": "enum RenderNode", "end": "pub async fn run_app_from_args"}
-        ],
+        "scanned_slices": scanned_slices,
         "blockers": blockers
     });
     write_json(&report_path, &report)?;
@@ -1947,14 +2011,18 @@ fn audit_runtime_finality(
         ],
         "runtime completeness report fields are still hardcoded instead of derived",
     );
-    audit_runtime_finality_markers(
+    audit_runtime_finality_required_tokens(
         checks,
         blockers,
         "playground:genericity-scans-all-probes",
         &xtask,
         &[
-            "{\"path\": source_path.display().to_string(), \"start\": \"fn render_nodes\", \"end\": \"fn delta_panel\"}",
-            "{\"path\": source_path.display().to_string(), \"start\": \"enum RenderNode\", \"end\": \"pub async fn run_app_from_args\"}",
+            "\"category\": \"renderer\"",
+            "\"category\": \"view-parser-and-render-ir\"",
+            "\"headed-probes\"",
+            "\"app-control-probes\"",
+            "\"source-event-probes\"",
+            "\"app-control-runtime\"",
         ],
         "verify-playground-genericity still reports only renderer slices, not source/headed/app-control probes",
     );
@@ -2050,6 +2118,29 @@ fn audit_runtime_finality_markers(
         pass,
         json!({"forbidden_findings": findings}).to_string(),
         (!pass).then(|| blocker.to_owned()),
+    );
+}
+
+fn audit_runtime_finality_required_tokens(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: &str,
+    source: &str,
+    required_tokens: &[&str],
+    blocker: &str,
+) {
+    let missing = required_tokens
+        .iter()
+        .filter(|token| !source.contains(*token))
+        .copied()
+        .collect::<Vec<_>>();
+    push_audit_check(
+        checks,
+        blockers,
+        format!("runtime-finality:{id}"),
+        missing.is_empty(),
+        json!({"missing_required_tokens": missing}).to_string(),
+        (!missing.is_empty()).then(|| blocker.to_owned()),
     );
 }
 

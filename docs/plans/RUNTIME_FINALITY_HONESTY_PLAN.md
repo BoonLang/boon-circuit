@@ -2,12 +2,20 @@
 
 ## Summary
 
-The audit confirms the repo is useful but still prototype-shaped. Current
-TodoMVC and Cells behavior, keyed deltas, generic `VIEW` rendering, and speed
-reports are real, but several docs and reports overstate finality. The cleanup
-must make implementation and claims match: real AST, typed IR, columnar runtime
-storage, dense route indexes, honest bounded profiles, and verification that
-distinguishes focusless/synthetic checks from real OS-input checks.
+The original audit found the repo useful but prototype-shaped: TodoMVC and
+Cells behavior, keyed deltas, generic `VIEW` rendering, and speed reports were
+real, but several docs and reports overstated finality. This plan is the
+cleanup contract that makes implementation and claims match: real AST, typed
+IR, columnar runtime storage, dense route indexes, honest bounded profiles, and
+verification that distinguishes focusless/synthetic checks from real OS-input
+checks.
+
+As of the latest checked implementation, the automated side of this plan is
+gated by `cargo xtask audit-machine-readiness` and the final handoff is gated by
+`cargo xtask audit-goal-readiness`. The runtime must still not be described as
+complete while `audit-goal-readiness` reports blockers; currently the intended
+remaining blockers are the real TodoMVC/Cells human reports and the dependent
+aggregate reports.
 
 This is not another local TodoMVC workaround. It is a core compiler/runtime
 cleanup that makes the checked implementation match the architecture promised
@@ -63,7 +71,7 @@ by `docs/architecture/RUNTIME_MODEL.md` and
   top-level `runtime_profile`, `runtime_profile_detail`, `capacities`, and
   `expression_coverage` fields exactly; schema and readiness audits must reject
   drift between those copies.
-  remaining TodoMVC/Cells shell must be listed explicitly as an
+  Remaining TodoMVC/Cells shell must be listed explicitly as an
   allowed scenario/assertion/report shell through
   `remaining_example_specific_shells` until removed.
 

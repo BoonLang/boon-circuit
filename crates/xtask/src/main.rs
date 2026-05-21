@@ -2641,6 +2641,19 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
+        "reports:human-and-headed-current-git",
+        &format!("{runtime}\n{xtask}"),
+        &[
+            "manual report git_commit `{report_commit}` does not match current git commit",
+            "linked headed report git_commit `{headed_commit}` does not match current git commit",
+            "full-os-headed-report-current-git",
+            "was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+        ],
+        "human and full headed reports must be rejected when they were generated for an older git commit",
+    );
+    audit_runtime_finality_required_tokens(
+        checks,
+        blockers,
         "reports:prepare-human-visible-session-required",
         &xtask,
         &[
@@ -2939,6 +2952,24 @@ fn audit_runtime_finality_reports(
             continue;
         }
         let report = read_json(&path)?;
+        let current_commit = git_commit();
+        let report_commit = report
+            .get("git_commit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        push_audit_check(
+            checks,
+            blockers,
+            format!("runtime-finality:{name}:full-os-headed-report-current-git"),
+            report_commit == current_commit,
+            format!("report_git_commit={report_commit}, current_git_commit={current_commit}"),
+            (report_commit != current_commit).then(|| {
+                format!(
+                    "`{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+                    path.display()
+                )
+            }),
+        );
         let full_os = report
             .get("input_injection_method")
             .and_then(serde_json::Value::as_str)
@@ -8996,6 +9027,18 @@ fn verify_existing_full_headed_report(
     }
     verify_report_schema(report)?;
     let report_json = read_json(report)?;
+    let current_commit = git_commit();
+    let report_commit = report_json
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>");
+    if report_commit != current_commit {
+        return Err(format!(
+            "{name} headed report `{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`; rerun `BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-{name}-headed-ply`",
+            report.display()
+        )
+        .into());
+    }
     if report_json
         .get("input_injection_method")
         .and_then(serde_json::Value::as_str)

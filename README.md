@@ -162,7 +162,9 @@ enforce the same rule unless `BOON_OS_INPUT_ISOLATED=xvfb` is present from the
 isolated xtask wrapper. Passing full OS reports use
 `input_injection_method = "os_pointer_keyboard_to_visible_window"`, have no
 `os_input_limitation`, record per-step visible targets and screenshots, and are
-checked by `audit-goal-readiness`.
+checked by `audit-goal-readiness`. Canonical full headed reports and the human
+reports linked to them must carry the current git commit; rerun the headed
+aliases after changing code.
 
 On this COSMIC desktop, open the manual playground surface without stealing
 unrelated focus by keeping the wrapper directly around the native window

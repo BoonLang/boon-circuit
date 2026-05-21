@@ -3611,6 +3611,23 @@ fn verify_human_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResu
     }
     verify_report_schema(Path::new(headed_report_path))?;
     let headed_report: JsonValue = serde_json::from_slice(&fs::read(headed_report_path)?)?;
+    let current_commit = git_commit();
+    let report_commit = json_str_field(report, "git_commit")?;
+    if report_commit != current_commit {
+        return Err(format!(
+            "{} manual report git_commit `{report_commit}` does not match current git commit `{current_commit}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let headed_commit = json_str_field(&headed_report, "git_commit")?;
+    if headed_commit != current_commit {
+        return Err(format!(
+            "{} linked headed report git_commit `{headed_commit}` does not match current git commit `{current_commit}`",
+            report_path.display()
+        )
+        .into());
+    }
     if headed_report.get("layer").and_then(JsonValue::as_str) != Some("headed-ply") {
         return Err(format!(
             "{} linked headed report `{headed_report_path}` is not headed-ply",

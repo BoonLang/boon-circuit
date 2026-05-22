@@ -5,6 +5,12 @@ members = [
     "crates/boon_runtime",
     "crates/boon_cli",
     "crates/boon_ply_playground",
+    "crates/boon_document_model",
+    "crates/boon_host",
+    "crates/boon_document",
+    "crates/boon_native_gpu",
+    "crates/boon_native_app_window",
+    "crates/boon_native_playground",
     "crates/xtask",
 ]
 resolver = "2"
@@ -18,6 +24,11 @@ rust-version = "1.88"
 boon_parser = { path = "crates/boon_parser" }
 boon_ir = { path = "crates/boon_ir" }
 boon_runtime = { path = "crates/boon_runtime" }
+boon_document_model = { path = "crates/boon_document_model" }
+boon_host = { path = "crates/boon_host" }
+boon_document = { path = "crates/boon_document" }
+boon_native_gpu = { path = "crates/boon_native_gpu" }
+boon_native_app_window = { path = "crates/boon_native_app_window" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
@@ -26,3 +37,6 @@ chumsky = "0.9"
 bitvec = "1.0"
 image = { version = "0.24.9", default-features = false, features = ["png"] }
 ply-engine = { version = "1.1.1", default-features = false }
+wgpu = "=29.0.1"
+glyphon = "=0.11.0"
+app_window = "=0.3.3"

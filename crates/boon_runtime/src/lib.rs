@@ -992,6 +992,18 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "audit-manual-readiness"
                 | "verify-runtime-finality"
                 | "verify-cells-wayland-scroll-speed"
+                | "verify-platform-contract"
+                | "verify-native-gpu-dependency-graph"
+                | "verify-native-gpu-architecture"
+                | "verify-native-gpu-layout-contract"
+                | "verify-native-gpu-shaders"
+                | "verify-native-gpu-multiwindow"
+                | "verify-native-gpu-ipc-backpressure"
+                | "verify-native-gpu-observability"
+                | "verify-native-gpu-preview-e2e"
+                | "verify-native-gpu-scroll-speed"
+                | "verify-native-gpu-negative"
+                | "verify-native-gpu-all"
         )
     )
 }

@@ -1,0 +1,30 @@
+[frame]
+preview_frame_ms_p95 = 16.7
+preview_frame_ms_p99 = 16.7
+preview_frame_ms_max = 33.4
+missed_frame_count = 0
+wheel_to_visible_ms_p95 = 50.0
+
+[ipc]
+preview_blocked_on_ipc_count = 0
+heartbeat_gap_ms_max = 250.0
+queue_depth_max = 256
+dropped_debug_update_count_max = 100000
+debug_query_bytes_p95 = 262144
+debug_subscription_bytes_p95 = 262144
+
+[memory]
+rss_mib_max = 1024
+upload_bytes_p95 = 262144
+
+[cells]
+logical_columns = 26
+logical_rows = 100
+draw_calls_p95 = 16
+queue_write_count_p95 = 8
+materialized_cell_overscan_multiplier = 2
+
+[dev_code_editor]
+min_lines = 10000
+min_longest_line_bytes = 2000
+preview_frame_ms_p95_while_scrolling = 16.7

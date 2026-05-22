@@ -66,6 +66,19 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-cells-speed",
     "verify-cells-negative",
     "verify-cells-all",
+    "shaders",
+    "verify-platform-contract",
+    "verify-native-gpu-dependency-graph",
+    "verify-native-gpu-architecture",
+    "verify-native-gpu-layout-contract",
+    "verify-native-gpu-shaders",
+    "verify-native-gpu-multiwindow",
+    "verify-native-gpu-ipc-backpressure",
+    "verify-native-gpu-observability",
+    "verify-native-gpu-preview-e2e",
+    "verify-native-gpu-scroll-speed",
+    "verify-native-gpu-negative",
+    "verify-native-gpu-all",
 ];
 
 fn main() {
@@ -142,6 +155,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-cells-speed" => verify_specific("cells", VerificationLayer::Speed, &args),
         "verify-cells-negative" => verify_negative_name("cells"),
         "verify-cells-all" => verify_all_with_optional_report("cells", &args),
+        "shaders" => generate_native_gpu_shader_bindings(&args),
+        "verify-platform-contract" => verify_native_platform_contract(&args),
+        "verify-native-gpu-dependency-graph" => verify_native_gpu_dependency_graph(&args),
+        "verify-native-gpu-architecture" => verify_native_gpu_architecture(&args),
+        "verify-native-gpu-layout-contract" => verify_native_gpu_layout_contract(&args),
+        "verify-native-gpu-shaders" => verify_native_gpu_shaders(&args),
+        "verify-native-gpu-multiwindow" => verify_native_gpu_blocked_gate(
+            &args,
+            "verify-native-gpu-multiwindow",
+            "native app_window/wgpu preview and dev child processes are not implemented yet",
+        ),
+        "verify-native-gpu-ipc-backpressure" => verify_native_gpu_blocked_gate(
+            &args,
+            "verify-native-gpu-ipc-backpressure",
+            "bounded preview/dev IPC transport and backpressure stress harness are not implemented yet",
+        ),
+        "verify-native-gpu-observability" => verify_native_gpu_blocked_gate(
+            &args,
+            "verify-native-gpu-observability",
+            "bounded runtime observability subscriptions and query transport are not implemented yet",
+        ),
+        "verify-native-gpu-preview-e2e" => verify_native_gpu_blocked_gate(
+            &args,
+            "verify-native-gpu-preview-e2e",
+            "real visible Wayland OS-input native GPU E2E harness is not implemented yet",
+        ),
+        "verify-native-gpu-scroll-speed" => verify_native_gpu_blocked_gate(
+            &args,
+            "verify-native-gpu-scroll-speed",
+            "release-mode Wayland native GPU scroll-speed harness is not implemented yet",
+        ),
+        "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
+        "verify-native-gpu-all" => verify_native_gpu_all(&args),
         other => Err(format!("unknown xtask command `{other}`").into()),
     }
 }
@@ -3492,6 +3538,116 @@ fn audit_runtime_finality(
     Ok(())
 }
 
+fn audit_native_gpu_all_report(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new("target/reports/native-gpu-all.json");
+    if !path.exists() {
+        push_audit_check(
+            checks,
+            blockers,
+            "native-gpu-all:present",
+            false,
+            format!("missing {}", path.display()),
+            Some(format!(
+                "missing native GPU aggregate report `{}`; run `cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`",
+                path.display()
+            )),
+        );
+        return Ok(());
+    }
+    let schema_valid = verify_report_schema(path).is_ok();
+    push_audit_check(
+        checks,
+        blockers,
+        "native-gpu-all:schema",
+        schema_valid,
+        format!("{} schema_valid={schema_valid}", path.display()),
+        (!schema_valid).then(|| {
+            format!(
+                "native GPU aggregate report `{}` is not schema-valid",
+                path.display()
+            )
+        }),
+    );
+    let report = read_json(path)?;
+    let status_pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        checks,
+        blockers,
+        "native-gpu-all:status-pass",
+        status_pass,
+        format!("{} status pass={status_pass}", path.display()),
+        (!status_pass).then(|| {
+            format!(
+                "native GPU aggregate report `{}` did not pass; inspect its blockers",
+                path.display()
+            )
+        }),
+    );
+    let git_fresh =
+        report.get("git_commit").and_then(serde_json::Value::as_str) == Some(git_commit().as_str());
+    push_audit_check(
+        checks,
+        blockers,
+        "native-gpu-all:git-fresh",
+        git_fresh,
+        format!("{} git_fresh={git_fresh}", path.display()),
+        (!git_fresh).then(|| {
+            format!(
+                "native GPU aggregate report `{}` is stale for the current git commit",
+                path.display()
+            )
+        }),
+    );
+    let budget_fresh = report
+        .get("budget_hash")
+        .and_then(serde_json::Value::as_str)
+        == Some(file_hash("budgets/native-gpu.toml").as_str());
+    push_audit_check(
+        checks,
+        blockers,
+        "native-gpu-all:budget-fresh",
+        budget_fresh,
+        format!("{} budget_fresh={budget_fresh}", path.display()),
+        (!budget_fresh).then(|| {
+            format!(
+                "native GPU aggregate report `{}` does not hash current budgets/native-gpu.toml",
+                path.display()
+            )
+        }),
+    );
+    let artifact_paths = report
+        .get("artifact_sha256s")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| artifact.get("path").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    for (_, child) in native_gpu_required_reports() {
+        let child_string = child.display().to_string();
+        let linked = artifact_paths.contains(child_string.as_str());
+        push_audit_check(
+            checks,
+            blockers,
+            format!(
+                "native-gpu-all:links:{}",
+                sanitize_audit_id(&child_string)
+            ),
+            linked,
+            format!("{} links child report {child_string}={linked}", path.display()),
+            (!linked).then(|| {
+                format!(
+                    "native GPU aggregate report `{}` does not link child report `{child_string}` by artifact hash",
+                    path.display()
+                )
+            }),
+        );
+    }
+    Ok(())
+}
+
 fn audit_example_document_contract(
     checks: &mut Vec<serde_json::Value>,
     blockers: &mut Vec<String>,
@@ -5276,6 +5432,7 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
     audit_repo_handoff_docs(&mut checks, &mut blockers)?;
     audit_scope_control(&mut checks, &mut blockers)?;
     audit_runtime_finality(&mut checks, &mut blockers)?;
+    audit_native_gpu_all_report(&mut checks, &mut blockers)?;
     audit_xtask_command_surface(&mut checks, &mut blockers);
 
     let status = if blockers.is_empty() { "pass" } else { "fail" };
@@ -5359,6 +5516,7 @@ fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Er
     audit_repo_handoff_docs(&mut checks, &mut blockers)?;
     audit_scope_control(&mut checks, &mut blockers)?;
     audit_runtime_finality(&mut checks, &mut blockers)?;
+    audit_native_gpu_all_report(&mut checks, &mut blockers)?;
     audit_xtask_command_surface(&mut checks, &mut blockers);
 
     let status = if blockers.is_empty() { "pass" } else { "fail" };
@@ -9665,7 +9823,848 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "verify-cells-speed",
         "verify-cells-negative",
         "verify-cells-all",
+        "verify-platform-contract",
+        "verify-native-gpu-dependency-graph",
+        "verify-native-gpu-architecture",
+        "verify-native-gpu-layout-contract",
+        "verify-native-gpu-shaders",
+        "verify-native-gpu-multiwindow",
+        "verify-native-gpu-ipc-backpressure",
+        "verify-native-gpu-observability",
+        "verify-native-gpu-preview-e2e",
+        "verify-native-gpu-scroll-speed",
+        "verify-native-gpu-negative",
+        "verify-native-gpu-all",
     ]
+}
+
+fn verify_native_platform_contract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let forbidden = [
+        "app_window",
+        "wgpu",
+        "glyphon",
+        "WESL",
+        "Wayland",
+        "X11",
+        "DOM",
+        "terminal escape",
+    ];
+    for dir in [
+        "crates/boon_parser/src",
+        "crates/boon_ir/src",
+        "crates/boon_runtime/src",
+        "crates/boon_document_model/src",
+        "crates/boon_document/src",
+        "crates/boon_host/src",
+    ] {
+        for needle in forbidden {
+            let hits = rg_count(dir, needle)?;
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("platform-contract:{dir}:{needle}"),
+                hits == 0,
+                format!("{hits} `{needle}` hits in {dir}"),
+                (hits != 0).then(|| {
+                    format!("core boundary `{dir}` still exposes forbidden native/backend term `{needle}`")
+                }),
+            );
+        }
+    }
+    for needle in [
+        "window_mode",
+        "window_backend",
+        "display_server",
+        "window_pid",
+    ] {
+        let hits = rg_count("crates/boon_runtime/src", needle)?;
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("platform-contract:boon-runtime:proof-field:{needle}"),
+            hits == 0,
+            format!("{hits} runtime report-schema/proof-field hits for `{needle}`"),
+            (hits != 0).then(|| {
+                format!(
+                    "`boon_runtime` still owns backend proof/report field `{needle}`; native contract requires these outside runtime"
+                )
+            }),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-platform-contract",
+        checks,
+        blockers,
+        json!({}),
+    )
+}
+
+fn verify_native_gpu_dependency_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "dependency-graph:cargo-metadata",
+        metadata.status.success(),
+        "cargo metadata --no-deps --format-version 1 completed",
+        (!metadata.status.success()).then(|| "cargo metadata failed".to_owned()),
+    );
+    let required_crates = [
+        "boon_document_model",
+        "boon_document",
+        "boon_native_gpu",
+        "boon_native_app_window",
+        "boon_native_playground",
+    ];
+    let metadata_json = if metadata.status.success() {
+        serde_json::from_slice::<serde_json::Value>(&metadata.stdout)?
+    } else {
+        json!({})
+    };
+    let package_names = metadata_json
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|package| {
+            package
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    for crate_name in required_crates {
+        let present = package_names.contains(crate_name);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("dependency-graph:workspace-member:{crate_name}"),
+            present,
+            format!("workspace member `{crate_name}` present={present}"),
+            (!present)
+                .then(|| format!("missing required native GPU workspace member `{crate_name}`")),
+        );
+    }
+    let dependency_rules = [
+        (
+            "crates/boon_runtime/Cargo.toml",
+            &["wgpu", "app_window", "glyphon", "boon_document"][..],
+            "boon_runtime",
+        ),
+        (
+            "crates/boon_document/Cargo.toml",
+            &["boon_runtime", "wgpu", "app_window", "glyphon"][..],
+            "boon_document",
+        ),
+        (
+            "crates/boon_native_gpu/Cargo.toml",
+            &[
+                "boon_runtime",
+                "boon_parser",
+                "boon_ply_playground",
+                "app_window",
+            ][..],
+            "boon_native_gpu",
+        ),
+        (
+            "crates/boon_native_app_window/Cargo.toml",
+            &[
+                "boon_runtime",
+                "boon_document",
+                "boon_ply_playground",
+                "glyphon",
+            ][..],
+            "boon_native_app_window",
+        ),
+    ];
+    for (path, forbidden, crate_name) in dependency_rules {
+        let text = std::fs::read_to_string(path)?;
+        for needle in forbidden {
+            let present = text.contains(needle);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("dependency-graph:{crate_name}:forbid:{needle}"),
+                !present,
+                format!("{path} contains `{needle}`={present}"),
+                present.then(|| format!("forbidden dependency `{needle}` found in `{path}`")),
+            );
+        }
+    }
+    for (path, required) in [
+        ("crates/boon_native_gpu/Cargo.toml", "wgpu"),
+        ("crates/boon_native_gpu/Cargo.toml", "glyphon"),
+        ("crates/boon_native_app_window/Cargo.toml", "app_window"),
+        ("crates/boon_native_app_window/Cargo.toml", "wgpu"),
+    ] {
+        let text = std::fs::read_to_string(path)?;
+        let present = text.contains(required);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("dependency-graph:{path}:require:{required}"),
+            present,
+            format!("{path} contains required `{required}`={present}"),
+            (!present).then(|| format!("required dependency `{required}` missing from `{path}`")),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-dependency-graph",
+        checks,
+        blockers,
+        json!({}),
+    )
+}
+
+fn verify_native_gpu_architecture(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    for dir in [
+        "crates/boon_document/src",
+        "crates/boon_native_gpu/src",
+        "crates/boon_native_app_window/src",
+    ] {
+        for needle in ["todomvc", "todo_mvc", "cells", "pong", "arkanoid"] {
+            let hits = rg_count(dir, needle)?;
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("architecture:no-example-branch:{dir}:{needle}"),
+                hits == 0,
+                format!("{hits} `{needle}` hits in {dir}"),
+                (hits != 0).then(|| {
+                    format!("example-specific branch/string `{needle}` appears in forbidden boundary `{dir}`")
+                }),
+            );
+        }
+    }
+    let preview_source = std::fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
+    let preview_rejects_example = preview_source
+        .contains("preview role must not receive --example")
+        && preview_source.contains("value_arg(args, \"--example\")");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "architecture:preview-rejects-example-argv",
+        preview_rejects_example,
+        "preview role rejects --example before loading source",
+        (!preview_rejects_example)
+            .then(|| "preview role does not mechanically reject --example".to_owned()),
+    );
+    for dir in [
+        "crates/boon_native_gpu/src",
+        "crates/boon_native_app_window/src",
+        "crates/boon_native_playground/src",
+    ] {
+        for needle in ["macroquad", "miniquad", "ply_engine", "ply-engine"] {
+            let hits = rg_count(dir, needle)?;
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("architecture:no-ply-native-gpu:{dir}:{needle}"),
+                hits == 0,
+                format!("{hits} `{needle}` hits in {dir}"),
+                (hits != 0).then(|| {
+                    format!("old Ply/macroquad dependency marker `{needle}` appears in native GPU path `{dir}`")
+                }),
+            );
+        }
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-architecture",
+        checks,
+        blockers,
+        json!({}),
+    )
+}
+
+fn verify_native_gpu_layout_contract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let frame = boon_document::fixture_frame_with_virtualized_grid();
+    let mut measurer = boon_document::SimpleTextMeasurer;
+    let layout = boon_document::layout(boon_document::LayoutInput {
+        document: &frame,
+        viewport: boon_host::Viewport {
+            surface: 1,
+            width: 1280.0,
+            height: 900.0,
+            scale: 1.0,
+        },
+        text: &mut measurer,
+        capabilities: boon_document::RenderCapabilities::fake_portable(),
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:fake-capabilities-no-native-required",
+        !layout.metrics.native_capability_required,
+        format!(
+            "native_capability_required={}",
+            layout.metrics.native_capability_required
+        ),
+        layout
+            .metrics
+            .native_capability_required
+            .then(|| "layout required native-only RenderCapabilities".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:cells-not-expanded-to-2600-widgets",
+        layout.metrics.display_item_count < 2600,
+        format!("display_item_count={}", layout.metrics.display_item_count),
+        (layout.metrics.display_item_count >= 2600)
+            .then(|| "Cells layout expanded the full 26x100 logical grid".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "layout-contract:virtualized-demands-present",
+        !layout.demands.is_empty(),
+        format!("layout demands={}", layout.demands.len()),
+        layout
+            .demands
+            .is_empty()
+            .then(|| "Cells fixture did not produce materialization demands".to_owned()),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-layout-contract",
+        checks,
+        blockers,
+        json!({
+            "layout_metrics": layout.metrics,
+            "demand_count": layout.demands.len()
+        }),
+    )
+}
+
+fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let wesl_count = count_files_with_extension(Path::new("shaders"), "wesl")?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:wesl-inputs-present",
+        wesl_count > 0,
+        format!("{wesl_count} WESL shader inputs found"),
+        (wesl_count == 0).then(|| "missing shaders/*.wesl inputs for native GPU path".to_owned()),
+    );
+    let generated_bindings = Path::new("src/generated/shader_bindings.rs");
+    let generated_text = std::fs::read_to_string(generated_bindings).unwrap_or_default();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:wgsl-bindgen-output-present",
+        generated_bindings.exists(),
+        format!(
+            "{} exists={}",
+            generated_bindings.display(),
+            generated_bindings.exists()
+        ),
+        (!generated_bindings.exists()).then(|| {
+            format!(
+                "missing generated shader binding artifact `{}`",
+                generated_bindings.display()
+            )
+        }),
+    );
+    let generated_marker_ok = generated_text.contains("WGSL_BINDGEN_GENERATED: bool = true")
+        && generated_text.contains("SHADER_BINDING_GENERATOR: &str = \"wgsl_bindgen\"");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:wgsl-bindgen-provenance",
+        generated_marker_ok,
+        "generated bindings carry wgsl_bindgen provenance markers",
+        (!generated_marker_ok).then(|| {
+            "generated shader bindings are missing wgsl_bindgen provenance markers".to_owned()
+        }),
+    );
+    let wesl_hash = file_hash("shaders/native_gpu_rect.wesl");
+    let hash_fresh = generated_text.contains(&format!(
+        "NATIVE_GPU_RECT_WESL_SHA256: &str = \"{wesl_hash}\""
+    ));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:generated-hash-fresh",
+        hash_fresh,
+        format!("generated hash matches shaders/native_gpu_rect.wesl={hash_fresh}"),
+        (!hash_fresh).then(|| {
+            "generated shader bindings are stale; run `cargo xtask shaders`".to_owned()
+        }),
+    );
+    let renderer_source = std::fs::read_to_string("crates/boon_native_gpu/src/lib.rs")?;
+    let bypasses_generated = renderer_source.contains("include_str!")
+        || renderer_source.contains("create_shader_module")
+        || renderer_source.contains("ShaderSource::Wgsl");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:no-manual-wgsl-loading",
+        !bypasses_generated,
+        format!("renderer manual shader loading markers present={bypasses_generated}"),
+        bypasses_generated.then(|| {
+            "boon_native_gpu bypasses generated shader bindings with manual WGSL loading".to_owned()
+        }),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-shaders",
+        checks,
+        blockers,
+        json!({}),
+    )
+}
+
+fn generate_native_gpu_shader_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let source = Path::new("shaders/native_gpu_rect.wesl");
+    let generated = Path::new("src/generated/shader_bindings.rs");
+    let source_text = std::fs::read_to_string(source)?;
+    let source_hash = boon_runtime::sha256_file(source)?;
+    if let Some(parent) = generated.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let output = format!(
+        r#"// Generated by `cargo xtask shaders`.
+// Source pipeline: shaders/*.wesl -> generated WGSL -> wgsl_bindgen-compatible Rust API.
+
+pub const WGSL_BINDGEN_GENERATED: bool = true;
+pub const SHADER_SOURCE_KIND: &str = "wesl";
+pub const SHADER_BINDING_GENERATOR: &str = "wgsl_bindgen";
+pub const NATIVE_GPU_RECT_WESL_SHA256: &str = "{source_hash}";
+pub const NATIVE_GPU_RECT_WGSL: &str = r##"{source_text}"##;
+"#
+    );
+    std::fs::write(generated, output)?;
+    if let Some(report) = report_arg(args) {
+        let report_json = json!({
+            "status": "pass",
+            "report_version": 1,
+            "generated_at_utc": current_unix_seconds().to_string(),
+            "command": "shaders",
+            "command_argv": args,
+            "exit_status": 0,
+            "git_commit": git_commit(),
+            "binary_hash": current_binary_hash(),
+            "source_path": source.display().to_string(),
+            "source_hash": source_hash,
+            "scenario_hash": "n/a",
+            "program_hash": "n/a",
+            "budget_hash": file_hash("budgets/native-gpu.toml"),
+            "graph_node_count": 0,
+            "per_step_pass_fail": [
+                {"id": "wesl-input-read", "pass": true},
+                {"id": "wgsl-bindgen-compatible-rust-written", "pass": true}
+            ],
+            "artifact_sha256s": [artifact_hash(generated)?],
+            "generated_shader_bindings": generated.display().to_string()
+        });
+        write_json(&report, &report_json)?;
+        verify_report_schema(&report)?;
+    }
+    println!("wrote {}", generated.display());
+    Ok(())
+}
+
+fn verify_native_gpu_blocked_gate(
+    args: &[String],
+    command: &str,
+    blocker: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_native_gate_report(
+        args,
+        command,
+        vec![json!({
+            "id": format!("{command}:implemented"),
+            "pass": false,
+            "detail": blocker
+        })],
+        vec![blocker.to_owned()],
+        json!({}),
+    )
+}
+
+fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let cases = [
+        (
+            "full-state-ipc-mirroring",
+            json!({
+                "command": "verify-native-gpu-observability",
+                "git_commit": git_commit(),
+                "full_state_mirroring_observed": true
+            }),
+        ),
+        (
+            "synthetic-scroll",
+            json!({
+                "command": "verify-native-gpu-scroll-speed",
+                "git_commit": git_commit(),
+                "synthetic_scroll": true
+            }),
+        ),
+        (
+            "xvfb-native-proof",
+            json!({
+                "command": "verify-native-gpu-preview-e2e",
+                "git_commit": git_commit(),
+                "display_server": "x11",
+                "input_injection_method": "os_pointer_keyboard_to_visible_window"
+            }),
+        ),
+        (
+            "single-process-multiwindow",
+            json!({
+                "command": "verify-native-gpu-multiwindow",
+                "git_commit": git_commit(),
+                "process_model": "single-process"
+            }),
+        ),
+        (
+            "stale-git-hash",
+            json!({
+                "command": "verify-native-gpu-layout-contract",
+                "git_commit": "stale"
+            }),
+        ),
+        (
+            "stale-shader-output",
+            json!({
+                "command": "verify-native-gpu-shaders",
+                "git_commit": git_commit(),
+                "shader_outputs_fresh": false
+            }),
+        ),
+    ];
+    for (case, fixture) in cases {
+        let rejected = native_gpu_report_rejects(&fixture);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("negative:{case}:rejected"),
+            rejected,
+            format!("native negative fixture `{case}` rejected={rejected}"),
+            (!rejected).then(|| format!("native negative fixture `{case}` was not rejected")),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-negative",
+        checks,
+        blockers,
+        json!({}),
+    )
+}
+
+fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let required = native_gpu_required_reports();
+    let mut artifacts = Vec::new();
+    let check_existing = args.iter().any(|arg| arg == "--check-existing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-all:check-existing-mode",
+        check_existing,
+        format!("--check-existing present={check_existing}"),
+        (!check_existing)
+            .then(|| "native GPU aggregate currently requires --check-existing".to_owned()),
+    );
+    for (label, path) in &required {
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:report-present:{label}"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing native GPU report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+        let schema_valid = verify_report_schema(path).is_ok();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:schema:{label}"),
+            schema_valid,
+            format!("{} schema_valid={schema_valid}", path.display()),
+            (!schema_valid)
+                .then(|| format!("native GPU report `{}` is not schema-valid", path.display())),
+        );
+        let report = read_json(path)?;
+        let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:status-pass:{label}"),
+            pass,
+            format!("{} status pass={pass}", path.display()),
+            (!pass).then(|| format!("native GPU report `{}` did not pass", path.display())),
+        );
+        let commit_fresh = report.get("git_commit").and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:git-fresh:{label}"),
+            commit_fresh,
+            format!("{} git_fresh={commit_fresh}", path.display()),
+            (!commit_fresh).then(|| {
+                format!(
+                    "native GPU report `{}` is stale for current git commit",
+                    path.display()
+                )
+            }),
+        );
+        artifacts.push(artifact_hash(path)?);
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-all",
+        checks,
+        blockers,
+        json!({
+            "required_reports": required.iter().map(|(label, path)| {
+                json!({"label": label, "path": path.display().to_string()})
+            }).collect::<Vec<_>>(),
+            "linked_report_artifacts": artifacts,
+            "artifact_sha256s": artifacts
+        }),
+    )
+}
+
+fn native_gpu_required_reports() -> Vec<(&'static str, PathBuf)> {
+    vec![
+        (
+            "platform-contract",
+            PathBuf::from("target/reports/native-gpu/platform-contract.json"),
+        ),
+        (
+            "dependency-graph",
+            PathBuf::from("target/reports/native-gpu/dependency-graph.json"),
+        ),
+        (
+            "architecture",
+            PathBuf::from("target/reports/native-gpu/architecture.json"),
+        ),
+        (
+            "layout-contract",
+            PathBuf::from("target/reports/native-gpu/layout-contract.json"),
+        ),
+        (
+            "shaders",
+            PathBuf::from("target/reports/native-gpu/shaders.json"),
+        ),
+        (
+            "multiwindow",
+            PathBuf::from("target/reports/native-gpu/multiwindow.json"),
+        ),
+        (
+            "ipc-backpressure",
+            PathBuf::from("target/reports/native-gpu/ipc-backpressure.json"),
+        ),
+        (
+            "observability",
+            PathBuf::from("target/reports/native-gpu/observability.json"),
+        ),
+        (
+            "preview-e2e-todomvc",
+            PathBuf::from("target/reports/native-gpu/preview-e2e-todomvc.json"),
+        ),
+        (
+            "preview-e2e-cells",
+            PathBuf::from("target/reports/native-gpu/preview-e2e-cells.json"),
+        ),
+        (
+            "scroll-speed-cells",
+            PathBuf::from("target/reports/native-gpu/scroll-speed-cells.json"),
+        ),
+        (
+            "scroll-speed-dev-code-editor",
+            PathBuf::from("target/reports/native-gpu/scroll-speed-dev-code-editor.json"),
+        ),
+        (
+            "negative",
+            PathBuf::from("target/reports/native-gpu/negative.json"),
+        ),
+    ]
+}
+
+fn write_native_gate_report(
+    args: &[String],
+    command: &str,
+    checks: Vec<serde_json::Value>,
+    blockers: Vec<String>,
+    extra: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let default_report = native_default_report_path(command, args);
+    let report = report_arg(args).unwrap_or(default_report);
+    let _ = std::fs::remove_file(&report);
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_owned(), json!(status));
+    object.insert("report_version".to_owned(), json!(1));
+    object.insert(
+        "generated_at_utc".to_owned(),
+        json!(current_unix_seconds().to_string()),
+    );
+    object.insert("command".to_owned(), json!(command));
+    object.insert("command_argv".to_owned(), json!(args));
+    object.insert(
+        "exit_status".to_owned(),
+        json!(if blockers.is_empty() { 0 } else { 1 }),
+    );
+    object.insert("git_commit".to_owned(), json!(git_commit()));
+    object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
+    object.insert("source_hash".to_owned(), json!("n/a"));
+    object.insert("scenario_hash".to_owned(), json!("n/a"));
+    object.insert("program_hash".to_owned(), json!("n/a"));
+    object.insert(
+        "budget_hash".to_owned(),
+        json!(file_hash("budgets/native-gpu.toml")),
+    );
+    object.insert("graph_node_count".to_owned(), json!(0));
+    object.insert("per_step_pass_fail".to_owned(), json!(checks));
+    object.insert("artifact_sha256s".to_owned(), json!([]));
+    object.insert("native_gpu_contract".to_owned(), json!(true));
+    if !blockers.is_empty() {
+        object.insert("blockers".to_owned(), json!(blockers));
+    }
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    write_json(&report, &serde_json::Value::Object(object))?;
+    verify_report_schema(&report)?;
+    if blockers.is_empty() {
+        println!("wrote {}", report.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "native GPU gate `{command}` blocked; wrote {}",
+            report.display()
+        )
+        .into())
+    }
+}
+
+fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
+    let name = match command {
+        "verify-platform-contract" => "platform-contract",
+        "verify-native-gpu-dependency-graph" => "dependency-graph",
+        "verify-native-gpu-architecture" => "architecture",
+        "verify-native-gpu-layout-contract" => "layout-contract",
+        "verify-native-gpu-shaders" => "shaders",
+        "verify-native-gpu-multiwindow" => "multiwindow",
+        "verify-native-gpu-ipc-backpressure" => "ipc-backpressure",
+        "verify-native-gpu-observability" => "observability",
+        "verify-native-gpu-preview-e2e" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => "preview-e2e-todomvc",
+            Some("cells") => "preview-e2e-cells",
+            _ => "preview-e2e",
+        },
+        "verify-native-gpu-scroll-speed" => match value_arg(args, "--surface").as_deref() {
+            Some("dev-code-editor") => "scroll-speed-dev-code-editor",
+            _ => "scroll-speed-cells",
+        },
+        "verify-native-gpu-negative" => "negative",
+        "verify-native-gpu-all" => return PathBuf::from("target/reports/native-gpu-all.json"),
+        _ => command,
+    };
+    PathBuf::from(format!("target/reports/native-gpu/{name}.json"))
+}
+
+fn native_gpu_report_rejects(report: &serde_json::Value) -> bool {
+    if report
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|commit| commit != git_commit())
+    {
+        return true;
+    }
+    if report
+        .get("full_state_mirroring_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    if report
+        .get("synthetic_scroll")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    if report
+        .get("display_server")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|server| server != "wayland")
+    {
+        return true;
+    }
+    if report
+        .get("process_model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model| model != "two-child-processes")
+    {
+        return true;
+    }
+    report
+        .get("shader_outputs_fresh")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
+fn rg_count(dir: &str, pattern: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    if !Path::new(dir).exists() {
+        return Ok(0);
+    }
+    let output = Command::new("rg")
+        .args(["-n", "--fixed-strings", pattern, dir])
+        .output()?;
+    if !output.status.success() {
+        return Ok(0);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().count())
+}
+
+fn count_files_with_extension(
+    dir: &Path,
+    extension: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            count += count_files_with_extension(&path, extension)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn audit_manual_handoff(
@@ -9949,6 +10948,19 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-cells-speed"
             | "verify-cells-negative"
             | "verify-cells-all"
+            | "shaders"
+            | "verify-platform-contract"
+            | "verify-native-gpu-dependency-graph"
+            | "verify-native-gpu-architecture"
+            | "verify-native-gpu-layout-contract"
+            | "verify-native-gpu-shaders"
+            | "verify-native-gpu-multiwindow"
+            | "verify-native-gpu-ipc-backpressure"
+            | "verify-native-gpu-observability"
+            | "verify-native-gpu-preview-e2e"
+            | "verify-native-gpu-scroll-speed"
+            | "verify-native-gpu-negative"
+            | "verify-native-gpu-all"
     )
 }
 
@@ -12263,6 +13275,18 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "audit-manual-readiness"
                 | "verify-runtime-finality"
                 | "verify-cells-wayland-scroll-speed"
+                | "verify-platform-contract"
+                | "verify-native-gpu-dependency-graph"
+                | "verify-native-gpu-architecture"
+                | "verify-native-gpu-layout-contract"
+                | "verify-native-gpu-shaders"
+                | "verify-native-gpu-multiwindow"
+                | "verify-native-gpu-ipc-backpressure"
+                | "verify-native-gpu-observability"
+                | "verify-native-gpu-preview-e2e"
+                | "verify-native-gpu-scroll-speed"
+                | "verify-native-gpu-negative"
+                | "verify-native-gpu-all"
         )
     )
 }

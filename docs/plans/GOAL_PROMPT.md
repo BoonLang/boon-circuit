@@ -1,74 +1,55 @@
 # `/goal` Prompt
 
-Use this prompt when starting an unattended implementation pass for this repo.
+Use this prompt for the next unattended native GPU implementation pass.
 
 ```text
-Continue implementing the full Boon Circuit plan in /home/martinkavik/repos/boon-circuit and verify it honestly end to end. Do not restart the repo or replace the current direction. Treat the repo markdown as the source of truth, especially docs/plans/IMPLEMENTATION_PLAN.md, docs/plans/EXAMPLE_VERIFICATION_PLAN.md, docs/plans/TODOMVC_E2E_TEST_PLAN.md, docs/examples/TODOMVC_CIRCUIT_STYLE.md, docs/examples/CELLS_CIRCUIT_STYLE.md, and docs/architecture/*.md.
+Implement and verify the native GPU playground architecture in /home/martinkavik/repos/boon-circuit. Treat docs/architecture/NATIVE_GPU_PIPELINE.md as the primary contract, with AGENTS.md and the existing docs/plans/*.md verification rules still binding. Do not commit or push unless explicitly asked.
 
-Do not commit or push unless I explicitly ask later.
+Start from current HEAD and do not restart the repo. The current native GPU path has useful scaffolding, generated shader bindings, report-schema extraction, and contract gates, but it is not complete. The known hard blockers from the last review are:
+- `verify-native-gpu-multiwindow`, `verify-native-gpu-ipc-backpressure`, `verify-native-gpu-observability`, `verify-native-gpu-preview-e2e`, and `verify-native-gpu-scroll-speed` are still blocked stubs.
+- `boon_native_playground` must become a real desktop supervisor that spawns two child processes: preview and dev/debug.
+- The preview child must receive only Boon source through `--code-file` or `ReplaceCode`, never an example name.
+- The dev child may resolve examples to source, edit/replace source, and observe preview through bounded telemetry/query IPC only.
+- `boon_native_app_window` must own real Wayland app_window windows/surfaces and adapt native events into generic host events.
+- `boon_native_gpu` must present real app-owned pixels through wgpu and generated shader APIs, not scaffold proof fields.
+- Report-schema/native-gate checks must reject fabricated reports, stale reports, missing artifact hashes, headless/X11 proof, private runtime dispatch, copied-pixel-only proof, full-state IPC mirroring, and same-commit stale reports.
+- Runtime/report ownership must not regress. Keep runtime focused on Boon execution. Move any remaining report/window enrichment out of runtime into callers or `boon_report_schema` when practical.
+- Shader verification must prove the real WESL/WGSL/wgsl_bindgen pipeline. Do not let marker strings or copy-only WESL-to-WGSL output count as completion.
 
-Build the small, fast Rust static-graph interpreter and native Ply playground described in the docs. Keep the implementation deliberately scoped:
-- no actor runtime
-- no async-per-value or channels-per-value model
-- no Differential Dataflow core
-- no reducer-style TodoMVC
-- no hardcoded Rust TodoMVC or Cells app behavior
-- no bytecode VM
-- no Rust or Zig codegen in this phase
-- no per-row or per-cell runtime graph cloning
+Implementation requirements:
+1. Native desktop role starts two native Wayland child processes, one preview and one dev/debug, with independent app_window/wgpu surfaces. Browser tabs are out of scope for this pass.
+2. Preview renders the selected Boon source with generic document/layout/render components only. No example-specific preview branches, no Rust shortcuts, no hardcoded TodoMVC or Cells behavior.
+3. Dev/debug window shows the code editor and controls by default, sends `ReplaceCode`, and consumes bounded telemetry or paged queries. It must never mirror the full runtime/document/layout/display-list state over IPC.
+4. IPC must be bounded and measurable: queue depth, dropped telemetry, byte caps, serialization timings, heartbeat gaps, and proof that preview rendering does not block on dev/debug overload.
+5. Cells and dev editor scrolling must be fast under real Wayland OS wheel input, including vertical and horizontal scroll. Do not make Cells smaller to pass. Prove no passive-scroll runtime dispatch and no graph rebuild.
+6. Host/document/render boundaries must stay typed and replaceable enough that native GPU can later be swapped, and browser/terminal frontends can be added later without leaking app_window/wgpu into core crates.
 
-Implement:
-1. Rust workspace skeleton and crates from the plan.
-2. Parser and diagnostics for the required Boon subset.
-3. Typed equation IR with static schedules, hidden runtime identity, and IR-level checks that runtime keys, generations, source ids, and bind epochs are not Boon values.
-4. Static runtime core with typed storage, keyed dirty sets, deterministic ticks, HOLD, THEN, WHEN, WHILE, LATEST, LIST, append/remove/move, stale source rejection, and keyed semantic deltas.
-5. Delta lowering to Ply patches without virtual DOM or list diffing.
-6. Native Ply playground with example selector, code editor, run/reset/step controls, render preview, semantic delta log, selected value inspector, dependency explanation panel, and headed/manual test support.
-   - `cargo xtask verify-playground-custom-source` must prove the editor/source-text path runs modified Boon source and is not hardcoded to bundled examples.
-7. TodoMVC in Boon source, close to the original local field-equation style, with no app-visible todo id and no global reducer.
-8. Cells in Boon source, with generic formula primitives only, real edit/commit/cancel state in Boon, dependency tracking, cycle errors, and no hardcoded app behavior.
-9. Shared example verification harness and all documented xtask commands.
-
-Start by running or reading the current `cargo xtask audit-goal-readiness` report. As of the current state, the known blockers are handoff/verification blockers:
-- aggregate all reports and fresh operator E2E reports may still be missing
-- if `cargo xtask audit-goal-readiness` or `cargo xtask verify-runtime-finality` reports any additional blocker, treat it as authoritative current evidence
-
-Do not make these blockers green by weakening reports, schemas, docs, or audits. Make them green only by completing the implementation and verification they describe.
-
-Verification must be honest and runnable. The machine-side commands must pass
-unattended; the final `verify-*-all`, `verify-examples-all`, and
-`audit-goal-readiness` commands must use fresh operator E2E reports bound to full
-headed OS-input evidence. Real human reports are follow-up evidence and must not
-be synthesized from automation:
-- cargo test -p boon_parser
-- cargo test -p boon_ir
-- cargo test -p boon_runtime
-- cargo test --workspace
-- cargo xtask verify-foundation
-- cargo xtask verify-playground-launch
-- cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn --report target/reports/todomvc-cli-run.json
-- cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
-- cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
-- cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/cells-cli-run.json
-- cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
-- cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
-- cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json
+Verification requirements:
+- cargo fmt --check
+- cargo check -p boon_report_schema -p boon_runtime -p xtask -p boon_native_gpu -p boon_native_app_window -p boon_native_playground
+- cargo test -p boon_report_schema -p boon_runtime --lib --no-fail-fast
+- cargo test -p xtask advertised_xtask_commands_are_unique_and_supported
+- cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
+- cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
+- cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json
+- cargo xtask verify-native-gpu-layout-contract --report target/reports/native-gpu/layout-contract.json
+- cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json
+- cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
+- cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
+- cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
+- cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
+- cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
+- cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
+- cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
+- cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
+- cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 - cargo xtask verify-report-schema
-- cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
-- cargo xtask audit-goal-readiness
 
-The headed Ply checks must open a real native window and prove real OS input, focus, screenshots or video artifacts, display backend and scale metadata, window pid/title, nonblank screenshots, and no direct source-event injection. Do not mark headed verification complete if it only does an OS keyboard probe plus scenario replay. It must drive each scenario step through real OS pointer/keyboard interaction with visible controls, or report that as a blocker.
+Use real visible Wayland/app_window evidence for native E2E and speed gates. Do not use headless/Xvfb as native proof. If COSMIC/Wayland tooling or app_window lacks an API needed for reliable proof, document the blocker and improve the local wrapper/tooling instead of weakening gates. When all non-human native GPU gates pass, stop and tell the user what remains for human visible testing.
+```
 
-Manual report checks must reject stale, hand-written, scripted, placeholder, or fake reports. They must require observer, artifact hashes, source/scenario hash matches, display/window metadata, and per-scenario-label pass/fail.
+Short slash command:
 
-Performance is part of correctness. Normal interactions should complete in a couple of milliseconds in release mode, with bounded RAM/VRAM growth, zero graph rebuilds per interaction, no post-warmup allocations in bounded profiles, and proportional dirty-key/render-patch counts. Large TodoMVC and Cells stress scenarios must prove the graph topology stays static and only affected keys/cells are recomputed.
-
-When finished, leave the repo ready for manual testing:
-- all machine-side verification commands pass
-- strict operator/all gates pass from current checked operator E2E reports
-- reports are written under target/reports
-- the native Ply playground can be launched for TodoMVC and Cells
-- `cargo xtask audit-goal-readiness` passes without suppressing any blocker
-- tell the user to continue with real human visible-window testing as follow-up
-- clearly report any remaining blocker or unimplemented planned item instead of treating it as a pass
+```text
+/goal follow docs/plans/GOAL_PROMPT.md and complete the native GPU playground implementation and verification contract.
 ```

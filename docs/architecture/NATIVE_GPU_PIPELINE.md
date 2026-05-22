@@ -192,6 +192,41 @@ pub trait BoonProgram {
 }
 ```
 
+### Runtime Observability
+
+The dev/debug window may show a real-time graph of app values, dependencies,
+dirty propagation, timings, and selected data. That graph is an observability
+view over the preview/runtime process. It is not a second copy of the runtime
+heap and it is not a remote renderer for the preview app.
+
+The preview/runtime role owns:
+
+- the live Boon value graph;
+- list/table/record storage;
+- dependency edges and dirty sets;
+- current document, layout, and render inputs;
+- frame-loop state and GPU buffers.
+
+The dev role may receive:
+
+- bounded summaries, counters, hashes, timings, and dirty-set sizes;
+- dependency graph metadata needed to draw the visible graph region;
+- sampled values, histograms, ranges, and selected-node details;
+- explicit paged query results for visible or selected debug panes.
+
+The dev role must not receive a continuous full copy of:
+
+- the runtime heap;
+- every current app value;
+- every list/table row;
+- the full document tree every frame;
+- the full display list or GPU instance stream.
+
+If a future debugger needs bulk value history, it must be implemented as a
+separate bounded trace subsystem with explicit byte caps, retention policy,
+sampling/level-of-detail rules, and an off switch. It must not be the live IPC
+path between preview and dev.
+
 ## Document And Layout Boundary
 
 ### `boon_document_model`
@@ -651,6 +686,8 @@ pub enum PreviewCommand {
     Run,
     Reset,
     Step,
+    SubscribeDebug(DebugSubscription),
+    QueryDebug(DebugQuery),
     SelectDiagnostic(DiagnosticId),
     Shutdown,
 }
@@ -658,6 +695,8 @@ pub enum PreviewCommand {
 pub enum PreviewEvent {
     Ready(PreviewReady),
     Snapshot(SnapshotEnvelope),
+    DebugUpdate(DebugEnvelope),
+    DebugQueryResult(DebugQueryResult),
     Metrics(FrameMetrics),
     Diagnostics(Vec<Diagnostic>),
     Disconnected(DisconnectReason),
@@ -670,17 +709,36 @@ pub struct SnapshotEnvelope {
     pub dropped_before: u64,
     pub payload_hash: String,
 }
+
+pub enum DebugSubscription {
+    RuntimeSummary,
+    DependencyGraphViewport { viewport: GraphViewport, max_nodes: usize },
+    DirtyPropagationSummary,
+    SelectedValues { ids: Vec<RuntimeValueId> },
+}
+
+pub enum DebugQuery {
+    ValueSlice { id: RuntimeValueId, range: ValueRange, max_bytes: usize },
+    DependencyNeighborhood { id: RuntimeValueId, depth: u8, max_nodes: usize },
+    DocumentSlice { root: DocumentNodeId, range: ChildRange, max_bytes: usize },
+}
 ```
 
 Snapshot telemetry is coalesced by sequence number. Old snapshots may be
-dropped. Commands are acknowledged separately. Source replacement commands have
-an explicit max payload size. Reports must include:
+dropped. Commands are acknowledged separately. Source replacement commands,
+debug subscriptions, and debug queries have explicit max payload sizes. Debug
+updates are latest-value/coalesced by subscription. Large debug views must use
+paged queries or sampled summaries instead of full-state mirroring. Reports must
+include:
 
 - `preview_blocked_on_ipc_count`;
 - `ipc_queue_depth_p50_p95_max`;
 - `snapshot_serialize_ms_p50_p95_max`;
 - `dropped_snapshot_count`;
 - `dropped_frame_metrics_count`;
+- `dropped_debug_update_count`;
+- `debug_query_bytes_p50_p95_max`;
+- `debug_subscription_bytes_p50_p95_max`;
 - `dev_command_apply_ms_p50_p95_max`;
 - `preview_heartbeat_gap_ms_max`.
 
@@ -772,6 +830,7 @@ cargo xtask verify-native-gpu-layout-contract
 cargo xtask verify-native-gpu-shaders --check
 cargo xtask verify-native-gpu-multiwindow
 cargo xtask verify-native-gpu-ipc-backpressure
+cargo xtask verify-native-gpu-observability
 cargo xtask verify-native-gpu-preview-e2e --example todomvc
 cargo xtask verify-native-gpu-preview-e2e --example cells
 cargo xtask verify-native-gpu-scroll-speed --example cells
@@ -837,6 +896,14 @@ outside generated APIs.
 `verify-native-gpu-ipc-backpressure` must stall or kill the dev role and prove
 preview frame p95, memory cap, dropped snapshot count, IPC heartbeat behavior,
 and continued preview rendering stay within budget.
+
+`verify-native-gpu-observability` must enable a large runtime value graph and a
+busy dev graph view, then prove debug subscriptions and queries are bounded,
+paged, or sampled. It must fail if the dev role receives a continuous full copy
+of the runtime heap, every app value, every list/table row, the full document
+tree each frame, or full display-list/GPU instance streams. It must also prove
+debug-update drops/coalescing are reported and preview frame timing remains
+inside budget while the dev graph is overloaded.
 
 `verify-native-gpu-preview-e2e` must drive visible native controls and assert
 runtime state, source inventory, frame hashes, hit targets, source intent

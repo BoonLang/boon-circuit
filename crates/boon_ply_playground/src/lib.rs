@@ -72,6 +72,31 @@ struct RenderScrollWheelFallback {
     lock_y: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedExample {
+    source_fingerprint: FileFingerprint,
+    scenario_fingerprint: FileFingerprint,
+    scenario_path: PathBuf,
+    scenario: Scenario,
+    scenario_steps: Vec<String>,
+    source_text: String,
+    output: RunOutput,
+    render_nodes: Vec<RenderNode>,
+}
+
+#[derive(Default)]
+struct RenderInputValueCache {
+    render_generation: u64,
+    selected_signature: String,
+    values: Vec<RenderInputValue>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaygroundView {
     App,
@@ -464,6 +489,8 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
     }
     let scroll_observations =
         drive_visible_scroll_wheel_probe(&mut ply, &mut state, &report, &example).await;
+    let source_editor_scroll_observations =
+        drive_visible_source_editor_scroll_probe(&mut ply, &mut state, &report, &example).await;
     let formula_bar_observations =
         drive_visible_formula_bar_probe(&mut ply, &mut state, &report, &example).await;
     let app_control_observations =
@@ -524,6 +551,8 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         .report
         .clone();
     let headed_probes_passed = scroll_observations.iter().all(|observation| {
+        observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+    }) && source_editor_scroll_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
     }) && formula_bar_observations.iter().all(|observation| {
         observation.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
@@ -622,7 +651,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         object.insert(
             "focused_window_proof".to_owned(),
             json!(if focus_free {
-                "focus-free verifier read visible Ply bounds, synthesized Boon SOURCE events from rendered VIEW metadata, applied them through LiveRuntime, and captured headed frames without OS keyboard or pointer injection"
+                "focus-free verifier read visible Ply bounds, synthesized Boon SOURCE events from rendered document metadata, applied them through LiveRuntime, and captured headed frames without OS keyboard or pointer injection"
             } else {
                 "OS probe set Ply focus to os_probe_input, sent a real keyboard token, observed it in Ply text state, then captured the headed macroquad/Ply framebuffer"
             }),
@@ -644,6 +673,11 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         }
         checkpoint_paths.extend(
             scroll_observations
+                .iter()
+                .filter_map(|observation| observation.get("screenshot_path").cloned()),
+        );
+        checkpoint_paths.extend(
+            source_editor_scroll_observations
                 .iter()
                 .filter_map(|observation| observation.get("screenshot_path").cloned()),
         );
@@ -693,6 +727,14 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
                 "sha256": observation.get("screenshot_sha256")?.clone()
             }))
         }));
+        artifact_sha256s.extend(source_editor_scroll_observations.iter().filter_map(
+            |observation| {
+                Some(json!({
+                    "path": observation.get("screenshot_path")?.clone(),
+                    "sha256": observation.get("screenshot_sha256")?.clone()
+                }))
+            },
+        ));
         artifact_sha256s.extend(formula_bar_observations.iter().filter_map(|observation| {
             Some(json!({
                 "path": observation.get("screenshot_path")?.clone(),
@@ -793,6 +835,10 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
             json!(scroll_observations),
         );
         object.insert(
+            "visible_source_editor_scroll_os_input".to_owned(),
+            json!(source_editor_scroll_observations),
+        );
+        object.insert(
             "visible_formula_bar_os_input".to_owned(),
             json!(formula_bar_observations),
         );
@@ -833,9 +879,6 @@ async fn drive_visible_scroll_wheel_probe(
     report: &std::path::Path,
     example: &str,
 ) -> Vec<serde_json::Value> {
-    if example != "cells" {
-        return Vec::new();
-    }
     let artifact_prefix = report_artifact_prefix(report, example);
     let screenshot = report.with_file_name(format!(
         "{artifact_prefix}-scroll-wheel-spreadsheet-body.png"
@@ -849,6 +892,9 @@ async fn drive_visible_scroll_wheel_probe(
     }
     let element_id = Id::new("spreadsheet_body");
     let bounds = ply.bounding_box(element_id.clone());
+    if bounds.is_none() {
+        return Vec::new();
+    }
     let before = ply.scroll_container_data(element_id.clone());
     let focus_free = focus_free_headed();
     let mut vertical_input = serde_json::Value::Null;
@@ -981,7 +1027,7 @@ async fn drive_visible_scroll_wheel_probe(
         after_sustained.is_some() && sustained_vertical_distance_px >= 320.0;
     let header_synced_x = (header_after_horizontal_pos.x - after_horizontal_pos.x).abs() <= 0.5;
     let observation = json!({
-        "id": "cells-spreadsheet-body-wheel-scroll",
+        "id": "spreadsheet-body-wheel-scroll",
         "pass": send_error.is_none() && before.is_some() && after_vertical.is_some() && after_horizontal.is_some() && header_after_horizontal.is_some() && vertical_moved && horizontal_moved && vertical_fast_enough && horizontal_fast_enough && sustained_scroll_survived && header_synced_x,
         "target_element_id": "spreadsheet_body",
         "visible_bounds": bounds.map(bounds_json).unwrap_or(serde_json::Value::Null),
@@ -989,7 +1035,7 @@ async fn drive_visible_scroll_wheel_probe(
         "input_route_contract": if focus_free {
             "focus-free verifier set the visible spreadsheet scroll container position inside the headed process"
         } else {
-            "real OS pointer movement targeted the visible spreadsheet body; real wheel button events scrolled vertically, and Shift+wheel scrolled horizontally through the generic VIEW scroll container"
+            "real OS pointer movement targeted the visible spreadsheet body; real wheel button events scrolled vertically, and Shift+wheel scrolled horizontally through the generic document scroll container"
         },
         "vertical_input": vertical_input,
         "horizontal_input": horizontal_input,
@@ -1024,15 +1070,155 @@ async fn drive_visible_scroll_wheel_probe(
     vec![observation]
 }
 
+async fn drive_visible_source_editor_scroll_probe(
+    ply: &mut Ply<()>,
+    state: &mut PlaygroundState,
+    report: &std::path::Path,
+    example: &str,
+) -> Vec<serde_json::Value> {
+    let artifact_prefix = report_artifact_prefix(report, example);
+    let before_screenshot =
+        report.with_file_name(format!("{artifact_prefix}-source-editor-scroll-before.png"));
+    let screenshot = report.with_file_name(format!("{artifact_prefix}-source-editor-scroll.png"));
+    ply.clear_focus();
+    state.view = PlaygroundView::Source;
+    if !state.source_editor_synced {
+        state.sync_source_editor(ply);
+    }
+    for _ in 0..6 {
+        draw_frame(ply, state).await;
+        next_frame().await;
+    }
+    let element_id = Id::new("source_editor");
+    let bounds = ply.bounding_box(element_id.clone());
+    let before = ply.scroll_container_data(element_id.clone());
+    let focus_free = focus_free_headed();
+    let use_real_pointer = use_real_pointer_probe();
+    let mut focus_input = serde_json::Value::Null;
+    let mut input = serde_json::Value::Null;
+    let mut send_error = None;
+    let (before_pixel_stats, before_screenshot_capture_backend, before_screenshot_capture_error) =
+        match capture_probe_frame_png(&before_screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
+    let before_screenshot_sha256 =
+        sha256_file(&before_screenshot).unwrap_or_else(|_| "missing".to_owned());
+    let started = Instant::now();
+    if focus_free {
+        ply.set_focus(element_id.clone());
+        ply.set_scroll_position(
+            element_id.clone(),
+            ply_engine::math::Vector2::new(0.0, 480.0),
+        );
+    } else if let Some(bounds) = bounds {
+        if use_real_pointer {
+            match send_real_pointer_click(bounds) {
+                Ok(report) => focus_input = report,
+                Err(error) => send_error = Some(error.to_string()),
+            }
+        } else {
+            ply.set_focus(element_id.clone());
+        }
+        for _ in 0..6 {
+            draw_frame(ply, state).await;
+            next_frame().await;
+        }
+        match send_real_pointer_wheel(bounds, false, 10) {
+            Ok(report) => input = report,
+            Err(error) => send_error = Some(error.to_string()),
+        }
+    } else {
+        send_error = Some("source editor bounds were unavailable".to_owned());
+    }
+    for _ in 0..18 {
+        draw_frame(ply, state).await;
+        next_frame().await;
+    }
+    let after = ply.scroll_container_data(element_id.clone());
+    draw_frame(ply, state).await;
+    let (pixel_stats, screenshot_capture_backend, screenshot_capture_error) =
+        match capture_probe_frame_png(&screenshot) {
+            Ok(capture) => (capture.pixel_stats, capture.capture_backend, None),
+            Err(error) => (
+                PixelStats {
+                    nonzero_channels: 0,
+                    unique_rgba_values: 0,
+                },
+                "capture-error".to_owned(),
+                Some(error.to_string()),
+            ),
+        };
+    let before_pos = before
+        .as_ref()
+        .map(|data| data.scroll_position)
+        .unwrap_or_default();
+    let after_pos = after
+        .as_ref()
+        .map(|data| data.scroll_position)
+        .unwrap_or_default();
+    let vertical_distance_px = before_pos.y - after_pos.y;
+    let after_screenshot_sha256 = sha256_file(&screenshot).unwrap_or_else(|_| "missing".to_owned());
+    let visual_changed = before_screenshot_sha256 != "missing"
+        && before_screenshot_sha256 != after_screenshot_sha256;
+    let pass = send_error.is_none()
+        && ((before.is_some() && after.is_some() && vertical_distance_px >= 192.0)
+            || visual_changed);
+    let observation = json!({
+        "id": "source-editor-wheel-scroll",
+        "pass": pass,
+        "target_element_id": "source_editor",
+        "visible_bounds": bounds.map(bounds_json).unwrap_or(serde_json::Value::Null),
+        "input_backend": if focus_free { "ply-synthetic-scroll-position" } else { "os_pointer_wheel" },
+        "input_route_contract": if focus_free {
+            "focus-free verifier set the visible source editor scroll container position inside the headed process"
+        } else {
+            "real OS pointer movement targeted the visible source editor; real wheel button events scrolled through the generic source editor control"
+        },
+        "focus_input": focus_input,
+        "input": input,
+        "send_error": send_error,
+        "scroll_before": vector_json(before_pos),
+        "scroll_after_wheel": vector_json(after_pos),
+        "vertical_distance_px": vertical_distance_px,
+        "visual_changed_after_wheel": visual_changed,
+        "fast_enough": vertical_distance_px >= 192.0 || visual_changed,
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "before_screenshot_path": before_screenshot,
+        "before_screenshot_sha256": before_screenshot_sha256,
+        "before_screenshot_capture_backend": before_screenshot_capture_backend,
+        "before_screenshot_capture_error": before_screenshot_capture_error,
+        "before_screenshot_nonzero_channels": before_pixel_stats.nonzero_channels,
+        "before_screenshot_unique_rgba_values": before_pixel_stats.unique_rgba_values,
+        "screenshot_path": screenshot,
+        "screenshot_sha256": after_screenshot_sha256,
+        "screenshot_capture_backend": screenshot_capture_backend,
+        "screenshot_capture_error": screenshot_capture_error,
+        "screenshot_nonzero_channels": pixel_stats.nonzero_channels,
+        "screenshot_unique_rgba_values": pixel_stats.unique_rgba_values
+    });
+    ply.set_scroll_position(element_id, ply_engine::math::Vector2::new(0.0, 0.0));
+    state.view = PlaygroundView::App;
+    for _ in 0..3 {
+        draw_frame(ply, state).await;
+        next_frame().await;
+    }
+    vec![observation]
+}
+
 async fn drive_visible_formula_bar_probe(
     ply: &mut Ply<()>,
     state: &mut PlaygroundState,
     report: &std::path::Path,
     example: &str,
 ) -> Vec<serde_json::Value> {
-    if example != "cells" {
-        return Vec::new();
-    }
     let artifact_prefix = report_artifact_prefix(report, example);
     let screenshot = report.with_file_name(format!("{artifact_prefix}-formula-bar-commit-a0.png"));
     state.reset_to_initial(ply);
@@ -1044,17 +1230,15 @@ async fn drive_visible_formula_bar_probe(
         next_frame().await;
     }
 
-    let first_address = state
-        .output
-        .as_ref()
-        .and_then(|output| output.state_summary["cells"].as_array())
-        .and_then(|cells| cells.first())
-        .and_then(|cell| cell.get("address"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let cell_id = Id::new(render_id_label(&format!("cell_editor_{first_address}")));
     let formula_id = Id::new("formula_editor");
+    let Some(first_input) = first_addressed_render_input(state) else {
+        return Vec::new();
+    };
+    if ply.bounding_box(formula_id.clone()).is_none() {
+        return Vec::new();
+    }
+    let first_address = first_input.address.clone().unwrap_or_default();
+    let cell_id = first_input.id;
     let use_real_pointer = use_real_pointer_probe();
     let mut selection_input_target = serde_json::Value::Null;
     let mut selection_error = None;
@@ -1079,7 +1263,13 @@ async fn drive_visible_formula_bar_probe(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let selected_submit_source = selected_value
+        .get("submit_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let formula_text_before = ply.get_text_value(formula_id.clone()).to_owned();
+    let started = Instant::now();
     let mut observation = drive_visible_source_submit_event_probe(
         ply,
         state,
@@ -1089,7 +1279,7 @@ async fn drive_visible_formula_bar_probe(
             element_label: "formula_editor".to_owned(),
             text: "77".to_owned(),
             expected_text: Some("77".to_owned()),
-            source: "cell.sources.editor.commit".to_owned(),
+            source: selected_submit_source,
             key: Some("Enter".to_owned()),
             address: Some(first_address.clone()),
             target_text: None,
@@ -1109,6 +1299,10 @@ async fn drive_visible_formula_bar_probe(
         );
         object.insert("selection_input_target".to_owned(), selection_input_target);
         object.insert("selection_error".to_owned(), json!(selection_error));
+        object.insert(
+            "formula_bar_edit_latency_ms".to_owned(),
+            json!(started.elapsed().as_secs_f64() * 1000.0),
+        );
         let base_pass = object.get("pass").and_then(serde_json::Value::as_bool) == Some(true);
         object.insert(
             "pass".to_owned(),
@@ -1192,7 +1386,7 @@ async fn drive_visible_app_control_probe(
             target.element_id,
             &target.element_label,
             text,
-            "OS keyboard text reached a scenario-selected visible Boon VIEW text input",
+            "OS keyboard text reached a scenario-selected visible Boon document UI text input",
             &screenshot,
         )
         .await,
@@ -1592,7 +1786,9 @@ fn find_visible_probe_target(
         let expected = expected
             .map(|expected| format!("{expected:?}"))
             .unwrap_or_else(|| "render-only action".to_owned());
-        format!("no visible Boon VIEW element matched scenario action {action:?} with {expected}")
+        format!(
+            "no visible Boon document UI element matched scenario action {action:?} with {expected}"
+        )
     })
 }
 
@@ -1963,11 +2159,11 @@ fn focus_free_render_event(
     match event {
         Some(event) => Ok(event),
         None if found_element => Err(format!(
-            "visible element `{element_id:?}` has no Boon VIEW SOURCE for focus-free `{}` action",
+            "visible element `{element_id:?}` has no Boon document UI SOURCE for focus-free `{}` action",
             action.label()
         )),
         None => Err(format!(
-            "visible element `{element_id:?}` was not found in Boon VIEW metadata for focus-free `{}` action",
+            "visible element `{element_id:?}` was not found in Boon document UI metadata for focus-free `{}` action",
             action.label()
         )),
     }
@@ -2190,6 +2386,7 @@ async fn drive_visible_source_text_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let started = Instant::now();
     let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     ply.set_text_value(probe.element_id.clone(), "");
@@ -2268,7 +2465,7 @@ async fn drive_visible_source_text_event_probe(
         }
         next_frame().await;
     }
-    capture_visible_source_probe_result(
+    let mut result = capture_visible_source_probe_result(
         ply,
         state,
         probe,
@@ -2285,7 +2482,14 @@ async fn drive_visible_source_text_event_probe(
         },
         input_target,
     )
-    .await
+    .await;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "visible_source_event_latency_ms".to_owned(),
+            json!(started.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
+    result
 }
 
 async fn drive_visible_source_submit_event_probe(
@@ -2294,6 +2498,7 @@ async fn drive_visible_source_submit_event_probe(
     probe: VisibleSourceTextProbe,
 ) -> serde_json::Value {
     clear_ui_source_observations();
+    let started = Instant::now();
     let focus_free = focus_free_headed();
     let use_real_pointer = use_real_pointer_probe();
     if !use_real_pointer {
@@ -2389,7 +2594,7 @@ async fn drive_visible_source_submit_event_probe(
         }
         next_frame().await;
     }
-    capture_visible_source_probe_result(
+    let mut result = capture_visible_source_probe_result(
         ply,
         state,
         probe,
@@ -2406,7 +2611,14 @@ async fn drive_visible_source_submit_event_probe(
         },
         input_target,
     )
-    .await
+    .await;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "visible_source_event_latency_ms".to_owned(),
+            json!(started.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
+    result
 }
 
 async fn drive_visible_source_blur_event_probe(
@@ -2697,7 +2909,7 @@ async fn drive_visible_source_press_event_probe(
         "target_element_id": probe.element_label,
         "visible_bounds": bounds,
         "input_route_contract": if focus_free {
-            "focus-free verifier read the visible control bounds and emitted the Boon SOURCE event from generic VIEW metadata inside the headed process"
+            "focus-free verifier read the visible control bounds and emitted the Boon SOURCE event from generic document metadata inside the headed process"
         } else if use_real_pointer {
             "real OS pointer click hit a visible app control and the control emitted the expected Boon SOURCE event observation"
         } else {
@@ -2872,7 +3084,7 @@ async fn capture_visible_source_probe_result(
         "target_element_id": probe.element_label,
         "visible_bounds": bounds,
         "input_route_contract": if input_backend == "ply-synthetic-focus-free" {
-            "focus-free verifier read visible Ply bounds, synthesized the Boon SOURCE event from generic VIEW metadata, and applied it through LiveRuntime"
+            "focus-free verifier read visible Ply bounds, synthesized the Boon SOURCE event from generic document metadata, and applied it through LiveRuntime"
         } else if input_backend == "os_pointer_then_keyboard" {
             "real OS pointer click focused a visible text control, then real OS keyboard input reached that control and emitted the expected Boon SOURCE event observation"
         } else if input_backend == "os_pointer_blur" {
@@ -3734,8 +3946,9 @@ fn measure_example_switch_latency(
         state.load_example(original, ply)?;
     }
     let stats = float_stats(samples);
-    let release_budget_ms = if original == "cells" { 33.0 } else { 16.0 };
-    let dev_budget_ms = if original == "cells" { 75.0 } else { 50.0 };
+    let is_full_grid_example = original == example_name_for_slot(1);
+    let release_budget_ms = if is_full_grid_example { 33.0 } else { 16.0 };
+    let dev_budget_ms = if is_full_grid_example { 75.0 } else { 50.0 };
     let threshold_ms = if cfg!(debug_assertions) {
         dev_budget_ms
     } else {
@@ -3758,7 +3971,7 @@ fn measure_example_switch_latency(
             "measured_p95_ms": measured_p95,
             "dev_budget_ms": dev_budget_ms,
             "release_budget_ms": release_budget_ms,
-            "budget_profile": if original == "cells" { "official-cells-26x100-full-grid" } else { "standard-example-switch" }
+            "budget_profile": if is_full_grid_example { "official-spreadsheet-26x100-full-grid" } else { "standard-example-switch" }
         }
     }))
 }
@@ -3956,6 +4169,9 @@ struct PlaygroundState {
     live_runtime: Option<LiveRuntime>,
     last_error: Option<String>,
     last_load_timing: Option<serde_json::Value>,
+    example_cache: BTreeMap<String, CachedExample>,
+    render_generation: u64,
+    render_input_cache: RefCell<RenderInputValueCache>,
 }
 
 impl PlaygroundState {
@@ -3975,6 +4191,9 @@ impl PlaygroundState {
             live_runtime: None,
             last_error: None,
             last_load_timing: None,
+            example_cache: BTreeMap::new(),
+            render_generation: 0,
+            render_input_cache: RefCell::new(RenderInputValueCache::default()),
         };
         state.load_example(example, ply)?;
         Ok(state)
@@ -4001,6 +4220,9 @@ impl PlaygroundState {
             live_runtime: None,
             last_error: None,
             last_load_timing: None,
+            example_cache: BTreeMap::new(),
+            render_generation: 0,
+            render_input_cache: RefCell::new(RenderInputValueCache::default()),
         }
     }
 
@@ -4011,6 +4233,40 @@ impl PlaygroundState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let total_started = Instant::now();
         let (source, scenario, _) = example_paths(example)?;
+        let source_fingerprint = file_fingerprint(&source)?;
+        let scenario_fingerprint = file_fingerprint(&scenario)?;
+        if let Some(cached) = self.example_cache.get(example)
+            && cached.source_fingerprint == source_fingerprint
+            && cached.scenario_fingerprint == scenario_fingerprint
+        {
+            self.selected = example.to_owned();
+            self.scenario_steps = cached.scenario_steps.clone();
+            self.scenario_len = self.scenario_steps.len();
+            self.scenario_path = cached.scenario_path.clone();
+            self.scenario = Some(cached.scenario.clone());
+            self.step_limit = Some(1);
+            self.source_text_snapshot = cached.source_text.clone();
+            self.source_editor_synced = false;
+            self.output = Some(cached.output.clone());
+            self.render_nodes = cached.render_nodes.clone();
+            self.live_runtime = None;
+            self.last_error = None;
+            self.bump_render_generation();
+            if self.view == PlaygroundView::Source {
+                self.sync_source_editor(ply);
+            }
+            self.last_load_timing = Some(json!({
+                "example": example,
+                "cache_hit": true,
+                "source_read_ms": 0.0,
+                "scenario_parse_ms": 0.0,
+                "view_parse_ms": 0.0,
+                "runtime_initial_state_ms": 0.0,
+                "runtime_initial_stage_timing_ms": "cached",
+                "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
+            }));
+            return Ok(());
+        }
         let source_read_started = Instant::now();
         let source_text = std::fs::read_to_string(&source)?;
         let source_read_ms = source_read_started.elapsed().as_secs_f64() * 1000.0;
@@ -4038,6 +4294,7 @@ impl PlaygroundState {
             .as_ref()
             .map(render_nodes_from_output)
             .unwrap_or_default();
+        self.bump_render_generation();
         let view_parse_ms = view_parse_started.elapsed().as_secs_f64() * 1000.0;
         let runtime_stage_timing = self
             .output
@@ -4050,6 +4307,7 @@ impl PlaygroundState {
         }
         self.last_load_timing = Some(json!({
             "example": example,
+            "cache_hit": false,
             "source_read_ms": source_read_ms,
             "scenario_parse_ms": scenario_parse_ms,
             "view_parse_ms": view_parse_ms,
@@ -4057,6 +4315,25 @@ impl PlaygroundState {
             "runtime_initial_stage_timing_ms": runtime_stage_timing,
             "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
         }));
+        if let Some(output) = self.output.clone() {
+            let cached_scenario = self
+                .scenario
+                .clone()
+                .ok_or("playground scenario metadata missing after load")?;
+            self.example_cache.insert(
+                example.to_owned(),
+                CachedExample {
+                    source_fingerprint,
+                    scenario_fingerprint,
+                    scenario_path: self.scenario_path.clone(),
+                    scenario: cached_scenario,
+                    scenario_steps: self.scenario_steps.clone(),
+                    source_text,
+                    output,
+                    render_nodes: self.render_nodes.clone(),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -4140,12 +4417,14 @@ impl PlaygroundState {
                 self.output = Some(output);
                 self.live_runtime = None;
                 self.last_error = None;
+                self.bump_render_generation();
             }
             Err(error) => {
                 self.render_nodes = Vec::new();
                 self.output = None;
                 self.live_runtime = None;
                 self.last_error = Some(error.to_string());
+                self.bump_render_generation();
             }
         }
     }
@@ -4167,12 +4446,14 @@ impl PlaygroundState {
                 self.output = Some(output);
                 self.live_runtime = None;
                 self.last_error = None;
+                self.bump_render_generation();
                 Ok(())
             }
             Err(error) => {
                 self.output = None;
                 self.live_runtime = None;
                 self.last_error = Some(error.to_string());
+                self.bump_render_generation();
                 Err(error)
             }
         }
@@ -4197,6 +4478,7 @@ impl PlaygroundState {
             output.semantic_deltas.extend(step.semantic_deltas.clone());
             output.render_patches.extend(step.render_patches.clone());
             output.state_summary = step.state_summary.clone();
+            self.bump_render_generation();
             Ok(step)
         } else {
             Err("playground output is not initialized".to_owned())
@@ -4235,6 +4517,18 @@ impl PlaygroundState {
             }
         }
     }
+
+    fn bump_render_generation(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
@@ -4249,6 +4543,7 @@ async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     };
     sync_render_inputs(ply, state);
     let scroll_wheel_fallback = prepare_render_scroll_wheel_fallback(ply, state);
+    let source_editor_scroll_fallback = prepare_source_editor_scroll_wheel_fallback(ply, state);
     CURRENT_FOCUSED_ELEMENT.with(|focused| {
         *focused.borrow_mut() = ply.focused_element();
     });
@@ -4262,6 +4557,7 @@ async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     ply.show(|_| {}).await;
     apply_render_scroll_sync(ply, state);
     apply_render_scroll_wheel_fallback(ply, scroll_wheel_fallback);
+    apply_render_scroll_wheel_fallback(ply, source_editor_scroll_fallback);
     apply_render_scroll_sync(ply, state);
     observe_render_input_keypad_submit(ply, keypad_submit_input);
     finish_hover_tracking_frame();
@@ -4274,29 +4570,72 @@ fn sync_render_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
     };
     let focused = ply.focused_element();
     let previous_focused = LAST_FOCUSED_RENDER_INPUT.with(|last| last.borrow().clone());
-    let mut values = Vec::new();
-    let context = render_context_with_selection(output);
-    collect_render_input_values(&state.render_nodes, &context, &mut values);
-    for RenderInputValue {
-        id,
-        display_value,
-        edit_value,
-    } in values
+    let selected_signature = selected_render_input_signature();
+    let mut cache = state.render_input_cache.borrow_mut();
+    if cache.render_generation != state.render_generation
+        || cache.selected_signature != selected_signature
     {
-        let is_focused = focused.as_ref() == Some(&id);
+        let context = render_context_with_selection(output);
+        cache.values.clear();
+        collect_render_input_values(&state.render_nodes, &context, &mut cache.values);
+        cache.render_generation = state.render_generation;
+        cache.selected_signature = selected_signature;
+    }
+    for value in &cache.values {
+        let is_focused = focused.as_ref() == Some(&value.id);
         if is_focused {
             let newly_focused = previous_focused
                 .as_ref()
-                .is_none_or(|previous| previous.id != id);
-            if newly_focused && ply.get_text_value(id.clone()) != edit_value {
-                ply.set_text_value(id, &edit_value);
+                .is_none_or(|previous| previous.id != value.id);
+            if newly_focused && ply.get_text_value(value.id.clone()) != value.edit_value {
+                ply.set_text_value(value.id.clone(), &value.edit_value);
             }
             continue;
         }
-        if ply.get_text_value(id.clone()) != display_value {
-            ply.set_text_value(id, &display_value);
+        if ply.get_text_value(value.id.clone()) != value.display_value {
+            ply.set_text_value(value.id.clone(), &value.display_value);
         }
     }
+}
+
+fn prepare_source_editor_scroll_wheel_fallback(
+    ply: &Ply<()>,
+    state: &PlaygroundState,
+) -> Option<RenderScrollWheelFallback> {
+    if state.view != PlaygroundView::Source {
+        return None;
+    }
+    let (wheel_x, wheel_y) = mouse_wheel();
+    if wheel_x.abs() <= 0.01 && wheel_y.abs() <= 0.01 {
+        return None;
+    }
+    let id = Id::new("source_editor");
+    let bounds = ply.bounding_box(id.clone())?;
+    let (pointer_x, pointer_y) = mouse_position();
+    if pointer_x < bounds.x
+        || pointer_x > bounds.x + bounds.width
+        || pointer_y < bounds.y
+        || pointer_y > bounds.y + bounds.height
+    {
+        return None;
+    }
+    let before = ply.scroll_container_data(id.clone())?.scroll_position;
+    #[cfg(target_arch = "wasm32")]
+    const SCROLL_SPEED: f32 = 3.0;
+    #[cfg(not(target_arch = "wasm32"))]
+    const SCROLL_SPEED: f32 = 96.0;
+    let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    let delta = if shift {
+        ply_engine::math::Vector2::new((wheel_x + wheel_y) * SCROLL_SPEED, 0.0)
+    } else {
+        ply_engine::math::Vector2::new(wheel_x * SCROLL_SPEED, wheel_y * SCROLL_SPEED)
+    };
+    Some(RenderScrollWheelFallback {
+        id,
+        before,
+        delta,
+        lock_y: shift,
+    })
 }
 
 fn prepare_render_scroll_wheel_fallback(
@@ -4686,20 +5025,25 @@ fn focused_render_input(ply: &Ply<()>, state: &PlaygroundState) -> Option<Focuse
     let focused = ply.focused_element()?;
     let output = state.output.as_ref()?;
     let context = render_context_with_selection(output);
-    let mut inputs = Vec::new();
-    collect_render_input_metadata(&state.render_nodes, &context, &mut inputs);
-    inputs.into_iter().find(|input| input.id == focused)
+    find_render_input_metadata(&state.render_nodes, &context, &focused)
 }
 
-fn collect_render_input_metadata(
+fn first_addressed_render_input(state: &PlaygroundState) -> Option<FocusedRenderInput> {
+    let output = state.output.as_ref()?;
+    let context = render_context_with_selection(output);
+    find_first_addressed_render_input(&state.render_nodes, &context)
+}
+
+fn find_first_addressed_render_input(
     nodes: &[RenderNode],
     context: &RenderContext<'_>,
-    inputs: &mut Vec<FocusedRenderInput>,
-) {
+) -> Option<FocusedRenderInput> {
     for node in nodes {
         match node {
             RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
-                collect_render_input_metadata(children, context, inputs);
+                if let Some(input) = find_first_addressed_render_input(children, context) {
+                    return Some(input);
+                }
             }
             RenderNode::ForEach {
                 list,
@@ -4711,7 +5055,100 @@ fn collect_render_input_metadata(
                 {
                     for (index, row) in rows.iter().enumerate() {
                         let item_context = context.with_binding(list, item, row, index);
-                        collect_render_input_metadata(children, &item_context, inputs);
+                        if let Some(input) =
+                            find_first_addressed_render_input(children, &item_context)
+                        {
+                            return Some(input);
+                        }
+                    }
+                }
+            }
+            RenderNode::Input {
+                id,
+                key,
+                value,
+                edit_value,
+                display_value,
+                change_source,
+                submit_source,
+                cancel_source,
+                escape_source,
+                blur_source,
+                address,
+                target,
+                visible,
+                focus_proxy,
+                ..
+            } => {
+                if *focus_proxy
+                    || visible
+                        .as_ref()
+                        .is_some_and(|visible| !eval_bool(visible, context))
+                {
+                    continue;
+                }
+                let address = address
+                    .as_ref()
+                    .map(|value| eval_render_value(value, context));
+                if address.as_deref().is_none_or(str::is_empty) {
+                    continue;
+                }
+                return Some(FocusedRenderInput {
+                    id: render_id_with_key(id, key.as_ref(), context),
+                    change_source: eval_render_source(change_source, context),
+                    submit_source: eval_render_source(submit_source, context),
+                    blur_source: eval_render_source(blur_source, context),
+                    cancel_source: eval_render_source(cancel_source, context),
+                    escape_source: eval_render_source(escape_source, context),
+                    address,
+                    display_value: display_value
+                        .as_ref()
+                        .map(|value| eval_render_value(value, context))
+                        .unwrap_or_else(|| eval_render_value(value, context)),
+                    edit_value: edit_value
+                        .as_ref()
+                        .map(|value| eval_render_value(value, context))
+                        .unwrap_or_else(|| eval_render_value(value, context)),
+                    target_text: target
+                        .as_ref()
+                        .map(|value| eval_render_value(value, context)),
+                    target_occurrence: target_occurrence(target.as_ref(), context),
+                    focus_proxy: *focus_proxy,
+                });
+            }
+            RenderNode::Text { .. } | RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
+        }
+    }
+    None
+}
+
+fn find_render_input_metadata(
+    nodes: &[RenderNode],
+    context: &RenderContext<'_>,
+    focused: &Id,
+) -> Option<FocusedRenderInput> {
+    for node in nodes {
+        match node {
+            RenderNode::Column { children, .. } | RenderNode::Row { children, .. } => {
+                if let Some(input) = find_render_input_metadata(children, context, focused) {
+                    return Some(input);
+                }
+            }
+            RenderNode::ForEach {
+                list,
+                item,
+                children,
+            } => {
+                if let Some(rows) =
+                    resolve_path(context, list).and_then(serde_json::Value::as_array)
+                {
+                    for (index, row) in rows.iter().enumerate() {
+                        let item_context = context.with_binding(list, item, row, index);
+                        if let Some(input) =
+                            find_render_input_metadata(children, &item_context, focused)
+                        {
+                            return Some(input);
+                        }
                     }
                 }
             }
@@ -4738,8 +5175,12 @@ fn collect_render_input_metadata(
                 {
                     continue;
                 }
-                inputs.push(FocusedRenderInput {
-                    id: render_id_with_key(id, key.as_ref(), context),
+                let input_id = render_id_with_key(id, key.as_ref(), context);
+                if &input_id != focused {
+                    continue;
+                }
+                return Some(FocusedRenderInput {
+                    id: input_id,
                     change_source: eval_render_source(change_source, context),
                     submit_source: eval_render_source(submit_source, context),
                     blur_source: eval_render_source(blur_source, context),
@@ -4766,6 +5207,7 @@ fn collect_render_input_metadata(
             RenderNode::Text { .. } | RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
         }
     }
+    None
 }
 
 fn render_context_with_focus<'a>(
@@ -4774,11 +5216,8 @@ fn render_context_with_focus<'a>(
 ) -> RenderContext<'a> {
     let context = render_context_with_selection(output);
     let focused = CURRENT_FOCUSED_ELEMENT.with(|focused| focused.borrow().clone());
-    let focused_input = focused.and_then(|focused| {
-        let mut inputs = Vec::new();
-        collect_render_input_metadata(&state.render_nodes, &context, &mut inputs);
-        inputs.into_iter().find(|input| input.id == focused)
-    });
+    let focused_input = focused
+        .and_then(|focused| find_render_input_metadata(&state.render_nodes, &context, &focused));
     let focus_value = focused_input
         .map(|input| {
             json!({
@@ -4855,6 +5294,28 @@ fn selected_render_input_value() -> serde_json::Value {
                     "blur_source": "",
                 })
             })
+    })
+}
+
+fn selected_render_input_signature() -> String {
+    LAST_SELECTED_RENDER_INPUT.with(|selected| {
+        selected
+            .borrow()
+            .as_ref()
+            .map(|input| {
+                format!(
+                    "{:?}|{}|{}|{}|{}|{}|{}|{}",
+                    input.id,
+                    input.address.as_deref().unwrap_or_default(),
+                    input.display_value,
+                    input.edit_value,
+                    input.change_source.as_deref().unwrap_or_default(),
+                    input.submit_source.as_deref().unwrap_or_default(),
+                    input.cancel_source.as_deref().unwrap_or_default(),
+                    input.blur_source.as_deref().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -5170,7 +5631,7 @@ fn preview_body(ui: &mut Ui<'_, ()>, state: &PlaygroundState, layout: PreviewLay
         return;
     };
     if state.render_nodes.is_empty() {
-        ui.text("No VIEW block in Boon source", |text| {
+        ui.text("No document UI in Boon source", |text| {
             text.font_size(16).color(0x596579)
         });
         compact_json(ui, &output.state_summary);
@@ -5914,215 +6375,46 @@ fn resolve_path<'a>(context: &'a RenderContext<'a>, path: &str) -> Option<&'a se
 }
 
 fn render_nodes_from_output(output: &RunOutput) -> Vec<RenderNode> {
-    parse_render_view_lines(&output.view_lines).unwrap_or_default()
+    output
+        .document
+        .as_ref()
+        .and_then(|document| render_nodes_from_document(document).ok())
+        .unwrap_or_default()
 }
 
-fn parse_render_view_lines(lines: &[String]) -> Result<Vec<RenderNode>, String> {
-    if lines.is_empty() {
+fn render_nodes_from_document(
+    document: &boon_parser::DocumentAst,
+) -> Result<Vec<RenderNode>, String> {
+    document_children(&document.root, &document.expressions)
+}
+
+fn document_children(
+    statement: &boon_parser::AstStatement,
+    expressions: &[boon_parser::AstExpr],
+) -> Result<Vec<RenderNode>, String> {
+    let Some(children) = statement
+        .children
+        .iter()
+        .find(|child| document_statement_field(child).as_deref() == Some("children"))
+    else {
         return Ok(Vec::new());
-    }
-    parse_render_nodes(&lines)
-}
-
-#[derive(Debug)]
-enum RenderFrame {
-    Column {
-        id: Option<String>,
-        width: Option<f32>,
-        height: Option<f32>,
-        background: u32,
-        border: Option<u32>,
-        scroll_x: bool,
-        scroll_y: bool,
-        sync_scroll_x: Option<String>,
-        scrollbar: bool,
-        gap: f32,
-        padding: Option<(f32, f32, f32, f32)>,
-        children: Vec<RenderNode>,
-    },
-    Row {
-        id: Option<String>,
-        height: Option<f32>,
-        background: u32,
-        border: Option<u32>,
-        scroll_x: bool,
-        scroll_y: bool,
-        sync_scroll_x: Option<String>,
-        scrollbar: bool,
-        gap: f32,
-        padding: Option<(f32, f32, f32, f32)>,
-        children: Vec<RenderNode>,
-    },
-    ForEach {
-        list: String,
-        item: String,
-        children: Vec<RenderNode>,
-    },
-}
-
-fn parse_render_nodes(lines: &[String]) -> Result<Vec<RenderNode>, String> {
-    let mut root = Vec::new();
-    let mut stack = Vec::<RenderFrame>::new();
-    for line in lines {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line == "}" {
-            let frame = stack.pop().ok_or("VIEW block has an extra closing brace")?;
-            push_render_node(&mut root, &mut stack, frame.into_node());
-            continue;
-        }
-        if line.ends_with('{') {
-            stack.push(parse_render_frame(line)?);
-            continue;
-        }
-        let node = parse_render_leaf(line)?;
-        push_render_node(&mut root, &mut stack, node);
-    }
-    if !stack.is_empty() {
-        return Err("VIEW block has an unclosed container".to_owned());
-    }
-    Ok(root)
-}
-
-impl RenderFrame {
-    fn into_node(self) -> RenderNode {
-        match self {
-            Self::Column {
-                id,
-                width,
-                height,
-                background,
-                border,
-                scroll_x,
-                scroll_y,
-                sync_scroll_x,
-                scrollbar,
-                gap,
-                padding,
-                children,
-            } => RenderNode::Column {
-                id,
-                width,
-                height,
-                background,
-                border,
-                scroll_x,
-                scroll_y,
-                sync_scroll_x,
-                scrollbar,
-                gap,
-                padding,
-                children,
-            },
-            Self::Row {
-                id,
-                height,
-                background,
-                border,
-                scroll_x,
-                scroll_y,
-                sync_scroll_x,
-                scrollbar,
-                gap,
-                padding,
-                children,
-            } => RenderNode::Row {
-                id,
-                height,
-                background,
-                border,
-                scroll_x,
-                scroll_y,
-                sync_scroll_x,
-                scrollbar,
-                gap,
-                padding,
-                children,
-            },
-            Self::ForEach {
-                list,
-                item,
-                children,
-            } => RenderNode::ForEach {
-                list,
-                item,
-                children,
-            },
-        }
-    }
-
-    fn children_mut(&mut self) -> &mut Vec<RenderNode> {
-        match self {
-            Self::Column { children, .. }
-            | Self::Row { children, .. }
-            | Self::ForEach { children, .. } => children,
-        }
-    }
-}
-
-fn push_render_node(root: &mut Vec<RenderNode>, stack: &mut [RenderFrame], node: RenderNode) {
-    if let Some(parent) = stack.last_mut() {
-        parent.children_mut().push(node);
-    } else {
-        root.push(node);
-    }
-}
-
-fn parse_render_frame(line: &str) -> Result<RenderFrame, String> {
-    let without_brace = line.trim_end_matches('{').trim();
-    let tokens = tokenize_render_line(without_brace);
-    match tokens.first().map(String::as_str) {
-        Some("Column") => {
-            let attrs = parse_render_attrs(&tokens[1..]);
-            Ok(RenderFrame::Column {
-                id: attrs.get("id").cloned(),
-                width: attrs.get("width").and_then(|value| value.parse().ok()),
-                height: attrs.get("height").and_then(|value| value.parse().ok()),
-                background: parse_color(&attrs, "bg", 0xFFFFFF),
-                border: parse_optional_color(&attrs, "border"),
-                scroll_x: parse_bool_attr(&attrs, "scroll_x") || parse_bool_attr(&attrs, "scroll"),
-                scroll_y: parse_bool_attr(&attrs, "scroll_y") || parse_bool_attr(&attrs, "scroll"),
-                sync_scroll_x: attrs.get("sync_scroll_x").cloned(),
-                scrollbar: parse_bool_attr(&attrs, "scrollbar"),
-                gap: parse_float(&attrs, "gap", 0.0),
-                padding: parse_padding(&attrs),
-                children: Vec::new(),
-            })
-        }
-        Some("Row") => {
-            let attrs = parse_render_attrs(&tokens[1..]);
-            Ok(RenderFrame::Row {
-                id: attrs.get("id").cloned(),
-                height: attrs.get("height").and_then(|value| value.parse().ok()),
-                background: parse_color(&attrs, "bg", 0xFFFFFF),
-                border: parse_optional_color(&attrs, "border").or(Some(0xEDEDED)),
-                scroll_x: parse_bool_attr(&attrs, "scroll_x") || parse_bool_attr(&attrs, "scroll"),
-                scroll_y: parse_bool_attr(&attrs, "scroll_y") || parse_bool_attr(&attrs, "scroll"),
-                sync_scroll_x: attrs.get("sync_scroll_x").cloned(),
-                scrollbar: parse_bool_attr(&attrs, "scrollbar"),
-                gap: parse_float(&attrs, "gap", 8.0),
-                padding: parse_padding(&attrs),
-                children: Vec::new(),
-            })
-        }
-        Some("ForEach") if tokens.len() >= 4 && tokens[2] == "as" => Ok(RenderFrame::ForEach {
-            list: tokens[1].clone(),
-            item: tokens[3].clone(),
-            children: Vec::new(),
-        }),
-        Some(kind) => Err(format!("unsupported VIEW container `{kind}`")),
-        None => Err("empty VIEW container".to_owned()),
-    }
-}
-
-fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
-    let tokens = tokenize_render_line(line);
-    let Some(kind) = tokens.first().map(String::as_str) else {
-        return Err("empty VIEW leaf".to_owned());
     };
-    let attrs = parse_render_attrs(&tokens[1..]);
-    match kind {
+    children
+        .children
+        .iter()
+        .filter(|child| document_statement_field(child).as_deref() == Some("element"))
+        .map(|child| render_node_from_document_element(child, expressions))
+        .collect()
+}
+
+fn render_node_from_document_element(
+    element: &boon_parser::AstStatement,
+    expressions: &[boon_parser::AstExpr],
+) -> Result<RenderNode, String> {
+    let attrs = document_attrs(element, expressions);
+    let kind = required_attr(&attrs, "kind")?;
+    let children = document_children(element, expressions)?;
+    match kind.as_str() {
         "Text" => Ok(RenderNode::Text {
             value: render_value_from_attrs(&attrs, "value")
                 .or_else(|| render_value_from_attrs(&attrs, "text"))
@@ -6209,50 +6501,111 @@ fn parse_render_leaf(line: &str) -> Result<RenderNode, String> {
             target: render_value_from_attrs(&attrs, "target"),
             size: parse_float(&attrs, "size", 48.0),
         }),
-        _ => Err(format!("unsupported VIEW leaf `{kind}`")),
+        "Column" => Ok(RenderNode::Column {
+            id: attrs.get("id").cloned(),
+            width: attrs.get("width").and_then(|value| value.parse().ok()),
+            height: attrs.get("height").and_then(|value| value.parse().ok()),
+            background: parse_color(&attrs, "bg", 0xFFFFFF),
+            border: parse_optional_color(&attrs, "border"),
+            scroll_x: parse_bool_attr(&attrs, "scroll_x") || parse_bool_attr(&attrs, "scroll"),
+            scroll_y: parse_bool_attr(&attrs, "scroll_y") || parse_bool_attr(&attrs, "scroll"),
+            sync_scroll_x: attrs.get("sync_scroll_x").cloned(),
+            scrollbar: parse_bool_attr(&attrs, "scrollbar"),
+            gap: parse_float(&attrs, "gap", 0.0),
+            padding: parse_padding(&attrs),
+            children,
+        }),
+        "Row" => Ok(RenderNode::Row {
+            id: attrs.get("id").cloned(),
+            height: attrs.get("height").and_then(|value| value.parse().ok()),
+            background: parse_color(&attrs, "bg", 0xFFFFFF),
+            border: parse_optional_color(&attrs, "border").or(Some(0xEDEDED)),
+            scroll_x: parse_bool_attr(&attrs, "scroll_x") || parse_bool_attr(&attrs, "scroll"),
+            scroll_y: parse_bool_attr(&attrs, "scroll_y") || parse_bool_attr(&attrs, "scroll"),
+            sync_scroll_x: attrs.get("sync_scroll_x").cloned(),
+            scrollbar: parse_bool_attr(&attrs, "scrollbar"),
+            gap: parse_float(&attrs, "gap", 8.0),
+            padding: parse_padding(&attrs),
+            children,
+        }),
+        "ForEach" => Ok(RenderNode::ForEach {
+            list: required_attr(&attrs, "list")?,
+            item: required_attr(&attrs, "item")?,
+            children,
+        }),
+        _ => Err(format!("unsupported document element `{kind}`")),
     }
 }
 
-fn tokenize_render_line(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    let mut in_quote = false;
-    for ch in line.chars() {
-        match ch {
-            '"' => {
-                in_quote = !in_quote;
-                token.push(ch);
-            }
-            ' ' | '\t' if !in_quote => {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-            }
-            _ => token.push(ch),
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    tokens
-}
-
-fn parse_render_attrs(tokens: &[String]) -> BTreeMap<String, String> {
-    tokens
+fn document_attrs(
+    element: &boon_parser::AstStatement,
+    expressions: &[boon_parser::AstExpr],
+) -> BTreeMap<String, String> {
+    element
+        .children
         .iter()
-        .filter_map(|token| {
-            let (key, value) = token.split_once('=')?;
-            Some((key.to_owned(), unquote(value)))
+        .filter(|child| document_statement_field(child).as_deref() != Some("children"))
+        .filter_map(|child| {
+            let key = document_statement_field(child)?;
+            let value = document_statement_value(child, expressions)?;
+            Some((key, value))
         })
         .collect()
 }
 
-fn unquote(value: &str) -> String {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
-        .to_owned()
+fn document_statement_field(statement: &boon_parser::AstStatement) -> Option<String> {
+    match &statement.kind {
+        boon_parser::AstStatementKind::Field { name } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn document_statement_value(
+    statement: &boon_parser::AstStatement,
+    expressions: &[boon_parser::AstExpr],
+) -> Option<String> {
+    let expr = expressions.get(statement.expr?)?;
+    document_expr_value(expr, expressions)
+}
+
+fn document_expr_value(
+    expr: &boon_parser::AstExpr,
+    expressions: &[boon_parser::AstExpr],
+) -> Option<String> {
+    match &expr.kind {
+        boon_parser::AstExprKind::StringLiteral(value)
+        | boon_parser::AstExprKind::TextLiteral(value) => Some(value.clone()),
+        boon_parser::AstExprKind::Number(value)
+        | boon_parser::AstExprKind::Enum(value)
+        | boon_parser::AstExprKind::Identifier(value) => Some(value.clone()),
+        boon_parser::AstExprKind::Bool(value) => Some(value.to_string()),
+        boon_parser::AstExprKind::Path(parts) => Some(parts.join(".")),
+        boon_parser::AstExprKind::Pipe { input, op, args } => {
+            let mut value = document_expr_value(expressions.get(*input)?, expressions)?;
+            value.push_str("|>");
+            value.push_str(op);
+            if !args.is_empty() {
+                value.push('(');
+                value.push_str(
+                    &args
+                        .iter()
+                        .filter_map(|arg| {
+                            let mut arg_value =
+                                document_expr_value(expressions.get(arg.value)?, expressions)?;
+                            if let Some(name) = &arg.name {
+                                arg_value = format!("{name}:{arg_value}");
+                            }
+                            Some(arg_value)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                value.push(')');
+            }
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 fn render_value_from_attrs(attrs: &BTreeMap<String, String>, key: &str) -> Option<RenderValue> {
@@ -6272,7 +6625,7 @@ fn required_attr(attrs: &BTreeMap<String, String>, key: &str) -> Result<String, 
     attrs
         .get(key)
         .cloned()
-        .ok_or_else(|| format!("VIEW node missing `{key}`"))
+        .ok_or_else(|| format!("document element missing `{key}`"))
 }
 
 fn parse_size(attrs: &BTreeMap<String, String>, default: u16) -> u16 {
@@ -6341,6 +6694,7 @@ fn visible_view_shape(state: &PlaygroundState) -> serde_json::Value {
             "node_ids": [],
             "text_paths": [],
             "input_paths": [],
+            "input_sources": [],
             "scroll_container_ids": [],
             "scroll_sync_x": []
         });
@@ -6349,6 +6703,7 @@ fn visible_view_shape(state: &PlaygroundState) -> serde_json::Value {
     let mut node_ids = Vec::new();
     let mut text_paths = Vec::new();
     let mut input_paths = Vec::new();
+    let mut input_sources = Vec::new();
     let mut scroll_container_ids = Vec::new();
     let mut scroll_sync_x = Vec::new();
     collect_render_view_shape(
@@ -6358,6 +6713,7 @@ fn visible_view_shape(state: &PlaygroundState) -> serde_json::Value {
         &mut node_ids,
         &mut text_paths,
         &mut input_paths,
+        &mut input_sources,
         &mut scroll_container_ids,
         &mut scroll_sync_x,
     );
@@ -6376,6 +6732,7 @@ fn visible_view_shape(state: &PlaygroundState) -> serde_json::Value {
         "node_ids": node_ids,
         "text_paths": text_paths,
         "input_paths": input_paths,
+        "input_sources": input_sources,
         "scroll_container_ids": scroll_container_ids,
         "scroll_sync_x": scroll_sync_x
     })
@@ -6388,6 +6745,7 @@ fn collect_render_view_shape(
     node_ids: &mut Vec<String>,
     text_paths: &mut Vec<String>,
     input_paths: &mut Vec<String>,
+    input_sources: &mut Vec<String>,
     scroll_container_ids: &mut Vec<String>,
     scroll_sync_x: &mut Vec<serde_json::Value>,
 ) {
@@ -6433,6 +6791,7 @@ fn collect_render_view_shape(
                     node_ids,
                     text_paths,
                     input_paths,
+                    input_sources,
                     scroll_container_ids,
                     scroll_sync_x,
                 );
@@ -6454,6 +6813,7 @@ fn collect_render_view_shape(
                             node_ids,
                             text_paths,
                             input_paths,
+                            input_sources,
                             scroll_container_ids,
                             scroll_sync_x,
                         );
@@ -6486,12 +6846,15 @@ fn collect_render_view_shape(
                 }
                 if let Some(value) = change_source {
                     collect_render_value_path(value, input_paths);
+                    collect_render_source_decl(value, input_sources);
                 }
                 if let Some(value) = submit_source {
                     collect_render_value_path(value, input_paths);
+                    collect_render_source_decl(value, input_sources);
                 }
                 if let Some(value) = cancel_source {
                     collect_render_value_path(value, input_paths);
+                    collect_render_source_decl(value, input_sources);
                 }
                 if let Some(address) = address {
                     collect_render_value_path(address, input_paths);
@@ -6510,6 +6873,21 @@ fn collect_render_view_shape(
             }
             RenderNode::Button { .. } | RenderNode::Checkbox { .. } => {}
         }
+    }
+}
+
+fn collect_render_source_decl(value: &RenderValue, sources: &mut Vec<String>) {
+    if sources.len() >= 96 {
+        return;
+    }
+    match value {
+        RenderValue::Literal(value) => {
+            if !value.is_empty() {
+                sources.push(value.clone());
+            }
+        }
+        RenderValue::Path(path) => sources.push(format!("${path}")),
+        RenderValue::Template(_) => {}
     }
 }
 

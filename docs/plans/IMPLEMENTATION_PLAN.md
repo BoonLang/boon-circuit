@@ -330,9 +330,10 @@ viewport derived from `Grid/cells(columns: 26, rows: 100)`, including at least
 and nonblank screenshot evidence. Semantic/stress evidence for the 26x100
 runtime model is not by itself visible playground parity.
 
-The Cells viewport must be declared in `examples/cells.bn` with generic `VIEW`
-components and generic attributes. The playground may interpret those generic
-attributes, but it must not render a hardcoded Cells-specific spreadsheet.
+The Cells viewport must be declared in `examples/cells.bn` as regular Boon
+`document` data with generic elements and attributes. The playground may
+interpret those generic attributes, but it must not render a hardcoded
+Cells-specific spreadsheet.
 
 The playground also owns the shared example verification harness described in
 [EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md):

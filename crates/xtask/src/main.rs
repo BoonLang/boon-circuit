@@ -42,6 +42,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "audit-manual-readiness",
     "verify-todomvc-headed-ply",
     "verify-todomvc-headed-focusless",
+    "verify-todomvc-visible-reality",
     "verify-todomvc-operator-e2e",
     "verify-todomvc-human",
     "prepare-todomvc-human-report",
@@ -115,6 +116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verify_specific("todomvc", VerificationLayer::HeadedPly, &args)
         }
         "verify-todomvc-headed-focusless" => verify_headed_focusless("todomvc", &args),
+        "verify-todomvc-visible-reality" => verify_todomvc_visible_reality(&args),
         "verify-todomvc-operator-e2e" => verify_operator_e2e("todomvc", &args),
         "verify-todomvc-human" => verify_human("todomvc", &args),
         "prepare-todomvc-human-report" => prepare_human_report("todomvc", &args),
@@ -2031,6 +2033,160 @@ fn verify_todomvc_reference_parity(args: &[String]) -> Result<(), Box<dyn std::e
     }
 }
 
+fn verify_todomvc_visible_reality(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/todomvc-visible-reality.json"));
+    let smoke_report = report_path.with_file_name("todomvc-visible-reality-smoke.json");
+    let semantic_report = report_path.with_file_name("todomvc-visible-reality-semantic.json");
+    let screenshot = smoke_report.with_extension("png");
+
+    let mut command = isolated_smoke_launch_command(
+        "todomvc",
+        smoke_report
+            .to_str()
+            .ok_or("TodoMVC visible reality smoke report path is not utf-8")?,
+        Some("4"),
+    )?;
+    let status = run_command_with_timeout(&mut command, Duration::from_secs(90))?;
+    if !status.success() {
+        return Err("TodoMVC visible reality smoke launch failed".into());
+    }
+    verify_report_schema(&smoke_report)?;
+
+    let (source, scenario, budget) = example_paths("todomvc")?;
+    let source_text = std::fs::read_to_string(&source)?;
+    let semantic = run_scenario(
+        &source,
+        &scenario,
+        VerificationLayer::Semantic,
+        Some(&semantic_report),
+    )?;
+    verify_report_schema(&semantic_report)?;
+    let smoke = read_json(&smoke_report)?;
+    let visible_shape = smoke
+        .get("visible_view_shape")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let node_ids = visible_shape
+        .get("node_ids")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let input_paths = visible_shape
+        .get("input_paths")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let input_sources = visible_shape
+        .get("input_sources")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let semantic_passed = semantic
+        .report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let has_document = source_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("document:"));
+    let has_view = source_text.lines().any(|line| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("VIEW")
+    });
+    let has_surface = node_ids
+        .iter()
+        .any(|value| value.as_str() == Some("todomvc_surface"));
+    let has_input_row = node_ids
+        .iter()
+        .any(|value| value.as_str() == Some("todomvc_input_row"));
+    let has_footer = node_ids
+        .iter()
+        .any(|value| value.as_str() == Some("todomvc_footer"));
+    let has_new_todo_binding = input_paths
+        .iter()
+        .any(|value| value.as_str() == Some("new_todo_text"));
+    let has_new_todo_change = input_sources
+        .iter()
+        .any(|value| value.as_str() == Some("store.sources.new_todo_input.change"));
+    let has_new_todo_submit = input_sources
+        .iter()
+        .any(|value| value.as_str() == Some("store.sources.new_todo_input.key_down"));
+    let screenshot_hash = boon_runtime::sha256_file(&screenshot)?;
+    let nonblank = smoke
+        .get("nonblank_screenshot_hashes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let checks = vec![
+        json!({"id": "source-uses-document-variable", "pass": has_document, "actual": {"has_document": has_document}}),
+        json!({"id": "source-has-no-view-block", "pass": !has_view, "actual": {"has_view": has_view}}),
+        json!({"id": "semantic-scenario-passed", "pass": semantic_passed, "actual": {"status": semantic.report.get("status").cloned().unwrap_or_else(|| json!(null))}}),
+        json!({"id": "render-tree-todomvc-surface", "pass": has_surface && has_input_row && has_footer, "actual": {"node_ids": node_ids}}),
+        json!({"id": "render-tree-new-todo-input-bindings", "pass": has_new_todo_binding && has_new_todo_change && has_new_todo_submit, "actual": {"input_paths": input_paths, "input_sources": input_sources}}),
+        json!({"id": "nonblank-screenshot", "pass": nonblank.get("nonzero_channels").and_then(serde_json::Value::as_u64).unwrap_or_default() > 0 && nonblank.get("unique_rgba_values").and_then(serde_json::Value::as_u64).unwrap_or_default() > 1, "artifact": nonblank}),
+    ];
+    let blockers = checks
+        .iter()
+        .filter(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+        .filter_map(|check| check.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let artifacts = [
+        smoke_report.clone(),
+        semantic_report.clone(),
+        screenshot.clone(),
+    ];
+    let report = json!({
+        "status": if blockers.is_empty() { "pass" } else { "fail" },
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-todomvc-visible-reality",
+        "command_argv": xtask_command_argv(args, "verify-todomvc-visible-reality"),
+        "layer": "visible-reality",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source.display().to_string(),
+        "source_hash": boon_runtime::sha256_file(&source)?,
+        "scenario_path": scenario.display().to_string(),
+        "scenario_hash": boon_runtime::sha256_file(&scenario)?,
+        "program_hash": boon_runtime::sha256_file(&source)?,
+        "budget_hash": boon_runtime::sha256_file(&budget)?,
+        "graph_node_count": semantic.report.get("graph_node_count").cloned().unwrap_or_else(|| json!(0)),
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifacts.iter().filter(|path| path.exists()).map(|path| json!({
+            "path": path.display().to_string(),
+            "sha256": boon_runtime::sha256_file(path).unwrap_or_else(|_| "missing".to_owned())
+        })).collect::<Vec<_>>(),
+        "render_tree_visible_shape": visible_shape,
+        "screenshot_path": screenshot.display().to_string(),
+        "screenshot_sha256": screenshot_hash,
+        "nonblank_screenshot_hashes": [nonblank],
+        "linked_reports": {
+            "smoke_report": smoke_report.display().to_string(),
+            "semantic_report": semantic_report.display().to_string()
+        },
+        "blockers": blockers
+    });
+    write_json(&report_path, &report)?;
+    if report.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+        verify_report_schema(&report_path)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "TodoMVC visible reality failed; report written to `{}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
 fn verify_cells_visible_reality(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report_path = report_arg(args)
         .unwrap_or_else(|| PathBuf::from("target/reports/cells-visible-reality.json"));
@@ -2052,6 +2208,7 @@ fn verify_cells_visible_reality(args: &[String]) -> Result<(), Box<dyn std::erro
     verify_report_schema(&smoke_report)?;
 
     let (source, scenario, budget) = example_paths("cells")?;
+    let source_text = std::fs::read_to_string(&source)?;
     let semantic = run_scenario(
         &source,
         &scenario,
@@ -2158,6 +2315,16 @@ fn verify_cells_visible_reality(args: &[String]) -> Result<(), Box<dyn std::erro
                 && value.get("source").and_then(serde_json::Value::as_str)
                     == Some("spreadsheet_body")
         });
+    let has_document = source_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("document:"));
+    let has_view = source_text.lines().any(|line| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("VIEW")
+    });
     let screenshot_hash = boon_runtime::sha256_file(&screenshot)?;
     let nonblank = smoke
         .get("nonblank_screenshot_hashes")
@@ -2167,6 +2334,8 @@ fn verify_cells_visible_reality(args: &[String]) -> Result<(), Box<dyn std::erro
         .unwrap_or_else(|| json!({}));
 
     let checks = vec![
+        json!({"id": "source-uses-document-variable", "pass": has_document, "actual": {"has_document": has_document}}),
+        json!({"id": "source-has-no-view-block", "pass": !has_view, "actual": {"has_view": has_view}}),
         json!({"id": "source-grid-26x100", "pass": source_columns == Some(26) && source_rows == Some(100), "actual": {"columns": source_columns, "rows": source_rows}}),
         json!({"id": "viewport-uses-all-26-columns", "pass": viewport_columns == 26 && grid_column_count == 26, "actual": {"viewport_columns": viewport_columns, "grid_column_count": grid_column_count}}),
         json!({"id": "viewport-has-official-100-rows", "pass": viewport_rows == 100 && grid_row_count == 100, "actual": {"viewport_rows": viewport_rows, "grid_row_count": grid_row_count}}),
@@ -2524,6 +2693,8 @@ fn audit_runtime_finality(
     let xtask = read_source_for_audit("crates/xtask/src/main.rs", checks, blockers)?;
     let readme = read_source_for_audit("README.md", checks, blockers)?;
     let decisions = read_source_for_audit("docs/architecture/DECISIONS.md", checks, blockers)?;
+    let todomvc_example = read_source_for_audit("examples/todomvc.bn", checks, blockers)?;
+    let cells_example = read_source_for_audit("examples/cells.bn", checks, blockers)?;
     let runtime_plan = read_source_for_audit(
         "docs/plans/RUNTIME_FINALITY_HONESTY_PLAN.md",
         checks,
@@ -2532,6 +2703,8 @@ fn audit_runtime_finality(
     let verification_plan =
         read_source_for_audit("docs/plans/EXAMPLE_VERIFICATION_PLAN.md", checks, blockers)?;
     let ir_production = source_before_cfg_test(&ir);
+    audit_example_document_contract(checks, blockers, "todomvc", &todomvc_example);
+    audit_example_document_contract(checks, blockers, "cells", &cells_example);
 
     audit_runtime_finality_markers(
         checks,
@@ -2581,17 +2754,17 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
-        "parser:structural-view-ast-boundary",
+        "parser:structured-document-ast-boundary",
         &parser,
         &[
-            "AstStatementKind::View",
-            "pub is_view: bool",
-            "self.items.iter().filter(|item| !item.is_view)",
-            "&& !self.line_is_view(token.line)",
-            "AstStatementKind::View => {}",
-            "parses_view_structurally_without_semantic_source_leakage",
+            "pub struct DocumentAst",
+            "pub fn parsed_document",
+            "fn document_statement",
+            "fn line_is_document",
+            "AstExprKind::StringLiteral",
+            "parses_document_structurally_without_semantic_source_leakage",
         ],
-        "parser must keep VIEW in the AST and exclude it from semantic tables structurally, not by text stripping",
+        "parser must keep document UI in the AST and expose it structurally without text-line extraction",
     );
     audit_runtime_finality_markers(
         checks,
@@ -2730,7 +2903,7 @@ fn audit_runtime_finality(
     audit_runtime_finality_required_tokens(
         checks,
         blockers,
-        "ir:view-bindings",
+        "ir:document-bindings",
         &ir,
         &[
             "pub view_bindings: Vec<ViewBinding>",
@@ -2738,12 +2911,14 @@ fn audit_runtime_finality(
             "pub struct ViewBindingId(pub usize)",
             "pub enum ViewBindingKind",
             "fn view_bindings(",
+            "fn collect_document_view_bindings",
+            "fn document_statement_value",
             "fn view_data_path(value: &str) -> Option<String>",
             "ViewBindingKind::Source",
             "ViewBindingKind::Data",
             "ViewBindingKind::Target",
         ],
-        "typed IR must expose VIEW data/source/target bindings instead of leaving all binding discovery to playground-side view-line parsing",
+        "typed IR must expose document data/source/target bindings instead of leaving binding discovery to playground-side text parsing",
     );
     audit_runtime_finality_required_tokens(
         checks,
@@ -3173,6 +3348,41 @@ fn audit_runtime_finality(
     );
     audit_runtime_finality_reports(checks, blockers)?;
     Ok(())
+}
+
+fn audit_example_document_contract(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    example: &str,
+    source: &str,
+) {
+    let has_document = source
+        .lines()
+        .any(|line| line.trim_start().starts_with("document:"));
+    let has_view = source.lines().any(|line| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("VIEW")
+    });
+    push_audit_check(
+        checks,
+        blockers,
+        format!("example:{example}:document-variable-present"),
+        has_document,
+        format!("examples/{example}.bn declares document:"),
+        (!has_document)
+            .then(|| format!("examples/{example}.bn must declare top-level `document:`")),
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        format!("example:{example}:view-block-removed"),
+        !has_view,
+        format!("examples/{example}.bn has no VIEW block"),
+        has_view.then(|| format!("examples/{example}.bn must not contain a `VIEW` block")),
+    );
 }
 
 fn read_source_for_audit(
@@ -9178,6 +9388,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "audit-manual-readiness",
         "verify-todomvc-headed-ply",
         "verify-todomvc-headed-focusless",
+        "verify-todomvc-visible-reality",
         "verify-todomvc-operator-e2e",
         "verify-todomvc-human",
         "prepare-todomvc-human-report",
@@ -9461,6 +9672,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-todomvc-ply-headless"
             | "verify-todomvc-headed-ply"
             | "verify-todomvc-headed-focusless"
+            | "verify-todomvc-visible-reality"
             | "verify-todomvc-operator-e2e"
             | "verify-todomvc-human"
             | "prepare-todomvc-human-report"

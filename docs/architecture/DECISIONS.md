@@ -303,10 +303,11 @@ schedule. They also include `expression_coverage`,
 computed from parser AST plus typed IR, and the schema rejects executable
 reports if any parser/lowering `Unknown` expression, initializer, update, or
 predicate fallback reaches the accepted runtime surface.
-The parser keeps the full source, including `VIEW`, in one tokenized AST.
-Semantic iterators skip structurally marked `VIEW` subtrees instead of using a
-separate text-stripping pass, so `VIEW` metadata cannot create hidden semantic
-sources or state cells while still remaining available to the renderer.
+The parser keeps the full source, including the top-level `document` UI value,
+in one tokenized AST. Semantic iterators skip the structurally marked
+`document` subtree instead of using a separate text-stripping pass, so UI
+metadata cannot create hidden semantic sources or state cells while still
+remaining available to the renderer.
 Public IR tables now expose transparent typed IDs (`ExprId`, `NodeId`,
 `ScopeId`, `SourceId`, `StateId`, `ListId`, and `FieldId`) rather than raw
 public `usize` slots for the identifiers that cross lowering/report boundaries.
@@ -318,10 +319,10 @@ those entries by `ScopeId`.
 from AST source references and match-arm payload destructuring, so requirements
 such as `text`, `key`, and row address payloads are visible in typed IR and
 reports instead of being implicit in scenario code.
-`VIEW` bindings now have a typed IR table too. Layout drawing still uses the
-parsed VIEW lines in the native playground, but data bindings, source bindings,
-and row target bindings are exposed as compiler output with `ViewBindingId`,
-binding kind, scope id, and source id where applicable.
+Document UI bindings have a typed IR table too. Layout drawing reads the
+structured `document` AST in the native playground, while data bindings, source
+bindings, and row target bindings are exposed as compiler output with
+`ViewBindingId`, binding kind, scope id, and source id where applicable.
 Runtime list memories keep row slots, visible order, `BitVec` valid bits, and a
 free-list as separate storage. A remove tombstones the slot and clears key
 lookup while the visible order vector shrinks; later appends may reuse the free

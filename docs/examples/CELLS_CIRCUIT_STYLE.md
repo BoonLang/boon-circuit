@@ -11,8 +11,8 @@ actor per cell.
 - Dependencies between cells are explicit runtime data.
 - Only affected cells recompute after an edit.
 - Cycles are detected and reported deterministically.
-- The visible preview is generated from the Boon example's `VIEW`, state, and
-  generic state summary data. The native playground may add generic UI
+- The visible preview is generated from the Boon example's `document`, state,
+  and generic state summary data. The native playground may add generic UI
   primitives such as `Row`, `Column`, `Text`, `Input`, focus styling, and
   scrolling, but it must not contain a dedicated Cells widget or hardcoded Cells
   preview.
@@ -144,7 +144,7 @@ required visible samples beyond A0-D0: Z0, A99, and Z99
 ```
 
 The runtime state summary may expose a bounded view projection such as
-`grid_columns`, `grid_rows`, and visible `cells` to feed the generic `VIEW`
+`grid_columns`, `grid_rows`, and visible `cells` to feed the generic `document`
 renderer. That projection is UI data derived from the authoritative grid/list
 storage. It is not allowed to replace or shrink the underlying 26x100 runtime
 model.
@@ -152,8 +152,8 @@ model.
 The Cells source owns the spreadsheet layout declaration. Header rows, row
 labels, compact editors, displayed values, edit-mode formulas, focused cell
 styling, and the scrollable body must be declared in `examples/cells.bn` with
-generic `VIEW` components. The playground renderer only interprets those generic
-component attributes.
+generic `document` elements. The playground renderer only interprets those
+generic component attributes.
 
 ## Formula Primitive Contract
 

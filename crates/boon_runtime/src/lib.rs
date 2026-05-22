@@ -6,7 +6,7 @@ use boon_ir::{
     ListPredicate, SourceId, SourcePayloadField, TypedProgram, UpdateExpression, debug_tables,
     lower, verify_hidden_identity, verify_static_schedule,
 };
-use boon_parser::{ParsedProgram, parse_source};
+use boon_parser::{DocumentAst, ParsedProgram, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
@@ -244,7 +244,7 @@ pub struct RunOutput {
     pub render_patches: Vec<RenderPatch<'static>>,
     pub state_summary: JsonValue,
     #[serde(skip)]
-    pub view_lines: Vec<String>,
+    pub document: Option<DocumentAst>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -555,7 +555,7 @@ pub fn run_scenario(
     }
     Ok(RunOutput {
         report,
-        view_lines: boon_parser::parsed_view_lines(&parsed),
+        document: boon_parser::parsed_document(&parsed),
         ..output
     })
 }
@@ -628,7 +628,7 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     )?;
     Ok(RunOutput {
         report,
-        view_lines: boon_parser::parsed_view_lines(&parsed),
+        document: boon_parser::parsed_document(&parsed),
         ..output
     })
 }
@@ -732,7 +732,7 @@ pub fn run_source_initial_state(
         semantic_deltas: Vec::new(),
         render_patches: Vec::new(),
         state_summary,
-        view_lines: boon_parser::parsed_view_lines(&parsed),
+        document: boon_parser::parsed_document(&parsed),
     })
 }
 
@@ -6439,7 +6439,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         semantic_deltas,
         render_patches,
         state_summary,
-        view_lines: boon_parser::parsed_view_lines(parsed),
+        document: boon_parser::parsed_document(parsed),
     })
 }
 

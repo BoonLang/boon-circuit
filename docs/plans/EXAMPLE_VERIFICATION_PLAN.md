@@ -143,8 +143,8 @@ A0-D0 scenario subset. The Cells aggregate and readiness audits require that
 report in addition to semantic, headed, speed, negative, and operator E2E
 reports.
 
-The visible surface must be generated from the example's Boon `VIEW`, state, and
-state-summary projection. Generic renderer support for focus styling,
+The visible surface must be generated from the example's Boon `document`, state,
+and state-summary projection. Generic renderer support for focus styling,
 display-versus-edit input values, and scroll containers is allowed; a
 Cells-specific preview/widget path is not valid evidence.
 

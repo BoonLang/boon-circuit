@@ -48,7 +48,7 @@ impl AstProgram {
     pub fn semantic_tokens(&self) -> impl Iterator<Item = &AstToken> {
         self.tokens.iter().filter(|token| {
             !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
-                && !self.line_is_view(token.line)
+                && !self.line_is_document(token.line)
                 && !self
                     .lines
                     .iter()
@@ -61,18 +61,26 @@ impl AstProgram {
         self.lines.iter().filter(|line| {
             !line.symbols.is_empty()
                 && line.symbols.first().map(String::as_str) != Some("#")
-                && !self.line_is_view(line.line)
+                && !self.line_is_document(line.line)
         })
     }
 
     pub fn semantic_parser_items(&self) -> impl Iterator<Item = &ParserItem> {
-        self.items.iter().filter(|item| !item.is_view)
-    }
-
-    fn line_is_view(&self, line: usize) -> bool {
         self.items
             .iter()
-            .any(|item| item.line == line && item.is_view)
+            .filter(|item| !self.line_is_document(item.line))
+    }
+
+    fn line_is_document(&self, line: usize) -> bool {
+        self.statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    &statement.kind,
+                    AstStatementKind::Field { name } if name == "document"
+                )
+            })
+            .is_some_and(|statement| statement_contains_line(statement, line))
     }
 }
 
@@ -101,7 +109,6 @@ pub struct ParserItem {
     pub list_capacity: Option<usize>,
     pub is_list: bool,
     pub is_grid_list: bool,
-    pub is_view: bool,
     pub opens_scope: bool,
     pub closes_scope: bool,
     pub operators: Vec<String>,
@@ -161,7 +168,6 @@ pub enum AstStatementKind {
         capacity: Option<usize>,
         grid: bool,
     },
-    View,
     Block,
     Expression,
 }
@@ -179,6 +185,7 @@ pub struct AstExpr {
 pub enum AstExprKind {
     Identifier(String),
     Path(Vec<String>),
+    StringLiteral(String),
     TextLiteral(String),
     Number(String),
     Bool(bool),
@@ -285,6 +292,12 @@ pub struct ParsedRowScopeFunction {
     pub row_scope: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentAst {
+    pub root: AstStatement,
+    pub expressions: Vec<AstExpr>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub path: String,
@@ -332,18 +345,13 @@ pub fn parse_source(
     })
 }
 
-pub fn parse_view_lines(
-    path: impl Into<String>,
-    source: impl Into<String>,
-) -> Result<Vec<String>, ParseError> {
-    let path = path.into();
-    let source = source.into();
-    let ast = parse_ast(&path, &source)?;
-    Ok(view_lines_from_ast(&ast))
-}
-
-pub fn parsed_view_lines(program: &ParsedProgram) -> Vec<String> {
-    view_lines_from_ast(&program.ast)
+pub fn parsed_document(program: &ParsedProgram) -> Option<DocumentAst> {
+    document_statement(&program.ast)
+        .cloned()
+        .map(|root| DocumentAst {
+            root,
+            expressions: program.ast.expressions.clone(),
+        })
 }
 
 fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
@@ -397,67 +405,21 @@ fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     })
 }
 
-fn view_lines_from_ast(ast: &AstProgram) -> Vec<String> {
-    let mut in_view = false;
-    let mut depth = 0i32;
-    let mut lines = Vec::new();
-    for item in ast.items.iter().filter(|item| item.is_view) {
-        let starts_view = !in_view
-            && item.symbols.first().map(String::as_str) == Some("VIEW")
-            && item.symbols.iter().any(|symbol| symbol == "{");
-        if starts_view {
-            in_view = true;
-            depth = symbol_brace_delta(&item.symbols);
-            continue;
-        }
-        if !in_view {
-            continue;
-        }
-        depth += symbol_brace_delta(&item.symbols);
-        if depth <= 0 {
-            return lines;
-        }
-        let line = view_line_from_ast_tokens(ast, item.line);
-        if !line.is_empty() {
-            lines.push(line);
-        }
-    }
-    lines
+fn document_statement(ast: &AstProgram) -> Option<&AstStatement> {
+    ast.statements.iter().find(|statement| {
+        matches!(
+            &statement.kind,
+            AstStatementKind::Field { name } if name == "document"
+        )
+    })
 }
 
-fn view_line_from_ast_tokens(ast: &AstProgram, line: usize) -> String {
-    let mut output = String::new();
-    for token in ast.tokens.iter().filter(|token| token.line == line) {
-        if matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
-            continue;
-        }
-        push_view_token(&mut output, &token.lexeme);
-    }
-    output
-}
-
-fn push_view_token(output: &mut String, token: &str) {
-    let token = token.trim();
-    if token.is_empty() {
-        return;
-    }
-    if output.is_empty()
-        || view_token_no_space_before(token)
-        || output.chars().last().is_some_and(view_token_no_space_after)
-    {
-        output.push_str(token);
-    } else {
-        output.push(' ');
-        output.push_str(token);
-    }
-}
-
-fn view_token_no_space_before(token: &str) -> bool {
-    matches!(token, ")" | "]" | "}" | "," | "." | "=" | ":")
-}
-
-fn view_token_no_space_after(ch: char) -> bool {
-    matches!(ch, '$' | '#' | '.' | '=' | ':' | ',')
+fn statement_contains_line(statement: &AstStatement, line: usize) -> bool {
+    statement.line == line
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_contains_line(child, line))
 }
 
 fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), Error = Simple<char>>
@@ -480,6 +442,9 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         )
         .then_ignore(just('"'))
         .to(AstTokenKind::String);
+    let comment = choice((just("#"), just("--")))
+        .ignore_then(none_of('\n').repeated())
+        .to(AstTokenKind::Comment);
     let operator = choice((
         just("=>").ignored(),
         just("|>").ignored(),
@@ -495,7 +460,7 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
     let unknown = any().to(AstTokenKind::Unknown);
 
     choice((
-        string, identifier, number, operator, symbol, newline, unknown,
+        string, comment, identifier, number, operator, symbol, newline, unknown,
     ))
     .padded_by(horizontal_space)
     .map_with_span(|kind, span| (kind, span))
@@ -569,10 +534,8 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
             start = token.start;
         }
         end = token.end;
-        if !matches!(
-            token.kind,
-            AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
-        ) && !token.lexeme.is_empty()
+        if !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline)
+            && !token.lexeme.is_empty()
         {
             symbols.push(token.lexeme.clone());
         }
@@ -590,30 +553,16 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
 }
 
 fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
-    let mut view_depth = 0i32;
     lines
         .iter()
         .filter(|line| {
             !line.symbols.is_empty() && line.symbols.first().map(String::as_str) != Some("#")
         })
-        .map(|line| {
-            let starts_view = view_depth == 0
-                && line.symbols.first().map(String::as_str) == Some("VIEW")
-                && line.symbols.iter().any(|symbol| symbol == "{");
-            let is_view = view_depth > 0 || starts_view;
-            let item = parser_item(line, is_view);
-            if is_view {
-                view_depth += symbol_brace_delta(&line.symbols);
-                if view_depth <= 0 {
-                    view_depth = 0;
-                }
-            }
-            item
-        })
+        .map(|line| parser_item(line))
         .collect()
 }
 
-fn parser_item(line: &ParserLine, is_view: bool) -> ParserItem {
+fn parser_item(line: &ParserLine) -> ParserItem {
     let symbols = line.symbols.clone();
     let field = ast_field_name(&symbols).map(ToOwned::to_owned);
     let example = (symbols.first().map(String::as_str) == Some("EXAMPLE"))
@@ -644,7 +593,6 @@ fn parser_item(line: &ParserLine, is_view: bool) -> ParserItem {
         function,
         is_list,
         is_grid_list,
-        is_view,
     }
 }
 
@@ -706,8 +654,6 @@ fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -
             capacity: item.list_capacity,
             grid: item.is_grid_list,
         }
-    } else if item.symbols.first().map(String::as_str) == Some("VIEW") {
-        AstStatementKind::View
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
     } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "]")) {
@@ -715,14 +661,12 @@ fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -
     } else {
         AstStatementKind::Expression
     };
-    let expr = if item.is_view
-        || matches!(
-            kind,
-            AstStatementKind::Example { .. }
-                | AstStatementKind::Function { .. }
-                | AstStatementKind::View
-                | AstStatementKind::Block
-        ) {
+    let expr = if matches!(
+        kind,
+        AstStatementKind::Example { .. }
+            | AstStatementKind::Function { .. }
+            | AstStatementKind::Block
+    ) {
         None
     } else {
         let expr_tokens = statement_expression_tokens(item);
@@ -796,6 +740,9 @@ fn ast_expr_kind(
     }
     if tokens.len() == 1 && tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
         return AstExprKind::Number(tokens[0].clone());
+    }
+    if let Some(value) = string_literal_value(tokens) {
+        return AstExprKind::StringLiteral(value);
     }
     if let Some(text) = text_literal_value(tokens) {
         return AstExprKind::TextLiteral(text);
@@ -1077,6 +1024,31 @@ fn text_literal_value(tokens: &[String]) -> Option<String> {
     Some(tokens[2..close].join(" "))
 }
 
+fn string_literal_value(tokens: &[String]) -> Option<String> {
+    if tokens.len() != 1 {
+        return None;
+    }
+    tokens[0]
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .map(unescape_string_literal)
+}
+
+fn unescape_string_literal(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                output.push(next);
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 fn value_starts_uppercase_identifier(value: &str) -> bool {
     value
         .chars()
@@ -1147,17 +1119,6 @@ fn is_name(name: &str) -> bool {
         && name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn symbol_brace_delta(symbols: &[String]) -> i32 {
-    symbols
-        .iter()
-        .map(|symbol| match symbol.as_str() {
-            "{" => 1,
-            "}" => -1,
-            _ => 0,
-        })
-        .sum()
 }
 
 fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, ParseError> {
@@ -1523,7 +1484,6 @@ fn derive_structure_from_statements(
             | AstStatementKind::Expression => {
                 derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
             }
-            AstStatementKind::View => {}
         }
     }
 }
@@ -1554,7 +1514,6 @@ fn collect_row_scope_statements(
             }
             AstStatementKind::Function { .. } => {}
             AstStatementKind::Example { .. }
-            | AstStatementKind::View
             | AstStatementKind::Block
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
@@ -2104,7 +2063,7 @@ todos |> List/map(todo, new: new_todo(seed: todo))
     }
 
     #[test]
-    fn parses_view_structurally_without_semantic_source_leakage() {
+    fn parses_document_structurally_without_semantic_source_leakage() {
         let source = r#"
 EXAMPLE TodoMVC
 store:
@@ -2122,20 +2081,17 @@ todos |> List/map(todo, new: new_todo(seed: todo))
 FUNCTION new_todo(seed) {
     title: seed.title |> HOLD title { LATEST {} }
 }
-VIEW {
-    text id: "fake-source" value: "SOURCE runtime_key TodoId"
-}
+document:
+    children:
+        element:
+            kind: Text
+            id: "fake-source"
+            value: "SOURCE runtime_key TodoId"
 after_view: "" |> HOLD after_view { LATEST {} }
 "#;
-        let parsed = parse_source("view-structural.bn", source).unwrap();
-        assert!(parsed.source.contains("VIEW {"));
-        assert!(
-            parsed
-                .ast
-                .statements
-                .iter()
-                .any(|statement| matches!(statement.kind, AstStatementKind::View))
-        );
+        let parsed = parse_source("document-structural.bn", source).unwrap();
+        assert!(parsed.source.contains("document:"));
+        assert!(parsed_document(&parsed).is_some());
         assert_eq!(parsed.source_ports.len(), 1);
         assert_eq!(
             parsed.source_ports[0].path,
@@ -2151,26 +2107,37 @@ after_view: "" |> HOLD after_view { LATEST {} }
     }
 
     #[test]
-    fn extracts_view_lines_from_ast_tokens() {
+    fn parses_document_string_literals_and_comments() {
         let source = r##"
 EXAMPLE TodoMVC
-VIEW {
-    Column id=todomvc_surface bg=#ffffff {
-        Text text="todos" color=#b83f45
-        Input id=todo_new_input value=$new_todo_text placeholder="What needs to be done?"
-    }
+-- sibling Boon syntax comment
+# current boon-circuit syntax comment
+store:
+    sources:
+        new_todo_input: [change: SOURCE]
+    new_todo_text: "" |> HOLD new_todo_text { LATEST {} }
+todos: LIST[4] {}
+todos |> List/map(todo, new: new_todo(seed: todo))
+FUNCTION new_todo(seed) {
+    title: seed.title |> HOLD title { LATEST {} }
 }
+document:
+    children:
+        element:
+            kind: Input
+            id: "todo_new_input"
+            value: "$new_todo_text"
+            placeholder: "What needs to be done?"
 "##;
-        let lines = parse_view_lines("view-lines.bn", source).unwrap();
-        assert_eq!(
-            lines,
-            vec![
-                "Column id=todomvc_surface bg=#ffffff {",
-                "Text text=\"todos\" color=#b83f45",
-                "Input id=todo_new_input value=$new_todo_text placeholder=\"What needs to be done?\"",
-                "}",
-            ]
-        );
+        let parsed = parse_source("document-lines.bn", source).unwrap();
+        let document = parsed_document(&parsed).expect("document should parse");
+        assert!(statement_contains_line(&document.root, document.root.line));
+        assert!(document.expressions.iter().any(|expr| {
+            matches!(
+                &expr.kind,
+                AstExprKind::StringLiteral(value) if value == "What needs to be done?"
+            )
+        }));
     }
 
     #[test]

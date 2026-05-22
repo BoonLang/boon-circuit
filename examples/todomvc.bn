@@ -171,31 +171,225 @@ FUNCTION new_todo(seed, store) {
     ]
 }
 
-VIEW {
-    Text text="todos" size=80 color=#b83f45 bg=#f5f5f5 width=550 height=118 center=true
-    Column id=todomvc_surface width=550 bg=#ffffff border=#ead7d7 {
-        Row id=todomvc_input_row height=66 bg=#ffffff border=#ead7d7 padding=8,8,5,5 gap=9 {
-            Button id=todo_toggle_all text="⌄" source=store.sources.toggle_all_checkbox.click width=36 height=50 size=28 color=#777777 bg=#ffffff border=#ffffff
-            Input id=todo_new_input value=$new_todo_text placeholder="What needs to be done?" change=store.sources.new_todo_input.change submit=store.sources.new_todo_input.key_down size=24 height=56 color=#4d4d4d placeholder_color=#9a9a9a bg=#ffffff border=#ffffff
-        }
-        ForEach visible_todos as todo {
-            Row id=todo_row height=59 bg=#ffffff border=#ededed padding=6,6,5,5 gap=11 {
-                Checkbox id=todo_row_checkbox checked=$todo.completed source=todo.sources.todo_checkbox.click target=$todo.title size=28
-                Button id=todo_row_title text=$todo.title double_click=todo.sources.todo_title_element.double_click target=$todo.title visible=$todo.not_editing width=fill height=42 size=24 color=#4d4d4d bg=#ffffff border=#ffffff color_if=$todo.completed if_color=#949494 strike_if=$todo.completed align=left
-                Input id=todo_row_edit value=$todo.edit_text placeholder=$todo.title change=todo.sources.editing_todo_title_element.change submit=todo.sources.editing_todo_title_element.key_down escape=todo.sources.editing_todo_title_element.key_down blur=todo.sources.editing_todo_title_element.blur target=$todo.title visible=$todo.editing size=24 height=43 color=#4d4d4d placeholder_color=#777777 bg=#ffffff border=#999999
-                Button id=todo_row_delete text="×" source=todo.sources.remove_todo_button.press target=$todo.title hover_visible=true width=32 height=32 size=24 color=#cc9a9a bg=#ffffff border=#ffffff
-            }
-        }
-        Row id=todomvc_footer height=41 bg=#ffffff border=#ededed padding=9,9,4,4 gap=9 {
-            Text template="{active_count} items left" size=14 color=#111111 width=130 height=24
-            Button id=todo_filter_all text="All" selected=$selected_filter:All source=store.sources.filter_all.press width=43 height=24 size=14 color=#111111 bg=#ffffff border=#ffffff selected_border=#d65d52
-            Button id=todo_filter_active text="Active" selected=$selected_filter:Active source=store.sources.filter_active.press width=65 height=24 size=14 color=#111111 bg=#ffffff border=#ffffff selected_border=#d65d52
-            Button id=todo_filter_completed text="Completed" selected=$selected_filter:Completed source=store.sources.filter_completed.press width=95 height=24 size=14 color=#111111 bg=#ffffff border=#ffffff selected_border=#d65d52
-            Button id=todo_clear_completed text="Clear completed" source=store.sources.clear_completed_button.press visible=$completed_count width=fill height=24 size=14 color=#111111 bg=#ffffff border=#ffffff
-        }
-    }
-    Text text="" size=1 color=#f5f5f5 bg=#f5f5f5 width=fill height=43 center=true
-    Text text="Double-click to edit a todo" size=12 color=#4d4d4d bg=#f5f5f5 width=fill height=30 center=true
-    Text text="Created by Martin Kavík" size=12 color=#4d4d4d bg=#f5f5f5 width=fill height=23 center=true
-    Text text="Part of TodoMVC" size=12 color=#4d4d4d bg=#f5f5f5 width=fill height=23 center=true
-}
+document:
+    children:
+        element:
+            kind: Text
+            text: "todos"
+            size: 80
+            color: "#b83f45"
+            bg: "#f5f5f5"
+            width: 550
+            height: 118
+            center: true
+        element:
+            kind: Column
+            id: "todomvc_surface"
+            width: 550
+            bg: "#ffffff"
+            border: "#ead7d7"
+            children:
+                element:
+                    kind: Row
+                    id: "todomvc_input_row"
+                    height: 66
+                    bg: "#ffffff"
+                    border: "#ead7d7"
+                    padding: "8,8,5,5"
+                    gap: 9
+                    children:
+                        element:
+                            kind: Button
+                            id: "todo_toggle_all"
+                            text: "⌄"
+                            source: store.sources.toggle_all_checkbox.click
+                            width: 36
+                            height: 50
+                            size: 28
+                            color: "#777777"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+                        element:
+                            kind: Input
+                            id: "todo_new_input"
+                            value: "$new_todo_text"
+                            placeholder: "What needs to be done?"
+                            change: store.sources.new_todo_input.change
+                            submit: store.sources.new_todo_input.key_down
+                            size: 24
+                            height: 56
+                            color: "#4d4d4d"
+                            placeholder_color: "#9a9a9a"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+                element:
+                    kind: ForEach
+                    list: visible_todos
+                    item: todo
+                    children:
+                        element:
+                            kind: Row
+                            id: "todo_row"
+                            height: 59
+                            bg: "#ffffff"
+                            border: "#ededed"
+                            padding: "6,6,5,5"
+                            gap: 11
+                            children:
+                                element:
+                                    kind: Checkbox
+                                    id: "todo_row_checkbox"
+                                    checked: "$todo.completed"
+                                    source: todo.sources.todo_checkbox.click
+                                    target: "$todo.title"
+                                    size: 28
+                                element:
+                                    kind: Button
+                                    id: "todo_row_title"
+                                    text: "$todo.title"
+                                    double_click: todo.sources.todo_title_element.double_click
+                                    target: "$todo.title"
+                                    visible: "$todo.not_editing"
+                                    width: fill
+                                    height: 42
+                                    size: 24
+                                    color: "#4d4d4d"
+                                    bg: "#ffffff"
+                                    border: "#ffffff"
+                                    color_if: "$todo.completed"
+                                    if_color: "#949494"
+                                    strike_if: "$todo.completed"
+                                    align: left
+                                element:
+                                    kind: Input
+                                    id: "todo_row_edit"
+                                    value: "$todo.edit_text"
+                                    placeholder: "$todo.title"
+                                    change: todo.sources.editing_todo_title_element.change
+                                    submit: todo.sources.editing_todo_title_element.key_down
+                                    escape: todo.sources.editing_todo_title_element.key_down
+                                    blur: todo.sources.editing_todo_title_element.blur
+                                    target: "$todo.title"
+                                    visible: "$todo.editing"
+                                    size: 24
+                                    height: 43
+                                    color: "#4d4d4d"
+                                    placeholder_color: "#777777"
+                                    bg: "#ffffff"
+                                    border: "#999999"
+                                element:
+                                    kind: Button
+                                    id: "todo_row_delete"
+                                    text: "×"
+                                    source: todo.sources.remove_todo_button.press
+                                    target: "$todo.title"
+                                    hover_visible: true
+                                    width: 32
+                                    height: 32
+                                    size: 24
+                                    color: "#cc9a9a"
+                                    bg: "#ffffff"
+                                    border: "#ffffff"
+                element:
+                    kind: Row
+                    id: "todomvc_footer"
+                    height: 41
+                    bg: "#ffffff"
+                    border: "#ededed"
+                    padding: "9,9,4,4"
+                    gap: 9
+                    children:
+                        element:
+                            kind: Text
+                            template: "{active_count} items left"
+                            size: 14
+                            color: "#111111"
+                            width: 130
+                            height: 24
+                        element:
+                            kind: Button
+                            id: "todo_filter_all"
+                            text: "All"
+                            selected: "$selected_filter:All"
+                            source: store.sources.filter_all.press
+                            width: 43
+                            height: 24
+                            size: 14
+                            color: "#111111"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+                            selected_border: "#d65d52"
+                        element:
+                            kind: Button
+                            id: "todo_filter_active"
+                            text: "Active"
+                            selected: "$selected_filter:Active"
+                            source: store.sources.filter_active.press
+                            width: 65
+                            height: 24
+                            size: 14
+                            color: "#111111"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+                            selected_border: "#d65d52"
+                        element:
+                            kind: Button
+                            id: "todo_filter_completed"
+                            text: "Completed"
+                            selected: "$selected_filter:Completed"
+                            source: store.sources.filter_completed.press
+                            width: 95
+                            height: 24
+                            size: 14
+                            color: "#111111"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+                            selected_border: "#d65d52"
+                        element:
+                            kind: Button
+                            id: "todo_clear_completed"
+                            text: "Clear completed"
+                            source: store.sources.clear_completed_button.press
+                            visible: "$completed_count"
+                            width: fill
+                            height: 24
+                            size: 14
+                            color: "#111111"
+                            bg: "#ffffff"
+                            border: "#ffffff"
+        element:
+            kind: Text
+            text: ""
+            size: 1
+            color: "#f5f5f5"
+            bg: "#f5f5f5"
+            width: fill
+            height: 43
+            center: true
+        element:
+            kind: Text
+            text: "Double-click to edit a todo"
+            size: 12
+            color: "#4d4d4d"
+            bg: "#f5f5f5"
+            width: fill
+            height: 30
+            center: true
+        element:
+            kind: Text
+            text: "Created by Martin Kavík"
+            size: 12
+            color: "#4d4d4d"
+            bg: "#f5f5f5"
+            width: fill
+            height: 23
+            center: true
+        element:
+            kind: Text
+            text: "Part of TodoMVC"
+            size: 12
+            color: "#4d4d4d"
+            bg: "#f5f5f5"
+            width: fill
+            height: 23
+            center: true

@@ -927,48 +927,14 @@ fn view_bindings(
         .map(|source| (source.path.as_str(), source.id))
         .collect::<Vec<_>>();
     let mut bindings = Vec::new();
-    for line in boon_parser::parsed_view_lines(program) {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        let Some(node_kind) = tokens.first() else {
-            continue;
-        };
-        if matches!(*node_kind, "}" | "{") {
-            continue;
-        }
-        for token in tokens.iter().skip(1) {
-            let Some((attr, raw_value)) = token.split_once('=') else {
-                continue;
-            };
-            let value = raw_value.trim_matches('"');
-            if let Some(path) = view_data_path(value) {
-                bindings.push(ViewBinding {
-                    id: ViewBindingId(bindings.len()),
-                    node_kind: (*node_kind).to_owned(),
-                    attr: attr.to_owned(),
-                    scope_id: scope_id_for_path(row_scopes, &path),
-                    source_id: None,
-                    kind: if attr == "target" {
-                        ViewBindingKind::Target
-                    } else {
-                        ViewBindingKind::Data
-                    },
-                    path,
-                });
-            } else if let Some((path, source_id)) = source_paths
-                .iter()
-                .find(|(source_path, _)| *source_path == value)
-            {
-                bindings.push(ViewBinding {
-                    id: ViewBindingId(bindings.len()),
-                    node_kind: (*node_kind).to_owned(),
-                    attr: attr.to_owned(),
-                    path: (*path).to_owned(),
-                    kind: ViewBindingKind::Source,
-                    scope_id: scope_id_for_path(row_scopes, path),
-                    source_id: Some(*source_id),
-                });
-            }
-        }
+    if let Some(document) = boon_parser::parsed_document(program) {
+        collect_document_view_bindings(
+            &document.root.children,
+            &document.expressions,
+            row_scopes,
+            &source_paths,
+            &mut bindings,
+        );
     }
     bindings
 }
@@ -977,6 +943,145 @@ fn view_data_path(value: &str) -> Option<String> {
     let path = value.strip_prefix('$')?;
     let path = path.split_once(':').map_or(path, |(path, _)| path);
     (!path.trim().is_empty()).then(|| path.to_owned())
+}
+
+fn collect_document_view_bindings(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    for statement in statements {
+        if document_statement_field(statement).as_deref() == Some("element") {
+            if let Some(kind) = document_child_value(statement, "kind", expressions) {
+                collect_document_element_bindings(
+                    &kind,
+                    statement,
+                    expressions,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                );
+            }
+        }
+        collect_document_view_bindings(
+            &statement.children,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+        );
+    }
+}
+
+fn collect_document_element_bindings(
+    node_kind: &str,
+    element: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    for child in &element.children {
+        let Some(attr) = document_statement_field(child) else {
+            continue;
+        };
+        if matches!(attr.as_str(), "kind" | "children") {
+            continue;
+        }
+        let Some(value) = document_statement_value(child, expressions) else {
+            continue;
+        };
+        if let Some(path) = view_data_path(&value) {
+            bindings.push(ViewBinding {
+                id: ViewBindingId(bindings.len()),
+                node_kind: node_kind.to_owned(),
+                attr: attr.clone(),
+                scope_id: scope_id_for_path(row_scopes, &path),
+                source_id: None,
+                kind: if attr == "target" {
+                    ViewBindingKind::Target
+                } else {
+                    ViewBindingKind::Data
+                },
+                path,
+            });
+        } else if let Some((path, source_id)) = source_paths
+            .iter()
+            .find(|(source_path, _)| *source_path == value)
+        {
+            bindings.push(ViewBinding {
+                id: ViewBindingId(bindings.len()),
+                node_kind: node_kind.to_owned(),
+                attr,
+                path: (*path).to_owned(),
+                kind: ViewBindingKind::Source,
+                scope_id: scope_id_for_path(row_scopes, path),
+                source_id: Some(*source_id),
+            });
+        }
+    }
+}
+
+fn document_child_value(
+    statement: &AstStatement,
+    field: &str,
+    expressions: &[AstExpr],
+) -> Option<String> {
+    statement
+        .children
+        .iter()
+        .find(|child| document_statement_field(child).as_deref() == Some(field))
+        .and_then(|child| document_statement_value(child, expressions))
+}
+
+fn document_statement_field(statement: &AstStatement) -> Option<String> {
+    match &statement.kind {
+        AstStatementKind::Field { name } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn document_statement_value(statement: &AstStatement, expressions: &[AstExpr]) -> Option<String> {
+    let expr = expressions.get(statement.expr?)?;
+    document_expr_value(expr, expressions)
+}
+
+fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String> {
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Number(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value) => {
+            Some(value.clone())
+        }
+        AstExprKind::Bool(value) => Some(value.to_string()),
+        AstExprKind::Path(parts) => Some(parts.join(".")),
+        AstExprKind::Pipe { input, op, args } => {
+            let mut value = document_expr_value(expressions.get(*input)?, expressions)?;
+            value.push_str("|>");
+            value.push_str(op);
+            if !args.is_empty() {
+                value.push('(');
+                value.push_str(
+                    &args
+                        .iter()
+                        .filter_map(|arg| {
+                            let mut arg_value =
+                                document_expr_value(expressions.get(arg.value)?, expressions)?;
+                            if let Some(name) = &arg.name {
+                                arg_value = format!("{name}:{arg_value}");
+                            }
+                            Some(arg_value)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                value.push(')');
+            }
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 fn require_known_symbol(
@@ -1566,6 +1671,7 @@ fn expression_ir_node_kind(expr: &AstExpr) -> Option<IrNodeKind> {
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::Bool(_)
@@ -1626,6 +1732,7 @@ fn ast_expr_label(expr: &AstExpr) -> String {
         AstExprKind::Unknown(tokens) => tokens.join("_"),
         AstExprKind::Delimiter => "delimiter".to_owned(),
         AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::StringLiteral(_) => "string_literal".to_owned(),
         AstExprKind::TextLiteral(_) => "text_literal".to_owned(),
         AstExprKind::Bool(value) => format!("bool_{value}"),
         AstExprKind::Source => "source".to_owned(),
@@ -1917,7 +2024,7 @@ fn field_initial_value(field: &FieldDef) -> InitialValue {
 
 fn ast_initial_value(expr: &AstExpr) -> InitialValue {
     match &expr.kind {
-        AstExprKind::TextLiteral(value) => InitialValue::Text {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
             value: value.clone(),
         },
         AstExprKind::Bool(value) => InitialValue::Bool { value: *value },
@@ -2127,7 +2234,7 @@ fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<Stri
         AstExprKind::Path(parts) => parts.join("."),
         AstExprKind::Bool(true) => "True".to_owned(),
         AstExprKind::Bool(false) => "False".to_owned(),
-        AstExprKind::TextLiteral(value) => value.clone(),
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => value.clone(),
         AstExprKind::Unknown(tokens) => tokens_to_path(tokens),
         AstExprKind::Delimiter => String::new(),
         AstExprKind::Source
@@ -2150,6 +2257,7 @@ fn ast_simple_update_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option
         AstExprKind::Identifier(value)
         | AstExprKind::Enum(value)
         | AstExprKind::Number(value)
+        | AstExprKind::StringLiteral(value)
         | AstExprKind::TextLiteral(value) => Some(value.clone()),
         AstExprKind::Bool(true) => Some("True".to_owned()),
         AstExprKind::Bool(false) => Some("False".to_owned()),
@@ -3015,7 +3123,6 @@ fn gather_field_defs_from_statements(
                 }
             }
             AstStatementKind::Example { .. }
-            | AstStatementKind::View
             | AstStatementKind::Block
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
@@ -3107,6 +3214,7 @@ fn collect_expr_tree(
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::Bool(_)
@@ -4081,7 +4189,8 @@ EXAMPLE TodoMVC
             }
         }
 }
-VIEW {}
+document:
+    children:
 "#;
         let parsed = boon_parser::parse_source("renamed-row-scope.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();

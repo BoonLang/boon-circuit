@@ -2,6 +2,10 @@ use boon_document::{LayoutFrame, RenderCapabilities};
 use boon_host::SurfaceId;
 use serde::{Deserialize, Serialize};
 
+pub mod generated {
+    pub mod shader_bindings;
+}
+
 pub const REQUIRED_WGPU_VERSION: &str = "29.0.1";
 pub const REQUIRED_GLYPHON_VERSION: &str = "0.11.0";
 
@@ -77,14 +81,18 @@ impl std::fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NativeGpuRenderer {
     frame_seq: u64,
+    rect_shader: generated::shader_bindings::ShaderEntry,
 }
 
 impl NativeGpuRenderer {
     pub fn new_uninitialized() -> Self {
-        Self { frame_seq: 0 }
+        Self {
+            frame_seq: 0,
+            rect_shader: generated::shader_bindings::ShaderEntry::NativeGpuRect,
+        }
     }
 
     pub fn required_backend_versions() -> (&'static str, &'static str) {
@@ -93,6 +101,10 @@ impl NativeGpuRenderer {
 
     pub fn default_frame_format_name() -> String {
         format!("{:?}", wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    pub fn rect_shader_entry(&self) -> generated::shader_bindings::ShaderEntry {
+        self.rect_shader
     }
 }
 
@@ -110,7 +122,11 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
         self.frame_seq += 1;
         Ok(RenderProof {
             artifact: RenderProofArtifact::CopyToPresent {
-                source_texture_hash: format!("layout-items-{}", frame.display_list.len()),
+                source_texture_hash: format!(
+                    "{:?}:layout-items-{}",
+                    self.rect_shader_entry(),
+                    frame.display_list.len()
+                ),
                 target_surface_id: target.id(),
                 target_surface_epoch: target.epoch(),
                 target_format: target.format(),

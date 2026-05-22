@@ -3,6 +3,7 @@ members = [
     "crates/boon_parser",
     "crates/boon_ir",
     "crates/boon_runtime",
+    "crates/boon_report_schema",
     "crates/boon_cli",
     "crates/boon_ply_playground",
     "crates/boon_document_model",
@@ -24,6 +25,7 @@ rust-version = "1.88"
 boon_parser = { path = "crates/boon_parser" }
 boon_ir = { path = "crates/boon_ir" }
 boon_runtime = { path = "crates/boon_runtime" }
+boon_report_schema = { path = "crates/boon_report_schema" }
 boon_document_model = { path = "crates/boon_document_model" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
@@ -40,3 +42,4 @@ ply-engine = { version = "1.1.1", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"
 app_window = "=0.3.3"
+wgsl_bindgen = "=0.22.2"

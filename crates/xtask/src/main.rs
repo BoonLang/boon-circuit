@@ -2875,6 +2875,9 @@ fn audit_runtime_finality(
     let parser = read_source_for_audit("crates/boon_parser/src/lib.rs", checks, blockers)?;
     let ir = read_source_for_audit("crates/boon_ir/src/lib.rs", checks, blockers)?;
     let runtime = read_source_for_audit("crates/boon_runtime/src/lib.rs", checks, blockers)?;
+    let report_schema =
+        read_source_for_audit("crates/boon_report_schema/src/lib.rs", checks, blockers)?;
+    let runtime_report_schema = format!("{runtime}\n{report_schema}");
     let cli = read_source_for_audit("crates/boon_cli/src/main.rs", checks, blockers)?;
     let playground =
         read_source_for_audit("crates/boon_ply_playground/src/lib.rs", checks, blockers)?;
@@ -3347,7 +3350,7 @@ fn audit_runtime_finality(
         checks,
         blockers,
         "reports:runtime-execution-mirrors-profile-capacity-coverage",
-        &runtime,
+        &runtime_report_schema,
         &[
             "fn verify_runtime_execution_report_mirror(",
             "\"runtime_profile\"",
@@ -3407,7 +3410,7 @@ fn audit_runtime_finality(
         checks,
         blockers,
         "reports:human-pass-label-provenance",
-        &runtime,
+        &runtime_report_schema,
         &[
             "fn command_argv_values_after",
             "fn command_argv_value_after",
@@ -3425,7 +3428,7 @@ fn audit_runtime_finality(
         checks,
         blockers,
         "reports:human-visible-pid-cmdline-provenance",
-        &format!("{runtime}\n{xtask}"),
+        &format!("{runtime_report_schema}\n{xtask}"),
         &[
             "fn visible_playground_process_cmdline(",
             "/proc/{pid}/cmdline",
@@ -3440,7 +3443,7 @@ fn audit_runtime_finality(
         checks,
         blockers,
         "reports:human-and-headed-current-git",
-        &format!("{runtime}\n{xtask}"),
+        &format!("{runtime_report_schema}\n{xtask}"),
         &[
             "manual report git_commit `{report_commit}` does not match current git commit",
             "linked headed report git_commit `{headed_commit}` does not match current git commit",
@@ -3625,8 +3628,8 @@ fn audit_native_gpu_all_report(
         .flatten()
         .filter_map(|artifact| artifact.get("path").and_then(serde_json::Value::as_str))
         .collect::<BTreeSet<_>>();
-    for (_, child) in native_gpu_required_reports() {
-        let child_string = child.display().to_string();
+    for child in native_gpu_required_reports() {
+        let child_string = child.path.display().to_string();
         let linked = artifact_paths.contains(child_string.as_str());
         push_audit_check(
             checks,
@@ -10162,7 +10165,7 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
         format!("{wesl_count} WESL shader inputs found"),
         (wesl_count == 0).then(|| "missing shaders/*.wesl inputs for native GPU path".to_owned()),
     );
-    let generated_bindings = Path::new("src/generated/shader_bindings.rs");
+    let generated_bindings = Path::new("crates/boon_native_gpu/src/generated/shader_bindings.rs");
     let generated_text = std::fs::read_to_string(generated_bindings).unwrap_or_default();
     push_audit_check(
         &mut checks,
@@ -10182,21 +10185,24 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
         }),
     );
     let generated_marker_ok = generated_text.contains("WGSL_BINDGEN_GENERATED: bool = true")
-        && generated_text.contains("SHADER_BINDING_GENERATOR: &str = \"wgsl_bindgen\"");
+        && generated_text.contains("SHADER_BINDING_GENERATOR: &str = \"wgsl_bindgen\"")
+        && generated_text.contains("create_shader_module_embed_source")
+        && generated_text.contains("vertex_state")
+        && generated_text.contains("fragment_state")
+        && generated_text.contains("vs_main_entry")
+        && generated_text.contains("fs_main_entry");
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "shaders:wgsl-bindgen-provenance",
+        "shaders:wgsl-bindgen-api",
         generated_marker_ok,
-        "generated bindings carry wgsl_bindgen provenance markers",
+        "generated bindings expose a wgsl_bindgen Rust API, not only provenance markers",
         (!generated_marker_ok).then(|| {
-            "generated shader bindings are missing wgsl_bindgen provenance markers".to_owned()
+            "generated shader bindings are not real wgsl_bindgen Rust APIs yet".to_owned()
         }),
     );
     let wesl_hash = file_hash("shaders/native_gpu_rect.wesl");
-    let hash_fresh = generated_text.contains(&format!(
-        "NATIVE_GPU_RECT_WESL_SHA256: &str = \"{wesl_hash}\""
-    ));
+    let hash_fresh = generated_text.contains(&wesl_hash);
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -10207,9 +10213,19 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
             .then(|| "generated shader bindings are stale; run `cargo xtask shaders`".to_owned()),
     );
     let renderer_source = std::fs::read_to_string("crates/boon_native_gpu/src/lib.rs")?;
-    let bypasses_generated = renderer_source.contains("include_str!")
-        || renderer_source.contains("create_shader_module")
-        || renderer_source.contains("ShaderSource::Wgsl");
+    let renderer_uses_generated_api =
+        renderer_source.contains("generated::shader_bindings::ShaderEntry");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "shaders:renderer-uses-generated-api",
+        renderer_uses_generated_api,
+        format!("renderer uses generated shader API={renderer_uses_generated_api}"),
+        (!renderer_uses_generated_api)
+            .then(|| "boon_native_gpu does not consume generated shader API".to_owned()),
+    );
+    let bypasses_generated =
+        renderer_source.contains("include_str!") || renderer_source.contains("ShaderSource::Wgsl");
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -10231,24 +10247,27 @@ fn verify_native_gpu_shaders(args: &[String]) -> Result<(), Box<dyn std::error::
 
 fn generate_native_gpu_shader_bindings(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = Path::new("shaders/native_gpu_rect.wesl");
-    let generated = Path::new("src/generated/shader_bindings.rs");
+    let generated_dir = Path::new("crates/boon_native_gpu/src/generated");
+    let generated = generated_dir.join("shader_bindings.rs");
+    let wgsl_output = generated_dir.join("native_gpu_rect.wgsl");
     let source_text = std::fs::read_to_string(source)?;
     let source_hash = boon_runtime::sha256_file(source)?;
-    if let Some(parent) = generated.parent() {
-        std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(generated_dir)?;
+    std::fs::write(&wgsl_output, &source_text)?;
+    let _ = std::fs::remove_file(&generated);
+    wgsl_bindgen::WgslBindgenOptionBuilder::default()
+        .workspace_root(generated_dir)
+        .add_entry_point(wgsl_output.display().to_string())
+        .serialization_strategy(wgsl_bindgen::WgslTypeSerializeStrategy::Encase)
+        .skip_hash_check(true)
+        .output(&generated)
+        .build()?
+        .generate()?;
+    prepend_native_gpu_shader_metadata(&generated, source_hash.as_str())?;
+    let rustfmt_status = Command::new("rustfmt").arg(&generated).status()?;
+    if !rustfmt_status.success() {
+        return Err(format!("rustfmt failed for `{}`", generated.display()).into());
     }
-    let output = format!(
-        r###"// Generated by `cargo xtask shaders`.
-// Source pipeline: shaders/*.wesl -> generated WGSL -> wgsl_bindgen-compatible Rust API.
-
-pub const WGSL_BINDGEN_GENERATED: bool = true;
-pub const SHADER_SOURCE_KIND: &str = "wesl";
-pub const SHADER_BINDING_GENERATOR: &str = "wgsl_bindgen";
-pub const NATIVE_GPU_RECT_WESL_SHA256: &str = "{source_hash}";
-pub const NATIVE_GPU_RECT_WGSL: &str = r##"{source_text}"##;
-"###
-    );
-    std::fs::write(generated, output)?;
     if let Some(report) = report_arg(args) {
         let report_json = json!({
             "status": "pass",
@@ -10267,15 +10286,50 @@ pub const NATIVE_GPU_RECT_WGSL: &str = r##"{source_text}"##;
             "graph_node_count": 0,
             "per_step_pass_fail": [
                 {"id": "wesl-input-read", "pass": true},
-                {"id": "wgsl-bindgen-compatible-rust-written", "pass": true}
+                {"id": "wesl-to-wgsl-written", "pass": true},
+                {"id": "wgsl-bindgen-rust-api-written", "pass": true}
             ],
-            "artifact_sha256s": [artifact_hash(generated)?],
+            "artifact_sha256s": [artifact_hash(&wgsl_output)?, artifact_hash(&generated)?],
+            "generated_wgsl": wgsl_output.display().to_string(),
             "generated_shader_bindings": generated.display().to_string()
         });
         write_json(&report, &report_json)?;
         verify_report_schema(&report)?;
     }
     println!("wrote {}", generated.display());
+    Ok(())
+}
+
+fn prepend_native_gpu_shader_metadata(
+    generated: &Path,
+    source_hash: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let generated_text = std::fs::read_to_string(generated)?;
+    let metadata = format!(
+        r#"// Generated by `cargo xtask shaders`.
+// Source pipeline: shaders/*.wesl -> generated WGSL -> wgsl_bindgen Rust API.
+
+pub const WGSL_BINDGEN_GENERATED: bool = true;
+pub const SHADER_SOURCE_KIND: &str = "wesl";
+pub const SHADER_BINDING_GENERATOR: &str = "wgsl_bindgen";
+pub const NATIVE_GPU_RECT_WESL_SHA256: &str = "{source_hash}";
+
+"#
+    );
+    let mut output = String::new();
+    let mut inserted = false;
+    for line in generated_text.lines() {
+        output.push_str(line);
+        output.push('\n');
+        if !inserted && line.trim_start().starts_with("#![allow(") {
+            output.push_str(&metadata);
+            inserted = true;
+        }
+    }
+    if !inserted {
+        output = format!("{metadata}{generated_text}");
+    }
+    std::fs::write(generated, output)?;
     Ok(())
 }
 
@@ -10300,54 +10354,121 @@ fn verify_native_gpu_blocked_gate(
 fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
+    let base = || {
+        json!({
+            "command": "verify-native-gpu-preview-e2e",
+            "git_commit": git_commit(),
+            "generated_at_utc": current_unix_seconds().to_string(),
+            "native_gpu_contract": true
+        })
+    };
     let cases = [
         (
             "full-state-ipc-mirroring",
-            json!({
-                "command": "verify-native-gpu-observability",
-                "git_commit": git_commit(),
-                "full_state_mirroring_observed": true
-            }),
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-observability",
+                    "full_state_mirroring_observed": true
+                }),
+            ),
         ),
         (
             "synthetic-scroll",
-            json!({
-                "command": "verify-native-gpu-scroll-speed",
-                "git_commit": git_commit(),
-                "synthetic_scroll": true
-            }),
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-scroll-speed",
+                    "synthetic_scroll": true
+                }),
+            ),
         ),
         (
             "xvfb-native-proof",
-            json!({
-                "command": "verify-native-gpu-preview-e2e",
-                "git_commit": git_commit(),
-                "display_server": "x11",
-                "input_injection_method": "os_pointer_keyboard_to_visible_window"
-            }),
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "display_server": "x11",
+                    "input_injection_method": "os_pointer_keyboard_to_visible_window"
+                }),
+            ),
         ),
         (
             "single-process-multiwindow",
-            json!({
-                "command": "verify-native-gpu-multiwindow",
-                "git_commit": git_commit(),
-                "process_model": "single-process"
-            }),
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-multiwindow",
+                    "process_model": "single-process"
+                }),
+            ),
         ),
         (
             "stale-git-hash",
-            json!({
-                "command": "verify-native-gpu-layout-contract",
-                "git_commit": "stale"
-            }),
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-layout-contract",
+                    "git_commit": "stale"
+                }),
+            ),
         ),
         (
             "stale-shader-output",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-shaders",
+                    "shader_outputs_fresh": false
+                }),
+            ),
+        ),
+        (
+            "missing-native-contract",
             json!({
-                "command": "verify-native-gpu-shaders",
+                "command": "verify-native-gpu-layout-contract",
                 "git_commit": git_commit(),
-                "shader_outputs_fresh": false
+                "generated_at_utc": current_unix_seconds().to_string()
             }),
+        ),
+        (
+            "future-dated-report",
+            merge_json(
+                base(),
+                json!({
+                    "generated_at_utc": current_unix_seconds().saturating_add(3600).to_string()
+                }),
+            ),
+        ),
+        (
+            "stale-surface-epoch",
+            merge_json(
+                base(),
+                json!({
+                    "surface_epoch": 7,
+                    "target_surface_epoch": 6
+                }),
+            ),
+        ),
+        (
+            "copied-pixel-hash-only-proof",
+            merge_json(
+                base(),
+                json!({
+                    "copied_pixel_hash_only": true
+                }),
+            ),
+        ),
+        (
+            "headless-native-proof",
+            merge_json(
+                base(),
+                json!({
+                    "headless": true,
+                    "display_server": "wayland"
+                }),
+            ),
         ),
     ];
     for (case, fixture) in cases {
@@ -10385,7 +10506,9 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         (!check_existing)
             .then(|| "native GPU aggregate currently requires --check-existing".to_owned()),
     );
-    for (label, path) in &required {
+    for requirement in &required {
+        let label = requirement.label;
+        let path = &requirement.path;
         let exists = path.exists();
         push_audit_check(
             &mut checks,
@@ -10409,6 +10532,25 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                 .then(|| format!("native GPU report `{}` is not schema-valid", path.display())),
         );
         let report = read_json(path)?;
+        let semantic_blockers = validate_native_gpu_child_report(requirement, &report);
+        let semantically_valid = semantic_blockers.is_empty();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:contract:{label}"),
+            semantically_valid,
+            format!(
+                "{} native contract valid={semantically_valid}",
+                path.display()
+            ),
+            (!semantically_valid).then(|| {
+                format!(
+                    "native GPU report `{}` violates native contract: {}",
+                    path.display(),
+                    semantic_blockers.join("; ")
+                )
+            }),
+        );
         let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
         push_audit_check(
             &mut checks,
@@ -10441,8 +10583,13 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         checks,
         blockers,
         json!({
-            "required_reports": required.iter().map(|(label, path)| {
-                json!({"label": label, "path": path.display().to_string()})
+            "required_reports": required.iter().map(|report| {
+                json!({
+                    "label": report.label,
+                    "path": report.path.display().to_string(),
+                    "command": report.command,
+                    "required_argv": report.required_argv
+                })
             }).collect::<Vec<_>>(),
             "linked_report_artifacts": artifacts,
             "artifact_sha256s": artifacts
@@ -10450,61 +10597,298 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     )
 }
 
-fn native_gpu_required_reports() -> Vec<(&'static str, PathBuf)> {
+struct NativeGpuRequiredReport {
+    label: &'static str,
+    path: PathBuf,
+    command: &'static str,
+    required_argv: &'static [(&'static str, &'static str)],
+}
+
+fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
     vec![
-        (
+        native_gpu_required_report(
             "platform-contract",
-            PathBuf::from("target/reports/native-gpu/platform-contract.json"),
+            "target/reports/native-gpu/platform-contract.json",
+            "verify-platform-contract",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "dependency-graph",
-            PathBuf::from("target/reports/native-gpu/dependency-graph.json"),
+            "target/reports/native-gpu/dependency-graph.json",
+            "verify-native-gpu-dependency-graph",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "architecture",
-            PathBuf::from("target/reports/native-gpu/architecture.json"),
+            "target/reports/native-gpu/architecture.json",
+            "verify-native-gpu-architecture",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "layout-contract",
-            PathBuf::from("target/reports/native-gpu/layout-contract.json"),
+            "target/reports/native-gpu/layout-contract.json",
+            "verify-native-gpu-layout-contract",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "shaders",
-            PathBuf::from("target/reports/native-gpu/shaders.json"),
+            "target/reports/native-gpu/shaders.json",
+            "verify-native-gpu-shaders",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "multiwindow",
-            PathBuf::from("target/reports/native-gpu/multiwindow.json"),
+            "target/reports/native-gpu/multiwindow.json",
+            "verify-native-gpu-multiwindow",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "ipc-backpressure",
-            PathBuf::from("target/reports/native-gpu/ipc-backpressure.json"),
+            "target/reports/native-gpu/ipc-backpressure.json",
+            "verify-native-gpu-ipc-backpressure",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "observability",
-            PathBuf::from("target/reports/native-gpu/observability.json"),
+            "target/reports/native-gpu/observability.json",
+            "verify-native-gpu-observability",
+            &[],
         ),
-        (
+        native_gpu_required_report(
             "preview-e2e-todomvc",
-            PathBuf::from("target/reports/native-gpu/preview-e2e-todomvc.json"),
+            "target/reports/native-gpu/preview-e2e-todomvc.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "todomvc")],
         ),
-        (
+        native_gpu_required_report(
             "preview-e2e-cells",
-            PathBuf::from("target/reports/native-gpu/preview-e2e-cells.json"),
+            "target/reports/native-gpu/preview-e2e-cells.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "cells")],
         ),
-        (
+        native_gpu_required_report(
             "scroll-speed-cells",
-            PathBuf::from("target/reports/native-gpu/scroll-speed-cells.json"),
+            "target/reports/native-gpu/scroll-speed-cells.json",
+            "verify-native-gpu-scroll-speed",
+            &[("--surface", "cells")],
         ),
-        (
+        native_gpu_required_report(
             "scroll-speed-dev-code-editor",
-            PathBuf::from("target/reports/native-gpu/scroll-speed-dev-code-editor.json"),
+            "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
+            "verify-native-gpu-scroll-speed",
+            &[("--surface", "dev-code-editor")],
         ),
-        (
+        native_gpu_required_report(
             "negative",
-            PathBuf::from("target/reports/native-gpu/negative.json"),
+            "target/reports/native-gpu/negative.json",
+            "verify-native-gpu-negative",
+            &[],
         ),
     ]
+}
+
+fn native_gpu_required_report(
+    label: &'static str,
+    path: &str,
+    command: &'static str,
+    required_argv: &'static [(&'static str, &'static str)],
+) -> NativeGpuRequiredReport {
+    NativeGpuRequiredReport {
+        label,
+        path: PathBuf::from(path),
+        command,
+        required_argv,
+    }
+}
+
+fn validate_native_gpu_child_report(
+    requirement: &NativeGpuRequiredReport,
+    report: &serde_json::Value,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let command = report
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if command != requirement.command {
+        blockers.push(format!(
+            "command `{command}` does not match expected `{}` for label `{}`",
+            requirement.command, requirement.label
+        ));
+    }
+    if report
+        .get("native_gpu_contract")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        blockers.push("missing native_gpu_contract=true".to_owned());
+    }
+    let expected_budget = file_hash("budgets/native-gpu.toml");
+    if report
+        .get("budget_hash")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_budget.as_str())
+    {
+        blockers.push("budget_hash does not match current budgets/native-gpu.toml".to_owned());
+    }
+    let argv = report
+        .get("command_argv")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !argv
+        .iter()
+        .any(|arg| arg.as_str() == Some(requirement.command))
+    {
+        blockers.push(format!(
+            "command_argv does not contain expected command `{}`",
+            requirement.command
+        ));
+    }
+    for (flag, value) in requirement.required_argv {
+        if !command_argv_contains_pair(&argv, flag, value) {
+            blockers.push(format!(
+                "command_argv missing required pair `{flag} {value}` for label `{}`",
+                requirement.label
+            ));
+        }
+    }
+    blockers.extend(native_gpu_report_rejection_reasons(report));
+    blockers.extend(native_gpu_label_contract_blockers(
+        requirement.label,
+        report,
+    ));
+    blockers
+}
+
+fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -> Vec<String> {
+    let mut blockers = Vec::new();
+    match label {
+        "multiwindow" => {
+            require_str_field(
+                &mut blockers,
+                report,
+                "process_model",
+                "two-child-processes",
+            );
+            require_positive_u64(&mut blockers, report, "preview_child_pid");
+            require_positive_u64(&mut blockers, report, "dev_child_pid");
+            require_bool_field(&mut blockers, report, "preview_survives_dev_exit", true);
+        }
+        "ipc-backpressure" => {
+            require_bool_field(&mut blockers, report, "bounded_ipc", true);
+            require_u64_at_most(&mut blockers, report, "preview_blocked_on_ipc_count", 0);
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "queue_depth_max",
+                native_gpu_budget_u64("ipc", "queue_depth_max").unwrap_or(256),
+            );
+        }
+        "observability" => {
+            require_bool_field(&mut blockers, report, "bounded_observability", true);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "full_state_mirroring_observed",
+                false,
+            );
+        }
+        "preview-e2e-todomvc" | "preview-e2e-cells" => {
+            require_str_field(&mut blockers, report, "display_server", "wayland");
+            require_bool_field(&mut blockers, report, "real_os_input", true);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "preview_receives_example_name",
+                false,
+            );
+            require_positive_u64(&mut blockers, report, "surface_epoch");
+            require_nonempty_array(
+                &mut blockers,
+                report,
+                "checkpoint_screenshot_or_video_paths",
+            );
+            if report
+                .get("input_injection_method")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|method| {
+                    let method = method.to_ascii_lowercase();
+                    !method.contains("os")
+                        || !method.contains("visible")
+                        || method.contains("xvfb")
+                        || method.contains("headless")
+                })
+            {
+                blockers.push(
+                    "input_injection_method must prove real OS input to a visible Wayland window"
+                        .to_owned(),
+                );
+            }
+        }
+        "scroll-speed-cells" => {
+            require_scroll_budget_fields(&mut blockers, report);
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "logical_columns",
+                native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26),
+            );
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "logical_rows",
+                native_gpu_budget_u64("cells", "logical_rows").unwrap_or(100),
+            );
+            require_bool_field(&mut blockers, report, "synthetic_scroll", false);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "runtime_dispatch_on_passive_scroll",
+                false,
+            );
+        }
+        "scroll-speed-dev-code-editor" => {
+            require_scroll_budget_fields(&mut blockers, report);
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "line_count",
+                native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000),
+            );
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "longest_line_bytes",
+                native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000),
+            );
+        }
+        _ => {}
+    }
+    blockers
+}
+
+fn require_scroll_budget_fields(blockers: &mut Vec<String>, report: &serde_json::Value) {
+    require_str_field(blockers, report, "display_server", "wayland");
+    require_bool_field(blockers, report, "budget_pass", true);
+    require_f64_at_most(
+        blockers,
+        report,
+        "preview_frame_ms_p95",
+        native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7),
+    );
+    require_f64_at_most(
+        blockers,
+        report,
+        "wheel_to_visible_ms_p95",
+        native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0),
+    );
+    require_u64_at_most(
+        blockers,
+        report,
+        "missed_frame_count",
+        native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+    );
 }
 
 fn write_native_gate_report(
@@ -10593,50 +10977,228 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
 }
 
 fn native_gpu_report_rejects(report: &serde_json::Value) -> bool {
+    !native_gpu_report_rejection_reasons(report).is_empty()
+}
+
+fn native_gpu_report_rejection_reasons(report: &serde_json::Value) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if report
+        .get("native_gpu_contract")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        reasons.push("missing native_gpu_contract=true".to_owned());
+    }
+    if let Some(generated) = report
+        .get("generated_at_utc")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|generated| generated.parse::<u64>().ok())
+    {
+        if generated > current_unix_seconds().saturating_add(5) {
+            reasons.push("generated_at_utc is future-dated".to_owned());
+        }
+    }
     if report
         .get("git_commit")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|commit| commit != git_commit())
     {
-        return true;
+        reasons.push("git_commit is stale for current checkout".to_owned());
     }
     if report
         .get("full_state_mirroring_observed")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
     {
-        return true;
+        reasons.push("full_state_mirroring_observed=true".to_owned());
     }
     if report
         .get("synthetic_scroll")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
     {
-        return true;
+        reasons.push("synthetic_scroll=true".to_owned());
     }
     if report
         .get("display_server")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|server| server != "wayland")
     {
-        return true;
+        reasons.push("display_server is not wayland".to_owned());
     }
     if report
         .get("process_model")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|model| model != "two-child-processes")
     {
-        return true;
+        reasons.push("process_model is not two-child-processes".to_owned());
     }
-    report
+    if report
         .get("shader_outputs_fresh")
         .and_then(serde_json::Value::as_bool)
         == Some(false)
+    {
+        reasons.push("shader_outputs_fresh=false".to_owned());
+    }
+    if report.get("headless").and_then(serde_json::Value::as_bool) == Some(true) {
+        reasons.push("headless native proof is forbidden".to_owned());
+    }
+    if report
+        .get("copied_pixel_hash_only")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || report
+            .get("pixel_hash_reused")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        reasons.push("copied or reused pixel hash proof is forbidden".to_owned());
+    }
+    if let (Some(surface_epoch), Some(target_epoch)) = (
+        report
+            .get("surface_epoch")
+            .and_then(serde_json::Value::as_u64),
+        report
+            .get("target_surface_epoch")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        if surface_epoch != target_epoch {
+            reasons.push("target_surface_epoch does not match surface_epoch".to_owned());
+        }
+    }
+    reasons
+}
+
+fn command_argv_contains_pair(argv: &[serde_json::Value], flag: &str, value: &str) -> bool {
+    argv.windows(2)
+        .any(|window| window[0].as_str() == Some(flag) && window[1].as_str() == Some(value))
+}
+
+fn require_str_field(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+    expected: &str,
+) {
+    if report.get(key).and_then(serde_json::Value::as_str) != Some(expected) {
+        blockers.push(format!("{key} must be `{expected}`"));
+    }
+}
+
+fn require_bool_field(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+    expected: bool,
+) {
+    if report.get(key).and_then(serde_json::Value::as_bool) != Some(expected) {
+        blockers.push(format!("{key} must be {expected}"));
+    }
+}
+
+fn require_positive_u64(blockers: &mut Vec<String>, report: &serde_json::Value, key: &str) {
+    if !report
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|value| value > 0)
+    {
+        blockers.push(format!("{key} must be a positive integer"));
+    }
+}
+
+fn require_u64_at_most(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+    max: u64,
+) {
+    match report.get(key).and_then(serde_json::Value::as_u64) {
+        Some(value) if value <= max => {}
+        Some(value) => blockers.push(format!("{key}={value} exceeds budget {max}")),
+        None => blockers.push(format!("{key} is missing or not an integer")),
+    }
+}
+
+fn require_u64_at_least(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+    min: u64,
+) {
+    match report.get(key).and_then(serde_json::Value::as_u64) {
+        Some(value) if value >= min => {}
+        Some(value) => blockers.push(format!("{key}={value} is below required {min}")),
+        None => blockers.push(format!("{key} is missing or not an integer")),
+    }
+}
+
+fn require_f64_at_most(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+    max: f64,
+) {
+    match report.get(key).and_then(serde_json::Value::as_f64) {
+        Some(value) if value <= max => {}
+        Some(value) => blockers.push(format!("{key}={value} exceeds budget {max}")),
+        None => blockers.push(format!("{key} is missing or not numeric")),
+    }
+}
+
+fn require_nonempty_array(blockers: &mut Vec<String>, report: &serde_json::Value, key: &str) {
+    if !report
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| !values.is_empty())
+    {
+        blockers.push(format!("{key} must be a nonempty array"));
+    }
+}
+
+fn native_gpu_budget_u64(section: &str, key: &str) -> Option<u64> {
+    native_gpu_budget_f64(section, key).and_then(|value| {
+        if value >= 0.0 {
+            Some(value as u64)
+        } else {
+            None
+        }
+    })
+}
+
+fn native_gpu_budget_f64(section: &str, key: &str) -> Option<f64> {
+    let text = std::fs::read_to_string("budgets/native-gpu.toml").ok()?;
+    let mut current_section = "";
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = &line[1..line.len().saturating_sub(1)];
+            continue;
+        }
+        if current_section != section {
+            continue;
+        }
+        let Some((candidate, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        if candidate.trim() == key {
+            return raw_value.trim().parse::<f64>().ok();
+        }
+    }
+    None
+}
+
+fn merge_json(mut base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+    if let (Some(base), Some(overlay)) = (base.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
 }
 
 fn rg_count(dir: &str, pattern: &str) -> Result<usize, Box<dyn std::error::Error>> {
     if !Path::new(dir).exists() {
-        return Ok(0);
+        return Err(format!("required search directory `{dir}` is missing").into());
     }
     let output = Command::new("rg")
         .args(["-n", "--fixed-strings", pattern, dir])

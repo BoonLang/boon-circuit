@@ -25,9 +25,16 @@ creator:
 
 ```bash
 cargo build -p boon_ply_playground
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc --mode app
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells --mode app
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --preview-only --example cells
 ```
+
+The default interactive playground is a Wayland-only split launch: the preview
+window is the production-style app surface and the dev console is the
+debug/source/telemetry surface. Use `--preview-only` when only the production
+preview should open. Use `--single-window --mode <app|source|deltas|inspector|causes|scenario>`
+only for legacy debugging, not production-readiness evidence.
 
 After launch, prove the process exists with `pgrep -af boon_ply_playground`.
 If the user says the app is bothering their current workspace, stop immediately,
@@ -63,9 +70,10 @@ portal tooling and record that it is a visible manual artifact, not automated
 OS-input proof. Do not use whole-desktop screenshots as launch evidence when a
 repo report screenshot is available.
 
-Background launch is not evidence for full OS input. Full headed verification
-runs in an isolated Xvfb/X11 session by default, so OS pointer/keyboard events
-cannot land in the user's active desktop windows. Do not set
+Background launch is not evidence for full OS input. The legacy headed
+verification commands may run in isolated Xvfb/X11 for old report compatibility,
+so those reports cannot prove production Wayland preview speed or full Wayland
+input behavior. Do not set
 `BOON_ALLOW_LIVE_DESKTOP_INPUT=1` or
 `BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1` unless the user
 explicitly asks for live desktop input. Both variables are required before an
@@ -74,16 +82,23 @@ xtask verifier may target the live desktop:
 ```bash
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
+cargo xtask verify-playground-split-wayland --report target/reports/playground-split-wayland.json
+cargo xtask verify-cells-wayland-scroll-speed --report target/reports/cells-wayland-scroll-speed.json
 ```
 
 Launch-smoke verifiers also use isolated Xvfb/X11. Do not accept whole-desktop
 COSMIC screenshots as launch evidence; they can capture unrelated user windows.
+Do not accept Xvfb/X11 reports as evidence that the Cells example scrolls
+smoothly in production; use the Wayland scroll-speed report, which enforces the
+60 FPS p95 frame-time and wheel-to-visible-scroll budgets.
 
 Before claiming handoff readiness, run:
 
 ```bash
 cargo xtask verify-report-schema
 cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
+cargo xtask verify-playground-split-wayland --report target/reports/playground-split-wayland.json
+cargo xtask verify-cells-wayland-scroll-speed --report target/reports/cells-wayland-scroll-speed.json
 cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
 cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json

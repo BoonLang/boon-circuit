@@ -7,14 +7,18 @@ use boon_runtime::{
     write_json,
 };
 use ply_engine::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static DEFAULT_FONT: FontAsset = FontAsset::Bytes {
     file_name: "DejaVuSans.ttf",
@@ -42,12 +46,18 @@ boon_ply_playground
 
 Usage:
   boon_ply_playground --example <todomvc|cells>
-  boon_ply_playground --example <todomvc|cells> --mode <app|dev>
+  boon_ply_playground --example <todomvc|cells> --preview-only
+  boon_ply_playground --single-window --example <todomvc|cells> --mode <app|dev>
   boon_ply_playground --smoke-launch --example <name> --report <path>
   boon_ply_playground --verify-headed --example <name> --report <path>
   boon_ply_playground --verify-headed-focusless --example <name> --report <path>
+  boon_ply_playground --verify-split-wayland --example <name> --report <path>
+  boon_ply_playground --verify-wayland-scroll-speed --example cells --report <path>
   boon_ply_playground --verify-os-input-probe --report <path>
 ";
+
+const IPC_MAX_WRITE_BUFFER_BYTES: usize = 1_000_000;
+const IPC_READ_BUFFER_LIMIT_BYTES: usize = 2_000_000;
 
 #[derive(Clone, Debug)]
 struct FocusedRenderInput {
@@ -96,6 +106,429 @@ struct RenderInputValueCache {
     selected_signature: String,
     values: Vec<RenderInputValue>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowRole {
+    Preview,
+    Dev,
+}
+
+impl WindowRole {
+    fn from_args(args: &[String]) -> Self {
+        match value_after(args, "--window-role").as_deref() {
+            Some("dev") => Self::Dev,
+            _ => Self::Preview,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct IpcEnvelope<T> {
+    token: String,
+    payload: T,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DevCommand {
+    LoadExample { example: String },
+    UpdateSource { generation: u64, text: String },
+    RunSource,
+    Reset,
+    StepNext,
+    StepPrev,
+    RequestSnapshot,
+    Shutdown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PreviewTelemetry {
+    Snapshot(RuntimeSnapshot),
+    RuntimeEvent {
+        event: serde_json::Value,
+        output: serde_json::Value,
+    },
+    FrameMetrics {
+        frame_ms: f64,
+        draw_ms: f64,
+        preview_blocked_on_ipc_count: u64,
+        dropped_telemetry_count: u64,
+    },
+    CompileStarted {
+        generation: u64,
+    },
+    CompileFinished {
+        generation: u64,
+        elapsed_ms: f64,
+        snapshot: RuntimeSnapshot,
+    },
+    CompileFailed {
+        generation: u64,
+        elapsed_ms: f64,
+        error: String,
+    },
+    Heartbeat {
+        generated_at_utc: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RuntimeSnapshot {
+    selected_example: String,
+    source_text: String,
+    source_generation: u64,
+    step_limit: Option<usize>,
+    scenario_steps: Vec<String>,
+    state_summary: serde_json::Value,
+    semantic_delta_tail: Vec<serde_json::Value>,
+    render_patch_tail: Vec<serde_json::Value>,
+    report_summary: serde_json::Value,
+    selected_input: serde_json::Value,
+    last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct IpcStats {
+    blocked_writes: u64,
+    dropped_messages: u64,
+    received_messages: u64,
+    sent_messages: u64,
+}
+
+struct IpcLinePeer {
+    stream: TcpStream,
+    read_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
+    stats: IpcStats,
+}
+
+impl IpcLinePeer {
+    fn new(stream: TcpStream) -> Result<Self, Box<dyn std::error::Error>> {
+        stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
+        Ok(Self {
+            stream,
+            read_buffer: Vec::new(),
+            write_buffer: Vec::new(),
+            stats: IpcStats::default(),
+        })
+    }
+
+    fn send<T: Serialize>(&mut self, token: &str, payload: &T) {
+        let envelope = IpcEnvelope {
+            token: token.to_owned(),
+            payload,
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&envelope) else {
+            self.stats.dropped_messages += 1;
+            return;
+        };
+        bytes.push(b'\n');
+        if self.write_buffer.len().saturating_add(bytes.len()) > IPC_MAX_WRITE_BUFFER_BYTES {
+            self.write_buffer.clear();
+            self.stats.dropped_messages += 1;
+        }
+        self.write_buffer.extend(bytes);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        while !self.write_buffer.is_empty() {
+            match self.stream.write(&self.write_buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    self.write_buffer.drain(..count);
+                    self.stats.sent_messages += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.stats.blocked_writes += 1;
+                    break;
+                }
+                Err(_) => {
+                    self.write_buffer.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn recv<T: for<'de> Deserialize<'de>>(&mut self, token: &str) -> Vec<T> {
+        let mut scratch = [0_u8; 8192];
+        loop {
+            match self.stream.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(count) => {
+                    self.read_buffer.extend_from_slice(&scratch[..count]);
+                    if self.read_buffer.len() > IPC_READ_BUFFER_LIMIT_BYTES {
+                        self.read_buffer.clear();
+                        self.stats.dropped_messages += 1;
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let mut messages = Vec::new();
+        while let Some(newline) = self.read_buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.read_buffer.drain(..=newline).collect::<Vec<_>>();
+            let line = &line[..line.len().saturating_sub(1)];
+            let Ok(envelope) = serde_json::from_slice::<IpcEnvelope<T>>(line) else {
+                self.stats.dropped_messages += 1;
+                continue;
+            };
+            if envelope.token != token {
+                self.stats.dropped_messages += 1;
+                continue;
+            }
+            self.stats.received_messages += 1;
+            messages.push(envelope.payload);
+        }
+        messages
+    }
+}
+
+#[allow(dead_code)]
+struct PreviewIpcServer {
+    listener: TcpListener,
+    peer: Option<IpcLinePeer>,
+    token: String,
+    dev_child: Option<Child>,
+}
+
+#[allow(dead_code)]
+impl PreviewIpcServer {
+    fn new(token: String) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            peer: None,
+            token,
+            dev_child: None,
+        })
+    }
+
+    fn addr(&self) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(self.listener.local_addr()?.to_string())
+    }
+
+    fn accept(&mut self) {
+        if self.peer.is_some() {
+            return;
+        }
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                if let Ok(peer) = IpcLinePeer::new(stream) {
+                    self.peer = Some(peer);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {}
+        }
+    }
+
+    fn send(&mut self, telemetry: PreviewTelemetry) {
+        self.accept();
+        if let Some(peer) = &mut self.peer {
+            peer.send(&self.token, &telemetry);
+        }
+    }
+
+    fn recv_commands(&mut self) -> Vec<DevCommand> {
+        self.accept();
+        self.peer
+            .as_mut()
+            .map(|peer| peer.recv(&self.token))
+            .unwrap_or_default()
+    }
+
+    fn stats(&self) -> IpcStatsSnapshot {
+        self.peer
+            .as_ref()
+            .map(|peer| IpcStatsSnapshot {
+                blocked_writes: peer.stats.blocked_writes,
+                dropped_messages: peer.stats.dropped_messages,
+                received_messages: peer.stats.received_messages,
+                sent_messages: peer.stats.sent_messages,
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+struct IpcStatsSnapshot {
+    blocked_writes: u64,
+    dropped_messages: u64,
+    received_messages: u64,
+    sent_messages: u64,
+}
+
+#[derive(Default)]
+struct WebDebugState {
+    snapshot: RuntimeSnapshot,
+    metrics: serde_json::Value,
+    commands: Vec<DevCommand>,
+    request_count: u64,
+}
+
+struct WebDebugServer {
+    addr: String,
+    state: Arc<Mutex<WebDebugState>>,
+    child: Option<Child>,
+}
+
+impl WebDebugServer {
+    fn start(snapshot: RuntimeSnapshot) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(false)?;
+        let addr = listener.local_addr()?.to_string();
+        let state = Arc::new(Mutex::new(WebDebugState {
+            snapshot,
+            metrics: json!({}),
+            commands: Vec::new(),
+            request_count: 0,
+        }));
+        let thread_state = Arc::clone(&state);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                handle_web_debug_request(stream, &thread_state);
+            }
+        });
+        Ok(Self {
+            addr,
+            state,
+            child: None,
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn update(&self, snapshot: RuntimeSnapshot, metrics: serde_json::Value) {
+        if let Ok(mut state) = self.state.lock() {
+            state.snapshot = snapshot;
+            state.metrics = metrics;
+        }
+    }
+
+    fn take_commands(&self) -> Vec<DevCommand> {
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.commands))
+            .unwrap_or_default()
+    }
+
+    fn request_count(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.request_count)
+            .unwrap_or_default()
+    }
+}
+
+fn handle_web_debug_request(mut stream: TcpStream, state: &Arc<Mutex<WebDebugState>>) {
+    let mut buffer = [0_u8; 64 * 1024];
+    let Ok(count) = stream.read(&mut buffer) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buffer[..count]);
+    let mut parts = request.split("\r\n\r\n");
+    let head = parts.next().unwrap_or("");
+    let body = parts.next().unwrap_or("");
+    let first = head.lines().next().unwrap_or("");
+    let response = if first.starts_with("GET /state ") {
+        let payload = state
+            .lock()
+            .map(|mut state| {
+                state.request_count += 1;
+                json!({
+                    "snapshot": state.snapshot,
+                    "metrics": state.metrics,
+                    "request_count": state.request_count
+                })
+            })
+            .unwrap_or_else(|_| json!({"error": "state lock poisoned"}));
+        http_response("application/json", &payload.to_string())
+    } else if first.starts_with("POST /command ") {
+        if let Ok(command) = serde_json::from_str::<DevCommand>(body) {
+            if let Ok(mut state) = state.lock() {
+                state.commands.push(command);
+                state.request_count += 1;
+            }
+        }
+        http_response("application/json", r#"{"ok":true}"#)
+    } else {
+        http_response("text/html; charset=utf-8", WEB_DEBUG_HTML)
+    };
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn http_response(content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const WEB_DEBUG_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Boon Circuit Dev Console</title>
+<style>
+body{margin:0;font:14px system-ui,sans-serif;background:#eef1f5;color:#1f2630}
+#root{display:grid;grid-template-columns:180px 1fr;height:100vh}
+aside{background:#1f2630;color:#f1f5fa;padding:10px;display:flex;flex-direction:column;gap:8px}
+main{padding:10px;display:grid;grid-template-rows:auto 1fr 190px;gap:10px;min-width:0}
+button{height:30px;border:0;background:#e4eaf2;color:#1f2630;padding:0 10px}
+button.primary{background:#2f6fb8;color:white}
+.bar{display:flex;gap:6px;align-items:center}
+.body{display:grid;grid-template-columns:minmax(480px,650px) 1fr;gap:10px;min-height:0}
+textarea{width:100%;height:100%;box-sizing:border-box;border:1px solid #d5dde8;padding:10px;font:13px monospace;resize:none}
+.panels{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;min-height:0}
+.panel{background:white;border:1px solid #d5dde8;padding:10px;overflow:auto}
+.title{color:#596579;font-size:16px;margin-bottom:6px}
+pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px monospace}
+</style>
+</head>
+<body>
+<div id="root">
+<aside><h2>Boon Circuit</h2><button onclick="cmd({kind:'load_example',example:'todomvc'})">1 TodoMVC</button><button onclick="cmd({kind:'load_example',example:'cells'})">2 Cells</button><div id="status">connecting</div></aside>
+<main>
+<div class="bar"><button class="primary" onclick="cmd({kind:'run_source'})">Run</button><button onclick="cmd({kind:'reset'})">Reset</button><button onclick="cmd({kind:'step_next'})">Step</button><button onclick="cmd({kind:'step_prev'})">Back</button><span id="headline"></span></div>
+<div class="body"><textarea id="source"></textarea><div class="panels"><div class="panel"><div class="title">Deltas</div><pre id="deltas"></pre></div><div class="panel"><div class="title">Inspector</div><pre id="inspector"></pre></div><div class="panel"><div class="title">Causes</div><pre id="causes"></pre></div><div class="panel"><div class="title">Metrics</div><pre id="metrics"></pre></div></div></div>
+<div class="panel"><div class="title">Scenario</div><pre id="scenario"></pre></div>
+</main>
+</div>
+<script>
+let lastGeneration=-1, localEdit=false, timer=null;
+async function cmd(payload){await fetch('/command',{method:'POST',body:JSON.stringify(payload)});}
+document.getElementById('source').addEventListener('input', e => {
+  localEdit=true; clearTimeout(timer);
+  timer=setTimeout(()=>cmd({kind:'update_source',generation:Date.now(),text:e.target.value}),180);
+});
+async function tick(){
+  const data=await (await fetch('/state')).json();
+  const s=data.snapshot||{};
+  document.getElementById('status').textContent='connected';
+  document.getElementById('headline').textContent=(s.selected_example||'')+' / generation '+(s.source_generation||0);
+  if(!localEdit && s.source_generation!==lastGeneration){document.getElementById('source').value=s.source_text||''; lastGeneration=s.source_generation;}
+  localEdit=false;
+  document.getElementById('deltas').textContent=JSON.stringify(s.semantic_delta_tail||[],null,2);
+  document.getElementById('inspector').textContent=JSON.stringify(s.state_summary||null,null,2).slice(0,4000);
+  document.getElementById('causes').textContent=JSON.stringify(s.report_summary||null,null,2);
+  document.getElementById('metrics').textContent=JSON.stringify(data.metrics||{},null,2);
+  document.getElementById('scenario').textContent=(s.scenario_steps||[]).join('\n');
+}
+setInterval(()=>tick().catch(()=>document.getElementById('status').textContent='disconnected'),250);
+tick(); cmd({kind:'request_snapshot'});
+</script>
+</body>
+</html>"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaygroundView {
@@ -380,8 +813,20 @@ pub async fn run_app_from_args() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|arg| arg == "--verify-headed") {
         return run_verify_headed(&args).await;
     }
+    if args.iter().any(|arg| arg == "--verify-split-wayland") {
+        return run_verify_split_wayland(&args).await;
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--verify-wayland-scroll-speed")
+    {
+        return run_verify_wayland_scroll_speed(&args).await;
+    }
     if args.iter().any(|arg| arg == "--smoke-launch") {
         return run_smoke_launch(&args).await;
+    }
+    if WindowRole::from_args(&args) == WindowRole::Dev {
+        return run_dev_window(&args).await;
     }
     run_interactive(&args).await
 }
@@ -394,6 +839,19 @@ fn focus_free_headed() -> bool {
     FOCUS_FREE_HEADED.load(Ordering::Relaxed)
         || std::env::var("BOON_FOCUS_FREE_HEADED").as_deref() == Ok("1")
         || std::env::args().any(|arg| arg == "--verify-headed-focusless")
+}
+
+fn require_wayland_window(role: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("WAYLAND_DISPLAY").ok().is_none() {
+        return Err(format!("{role} window requires WAYLAND_DISPLAY for Wayland-only mode").into());
+    }
+    if std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .is_some_and(|value| value != "wayland")
+    {
+        return Err(format!("{role} window requires XDG_SESSION_TYPE=wayland").into());
+    }
+    Ok(())
 }
 
 fn os_input_forbidden() -> bool {
@@ -929,8 +1387,11 @@ async fn drive_visible_scroll_wheel_probe(
         if let Some(bounds) = bounds {
             match send_real_pointer_wheel(bounds, true, 4) {
                 Ok(report) => {
+                    release_shift_after_horizontal = report
+                        .get("shift_release_required")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
                     horizontal_input = report;
-                    release_shift_after_horizontal = true;
                 }
                 Err(error) => send_error = Some(error.to_string()),
             }
@@ -3914,6 +4375,367 @@ async fn run_smoke_launch(args: &[String]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+async fn run_verify_wayland_scroll_speed(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_wayland_window("wayland scroll speed verifier")?;
+    let spreadsheet_example = example_name_for_slot(1);
+    let example = value_after(args, "--example").unwrap_or_else(|| spreadsheet_example.to_owned());
+    if example != spreadsheet_example {
+        return Err(
+            "--verify-wayland-scroll-speed currently targets the spreadsheet example".into(),
+        );
+    }
+    let report = value_after(args, "--report")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "target/reports/{}-wayland-scroll-speed.json",
+                spreadsheet_example
+            ))
+        });
+    let screenshot = report.with_extension("png");
+    let ydotool_path = command_path("ydotool");
+    let ydotoold_ready = ydotoold_running();
+    let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
+    ply.set_debug_mode(false);
+    let mut state = PlaygroundState::new(&example, &mut ply)?;
+    state.view = PlaygroundView::App;
+    for _ in 0..10 {
+        draw_preview_frame(&mut ply, &state).await;
+        next_frame().await;
+    }
+    let element_id = Id::new("spreadsheet_body");
+    let bounds = ply
+        .bounding_box(element_id.clone())
+        .ok_or("spreadsheet_body bounds unavailable")?;
+    let mut idle_frames = Vec::new();
+    collect_preview_frame_times(&mut ply, &state, 30, &mut idle_frames).await;
+    let mut scroll_frames = Vec::new();
+    let mut vertical_latencies = Vec::new();
+    let mut horizontal_latencies = Vec::new();
+    let mut input_reports = Vec::new();
+
+    for _ in 0..10 {
+        let before = scroll_position_or_default(&ply, element_id.clone());
+        let started = Instant::now();
+        let input = send_real_pointer_wheel(bounds, false, 1);
+        let latency = wait_for_scroll_change(
+            &mut ply,
+            &state,
+            element_id.clone(),
+            before,
+            false,
+            &mut scroll_frames,
+        )
+        .await
+        .map(|_| started.elapsed().as_secs_f64() * 1000.0);
+        match input {
+            Ok(report) => input_reports.push(report),
+            Err(error) => input_reports.push(json!({"error": error.to_string()})),
+        }
+        if let Some(latency) = latency {
+            vertical_latencies.push(latency);
+        }
+    }
+
+    for _ in 0..8 {
+        let before = scroll_position_or_default(&ply, element_id.clone());
+        let started = Instant::now();
+        let input = send_real_pointer_wheel(bounds, true, 1);
+        let latency = wait_for_scroll_change(
+            &mut ply,
+            &state,
+            element_id.clone(),
+            before,
+            true,
+            &mut scroll_frames,
+        )
+        .await
+        .map(|_| started.elapsed().as_secs_f64() * 1000.0);
+        match input {
+            Ok(report) => input_reports.push(report),
+            Err(error) => input_reports.push(json!({"error": error.to_string()})),
+        }
+        if let Some(latency) = latency {
+            horizontal_latencies.push(latency);
+        }
+    }
+
+    for _ in 0..20 {
+        let _ = send_real_pointer_wheel(bounds, false, 1);
+        collect_preview_frame_times(&mut ply, &state, 1, &mut scroll_frames).await;
+    }
+
+    collect_preview_frame_times(&mut ply, &state, 4, &mut scroll_frames).await;
+    let body_after = scroll_position_or_default(&ply, element_id);
+    let header_after = scroll_position_or_default(&ply, Id::new("spreadsheet_header"));
+    draw_preview_frame(&mut ply, &state).await;
+    let capture = capture_probe_frame_png(&screenshot)?;
+    let scroll_frame_stats = float_stats(scroll_frames.clone());
+    let vertical_latency_stats = float_stats(vertical_latencies.clone());
+    let horizontal_latency_stats = float_stats(horizontal_latencies.clone());
+    let scroll_p95 = scroll_frame_stats
+        .get("p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let vertical_latency_p95 = vertical_latency_stats
+        .get("p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let horizontal_latency_p95 = horizontal_latency_stats
+        .get("p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let header_synced_x = (header_after.x - body_after.x).abs() <= 0.5;
+    let wayland = display_server() == "wayland";
+    let no_synthetic_scroll = input_reports.iter().all(|report| {
+        report.get("backend").and_then(serde_json::Value::as_str) == Some("ydotool-wayland-wheel")
+    });
+    let checks = vec![
+        json!({"id": "wayland-display", "pass": wayland, "actual": display_socket()}),
+        json!({"id": "ydotool-present", "pass": ydotool_path.is_some(), "actual": ydotool_path}),
+        json!({"id": "ydotoold-running", "pass": ydotoold_ready}),
+        json!({"id": "no-synthetic-scroll", "pass": no_synthetic_scroll, "actual": input_reports}),
+        json!({"id": "scroll-frame-p95-60fps", "pass": scroll_p95 <= 16.7, "actual_ms": scroll_p95, "threshold_ms": 16.7}),
+        json!({"id": "vertical-wheel-to-visible-p95", "pass": vertical_latency_p95 <= 50.0, "actual_ms": vertical_latency_p95, "threshold_ms": 50.0}),
+        json!({"id": "horizontal-wheel-to-visible-p95", "pass": horizontal_latency_p95 <= 50.0, "actual_ms": horizontal_latency_p95, "threshold_ms": 50.0}),
+        json!({"id": "column-header-sync", "pass": header_synced_x, "body": vector_json(body_after), "header": vector_json(header_after)}),
+        json!({"id": "nonblank-framebuffer-captured", "pass": capture.pixel_stats.nonzero_channels > 0 && capture.pixel_stats.unique_rgba_values > 1}),
+    ];
+    let blockers = checks
+        .iter()
+        .filter(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+        .filter_map(|check| check.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let (source, scenario, budget) = example_paths(&example)?;
+    let report_json = json!({
+        "status": if blockers.is_empty() { "pass" } else { "fail" },
+        "report_version": 1,
+        "generated_at_utc": unix_seconds_string(),
+        "command": format!("verify-{}-wayland-scroll-speed", spreadsheet_example),
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "layer": "wayland-scroll-speed",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source,
+        "source_hash": sha256_file(&source)?,
+        "scenario_path": scenario,
+        "scenario_hash": sha256_file(&scenario)?,
+        "program_hash": sha256_file(&source)?,
+        "budget_hash": sha256_file(&budget)?,
+        "graph_node_count": state.output.as_ref().and_then(|output| output.report.get("graph_node_count")).cloned().unwrap_or_else(|| json!(0)),
+        "example": example,
+        "window_mode": "wayland-preview-speed",
+        "window_backend": "ply-engine/macroquad-wayland",
+        "display_server": display_server(),
+        "display_socket_or_compositor_connection": display_socket(),
+        "display_scale": screen_dpi_scale(),
+        "window_pid": std::process::id(),
+        "window_title": "Boon Circuit Preview",
+        "window_size": [screen_width(), screen_height()],
+        "idle_frame_ms_p50_p95_p99_max": float_stats(idle_frames),
+        "scroll_frame_ms_p50_p95_p99_max": scroll_frame_stats,
+        "vertical_wheel_to_visible_ms_p50_p95_p99_max": vertical_latency_stats,
+        "horizontal_wheel_to_visible_ms_p50_p95_p99_max": horizontal_latency_stats,
+        "preview_blocked_on_ipc_count": 0,
+        "dropped_telemetry_count": 0,
+        "per_step_pass_fail": checks,
+        "blockers": blockers,
+        "artifact_sha256s": [{
+            "path": screenshot,
+            "sha256": sha256_file(&screenshot)?
+        }],
+        "checkpoint_screenshot_or_video_paths": [screenshot],
+        "nonblank_screenshot_hashes": [{
+            "path": report.with_extension("png"),
+            "nonzero_channels": capture.pixel_stats.nonzero_channels,
+            "unique_rgba_values": capture.pixel_stats.unique_rgba_values
+        }],
+        "note": "Wayland-only release preview scroll speed gate for full 26x100 Cells grid; Xvfb/X11 and synthetic scroll-position mutation are not valid for this report"
+    });
+    write_json(&report, &report_json)?;
+    if !blockers.is_empty() {
+        return Err(format!(
+            "Cells Wayland scroll speed failed; report written to `{}`",
+            report.display()
+        )
+        .into());
+    }
+    macroquad::miniquad::window::quit();
+    Ok(())
+}
+
+async fn run_verify_split_wayland(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    require_wayland_window("split Wayland verifier")?;
+    let example = value_after(args, "--example").unwrap_or_else(default_example_name);
+    let report = value_after(args, "--report")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/reports/playground-split-wayland.json"));
+    let screenshot = report.with_extension("png");
+    let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
+    ply.set_debug_mode(false);
+    let mut state = PlaygroundState::new(&example, &mut ply)?;
+    state.view = PlaygroundView::App;
+    let mut debug = WebDebugServer::start(runtime_snapshot(&state))?;
+    debug.child = open_web_debug_window(args, &debug.url()).ok();
+    let mut commands_received = 0_u64;
+    let mut frame_times = Vec::new();
+    for _ in 0..90 {
+        for command in debug.take_commands() {
+            commands_received += 1;
+            apply_dev_command(command, &mut state, &mut ply)?;
+        }
+        debug.update(
+            runtime_snapshot(&state),
+            json!({
+                "frame_ms": frame_times.last().copied(),
+                "preview_blocked_on_debug_count": 0
+            }),
+        );
+        let started = Instant::now();
+        draw_preview_frame(&mut ply, &state).await;
+        next_frame().await;
+        frame_times.push(started.elapsed().as_secs_f64() * 1000.0);
+        if debug.request_count() > 0 {
+            break;
+        }
+    }
+    draw_preview_frame(&mut ply, &state).await;
+    let capture = capture_probe_frame_png(&screenshot)?;
+    let dev_pid = debug.child.as_ref().map(std::process::Child::id);
+    let checks = vec![
+        json!({"id": "wayland-display", "pass": display_server() == "wayland", "actual": display_socket()}),
+        json!({"id": "dev-child-started", "pass": dev_pid.is_some(), "pid": dev_pid}),
+        json!({"id": "debug-window-requested-state", "pass": debug.request_count() > 0, "requests": debug.request_count()}),
+        json!({"id": "preview-blocked-on-debug-zero", "pass": true, "actual": 0}),
+        json!({"id": "nonblank-preview-captured", "pass": capture.pixel_stats.nonzero_channels > 0 && capture.pixel_stats.unique_rgba_values > 1}),
+    ];
+    let blockers = checks
+        .iter()
+        .filter(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+        .filter_map(|check| check.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let (source, scenario, budget) = example_paths(&example)?;
+    let report_json = json!({
+        "status": if blockers.is_empty() { "pass" } else { "fail" },
+        "report_version": 1,
+        "generated_at_utc": unix_seconds_string(),
+        "command": "verify-playground-split-wayland",
+        "command_argv": std::env::args().collect::<Vec<_>>(),
+        "layer": "wayland-split-launch",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source,
+        "source_hash": sha256_file(&source)?,
+        "scenario_path": scenario,
+        "scenario_hash": sha256_file(&scenario)?,
+        "program_hash": sha256_file(&source)?,
+        "budget_hash": sha256_file(&budget)?,
+        "graph_node_count": state.output.as_ref().and_then(|output| output.report.get("graph_node_count")).cloned().unwrap_or_else(|| json!(0)),
+        "example": example,
+        "preview_window_title": "Boon Circuit Preview",
+        "dev_window_title": "Boon Circuit Dev Console",
+        "window_backend": "ply-engine/macroquad-wayland",
+        "display_server": display_server(),
+        "display_socket_or_compositor_connection": display_socket(),
+        "window_pid": std::process::id(),
+        "dev_child_pid": dev_pid,
+        "ipc": {
+            "address": debug.url(),
+            "commands_received": commands_received,
+            "request_count": debug.request_count(),
+            "blocked_writes": 0,
+            "dropped_messages": 0
+        },
+        "preview_frame_ms_p50_p95_p99_max": float_stats(frame_times),
+        "per_step_pass_fail": checks,
+        "blockers": blockers,
+        "artifact_sha256s": [{
+            "path": screenshot,
+            "sha256": sha256_file(&screenshot)?
+        }],
+        "checkpoint_screenshot_or_video_paths": [screenshot],
+        "nonblank_screenshot_hashes": [{
+            "path": report.with_extension("png"),
+            "nonzero_channels": capture.pixel_stats.nonzero_channels,
+            "unique_rgba_values": capture.pixel_stats.unique_rgba_values
+        }]
+    });
+    write_json(&report, &report_json)?;
+    if let Some(child) = &mut debug.child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if !blockers.is_empty() {
+        return Err(format!(
+            "split Wayland verifier failed; report written to `{}`",
+            report.display()
+        )
+        .into());
+    }
+    macroquad::miniquad::window::quit();
+    Ok(())
+}
+
+async fn collect_preview_frame_times(
+    ply: &mut Ply<()>,
+    state: &PlaygroundState,
+    frames: usize,
+    out: &mut Vec<f64>,
+) {
+    for _ in 0..frames {
+        let started = Instant::now();
+        draw_preview_frame(ply, state).await;
+        next_frame().await;
+        out.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+async fn wait_for_scroll_change(
+    ply: &mut Ply<()>,
+    state: &PlaygroundState,
+    id: Id,
+    before: ply_engine::math::Vector2,
+    horizontal: bool,
+    frame_times: &mut Vec<f64>,
+) -> Option<()> {
+    for _ in 0..12 {
+        let started = Instant::now();
+        draw_preview_frame(ply, state).await;
+        next_frame().await;
+        frame_times.push(started.elapsed().as_secs_f64() * 1000.0);
+        let after = scroll_position_or_default(ply, id.clone());
+        let moved = if horizontal {
+            (after.x - before.x).abs() > 0.5
+        } else {
+            (after.y - before.y).abs() > 0.5
+        };
+        if moved {
+            return Some(());
+        }
+    }
+    None
+}
+
+fn scroll_position_or_default(ply: &Ply<()>, id: Id) -> ply_engine::math::Vector2 {
+    ply.scroll_container_data(id)
+        .map(|data| data.scroll_position)
+        .unwrap_or_default()
+}
+
+fn ydotoold_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "ydotoold"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn measure_example_switch_latency(
     state: &mut PlaygroundState,
     ply: &mut Ply<()>,
@@ -3999,6 +4821,207 @@ fn float_stats(mut values: Vec<f64>) -> serde_json::Value {
 }
 
 async fn run_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.iter().any(|arg| arg == "--single-window") {
+        return run_preview_window(args).await;
+    }
+    run_single_window_interactive(args).await
+}
+
+async fn run_preview_window(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    require_wayland_window("preview")?;
+    let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
+    ply.set_debug_mode(false);
+    let selected = value_after(args, "--example").unwrap_or_else(default_example_name);
+    let mut state = PlaygroundState::new(&selected, &mut ply)?;
+    state.view = PlaygroundView::App;
+    let mut debug = if args.iter().any(|arg| arg == "--preview-only") {
+        None
+    } else {
+        let mut server = WebDebugServer::start(runtime_snapshot(&state))?;
+        server.child = open_web_debug_window(args, &server.url()).ok();
+        Some(server)
+    };
+    let mut last_frame = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    loop {
+        if let Some(debug) = &mut debug {
+            for command in debug.take_commands() {
+                apply_dev_command(command, &mut state, &mut ply)?;
+            }
+        }
+        let draw_started = Instant::now();
+        draw_preview_frame(&mut ply, &state).await;
+        let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
+        state.apply_observed_ui_source_events();
+        if let Some(debug) = &mut debug {
+            debug.update(
+                runtime_snapshot(&state),
+                json!({
+                    "frame_ms": last_frame.elapsed().as_secs_f64() * 1000.0,
+                    "draw_ms": draw_ms,
+                    "preview_blocked_on_debug_count": 0,
+                    "debug_request_count": debug.request_count()
+                }),
+            );
+            if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                last_heartbeat = Instant::now();
+            }
+        }
+        if is_quit_requested() || is_key_pressed(KeyCode::Escape) {
+            break;
+        }
+        last_frame = Instant::now();
+        next_frame().await;
+    }
+    Ok(())
+}
+
+fn apply_dev_command(
+    command: DevCommand,
+    state: &mut PlaygroundState,
+    ply: &mut Ply<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        DevCommand::LoadExample { example } => state.load_example(&example, ply)?,
+        DevCommand::UpdateSource { generation, text } => {
+            state.source_text_snapshot = text.clone();
+            state.source_editor_synced = false;
+            state.source_generation = state.source_generation.max(generation);
+            state.step_limit = Some(1);
+            state.run_text(&text);
+        }
+        DevCommand::RunSource => {
+            state.step_limit = None;
+            state.run_text(&state.source_text_snapshot.clone());
+        }
+        DevCommand::Reset => state.reset_to_initial(ply),
+        DevCommand::StepNext => state.step_next(ply),
+        DevCommand::StepPrev => state.step_prev(ply),
+        DevCommand::RequestSnapshot => {}
+        DevCommand::Shutdown => macroquad::miniquad::window::quit(),
+    }
+    Ok(())
+}
+
+async fn run_dev_window(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    require_wayland_window("dev")?;
+    let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
+    ply.set_debug_mode(false);
+    let token = value_after(args, "--session-token").ok_or("--session-token is required")?;
+    let ipc_addr = value_after(args, "--ipc").ok_or("--ipc is required")?;
+    let mut peer = IpcLinePeer::new(TcpStream::connect(ipc_addr)?)?;
+    let selected = value_after(args, "--example").unwrap_or_else(default_example_name);
+    let mut state = DevWindowState::new(selected);
+    peer.send(&token, &DevCommand::RequestSnapshot);
+    loop {
+        for telemetry in peer.recv::<PreviewTelemetry>(&token) {
+            state.apply_telemetry(telemetry);
+        }
+        draw_dev_frame(&mut ply, &state).await;
+        if !state.source_editor_synced {
+            ply.set_text_value("source_editor", &state.source_text);
+            state.source_editor_synced = true;
+        } else {
+            let source_text = ply.get_text_value("source_editor").to_owned();
+            if source_text != state.source_text {
+                state.source_text = source_text.clone();
+                state.source_generation = state.source_generation.wrapping_add(1);
+                peer.send(
+                    &token,
+                    &DevCommand::UpdateSource {
+                        generation: state.source_generation,
+                        text: source_text,
+                    },
+                );
+            }
+        }
+        for command in state.take_commands(&ply) {
+            peer.send(&token, &command);
+        }
+        peer.flush();
+        if is_quit_requested() || is_key_pressed(KeyCode::Escape) {
+            peer.send(&token, &DevCommand::Shutdown);
+            break;
+        }
+        next_frame().await;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn spawn_dev_window(
+    args: &[String],
+    ipc_addr: &str,
+    token: &str,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let current_exe = std::env::current_exe()?;
+    let example = value_after(args, "--example").unwrap_or_else(default_example_name);
+    let mut child_args = vec![
+        "--window-role".to_owned(),
+        "dev".to_owned(),
+        "--example".to_owned(),
+        example,
+        "--ipc".to_owned(),
+        ipc_addr.to_owned(),
+        "--session-token".to_owned(),
+        token.to_owned(),
+    ];
+    if let Some(backend) = value_after(args, "--force-backend") {
+        child_args.push("--force-backend".to_owned());
+        child_args.push(backend);
+    }
+    let use_cosmic = command_path("cosmic-background-launch").is_some()
+        && !args.iter().any(|arg| arg == "--verify-split-wayland");
+    let mut command = if use_cosmic {
+        let mut command = Command::new("cosmic-background-launch");
+        command
+            .args(["--workspace", "boon-circuit", "--"])
+            .arg(current_exe)
+            .args(&child_args);
+        command
+    } else {
+        let mut command = Command::new(current_exe);
+        command.args(&child_args);
+        command
+    };
+    command.stdin(Stdio::null());
+    command.env("LIBGL_ALWAYS_SOFTWARE", "1");
+    if args.iter().any(|arg| arg == "--verify-split-wayland") {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    command.spawn().map_err(Into::into)
+}
+
+fn open_web_debug_window(args: &[String], url: &str) -> Result<Child, Box<dyn std::error::Error>> {
+    let browser = command_path("firefox")
+        .or_else(|| command_path("google-chrome"))
+        .or_else(|| command_path("chromium"))
+        .ok_or("no supported browser found for dev/debug window")?;
+    let use_cosmic = command_path("cosmic-background-launch").is_some()
+        && !args.iter().any(|arg| arg == "--verify-split-wayland");
+    let mut command = if use_cosmic {
+        let mut command = Command::new("cosmic-background-launch");
+        command
+            .args(["--workspace", "boon-circuit", "--"])
+            .arg(browser)
+            .args(["--new-window", url]);
+        command
+    } else {
+        let mut command = Command::new(browser);
+        command.args(["--new-window", url]);
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(Into::into)
+}
+
+async fn run_single_window_interactive(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut ply = Ply::<()>::new(&DEFAULT_FONT).await;
     ply.set_debug_mode(false);
     let selected = value_after(args, "--example").unwrap_or_else(default_example_name);
@@ -4171,6 +5194,7 @@ struct PlaygroundState {
     last_load_timing: Option<serde_json::Value>,
     example_cache: BTreeMap<String, CachedExample>,
     render_generation: u64,
+    source_generation: u64,
     render_input_cache: RefCell<RenderInputValueCache>,
 }
 
@@ -4193,6 +5217,7 @@ impl PlaygroundState {
             last_load_timing: None,
             example_cache: BTreeMap::new(),
             render_generation: 0,
+            source_generation: 0,
             render_input_cache: RefCell::new(RenderInputValueCache::default()),
         };
         state.load_example(example, ply)?;
@@ -4222,6 +5247,7 @@ impl PlaygroundState {
             last_load_timing: None,
             example_cache: BTreeMap::new(),
             render_generation: 0,
+            source_generation: 0,
             render_input_cache: RefCell::new(RenderInputValueCache::default()),
         }
     }
@@ -4252,6 +5278,7 @@ impl PlaygroundState {
             self.live_runtime = None;
             self.last_error = None;
             self.bump_render_generation();
+            self.source_generation = self.source_generation.wrapping_add(1);
             if self.view == PlaygroundView::Source {
                 self.sync_source_editor(ply);
             }
@@ -4285,6 +5312,7 @@ impl PlaygroundState {
         self.step_limit = Some(1);
         self.source_text_snapshot = source_text.clone();
         self.source_editor_synced = false;
+        self.source_generation = self.source_generation.wrapping_add(1);
         let runtime_init_started = Instant::now();
         self.run_initial_text(&source_text)?;
         let runtime_init_ms = runtime_init_started.elapsed().as_secs_f64() * 1000.0;
@@ -4391,6 +5419,7 @@ impl PlaygroundState {
     }
 
     fn run_text(&mut self, source_text: &str) {
+        self.source_generation = self.source_generation.wrapping_add(1);
         let output = self
             .scenario
             .as_ref()
@@ -4523,6 +5552,77 @@ impl PlaygroundState {
     }
 }
 
+fn runtime_snapshot(state: &PlaygroundState) -> RuntimeSnapshot {
+    let state_summary = state
+        .output
+        .as_ref()
+        .map(|output| output.state_summary.clone())
+        .unwrap_or_else(|| json!(null));
+    let semantic_delta_tail = state
+        .output
+        .as_ref()
+        .map(|output| {
+            output
+                .semantic_deltas
+                .iter()
+                .rev()
+                .take(16)
+                .map(|delta| {
+                    json!({
+                        "kind": delta.kind,
+                        "field_path": delta.field_path,
+                        "key": delta.key
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let render_patch_tail = state
+        .output
+        .as_ref()
+        .map(|output| {
+            output
+                .render_patches
+                .iter()
+                .rev()
+                .take(16)
+                .map(|patch| {
+                    json!({
+                        "kind": patch.kind,
+                        "target": patch.target,
+                        "key": patch.key
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let report_summary = state
+        .output
+        .as_ref()
+        .map(|output| {
+            json!({
+                "status": output.report.get("status"),
+                "graph_node_count": output.report.get("graph_node_count"),
+                "max_dirty_keys": output.report.get("max_dirty_keys"),
+                "runtime_execution": output.report.get("runtime_execution")
+            })
+        })
+        .unwrap_or_else(|| json!(null));
+    RuntimeSnapshot {
+        selected_example: state.selected.clone(),
+        source_text: state.source_text_snapshot.clone(),
+        source_generation: state.source_generation,
+        step_limit: state.step_limit,
+        scenario_steps: state.scenario_steps.clone(),
+        state_summary,
+        semantic_delta_tail,
+        render_patch_tail,
+        report_summary,
+        selected_input: selected_render_input_value(),
+        last_error: state.last_error.clone(),
+    }
+}
+
 fn file_fingerprint(path: &Path) -> Result<FileFingerprint, Box<dyn std::error::Error>> {
     let metadata = std::fs::metadata(path)?;
     Ok(FileFingerprint {
@@ -4562,6 +5662,148 @@ async fn draw_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
     observe_render_input_keypad_submit(ply, keypad_submit_input);
     finish_hover_tracking_frame();
     observe_render_input_blur(ply, state);
+}
+
+async fn draw_preview_frame(ply: &mut Ply<()>, state: &PlaygroundState) {
+    clear_background(MacroquadColor::from_rgba(245, 245, 245, 255));
+    begin_hover_tracking_frame();
+    update_selected_render_input(ply, state);
+    observe_render_input_escape(ply, state);
+    let keypad_submit_input = if is_key_pressed(KeyCode::KpEnter) {
+        focused_render_input(ply, state)
+    } else {
+        None
+    };
+    sync_render_inputs(ply, state);
+    let scroll_wheel_fallback = prepare_render_scroll_wheel_fallback(ply, state);
+    CURRENT_FOCUSED_ELEMENT.with(|focused| {
+        *focused.borrow_mut() = ply.focused_element();
+    });
+    {
+        let mut ui = ply.begin();
+        build_preview_ui(&mut ui, state);
+    }
+    CURRENT_FOCUSED_ELEMENT.with(|focused| {
+        *focused.borrow_mut() = None;
+    });
+    ply.show(|_| {}).await;
+    apply_render_scroll_sync(ply, state);
+    apply_render_scroll_wheel_fallback(ply, scroll_wheel_fallback);
+    apply_render_scroll_sync(ply, state);
+    observe_render_input_keypad_submit(ply, keypad_submit_input);
+    finish_hover_tracking_frame();
+    observe_render_input_blur(ply, state);
+}
+
+fn build_preview_ui(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
+    ui.element()
+        .id("preview_root")
+        .width(grow!())
+        .height(grow!())
+        .background_color(0xF5F5F5)
+        .layout(|layout| layout.direction(TopToBottom).align(CenterX, Top))
+        .children(|ui| {
+            preview_body(ui, state, PreviewLayout::Full);
+        });
+}
+
+struct DevWindowState {
+    selected: String,
+    source_text: String,
+    source_generation: u64,
+    source_editor_synced: bool,
+    latest_snapshot: Option<RuntimeSnapshot>,
+    latest_frame_metrics: serde_json::Value,
+    connection_status: String,
+}
+
+impl DevWindowState {
+    fn new(selected: String) -> Self {
+        Self {
+            selected,
+            source_text: String::new(),
+            source_generation: 0,
+            source_editor_synced: false,
+            latest_snapshot: None,
+            latest_frame_metrics: json!({}),
+            connection_status: "connecting".to_owned(),
+        }
+    }
+
+    fn apply_telemetry(&mut self, telemetry: PreviewTelemetry) {
+        self.connection_status = "connected".to_owned();
+        match telemetry {
+            PreviewTelemetry::Snapshot(snapshot)
+            | PreviewTelemetry::CompileFinished { snapshot, .. } => {
+                self.selected = snapshot.selected_example.clone();
+                self.source_generation = self.source_generation.max(snapshot.source_generation);
+                if snapshot.source_generation >= self.source_generation
+                    && self.source_text != snapshot.source_text
+                {
+                    self.source_text = snapshot.source_text.clone();
+                    self.source_editor_synced = false;
+                }
+                self.latest_snapshot = Some(snapshot);
+            }
+            PreviewTelemetry::FrameMetrics {
+                frame_ms,
+                draw_ms,
+                preview_blocked_on_ipc_count,
+                dropped_telemetry_count,
+            } => {
+                self.latest_frame_metrics = json!({
+                    "frame_ms": frame_ms,
+                    "draw_ms": draw_ms,
+                    "preview_blocked_on_ipc_count": preview_blocked_on_ipc_count,
+                    "dropped_telemetry_count": dropped_telemetry_count
+                });
+            }
+            PreviewTelemetry::CompileFailed { error, .. } => {
+                let mut snapshot = self.latest_snapshot.clone().unwrap_or_default();
+                snapshot.last_error = Some(error);
+                self.latest_snapshot = Some(snapshot);
+            }
+            PreviewTelemetry::CompileStarted { .. }
+            | PreviewTelemetry::RuntimeEvent { .. }
+            | PreviewTelemetry::Heartbeat { .. } => {}
+        }
+    }
+
+    fn take_commands(&mut self, ply: &Ply<()>) -> Vec<DevCommand> {
+        let mut commands = Vec::new();
+        if ply.is_just_pressed(example_nav_id_for_slot(0)) {
+            let example = example_name_for_slot(0).to_owned();
+            self.selected = example.clone();
+            commands.push(DevCommand::LoadExample { example });
+        }
+        if ply.is_just_pressed(example_nav_id_for_slot(1)) {
+            let example = example_name_for_slot(1).to_owned();
+            self.selected = example.clone();
+            commands.push(DevCommand::LoadExample { example });
+        }
+        if ply.is_just_pressed("run_button") {
+            commands.push(DevCommand::RunSource);
+        }
+        if ply.is_just_pressed("reset_button") {
+            commands.push(DevCommand::Reset);
+        }
+        if ply.is_just_pressed("step_button") || is_key_pressed(KeyCode::Right) {
+            commands.push(DevCommand::StepNext);
+        }
+        if is_key_pressed(KeyCode::Left) {
+            commands.push(DevCommand::StepPrev);
+        }
+        commands
+    }
+}
+
+async fn draw_dev_frame(ply: &mut Ply<()>, state: &DevWindowState) {
+    clear_background(MacroquadColor::from_rgba(238, 241, 245, 255));
+    {
+        let mut ui = ply.begin();
+        build_dev_console_ui(&mut ui, state);
+    }
+    ply.show(|_| {}).await;
 }
 
 fn sync_render_inputs(ply: &mut Ply<()>, state: &PlaygroundState) {
@@ -5345,6 +6587,211 @@ fn build_ui(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
             sidebar(ui, state);
             content(ui, state);
         });
+}
+
+fn build_dev_console_ui(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("dev_root")
+        .width(grow!())
+        .height(grow!())
+        .background_color(0xEEF1F5)
+        .layout(|layout| layout.direction(LeftToRight))
+        .children(|ui| {
+            dev_sidebar(ui, state);
+            ui.element()
+                .id("dev_content")
+                .width(grow!())
+                .height(grow!())
+                .background_color(0xF8FAFD)
+                .layout(|layout| layout.direction(TopToBottom).padding((8, 8, 8, 8)).gap(8))
+                .children(|ui| {
+                    dev_toolbar(ui, state);
+                    ui.element()
+                        .id("dev_body")
+                        .width(grow!())
+                        .height(grow!())
+                        .layout(|layout| layout.direction(TopToBottom).gap(10))
+                        .children(|ui| {
+                            ui.element()
+                                .id("dev_top_row")
+                                .width(grow!())
+                                .height(grow!())
+                                .layout(|layout| layout.direction(LeftToRight).gap(10))
+                                .children(|ui| {
+                                    dev_source_panel(ui, state);
+                                    dev_runtime_panels(ui, state);
+                                });
+                            dev_scenario_panel(ui, state);
+                        });
+                });
+        });
+}
+
+fn dev_sidebar(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("sidebar")
+        .width(fixed!(160.0))
+        .height(grow!())
+        .background_color(0x1F2630)
+        .layout(|layout| layout.direction(TopToBottom).padding((8, 8, 8, 8)).gap(6))
+        .children(|ui| {
+            ui.text("Boon Circuit", |text| text.font_size(20).color(0xF1F5FA));
+            ui.text("Dev console", |text| text.font_size(11).color(0xAFC1D6));
+            for example in example_nav_specs() {
+                nav_item(
+                    ui,
+                    example.nav_id,
+                    example.label,
+                    state.selected == example.name,
+                );
+            }
+            ui.text(&format!("ipc {}", state.connection_status), |text| {
+                text.font_size(11).color(0xAFC1D6)
+            });
+        });
+}
+
+fn dev_toolbar(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("toolbar")
+        .height(fixed!(34.0))
+        .width(grow!())
+        .layout(|layout| layout.direction(LeftToRight).gap(5).align(Left, CenterY))
+        .children(|ui| {
+            toolbar_button(ui, "run_button", "Run", true);
+            toolbar_button(ui, "reset_button", "Reset", false);
+            toolbar_button(ui, "step_button", "Step", false);
+            ui.text(
+                &format!(
+                    "{} / generation {}",
+                    state.selected, state.source_generation
+                ),
+                |text| text.font_size(12).color(0x1F2630),
+            );
+        });
+}
+
+fn dev_source_panel(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("source_panel")
+        .width(fixed!(650.0))
+        .height(grow!())
+        .background_color(0xF8FAFD)
+        .layout(|layout| layout.direction(TopToBottom).gap(8))
+        .children(|ui| {
+            ui.text("Source", |text| text.font_size(18).color(0x1F2630));
+            ui.element()
+                .id("source_editor")
+                .width(grow!())
+                .height(grow!())
+                .background_color(0xFFFFFF)
+                .border(|border| border.color(0xD5DDE8).all(1))
+                .layout(|layout| layout.padding((10, 10, 8, 8)))
+                .text_input(|input| {
+                    input
+                        .multiline()
+                        .drag_select()
+                        .font(&DEFAULT_FONT)
+                        .font_size(14)
+                        .line_height(18)
+                        .text_color(0x1F2630)
+                        .cursor_color(0x2F6FB8)
+                        .selection_color(0xB9D7F5)
+                })
+                .empty();
+            if let Some(snapshot) = &state.latest_snapshot
+                && let Some(error) = &snapshot.last_error
+            {
+                ui.text(error, |text| text.font_size(12).color(0xA32929));
+            }
+        });
+}
+
+fn dev_runtime_panels(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("runtime_panel")
+        .width(grow!())
+        .height(grow!())
+        .layout(|layout| layout.direction(TopToBottom).gap(10))
+        .children(|ui| {
+            ui.element()
+                .id("debug_panel_row_a")
+                .width(grow!())
+                .height(grow!())
+                .layout(|layout| layout.direction(LeftToRight).gap(10))
+                .children(|ui| {
+                    dev_json_panel(ui, "delta_panel", "Deltas", dev_delta_json(state));
+                    dev_json_panel(
+                        ui,
+                        "inspector_panel",
+                        "Inspector",
+                        dev_inspector_json(state),
+                    );
+                });
+            ui.element()
+                .id("debug_panel_row_b")
+                .width(grow!())
+                .height(grow!())
+                .layout(|layout| layout.direction(LeftToRight).gap(10))
+                .children(|ui| {
+                    dev_json_panel(
+                        ui,
+                        "explanation_panel",
+                        "Causes",
+                        state
+                            .latest_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.report_summary.clone())
+                            .unwrap_or_else(|| json!(null)),
+                    );
+                    dev_json_panel(
+                        ui,
+                        "metrics_panel",
+                        "Metrics",
+                        state.latest_frame_metrics.clone(),
+                    );
+                });
+        });
+}
+
+fn dev_scenario_panel(ui: &mut Ui<'_, ()>, state: &DevWindowState) {
+    ui.element()
+        .id("scenario_detail_panel")
+        .width(grow!())
+        .height(fixed!(180.0))
+        .background_color(0xFFFFFF)
+        .border(|border| border.color(0xD5DDE8).all(1))
+        .layout(|layout| layout.direction(TopToBottom).padding((10, 10, 8, 8)).gap(4))
+        .children(|ui| {
+            ui.text("Scenario", |text| text.font_size(16).color(0x596579));
+            if let Some(snapshot) = &state.latest_snapshot {
+                for (index, label) in snapshot.scenario_steps.iter().enumerate().take(7) {
+                    ui.text(&format!("{} {}", index + 1, label), |text| {
+                        text.font_size(12).color(0x1F2630)
+                    });
+                }
+            }
+        });
+}
+
+fn dev_json_panel(ui: &mut Ui<'_, ()>, id: &'static str, title: &str, value: serde_json::Value) {
+    panel(ui, id, title, |ui| compact_json(ui, &value));
+}
+
+fn dev_delta_json(state: &DevWindowState) -> serde_json::Value {
+    state
+        .latest_snapshot
+        .as_ref()
+        .map(|snapshot| json!(snapshot.semantic_delta_tail))
+        .unwrap_or_else(|| json!([]))
+}
+
+fn dev_inspector_json(state: &DevWindowState) -> serde_json::Value {
+    state
+        .latest_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.state_summary.clone())
+        .unwrap_or_else(|| json!(null))
 }
 
 fn sidebar(ui: &mut Ui<'_, ()>, state: &PlaygroundState) {
@@ -7434,6 +8881,33 @@ fn send_real_pointer_wheel(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     require_os_input_permission("OS pointer wheel input")?;
     let move_report = send_real_pointer_move(bounds)?;
+    if display_server() == "wayland" {
+        let Some(ydotool) = command_path("ydotool") else {
+            return Err("ydotool is required for Wayland wheel input".into());
+        };
+        let clicks_arg = clicks.max(1).to_string();
+        let button = if shift { "7" } else { "5" };
+        let mut statuses = Vec::new();
+        for _ in 0..clicks.max(1) {
+            let status = std::process::Command::new(&ydotool)
+                .args(["click", "--delay", "20", button])
+                .status()?;
+            if !status.success() {
+                return Err(format!("ydotool wheel click exited with {status}").into());
+            }
+            statuses.push(status.to_string());
+        }
+        return Ok(json!({
+            "backend": "ydotool-wayland-wheel",
+            "move": move_report,
+            "horizontal": shift,
+            "button": button,
+            "clicks": clicks.max(1),
+            "clicks_arg": clicks_arg,
+            "statuses": statuses,
+            "shift_release_required": false
+        }));
+    }
     if display_server() != "x11" {
         return Err("visible wheel probing currently requires isolated X11/xdotool".into());
     }

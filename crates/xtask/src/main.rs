@@ -30,6 +30,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-foundation",
     "verify-playground-launch",
     "verify-playground-background-launch",
+    "verify-playground-split-wayland",
     "verify-todomvc-reference-parity",
     "verify-playground-genericity",
     "bench-example",
@@ -56,6 +57,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-cells-headed-ply",
     "verify-cells-headed-focusless",
     "verify-cells-visible-reality",
+    "verify-cells-wayland-scroll-speed",
     "verify-cells-operator-e2e",
     "verify-cells-human",
     "prepare-cells-human-report",
@@ -99,6 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-foundation" => verify_foundation(&args),
         "verify-playground-launch" => verify_playground_launch(&args),
         "verify-playground-background-launch" => verify_playground_background_launch(&args),
+        "verify-playground-split-wayland" => verify_playground_split_wayland(&args),
         "verify-todomvc-reference-parity" => verify_todomvc_reference_parity(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
         "verify-playground-custom-source" => verify_playground_custom_source(&args),
@@ -132,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-cells-headed-ply" => verify_specific("cells", VerificationLayer::HeadedPly, &args),
         "verify-cells-headed-focusless" => verify_headed_focusless("cells", &args),
         "verify-cells-visible-reality" => verify_cells_visible_reality(&args),
+        "verify-cells-wayland-scroll-speed" => verify_cells_wayland_scroll_speed(&args),
         "verify-cells-operator-e2e" => verify_operator_e2e("cells", &args),
         "verify-cells-human" => verify_human("cells", &args),
         "prepare-cells-human-report" => prepare_human_report("cells", &args),
@@ -1817,6 +1821,144 @@ fn verify_playground_background_launch(args: &[String]) -> Result<(), Box<dyn st
     });
     write_json(&aggregate_path, &aggregate)?;
     verify_report_schema(&aggregate_path)?;
+    Ok(())
+}
+
+fn verify_playground_split_wayland(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/playground-split-wayland.json"));
+    run_wayland_playground_report(
+        "--verify-split-wayland",
+        "cells",
+        &report,
+        Duration::from_secs(120),
+    )?;
+    verify_report_schema(&report)?;
+    let report_json = read_json(&report)?;
+    if report_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Wayland split verifier failed; report written to `{}`",
+            report.display()
+        )
+        .into())
+    }
+}
+
+fn verify_cells_wayland_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/cells-wayland-scroll-speed.json"));
+    run_wayland_playground_report(
+        "--verify-wayland-scroll-speed",
+        "cells",
+        &report,
+        Duration::from_secs(180),
+    )?;
+    verify_report_schema(&report)?;
+    let report_json = read_json(&report)?;
+    if report_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cells Wayland scroll speed failed; report written to `{}`",
+            report.display()
+        )
+        .into())
+    }
+}
+
+fn run_wayland_playground_report(
+    verifier_flag: &str,
+    example: &str,
+    report: &Path,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("WAYLAND_DISPLAY").ok().is_none() {
+        return Err("Wayland verifier requires WAYLAND_DISPLAY".into());
+    }
+    let _ = std::fs::remove_file(report);
+    let _ = std::fs::remove_file(report.with_extension("png"));
+    let launched_after = SystemTime::now();
+    let report_arg = report
+        .to_str()
+        .ok_or("Wayland verifier report path is not utf-8")?;
+    let mut base_args = vec![
+        "run",
+        "--release",
+        "-p",
+        "boon_ply_playground",
+        "--",
+        verifier_flag,
+        "--example",
+        example,
+        "--report",
+        report_arg,
+    ];
+    if command_path("cosmic-background-launch").is_some() {
+        let mut command = Command::new("cosmic-background-launch");
+        command
+            .args([
+                "--workspace",
+                "boon-circuit",
+                "--",
+                "env",
+                "BOON_ALLOW_LIVE_DESKTOP_INPUT=1",
+                "BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1",
+                "BOON_ALLOW_OS_POINTER_PROBE=1",
+                "cargo",
+            ])
+            .args(&base_args)
+            .env("BOON_ALLOW_LIVE_DESKTOP_INPUT", "1")
+            .env(
+                "BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS",
+                "1",
+            )
+            .env("BOON_ALLOW_OS_POINTER_PROBE", "1")
+            .env_remove("BOON_PLY_LINUX_BACKEND")
+            .env_remove("BOON_OS_INPUT_ISOLATED");
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cosmic background launch failed for {verifier_flag}: {}",
+                text_tail(&String::from_utf8_lossy(&output.stderr), 1200)
+            )
+            .into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let launched_pid = stdout
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        wait_for_fresh_report(report, launched_after, timeout)?;
+        if let Some(pid) = launched_pid {
+            let _ = wait_for_pid_exit(pid, Duration::from_secs(30));
+        }
+    } else {
+        let mut command = Command::new("cargo");
+        command
+            .args(base_args.drain(..))
+            .env("BOON_ALLOW_LIVE_DESKTOP_INPUT", "1")
+            .env(
+                "BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS",
+                "1",
+            )
+            .env("BOON_ALLOW_OS_POINTER_PROBE", "1")
+            .env_remove("BOON_PLY_LINUX_BACKEND")
+            .env_remove("BOON_OS_INPUT_ISOLATED");
+        let status = run_command_with_timeout(&mut command, timeout)?;
+        if !status.success() {
+            return Err(format!("{verifier_flag} failed with {status}").into());
+        }
+    }
     Ok(())
 }
 
@@ -5056,6 +5198,7 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
             "final_aggregate": [
                 "cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json",
                 "cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json",
+                "cargo xtask verify-cells-wayland-scroll-speed --report target/reports/cells-wayland-scroll-speed.json",
                 "cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json",
                 "cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json",
                 "cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json",
@@ -5090,6 +5233,13 @@ fn current_handoff_blockers() -> Vec<String> {
             cells_visible.display()
         ));
     }
+    let cells_wayland_speed = cells_wayland_scroll_speed_report_path();
+    if verify_existing_cells_wayland_scroll_speed_report(&cells_wayland_speed).is_err() {
+        blockers.push(format!(
+            "missing fresh Cells Wayland scroll speed report `{}`",
+            cells_wayland_speed.display()
+        ));
+    }
     blockers
 }
 
@@ -5111,6 +5261,7 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
     audit_foundation(&mut checks, &mut blockers)?;
     audit_playground_launch(&mut checks, &mut blockers)?;
     audit_playground_background_launch(&mut checks, &mut blockers)?;
+    audit_playground_split_wayland(&mut checks, &mut blockers)?;
     audit_example_source_contracts(&mut checks, &mut blockers)?;
     audit_scenario_coverage(&mut checks, &mut blockers)?;
     audit_cli_scenario_reports(&mut checks, &mut blockers)?;
@@ -5186,6 +5337,7 @@ fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Er
     audit_foundation(&mut checks, &mut blockers)?;
     audit_playground_launch(&mut checks, &mut blockers)?;
     audit_playground_background_launch(&mut checks, &mut blockers)?;
+    audit_playground_split_wayland(&mut checks, &mut blockers)?;
     audit_example_source_contracts(&mut checks, &mut blockers)?;
     audit_scenario_coverage(&mut checks, &mut blockers)?;
     audit_cli_scenario_reports(&mut checks, &mut blockers)?;
@@ -5808,6 +5960,7 @@ fn audit_example_readiness(
 
     if name == "cells" {
         audit_cells_visible_reality(checks, blockers);
+        audit_cells_wayland_scroll_speed(checks, blockers);
     }
 
     audit_manual_template_readiness(name, checks, blockers)?;
@@ -5862,6 +6015,37 @@ fn audit_cells_visible_reality(checks: &mut Vec<serde_json::Value>, blockers: &m
             error.to_string(),
             Some(format!(
                 "Cells visible reality report `{}` is missing, stale, or invalid: {error}",
+                report.display()
+            )),
+        ),
+    }
+}
+
+fn audit_cells_wayland_scroll_speed(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) {
+    let report = cells_wayland_scroll_speed_report_path();
+    match verify_existing_cells_wayland_scroll_speed_report(&report) {
+        Ok(()) => push_audit_check(
+            checks,
+            blockers,
+            "cells:wayland-scroll-speed:fresh-current-report",
+            true,
+            format!(
+                "{} proves release Wayland Cells scroll speed meets the 60 FPS gate",
+                report.display()
+            ),
+            None,
+        ),
+        Err(error) => push_audit_check(
+            checks,
+            blockers,
+            "cells:wayland-scroll-speed:fresh-current-report",
+            false,
+            error.to_string(),
+            Some(format!(
+                "Cells Wayland scroll speed report `{}` is missing, stale, invalid, or failed: {error}",
                 report.display()
             )),
         ),
@@ -5953,6 +6137,7 @@ fn audit_example_machine_readiness(
 
     if name == "cells" {
         audit_cells_visible_reality(checks, blockers);
+        audit_cells_wayland_scroll_speed(checks, blockers);
     }
 
     audit_manual_template_readiness(name, checks, blockers)?;
@@ -6809,6 +6994,74 @@ fn audit_playground_background_launch(
             }),
         );
     }
+    Ok(())
+}
+
+fn audit_playground_split_wayland(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = PathBuf::from("target/reports/playground-split-wayland.json");
+    if !report.exists() {
+        push_audit_check(
+            checks,
+            blockers,
+            "playground-split-wayland:present",
+            false,
+            format!("missing {}", report.display()),
+            Some(format!(
+                "missing Wayland split launch report `{}`; run `cargo xtask verify-playground-split-wayland --report target/reports/playground-split-wayland.json`",
+                report.display()
+            )),
+        );
+        return Ok(());
+    }
+    match verify_report_schema(&report) {
+        Ok(()) => {}
+        Err(error) => {
+            push_audit_check(
+                checks,
+                blockers,
+                "playground-split-wayland:schema",
+                false,
+                error.to_string(),
+                Some(format!(
+                    "Wayland split launch report `{}` is not schema-valid: {error}",
+                    report.display()
+                )),
+            );
+            return Ok(());
+        }
+    }
+    let report_json = read_json(&report)?;
+    let wayland = report_json
+        .get("display_server")
+        .and_then(serde_json::Value::as_str)
+        == Some("wayland");
+    let passed = report_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let current = report_json
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        == Some(git_commit().as_str());
+    push_audit_check(
+        checks,
+        blockers,
+        "playground-split-wayland:fresh-pass",
+        wayland && passed && current,
+        format!(
+            "{} status={passed}, wayland={wayland}, current_commit={current}",
+            report.display()
+        ),
+        (!(wayland && passed && current)).then(|| {
+            format!(
+                "Wayland split launch report `{}` is missing, stale, failed, or not Wayland evidence",
+                report.display()
+            )
+        }),
+    );
     Ok(())
 }
 
@@ -9376,6 +9629,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "verify-foundation",
         "verify-playground-launch",
         "verify-playground-background-launch",
+        "verify-playground-split-wayland",
         "verify-todomvc-reference-parity",
         "verify-playground-genericity",
         "bench-example",
@@ -9402,6 +9656,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "verify-cells-headed-ply",
         "verify-cells-headed-focusless",
         "verify-cells-visible-reality",
+        "verify-cells-wayland-scroll-speed",
         "verify-cells-operator-e2e",
         "verify-cells-human",
         "prepare-cells-human-report",
@@ -9658,6 +9913,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-foundation"
             | "verify-playground-launch"
             | "verify-playground-background-launch"
+            | "verify-playground-split-wayland"
             | "verify-todomvc-reference-parity"
             | "verify-playground-genericity"
             | "verify-playground-custom-source"
@@ -9686,6 +9942,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-cells-headed-ply"
             | "verify-cells-headed-focusless"
             | "verify-cells-visible-reality"
+            | "verify-cells-wayland-scroll-speed"
             | "verify-cells-operator-e2e"
             | "verify-cells-human"
             | "prepare-cells-human-report"
@@ -9769,6 +10026,24 @@ fn verify_all_with_optional_report(
             verify_existing_cells_visible_reality_report(&report)
         } else {
             verify_cells_visible_reality(&[])
+        };
+        if let Err(error) = result {
+            write_all_blocked_debug_report(
+                name,
+                args,
+                &reports,
+                VerificationLayer::All,
+                &report,
+                &error.to_string(),
+            )?;
+            return Err(error);
+        }
+        reports.push(report);
+        let report = cells_wayland_scroll_speed_report_path();
+        let result = if check_existing {
+            verify_existing_cells_wayland_scroll_speed_report(&report)
+        } else {
+            verify_cells_wayland_scroll_speed(&[])
         };
         if let Err(error) = result {
             write_all_blocked_debug_report(
@@ -9873,6 +10148,69 @@ fn verify_existing_cells_visible_reality_report(
     if age_seconds > 24 * 60 * 60 {
         return Err(format!(
             "Cells visible reality report `{}` is {age_seconds}s old; rerun `cargo xtask verify-cells-visible-reality`",
+            report.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_existing_cells_wayland_scroll_speed_report(
+    report: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !report.exists() {
+        return Err(format!(
+            "missing existing Cells Wayland scroll speed report `{}`; run `cargo xtask verify-cells-wayland-scroll-speed --report {}`",
+            report.display(),
+            report.display()
+        )
+        .into());
+    }
+    verify_report_schema(report)?;
+    let report_json = read_json(report)?;
+    let current_commit = git_commit();
+    let report_commit = report_json
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>");
+    if report_commit != current_commit {
+        return Err(format!(
+            "Cells Wayland scroll speed report `{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+            report.display()
+        )
+        .into());
+    }
+    if report_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return Err(format!(
+            "Cells Wayland scroll speed report `{}` did not pass",
+            report.display()
+        )
+        .into());
+    }
+    if report_json
+        .get("display_server")
+        .and_then(serde_json::Value::as_str)
+        != Some("wayland")
+    {
+        return Err(format!(
+            "Cells Wayland scroll speed report `{}` is not Wayland evidence",
+            report.display()
+        )
+        .into());
+    }
+    let generated = report_json
+        .get("generated_at_utc")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{} missing generated_at_utc", report.display()))?
+        .parse::<u64>()?;
+    let age_seconds = current_unix_seconds().saturating_sub(generated);
+    if age_seconds > 24 * 60 * 60 {
+        return Err(format!(
+            "Cells Wayland scroll speed report `{}` is {age_seconds}s old; rerun `cargo xtask verify-cells-wayland-scroll-speed`",
             report.display()
         )
         .into());
@@ -11924,6 +12262,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "audit-goal-readiness"
                 | "audit-manual-readiness"
                 | "verify-runtime-finality"
+                | "verify-cells-wayland-scroll-speed"
         )
     )
 }
@@ -12099,6 +12438,10 @@ fn report_path(name: &str, layer: VerificationLayer) -> PathBuf {
 
 fn cells_visible_reality_report_path() -> PathBuf {
     PathBuf::from("target/reports/cells-visible-reality.json")
+}
+
+fn cells_wayland_scroll_speed_report_path() -> PathBuf {
+    PathBuf::from("target/reports/cells-wayland-scroll-speed.json")
 }
 
 fn manual_template_path(name: &str) -> PathBuf {

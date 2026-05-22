@@ -58,7 +58,9 @@ cargo xtask verify-example-all <name>
 cargo xtask verify-examples-all
 cargo xtask bench-example <name>
 cargo xtask verify-playground-launch
+cargo xtask verify-playground-split-wayland
 cargo xtask verify-playground-custom-source
+cargo xtask verify-cells-wayland-scroll-speed
 cargo xtask verify-report-schema
 cargo xtask audit-goal-readiness
 ```
@@ -79,6 +81,12 @@ macroquad framebuffer screenshots and records the surface controls that should
 be visible before manual testing. It is not an input or manual acceptance
 substitute, and it must not fall back to whole-desktop COSMIC screenshots for
 accepted launch artifacts.
+
+`verify-playground-split-wayland` is the production-style playground launch
+gate. It must run on native Wayland, start a preview window plus a dev/debug
+window, prove the preview/dev IPC handshake, and reject Xvfb/X11 evidence. The
+preview window is the app/runtime authority; the dev window may observe and send
+commands, but slow debug rendering must not block preview frames.
 
 `audit-goal-readiness` also enforces interpreter-phase scope. It rejects
 forbidden first-pass substrates such as Differential Dataflow, actor runtimes,
@@ -142,6 +150,13 @@ native app is a spreadsheet viewport over the 26x100 source grid, not only the
 A0-D0 scenario subset. The Cells aggregate and readiness audits require that
 report in addition to semantic, headed, speed, negative, and operator E2E
 reports.
+
+Cells also requires native Wayland scroll-speed evidence. `verify-cells-wayland-scroll-speed`
+writes `target/reports/cells-wayland-scroll-speed.json`, targets the release
+preview over the full 26x100 grid, injects real Wayland pointer/wheel input, and
+fails unless scroll frame p95 is at or below 16.7 ms and wheel-to-visible-scroll
+p95 is at or below 50 ms. Xvfb/X11, `xdotool`, and synthetic scroll-position
+mutation are not valid evidence for this gate.
 
 The visible surface must be generated from the example's Boon `document`, state,
 and state-summary projection. Generic renderer support for focus styling,

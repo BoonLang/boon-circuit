@@ -991,6 +991,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "audit-goal-readiness"
                 | "audit-manual-readiness"
                 | "verify-runtime-finality"
+                | "verify-cells-wayland-scroll-speed"
         )
     )
 }

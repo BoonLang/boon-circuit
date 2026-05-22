@@ -6,8 +6,9 @@ This plan is for building the first honest Boon Circuit proof in this repo.
 
 The implementation is not successful until all of these are true:
 
-1. A native playground can load and run Boon examples.
-2. The playground includes a code editor and can run custom Boon source.
+1. A native Wayland playground can load and run Boon examples.
+2. The playground opens a production-style preview window and a separate
+   dev/debug window with the code editor visible by default.
 3. TodoMVC is written in local field-equation style, not a central reducer.
 4. TodoMVC can handle many todos without graph growth per todo.
 5. Ordinary TodoMVC does not expose runtime identity, references, or row ids.
@@ -17,7 +18,8 @@ The implementation is not successful until all of these are true:
 9. Every interactive example passes the shared headed/manual/semantic/speed
    verification contract.
 10. Normal interactions complete in a couple of milliseconds in release mode
-    with bounded RAM and VRAM growth.
+    with bounded RAM and VRAM growth, and Cells scrolls at the Wayland 60 FPS
+    gate.
 
 ## Phase 0: Repo Skeleton
 
@@ -293,6 +295,7 @@ Hard gate:
 ```text
 cargo run -p boon_ply_playground
 cargo xtask verify-playground-launch
+cargo xtask verify-playground-split-wayland
 cargo xtask verify-playground-custom-source
 cargo xtask verify-todomvc-all --report target/reports/todomvc-all.json
 cargo xtask verify-example-headed-ply cells
@@ -321,6 +324,11 @@ nonblank screenshots, and writes `target/reports/playground-launch*.json`. It is
 startup/render evidence only; it does not replace headed OS-input or human
 verification.
 
+`verify-playground-split-wayland` is the production-style launch proof. It runs
+on native Wayland, starts the app preview and dev/debug console as separate
+windows, proves the preview/dev IPC handshake, and rejects Xvfb/X11 evidence for
+this gate.
+
 Cells has an additional visible-reality gate because its semantic scenario can
 exercise only a small subset of a much larger spreadsheet.
 `verify-cells-visible-reality` writes
@@ -329,6 +337,13 @@ viewport derived from `Grid/cells(columns: 26, rows: 100)`, including at least
 26 columns, 100 rows, 2600 rendered addressed editors, non-A-D address samples,
 and nonblank screenshot evidence. Semantic/stress evidence for the 26x100
 runtime model is not by itself visible playground parity.
+
+`verify-cells-wayland-scroll-speed` writes
+`target/reports/cells-wayland-scroll-speed.json` and is the accepted Cells scroll
+performance proof. It runs the full 26x100 grid in the Wayland preview, injects
+real pointer/wheel input, and enforces scroll frame p95 <= 16.7 ms plus
+wheel-to-visible-scroll p95 <= 50 ms. Synthetic scroll mutation and Xvfb/X11
+reports cannot satisfy this gate.
 
 The Cells viewport must be declared in `examples/cells.bn` as regular Boon
 `document` data with generic elements and attributes. The playground may
@@ -341,10 +356,12 @@ The playground also owns the shared example verification harness described in
 ```text
 verify-foundation
 verify-playground-launch
+verify-playground-split-wayland
 verify-example-headed-ply
 verify-example-operator-e2e
 verify-example-human
 verify-cells-visible-reality
+verify-cells-wayland-scroll-speed
 verify-example-semantic
 verify-example-ply-headless
 verify-example-speed

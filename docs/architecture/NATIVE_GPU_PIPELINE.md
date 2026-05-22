@@ -32,18 +32,25 @@ lifecycle, or GPU proof fields.
 Use a role-based native executable:
 
 ```text
-boon_native_playground --role preview --example cells
+boon_native_playground --role preview --code-file examples/cells.bn
 boon_native_playground --role dev --connect <preview-socket>
 boon_native_playground --role desktop --example cells
 ```
 
-`--role preview` is the production-shaped app. It owns the runtime, the preview
-window, the preview frame loop, and the preview GPU device/queue. It must not
-depend on any dev/debug widgets being loaded.
+`--role preview` is the production-shaped app. It owns the runtime, the loaded
+Boon code, the preview window, the preview frame loop, and the preview GPU
+device/queue. It renders whatever Boon code is currently loaded as the
+user-facing app surface. It must not receive or branch on example names, and it
+must not depend on any dev/debug widgets being loaded.
 
 `--role dev` opens the dev/debug window. It connects to the preview role through
-the role protocol. It can request source replacement, run/reset/step, and
-subscribe to snapshots, deltas, timings, and diagnostics.
+the role protocol. It shows the example selector, visible code editor, run/reset
+/step controls, logs, inspectors, and diagnostics. Selecting an example in this
+window only loads that example's Boon code into the editor and sends
+`ReplaceCode` to the preview role. The preview window must render the replacement
+code without knowing whether it came from a bundled example, edited source, or a
+custom file. The dev role can also subscribe to snapshots, deltas, timings, and
+diagnostics.
 
 `--role desktop` is only a launcher/supervisor. The hard native path is:
 
@@ -54,6 +61,11 @@ subscribe to snapshots, deltas, timings, and diagnostics.
    window IDs, surface IDs, and frame proofs;
 5. keep preview alive when the dev window closes;
 6. disconnect or terminate dev cleanly when preview closes.
+
+`--role desktop --example <name>` is launcher convenience only. The desktop role
+resolves the example to Boon code plus source hash before launching preview or
+sending commands. Preview argv and preview reports must prove that the preview
+role received `--code-file` or `ReplaceCode`, not `--example`.
 
 For the hard gate, preview and dev are two child processes. Each child owns its
 own `app_window::application::main`, native window, `app_window::Surface`,
@@ -635,7 +647,7 @@ API shape:
 
 ```rust
 pub enum PreviewCommand {
-    ReplaceSource { source: String, expected_hash: String },
+    ReplaceCode { code: String, expected_hash: String },
     Run,
     Reset,
     Step,

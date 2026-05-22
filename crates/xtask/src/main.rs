@@ -54,6 +54,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "explain-todomvc-hardware",
     "verify-cells-headed-ply",
     "verify-cells-headed-focusless",
+    "verify-cells-visible-reality",
     "verify-cells-operator-e2e",
     "verify-cells-human",
     "prepare-cells-human-report",
@@ -128,6 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "verify-cells-headed-ply" => verify_specific("cells", VerificationLayer::HeadedPly, &args),
         "verify-cells-headed-focusless" => verify_headed_focusless("cells", &args),
+        "verify-cells-visible-reality" => verify_cells_visible_reality(&args),
         "verify-cells-operator-e2e" => verify_operator_e2e("cells", &args),
         "verify-cells-human" => verify_human("cells", &args),
         "prepare-cells-human-report" => prepare_human_report("cells", &args),
@@ -1170,7 +1172,7 @@ fn verify_operator_e2e(name: &str, args: &[String]) -> Result<(), Box<dyn std::e
         "report_version": 1,
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "operator-e2e",
-        "command_argv": args,
+        "command_argv": xtask_command_argv(args, &format!("verify-{name}-operator-e2e")),
         "exit_status": 0,
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -1205,6 +1207,16 @@ fn verify_operator_e2e(name: &str, args: &[String]) -> Result<(), Box<dyn std::e
     write_json(&report, &report_json)?;
     verify_existing_operator_e2e_report(name, &report)?;
     Ok(())
+}
+
+fn xtask_command_argv(args: &[String], default_command: &str) -> Vec<String> {
+    let mut command_argv = vec!["cargo".to_owned(), "xtask".to_owned()];
+    if args.is_empty() {
+        command_argv.push(default_command.to_owned());
+    } else {
+        command_argv.extend(args.iter().cloned());
+    }
+    command_argv
 }
 
 fn verify_existing_operator_e2e_report(
@@ -2019,6 +2031,228 @@ fn verify_todomvc_reference_parity(args: &[String]) -> Result<(), Box<dyn std::e
     }
 }
 
+fn verify_cells_visible_reality(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/cells-visible-reality.json"));
+    let smoke_report = report_path.with_file_name("cells-visible-reality-smoke.json");
+    let semantic_report = report_path.with_file_name("cells-visible-reality-semantic.json");
+    let screenshot = smoke_report.with_extension("png");
+
+    let mut command = isolated_smoke_launch_command(
+        "cells",
+        smoke_report
+            .to_str()
+            .ok_or("visible reality smoke report path is not utf-8")?,
+        Some("4"),
+    )?;
+    let status = run_command_with_timeout(&mut command, Duration::from_secs(90))?;
+    if !status.success() {
+        return Err("Cells visible reality smoke launch failed".into());
+    }
+    verify_report_schema(&smoke_report)?;
+
+    let (source, scenario, budget) = example_paths("cells")?;
+    let semantic = run_scenario(
+        &source,
+        &scenario,
+        VerificationLayer::Semantic,
+        Some(&semantic_report),
+    )?;
+    verify_report_schema(&semantic_report)?;
+    let smoke = read_json(&smoke_report)?;
+    let summary = semantic.state_summary;
+    let grid = summary
+        .get("grid")
+        .ok_or("Cells state summary missing grid visible projection")?;
+    let source_columns = grid.get("columns").and_then(serde_json::Value::as_u64);
+    let source_rows = grid.get("rows").and_then(serde_json::Value::as_u64);
+    let viewport_columns = grid
+        .get("viewport_columns")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let viewport_rows = grid
+        .get("viewport_rows")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let viewport_cell_count = grid
+        .get("viewport_cell_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let flat_addresses = summary
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("address").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let grid_row_count = summary
+        .get("grid_rows")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let grid_column_count = summary
+        .get("grid_columns")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let visible_shape = smoke
+        .get("visible_view_shape")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let rendered_cell_count = visible_shape
+        .get("addressed_input_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let node_ids = visible_shape
+        .get("node_ids")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let text_paths = visible_shape
+        .get("text_paths")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let input_paths = visible_shape
+        .get("input_paths")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let scroll_container_ids = visible_shape
+        .get("scroll_container_ids")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let scroll_sync_x = visible_shape
+        .get("scroll_sync_x")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let has_formula_bar_node = node_ids
+        .iter()
+        .any(|value| value.as_str() == Some("spreadsheet_formula_bar"));
+    let has_formula_value_node = node_ids
+        .iter()
+        .any(|value| value.as_str() == Some("formula_value"));
+    let has_selected_formula_binding = input_paths
+        .iter()
+        .any(|value| value.as_str() == Some("selected_input.edit_value"));
+    let formula_bar_routes_to_selected_cell = input_paths
+        .iter()
+        .any(|value| value.as_str() == Some("selected_input.change_source"))
+        && input_paths
+            .iter()
+            .any(|value| value.as_str() == Some("selected_input.submit_source"))
+        && input_paths
+            .iter()
+            .any(|value| value.as_str() == Some("selected_input.address"));
+    let has_spreadsheet_body_scroll = scroll_container_ids
+        .iter()
+        .any(|value| value.as_str() == Some("spreadsheet_body"));
+    let has_header_scroll_sync = scroll_container_ids
+        .iter()
+        .any(|value| value.as_str() == Some("spreadsheet_header"))
+        && scroll_sync_x.iter().any(|value| {
+            value.get("target").and_then(serde_json::Value::as_str) == Some("spreadsheet_header")
+                && value.get("source").and_then(serde_json::Value::as_str)
+                    == Some("spreadsheet_body")
+        });
+    let screenshot_hash = boon_runtime::sha256_file(&screenshot)?;
+    let nonblank = smoke
+        .get("nonblank_screenshot_hashes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let checks = vec![
+        json!({"id": "source-grid-26x100", "pass": source_columns == Some(26) && source_rows == Some(100), "actual": {"columns": source_columns, "rows": source_rows}}),
+        json!({"id": "viewport-uses-all-26-columns", "pass": viewport_columns == 26 && grid_column_count == 26, "actual": {"viewport_columns": viewport_columns, "grid_column_count": grid_column_count}}),
+        json!({"id": "viewport-has-official-100-rows", "pass": viewport_rows == 100 && grid_row_count == 100, "actual": {"viewport_rows": viewport_rows, "grid_row_count": grid_row_count}}),
+        json!({"id": "flat-visible-projection-covers-official-26x100-grid", "pass": flat_addresses.len() as u64 == viewport_cell_count && viewport_cell_count == 2600, "actual": {"flat_visible_count": flat_addresses.len(), "viewport_cell_count": viewport_cell_count}}),
+        json!({"id": "visible-address-samples-include-official-grid-edges", "pass": flat_addresses.iter().any(|address| address == "Z0") && flat_addresses.iter().any(|address| address == "A99") && flat_addresses.iter().any(|address| address == "Z99"), "required": ["Z0", "A99", "Z99"]}),
+        json!({"id": "render-tree-addressed-input-count", "pass": rendered_cell_count == viewport_cell_count && rendered_cell_count >= 2600, "actual": rendered_cell_count}),
+        json!({"id": "render-tree-address-samples-beyond-a0-d0", "pass": visible_shape.get("address_samples_after_first_four").and_then(serde_json::Value::as_array).is_some_and(|items| !items.is_empty()), "samples": visible_shape.get("address_samples_after_first_four").cloned().unwrap_or_else(|| json!([]))}),
+        json!({"id": "render-tree-formula-bar-editable-and-bound-to-selected-input", "pass": has_formula_bar_node && has_formula_value_node && has_selected_formula_binding && formula_bar_routes_to_selected_cell, "actual": {"node_ids": node_ids, "text_paths": text_paths, "input_paths": input_paths}}),
+        json!({"id": "render-tree-scrollable-spreadsheet-body", "pass": has_spreadsheet_body_scroll, "actual": {"scroll_container_ids": scroll_container_ids}}),
+        json!({"id": "render-tree-column-header-scrolls-with-grid", "pass": has_header_scroll_sync, "actual": {"scroll_container_ids": scroll_container_ids, "scroll_sync_x": scroll_sync_x}}),
+        json!({"id": "nonblank-screenshot", "pass": nonblank.get("nonzero_channels").and_then(serde_json::Value::as_u64).unwrap_or_default() > 0 && nonblank.get("unique_rgba_values").and_then(serde_json::Value::as_u64).unwrap_or_default() > 1, "artifact": nonblank}),
+    ];
+    let blockers = checks
+        .iter()
+        .filter(|check| check.get("pass").and_then(serde_json::Value::as_bool) != Some(true))
+        .filter_map(|check| check.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let artifacts = [
+        smoke_report.clone(),
+        semantic_report.clone(),
+        screenshot.clone(),
+        PathBuf::from("docs/plans/CELLS_PLAYGROUND_REALITY_PARITY_PLAN.md"),
+        PathBuf::from("docs/examples/CELLS_CIRCUIT_STYLE.md"),
+    ];
+    let report = json!({
+        "status": if blockers.is_empty() { "pass" } else { "fail" },
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-cells-visible-reality",
+        "command_argv": xtask_command_argv(args, "verify-cells-visible-reality"),
+        "layer": "visible-reality",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "source_path": source.display().to_string(),
+        "source_hash": boon_runtime::sha256_file(&source)?,
+        "scenario_path": scenario.display().to_string(),
+        "scenario_hash": boon_runtime::sha256_file(&scenario)?,
+        "program_hash": boon_runtime::sha256_file(&source)?,
+        "budget_hash": boon_runtime::sha256_file(&budget)?,
+        "graph_node_count": semantic.report.get("graph_node_count").cloned().unwrap_or_else(|| json!(0)),
+        "per_step_pass_fail": checks,
+        "artifact_sha256s": artifacts.iter().filter(|path| path.exists()).map(|path| json!({
+            "path": path.display().to_string(),
+            "sha256": boon_runtime::sha256_file(path).unwrap_or_else(|_| "missing".to_owned())
+        })).collect::<Vec<_>>(),
+        "source_grid_dimensions": {
+            "columns": source_columns,
+            "rows": source_rows
+        },
+        "viewport_dimensions": {
+            "columns": viewport_columns,
+            "rows": viewport_rows,
+            "cell_count": viewport_cell_count
+        },
+        "rendered_cell_count": rendered_cell_count,
+        "visible_address_samples": {
+            "first": flat_addresses.iter().take(12).cloned().collect::<Vec<_>>(),
+            "beyond_a0_d0": flat_addresses.iter().filter(|address| !matches!(address.as_str(), "A0" | "B0" | "C0" | "D0")).take(12).cloned().collect::<Vec<_>>(),
+            "last": flat_addresses.last().cloned(),
+            "required_present": ["Z0", "A99", "Z99"]
+        },
+        "render_tree_visible_shape": visible_shape,
+        "screenshot_path": screenshot.display().to_string(),
+        "screenshot_sha256": screenshot_hash,
+        "nonblank_screenshot_hashes": [nonblank],
+        "linked_reports": {
+            "smoke_report": smoke_report.display().to_string(),
+            "semantic_report": semantic_report.display().to_string()
+        },
+        "blockers": blockers
+    });
+    write_json(&report_path, &report)?;
+    if report.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+        verify_report_schema(&report_path)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "Cells visible reality failed; report written to `{}`",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
 fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report_path = report_arg(args)
         .unwrap_or_else(|| PathBuf::from("target/reports/playground-genericity.json"));
@@ -2118,7 +2352,7 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
         "todo_new_input",
         "todo_row",
         "cells",
-        "cell_editor_A1",
+        "cell_editor_A0",
     ];
     for (category, start, end) in [
         (
@@ -3067,7 +3301,7 @@ fn audit_playground_probe_specificity(
         for token in [
             "todo_new_input",
             "todo_row",
-            "cell_editor_A1",
+            "cell_editor_A0",
             "todomvc",
             "cells",
         ] {
@@ -4496,7 +4730,7 @@ fn verify_playground_custom_source(args: &[String]) -> Result<(), Box<dyn std::e
                         "step_limit": 3,
                         "expected_grid_dimensions": {"columns": 3, "rows": 4},
                         "actual_grid_initializer": cells_output.report["ir_debug_tables"]["lists"][0]["initializer"].clone(),
-                        "a1_value_after_commit": cells_output.state_summary["cells"][0]["value"].clone()
+                        "a0_value_after_commit": cells_output.state_summary["cells"][0]["value"].clone()
                     },
                     "original_full_scenario_rejected_custom_grid_shape": true,
                     "original_full_scenario_rejection": original_cells_scenario_error
@@ -4573,6 +4807,7 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 "cargo xtask verify-os-input-probe --report target/reports/os-input-probe.json",
                 "BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply",
                 "BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply",
+                "cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json",
                 "cargo xtask verify-todomvc-speed",
                 "cargo xtask verify-cells-speed",
                 "cargo xtask verify-todomvc-negative",
@@ -4610,6 +4845,7 @@ fn write_manual_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error
             ],
             "final_aggregate": [
                 "cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json",
+                "cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json",
                 "cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json",
                 "cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json",
                 "cargo xtask audit-manual-readiness --report target/reports/debug/manual-readiness.json",
@@ -4636,6 +4872,13 @@ fn current_handoff_blockers() -> Vec<String> {
         if !all.exists() {
             blockers.push(format!("missing aggregate report `{}`", all.display()));
         }
+    }
+    let cells_visible = cells_visible_reality_report_path();
+    if verify_existing_cells_visible_reality_report(&cells_visible).is_err() {
+        blockers.push(format!(
+            "missing fresh Cells visible reality report `{}`",
+            cells_visible.display()
+        ));
     }
     blockers
 }
@@ -5353,6 +5596,10 @@ fn audit_example_readiness(
         }
     }
 
+    if name == "cells" {
+        audit_cells_visible_reality(checks, blockers);
+    }
+
     audit_manual_template_readiness(name, checks, blockers)?;
 
     let human_report = report_path(name, VerificationLayer::Human);
@@ -5381,6 +5628,34 @@ fn audit_example_readiness(
         ),
     }
     Ok(())
+}
+
+fn audit_cells_visible_reality(checks: &mut Vec<serde_json::Value>, blockers: &mut Vec<String>) {
+    let report = cells_visible_reality_report_path();
+    match verify_existing_cells_visible_reality_report(&report) {
+        Ok(()) => push_audit_check(
+            checks,
+            blockers,
+            "cells:visible-reality:fresh-current-report",
+            true,
+            format!(
+                "{} proves the visible Cells viewport matches the 26x100 source grid",
+                report.display()
+            ),
+            None,
+        ),
+        Err(error) => push_audit_check(
+            checks,
+            blockers,
+            "cells:visible-reality:fresh-current-report",
+            false,
+            error.to_string(),
+            Some(format!(
+                "Cells visible reality report `{}` is missing, stale, or invalid: {error}",
+                report.display()
+            )),
+        ),
+    }
 }
 
 fn audit_example_machine_readiness(
@@ -5464,6 +5739,10 @@ fn audit_example_machine_readiness(
         if matches!(layer, VerificationLayer::Negative) {
             audit_negative_report_contract(name, &report, &report_json, checks, blockers);
         }
+    }
+
+    if name == "cells" {
+        audit_cells_visible_reality(checks, blockers);
     }
 
     audit_manual_template_readiness(name, checks, blockers)?;
@@ -6862,20 +7141,20 @@ const REQUIRED_TODOMVC_SCENARIO_IDS: &[&str] = &[
 
 const REQUIRED_CELLS_SCENARIO_IDS: &[&str] = &[
     "initial",
-    "edit-a1-literal",
-    "commit-a1-literal",
-    "edit-a1-cancel-draft",
-    "cancel-a1-draft",
-    "commit-b1-formula",
-    "change-a1-updates-b1",
+    "edit-a0-literal",
+    "commit-a0-literal",
+    "edit-a0-cancel-draft",
+    "cancel-a0-draft",
+    "commit-b0-formula",
+    "change-a0-updates-b0",
     "cycle-error",
-    "replace-b1-formula-removes-stale-cycle-edge",
-    "a1-recomputes-after-cycle-break",
-    "change-a1-after-edge-replacement-does-not-recompute-b1",
-    "commit-c1-fanout-formula",
-    "commit-d1-fanout-formula",
-    "change-a1-fanout-recomputes-dependents-only",
-    "d1-updated-by-fanout",
+    "replace-b0-formula-removes-stale-cycle-edge",
+    "a0-recomputes-after-cycle-break",
+    "change-a0-after-edge-replacement-does-not-recompute-b0",
+    "commit-c0-fanout-formula",
+    "commit-d0-fanout-formula",
+    "change-a0-fanout-recomputes-dependents-only",
+    "d0-updated-by-fanout",
 ];
 
 fn audit_cli_scenario_reports(
@@ -8911,6 +9190,7 @@ fn documented_xtask_commands() -> &'static [&'static str] {
         "explain-todomvc-hardware",
         "verify-cells-headed-ply",
         "verify-cells-headed-focusless",
+        "verify-cells-visible-reality",
         "verify-cells-operator-e2e",
         "verify-cells-human",
         "prepare-cells-human-report",
@@ -9193,6 +9473,7 @@ fn xtask_command_supported(command: &str) -> bool {
             | "verify-cells-ply-headless"
             | "verify-cells-headed-ply"
             | "verify-cells-headed-focusless"
+            | "verify-cells-visible-reality"
             | "verify-cells-operator-e2e"
             | "verify-cells-human"
             | "prepare-cells-human-report"
@@ -9270,6 +9551,26 @@ fn verify_all_with_optional_report(
         }
         reports.push(report);
     }
+    if name == "cells" {
+        let report = cells_visible_reality_report_path();
+        let result = if check_existing {
+            verify_existing_cells_visible_reality_report(&report)
+        } else {
+            verify_cells_visible_reality(&[])
+        };
+        if let Err(error) = result {
+            write_all_blocked_debug_report(
+                name,
+                args,
+                &reports,
+                VerificationLayer::All,
+                &report,
+                &error.to_string(),
+            )?;
+            return Err(error);
+        }
+        reports.push(report);
+    }
     for report in &reports {
         verify_report_schema(report)?;
     }
@@ -9324,6 +9625,47 @@ fn verify_existing_layer_report(
     } else {
         verify_report_schema(report)
     }
+}
+
+fn verify_existing_cells_visible_reality_report(
+    report: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !report.exists() {
+        return Err(format!(
+            "missing existing Cells visible reality report `{}`; run `cargo xtask verify-cells-visible-reality --report {}`",
+            report.display(),
+            report.display()
+        )
+        .into());
+    }
+    verify_report_schema(report)?;
+    let report_json = read_json(report)?;
+    let current_commit = git_commit();
+    let report_commit = report_json
+        .get("git_commit")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>");
+    if report_commit != current_commit {
+        return Err(format!(
+            "Cells visible reality report `{}` was generated for git commit `{report_commit}`, current commit is `{current_commit}`",
+            report.display()
+        )
+        .into());
+    }
+    let generated = report_json
+        .get("generated_at_utc")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{} missing generated_at_utc", report.display()))?
+        .parse::<u64>()?;
+    let age_seconds = current_unix_seconds().saturating_sub(generated);
+    if age_seconds > 24 * 60 * 60 {
+        return Err(format!(
+            "Cells visible reality report `{}` is {age_seconds}s old; rerun `cargo xtask verify-cells-visible-reality`",
+            report.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn verify_existing_full_headed_report(
@@ -11541,6 +11883,10 @@ fn required_value_arg(args: &[String], flag: &str) -> Result<String, Box<dyn std
 
 fn report_path(name: &str, layer: VerificationLayer) -> PathBuf {
     PathBuf::from(format!("target/reports/{name}-{}.json", layer.as_str()))
+}
+
+fn cells_visible_reality_report_path() -> PathBuf {
+    PathBuf::from("target/reports/cells-visible-reality.json")
 }
 
 fn manual_template_path(name: &str) -> PathBuf {

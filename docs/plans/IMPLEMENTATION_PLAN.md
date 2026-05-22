@@ -321,6 +321,19 @@ nonblank screenshots, and writes `target/reports/playground-launch*.json`. It is
 startup/render evidence only; it does not replace headed OS-input or human
 verification.
 
+Cells has an additional visible-reality gate because its semantic scenario can
+exercise only a small subset of a much larger spreadsheet.
+`verify-cells-visible-reality` writes
+`target/reports/cells-visible-reality.json` and must prove a visible spreadsheet
+viewport derived from `Grid/cells(columns: 26, rows: 100)`, including at least
+26 columns, 100 rows, 2600 rendered addressed editors, non-A-D address samples,
+and nonblank screenshot evidence. Semantic/stress evidence for the 26x100
+runtime model is not by itself visible playground parity.
+
+The Cells viewport must be declared in `examples/cells.bn` with generic `VIEW`
+components and generic attributes. The playground may interpret those generic
+attributes, but it must not render a hardcoded Cells-specific spreadsheet.
+
 The playground also owns the shared example verification harness described in
 [EXAMPLE_VERIFICATION_PLAN.md](EXAMPLE_VERIFICATION_PLAN.md):
 
@@ -330,6 +343,7 @@ verify-playground-launch
 verify-example-headed-ply
 verify-example-operator-e2e
 verify-example-human
+verify-cells-visible-reality
 verify-example-semantic
 verify-example-ply-headless
 verify-example-speed
@@ -379,6 +393,7 @@ cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
 cargo test -p boon_runtime cells
 cargo xtask verify-cells-headed-ply
 cargo xtask verify-cells-human
+cargo xtask verify-cells-visible-reality
 cargo xtask verify-cells-semantic
 cargo xtask verify-cells-ply-headless
 cargo xtask verify-cells-speed

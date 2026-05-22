@@ -18,6 +18,7 @@ cargo xtask verify-playground-custom-source
 cargo xtask verify-os-input-probe --report target/reports/os-input-probe.json
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
 BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
+cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json
 cargo xtask verify-todomvc-speed
 cargo xtask verify-cells-speed
 cargo xtask verify-todomvc-negative
@@ -272,6 +273,9 @@ The tester must interact with the visible Cells surface and verify every label
 from `examples/cells.scn`, including literal edits, Enter commit, Escape cancel,
 formula dependencies, cycle errors, stale edge replacement, and fanout
 recompute.
+The visible grid, focused-cell styling, edit-formula/display-value behavior, and
+scrolling must come from `examples/cells.bn` through generic playground
+components, not from a hardcoded Cells renderer.
 
 Record the session timing and checkpoint artifact the same way:
 
@@ -339,6 +343,7 @@ For final automated/operator acceptance:
 ```bash
 cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
 cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
+cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json
 cargo xtask verify-todomvc-all --check-existing --report target/reports/todomvc-all.json
 cargo xtask verify-cells-all --check-existing --report target/reports/cells-all.json
 cargo xtask verify-examples-all --check-existing --report target/reports/examples-all.json

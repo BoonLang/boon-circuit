@@ -146,7 +146,7 @@ stores only todo field data in its row value; key/generation mechanics are owned
 by the list memory layer. Row source bindings are derived from parsed `SOURCE`
 ports in the Boon row template, not from a fixed Rust list of TodoMVC element
 names. Cells uses the same hidden grid slots for protocol deltas; visible
-spreadsheet addresses such as `A1` remain ordinary domain data and are not hashed
+spreadsheet addresses such as `A0` remain ordinary domain data and are not hashed
 into runtime identity.
 
 ## D6. SOURCE Is Canonical
@@ -501,7 +501,7 @@ hover-only render affordances still use the UI action target because they do not
 produce a Boon source event. Cells uses the same boundary: source events carry
 the visible address plus optional text, and the compiled branch table
 distinguishes edit, commit, and cancel sources without reparsing UI target
-labels such as "A1 editor". Those source routes are now precomputed in the
+labels such as "A0 editor". Those source routes are now precomputed in the
 compiled runtime plan from scalar branches, derived text transforms, and list
 remove operations, so normal ticks no longer scan those tables just to classify
 a source. Source-route scalar targets also carry their compiled branch
@@ -641,7 +641,7 @@ same routed source event for row-addressed edit, commit, and cancel source
 events; commit is detected from the compiled `formula_text` target instead of a
 concrete adapter lookup. The action input for Cells resolves row context
 generically by looking up the `address` field in the keyed `cells` list, so the
-runtime no longer converts `A1`/`B1` to list indexes in a Cells surface driver
+runtime no longer converts `A0`/`B0` to list indexes in a Cells surface driver
 before applying source actions.
 TodoMVC row source paths now use a generic list-index action-input helper that
 validates the compiled source route targets the `todos` list before applying
@@ -750,7 +750,7 @@ two-variable override:
 `BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1`.
 It records three intermediate OS-input slices. First, it focuses one real
 visible application text control in the preview
-(`todo_new_input` for TodoMVC or `cell_editor_A1` for Cells), sends real OS
+(`todo_new_input` for TodoMVC or `cell_editor_A0` for Cells), sends real OS
 keyboard text through the selected OS keyboard backend, observes the text
 through Ply state, captures the control screenshot, and stores the control
 bounds and artifact hash. Second,

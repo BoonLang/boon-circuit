@@ -19,7 +19,7 @@ FUNCTION new_cell(seed) {
         address: seed.address
 
         editing_text:
-            TEXT {} |> HOLD draft {
+            seed.default_formula |> HOLD draft {
                 LATEST {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
@@ -28,7 +28,7 @@ FUNCTION new_cell(seed) {
             }
 
         formula_text:
-            TEXT {} |> HOLD formula_text {
+            seed.default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
                 }
@@ -58,11 +58,29 @@ FUNCTION new_cell(seed) {
 }
 
 VIEW {
-    ForEach cells as cell {
-        Row id=cell_row height=40 {
-            Text value=$cell.address size=15
-            Input id=cell_editor key=$cell.address value=$cell.formula placeholder=$cell.formula change=cell.sources.editor.change submit=cell.sources.editor.commit cancel=cell.sources.editor.cancel address=$cell.address size=14
-            Text template="= {cell.value} {cell.error}" size=15
+    Column id=spreadsheet_view width=1000 bg=#F6F8FB gap=4 padding=8 border=#CBD5E1 {
+        Row id=spreadsheet_formula_bar height=34 bg=#F6F8FB gap=4 padding=0 {
+            Text value=$selected_input.address width=40 height=30 bg=#E4EAF2 color=#344256 center=true size=10
+            Text value="fx" width=24 height=30 bg=#E4EAF2 color=#344256 center=true size=10
+            Column id=formula_value height=30 bg=#FFFFFF padding=0 border=#CBD5E1 {
+                Input id=formula_editor width=fill height=30 value=$selected_input.edit_value edit_value=$selected_input.edit_value display_value=$selected_input.edit_value placeholder="" change=$selected_input.change_source submit=$selected_input.submit_source cancel=$selected_input.cancel_source address=$selected_input.address focus_proxy=true size=12 bg=#FFFFFF border=#CBD5E1 focused_bg=#FFFFFF focused_border=#2F6FB8
+            }
+        }
+        Row id=spreadsheet_header height=26 bg=#E4EAF2 gap=1 padding=0 scroll_x=true sync_scroll_x=spreadsheet_body {
+            Text value="" width=40 height=24 bg=#D5DDE8 center=true size=10
+            ForEach grid_columns as column {
+                Text value=$column.label width=80 height=24 bg=#D5DDE8 color=#344256 center=true size=10
+            }
+        }
+        Column id=spreadsheet_body height=520 bg=#FFFFFF gap=1 padding=0 scroll=true scrollbar=true {
+            ForEach grid_rows as grid_row {
+                Row id=spreadsheet_row height=26 bg=#FFFFFF gap=1 padding=0 {
+                    Text value=$grid_row.row_number width=40 height=24 bg=#EDF1F6 color=#4A5A70 center=true size=10
+                    ForEach grid_row.cells as cell {
+                        Input id=cell_editor key=$cell.address width=80 height=24 value=$cell.value edit_value=$cell.editing_text display_value=$cell.value placeholder=$cell.value change=cell.sources.editor.change submit=cell.sources.editor.commit cancel=cell.sources.editor.cancel address=$cell.address size=10 bg=#FFFFFF border=#D9E2EC focused_bg=#FFF7D6 focused_border=#2F6FB8
+                    }
+                }
+            }
         }
     }
 }

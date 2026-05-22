@@ -977,6 +977,9 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report_layer_is(&report, "human") {
         verify_human_artifacts(&report, path)?;
     }
+    if report_command_is(&report, "verify-cells-visible-reality") {
+        verify_cells_visible_reality_report(&report, path)?;
+    }
     Ok(())
 }
 
@@ -2045,6 +2048,122 @@ fn verify_playground_surface_report(report: &JsonValue, report_path: &Path) -> R
                 .into());
             }
         }
+    }
+    Ok(())
+}
+
+fn verify_cells_visible_reality_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let dimensions = report
+        .get("source_grid_dimensions")
+        .ok_or_else(|| format!("{} missing source_grid_dimensions", report_path.display()))?;
+    if dimensions.get("columns").and_then(JsonValue::as_u64) != Some(26)
+        || dimensions.get("rows").and_then(JsonValue::as_u64) != Some(100)
+    {
+        return Err(format!(
+            "{} Cells visible reality report is not bound to the 26x100 source grid",
+            report_path.display()
+        )
+        .into());
+    }
+    let viewport = report
+        .get("viewport_dimensions")
+        .ok_or_else(|| format!("{} missing viewport_dimensions", report_path.display()))?;
+    let viewport_columns = viewport
+        .get("columns")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let viewport_rows = viewport
+        .get("rows")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let viewport_cells = viewport
+        .get("cell_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if viewport_columns < 26 || viewport_rows < 100 || viewport_cells < 2600 {
+        return Err(format!(
+            "{} Cells visible viewport is too small: columns={viewport_columns}, rows={viewport_rows}, cells={viewport_cells}",
+            report_path.display()
+        )
+        .into());
+    }
+    let rendered = report
+        .get("rendered_cell_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    if rendered < viewport_cells {
+        return Err(format!(
+            "{} rendered only {rendered} addressed inputs for {viewport_cells} visible cells",
+            report_path.display()
+        )
+        .into());
+    }
+    let samples = report
+        .get("visible_address_samples")
+        .ok_or_else(|| format!("{} missing visible_address_samples", report_path.display()))?;
+    let has_required = samples
+        .get("required_present")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|items| {
+            let values = items
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect::<BTreeSet<_>>();
+            values.contains("Z0") && values.contains("A99") && values.contains("Z99")
+        });
+    if !has_required {
+        return Err(format!(
+            "{} visible address samples do not prove non-A-D spreadsheet cells",
+            report_path.display()
+        )
+        .into());
+    }
+    let screenshot = report
+        .get("screenshot_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing screenshot_path", report_path.display()))?;
+    let expected_hash = report
+        .get("screenshot_sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing screenshot_sha256", report_path.display()))?;
+    let actual_hash = sha256_file(Path::new(screenshot))?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "{} has stale screenshot_sha256 for `{screenshot}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let nonblank = report
+        .get("nonblank_screenshot_hashes")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} missing nonblank_screenshot_hashes",
+                report_path.display()
+            )
+        })?;
+    let proved_nonblank = nonblank.iter().any(|entry| {
+        entry
+            .get("nonzero_channels")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_default()
+            > 0
+            && entry
+                .get("unique_rgba_values")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or_default()
+                > 1
+    });
+    if !proved_nonblank {
+        return Err(format!(
+            "{} Cells visible reality screenshot is blank",
+            report_path.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -4446,7 +4565,7 @@ impl LoadedRuntime {
             LoadedRuntimeSurface::Todo(state) => {
                 generic.todomvc_summary(state.stale_source_drop_count)
             }
-            LoadedRuntimeSurface::Cells(_) => generic.cells_summary(),
+            LoadedRuntimeSurface::Cells(state) => generic.cells_summary(state.columns, state.rows),
         }
     }
 
@@ -5038,7 +5157,7 @@ fn assert_loaded_todomvc_generic_fields(generic: &GenericScheduledRuntime) -> Ru
 }
 
 fn initialize_loaded_cells_generic(
-    generic: GenericScheduledRuntime,
+    mut generic: GenericScheduledRuntime,
     ir: &TypedProgram,
 ) -> RuntimeResult<(GenericScheduledRuntime, CellsRuntimeState)> {
     let (columns, rows) =
@@ -5053,20 +5172,49 @@ fn initialize_loaded_cells_generic(
     }
     let mut cells = Vec::with_capacity(expected_len);
     cells.resize_with(expected_len, Cell::default);
-    Ok((
-        generic,
-        CellsRuntimeState {
-            cells,
-            dependency_cache: GenericFormulaDependencyCache::with_capacity(expected_len),
-            evaluation_cache: GenericFormulaEvaluationCache::with_capacity(expected_len),
-            columns,
-            rows,
-            interned_texts: Vec::new(),
-            step_recomputed: Vec::with_capacity(8),
-            dirty_key_sets: DirtyKeySets::with_capacity(expected_len.min(128).max(16)),
-            last_recompute_candidates: 0,
-        },
-    ))
+    let mut state = CellsRuntimeState {
+        cells,
+        dependency_cache: GenericFormulaDependencyCache::with_capacity(expected_len),
+        evaluation_cache: GenericFormulaEvaluationCache::with_capacity(expected_len),
+        columns,
+        rows,
+        interned_texts: Vec::new(),
+        step_recomputed: Vec::with_capacity(8),
+        dirty_key_sets: DirtyKeySets::with_capacity(expected_len.min(128).max(16)),
+        last_recompute_candidates: 0,
+    };
+    initialize_loaded_cells_from_generic(&mut generic, &mut state)?;
+    Ok((generic, state))
+}
+
+fn initialize_loaded_cells_from_generic(
+    generic: &mut GenericScheduledRuntime,
+    state: &mut CellsRuntimeState,
+) -> RuntimeResult<()> {
+    generic.formula_equations.expect_cells_pipeline()?;
+    for index in 0..state.cells.len() {
+        let formula = generic.list_row_textlike("cells", index, "formula_text")?;
+        state.cells[index].parsed =
+            generic
+                .formula_equations
+                .parse_cell_formula(formula, state.columns, state.rows)?;
+        replace_loaded_cell_dependencies(generic, state, index)?;
+    }
+    state.evaluation_cache.begin_tick();
+    for index in 0..state.cells.len() {
+        let _ = state.evaluation_cache.eval_cell(&state.cells, index);
+    }
+    for index in 0..state.cells.len() {
+        let result = state.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
+        GenericFormulaEvaluationCache::apply_result_to_cell(
+            index,
+            index,
+            result,
+            &mut state.cells[index],
+        )?;
+        sync_loaded_cell_derived_fields(generic, state, index)?;
+    }
+    Ok(())
 }
 
 fn prepare_loaded_cells_scenario(
@@ -8647,27 +8795,68 @@ impl GenericScheduledRuntime {
         active_count == 0 && completed_count > 0
     }
 
-    fn cells_summary(&self) -> JsonValue {
-        let interesting = ["A1", "B1", "C1", "D1"];
-        json!({
-            "cells": interesting.iter().map(|address| {
-                self.cell_summary(address).unwrap_or_else(|error| {
-                    json!({
-                        "address": address,
-                        "error": error.to_string()
-                    })
+    fn cells_summary(&self, columns: usize, rows: usize) -> JsonValue {
+        let viewport_columns = columns.min(26);
+        let viewport_rows = rows.min(100);
+        let visible_cells = (0..viewport_rows)
+            .flat_map(|row| {
+                (0..viewport_columns).map(move |column| {
+                    let index = row * columns + column;
+                    let mut address = String::new();
+                    push_cell_address(columns, index, &mut address);
+                    self.cell_summary_at(index, address)
                 })
-            }).collect::<Vec<_>>(),
+            })
+            .collect::<Vec<_>>();
+        let grid_columns = (0..viewport_columns)
+            .map(|column| {
+                let mut label = String::new();
+                push_spreadsheet_column_label(column, &mut label);
+                json!({
+                    "label": label,
+                    "index": column + 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let grid_rows = visible_cells
+            .chunks(viewport_columns.max(1))
+            .enumerate()
+            .map(|(row_index, cells)| {
+                json!({
+                    "row_number": row_index,
+                    "cells": cells
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "grid": {
+                "columns": columns,
+                "rows": rows,
+                "total_cells": columns.saturating_mul(rows),
+                "viewport_columns": viewport_columns,
+                "viewport_rows": viewport_rows,
+                "viewport_cell_count": visible_cells.len(),
+                "viewport_kind": "scrollable_spreadsheet_grid"
+            },
+            "grid_columns": grid_columns,
+            "grid_rows": grid_rows,
+            "cells": visible_cells,
         })
     }
 
-    fn cell_summary(&self, address: &str) -> RuntimeResult<JsonValue> {
-        let index = self.cell_index_by_address(address)?;
-        let mut row = self.storage.list_row_fields_json(
-            "cells",
-            index,
-            &["address", "formula_text", "editing_text", "editing"],
-        )?;
+    fn cell_summary_at(&self, index: usize, address: String) -> JsonValue {
+        let formula = self
+            .storage
+            .list_row_textlike_opt("cells", index, "formula_text")
+            .unwrap_or("");
+        let editing_text = self
+            .storage
+            .list_row_textlike_opt("cells", index, "editing_text")
+            .unwrap_or("");
+        let editing = self
+            .storage
+            .list_row_bool_opt("cells", index, "editing")
+            .unwrap_or(false);
         let value = self
             .storage
             .list_row_textlike_opt("cells", index, "value")
@@ -8684,15 +8873,15 @@ impl GenericScheduledRuntime {
             .filter(|dependency| !dependency.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Ok(json!({
-            "address": row.remove("address").unwrap_or_else(|| json!(address)),
-            "formula": row.remove("formula_text").unwrap_or_else(|| json!("")),
-            "editing_text": row.remove("editing_text").unwrap_or_else(|| json!("")),
+        json!({
+            "address": address,
+            "formula": formula,
+            "editing_text": editing_text,
+            "editing": editing,
             "value": value,
             "error": error,
-            "editing": row.remove("editing").unwrap_or_else(|| json!(false)),
-            "dependencies": dependencies,
-        }))
+            "dependencies": dependencies
+        })
     }
 
     fn prepare_todomvc_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
@@ -9095,11 +9284,15 @@ impl GenericCircuitRuntime {
                                 "{}{}",
                                 spreadsheet_column_label(column)
                                     .ok_or("grid column label is out of range")?,
-                                row + 1
+                                row
                             );
                             let mut seed_fields = ValueColumns::default();
                             seed_fields
                                 .insert_value("address".to_owned(), FieldValue::Text(address));
+                            seed_fields.insert_value(
+                                "default_formula".to_owned(),
+                                FieldValue::Text(default_cells_formula(column, row)),
+                            );
                             let mut row = row_template.materialize(seed_fields)?;
                             seed_indexed_formula_fields(ir, &row_scope, &mut row);
                             grid_rows.push(row);
@@ -9299,6 +9492,7 @@ impl GenericCircuitRuntime {
         Ok(values)
     }
 
+    #[cfg(test)]
     fn list_row_fields_json(
         &self,
         list: &str,
@@ -10782,7 +10976,7 @@ fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
             let address = format!(
                 "{}{}",
                 spreadsheet_column_label(column).unwrap_or_else(|| "?".to_owned()),
-                row + 1
+                row
             );
             cell_generic_row(&address)
         })
@@ -13595,6 +13789,12 @@ enum FormulaAst {
     Number(i64),
     Cell(usize),
     Binary(FormulaTerm, FormulaOp, FormulaTerm),
+    Add(FormulaTerm, FormulaTerm),
+    SumRange {
+        start_index: usize,
+        end_index: usize,
+        step: usize,
+    },
     ParseError,
 }
 
@@ -14058,10 +14258,14 @@ impl GenericFormulaEvaluationCache {
         let previous_error = cell.error;
         match result {
             Ok(value) => {
-                cell.value_number = Some(value);
                 cell.error = None;
                 cell.value.clear();
-                write!(&mut cell.value, "{value}")?;
+                if matches!(cell.parsed, FormulaAst::Empty) {
+                    cell.value_number = None;
+                } else {
+                    cell.value_number = Some(value);
+                    write!(&mut cell.value, "{value}")?;
+                }
             }
             Err(error) => {
                 cell.value_number = None;
@@ -14093,6 +14297,24 @@ impl GenericFormulaEvaluationCache {
                     FormulaOp::Divide if right == 0 => Err("div_by_zero"),
                     FormulaOp::Divide => Ok(left / right),
                 }
+            }
+            FormulaAst::Add(left, right) => {
+                let left = self.eval_term(cells, left)?;
+                let right = self.eval_term(cells, right)?;
+                Ok(left + right)
+            }
+            FormulaAst::SumRange {
+                start_index,
+                end_index,
+                step,
+            } => {
+                let mut sum = 0i64;
+                let mut index = start_index;
+                while index <= end_index {
+                    sum += self.eval_cell(cells, index)?;
+                    index = index.saturating_add(step);
+                }
+                Ok(sum)
             }
             FormulaAst::ParseError => Err("parse_error"),
         }
@@ -14594,7 +14816,7 @@ impl CellsRuntime {
 
 fn push_cell_address(columns: usize, index: usize, output: &mut String) {
     let col = index % columns;
-    let row = index / columns + 1;
+    let row = index / columns;
     push_spreadsheet_column_label(col, output);
     write!(output, "{row}").expect("writing to String cannot fail");
 }
@@ -14631,6 +14853,26 @@ fn parse_formula_ast(formula: &str, columns: usize, rows: usize) -> FormulaAst {
         return FormulaAst::Number(value);
     }
     let expr = trimmed.strip_prefix('=').unwrap_or(trimmed);
+    if let Some((left, right)) = parse_two_arg_function(expr, "add") {
+        let Some(left) = parse_formula_term(left.trim(), columns, rows) else {
+            return FormulaAst::ParseError;
+        };
+        let Some(right) = parse_formula_term(right.trim(), columns, rows) else {
+            return FormulaAst::ParseError;
+        };
+        return FormulaAst::Add(left, right);
+    }
+    if let Some(range) = parse_one_arg_function(expr, "sum") {
+        let Some((start_index, end_index, step)) = parse_cell_range(range.trim(), columns, rows)
+        else {
+            return FormulaAst::ParseError;
+        };
+        return FormulaAst::SumRange {
+            start_index,
+            end_index,
+            step,
+        };
+    }
     if let Some((left, op, right)) = split_formula_binary(expr) {
         let Some(left) = parse_formula_term(left.trim(), columns, rows) else {
             return FormulaAst::ParseError;
@@ -14646,6 +14888,42 @@ fn parse_formula_ast(formula: &str, columns: usize, rows: usize) -> FormulaAst {
             FormulaTerm::Cell(index) => FormulaAst::Cell(index),
         })
         .unwrap_or(FormulaAst::ParseError)
+}
+
+fn parse_two_arg_function<'a>(expr: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+    let body = parse_function_body(expr, name)?;
+    body.split_once(',')
+}
+
+fn parse_one_arg_function<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
+    parse_function_body(expr, name)
+}
+
+fn parse_function_body<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
+    let expr = expr.trim();
+    let open = expr.find('(')?;
+    let close = expr.rfind(')')?;
+    if close != expr.len().saturating_sub(1) {
+        return None;
+    }
+    if !expr[..open].trim().eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(&expr[open + 1..close])
+}
+
+fn parse_cell_range(range: &str, columns: usize, rows: usize) -> Option<(usize, usize, usize)> {
+    let (start, end) = range.split_once(':')?;
+    let start_index = cell_index(start.trim(), columns, rows)?;
+    let end_index = cell_index(end.trim(), columns, rows)?;
+    if start_index % columns != end_index % columns {
+        return None;
+    }
+    Some((
+        start_index.min(end_index),
+        start_index.max(end_index),
+        columns,
+    ))
 }
 
 fn split_formula_binary(expr: &str) -> Option<(&str, FormulaOp, &str)> {
@@ -14703,8 +14981,25 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         "grid_columns": state.columns,
         "grid_rows": state.rows,
     });
-    reserve_loaded_cell_cache(&mut state, "=A1+1".len().max("10".len()), 1);
-    for value in ["", "0", "1", "=A1+1", "7", "10"] {
+    let max_text_len = "=A0+100".len().max("10".len());
+    let max_deps = 4usize;
+    reserve_loaded_cell_cache(&mut state, max_text_len, max_deps);
+    runtime.reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
+        max_text_len.saturating_sub(current.len())
+    })?;
+    runtime.reserve_list_row_textlike_fields("cells", "editing_text", |_, current| {
+        max_text_len.saturating_sub(current.len())
+    })?;
+    runtime.reserve_list_row_textlike_fields("cells", "value", |_, current| {
+        max_text_len.saturating_sub(current.len())
+    })?;
+    runtime.reserve_list_row_textlike_fields("cells", "error", |_, current| {
+        max_text_len.saturating_sub(current.len())
+    })?;
+    runtime.reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
+        max_deps.saturating_mul(8).saturating_sub(current.len())
+    })?;
+    for value in ["", "0", "1", "=A0+1", "7", "10"] {
         intern_loaded_cell_text(&mut state, value);
     }
     let mut deltas = Vec::with_capacity(4);
@@ -14714,7 +15009,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "C1",
+        "C0",
         "0",
         &mut deltas,
         &mut patches,
@@ -14724,7 +15019,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "A1",
+        "A0",
         "1",
         &mut deltas,
         &mut patches,
@@ -14734,8 +15029,8 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "B1",
-        "=A1+1",
+        "B0",
+        "=A0+1",
         &mut deltas,
         &mut patches,
         &mut recomputed,
@@ -14749,7 +15044,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "C1",
+        "C0",
         "7",
         &mut deltas,
         &mut patches,
@@ -14787,7 +15082,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "A1",
+        "A0",
         "10",
         &mut deltas,
         &mut patches,
@@ -14823,7 +15118,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
     recomputed.reserve(128);
     for index in 1..=100 {
         let address = loaded_cell_address(&state, index);
-        let formula = format!("=A1+{index}");
+        let formula = format!("=A0+{index}");
         let mut setup_deltas = Vec::with_capacity(4);
         let mut setup_patches = Vec::with_capacity(2);
         loaded_cells_commit_from_source(
@@ -14846,7 +15141,7 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
         &mut runtime,
         &mut state,
         "cell.sources.editor.commit",
-        "A1",
+        "A0",
         "2",
         &mut deltas,
         &mut patches,
@@ -14884,9 +15179,20 @@ fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
 fn formula_ast_dependencies_into(ast: FormulaAst, deps: &mut Vec<usize>) {
     match ast {
         FormulaAst::Cell(index) => push_unique_dependency(deps, index),
-        FormulaAst::Binary(left, _, right) => {
+        FormulaAst::Binary(left, _, right) | FormulaAst::Add(left, right) => {
             formula_term_dependencies_into(left, deps);
             formula_term_dependencies_into(right, deps);
+        }
+        FormulaAst::SumRange {
+            start_index,
+            end_index,
+            step,
+        } => {
+            let mut index = start_index;
+            while index <= end_index {
+                push_unique_dependency(deps, index);
+                index = index.saturating_add(step);
+            }
         }
         FormulaAst::Empty | FormulaAst::Number(_) | FormulaAst::ParseError => {}
     }
@@ -14922,10 +15228,10 @@ fn cell_index(address: &str, columns: usize, rows: usize) -> Option<usize> {
         return None;
     }
     let row = chars.as_str().parse::<usize>().ok()?;
-    if row == 0 || row > rows {
+    if row >= rows {
         return None;
     }
-    Some((row - 1) * columns + col)
+    Some(row * columns + col)
 }
 
 #[cfg(test)]
@@ -14995,6 +15301,17 @@ fn spreadsheet_column_label(index: usize) -> Option<String> {
         return None;
     }
     Some(((b'A' + index as u8) as char).to_string())
+}
+
+fn default_cells_formula(column: usize, row: usize) -> String {
+    match (column, row) {
+        (0, 0) => "5".to_owned(),
+        (0, 1) => "10".to_owned(),
+        (0, 2) => "15".to_owned(),
+        (1, 0) => "=add(A0,A1)".to_owned(),
+        (2, 0) => "=sum(A0:A2)".to_owned(),
+        _ => String::new(),
+    }
 }
 
 fn is_cell_address(value: &str) -> bool {
@@ -15888,7 +16205,7 @@ mod tests {
             cells_source,
             Path::new("../../examples/cells.scn"),
             VerificationLayer::Semantic,
-            Some(3),
+            Some(6),
         )
         .unwrap();
         let formula = cells_output
@@ -15947,11 +16264,11 @@ mod tests {
                     text: Some("41"),
                     key: Some("Enter"),
                     target_text: None,
-                    address: Some("A1"),
+                    address: Some("A0"),
                 },
                 TickSeq(3),
                 "address",
-                Some("A1"),
+                Some("A0"),
             )
             .unwrap();
         assert_eq!(cells_input.source, "cell.sources.editor.commit");
@@ -15991,8 +16308,8 @@ mod tests {
         let a1 = cells_runtime
             .list_row_fields_json("cells", 0, &["address", "formula_text", "editing"])
             .unwrap();
-        assert_eq!(a1["address"], "A1");
-        assert_eq!(a1["formula_text"], "");
+        assert_eq!(a1["address"], "A0");
+        assert_eq!(a1["formula_text"], "5");
         assert_eq!(a1["editing"], false);
     }
 
@@ -16134,23 +16451,31 @@ mod tests {
         .unwrap();
         runtime
             .apply_source_event_for_step(
-                &scenario.step[1],
+                scenario
+                    .step
+                    .iter()
+                    .find(|step| step.id == "edit-a0-literal")
+                    .expect("Cells scenario includes edit-a0-literal"),
                 LiveSourceEvent {
                     source: "cell.sources.editor.change".to_owned(),
                     text: Some("41".to_owned()),
-                    address: Some("A1".to_owned()),
+                    address: Some("A0".to_owned()),
                     ..LiveSourceEvent::default()
                 },
             )
             .unwrap();
         let output = runtime
             .apply_source_event_for_step(
-                &scenario.step[2],
+                scenario
+                    .step
+                    .iter()
+                    .find(|step| step.id == "commit-a0-literal")
+                    .expect("Cells scenario includes commit-a0-literal"),
                 LiveSourceEvent {
                     source: "cell.sources.editor.commit".to_owned(),
                     text: Some("41".to_owned()),
                     key: Some("Enter".to_owned()),
-                    address: Some("A1".to_owned()),
+                    address: Some("A0".to_owned()),
                     ..LiveSourceEvent::default()
                 },
             )
@@ -17183,9 +17508,9 @@ mod tests {
             "source".to_owned(),
             toml::Value::String("cell.sources.editor.commit".to_owned()),
         );
-        expected.insert("text".to_owned(), toml::Value::String("=A1+1".to_owned()));
+        expected.insert("text".to_owned(), toml::Value::String("=A0+1".to_owned()));
         expected.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
-        expected.insert("address".to_owned(), toml::Value::String("B1".to_owned()));
+        expected.insert("address".to_owned(), toml::Value::String("B0".to_owned()));
         expected.insert(
             "target_text".to_owned(),
             toml::Value::String("Buy groceries".to_owned()),
@@ -17198,9 +17523,9 @@ mod tests {
 
         let event = GenericSourceEvent::require(&step).unwrap();
         assert_eq!(event.source, "cell.sources.editor.commit");
-        assert_eq!(event.text, Some("=A1+1"));
+        assert_eq!(event.text, Some("=A0+1"));
         assert_eq!(event.key, Some("Enter"));
-        assert_eq!(event.address, Some("B1"));
+        assert_eq!(event.address, Some("B0"));
         assert_eq!(event.target_text, Some("Buy groceries"));
 
         let missing = ScenarioStep {
@@ -17472,17 +17797,17 @@ mod tests {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
         runtime.reserve_cell_cache("41".len(), 1);
         let expected_key = runtime
-            .cell_key_generation(runtime.cell_index("A1").unwrap())
+            .cell_key_generation(runtime.cell_index("A0").unwrap())
             .0;
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
         runtime
-            .commit("A1", "41", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "41", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         assert!(deltas.iter().all(|delta| delta.list_id == Some("cells")));
         assert!(deltas.iter().all(|delta| delta.key == Some(expected_key)));
-        assert_ne!(expected_key, cell_address_hash_for_test("A1"));
+        assert_ne!(expected_key, cell_address_hash_for_test("A0"));
     }
 
     #[test]
@@ -17506,17 +17831,17 @@ mod tests {
         runtime
             .commit_from_source(
                 "cell.sources.editor.apply",
-                "A1",
+                "A0",
                 "123",
                 &mut deltas,
                 &mut patches,
                 &mut recomputed,
             )
             .unwrap();
-        let a1 = runtime.cell_index("A1").unwrap();
+        let a1 = runtime.cell_index("A0").unwrap();
         assert_eq!(runtime.cell_text_field(a1, "formula_text").unwrap(), "123");
         assert_eq!(runtime.cell_text_field(a1, "editing_text").unwrap(), "123");
-        assert_eq!(runtime.cell("A1").unwrap().value, "123");
+        assert_eq!(runtime.cell("A0").unwrap().value, "123");
         assert!(!runtime.cell_bool_field(a1, "editing").unwrap());
 
         let mut action = BTreeMap::new();
@@ -17526,7 +17851,7 @@ mod tests {
         );
         action.insert(
             "target".to_owned(),
-            toml::Value::String("A1 editor".to_owned()),
+            toml::Value::String("A0 editor".to_owned()),
         );
         action.insert("key".to_owned(), toml::Value::String("Escape".to_owned()));
         let mut expected = BTreeMap::new();
@@ -17534,7 +17859,7 @@ mod tests {
             "source".to_owned(),
             toml::Value::String("cell.sources.editor.revert".to_owned()),
         );
-        expected.insert("address".to_owned(), toml::Value::String("A1".to_owned()));
+        expected.insert("address".to_owned(), toml::Value::String("A0".to_owned()));
         let step = ScenarioStep {
             id: "renamed-cell-revert".to_owned(),
             user_action: Some(action),
@@ -17700,7 +18025,7 @@ mod tests {
         );
         store.insert(
             "cells".to_owned(),
-            KeyedList::from_values([cell_generic_row("A1")]),
+            KeyedList::from_values([cell_generic_row("A0")]),
             Some(26),
             RuntimeRecordTemplate::default(),
         );
@@ -17809,86 +18134,121 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
-        for (formula, expected) in [("=8+2", "10"), ("=8-2", "6"), ("=8*2", "16"), ("=8/2", "4")] {
+        for (formula, expected) in [
+            ("=8+2", "10"),
+            ("=8-2", "6"),
+            ("=8*2", "16"),
+            ("=8/2", "4"),
+            ("=add(8,2)", "10"),
+        ] {
             deltas.clear();
             patches.clear();
             recomputed.clear();
             runtime
-                .commit("A1", formula, &mut deltas, &mut patches, &mut recomputed)
+                .commit("A0", formula, &mut deltas, &mut patches, &mut recomputed)
                 .unwrap();
-            assert_eq!(runtime.cell("A1").unwrap().value, expected);
-            assert_eq!(runtime.cell("A1").unwrap().error, None);
+            assert_eq!(runtime.cell("A0").unwrap().value, expected);
+            assert_eq!(runtime.cell("A0").unwrap().error, None);
         }
         runtime
-            .commit("A1", "=8/0", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "=8/0", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert_eq!(runtime.cell("A1").unwrap().error, Some("div_by_zero"));
+        assert_eq!(runtime.cell("A0").unwrap().error, Some("div_by_zero"));
+        runtime
+            .commit("D0", "", &mut deltas, &mut patches, &mut recomputed)
+            .unwrap();
+        assert_eq!(runtime.cell("D0").unwrap().value, "");
+        assert_eq!(runtime.cell("D0").unwrap().value_number, None);
+        runtime
+            .commit("E0", "=D0+2", &mut deltas, &mut patches, &mut recomputed)
+            .unwrap();
+        assert_eq!(runtime.cell("E0").unwrap().value, "2");
+        runtime
+            .commit("A0", "5", &mut deltas, &mut patches, &mut recomputed)
+            .unwrap();
+        runtime
+            .commit("A1", "10", &mut deltas, &mut patches, &mut recomputed)
+            .unwrap();
+        runtime
+            .commit("A2", "15", &mut deltas, &mut patches, &mut recomputed)
+            .unwrap();
+        runtime
+            .commit(
+                "C0",
+                "=SUM(A0:A2)",
+                &mut deltas,
+                &mut patches,
+                &mut recomputed,
+            )
+            .unwrap();
+        assert_eq!(runtime.cell("C0").unwrap().value, "30");
+        assert_eq!(runtime.cell("C0").unwrap().error, None);
     }
 
     #[test]
     fn replacing_formula_removes_stale_dependency_edges() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("=A1+1".len(), 1);
+        runtime.reserve_cell_cache("=A0+1".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
         runtime
-            .commit("A1", "1", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "1", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         runtime
-            .commit("B1", "=A1+1", &mut deltas, &mut patches, &mut recomputed)
+            .commit("B0", "=A0+1", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert_eq!(runtime.cell("B1").unwrap().value, "2");
-        assert_eq!(runtime.cell("B1").unwrap().deps, vec![0]);
+        assert_eq!(runtime.cell("B0").unwrap().value, "2");
+        assert_eq!(runtime.cell("B0").unwrap().deps, vec![0]);
         assert_eq!(runtime.dependency_cache.reverse_deps[0], vec![1]);
 
         recomputed.clear();
         runtime
-            .commit("B1", "5", &mut deltas, &mut patches, &mut recomputed)
+            .commit("B0", "5", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert!(runtime.cell("B1").unwrap().deps.is_empty());
+        assert!(runtime.cell("B0").unwrap().deps.is_empty());
         assert!(runtime.dependency_cache.reverse_deps[0].is_empty());
 
         recomputed.clear();
         runtime
-            .commit("A1", "10", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "10", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         let recomputed_addresses = recomputed
             .iter()
             .map(|index| runtime.address_for(*index))
             .collect::<Vec<_>>();
-        assert_eq!(recomputed_addresses, vec!["A1"]);
+        assert_eq!(recomputed_addresses, vec!["A0"]);
     }
 
     #[test]
     fn cells_fanout_uses_reverse_dependency_index() {
         let mut runtime = CellsRuntime::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("=A1+2".len(), 1);
+        runtime.reserve_cell_cache("=A0+2".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let mut recomputed = Vec::new();
         runtime
-            .commit("A1", "1", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "1", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         runtime
-            .commit("B1", "=A1+1", &mut deltas, &mut patches, &mut recomputed)
+            .commit("B0", "=A0+1", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         runtime
-            .commit("C1", "=A1+2", &mut deltas, &mut patches, &mut recomputed)
+            .commit("C0", "=A0+2", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         runtime
-            .commit("D1", "=A1+3", &mut deltas, &mut patches, &mut recomputed)
+            .commit("D0", "=A0+3", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
 
         recomputed.clear();
         runtime
-            .commit("A1", "10", &mut deltas, &mut patches, &mut recomputed)
+            .commit("A0", "10", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
         let recomputed_addresses = recomputed
             .iter()
             .map(|index| runtime.address_for(*index))
             .collect::<Vec<_>>();
-        assert_eq!(recomputed_addresses, vec!["A1", "B1", "C1", "D1"]);
+        assert_eq!(recomputed_addresses, vec!["A0", "B0", "C0", "D0"]);
         assert_eq!(runtime.dependency_cache.last_edge_walks(), 3);
         assert!(runtime.dependency_cache.last_edge_walks() < runtime.cells.len());
     }

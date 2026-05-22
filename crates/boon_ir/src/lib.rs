@@ -761,6 +761,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         if !matches!(binding.kind, ViewBindingKind::Source)
             && binding.scope_id.is_none()
             && !symbol_known(&binding.path, &known_symbols)
+            && !view_projection_symbol_known(&binding.path)
         {
             require_known_symbol("view binding path", &binding.path, &known_symbols)?;
         }
@@ -999,6 +1000,38 @@ fn symbol_known(value: &str, known_symbols: &BTreeSet<&str>) -> bool {
                 .rsplit_once('.')
                 .is_some_and(|(_, local)| local == value)
         })
+}
+
+fn view_projection_symbol_known(value: &str) -> bool {
+    matches!(
+        value,
+        "column.label"
+            | "column.index"
+            | "grid_row.row_number"
+            | "focused_input.active"
+            | "focused_input.address"
+            | "focused_input.display_value"
+            | "focused_input.edit_value"
+            | "focused_input.value"
+            | "focused_input.formula"
+            | "focused_input.change_source"
+            | "focused_input.submit_source"
+            | "focused_input.cancel_source"
+            | "focused_input.escape_source"
+            | "focused_input.blur_source"
+            | "selected_input.active"
+            | "selected_input.id"
+            | "selected_input.address"
+            | "selected_input.display_value"
+            | "selected_input.edit_value"
+            | "selected_input.value"
+            | "selected_input.formula"
+            | "selected_input.change_source"
+            | "selected_input.submit_source"
+            | "selected_input.cancel_source"
+            | "selected_input.escape_source"
+            | "selected_input.blur_source"
+    )
 }
 
 fn verify_scheduled_update_expression(
@@ -3748,8 +3781,8 @@ FUNCTION new_todo(seed) {
         assert!(ir.state_cells.iter().any(|cell| {
             cell.path == "cell.formula_text"
                 && cell.initial_value
-                    == InitialValue::Text {
-                        value: String::new(),
+                    == InitialValue::SeedField {
+                        path: "default_formula".to_owned(),
                     }
         }));
         assert!(ir.derived_values.iter().any(|value| {

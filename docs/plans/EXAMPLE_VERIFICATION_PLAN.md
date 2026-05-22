@@ -135,6 +135,19 @@ writes `target/reports/examples-all.json` linking both per-example aggregate
 reports. `audit-goal-readiness` requires that aggregate once the per-example
 aggregates are available.
 
+UI examples also need visible-reality evidence when the scenario covers only a
+subset of the declared product surface. For Cells, `verify-cells-visible-reality`
+writes `target/reports/cells-visible-reality.json` and proves that the visible
+native app is a spreadsheet viewport over the 26x100 source grid, not only the
+A0-D0 scenario subset. The Cells aggregate and readiness audits require that
+report in addition to semantic, headed, speed, negative, and operator E2E
+reports.
+
+The visible surface must be generated from the example's Boon `VIEW`, state, and
+state-summary projection. Generic renderer support for focus styling,
+display-versus-edit input values, and scroll containers is allowed; a
+Cells-specific preview/widget path is not valid evidence.
+
 `audit-goal-readiness` is stricter than schema validation. It scans the current
 reports and fails if the repo is not actually ready for final handoff. A report
 that is shape-valid but still says the runtime is adapter-backed, a headed replay
@@ -435,6 +448,12 @@ If a headed verifier proves only part of the OS-input path, it must include an
 `os_input_limitation` field and still fail negative fixtures that omit that
 limitation. A hybrid report is useful evidence, but it is not the final
 per-step OS hit-testing contract.
+
+For broad UI-shape claims, headed scenario evidence is not enough unless it also
+counts and samples the visible surface. A report may say a 26x100 Cells model is
+implemented only when it is paired with visible-reality evidence that records
+source dimensions, viewport dimensions, rendered addressed editor count, address
+samples outside A0-D0, and screenshot/hash/nonblank proof.
 
 Headed checks must run serially on a developer desktop. They open real windows
 and send real OS input to the focused Ply surface, so parallel headed runs can

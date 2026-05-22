@@ -11,6 +11,11 @@ actor per cell.
 - Dependencies between cells are explicit runtime data.
 - Only affected cells recompute after an edit.
 - Cycles are detected and reported deterministically.
+- The visible preview is generated from the Boon example's `VIEW`, state, and
+  generic state summary data. The native playground may add generic UI
+  primitives such as `Row`, `Column`, `Text`, `Input`, focus styling, and
+  scrolling, but it must not contain a dedicated Cells widget or hardcoded Cells
+  preview.
 
 ## Table Shape
 
@@ -36,7 +41,7 @@ CellDependency:
 
 `from_address -> to_address` means `to_address` reads `from_address`.
 
-`address` is ordinary spreadsheet data such as `A1`, not hidden runtime
+`address` is ordinary spreadsheet data such as `A0`, not hidden runtime
 identity. It can be displayed and compared as data. Runtime keys, slots, and
 source generations remain below the Boon language boundary.
 
@@ -62,7 +67,7 @@ FUNCTION new_cell(seed) {
         address: seed.address
 
         editing_text:
-            TEXT {} |> HOLD draft {
+            seed.default_formula |> HOLD draft {
                 LATEST {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
@@ -71,7 +76,7 @@ FUNCTION new_cell(seed) {
             }
 
         formula_text:
-            TEXT {} |> HOLD formula_text {
+            seed.default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
                 }
@@ -114,13 +119,41 @@ checked example uses `change`, `commit`, and `cancel`, but hidden source routing
 should follow parsed `SOURCE` ports rather than a separate Rust list of editor
 event names.
 
-`Grid/cells` produces domain coordinates and display addresses, for example:
+`Grid/cells` produces domain coordinates, display addresses, and seed demo
+formulas, for example:
 
 ```text
-[row: 1, column: 1, address: TEXT { A1 }]
+[row: 0, column: A, address: TEXT { A0 }, default_formula: TEXT { 5 }]
+[row: 0, column: B, address: TEXT { B0 }, default_formula: TEXT { =add(A0,A1) }]
+[row: 0, column: C, address: TEXT { C0 }, default_formula: TEXT { =sum(A0:A2) }]
 ```
 
 Those coordinates are ordinary data. They are not the hidden list key.
+
+## Visible Playground Shape
+
+The native playground must present Cells as a spreadsheet-like bounded viewport
+over the declared 26x100 model, not as a four-cell demo. The current visible
+contract is:
+
+```text
+source model: 26 columns x 100 rows
+visible projection: 26 columns x 100 rows
+visible addressed editors: 2600
+required visible samples beyond A0-D0: Z0, A99, and Z99
+```
+
+The runtime state summary may expose a bounded view projection such as
+`grid_columns`, `grid_rows`, and visible `cells` to feed the generic `VIEW`
+renderer. That projection is UI data derived from the authoritative grid/list
+storage. It is not allowed to replace or shrink the underlying 26x100 runtime
+model.
+
+The Cells source owns the spreadsheet layout declaration. Header rows, row
+labels, compact editors, displayed values, edit-mode formulas, focused cell
+styling, and the scrollable body must be declared in `examples/cells.bn` with
+generic `VIEW` components. The playground renderer only interprets those generic
+component attributes.
 
 ## Formula Primitive Contract
 
@@ -131,16 +164,16 @@ Minimum supported formula contract:
 
 ```text
 literals: numbers and text
-references: A1 style cell addresses
+references: A0 style cell addresses with 7GUIs rows 0 through 99
 operators: + - * / for numeric values
-functions: SUM(range) can be added after the base proof
+functions: add(left,right), sum(vertical_range)
 errors: parse_error, cycle_error, missing_ref, type_error, div_by_zero
 ```
 
-Current implementation note: numeric literals, A1 references, single binary
-`+`, `-`, `*`, and `/` expressions, dependency-edge replacement, `parse_error`,
-`cycle_error`, and `div_by_zero` are covered by runtime tests. Range functions
-such as `SUM` remain future work.
+Current implementation note: numeric literals, A0 references, single binary
+`+`, `-`, `*`, and `/` expressions, `add(left,right)`, vertical `sum(A0:A2)`,
+dependency-edge replacement, `parse_error`, `cycle_error`, and `div_by_zero` are
+covered by runtime tests.
 
 `Formula/parse(text)` returns a small formula AST or a deterministic error.
 `Formula/dependencies(ast)` returns a set of domain cell addresses. `Formula/eval`
@@ -150,10 +183,10 @@ keys.
 
 ## Propagation
 
-When `formula_text[A1]` changes:
+When `formula_text[A0]` changes:
 
-1. recompute `parsed_formula[A1]`.
-2. recompute dependency edges for `A1`.
+1. recompute `parsed_formula[A0]`.
+2. recompute dependency edges for `A0`.
 3. mark reverse dependents dirty.
 4. topologically recompute affected `value[*]`.
 5. emit `FieldSet` deltas for changed displayed values/errors.
@@ -176,7 +209,7 @@ scanning the whole grid.
 If a dependency cycle appears:
 
 ```text
-A1 -> B1 -> C1 -> A1
+A0 -> B0 -> C0 -> A0
 ```
 
 the engine should:
@@ -188,8 +221,8 @@ the engine should:
 ## Renderer Delta Example
 
 ```text
-FieldSet(/cells:A1, formula_text, "=B1+1")
-FieldSet(/cells:A1, value, 42)
+FieldSet(/cells:A0, formula_text, "=B0+1")
+FieldSet(/cells:A0, value, 42)
 FieldSet(/cells:C4, value, 100)
 FieldSet(/cells:C4, error, null)
 ```
@@ -207,6 +240,7 @@ Required commands:
 ```bash
 cargo xtask verify-cells-headed-ply
 cargo xtask verify-cells-human
+cargo xtask verify-cells-visible-reality
 cargo xtask verify-cells-semantic
 cargo xtask verify-cells-ply-headless
 cargo xtask verify-cells-speed
@@ -224,6 +258,12 @@ The headed Ply and manual passes must test real spreadsheet interaction:
 - move focus with pointer and keyboard.
 - scroll the grid if the visible viewport is smaller than the declared grid.
 - inspect that only affected visible cells update.
+
+Semantic, speed, and stress reports prove the runtime/dependency behavior. They
+do not by themselves prove the visible playground shape. The visible shape is
+accepted only when `target/reports/cells-visible-reality.json` proves the source
+grid dimensions, viewport dimensions, rendered addressed editor count, required
+address samples, and nonblank screenshot evidence.
 
 Required semantic scenarios:
 

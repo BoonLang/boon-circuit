@@ -49,8 +49,9 @@ the role protocol. It shows the example selector, visible code editor, run/reset
 window only loads that example's Boon code into the editor and sends
 `ReplaceCode` to the preview role. The preview window must render the replacement
 code without knowing whether it came from a bundled example, edited source, or a
-custom file. The dev role can also subscribe to snapshots, deltas, timings, and
-diagnostics.
+custom file. The dev role can also subscribe to bounded telemetry summaries,
+coalesced debug deltas, timings, diagnostics, and explicit paged debug query
+results. It must not subscribe to raw runtime snapshots or mirrored app state.
 
 `--role desktop` is only a launcher/supervisor. The hard native path is:
 
@@ -79,6 +80,8 @@ native implementation uses separate processes plus bounded local IPC. A later
 browser backend may use worker/postMessage or same-page channels, and a later
 terminal backend may use one host surface with panes, without changing
 `RuntimeTurn`, `DocumentPatch`, `LayoutFrame`, or preview telemetry schemas.
+Those host-neutral schemas are internal contracts. They are not role-protocol
+payloads unless explicitly wrapped in bounded, paged, coalesced debug messages.
 
 ## Crate Boundaries
 
@@ -99,9 +102,17 @@ boon_native_playground
 xtask
 ```
 
-`boon_document_model`, `boon_text`, `boon_host`, and `boon_render_core` may be
-separate crates or modules inside a larger crate at first, but the dependency
-rules below must be enforceable from day one.
+Initial implementation must add the fewest enforceable crates:
+`boon_document_model`, `boon_document`, `boon_native_gpu`,
+`boon_native_app_window`, and `boon_native_playground`.
+
+`boon_text`, `boon_host`, and `boon_render_core` may start as modules inside an
+owning crate only when their boundary rules remain mechanically verifiable. If a
+boundary starts as a module instead of a crate, `verify-native-gpu-architecture`
+must map source paths to logical boundary names and fail on forbidden `use`
+paths, type names, feature gates, backend-specific proof fields, and
+string/example branches inside those paths. Cargo dependency checks alone are
+insufficient until the boundary is a separate crate.
 
 ### Allowed Dependency Graph
 
@@ -115,7 +126,7 @@ boon_document -> boon_document_model, boon_text, boon_host types
 boon_host -> host-neutral event, viewport, role, and proof schemas
 boon_render_core -> boon_document, boon_host
 boon_native_gpu -> boon_render_core, boon_text, wgpu, glyphon
-boon_native_app_window -> boon_host, app_window
+boon_native_app_window -> boon_host, app_window, wgpu surface/configuration types
 boon_native_playground -> all native and core layers
 xtask -> verification and launch orchestration
 ```
@@ -129,8 +140,10 @@ Hard dependency rules:
 - `boon_native_gpu` may not depend on runtime, parser, examples, or app_window
   event APIs. It only receives layout/display-list data and a narrow render
   target.
-- `boon_native_app_window` may not depend on runtime, examples, document layout,
-  or GPU pipelines.
+- `boon_native_app_window` may own `wgpu::Surface` and surface
+  configuration/lifecycle state. It may not depend on runtime, examples,
+  document layout, renderer pipelines, shader modules, bind groups, GPU buffers,
+  textures, glyphon, or renderer caches.
 - `boon_native_playground` is the composition layer. It is the only crate that
   may connect runtime, document, host, native windowing, and native GPU.
 
@@ -162,8 +175,8 @@ Responsibilities:
 
 - parse/lower/execute Boon programs through the existing static graph path;
 - accept typed `SourceBatch` input through public runtime APIs only;
-- emit deterministic turns containing document patches, state snapshots,
-  diagnostics, and metrics;
+- emit deterministic turns containing document patches, local replay/test
+  snapshots, diagnostics, and metrics;
 - expose cause/explanation data for the dev window.
 
 Forbidden:
@@ -191,6 +204,10 @@ pub trait BoonProgram {
     fn snapshot(&self) -> RuntimeSnapshot;
 }
 ```
+
+`RuntimeSnapshot` is a local replay/test artifact. It must never be sent over
+preview/dev IPC. Debugger views use bounded observability summaries and explicit
+queries instead.
 
 ### Runtime Observability
 
@@ -247,17 +264,18 @@ Owns the renderer-neutral UI contract produced from Boon `document`.
 
 Responsibilities:
 
-- lower parser/runtime document data into `DocumentFrame`;
+- consume only `boon_document_model` values such as `DocumentFrame`,
+  `DocumentPatch`, styles, source bindings, and scroll state;
 - apply `DocumentPatch` streams into a `DocumentFrame`;
 - compute deterministic CPU layout from document, viewport, scale, text metrics,
   and renderer capabilities;
 - produce display lists, hit regions, scroll regions, accessibility/control
   semantics, and layout demands.
 
-Parser AST -> `DocumentFrame` lowering belongs here or in a compiler-facing
-document module, not in native host or renderer crates. Existing conversions
-that live inside the current playground must move behind this boundary before
-the native GPU path is accepted.
+Parser/IR-to-document-model lowering belongs in the compiler/runtime path before
+patches reach `boon_document`. Existing conversions that live inside the current
+playground must move behind that boundary before the native GPU path is
+accepted. `boon_document` does not inspect parser AST or runtime internals.
 
 Forbidden:
 
@@ -391,15 +409,14 @@ pub struct HitResolution {
     pub viewport_intent: Option<ViewportIntent>,
     pub source_intents: Vec<SourceIntent>,
 }
-
-impl SourceBatch {
-    pub fn from_document_intents(intents: &[SourceIntent]) -> Result<Self>;
-}
 ```
 
-Only the playground composition layer may call `BoonProgram::dispatch`. Native
-E2E tests must drive host input and hit regions; they must not call private
-runtime mutation APIs or inject source events behind the document/host route.
+`boon_host` and `boon_document` produce `SourceIntent` values only. They must not
+construct or name `SourceBatch`. Only the playground composition layer may
+translate `SourceIntent` plus `SourceInventory` into `boon_runtime::SourceBatch`
+and call `BoonProgram::dispatch`. Native E2E tests must drive host input and hit
+regions; they must not call private runtime mutation APIs or inject source
+events behind the document/host route.
 
 ## Render Core And Replaceability
 
@@ -414,7 +431,6 @@ pub trait RenderBackend {
     type Target;
 
     fn capabilities(&self) -> RenderCapabilities;
-    fn upload_layout(&mut self, diff: &LayoutDiff) -> Result<UploadStats>;
     fn render(
         &mut self,
         target: &mut Self::Target,
@@ -425,16 +441,37 @@ pub trait RenderBackend {
 
 pub enum RenderProofArtifact {
     AppOwnedPixels {
+        artifact_path: Utf8PathBuf,
+        artifact_sha256: String,
+        capture_method: CaptureMethod,
+        role_id: RoleId,
+        window_id: WindowId,
+        surface_id: SurfaceId,
+        surface_epoch: u64,
+        frame_seq: u64,
+        layout_frame_hash: String,
         hash: String,
         width: u32,
         height: u32,
+        nonblank_samples: NonBlankSampleReport,
     },
-    HostSurface {
-        hash: String,
+    CopyToPresent {
+        source_texture_hash: String,
+        target_surface_id: SurfaceId,
+        target_surface_epoch: u64,
+        target_format: SurfaceFormat,
         width: u32,
         height: u32,
+        acquired_surface_texture: bool,
+        command_submission_id: String,
+        present_result: PresentResult,
     },
     TextCells {
+        artifact_path: Utf8PathBuf,
+        artifact_sha256: String,
+        capture_method: CaptureMethod,
+        role_id: RoleId,
+        frame_seq: u64,
         hash: String,
         cols: u16,
         rows: u16,
@@ -446,6 +483,22 @@ The native GPU renderer is one `RenderBackend` implementation. A future browser
 or terminal renderer must be able to consume the same `LayoutFrame` and emit
 backend-appropriate `RenderProofArtifact`s without changing runtime or document
 schemas.
+
+`RenderCapabilities` is a renderer-neutral, serializable contract. It may
+describe portable limits and feature classes, but it must not expose backend type
+names, device IDs, shader/pipeline IDs, glyph atlas state, app_window state, or
+proof-only fields. `verify-native-gpu-layout-contract` must run layout against
+at least one non-native/fake capability set and prove no native-only capability
+is required.
+
+Layout diffing is a private renderer optimization in v1. A public `LayoutDiff`
+type may be added only after the producer, consumer, identity keys, and verifier
+assertions are specified.
+
+Surface `COPY_SRC` readback or compositor screenshot evidence is optional
+diagnostic evidence only. It must not be required for pass/fail unless the report
+records that the active surface capabilities support it. Hash-only render proof
+is not accepted; reports must link every proof artifact by path and sha256.
 
 ## Native GPU Renderer
 
@@ -459,7 +512,7 @@ Responsibilities:
   readback textures, and `glyphon` text cache;
 - render generic rectangles, borders, clips, text, grids, carets, selections,
   scrollbars, and debug overlays;
-- apply incremental GPU uploads from layout diffs;
+- apply incremental GPU uploads as a private renderer optimization;
 - expose frame timing, upload size, draw counts, text cache stats, and readback
   proof;
 - render into an app-owned frame texture first, then copy/present to the host
@@ -585,10 +638,18 @@ pub struct SurfaceSlot {
     pub role: WindowRole,
     pub viewport: Viewport,
     pub epoch: u64,
+    pub binding: SurfaceDeviceBinding,
     pub lifecycle: SurfaceLifecycle,
     // private: Window, app_window::Surface, wgpu::Surface
 }
 ```
+
+Each `SurfaceSlot` is bound to exactly one
+`SurfaceDeviceBinding { adapter_id, device_id, queue_id, surface_id, format,
+present_mode, alpha_mode, usage, epoch }`. `acquire`, `present`, and
+reconfigure must reject stale epochs or frames from a different device binding.
+Reports must include adapter info, chosen surface config, present mode, and
+whether the adapter is software.
 
 Required drop order:
 
@@ -618,7 +679,8 @@ Preview role responsibilities:
 - layout the preview document for the preview viewport;
 - route host input through document hit regions into source batches;
 - render preview frames on a fixed frame budget;
-- publish bounded snapshots and metrics to the dev role.
+- publish bounded summaries, debug deltas, diagnostics, and metrics to the dev
+  role.
 
 Dev role responsibilities:
 
@@ -627,7 +689,7 @@ Dev role responsibilities:
 - use the same `boon_document` -> `LayoutFrame` -> `boon_native_gpu` path for
   dev UI, with host-generated generic document data;
 - send source edits and control commands to the preview role;
-- consume preview snapshots asynchronously;
+- consume preview observability events asynchronously;
 - never block preview rendering.
 
 Forbidden:
@@ -649,7 +711,7 @@ app_window or wrapper event
   -> SourceBatch only for application-bound source input
   -> boon_runtime dispatch
   -> DocumentPatch
-  -> layout diff
+  -> LayoutFrame / private renderer diff
   -> GPU upload/render
 ```
 
@@ -675,14 +737,14 @@ through this same route.
 ## Role Protocol And Backpressure
 
 Preview-to-dev telemetry uses bounded nonblocking queues. Preview frame
-rendering must never wait for dev snapshot consumption, debug rendering, IPC
-writes, or snapshot serialization.
+rendering must never wait for dev telemetry consumption, debug rendering, IPC
+writes, or telemetry serialization.
 
 API shape:
 
 ```rust
 pub enum PreviewCommand {
-    ReplaceCode { code: String, expected_hash: String },
+    ReplaceCode { code: BoundedSourceText, expected_hash: String },
     Run,
     Reset,
     Step,
@@ -694,15 +756,15 @@ pub enum PreviewCommand {
 
 pub enum PreviewEvent {
     Ready(PreviewReady),
-    Snapshot(SnapshotEnvelope),
+    Telemetry(TelemetryEnvelope),
     DebugUpdate(DebugEnvelope),
     DebugQueryResult(DebugQueryResult),
     Metrics(FrameMetrics),
-    Diagnostics(Vec<Diagnostic>),
+    Diagnostics(BoundedDiagnostics),
     Disconnected(DisconnectReason),
 }
 
-pub struct SnapshotEnvelope {
+pub struct TelemetryEnvelope {
     pub seq: u64,
     pub turn_id: u64,
     pub byte_len: usize,
@@ -714,7 +776,11 @@ pub enum DebugSubscription {
     RuntimeSummary,
     DependencyGraphViewport { viewport: GraphViewport, max_nodes: usize },
     DirtyPropagationSummary,
-    SelectedValues { ids: Vec<RuntimeValueId> },
+    SelectedValues {
+        ids: BoundedVec<RuntimeValueId>,
+        max_values: usize,
+        max_bytes: usize,
+    },
 }
 
 pub enum DebugQuery {
@@ -724,17 +790,24 @@ pub enum DebugQuery {
 }
 ```
 
-Snapshot telemetry is coalesced by sequence number. Old snapshots may be
+Telemetry is coalesced by sequence number. Old telemetry messages may be
 dropped. Commands are acknowledged separately. Source replacement commands,
 debug subscriptions, and debug queries have explicit max payload sizes. Debug
 updates are latest-value/coalesced by subscription. Large debug views must use
-paged queries or sampled summaries instead of full-state mirroring. Reports must
-include:
+paged queries or sampled summaries instead of full-state mirroring.
+
+Telemetry serialization must run from precomputed bounded summaries outside
+runtime, document, layout, and render locks. If an IPC queue has no capacity, the
+preview role must drop or coalesce before serialization; it must not clone or
+serialize full runtime/document/layout/display-list state and then discover the
+queue is full.
+
+Reports must include:
 
 - `preview_blocked_on_ipc_count`;
 - `ipc_queue_depth_p50_p95_max`;
-- `snapshot_serialize_ms_p50_p95_max`;
-- `dropped_snapshot_count`;
+- `telemetry_serialize_ms_p50_p95_max`;
+- `dropped_telemetry_count`;
 - `dropped_frame_metrics_count`;
 - `dropped_debug_update_count`;
 - `debug_query_bytes_p50_p95_max`;
@@ -751,16 +824,17 @@ Preview performance is a product requirement, not only a renderer detail.
 
 - The preview role has its own event loop, runtime state, document state, GPU
   resources, and surface.
-- Dev snapshots are best-effort and bounded. If the dev role falls behind, the
-  preview drops old snapshots instead of waiting.
+- Dev telemetry is best-effort and bounded. If the dev role falls behind, the
+  preview drops old telemetry instead of waiting.
 - Cells grid rendering uses visible ranges, overscan, instance buffers, and text
   cache reuse.
 - Wheel scrolling must update scroll offsets and visible windows without runtime
   graph rebuilds or passive-scroll runtime dispatch.
 - Code editor scrolling in the dev role must use the same virtualized list/text
   infrastructure, not a giant per-line widget tree.
-- Release-mode frame reports must include p50/p95 frame time, upload bytes,
-  draw calls, visible nodes, text runs shaped, and dropped debug snapshots.
+- Release-mode frame reports must include p50/p95/p99/max frame time, missed
+  frame count, sample count, upload bytes, draw calls, visible nodes, text runs
+  shaped, and dropped debug telemetry.
 
 ### Scroll Hot Path
 
@@ -771,7 +845,15 @@ Cells body/header scrolling and dev code-editor scrolling must report:
 - `wheel_events_coalesced`;
 - `input_queue_depth_max`;
 - `layout_rebuild_scope`;
-- `newly_materialized_range_count`.
+- `newly_materialized_range_count`;
+- `scroll_frame_ms_p50_p95_p99_max`;
+- `missed_frame_count`;
+- `sample_frame_count`;
+- `sustained_scroll_duration_ms`;
+- `scroll_distance_px_rows_cols`;
+- `materialized_range_before_after`;
+- `visible_address_samples_before_after`;
+- `wheel_to_visible_ms_p95_per_axis`.
 
 For passive scroll, `runtime_dispatch_count_for_passive_scroll = 0` and
 `graph_rebuild_count = 0` are hard gates.
@@ -823,22 +905,31 @@ The architecture is not accepted until these gates exist and pass in release
 mode on this Wayland machine.
 
 ```text
-cargo xtask verify-platform-contract
-cargo xtask verify-native-gpu-dependency-graph
-cargo xtask verify-native-gpu-architecture
-cargo xtask verify-native-gpu-layout-contract
-cargo xtask verify-native-gpu-shaders --check
-cargo xtask verify-native-gpu-multiwindow
-cargo xtask verify-native-gpu-ipc-backpressure
-cargo xtask verify-native-gpu-observability
-cargo xtask verify-native-gpu-preview-e2e --example todomvc
-cargo xtask verify-native-gpu-preview-e2e --example cells
-cargo xtask verify-native-gpu-scroll-speed --example cells
-cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor
+cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
+cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
+cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json
+cargo xtask verify-native-gpu-layout-contract --report target/reports/native-gpu/layout-contract.json
+cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json
+cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
+cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
+cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
+cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
+cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
+cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
+cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
+cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
+cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 cargo xtask verify-report-schema
 cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
 cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
+
+Every native GPU gate must overwrite or remove any prior passing report before
+execution and write a schema-valid pass/fail report. `verify-native-gpu-all`
+must link every required native GPU report by path and sha256. Machine and goal
+readiness audits must fail unless `target/reports/native-gpu-all.json` is fresh
+for the current git commit, source hashes, binary hashes, scenario hashes, budget
+hash, and report schema version.
 
 `verify-platform-contract` must fail if core crates expose `app_window`, `wgpu`,
 `glyphon`, Wayland/X11, native process/window IDs, DOM types, terminal escape
@@ -857,8 +948,10 @@ to reject forbidden edges, including:
 
 - `wgpu`, `app_window`, or `glyphon` dependencies in runtime/parser/IR crates;
 - `boon_runtime` or example crate dependencies in `boon_native_gpu`;
-- `todomvc`, `todo_mvc`, `cells`, `pong`, or `arkanoid` branches in renderer or
-  app_window crates;
+- `todomvc`, `todo_mvc`, `cells`, `pong`, or `arkanoid` branches in preview,
+  document/layout, render core, renderer, or app_window code. Example-name
+  handling is allowed only in the desktop/dev example resolver, and it must
+  produce Boon source plus source hash before sending `ReplaceCode`;
 - private runtime dispatch shortcuts in native E2E code;
 - manual generated-WGSL loading in the renderer instead of generated
   `wgsl_bindgen` APIs;
@@ -868,7 +961,9 @@ to reject forbidden edges, including:
 `verify-native-gpu-layout-contract` must feed generic document fixtures plus
 TodoMVC/Cells runtime outputs into `boon_document`, then assert deterministic
 `LayoutFrame`, stable hit regions, accessibility/control semantics,
-virtualization bounds, and no full 26x100 Cells widget expansion.
+virtualization bounds, and no full 26x100 Cells widget expansion. It must also
+run layout against at least one fake/non-native `RenderCapabilities` set and
+prove layout does not require native-only capabilities.
 
 `verify-native-gpu-shaders --check` must prove generated WESL/WGSL/bindgen
 outputs are fresh, no `include_str!` or direct generated-WGSL loading is used in
@@ -884,7 +979,7 @@ outside generated APIs.
 - reports include app_window backend, `WAYLAND_DISPLAY`, `WGPU_STRATEGY`,
   `WGPU_SURFACE_STRATEGY`, main thread ID, render thread ID, role IDs, window
   IDs, surface IDs, surface epochs, logical/physical sizes, scale, app-owned
-  texture hash, presented surface hash, and current git commit;
+  texture hash, copy-to-present proof, and current git commit;
 - the preview surface renders a nonblank frame before the dev window finishes
   rendering its first full debug frame;
 - closing the dev window does not stop preview rendering;
@@ -893,9 +988,20 @@ outside generated APIs.
 - Xvfb/X11/headless/native-browser substitutes are rejected for this native
   Wayland gate.
 
+On COSMIC, the multiwindow gate must record `requested_workspace =
+"boon-circuit"`, actual workspace if available, preview/dev child PIDs, PID
+cmdlines, window title/app-id, mapped/focused state when exposed, and launcher
+report/artifact hashes. If `cosmic-background-launch` cannot provide
+machine-readable proof, the gate must fail with a blocker naming the missing
+launcher capability.
+
 `verify-native-gpu-ipc-backpressure` must stall or kill the dev role and prove
-preview frame p95, memory cap, dropped snapshot count, IPC heartbeat behavior,
-and continued preview rendering stay within budget.
+preview frame p95, memory cap, dropped telemetry count, IPC heartbeat behavior,
+and continued preview rendering satisfy explicit budgets. It must read
+`budgets/native-gpu.toml`, record `budget_hash`, and fail on missing budget
+fields. The report must include explicit thresholds and observed values for
+preview frame p95, heartbeat gap max, RSS/memory cap, dropped counts, queue
+depth, debug bytes, and `preview_blocked_on_ipc_count = 0`.
 
 `verify-native-gpu-observability` must enable a large runtime value graph and a
 busy dev graph view, then prove debug subscriptions and queries are bounded,
@@ -903,43 +1009,76 @@ paged, or sampled. It must fail if the dev role receives a continuous full copy
 of the runtime heap, every app value, every list/table row, the full document
 tree each frame, or full display-list/GPU instance streams. It must also prove
 debug-update drops/coalescing are reported and preview frame timing remains
-inside budget while the dev graph is overloaded.
+within explicit budget thresholds while the dev graph is overloaded. It must use
+the same `budgets/native-gpu.toml` and report `budget_hash`, thresholds, and
+observed values.
 
 `verify-native-gpu-preview-e2e` must drive visible native controls and assert
 runtime state, source inventory, frame hashes, hit targets, source intent
 routing, and timing. It must not pass by calling private source dispatch
-functions directly.
+functions directly. It must write non-human operator reports under
+`target/reports/native-gpu/preview-e2e-<example>.json`, bound to fresh visible
+Wayland OS-input evidence. Reports must include scenario labels,
+source/scenario hashes, window PID/cmdline, focused-window proof, per-step OS
+pointer/keyboard route, hit target, source intent, screenshot/readback
+artifacts, and must not claim human observation.
 
 `verify-native-gpu-scroll-speed --example cells` must fail unless it is a
 release-mode Wayland report with real wheel input, current git/source hashes,
 vertical and horizontal scroll evidence, `scroll_frame_ms_p95 <= 16.7`,
 `wheel_to_visible_ms_p95 <= 50`, `preview_blocked_on_ipc_count = 0`,
 `runtime_dispatch_count_for_passive_scroll = 0`, `graph_rebuild_count = 0`, and
-no Xvfb/X11 or synthetic scroll-position evidence.
+no Xvfb/X11 or synthetic scroll-position evidence. It must perform sustained
+vertical and horizontal wheel scroll over the full 26x100 logical grid, record
+visible address samples before and after outside `A0:D0`, require
+`missed_frame_count = 0`, require `wheel_to_visible_ms_p95 <= 50` per axis,
+keep `materialized_cell_count_max` within the visible-plus-overscan budget, and
+list every frame over 16.7 ms as an outlier.
 
-`verify-native-gpu-scroll-speed --surface dev-code-editor` must use a long
-source file, real wheel input, release mode, line virtualization, text cache
-metrics, and the same frame/latency thresholds as the Cells scroll gate.
+`verify-native-gpu-scroll-speed --surface dev-code-editor` must launch through
+`--role desktop` with the preview role loaded and debug telemetry enabled. It
+must use a generated source fixture with at least 10,000 lines, a longest line of
+at least 2,000 bytes, diagnostics/selection/caret overlays enabled, and both
+vertical and horizontal real wheel scroll. Reports must include
+`dev_editor_frame_ms_p50_p95_p99_max`, `wheel_to_visible_ms_p95` per axis,
+`visible_line_count`, `materialized_line_count_max`, `text_runs_shaped_p95`,
+`text_cache_hit_rate`, `glyph_atlas_evictions`, `upload_bytes_p95`,
+`preview_frame_ms_p95`, and `preview_blocked_on_ipc_count` during the editor
+scroll. Hard gates: no full-file widget tree, no full-file reshaping,
+`preview_blocked_on_ipc_count = 0`, and preview frame p95 remains `<= 16.7 ms`.
+
+`verify-native-gpu-negative` must mutate or fabricate reports for stale
+git/source/binary hashes, missing artifacts, future timestamps, Xvfb/headless
+substitution, synthetic scroll, private runtime dispatch, copied pixel hashes,
+stale surface epochs, wrong-thread WGPU calls, single-process multiwindow
+masquerade, full-state IPC mirroring, and stale shader outputs. Each fabricated
+case must be rejected.
 
 ## Migration Plan
+
+Implementation may be staged, but final acceptance for this architecture is the
+two-process preview/dev desktop path with all gates passing. A preview-only probe
+is an intermediate milestone, not handoff readiness.
 
 1. Add the new core/native crates behind feature-free workspace members,
    without touching the current Ply playground behavior.
 2. Keep current operator/human report schemas intact while the native GPU path
    is added; do not weaken existing manual-report requirements.
 3. Implement `boon_document_model`, `boon_document`, `boon_text`, `boon_host`,
-   and `boon_render_core` as pure portable contracts first.
+   and `boon_render_core` as pure portable contracts first. Keep any
+   module-based boundaries mechanically checked until they become crates.
 4. Add `cargo xtask shaders` for this repo and wire WESL -> WGSL ->
    `wgsl_bindgen` into `boon_native_gpu`.
 5. Build a one-process preview probe that renders generic document data through
-   `app_window`/`wgpu`, with app-owned texture readback plus surface readback.
+   `app_window`/`wgpu`, with app-owned texture readback plus copy-to-present
+   proof.
 6. Build the desktop role with preview and dev as separate native child
    processes.
 7. Connect preview role to the real Boon runtime and public source dispatch
    path.
 8. Add virtualized Cells grid rendering and code editor scrolling.
 9. Add the platform, dependency, architecture, layout, shader, multi-window,
-   IPC, E2E, and scroll-speed gates.
+   IPC, observability, E2E, negative-fixture, and scroll-speed gates.
 10. Only after the new native GPU path passes, retire or demote the current
     macroquad/Ply path.
 

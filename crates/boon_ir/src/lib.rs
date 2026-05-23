@@ -953,17 +953,17 @@ fn collect_document_view_bindings(
     bindings: &mut Vec<ViewBinding>,
 ) {
     for statement in statements {
-        if document_statement_field(statement).as_deref() == Some("element") {
-            if let Some(kind) = document_child_value(statement, "kind", expressions) {
-                collect_document_element_bindings(
-                    &kind,
-                    statement,
-                    expressions,
-                    row_scopes,
-                    source_paths,
-                    bindings,
-                );
-            }
+        if document_statement_field(statement).as_deref() == Some("element")
+            && let Some(kind) = document_child_value(statement, "kind", expressions)
+        {
+            collect_document_element_bindings(
+                &kind,
+                statement,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+            );
         }
         collect_document_view_bindings(
             &statement.children,
@@ -2545,11 +2545,13 @@ fn tokens_to_path(tokens: &[String]) -> String {
         .iter()
         .filter(|token| !matches!(token.as_str(), "{" | "}" | "[" | "]"))
         .fold(String::new(), |mut output, token| {
-            if token == "." || output.ends_with('.') || output.is_empty() {
-                output.push_str(token);
-            } else if matches!(token.as_str(), ":" | "(" | ")") {
-                output.push_str(token);
-            } else if output.ends_with('(') || output.ends_with(':') {
+            if token == "."
+                || output.ends_with('.')
+                || output.is_empty()
+                || matches!(token.as_str(), ":" | "(" | ")")
+                || output.ends_with('(')
+                || output.ends_with(':')
+            {
                 output.push_str(token);
             } else {
                 output.push(' ');
@@ -2625,12 +2627,12 @@ fn update_expression_for_source(
             value: "False".to_owned(),
         };
     }
-    if let Some(value) = branch_value_after_match(&branch, "Escape") {
-        if value_starts_lowercase_identifier(value) {
-            return UpdateExpression::PreviousValue {
-                path: value.to_owned(),
-            };
-        }
+    if let Some(value) = branch_value_after_match(&branch, "Escape")
+        && value_starts_lowercase_identifier(value)
+    {
+        return UpdateExpression::PreviousValue {
+            path: value.to_owned(),
+        };
     }
     if let Some(path) = branch.bool_not_path() {
         return UpdateExpression::BoolNot { path };
@@ -3002,7 +3004,7 @@ impl FieldDef {
         let ast_exprs = self
             .ast_exprs
             .iter()
-            .filter(|expr| lines.iter().any(|line| *line == expr.line))
+            .filter(|expr| lines.contains(&expr.line))
             .cloned()
             .collect();
         Some(RoutedBranch { items, ast_exprs })

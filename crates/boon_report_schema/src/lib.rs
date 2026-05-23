@@ -1031,14 +1031,13 @@ fn verify_expression_coverage(report: &JsonValue, report_path: &Path) -> Runtime
         coverage
             .get("ast_expression_count")
             .and_then(JsonValue::as_u64),
-    ) {
-        if report_expression_count != coverage_expression_count {
-            return Err(format!(
-                "{} expression_count does not match expression_coverage.ast_expression_count",
-                report_path.display()
-            )
-            .into());
-        }
+    ) && report_expression_count != coverage_expression_count
+    {
+        return Err(format!(
+            "{} expression_count does not match expression_coverage.ast_expression_count",
+            report_path.display()
+        )
+        .into());
     }
     for key in [
         "unknown_ast_expression_count",
@@ -3593,23 +3592,19 @@ fn verify_manual_checkpoint_content(
     let bytes = fs::read(checkpoint_path)?;
     match ext {
         "png" => verify_manual_png_checkpoint(report_path, checkpoint_path, &bytes)?,
-        "mp4" => {
-            if bytes.get(4..8) != Some(b"ftyp") {
-                return Err(format!(
-                    "{} manual checkpoint `{checkpoint_path}` is not a valid MP4 artifact",
-                    report_path.display()
-                )
-                .into());
-            }
+        "mp4" if bytes.get(4..8) != Some(b"ftyp") => {
+            return Err(format!(
+                "{} manual checkpoint `{checkpoint_path}` is not a valid MP4 artifact",
+                report_path.display()
+            )
+            .into());
         }
-        "webm" => {
-            if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-                return Err(format!(
-                    "{} manual checkpoint `{checkpoint_path}` is not a valid WebM artifact",
-                    report_path.display()
-                )
-                .into());
-            }
+        "webm" if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => {
+            return Err(format!(
+                "{} manual checkpoint `{checkpoint_path}` is not a valid WebM artifact",
+                report_path.display()
+            )
+            .into());
         }
         _ => {}
     }

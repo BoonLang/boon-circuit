@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![allow(clippy::too_many_arguments)]
 
 use bitvec::prelude::*;
 use boon_ir::{
@@ -788,7 +789,7 @@ impl LiveRuntime {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         self.runtime
-            .apply_step(&step, &mut semantic_deltas, &mut render_patches)?;
+            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
         self.runtime.assert_step_after_measurement(step)?;
         Ok(LiveStepOutput {
@@ -961,6 +962,7 @@ struct LoadedRuntime {
     surface: LoadedRuntimeSurface,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum LoadedRuntimeSurface {
     Todo(TodoRuntimeState),
     Cells(CellsRuntimeState),
@@ -1565,7 +1567,7 @@ fn initialize_loaded_todomvc_generic(
             return Err("TodoMVC seed titles must not be empty".into());
         }
         let (key, generation) = generic.row_identity("todos", index)?;
-        generic.bind_row_sources("todos", key, generation, &row_source_paths);
+        generic.bind_row_sources("todos", key, generation, &row_source_paths)?;
     }
     Ok((
         generic,
@@ -1614,7 +1616,7 @@ fn initialize_loaded_cells_generic(
         rows,
         interned_texts: Vec::new(),
         step_recomputed: Vec::with_capacity(8),
-        dirty_key_sets: DirtyKeySets::with_capacity(expected_len.min(128).max(16)),
+        dirty_key_sets: DirtyKeySets::with_capacity(expected_len.clamp(16, 128)),
         last_recompute_candidates: 0,
     };
     initialize_loaded_cells_from_generic(&mut generic, &mut state)?;
@@ -1695,25 +1697,15 @@ fn intern_loaded_cell_text(state: &mut CellsRuntimeState, value: &str) {
     if state
         .interned_texts
         .iter()
-        .any(|interned| *interned == value)
+        .any(|interned| interned == value)
     {
         return;
     }
-    let interned = Box::leak(value.to_owned().into_boxed_str());
-    state.interned_texts.push(interned);
+    state.interned_texts.push(value.to_owned());
 }
 
-fn cells_protocol_text<'a>(state: &CellsRuntimeState, value: &str) -> ProtocolValue<'a> {
-    if let Some(interned) = state
-        .interned_texts
-        .iter()
-        .copied()
-        .find(|interned| *interned == value)
-    {
-        ProtocolValue::Text(Cow::Borrowed(interned))
-    } else {
-        ProtocolValue::Text(Cow::Owned(value.to_owned()))
-    }
+fn cells_protocol_text<'a>(_state: &CellsRuntimeState, value: &str) -> ProtocolValue<'a> {
+    ProtocolValue::Text(Cow::Owned(value.to_owned()))
 }
 
 fn reserve_loaded_cell_cache(state: &mut CellsRuntimeState, max_text_len: usize, max_deps: usize) {
@@ -2863,10 +2855,10 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         state_summary.clone(),
         baseline_rss_mib,
     );
-    if matches!(layer, VerificationLayer::Speed) {
-        if let Some(stress_profiles) = runtime.stress_profiles(ir)? {
-            report["stress_profiles"] = stress_profiles;
-        }
+    if matches!(layer, VerificationLayer::Speed)
+        && let Some(stress_profiles) = runtime.stress_profiles(ir)?
+    {
+        report["stress_profiles"] = stress_profiles;
     }
     Ok(RunOutput {
         report,
@@ -4203,13 +4195,17 @@ impl RowSourceSlots {
         self.list_id == list_id && self.key == key && self.generation == generation
     }
 
-    fn push(&mut self, slot: usize) {
-        assert!(
-            self.len < MAX_ROW_SOURCE_BINDINGS,
-            "row source binding slot capacity exceeded"
-        );
+    fn push(&mut self, slot: usize) -> RuntimeResult<()> {
+        if self.len >= MAX_ROW_SOURCE_BINDINGS {
+            return Err(format!(
+                "row source binding slot capacity exceeded for `{}` key={} generation={} limit={MAX_ROW_SOURCE_BINDINGS}",
+                self.list_id, self.key, self.generation
+            )
+            .into());
+        }
         self.slots[self.len] = slot;
         self.len += 1;
+        Ok(())
     }
 }
 
@@ -4256,7 +4252,19 @@ impl SourceStore {
         key: u64,
         generation: u64,
         source_paths: &[&'static str],
-    ) {
+    ) -> RuntimeResult<()> {
+        let existing_len = self
+            .row_slots
+            .get(key as usize)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.matches(list_id, key, generation))
+            .map_or(0, |slot| slot.len);
+        if existing_len.saturating_add(source_paths.len()) > MAX_ROW_SOURCE_BINDINGS {
+            return Err(format!(
+                "row source binding slot capacity exceeded for `{list_id}` key={key} generation={generation} limit={MAX_ROW_SOURCE_BINDINGS}"
+            )
+            .into());
+        }
         for source_path in source_paths {
             let binding = SourceBinding {
                 list_id,
@@ -4272,12 +4280,13 @@ impl SourceStore {
             self.source_slots[binding.source_id as usize] = Some(slot);
             self.row_slots[key as usize]
                 .get_or_insert_with(|| RowSourceSlots::new(list_id, key, generation))
-                .push(slot);
+                .push(slot)?;
             self.active_bindings.push(Some(binding));
             self.active_count += 1;
             self.next_source_id += 1;
             self.next_bind_epoch += 1;
         }
+        Ok(())
     }
 
     fn unbind_row(&mut self, list_id: &'static str, key: u64, generation: u64) {
@@ -4454,8 +4463,8 @@ struct BoolValueSlot {
     value: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct FieldSlotId(u64);
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FieldSlotId(Box<str>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FieldValueRef<'a> {
@@ -4467,17 +4476,12 @@ enum FieldValueRef<'a> {
 impl FieldSlotId {
     fn from_path(path: &str) -> Self {
         let name = row_field_name(path);
-        Self(fnv1a_hash(name.as_bytes()))
+        Self(name.into())
     }
-}
 
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    fn as_str(&self) -> &str {
+        &self.0
     }
-    hash
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4514,12 +4518,16 @@ struct RuntimeListSlot {
     spare_rows: Vec<RuntimeRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ListSlotId(u64);
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListSlotId(Box<str>);
 
 impl ListSlotId {
     fn from_name(name: &str) -> Self {
-        Self(fnv1a_hash(name.as_bytes()))
+        Self(name.into())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -4540,7 +4548,7 @@ impl RuntimeListStore {
         }
         let list_id = ListSlotId::from_name(&name);
         let index = self
-            .list_slot_index(list_id, &name)
+            .list_slot_index(list_id.clone(), &name)
             .unwrap_or_else(|index| index);
         self.list_slots.insert(
             index,
@@ -4607,8 +4615,9 @@ impl RuntimeListStore {
     }
 
     fn list_slot_index(&self, list_id: ListSlotId, name: &str) -> Result<usize, usize> {
-        self.list_slots
-            .binary_search_by(|slot| (slot.list_id, slot.name.as_str()).cmp(&(list_id, name)))
+        self.list_slots.binary_search_by(|slot| {
+            (slot.list_id.as_str(), slot.name.as_str()).cmp(&(list_id.as_str(), name))
+        })
     }
 }
 
@@ -4857,13 +4866,13 @@ impl GenericScheduledRuntime {
                 }
             };
             if let Some(action_list) = action_list {
-                if let Some(existing) = list {
-                    if existing != action_list {
-                        return Err(format!(
-                            "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
-                        )
-                        .into());
-                    }
+                if let Some(existing) = list
+                    && existing != action_list
+                {
+                    return Err(format!(
+                        "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
+                    )
+                    .into());
                 }
                 list = Some(action_list);
             }
@@ -5835,8 +5844,8 @@ impl GenericCircuitRuntime {
         key: u64,
         generation: u64,
         source_paths: &[&'static str],
-    ) {
-        self.sources.bind_row(list, key, generation, source_paths);
+    ) -> RuntimeResult<()> {
+        self.sources.bind_row(list, key, generation, source_paths)
     }
 
     fn unbind_row_sources(&mut self, list: &'static str, key: u64, generation: u64) {
@@ -5888,7 +5897,7 @@ impl GenericCircuitRuntime {
             let mut row = serde_json::Map::new();
             for field in fields {
                 let value = self.list_row_field(list, index, field)?;
-                row.insert((*field).to_owned(), value.to_json());
+                row.insert((*field).to_owned(), value.as_json());
             }
             values.push(row);
         }
@@ -5905,7 +5914,7 @@ impl GenericCircuitRuntime {
         let mut row = serde_json::Map::new();
         for field in fields {
             let value = self.list_row_field(list, index, field)?;
-            row.insert((*field).to_owned(), value.to_json());
+            row.insert((*field).to_owned(), value.as_json());
         }
         Ok(row)
     }
@@ -6444,7 +6453,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<GenericListRowCommit> {
         let (key, generation) =
             self.append_row_for_trigger_text(equations, list, trigger, trigger_value)?;
-        self.bind_row_sources(list, key, generation, source_paths);
+        self.bind_row_sources(list, key, generation, source_paths)?;
         Ok(GenericListRowCommit {
             list,
             key,
@@ -6950,7 +6959,7 @@ impl GenericCircuitRuntime {
 }
 
 impl FieldValueRef<'_> {
-    fn to_json(&self) -> JsonValue {
+    fn as_json(&self) -> JsonValue {
         match self {
             Self::Text(value) | Self::Enum(value) => json!(value),
             Self::Bool(value) => json!(value),
@@ -6968,7 +6977,7 @@ impl FieldValueRef<'_> {
 impl ValueColumns {
     fn insert_value(&mut self, name: String, value: FieldValue) {
         let field_id = FieldSlotId::from_path(&name);
-        self.remove_field_id(field_id);
+        self.remove_field_id(&field_id);
         match value {
             FieldValue::Text(value) => {
                 Self::insert_text_slot(&mut self.text, field_id, value);
@@ -6982,7 +6991,7 @@ impl ValueColumns {
         }
     }
 
-    fn remove_field_id(&mut self, field_id: FieldSlotId) {
+    fn remove_field_id(&mut self, field_id: &FieldSlotId) {
         if let Ok(index) = Self::text_slot_index(&self.text, field_id) {
             self.text.remove(index);
         }
@@ -6999,9 +7008,9 @@ impl ValueColumns {
     }
 
     fn contains_key_id(&self, field_id: FieldSlotId) -> bool {
-        self.text_index_id(field_id).is_some()
-            || self.bool_index_id(field_id).is_some()
-            || self.enum_index_id(field_id).is_some()
+        Self::text_slot_index(&self.text, &field_id).is_ok()
+            || Self::bool_slot_index(&self.bools, &field_id).is_ok()
+            || Self::text_slot_index(&self.enums, &field_id).is_ok()
     }
 
     fn value(&self, field: &str) -> Option<FieldValueRef<'_>> {
@@ -7083,23 +7092,23 @@ impl ValueColumns {
                 target_field,
             );
         }
-        if let Some(source_index) = self.text_index(source_field) {
-            if let Some(target_index) = self.enum_index(target_field) {
-                let source = &self.text[source_index].value;
-                let target = &mut self.enums[target_index].value;
-                target.clear();
-                target.push_str(source);
-                return Ok(());
-            }
+        if let Some(source_index) = self.text_index(source_field)
+            && let Some(target_index) = self.enum_index(target_field)
+        {
+            let source = &self.text[source_index].value;
+            let target = &mut self.enums[target_index].value;
+            target.clear();
+            target.push_str(source);
+            return Ok(());
         }
-        if let Some(source_index) = self.enum_index(source_field) {
-            if let Some(target_index) = self.text_index(target_field) {
-                let source = &self.enums[source_index].value;
-                let target = &mut self.text[target_index].value;
-                target.clear();
-                target.push_str(source);
-                return Ok(());
-            }
+        if let Some(source_index) = self.enum_index(source_field)
+            && let Some(target_index) = self.text_index(target_field)
+        {
+            let source = &self.enums[source_index].value;
+            let target = &mut self.text[target_index].value;
+            target.clear();
+            target.push_str(source);
+            return Ok(());
         }
         if self.bool_index(source_field).is_some() || self.bool_index(target_field).is_some() {
             Err("cannot copy text-like runtime value through bool field".into())
@@ -7157,7 +7166,7 @@ impl ValueColumns {
     }
 
     fn text_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
-        Self::text_slot_index(&self.text, field_id).ok()
+        Self::text_slot_index(&self.text, &field_id).ok()
     }
 
     fn bool_index(&self, field: &str) -> Option<usize> {
@@ -7165,7 +7174,7 @@ impl ValueColumns {
     }
 
     fn bool_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
-        Self::bool_slot_index(&self.bools, field_id).ok()
+        Self::bool_slot_index(&self.bools, &field_id).ok()
     }
 
     fn enum_index(&self, field: &str) -> Option<usize> {
@@ -7173,25 +7182,25 @@ impl ValueColumns {
     }
 
     fn enum_index_id(&self, field_id: FieldSlotId) -> Option<usize> {
-        Self::text_slot_index(&self.enums, field_id).ok()
+        Self::text_slot_index(&self.enums, &field_id).ok()
     }
 
     fn insert_text_slot(slots: &mut Vec<TextValueSlot>, field_id: FieldSlotId, value: String) {
-        let index = Self::text_slot_index(slots, field_id).unwrap_or_else(|index| index);
+        let index = Self::text_slot_index(slots, &field_id).unwrap_or_else(|index| index);
         slots.insert(index, TextValueSlot { field_id, value });
     }
 
     fn insert_bool_slot(slots: &mut Vec<BoolValueSlot>, field_id: FieldSlotId, value: bool) {
-        let index = Self::bool_slot_index(slots, field_id).unwrap_or_else(|index| index);
+        let index = Self::bool_slot_index(slots, &field_id).unwrap_or_else(|index| index);
         slots.insert(index, BoolValueSlot { field_id, value });
     }
 
-    fn text_slot_index(slots: &[TextValueSlot], field_id: FieldSlotId) -> Result<usize, usize> {
-        slots.binary_search_by_key(&field_id, |slot| slot.field_id)
+    fn text_slot_index(slots: &[TextValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
+        slots.binary_search_by(|slot| slot.field_id.as_str().cmp(field_id.as_str()))
     }
 
-    fn bool_slot_index(slots: &[BoolValueSlot], field_id: FieldSlotId) -> Result<usize, usize> {
-        slots.binary_search_by_key(&field_id, |slot| slot.field_id)
+    fn bool_slot_index(slots: &[BoolValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
+        slots.binary_search_by(|slot| slot.field_id.as_str().cmp(field_id.as_str()))
     }
 }
 
@@ -7257,7 +7266,7 @@ impl RuntimeRecordTemplate {
 
     fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<RuntimeRecord> {
         for field in &self.fields {
-            if seed_fields.contains_key_id(field.field_id) {
+            if seed_fields.contains_key_id(field.field_id.clone()) {
                 continue;
             }
             let value = runtime_value_from_initial(&field.initial_value, &seed_fields)?;
@@ -7274,7 +7283,7 @@ impl RuntimeRecordTemplate {
         seed_text: impl Fn(&str) -> Option<&'a str>,
     ) -> RuntimeResult<()> {
         for field in &self.fields {
-            if !row.columns.contains_key_id(field.field_id) {
+            if !row.columns.contains_key_id(field.field_id.clone()) {
                 return Err(format!("generic row missing field `{}`", field.field_name).into());
             }
             match &field.initial_value {
@@ -8570,14 +8579,14 @@ impl SourceRoutePlan {
                     {
                         route.list_append_targets.push(SourceRouteListAppend {
                             list: operation.list,
-                            trigger: *trigger,
+                            trigger,
                         });
                     }
                 }
                 RuntimeListOperationKind::Remove { source, predicate } => {
                     let source_id = source_id_for_path(ir, source)?;
                     routes
-                        .route_mut(*source, source_id)
+                        .route_mut(source, source_id)
                         .list_remove_targets
                         .push(SourceRouteListRemove {
                             list: operation.list,
@@ -8643,10 +8652,9 @@ impl SourceRoutePlan {
         &self,
         source_id: SourceId,
     ) -> RuntimeResult<Option<&'static str>> {
-        Ok(self
-            .for_source_id(source_id)
+        self.for_source_id(source_id)
             .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
-            .single_root_scalar_target()?)
+            .single_root_scalar_target()
     }
 
     fn list_remove_predicate_for_source_id(
@@ -8932,7 +8940,7 @@ impl ListEquationPlan {
         let operations = ir
             .list_operations
             .iter()
-            .filter_map(|operation| {
+            .map(|operation| {
                 let list = leak_runtime_path(operation.list.clone());
                 let kind = match &operation.kind {
                     ListOperationKind::Append { trigger, fields } => {
@@ -8966,7 +8974,7 @@ impl ListEquationPlan {
                         }
                     }
                 };
-                Some(RuntimeListOperation { list, kind })
+                RuntimeListOperation { list, kind }
             })
             .collect();
         Self { operations }
@@ -9155,7 +9163,7 @@ fn seeded_todomvc_generic(
         let (key, generation) = runtime.storage.row_identity("todos", index)?;
         runtime
             .storage
-            .bind_row_sources("todos", key, generation, &row_source_paths);
+            .bind_row_sources("todos", key, generation, &row_source_paths)?;
     }
     let ir_proof = json!({
         "runtime_constructed_from_ir": true,
@@ -9216,7 +9224,7 @@ impl TodoRuntime {
         generic.reserve_source_rows(todo_count);
         for index in 0..todo_count {
             let (key, generation) = generic.row_identity("todos", index)?;
-            generic.bind_row_sources("todos", key, generation, &row_source_paths);
+            generic.bind_row_sources("todos", key, generation, &row_source_paths)?;
         }
         Self {
             generic,
@@ -9243,8 +9251,8 @@ impl TodoRuntime {
     fn apply_step_into<'a>(
         &mut self,
         step: &'a ScenarioStep,
-        mut deltas: &mut Vec<SemanticDelta<'a>>,
-        mut patches: &mut Vec<RenderPatch<'a>>,
+        deltas: &mut Vec<SemanticDelta<'a>>,
+        patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         let Some(event) = self.route_step(step)? else {
             return Ok(());
@@ -9269,11 +9277,7 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(
-                            mutation,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
@@ -9292,12 +9296,12 @@ impl TodoRuntime {
                     self.generic
                         .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
                 if let Some(insert) = batch.list_append("todos") {
-                    self.emit_todo_insert(insert, &mut deltas, &mut patches)?;
+                    self.emit_todo_insert(insert, deltas, patches)?;
                     if let Some(commit) = batch.root_text("store.new_todo_text") {
                         emit_todomvc_default_protocol_mutation(
                             GenericSourceMutation::RootText(commit),
-                            &mut deltas,
-                            &mut patches,
+                            deltas,
+                            patches,
                         )?;
                     }
                 }
@@ -9316,11 +9320,7 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(
-                            mutation,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
@@ -9328,7 +9328,7 @@ impl TodoRuntime {
             TodoEvent::Source(routed)
                 if routed.route_kind == GenericSourceRouteKind::ListRemove =>
             {
-                self.remove_where_source(&step.id, routed.source(), &mut deltas, &mut patches)?;
+                self.remove_where_source(&step.id, routed.source(), deltas, patches)?;
             }
             TodoEvent::Source(routed)
                 if routed.route_kind == GenericSourceRouteKind::IndexedBoolBulk =>
@@ -9348,11 +9348,7 @@ impl TodoRuntime {
                         _ => None,
                     },
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(
-                            mutation,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
@@ -9379,8 +9375,8 @@ impl TodoRuntime {
                     routed.source(),
                     Some(target_text),
                     all_completed,
-                    &mut deltas,
-                    &mut patches,
+                    deltas,
+                    patches,
                 )?;
             }
             TodoEvent::RowSource {
@@ -9389,7 +9385,7 @@ impl TodoRuntime {
                 target_occurrence,
             } if routed.route_kind == GenericSourceRouteKind::IndexedTextOpen => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                close_other_todomvc_editors(&mut self.generic, index, &mut deltas, &mut patches)?;
+                close_other_todomvc_editors(&mut self.generic, index, deltas, patches)?;
                 let all_completed = self.all_completed();
                 let source_event = GenericSourceEvent {
                     text: Some(target_text),
@@ -9421,7 +9417,7 @@ impl TodoRuntime {
                         todo_show_edit_input_text: Some(edit_text.value),
                         ..GenericRenderContext::default()
                     },
-                    &mut patches,
+                    patches,
                 )?;
             }
             TodoEvent::RowSource {
@@ -9447,11 +9443,7 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(
-                            mutation,
-                            &mut deltas,
-                            &mut patches,
-                        )?;
+                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
@@ -9495,8 +9487,8 @@ impl TodoRuntime {
                         if let Some(title) = batch.text("title") {
                             emit_todomvc_default_protocol_mutation(
                                 GenericSourceMutation::TextField(title),
-                                &mut deltas,
-                                &mut patches,
+                                deltas,
+                                patches,
                             )?;
                         }
                     } else if let Some(edit_text) = batch.text("edit_text") {
@@ -9506,8 +9498,8 @@ impl TodoRuntime {
                         batch.require_bool(routed.source(), "editing update", "editing")?;
                     emit_todomvc_default_protocol_mutation(
                         GenericSourceMutation::BoolField(editing),
-                        &mut deltas,
-                        &mut patches,
+                        deltas,
+                        patches,
                     )?;
                 }
             }
@@ -9542,15 +9534,15 @@ impl TodoRuntime {
                 if let Some(title) = batch.text("title") {
                     emit_todomvc_default_protocol_mutation(
                         GenericSourceMutation::TextField(title),
-                        &mut deltas,
-                        &mut patches,
+                        deltas,
+                        patches,
                     )?;
                 }
                 let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
                 emit_todomvc_default_protocol_mutation(
                     GenericSourceMutation::BoolField(editing),
-                    &mut deltas,
-                    &mut patches,
+                    deltas,
+                    patches,
                 )?;
             }
             TodoEvent::RowSource {
@@ -9564,8 +9556,8 @@ impl TodoRuntime {
                     index,
                     routed.source(),
                     Some(target_text),
-                    &mut deltas,
-                    &mut patches,
+                    deltas,
+                    patches,
                 )? {
                     return Err(format!(
                         "remove source `{}` predicate does not match todo `{target_text}`",
@@ -10523,7 +10515,6 @@ struct CellsRuntime {
     evaluation_cache: GenericFormulaEvaluationCache,
     columns: usize,
     rows: usize,
-    interned_texts: Vec<&'static str>,
     last_recompute_candidates: usize,
 }
 
@@ -10534,7 +10525,7 @@ struct CellsRuntimeState {
     evaluation_cache: GenericFormulaEvaluationCache,
     columns: usize,
     rows: usize,
-    interned_texts: Vec<&'static str>,
+    interned_texts: Vec<String>,
     step_recomputed: Vec<usize>,
     dirty_key_sets: DirtyKeySets,
     last_recompute_candidates: usize,
@@ -10811,22 +10802,12 @@ impl CellsRuntime {
             evaluation_cache: GenericFormulaEvaluationCache::with_capacity(cell_count),
             columns,
             rows,
-            interned_texts: Vec::new(),
             last_recompute_candidates: 0,
         }
     }
 
     fn protocol_text<'a>(&self, value: &str) -> ProtocolValue<'a> {
-        if let Some(interned) = self
-            .interned_texts
-            .iter()
-            .copied()
-            .find(|interned| *interned == value)
-        {
-            ProtocolValue::Text(Cow::Borrowed(interned))
-        } else {
-            ProtocolValue::Text(Cow::Owned(value.to_owned()))
-        }
+        ProtocolValue::Text(Cow::Owned(value.to_owned()))
     }
 
     fn reserve_cell_cache(&mut self, max_text_len: usize, max_deps: usize) {
@@ -13031,11 +13012,8 @@ mod tests {
         runtime
             .apply_step_into(&step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(
-            runtime.todo_completed_for_test(other_duplicate_index),
-            false
-        );
-        assert_eq!(runtime.todo_completed_for_test(target_index), true);
+        assert!(!runtime.todo_completed_for_test(other_duplicate_index));
+        assert!(runtime.todo_completed_for_test(target_index));
         assert_eq!(deltas.iter().find_map(|delta| delta.key), Some(target_key));
     }
 
@@ -13964,15 +13942,17 @@ mod tests {
     #[test]
     fn source_store_dense_source_id_slots_reject_unbound_sources() {
         let mut sources = SourceStore::with_capacity(4);
-        sources.bind_row(
-            "todos",
-            10,
-            1,
-            &[
-                "todo.sources.todo_checkbox.click",
-                "todo.sources.title_input.commit",
-            ],
-        );
+        sources
+            .bind_row(
+                "todos",
+                10,
+                1,
+                &[
+                    "todo.sources.todo_checkbox.click",
+                    "todo.sources.title_input.commit",
+                ],
+            )
+            .unwrap();
         let binding = sources
             .row_bindings("todos", 10, 1)
             .find(|binding| binding.source_path == "todo.sources.todo_checkbox.click")
@@ -13996,6 +13976,20 @@ mod tests {
             Some(binding.source_id),
             Some(binding.bind_epoch),
         ));
+    }
+
+    #[test]
+    fn source_store_row_binding_overflow_returns_error() {
+        let mut sources = SourceStore::with_capacity(MAX_ROW_SOURCE_BINDINGS + 1);
+        let path_refs = vec!["todo.sources.dynamic.change"; MAX_ROW_SOURCE_BINDINGS + 1];
+        let err = sources
+            .bind_row("todos", 10, 1, &path_refs)
+            .expect_err("overflow should return an error instead of panicking");
+        assert!(
+            err.to_string()
+                .contains("row source binding slot capacity exceeded")
+        );
+        assert_eq!(sources.len(), 0);
     }
 
     #[test]
@@ -14104,7 +14098,7 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert_eq!(runtime.todo_completed_for_test(0), false);
+        assert!(!runtime.todo_completed_for_test(0));
     }
 
     #[test]
@@ -14159,7 +14153,7 @@ mod tests {
         assert_eq!(runtime.stale_source_drop_count, 1);
         assert_eq!(runtime.todo_len(), 3);
         assert_eq!(runtime.todo_title_for_test(0), "Finish TodoMVC renderer");
-        assert_eq!(runtime.todo_completed_for_test(0), true);
+        assert!(runtime.todo_completed_for_test(0));
     }
 
     #[test]
@@ -14434,10 +14428,10 @@ mod tests {
         assert_eq!(store.memory("todos").unwrap().len(), 1);
         assert_eq!(store.memory("cells").unwrap().len(), 1);
         assert!(store.list_slots.windows(2).all(|window| (
-            window[0].list_id,
+            window[0].list_id.as_str(),
             window[0].name.as_str()
         ) < (
-            window[1].list_id,
+            window[1].list_id.as_str(),
             window[1].name.as_str()
         )));
     }

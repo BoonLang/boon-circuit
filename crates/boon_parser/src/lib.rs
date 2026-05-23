@@ -49,11 +49,11 @@ impl AstProgram {
         self.tokens.iter().filter(|token| {
             !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
                 && !self.line_is_document(token.line)
-                && !self
+                && self
                     .lines
                     .iter()
                     .find(|line| line.line == token.line)
-                    .is_some_and(|line| line.symbols.first().map(String::as_str) == Some("#"))
+                    .is_none_or(|line| line.symbols.first().map(String::as_str) != Some("#"))
         })
     }
 
@@ -558,7 +558,7 @@ fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
         .filter(|line| {
             !line.symbols.is_empty() && line.symbols.first().map(String::as_str) != Some("#")
         })
-        .map(|line| parser_item(line))
+        .map(parser_item)
         .collect()
 }
 
@@ -1145,21 +1145,16 @@ fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseE
     for token in ast.semantic_tokens() {
         match token.lexeme.as_str() {
             "[" | "{" | "(" => stack.push((token.lexeme.as_str(), token.line, token.column)),
-            "]" => {
-                if stack.pop().map(|(ch, _, _)| ch) != Some("[") {
-                    return Err(error(path, token.line, token.column, "unbalanced `]`"));
-                }
+            "]" if stack.pop().map(|(ch, _, _)| ch) != Some("[") => {
+                return Err(error(path, token.line, token.column, "unbalanced `]`"));
             }
-            "}" => {
-                if stack.pop().map(|(ch, _, _)| ch) != Some("{") {
-                    return Err(error(path, token.line, token.column, "unbalanced `}`"));
-                }
+            "}" if stack.pop().map(|(ch, _, _)| ch) != Some("{") => {
+                return Err(error(path, token.line, token.column, "unbalanced `}`"));
             }
-            ")" => {
-                if stack.pop().map(|(ch, _, _)| ch) != Some("(") {
-                    return Err(error(path, token.line, token.column, "unbalanced `)`"));
-                }
+            ")" if stack.pop().map(|(ch, _, _)| ch) != Some("(") => {
+                return Err(error(path, token.line, token.column, "unbalanced `)`"));
             }
+            "]" | "}" | ")" => {}
             _ => {}
         }
     }
@@ -2199,10 +2194,10 @@ List/map
         assert!(err.message.contains("line 4, column 15"));
     }
 
-    fn find_statement<'a>(
-        statements: &'a [AstStatement],
+    fn find_statement(
+        statements: &[AstStatement],
         predicate: impl Fn(&AstStatement) -> bool + Copy,
-    ) -> Option<&'a AstStatement> {
+    ) -> Option<&AstStatement> {
         statements.iter().find_map(|statement| {
             predicate(statement)
                 .then_some(statement)

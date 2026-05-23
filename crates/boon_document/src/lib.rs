@@ -1,6 +1,6 @@
-use boon_document_model::{
+pub use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind, DocumentPatch,
-    MaterializedRange, StylePatch, StyleValue, TextValue,
+    MaterializedRange, StyleMap, StylePatch, StyleValue, TextValue,
 };
 use boon_host::Viewport;
 use serde::{Deserialize, Serialize};
@@ -56,8 +56,11 @@ pub struct LayoutFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayItem {
     pub node: DocumentNodeId,
+    pub kind: DocumentNodeKind,
     pub bounds: Rect,
     pub text: Option<String>,
+    pub style: BTreeMap<String, StyleValue>,
+    pub focused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -235,6 +238,7 @@ impl LayoutBuilder<'_, '_> {
         let display_index = self.display_list.len();
         self.display_list.push(DisplayItem {
             node: node.id.clone(),
+            kind: node.kind.clone(),
             bounds: Rect {
                 x,
                 y,
@@ -242,6 +246,8 @@ impl LayoutBuilder<'_, '_> {
                 height,
             },
             text,
+            style: node.style.clone(),
+            focused: self.document.focus.as_ref() == Some(&node.id),
         });
 
         if !node.children.is_empty() {

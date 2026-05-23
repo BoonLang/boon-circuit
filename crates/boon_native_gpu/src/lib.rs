@@ -1,4 +1,6 @@
-use boon_document::{LayoutFrame, Rect, RenderCapabilities};
+use boon_document::{
+    DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap, StyleValue,
+};
 use boon_host::SurfaceId;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -532,7 +534,7 @@ impl GlyphonTextState {
         self.viewport.update(queue, Resolution { width, height });
         self.buffers.clear();
         self.buffers.reserve(runs.len());
-        for (_, text) in &runs {
+        for (_, text, _) in &runs {
             let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
             buffer.set_size(&mut self.font_system, Some(4096.0), Some(64.0));
             buffer.set_text(
@@ -546,7 +548,7 @@ impl GlyphonTextState {
             self.buffers.push(buffer);
         }
         let mut areas = Vec::with_capacity(self.buffers.len());
-        for ((bounds, _), buffer) in runs.iter().zip(self.buffers.iter()) {
+        for ((bounds, _, color), buffer) in runs.iter().zip(self.buffers.iter()) {
             let left = bounds.x + 4.0;
             let top = bounds.y + 4.0;
             areas.push(TextArea {
@@ -555,7 +557,7 @@ impl GlyphonTextState {
                 top,
                 scale: 1.0,
                 bounds: text_bounds(*bounds, width, height),
-                default_color: Color::rgb(238, 244, 248),
+                default_color: Color::rgba(color[0], color[1], color[2], color[3]),
                 custom_glyphs: &[],
             });
         }
@@ -600,13 +602,19 @@ impl GlyphonTextState {
     }
 }
 
-fn text_runs(frame: &LayoutFrame) -> Vec<(Rect, String)> {
+fn text_runs(frame: &LayoutFrame) -> Vec<(Rect, String, [u8; 4])> {
     frame
         .display_list
         .iter()
         .filter_map(|item| {
             let text = item.text.as_deref()?.trim();
-            (!text.is_empty()).then(|| (item.bounds, text.to_owned()))
+            (!text.is_empty()).then(|| {
+                (
+                    item.bounds,
+                    text.to_owned(),
+                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
+                )
+            })
         })
         .take(256)
         .collect()
@@ -624,20 +632,44 @@ fn text_bounds(bounds: Rect, width: u32, height: u32) -> TextBounds {
 fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec<f32>) {
     let mut positions = Vec::new();
     let mut colors = Vec::new();
+    push_rect(
+        &mut positions,
+        &mut colors,
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+        width,
+        height,
+        [0.965, 0.972, 0.982, 1.0],
+    );
     for (index, item) in frame.display_list.iter().enumerate().take(512) {
-        let x0 = (item.bounds.x / width.max(1.0))
-            .mul_add(2.0, -1.0)
-            .clamp(-1.0, 1.0);
-        let x1 = ((item.bounds.x + item.bounds.width) / width.max(1.0))
-            .mul_add(2.0, -1.0)
-            .clamp(-1.0, 1.0);
-        let y0 = (1.0 - (item.bounds.y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
-        let y1 =
-            (1.0 - ((item.bounds.y + item.bounds.height) / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
-        positions.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
-        let color = color_for_index(index);
-        for _ in 0..6 {
-            colors.extend_from_slice(&color);
+        let fill = style_color_f32(&item.style, "bg")
+            .or_else(|| style_color_f32(&item.style, "background"))
+            .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
+        push_rect(
+            &mut positions,
+            &mut colors,
+            item.bounds,
+            width,
+            height,
+            fill,
+        );
+        if let Some(border) = style_color_f32(&item.style, "border") {
+            push_border(
+                &mut positions,
+                &mut colors,
+                item.bounds,
+                width,
+                height,
+                if item.focused {
+                    [0.098, 0.459, 0.824, 1.0]
+                } else {
+                    border
+                },
+            );
         }
     }
     if positions.is_empty() {
@@ -651,11 +683,112 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
     (positions, colors)
 }
 
-fn color_for_index(index: usize) -> [f32; 4] {
-    let r = 0.18 + ((index * 37) % 80) as f32 / 140.0;
-    let g = 0.28 + ((index * 53) % 70) as f32 / 150.0;
-    let b = 0.38 + ((index * 29) % 60) as f32 / 160.0;
-    [r.min(0.92), g.min(0.92), b.min(0.92), 1.0]
+fn push_rect(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<f32>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let x0 = (rect.x / width.max(1.0))
+        .mul_add(2.0, -1.0)
+        .clamp(-1.0, 1.0);
+    let x1 = ((rect.x + rect.width) / width.max(1.0))
+        .mul_add(2.0, -1.0)
+        .clamp(-1.0, 1.0);
+    let y0 = (1.0 - (rect.y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
+    let y1 = (1.0 - ((rect.y + rect.height) / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
+    positions.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
+    for _ in 0..6 {
+        colors.extend_from_slice(&color);
+    }
+}
+
+fn push_border(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<f32>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let thickness = 2.0;
+    for edge in [
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: thickness,
+        },
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.height - thickness,
+            width: rect.width,
+            height: thickness,
+        },
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            width: thickness,
+            height: rect.height,
+        },
+        Rect {
+            x: rect.x + rect.width - thickness,
+            y: rect.y,
+            width: thickness,
+            height: rect.height,
+        },
+    ] {
+        push_rect(positions, colors, edge, width, height, color);
+    }
+}
+
+fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
+    match kind {
+        DocumentNodeKind::Root | DocumentNodeKind::Stack | DocumentNodeKind::ScrollRoot => {
+            [0.965, 0.972, 0.982, 1.0]
+        }
+        DocumentNodeKind::Row => {
+            if index % 2 == 0 {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.949, 0.965, 0.984, 1.0]
+            }
+        }
+        DocumentNodeKind::TextInput => [1.0, 1.0, 1.0, 1.0],
+        DocumentNodeKind::Button => [0.92, 0.95, 0.97, 1.0],
+        DocumentNodeKind::Grid | DocumentNodeKind::GridCell => [1.0, 1.0, 1.0, 1.0],
+        DocumentNodeKind::Text => [0.965, 0.972, 0.982, 1.0],
+    }
+}
+
+fn style_color_f32(style: &StyleMap, key: &str) -> Option<[f32; 4]> {
+    style_color_u8(style, key).map(|color| {
+        [
+            color[0] as f32 / 255.0,
+            color[1] as f32 / 255.0,
+            color[2] as f32 / 255.0,
+            color[3] as f32 / 255.0,
+        ]
+    })
+}
+
+fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {
+    let StyleValue::Text(value) = style.get(key)? else {
+        return None;
+    };
+    parse_hex_color(value)
+}
+
+fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
+    let hex = value.trim().strip_prefix('#')?;
+    let parse = |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).ok();
+    match hex.len() {
+        6 => Some([parse(0..2)?, parse(2..4)?, parse(4..6)?, 255]),
+        8 => Some([parse(0..2)?, parse(2..4)?, parse(4..6)?, parse(6..8)?]),
+        _ => None,
+    }
 }
 
 fn f32_slice_bytes(values: &[f32]) -> Vec<u8> {

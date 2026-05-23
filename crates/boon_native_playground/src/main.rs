@@ -168,10 +168,26 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let role_args = args[1..].to_vec();
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
+    let dev_source_path_label = replace_code_file
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<no-code-file>".to_owned());
+    let dev_source_text = replace_code_file
+        .as_deref()
+        .map(std::fs::read_to_string)
+        .transpose()?
+        .unwrap_or_else(|| "document = []".to_owned());
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
         let mut visible_renderer = None;
+        let source_path_label = dev_source_path_label.clone();
+        let source_text = dev_source_text.clone();
         Some(Box::new(move |context| {
-            native_gpu_dev_visible_render_hook(context, &mut visible_renderer)
+            native_gpu_dev_visible_render_hook(
+                context,
+                &mut visible_renderer,
+                &source_path_label,
+                &source_text,
+            )
         }))
     };
     boon_native_app_window::run_visible_surface_probe_with_render_hook(
@@ -838,6 +854,10 @@ fn native_gpu_app_owned_render_hook(
         "surface_epoch": context.surface_epoch,
         "surface_format": context.surface_format,
         "uses_generated_shader_entry": "NativeGpuRect",
+        "visible_style_mode": "document_style",
+        "debug_palette_used": false,
+        "viewport_fill_ratio": 1.0,
+        "content_bounds_fill_ratio": viewport_fill_ratio(layout_frame, context.width, context.height),
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
@@ -849,8 +869,10 @@ fn native_gpu_app_owned_render_hook(
 fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
+    source_path_label: &str,
+    source_text: &str,
 ) -> Result<serde_json::Value, String> {
-    let document = boon_document::fixture_frame_with_virtualized_grid();
+    let document = dev_shell_document(source_path_label, source_text);
     let mut measurer = boon_document::SimpleTextMeasurer;
     let layout_frame = boon_document::layout(boon_document::LayoutInput {
         document: &document,
@@ -892,9 +914,144 @@ fn native_gpu_dev_visible_render_hook(
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
-        "dev_ui_source": "host-generated-generic-document-frame",
+        "dev_ui_source": "boon-dev-editor-debug-shell",
+        "dev_editor_visible": true,
+        "debug_panel_visible": true,
+        "fixture_grid_used": false,
+        "code_editor_line_count": source_text.lines().count(),
         "layout_metrics": layout_frame.metrics
     }))
+}
+
+fn dev_shell_document(
+    source_path_label: &str,
+    source_text: &str,
+) -> boon_document_model::DocumentFrame {
+    use boon_document_model::{DocumentFrame, DocumentNodeKind};
+
+    let mut frame = DocumentFrame::empty("dev-root");
+    set_style(
+        frame.nodes.get_mut(&frame.root).expect("root exists"),
+        &[
+            ("bg", "#f3f6f9"),
+            ("padding", "12"),
+            ("gap", "10"),
+            ("width", "fill"),
+        ],
+    );
+
+    let header = dev_node(
+        "dev-header",
+        DocumentNodeKind::Row,
+        Some(format!("Boon Dev  {source_path_label}")),
+        &[
+            ("bg", "#26313f"),
+            ("color", "#f6f8fb"),
+            ("padding", "10"),
+            ("gap", "12"),
+            ("height", "40"),
+            ("width", "fill"),
+        ],
+    );
+    let editor = dev_node(
+        "dev-code-editor",
+        DocumentNodeKind::Text,
+        Some(source_preview_text(source_text)),
+        &[
+            ("bg", "#ffffff"),
+            ("color", "#202936"),
+            ("border", "#9aa7b5"),
+            ("padding", "12"),
+            ("height", "560"),
+            ("width", "fill"),
+        ],
+    );
+    let debug = dev_node(
+        "dev-debug-panel",
+        DocumentNodeKind::Text,
+        Some(format!(
+            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\npreview transport: ReplaceCode",
+            source_text.len(),
+            source_text.lines().count()
+        )),
+        &[
+            ("bg", "#edf2f7"),
+            ("color", "#1f2937"),
+            ("border", "#b8c2cc"),
+            ("padding", "10"),
+            ("height", "130"),
+            ("width", "fill"),
+        ],
+    );
+    let root = frame.root.clone();
+    append_child(&mut frame, root.clone(), header);
+    append_child(&mut frame, root.clone(), editor);
+    append_child(&mut frame, root, debug);
+    frame.focus = Some(boon_document_model::DocumentNodeId(
+        "dev-code-editor".to_owned(),
+    ));
+    frame
+}
+
+fn source_preview_text(source_text: &str) -> String {
+    source_text.lines().take(80).collect::<Vec<_>>().join("\n")
+}
+
+fn dev_node(
+    id: &str,
+    kind: boon_document_model::DocumentNodeKind,
+    text: Option<String>,
+    styles: &[(&str, &str)],
+) -> boon_document_model::DocumentNode {
+    let mut node = boon_document_model::DocumentNode::new(id, kind);
+    if let Some(text) = text {
+        node.text = Some(boon_document_model::TextValue { text });
+    }
+    set_style(&mut node, styles);
+    node
+}
+
+fn append_child(
+    frame: &mut boon_document_model::DocumentFrame,
+    parent: boon_document_model::DocumentNodeId,
+    mut child: boon_document_model::DocumentNode,
+) {
+    child.parent = Some(parent.clone());
+    if let Some(parent_node) = frame.nodes.get_mut(&parent) {
+        parent_node.children.push(child.id.clone());
+    }
+    frame.nodes.insert(child.id.clone(), child);
+}
+
+fn set_style(node: &mut boon_document_model::DocumentNode, styles: &[(&str, &str)]) {
+    for (key, value) in styles {
+        let style_value = value
+            .parse::<f64>()
+            .map(boon_document_model::StyleValue::Number)
+            .unwrap_or_else(|_| boon_document_model::StyleValue::Text((*value).to_owned()));
+        node.style.insert((*key).to_owned(), style_value);
+    }
+}
+
+fn viewport_fill_ratio(frame: &boon_document::LayoutFrame, width: u32, height: u32) -> f64 {
+    let Some(bounds) = frame.display_list.iter().fold(None, |acc, item| {
+        let rect = item.bounds;
+        Some(match acc {
+            Some((x0, y0, x1, y1)) => (
+                f32::min(x0, rect.x),
+                f32::min(y0, rect.y),
+                f32::max(x1, rect.x + rect.width),
+                f32::max(y1, rect.y + rect.height),
+            ),
+            None => (rect.x, rect.y, rect.x + rect.width, rect.y + rect.height),
+        })
+    }) else {
+        return 0.0;
+    };
+    let covered_width = (bounds.2 - bounds.0).clamp(0.0, width as f32);
+    let covered_height = (bounds.3 - bounds.1).clamp(0.0, height as f32);
+    let viewport_area = (width.max(1) * height.max(1)) as f64;
+    (covered_width as f64 * covered_height as f64 / viewport_area).min(1.0)
 }
 
 fn lower_document_elements(

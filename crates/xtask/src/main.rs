@@ -2411,6 +2411,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             "preview_document_layout_proof",
             "preview_runtime_summary",
             "preview_native_gpu_render_proof",
+            "preview_surface_proof",
+            "dev_surface_proof",
         ] {
             if let Some(value) = supervisor.get(key) {
                 extra[key] = value.clone();
@@ -2601,6 +2603,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         extra["runtime_state_assertions"] = json!(assertions);
     }
     extra["native_runtime_assertion_evidence"] = runtime_assertion_evidence;
+    let visible_reality_harness = native_visible_reality_harness(&extra);
+    extra["visible_reality_harness"] = visible_reality_harness;
 
     let two_windows = extra
         .get("process_model")
@@ -2808,6 +2812,33 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     push_audit_check(
         &mut checks,
         &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:visible-reality-harness"),
+        extra
+            .pointer("/visible_reality_harness/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass"),
+        format!(
+            "status={:?}, blocker_count={}",
+            extra
+                .pointer("/visible_reality_harness/status")
+                .and_then(serde_json::Value::as_str),
+            extra
+                .pointer("/visible_reality_harness/blockers")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        (extra
+            .pointer("/visible_reality_harness/status")
+            .and_then(serde_json::Value::as_str)
+            != Some("pass"))
+        .then(|| {
+            "native preview E2E lacks visible proof for document styling, live frame loop, non-fixture dev UI, and input-visible frame change"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         format!("native-gpu-preview-e2e-{example}:runtime-assertions"),
         extra
             .get("runtime_state_assertions")
@@ -2914,6 +2945,23 @@ fn native_preview_host_route_evidence(
         == Some(true);
     let input_ready = real_input || operator_input;
     let has_route = target_hit.is_some() && !matched_source_intents.is_empty();
+    let changes_visible_frame = report
+        .pointer("/dev_ipc_probe/operator_host_input/outputs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|outputs| {
+            outputs.iter().any(|output| {
+                output
+                    .get("render_patch_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+                    > 0
+                    || output
+                        .get("semantic_delta_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                        > 0
+            })
+        });
     let status = if input_ready && has_route {
         "pass"
     } else if !input_ready && has_route {
@@ -2934,7 +2982,9 @@ fn native_preview_host_route_evidence(
             "route_contract": "HostInputEvent -> document hit region -> SourceIntent",
             "private_runtime_dispatch_used": false,
             "operator_host_input_observed": operator_input,
-            "real_os_input_observed": real_input
+            "real_os_input_observed": real_input,
+            "changes_visible_frame": changes_visible_frame,
+            "visible_frame_change_method": "operator_host_event_to_preview_ipc_render_patch"
         })]
     } else {
         Vec::new()
@@ -2954,6 +3004,7 @@ fn native_preview_host_route_evidence(
             .unwrap_or_else(|| json!([])),
         "operator_host_input_observed": operator_input,
         "real_os_input_observed": real_input,
+        "changes_visible_frame": changes_visible_frame,
         "per_step_host_input_route": route_steps.clone(),
         "per_step_os_pointer_keyboard_route": route_steps,
         "blocked_reason": match status {
@@ -5131,6 +5182,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 report,
                 "/preview_native_gpu_render_proof",
             );
+            require_visible_playground_reality(&mut blockers, report);
             if report
                 .get("input_injection_method")
                 .and_then(serde_json::Value::as_str)
@@ -5263,6 +5315,117 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         _ => {}
     }
     blockers
+}
+
+fn native_visible_reality_harness(report: &serde_json::Value) -> serde_json::Value {
+    let mut blockers = Vec::new();
+    require_visible_playground_reality(&mut blockers, report);
+    json!({
+        "status": if blockers.is_empty() { "pass" } else { "fail" },
+        "method": "visible_wgpu_readback_plus_render_hook_contract",
+        "blockers": blockers,
+        "preview_readback_artifact": report
+            .pointer("/preview_surface_proof/readback_artifact")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "dev_readback_artifact": report
+            .pointer("/dev_surface_proof/readback_artifact")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "rejects_single_color_or_debug_palette_preview": true,
+        "rejects_fixture_grid_dev_surface": true,
+        "rejects_frozen_one_frame_surface": true
+    })
+}
+
+fn require_visible_playground_reality(blockers: &mut Vec<String>, report: &serde_json::Value) {
+    for (surface_key, role) in [
+        ("preview_surface_proof", "preview"),
+        ("dev_surface_proof", "dev"),
+    ] {
+        require_native_surface_proof(blockers, report, surface_key, role);
+        let surface_path = format!("/{surface_key}");
+        if report
+            .pointer(&format!("{surface_path}/interactive_frame_loop"))
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            blockers.push(format!(
+                "{surface_path}.interactive_frame_loop must be true; one-frame render then sleep is forbidden"
+            ));
+        }
+        require_visible_native_render_proof(
+            blockers,
+            report,
+            &format!("{surface_path}/external_render_proof"),
+        );
+    }
+    if report
+        .pointer("/preview_surface_proof/external_render_proof/visible_style_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("document_style")
+    {
+        blockers.push(
+            "preview_surface_proof.external_render_proof.visible_style_mode must be document_style"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/preview_surface_proof/external_render_proof/debug_palette_used")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        blockers.push(
+            "preview_surface_proof.external_render_proof.debug_palette_used must be false"
+                .to_owned(),
+        );
+    }
+    if !report
+        .pointer("/preview_surface_proof/external_render_proof/viewport_fill_ratio")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio >= 0.90)
+    {
+        blockers.push(
+            "preview_surface_proof.external_render_proof.viewport_fill_ratio must be at least 0.90"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/dev_surface_proof/external_render_proof/dev_ui_source")
+        .and_then(serde_json::Value::as_str)
+        != Some("boon-dev-editor-debug-shell")
+    {
+        blockers.push(
+            "dev_surface_proof.external_render_proof.dev_ui_source must be boon-dev-editor-debug-shell"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/dev_surface_proof/external_render_proof/dev_editor_visible")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        blockers.push(
+            "dev_surface_proof.external_render_proof.dev_editor_visible must be true".to_owned(),
+        );
+    }
+    if report
+        .pointer("/dev_surface_proof/external_render_proof/fixture_grid_used")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        blockers.push(
+            "dev_surface_proof.external_render_proof.fixture_grid_used must be false".to_owned(),
+        );
+    }
+    if report
+        .pointer("/native_host_input_route_evidence/changes_visible_frame")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        blockers
+            .push("native_host_input_route_evidence.changes_visible_frame must be true".to_owned());
+    }
 }
 
 fn require_scroll_budget_fields(blockers: &mut Vec<String>, report: &serde_json::Value) {

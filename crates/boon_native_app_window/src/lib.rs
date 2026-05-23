@@ -139,6 +139,7 @@ pub struct AppWindowSurfaceProof {
     pub presented_frame_ms: f64,
     pub readback_ms: Option<f64>,
     pub first_frame_ms: f64,
+    pub interactive_frame_loop: bool,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
     pub input_adapter: NativeInputAdapterProof,
@@ -546,7 +547,7 @@ async fn run_surface_probe_inner(
         window_backend: "app_window-wayland".to_owned(),
         window_title: options.title,
         window_id,
-        surface_id,
+        surface_id: surface_id.clone(),
         surface_epoch: 1,
         wgpu_strategy: format!("{:?}", app_window::WGPU_STRATEGY),
         wgpu_surface_strategy: format!("{:?}", app_window::WGPU_SURFACE_STRATEGY),
@@ -555,7 +556,7 @@ async fn run_surface_probe_inner(
         adapter_device: adapter_info.device,
         adapter_vendor: adapter_info.vendor,
         adapter_is_software: matches!(adapter_info.device_type, wgpu::DeviceType::Cpu),
-        surface_format,
+        surface_format: surface_format.clone(),
         present_mode,
         alpha_mode,
         logical_size: Viewport {
@@ -573,6 +574,7 @@ async fn run_surface_probe_inner(
         presented_frame_ms: surface_acquire_ms + present_submit_ms,
         readback_ms,
         first_frame_ms: surface_acquire_ms + present_submit_ms + readback_ms.unwrap_or(0.0),
+        interactive_frame_loop: true,
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
         input_adapter,
@@ -580,12 +582,67 @@ async fn run_surface_probe_inner(
         readback_artifact,
     };
     let _ = ready_sender.send(Ok(proof));
-    if options.hold_ms == 0 {
-        loop {
-            std::thread::sleep(Duration::from_secs(60));
+    let hold_started = Instant::now();
+    loop {
+        if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
+            break;
         }
+        let frame = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            other => {
+                return Err(NativeWindowError::Failed(format!(
+                    "get_current_texture during interactive loop: {other:?}"
+                )));
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("boon-native-app-window-interactive-encoder"),
+        });
+        match render_hook.as_mut() {
+            Some(render_hook) => {
+                render_hook(NativeRenderFrameContext {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut encoder,
+                    surface_view: &view,
+                    surface_texture_format: config.format,
+                    surface_id: surface_id.clone(),
+                    surface_epoch: 1,
+                    surface_format: surface_format.clone(),
+                    width,
+                    height,
+                })
+                .map_err(|error| {
+                    NativeWindowError::Failed(format!("external render hook: {error}"))
+                })?;
+            }
+            None => {
+                let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("boon-native-app-window-interactive-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear_color(options.role)),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+        frame.present();
+        std::thread::sleep(Duration::from_millis(16));
     }
-    std::thread::sleep(Duration::from_millis(options.hold_ms));
     drop(surface);
     drop(app_surface);
     drop(window);

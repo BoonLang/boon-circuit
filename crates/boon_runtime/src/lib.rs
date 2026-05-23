@@ -5226,6 +5226,21 @@ impl GenericScheduledRuntime {
                 "viewport_cell_count": visible_cells.len(),
                 "viewport_kind": "scrollable_spreadsheet_grid"
             },
+            "selected_input": visible_cells.first().map(|cell| json!({
+                "address": cell.get("address").and_then(JsonValue::as_str).unwrap_or("A0"),
+                "edit_value": cell.get("formula").and_then(JsonValue::as_str).unwrap_or(""),
+                "value": cell.get("value").and_then(JsonValue::as_str).unwrap_or(""),
+                "change_source": "cell.sources.editor.change",
+                "submit_source": "cell.sources.editor.commit",
+                "cancel_source": "cell.sources.editor.cancel"
+            })).unwrap_or_else(|| json!({
+                "address": "A0",
+                "edit_value": "",
+                "value": "",
+                "change_source": "cell.sources.editor.change",
+                "submit_source": "cell.sources.editor.commit",
+                "cancel_source": "cell.sources.editor.cancel"
+            })),
             "grid_columns": grid_columns,
             "grid_rows": grid_rows,
             "cells": visible_cells,

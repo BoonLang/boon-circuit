@@ -14,6 +14,7 @@ members = [
     "crates/boon_native_playground",
     "crates/xtask",
 ]
+exclude = ["vendor/app_window"]
 resolver = "2"
 
 [workspace.package]
@@ -41,5 +42,6 @@ image = { version = "0.24.9", default-features = false, features = ["png"] }
 ply-engine = { version = "1.1.1", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"
-app_window = "=0.3.3"
+app_window = { path = "vendor/app_window" }
 wgsl_bindgen = "=0.22.2"
+futures = "0.3"

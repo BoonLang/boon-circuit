@@ -12,4 +12,5 @@ boon_document_model.workspace = true
 boon_host.workspace = true
 boon_native_gpu.workspace = true
 boon_native_app_window.workspace = true
+boon_parser.workspace = true
 serde_json.workspace = true

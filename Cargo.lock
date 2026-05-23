@@ -115,8 +115,6 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "app_window"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b7f921aeb5aee967eb8e851bfd1076166e38aa852a95b6c004cda5c9e6051f"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -543,7 +541,11 @@ version = "0.1.0"
 dependencies = [
  "app_window",
  "boon_host",
+ "futures",
+ "image",
  "serde",
+ "serde_json",
+ "sha2",
  "wgpu",
 ]
 
@@ -554,7 +556,10 @@ dependencies = [
  "boon_document",
  "boon_host",
  "glyphon",
+ "image",
  "serde",
+ "serde_json",
+ "sha2",
  "wgpu",
 ]
 
@@ -567,6 +572,7 @@ dependencies = [
  "boon_host",
  "boon_native_app_window",
  "boon_native_gpu",
+ "boon_parser",
  "boon_runtime",
  "serde_json",
 ]
@@ -1226,6 +1232,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -1247,6 +1254,17 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -1296,10 +1314,13 @@ version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
+ "futures-channel",
  "futures-core",
+ "futures-io",
  "futures-macro",
  "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]

@@ -1,111 +1,67 @@
 # Boon Circuit Agent Notes
 
-Treat `docs/plans/IMPLEMENTATION_PLAN.md`,
-`docs/plans/EXAMPLE_VERIFICATION_PLAN.md`,
-`docs/plans/TODOMVC_E2E_TEST_PLAN.md`, and
-`docs/plans/MANUAL_TESTING_RUNBOOK.md` as the implementation and verification
-contract.
+Treat `docs/architecture/NATIVE_GPU_PIPELINE.md` as the active implementation
+and verification contract for native window work. The older plan files still
+document historical Ply/runtime verification, but they are not the source of
+truth for the native two-window GPU playground.
 
 Do not commit or push unless the user explicitly asks.
 
-Do not fabricate `target/reports/todomvc-human.json` or
-`target/reports/cells-human.json`. Those reports are only valid after a real
-visible manual session with a human observer, fresh manual screenshot/video
-artifacts, the visible manual playground `--window-pid`, an explicit
-`--focused-window-proof`, helper provenance fields such as
-`manual_report_prepared_by`, and every scenario label explicitly passed.
-For Codex/operator completion, use non-human
-`target/reports/todomvc-operator-e2e.json` and
-`target/reports/cells-operator-e2e.json` reports. Those reports must be bound to
-fresh full headed OS-input reports and must not claim human observation.
+Do not fabricate human-observation reports. Human testing is a separate
+follow-up after the native GPU gates pass, and it must not be used as a shortcut
+for native GPU verifier evidence.
 
-For visible manual playground launches on this COSMIC desktop, use the
-workspace-qualified background launcher directly around the native window
-creator:
+For visible native playground launches on this COSMIC desktop, use the
+workspace-qualified background launcher around the native GPU desktop entrypoint
+only when a visible manual launch is explicitly needed:
 
 ```bash
-cargo build -p boon_ply_playground
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example todomvc
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --example cells
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_ply_playground --preview-only --example cells
+cargo build -p boon_native_playground
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example todomvc
+cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example cells
 ```
 
-The default interactive playground is a Wayland-only split launch: the preview
-window is the production-style app surface and the dev console is the
-debug/source/telemetry surface. Use `--preview-only` when only the production
-preview should open. Use `--single-window --mode <app|source|deltas|inspector|causes|scenario>`
-only for legacy debugging, not production-readiness evidence.
+The native desktop launch must create two native windows: a production-style
+preview window and a dev/debug window. The preview process/window receives Boon
+source, not example names or example-specific render shortcuts.
 
-After launch, prove the process exists with `pgrep -af boon_ply_playground`.
+After launch, prove the process exists with `pgrep -af boon_native_playground`.
 If the user says the app is bothering their current workspace, stop immediately,
-run `pgrep -af 'boon_ply_playground|xvfb-run|Xvfb'`, and kill only the matching
+run `pgrep -af 'boon_native_playground'`, and kill only the matching
 playground/test process you started.
 
 `cosmic-background-launch` is local/custom COSMIC tooling from the sibling
-`~/repos/cosmic*` checkouts, not an external immutable system command. If it
-does not provide enough proof for reliable app testing, suggest improving that
-tool instead of working around it here. Useful improvements would include a
-machine-readable report with launched child PID, requested and actual workspace,
-window identity/title/app-id, mapped/focused state, and optional targeted
-screenshot metadata so agents can prove that a visible app opened in the
-`boon-circuit` workspace without disturbing the user's active workspace.
+`~/repos/cosmic*` checkouts, not an external immutable system command. It may be
+used only as the workspace-qualified process launcher. Do not use COSMIC
+toplevel scraping, compositor activation, or whole-desktop screenshots as
+verification evidence; the native proof must come from app-owned reports,
+process IDs, host events, and WGPU readback.
 
-Do not assume native Wayland windows are visible to `xdotool`. On this COSMIC
-Wayland desktop, `xdotool search --pid <playground-pid>` can fail even when the
-window is real, so lack of an xdotool window id is not proof that launch failed.
-For screenshot evidence, prefer repo-generated artifacts from the playground
-or xtask reports, for example:
+Do not use legacy Ply, Xvfb, whole-desktop screenshots, `xdotool`, `ydotool`,
+direct COSMIC toplevel probing, or browser windows as evidence for the native
+GPU path. Use app-owned WGPU readback screenshots, native GPU reports, and the
+host-event verifier route described in `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 
-```bash
-cargo xtask verify-cells-visible-reality --report target/reports/cells-visible-reality.json
-cargo xtask verify-todomvc-headed-ply
-cargo xtask verify-cells-headed-ply
-```
-
-Those commands create targeted screenshot/report artifacts such as
-`target/reports/cells-visible-reality-smoke.png` and headed step screenshots.
-Use the `image-preflight` skill before viewing or uploading these screenshots.
-If a visible COSMIC screenshot is absolutely needed, use COSMIC screenshot
-portal tooling and record that it is a visible manual artifact, not automated
-OS-input proof. Do not use whole-desktop screenshots as launch evidence when a
-repo report screenshot is available.
-
-Background launch is not evidence for full OS input. The legacy headed
-verification commands may run in isolated Xvfb/X11 for old report compatibility,
-so those reports cannot prove production Wayland preview speed or full Wayland
-input behavior. Do not set
-`BOON_ALLOW_LIVE_DESKTOP_INPUT=1` or
-`BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS=1` unless the user
-explicitly asks for live desktop input. Both variables are required before an
-xtask verifier may target the live desktop:
+Before claiming native GPU handoff readiness, run only the native GPU gates:
 
 ```bash
-BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
-BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
-cargo xtask verify-playground-split-wayland --report target/reports/playground-split-wayland.json
-cargo xtask verify-cells-wayland-scroll-speed --report target/reports/cells-wayland-scroll-speed.json
+cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
+cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
+cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json
+cargo xtask verify-native-gpu-layout-contract --report target/reports/native-gpu/layout-contract.json
+cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json
+cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
+cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
+cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
+cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
+cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
+cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
+cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
+cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
+cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
-Launch-smoke verifiers also use isolated Xvfb/X11. Do not accept whole-desktop
-COSMIC screenshots as launch evidence; they can capture unrelated user windows.
-Do not accept Xvfb/X11 reports as evidence that the Cells example scrolls
-smoothly in production; use the Wayland scroll-speed report, which enforces the
-60 FPS p95 frame-time and wheel-to-visible-scroll budgets.
-
-Before claiming handoff readiness, run:
-
-```bash
-cargo xtask verify-report-schema
-cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
-cargo xtask verify-playground-split-wayland --report target/reports/playground-split-wayland.json
-cargo xtask verify-cells-wayland-scroll-speed --report target/reports/cells-wayland-scroll-speed.json
-cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
-cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
-cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
-```
-
-If `audit-machine-readiness` passes but `audit-goal-readiness` reports only
-missing operator/all reports, generate the operator E2E reports from fresh
-headed evidence. If human reports are missing, tell the user to continue with
-human testing as follow-up instead of weakening schemas, reports, or manual
-checks.
+If human observation is still needed after the native gates pass, tell the user
+to continue with human testing as a separate follow-up. Do not weaken native GPU
+schemas, reports, budgets, or negative checks to pass old Ply/COSMIC readiness
+audits.

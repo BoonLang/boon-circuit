@@ -495,10 +495,12 @@ Layout diffing is a private renderer optimization in v1. A public `LayoutDiff`
 type may be added only after the producer, consumer, identity keys, and verifier
 assertions are specified.
 
-Surface `COPY_SRC` readback or compositor screenshot evidence is optional
-diagnostic evidence only. It must not be required for pass/fail unless the report
-records that the active surface capabilities support it. Hash-only render proof
-is not accepted; reports must link every proof artifact by path and sha256.
+App-owned GPU readback is the primary screenshot evidence. The renderer may read
+back the visible WGPU surface when `COPY_SRC` is supported, or read back an
+explicit app-owned render target that is copied to the visible surface in the
+same frame. Compositor screenshots are diagnostic only and must not be the
+portable pass/fail mechanism. Hash-only render proof is not accepted; reports
+must link every proof artifact by path and sha256.
 
 ## Native GPU Renderer
 
@@ -594,6 +596,7 @@ Forbidden:
 - renderer pipelines;
 - layout decisions;
 - X11-only input assumptions;
+- live-desktop focus helpers as the default verification route;
 - `xdotool` as required Wayland proof.
 
 ### Native Wayland Threading Contract
@@ -625,6 +628,89 @@ Required app_window wrapper/API capabilities:
 - stable public window/surface identity for proof reports;
 - title/app-id/proof metadata;
 - resize event with logical size, scale, physical size, and epoch.
+
+### Portable Verifier Harness
+
+Native GPU E2E and scroll-speed gates must not depend on stealing focus from the
+developer's live COSMIC desktop, on a Weston-specific test extension, or on
+Linux-only global input tools. The default verifier path is host-portable:
+
+- launch the real native two-process app through the same `app_window`/`wgpu`
+  window path used by production;
+- capture screenshots from the app-owned GPU output by reading back the visible
+  WGPU surface or an explicit render target that is copied to the visible
+  surface in the same frame;
+- synthesize verifier input at the public host-event boundary, after native
+  `app_window` events would normally be normalized and before document
+  hit/focus/scroll routing;
+- route every verifier event through `HostEvent`/`HostInputEvent`,
+  document hit testing, `SourceIntent`/`ViewportIntent`, public runtime
+  dispatch when a source binding exists, layout, GPU upload, render, and
+  readback;
+- record the event source as `operator_host_input`, not `real_os_input`, unless
+  the event was actually delivered by the operating system/window backend.
+
+The harmonizing layer is the single boundary shared by real OS input and
+verifier input:
+
+```text
+OS/window event or verifier event
+  -> HostEvent / HostInputEvent
+  -> Document hit/focus/scroll resolution
+  -> SourceIntent and/or ViewportIntent
+  -> public runtime dispatch only when application source input is bound
+  -> DocumentPatch / layout / render / GPU readback
+```
+
+The verifier input source must be a public API in `boon_host` or the native
+composition layer. It must not call private runtime mutation APIs, mutate scroll
+offsets directly, dispatch `SourceBatch` before hit/source-intent routing, send
+example-specific preview commands, or bypass the renderer by fabricating
+display-list or runtime state.
+
+Reports must separate evidence tiers:
+
+- `real_os_input`: true only for events delivered by the OS/window backend and
+  observed by app_window or the platform input adapter;
+- `operator_host_input`: true for verifier-synthesized host events injected at
+  the harmonizing layer;
+- `input_injection_method`: names the exact source, for example
+  `operator_host_event_harness` or `os_pointer_keyboard_to_visible_window`;
+- `visual_capture_method`: names app-owned WGPU readback, copied render target
+  readback, or another explicit output-frame capture path;
+- `private_runtime_dispatch_used`: always false for passing reports.
+
+Platform-specific OS-input smoke tests may exist later for Linux, macOS, and
+Windows, but they are not the default correctness or speed gate. They must reuse
+the same harmonizing layer and may only upgrade `real_os_input` evidence; they
+must not introduce a second testing path.
+
+What we want from the native verifier:
+
+- a real preview window and a real dev/debug window, with the preview rendering
+  the current document selected or replaced from the dev side;
+- visual proof captured from the preview renderer's own WGPU output, never from
+  a whole-desktop screenshot or compositor-owned capture path;
+- interaction proof driven through the same host-event API that OS events use
+  after normalization, so tests cover hit testing, focus, source intents,
+  scroll intents, runtime updates, layout, upload, and present;
+- speed proof based on app-owned frame timing/readback and bounded renderer
+  metrics, not on whether a Linux compositor accepted global input;
+- report language that distinguishes operator host input from real OS input so
+  portable CI/operator proof cannot accidentally masquerade as human or
+  platform-input proof.
+
+Remove the now-dead compositor-specific experiment from the implementation:
+
+- delete nested-Weston/verifier-owned-compositor launch helpers from `xtask`;
+- delete COSMIC toplevel activation and direct Wayland/ydotool/evemu fallback
+  code from the native GPU verifier path;
+- delete report fields that require nested-compositor provenance as mandatory
+  evidence;
+- keep `cosmic-background-launch --workspace boon-circuit` only for visible
+  manual/operator app launches that should stay out of the user's workspace;
+- keep app-owned WGPU readback and frame timing as the screenshot/performance
+  evidence source.
 
 ### Surface Lifecycle
 
@@ -701,10 +787,10 @@ Forbidden:
 
 ## Input Contract
 
-Native input flows through one route:
+Native input and verifier input flow through one route:
 
 ```text
-app_window or wrapper event
+app_window, wrapper, or operator verifier event
   -> HostEvent / HostInputEvent
   -> Document hit/focus/scroll resolution
   -> SourceIntent and/or ViewportIntent
@@ -733,6 +819,12 @@ explicitly binds scroll position as application source data.
 Cells editing must support focus, formula bar text, raw formula/value display,
 caret movement, commit/cancel, row/column scrolling, and dependent recalculation
 through this same route.
+
+The operator verifier must exercise the same route by constructing
+`HostInputEvent`s at the harmonizing boundary. This is synthetic input, but it is
+not synthetic runtime state and it is not synthetic scroll position. The pass
+condition is the rendered app result captured from the GPU output after normal
+host/document/runtime/render processing.
 
 ## Role Protocol And Backpressure
 
@@ -919,17 +1011,20 @@ cargo xtask verify-native-gpu-scroll-speed --example cells --report target/repor
 cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
 cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
-cargo xtask verify-report-schema
-cargo xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json
-cargo xtask audit-goal-readiness --report target/reports/goal-readiness.json
 ```
 
 Every native GPU gate must overwrite or remove any prior passing report before
 execution and write a schema-valid pass/fail report. `verify-native-gpu-all`
-must link every required native GPU report by path and sha256. Machine and goal
-readiness audits must fail unless `target/reports/native-gpu-all.json` is fresh
-for the current git commit, source hashes, binary hashes, scenario hashes, budget
-hash, and report schema version.
+must link every required native GPU report by path and sha256, and it is the
+native GPU acceptance aggregate for this architecture.
+
+Do not run the legacy readiness audits as part of this architecture gate. The
+old `verify-report-schema`, `audit-machine-readiness`, `audit-goal-readiness`,
+Ply headed/headless, COSMIC split-launch, Xvfb, and browser/playground-smoke
+paths belong to the historical verification system and must not be used to prove
+the native two-window GPU playground. If broader repo readiness is rebuilt later,
+it must consume `target/reports/native-gpu-all.json` without launching or
+requiring legacy Ply/COSMIC/browser surfaces.
 
 `verify-platform-contract` must fail if core crates expose `app_window`, `wgpu`,
 `glyphon`, Wayland/X11, native process/window IDs, DOM types, terminal escape
@@ -988,12 +1083,13 @@ outside generated APIs.
 - Xvfb/X11/headless/native-browser substitutes are rejected for this native
   Wayland gate.
 
-On COSMIC, the multiwindow gate must record `requested_workspace =
-"boon-circuit"`, actual workspace if available, preview/dev child PIDs, PID
-cmdlines, window title/app-id, mapped/focused state when exposed, and launcher
-report/artifact hashes. If `cosmic-background-launch` cannot provide
-machine-readable proof, the gate must fail with a blocker naming the missing
-launcher capability.
+On COSMIC, the multiwindow gate may use `cosmic-background-launch` only as the
+workspace-qualified process launcher. The gate must record `requested_workspace
+= "boon-circuit"`, preview/dev child PIDs, PID cmdlines, native role reports,
+and launcher report/artifact hashes. It must not use COSMIC toplevel scraping,
+compositor activation, or whole-desktop screenshots as pass/fail evidence. If
+the launcher cannot provide machine-readable process proof, the gate must fail
+with a blocker naming the missing launcher capability.
 
 `verify-native-gpu-ipc-backpressure` must stall or kill the dev role and prove
 preview frame p95, memory cap, dropped telemetry count, IPC heartbeat behavior,
@@ -1017,29 +1113,33 @@ observed values.
 runtime state, source inventory, frame hashes, hit targets, source intent
 routing, and timing. It must not pass by calling private source dispatch
 functions directly. It must write non-human operator reports under
-`target/reports/native-gpu/preview-e2e-<example>.json`, bound to fresh visible
-Wayland OS-input evidence. Reports must include scenario labels,
-source/scenario hashes, window PID/cmdline, focused-window proof, per-step OS
-pointer/keyboard route, hit target, source intent, screenshot/readback
-artifacts, and must not claim human observation.
+`target/reports/native-gpu/preview-e2e-<example>.json`, bound to fresh
+operator-host-input evidence by default. Reports must include scenario labels,
+source/scenario hashes, window PID/cmdline, owned-surface proof, per-step
+host-input route, hit target, source intent, runtime assertions,
+screenshot/readback artifacts, and must not claim human observation or real OS
+input unless real OS/window events were actually observed.
 
 `verify-native-gpu-scroll-speed --example cells` must fail unless it is a
-release-mode Wayland report with real wheel input, current git/source hashes,
+release-mode native GPU report with operator host wheel input or stronger,
+current git/source hashes,
 vertical and horizontal scroll evidence, `scroll_frame_ms_p95 <= 16.7`,
 `wheel_to_visible_ms_p95 <= 50`, `preview_blocked_on_ipc_count = 0`,
 `runtime_dispatch_count_for_passive_scroll = 0`, `graph_rebuild_count = 0`, and
-no Xvfb/X11 or synthetic scroll-position evidence. It must perform sustained
-vertical and horizontal wheel scroll over the full 26x100 logical grid, record
-visible address samples before and after outside `A0:D0`, require
-`missed_frame_count = 0`, require `wheel_to_visible_ms_p95 <= 50` per axis,
-keep `materialized_cell_count_max` within the visible-plus-overscan budget, and
-list every frame over 16.7 ms as an outlier.
+no Xvfb/X11, headless-only, compositor-specific, private runtime dispatch, or
+synthetic scroll-position evidence. It must perform sustained vertical and
+horizontal wheel scroll over the full 26x100 logical grid through
+`HostInputEvent::Wheel`, record visible address samples before and after outside
+`A0:D0`, require `missed_frame_count = 0`, require `wheel_to_visible_ms_p95 <=
+50` per axis, keep `materialized_cell_count_max` within the
+visible-plus-overscan budget, capture the rendered result through GPU readback,
+and list every frame over 16.7 ms as an outlier.
 
 `verify-native-gpu-scroll-speed --surface dev-code-editor` must launch through
 `--role desktop` with the preview role loaded and debug telemetry enabled. It
 must use a generated source fixture with at least 10,000 lines, a longest line of
-at least 2,000 bytes, diagnostics/selection/caret overlays enabled, and both
-vertical and horizontal real wheel scroll. Reports must include
+at least 2,000 bytes, diagnostics/selection/caret overlays enabled, and
+sustained vertical and horizontal operator host wheel scroll. Reports must include
 `dev_editor_frame_ms_p50_p95_p99_max`, `wheel_to_visible_ms_p95` per axis,
 `visible_line_count`, `materialized_line_count_max`, `text_runs_shaped_p95`,
 `text_cache_hit_rate`, `glyph_atlas_evictions`, `upload_bytes_p95`,
@@ -1049,10 +1149,11 @@ scroll. Hard gates: no full-file widget tree, no full-file reshaping,
 
 `verify-native-gpu-negative` must mutate or fabricate reports for stale
 git/source/binary hashes, missing artifacts, future timestamps, Xvfb/headless
-substitution, synthetic scroll, private runtime dispatch, copied pixel hashes,
-stale surface epochs, wrong-thread WGPU calls, single-process multiwindow
-masquerade, full-state IPC mirroring, and stale shader outputs. Each fabricated
-case must be rejected.
+substitution, fake real-OS-input claims, synthetic scroll-position evidence,
+private runtime dispatch, copied pixel hashes, stale surface epochs,
+wrong-thread WGPU calls, single-process multiwindow masquerade, full-state IPC
+mirroring, nested-compositor-only evidence in the portable gate, and stale
+shader outputs. Each fabricated case must be rejected.
 
 ## Migration Plan
 
@@ -1060,10 +1161,10 @@ Implementation may be staged, but final acceptance for this architecture is the
 two-process preview/dev desktop path with all gates passing. A preview-only probe
 is an intermediate milestone, not handoff readiness.
 
-1. Add the new core/native crates behind feature-free workspace members,
-   without touching the current Ply playground behavior.
-2. Keep current operator/human report schemas intact while the native GPU path
-   is added; do not weaken existing manual-report requirements.
+1. Keep the native GPU path isolated from legacy browser, Ply, Xvfb, and
+   compositor-probing verifiers.
+2. Keep human observation as follow-up evidence only; do not weaken native GPU
+   report requirements to make a manual path look complete.
 3. Implement `boon_document_model`, `boon_document`, `boon_text`, `boon_host`,
    and `boon_render_core` as pure portable contracts first. Keep any
    module-based boundaries mechanically checked until they become crates.
@@ -1079,8 +1180,8 @@ is an intermediate milestone, not handoff readiness.
 8. Add virtualized Cells grid rendering and code editor scrolling.
 9. Add the platform, dependency, architecture, layout, shader, multi-window,
    IPC, observability, E2E, negative-fixture, and scroll-speed gates.
-10. Only after the new native GPU path passes, retire or demote the current
-    macroquad/Ply path.
+10. Keep removed legacy verifier paths out of `xtask`; old command names may
+    only fail fast with a native-GPU replacement message.
 
 At no point should implementation make an example smaller, hardcode an example
 renderer, accept a browser-backed native window, accept headless proof as native

@@ -1,10 +1,8 @@
-# Boon Circuit executable example: TodoMVC
-#
-# This source intentionally keeps the local field-equation shape from the
-# architecture docs. The first interpreter parses and validates this source,
-# lowers it to a static equation IR, and executes the declared example profile.
-
-EXAMPLE TodoMVC
+-- Boon Circuit executable example: TodoMVC
+--
+-- This source intentionally keeps the local field-equation shape from the
+-- architecture docs. The first interpreter parses and validates this source,
+-- lowers it to a static equation IR, and executes the declared example profile.
 
 store: [
     sources: [

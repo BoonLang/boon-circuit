@@ -425,6 +425,44 @@ impl Mouse {
             total_event_count: self.shared.total_event_count.load(Ordering::Relaxed),
         }
     }
+
+    /// Injects a deterministic in-process mouse sample for app-owned window tests.
+    ///
+    /// This is not a compositor or hardware event. It is intended for render/input
+    /// harnesses that need to exercise the same coalesced input boundary as normal
+    /// platform events while staying isolated from the user's desktop.
+    pub fn inject_test_motion(
+        &self,
+        pos_x: f64,
+        pos_y: f64,
+        window_width: f64,
+        window_height: f64,
+        window_protocol_id: u64,
+    ) {
+        let window_ptr = window_protocol_id as usize as *mut c_void;
+        let window = std::ptr::NonNull::new(window_ptr).map(Window);
+        self.shared.set_window_location(MouseWindowLocation::new(
+            pos_x,
+            pos_y,
+            window_width,
+            window_height,
+            window,
+        ));
+    }
+
+    /// Injects a deterministic in-process mouse button sample for app-owned
+    /// window tests. See [`Self::inject_test_motion`] for the boundary.
+    pub fn inject_test_button(&self, button: u8, down: bool, window_protocol_id: u64) {
+        self.shared
+            .set_key_state(button, down, window_protocol_id as usize as *mut c_void);
+    }
+
+    /// Injects deterministic in-process wheel deltas for app-owned window tests.
+    /// See [`Self::inject_test_motion`] for the boundary.
+    pub fn inject_test_scroll(&self, delta_x: f64, delta_y: f64, window_protocol_id: u64) {
+        self.shared
+            .add_scroll_delta(delta_x, delta_y, window_protocol_id as usize as *mut c_void);
+    }
 }
 
 impl PartialEq for Mouse {

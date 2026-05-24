@@ -6,6 +6,7 @@ use std::fmt;
 pub enum ProgramKind {
     TodoMvc,
     Cells,
+    Generic,
 }
 
 impl ProgramKind {
@@ -13,6 +14,7 @@ impl ProgramKind {
         match self {
             Self::TodoMvc => "todomvc",
             Self::Cells => "cells",
+            Self::Generic => "generic",
         }
     }
 }
@@ -49,20 +51,13 @@ impl AstProgram {
         self.tokens.iter().filter(|token| {
             !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
                 && !self.line_is_document(token.line)
-                && self
-                    .lines
-                    .iter()
-                    .find(|line| line.line == token.line)
-                    .is_none_or(|line| line.symbols.first().map(String::as_str) != Some("#"))
         })
     }
 
     pub fn semantic_parser_lines(&self) -> impl Iterator<Item = &ParserLine> {
-        self.lines.iter().filter(|line| {
-            !line.symbols.is_empty()
-                && line.symbols.first().map(String::as_str) != Some("#")
-                && !self.line_is_document(line.line)
-        })
+        self.lines
+            .iter()
+            .filter(|line| !line.symbols.is_empty() && !self.line_is_document(line.line))
     }
 
     pub fn semantic_parser_items(&self) -> impl Iterator<Item = &ParserItem> {
@@ -146,9 +141,6 @@ pub struct AstStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AstStatementKind {
-    Example {
-        name: String,
-    },
     Function {
         name: String,
         args: Vec<String>,
@@ -319,11 +311,12 @@ pub fn parse_source(
     let path = path.into();
     let source = source.into();
     let ast = parse_ast(&path, &source)?;
-    let kind = detect_program_kind(&path, &ast)?;
+    validate_source_syntax(&path, &ast)?;
     validate_balanced_brackets(&path, &ast)?;
     validate_required_constructs(&path, &ast)?;
     validate_list_capacities(&path, &ast)?;
     validate_no_reducer_style_update(&path, &ast)?;
+    let kind = detect_program_kind(&path, &ast)?;
     validate_no_hidden_identity_leak(&path, &ast, kind)?;
     let row_scope_functions = collect_row_scope_functions(&ast);
     let structure = derive_program_tables(&ast, &row_scope_functions);
@@ -354,7 +347,51 @@ pub fn parsed_document(program: &ParsedProgram) -> Option<DocumentAst> {
         })
 }
 
-fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
+pub fn format_source(
+    path: impl Into<String>,
+    source: impl Into<String>,
+) -> Result<String, ParseError> {
+    let path = path.into();
+    let source = source.into();
+    parse_source(path, source.clone())?;
+    let mut formatted_lines = Vec::new();
+    let mut previous_blank = false;
+    for line in source.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            if !previous_blank {
+                formatted_lines.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+        previous_blank = false;
+        let content = trimmed_end.trim_start_matches([' ', '\t']);
+        let raw_indent_columns = trimmed_end
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .map(|character| if character == '\t' { 4 } else { 1 })
+            .sum::<usize>();
+        let indent_columns = if raw_indent_columns > 0 {
+            // Parser-gated indentation normalization: every non-empty source line
+            // keeps its block depth, but mixed/two-space indentation is rewritten to
+            // the canonical four-column editor grid after the parser has accepted
+            // the source.
+            raw_indent_columns.div_ceil(4) * 4
+        } else {
+            raw_indent_columns
+        };
+        formatted_lines.push(format!("{}{}", " ".repeat(indent_columns), content));
+    }
+    while formatted_lines.last().is_some_and(|line| line.is_empty()) {
+        formatted_lines.pop();
+    }
+    let mut formatted = formatted_lines.join("\n");
+    formatted.push('\n');
+    Ok(formatted)
+}
+
+pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let source_index = SourceIndex::new(source);
     let spanned = token_parser()
         .repeated()
@@ -442,7 +479,7 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         )
         .then_ignore(just('"'))
         .to(AstTokenKind::String);
-    let comment = choice((just("#"), just("--")))
+    let comment = just("--")
         .ignore_then(none_of('\n').repeated())
         .to(AstTokenKind::Comment);
     let operator = choice((
@@ -555,9 +592,7 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
 fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
     lines
         .iter()
-        .filter(|line| {
-            !line.symbols.is_empty() && line.symbols.first().map(String::as_str) != Some("#")
-        })
+        .filter(|line| !line.symbols.is_empty())
         .map(parser_item)
         .collect()
 }
@@ -565,9 +600,6 @@ fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
 fn parser_item(line: &ParserLine) -> ParserItem {
     let symbols = line.symbols.clone();
     let field = ast_field_name(&symbols).map(ToOwned::to_owned);
-    let example = (symbols.first().map(String::as_str) == Some("EXAMPLE"))
-        .then(|| symbols.get(1).cloned())
-        .flatten();
     let function = (symbols.first().map(String::as_str) == Some("FUNCTION"))
         .then(|| symbols.get(1).cloned())
         .flatten();
@@ -589,7 +621,7 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         operators,
         symbols,
         field,
-        example,
+        example: None,
         function,
         is_list,
         is_grid_list,
@@ -632,9 +664,7 @@ fn ast_statement_block(
 }
 
 fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -> AstStatement {
-    let kind = if let Some(example) = item.example.clone() {
-        AstStatementKind::Example { name: example }
-    } else if let Some(function) = item.function.clone() {
+    let kind = if let Some(function) = item.function.clone() {
         AstStatementKind::Function {
             name: function,
             args: ast_function_args(&item.symbols),
@@ -663,9 +693,7 @@ fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -
     };
     let expr = if matches!(
         kind,
-        AstStatementKind::Example { .. }
-            | AstStatementKind::Function { .. }
-            | AstStatementKind::Block
+        AstStatementKind::Function { .. } | AstStatementKind::Block
     ) {
         None
     } else {
@@ -1122,22 +1150,45 @@ fn is_name(name: &str) -> bool {
 }
 
 fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, ParseError> {
-    for item in ast.semantic_parser_items() {
-        if let Some(example) = item.example.as_deref() {
-            return match example {
-                "TodoMVC" => Ok(ProgramKind::TodoMvc),
-                "Cells" => Ok(ProgramKind::Cells),
-                other => Err(ParseError {
-                    path: path.to_owned(),
-                    message: format!("unknown EXAMPLE `{other}`"),
-                }),
-            };
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    if ast_has_lexeme(ast, "Grid/cells") {
+        return Ok(ProgramKind::Cells);
+    }
+    if normalized_path.ends_with("examples/todomvc.bn") || normalized_path.contains("todomvc") {
+        return Ok(ProgramKind::TodoMvc);
+    }
+    if normalized_path.ends_with("examples/cells.bn") || normalized_path.contains("cells") {
+        return Ok(ProgramKind::Cells);
+    }
+    if ast_has_lexeme(ast, "new_todo") || ast_has_lexeme(ast, "todos") {
+        return Ok(ProgramKind::TodoMvc);
+    }
+    Ok(ProgramKind::Generic)
+}
+
+fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    for token in &ast.tokens {
+        if matches!(token.kind, AstTokenKind::String | AstTokenKind::Comment) {
+            continue;
+        }
+        if token.lexeme == "EXAMPLE" {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`EXAMPLE` is not Boon syntax; put example identity in the manifest/dev metadata",
+            ));
+        }
+        if token.lexeme == "#" {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`#` comments are not supported in Boon source; use `--` comments",
+            ));
         }
     }
-    Err(ParseError {
-        path: path.to_owned(),
-        message: "missing `EXAMPLE TodoMVC` or `EXAMPLE Cells` marker".to_owned(),
-    })
+    Ok(())
 }
 
 fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
@@ -1474,9 +1525,7 @@ fn derive_structure_from_statements(
                 });
                 derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
             }
-            AstStatementKind::Example { .. }
-            | AstStatementKind::Block
-            | AstStatementKind::Expression => {
+            AstStatementKind::Block | AstStatementKind::Expression => {
                 derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
             }
         }
@@ -1508,8 +1557,7 @@ fn collect_row_scope_statements(
                 }
             }
             AstStatementKind::Function { .. } => {}
-            AstStatementKind::Example { .. }
-            | AstStatementKind::Block
+            AstStatementKind::Block
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
             | AstStatementKind::List { .. }
@@ -1757,7 +1805,6 @@ mod tests {
         let nested_then = parse_source(
             "nested-then-bool-not.bn",
             r#"
-EXAMPLE TodoMVC
 store: [
     sources: [button: [press: SOURCE]]
     value:
@@ -1816,8 +1863,7 @@ FUNCTION new_todo(seed) {
     #[test]
     fn structured_expression_ast_ignores_comment_and_string_operators() {
         let source = r#"
-EXAMPLE Cells
-# LATEST { fake |> THEN { bad } }
+-- LATEST { fake |> THEN { bad } }
 label: "fake |> WHEN { SOURCE }"
 cells:
     Grid/cells(columns: 1, rows: 1)
@@ -1876,7 +1922,6 @@ FUNCTION new_cell(seed) {
     #[test]
     fn indexed_scope_comes_from_list_map_row_scope_not_fixed_names() {
         let source = r#"
-EXAMPLE TodoMVC
 store:
     sources:
         add_button: [press: SOURCE]
@@ -1898,7 +1943,7 @@ FUNCTION make_entry(seed) {
         }
 }
 "#;
-        let program = parse_source("renamed-row-scope.bn", source).unwrap();
+        let program = parse_source("examples/todomvc.bn", source).unwrap();
         assert!(program.row_scope_functions.iter().any(|scope| {
             scope.function == "make_entry" && scope.list == "entries" && scope.row_scope == "entry"
         }));
@@ -1961,11 +2006,17 @@ FUNCTION make_entry(seed) {
     }
 
     #[test]
-    fn example_marker_ignores_comments_strings_and_paths() {
+    fn unsupported_example_keyword_rejected_but_comments_strings_are_ignored() {
+        let err = parse_source(
+            "examples/cells.bn",
+            "EXAMPLE Cells\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("`EXAMPLE` is not Boon syntax"));
+        assert!(err.message.contains("manifest/dev metadata"));
+
         let source = r#"
-# EXAMPLE TodoMVC
-label: "EXAMPLE TodoMVC"
-EXAMPLE Cells
+-- label: "EXAMPLE TodoMVC"
 cells:
     Grid/cells(columns: 1, rows: 1)
     |> List/map(seed, new: new_cell(seed: seed))
@@ -1977,22 +2028,27 @@ LATEST
         assert_eq!(program.kind, ProgramKind::Cells);
 
         let missing = r#"
-# EXAMPLE TodoMVC
-label: "EXAMPLE Cells"
+-- label: "EXAMPLE Cells"
 SOURCE
 HOLD
 LATEST
 List/map
 LIST {}
 "#;
-        let err = parse_source("examples/todomvc.bn", missing).unwrap_err();
-        assert!(err.message.contains("missing `EXAMPLE"));
+        let program = parse_source("unknown-kind.bn", missing).unwrap();
+        assert_eq!(program.kind, ProgramKind::Generic);
+
+        let err = parse_source(
+            "unknown-kind.bn",
+            "# comment\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("use `--` comments"));
     }
 
     #[test]
     fn parses_profiled_list_capacity() {
         let source = r#"
-EXAMPLE TodoMVC
 todos: LIST[10000] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
@@ -2010,7 +2066,6 @@ todos |> List/map(todo, new: new_todo(seed: todo))
     #[test]
     fn rejects_malformed_list_capacity() {
         let source = r#"
-EXAMPLE TodoMVC
 todos: LIST[many] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
@@ -2021,13 +2076,12 @@ todos |> List/map(todo, new: new_todo(seed: todo))
             err.message
                 .contains("LIST capacity must be a positive integer")
         );
-        assert!(err.message.contains("line 3"));
+        assert!(err.message.contains("line 2"));
     }
 
     #[test]
     fn rejects_zero_list_capacity() {
         let source = r#"
-EXAMPLE TodoMVC
 todos: LIST[0] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
@@ -2042,8 +2096,8 @@ todos |> List/map(todo, new: new_todo(seed: todo))
 
     #[test]
     fn rejects_hidden_todo_id() {
-        let source = "EXAMPLE TodoMVC\nLIST {}\nid: TodoId[id: Ulid/generate()]\nSOURCE\nHOLD\nLATEST\nList/map";
-        let err = parse_source("bad.bn", source).unwrap_err();
+        let source = "LIST {}\nid: TodoId[id: Ulid/generate()]\nSOURCE\nHOLD\nLATEST\nList/map";
+        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
         assert!(err.message.contains("hidden runtime identity") || err.message.contains("id"));
     }
 
@@ -2060,7 +2114,6 @@ todos |> List/map(todo, new: new_todo(seed: todo))
     #[test]
     fn parses_document_structurally_without_semantic_source_leakage() {
         let source = r#"
-EXAMPLE TodoMVC
 store:
     sources:
         new_todo_input: [
@@ -2104,9 +2157,8 @@ after_view: "" |> HOLD after_view { LATEST {} }
     #[test]
     fn parses_document_string_literals_and_comments() {
         let source = r##"
-EXAMPLE TodoMVC
 -- sibling Boon syntax comment
-# current boon-circuit syntax comment
+-- current boon-circuit syntax comment
 store:
     sources:
         new_todo_input: [change: SOURCE]
@@ -2137,16 +2189,14 @@ document:
 
     #[test]
     fn rejects_app_visible_todomvc_id_field() {
-        let source =
-            "EXAMPLE TodoMVC\nLIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
-        let err = parse_source("bad.bn", source).unwrap_err();
+        let source = "LIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
+        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
         assert!(err.message.contains("app-visible `id`"));
     }
 
     #[test]
     fn rejects_global_reducer_update_shape() {
         let source = r#"
-EXAMPLE TodoMVC
 FUNCTION update(state, event) {
     event.source |> WHEN {
         ToggleTodo => state |> TodoTable/update(completed: True)
@@ -2157,14 +2207,13 @@ click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
 items |> List/map(item, new: new_item(seed: item))
 "#;
-        let err = parse_source("bad-reducer.bn", source).unwrap_err();
+        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
         assert!(err.message.contains("central reducer"));
     }
 
     #[test]
     fn bracket_diagnostics_report_line_and_column() {
         let source = r#"
-EXAMPLE TodoMVC
 store: [
     bad: )
 ]
@@ -2175,13 +2224,12 @@ List/map
 "#;
         let err = parse_source("bad-bracket.bn", source).unwrap_err();
         assert!(err.message.contains("unbalanced `)`"));
-        assert!(err.message.contains("line 4, column 10"));
+        assert!(err.message.contains("line 3, column 10"));
     }
 
     #[test]
     fn unclosed_bracket_reports_opening_position() {
         let source = r#"
-EXAMPLE Cells
 cells:
     Grid/cells(columns: 26, rows: 100
 SOURCE
@@ -2191,7 +2239,7 @@ List/map
 "#;
         let err = parse_source("bad-unclosed.bn", source).unwrap_err();
         assert!(err.message.contains("unclosed `(`"));
-        assert!(err.message.contains("line 4, column 15"));
+        assert!(err.message.contains("line 3, column 15"));
     }
 
     fn find_statement(

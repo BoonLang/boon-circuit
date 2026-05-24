@@ -1,0 +1,104 @@
+[[example]]
+id = "cells"
+label = "Cells"
+source = "examples/cells.bn"
+scenario = "examples/cells.scn"
+budget = "examples/cells.budget.toml"
+category = "7gui"
+order = 10
+default_tab_order = 10
+shown_by_default = true
+required_evidence_tier = "real-window"
+human_testing_needed = true
+initial_visible_assertions = [
+  "grid-visible",
+  "row-headers-visible",
+  "column-headers-visible",
+  "seeded-demo-data-visible",
+  "empty-cells-blank",
+  "focused-cell-style-visible",
+  "formula-bar-visible",
+  "dev-window-editor-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "focus-cell",
+  "type-scalar-value",
+  "commit-value-enter",
+  "edit-formula-bar",
+  "commit-formula-enter",
+  "recompute-dependents",
+  "invalid-formula-error",
+  "cycle-error",
+  "cancel-edit-escape",
+  "blur-commit-or-cancel",
+]
+scroll_focus_scenarios = [
+  "vertical-wheel-scroll",
+  "horizontal-wheel-scroll",
+  "shift-wheel-horizontal-scroll",
+  "headers-align-during-scroll",
+]
+visual_artifacts = [
+  "preview-app-owned-framebuffer-before-after",
+  "dev-app-owned-framebuffer",
+  "focused-cell-crop",
+  "formula-bar-crop",
+]
+performance_thresholds = [
+  "preview-scroll-p95-frame-ms <= 16.7",
+  "preview-scroll-p99-frame-ms <= 25.0",
+  "dev-editor-scroll-p95-frame-ms <= 16.7",
+  "logical-grid-cells >= 2600",
+]
+
+[[example]]
+id = "todomvc"
+label = "TodoMVC"
+source = "examples/todomvc.bn"
+scenario = "examples/todomvc.scn"
+budget = "examples/todomvc.budget.toml"
+category = "main"
+order = 20
+default_tab_order = 20
+shown_by_default = true
+required_evidence_tier = "real-window"
+human_testing_needed = true
+initial_visible_assertions = [
+  "title-todos-visible",
+  "seeded-demo-rows-visible",
+  "initial-count-3-items-left",
+  "one-completed-row-visible",
+  "clear-completed-visibility-matches-state",
+  "new-todo-placeholder-visible",
+  "filter-footer-visible",
+  "dev-window-editor-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "focus-new-todo-input",
+  "type-new-todo",
+  "enter-adds-todo",
+  "reject-empty-add",
+  "toggle-single-row",
+  "toggle-all-rows",
+  "switch-all-active-completed",
+  "double-click-edit-row",
+  "enter-commits-edit",
+  "escape-cancels-edit",
+  "blur-commits-edit",
+  "clear-completed",
+  "delete-row",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "preview-app-owned-framebuffer-before-after",
+  "dev-app-owned-framebuffer",
+  "todo-row-crop",
+  "footer-controls-crop",
+]
+performance_thresholds = [
+  "preview-interaction-p95-frame-ms <= 16.7",
+  "preview-interaction-p99-frame-ms <= 25.0",
+  "dev-editor-scroll-p95-frame-ms <= 16.7",
+]

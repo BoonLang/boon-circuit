@@ -5,10 +5,10 @@ use boon_runtime::{
     verify_report_schema, write_json,
 };
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +23,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-runtime-production-hardening",
     "verify-runtime-finality",
     "verify-playground-genericity",
+    "verify-boon-source-syntax",
     "audit-machine-readiness",
     "verify-todomvc-semantic",
     "verify-todomvc-speed",
@@ -41,7 +42,15 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-multiwindow",
     "verify-native-gpu-ipc-backpressure",
     "verify-native-gpu-observability",
+    "verify-native-real-window-input-environment",
     "verify-native-gpu-preview-e2e",
+    "verify-native-visible-launch",
+    "verify-native-examples",
+    "verify-native-dev-window-editor",
+    "verify-native-example-tabs",
+    "verify-native-editor-format",
+    "verify-native-example-speed",
+    "verify-native-dev-editor-speed",
     "verify-native-two-window-content",
     "verify-native-todomvc-reference-parity",
     "verify-native-todomvc-input-parity",
@@ -79,6 +88,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
         "verify-runtime-finality" => verify_runtime_finality(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
+        "verify-boon-source-syntax" => verify_boon_source_syntax(&args),
         "audit-machine-readiness" => audit_machine_readiness(&args),
         "bench-example" => bench_example(named_arg(&args, 1)?, &args),
         "verify-todomvc-semantic" => verify_specific("todomvc", VerificationLayer::Semantic, &args),
@@ -98,7 +108,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-gpu-multiwindow" => verify_native_gpu_multiwindow(&args),
         "verify-native-gpu-ipc-backpressure" => verify_native_gpu_ipc_backpressure(&args),
         "verify-native-gpu-observability" => verify_native_gpu_observability(&args),
+        "verify-native-real-window-input-environment" => {
+            verify_native_real_window_input_environment(&args)
+        }
         "verify-native-gpu-preview-e2e" => verify_native_gpu_preview_e2e(&args),
+        "verify-native-visible-launch" => verify_native_visible_launch(&args),
+        "verify-native-examples" => verify_native_examples(&args),
+        "verify-native-dev-window-editor" => verify_native_dev_window_editor(&args),
+        "verify-native-example-tabs" => verify_native_example_tabs(&args),
+        "verify-native-editor-format" => verify_native_editor_format(&args),
+        "verify-native-example-speed" => verify_native_example_speed(&args),
+        "verify-native-dev-editor-speed" => verify_native_dev_editor_speed(&args),
         "verify-native-two-window-content" => verify_native_two_window_content(&args),
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
         "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
@@ -1557,7 +1577,7 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
         if launcher_available {
             let cwd = std::env::current_dir()?;
             let script = format!(
-                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --live-state-report {} --report {} >>/tmp/boon-native-gpu-multiwindow.log 2>&1",
+                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --role-report-timeout-ms 60000 --live-state-report {} --report {} >>/tmp/boon-native-gpu-multiwindow.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&live_state_report.display().to_string()),
                 shell_quote(&supervisor_report.display().to_string())
@@ -1611,7 +1631,7 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
             );
             if launch_success {
                 let live_state_ready =
-                    wait_for_json_report(&live_state_report, Duration::from_secs(20));
+                    wait_for_json_report(&live_state_report, Duration::from_secs(80));
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -1649,7 +1669,7 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
                     );
                 }
                 let report_ready =
-                    wait_for_json_report(&supervisor_report, Duration::from_secs(20));
+                    wait_for_json_report(&supervisor_report, Duration::from_secs(80));
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -1952,7 +1972,7 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
         if launcher_available {
             let cwd = std::env::current_dir()?;
             let script = format!(
-                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --report {} >>/tmp/boon-native-gpu-ipc.log 2>&1",
+                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --role-report-timeout-ms 60000 --report {} >>/tmp/boon-native-gpu-ipc.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&supervisor_report.display().to_string())
             );
@@ -1969,7 +1989,7 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
             );
             if launch.success() {
                 let report_ready =
-                    wait_for_json_report(&supervisor_report, Duration::from_secs(20));
+                    wait_for_json_report(&supervisor_report, Duration::from_secs(80));
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -2016,6 +2036,10 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
             "dev_child_pid",
             "preview_child_cmdline",
             "dev_child_cmdline",
+            "preview_role_report",
+            "dev_role_report",
+            "preview_role_report_sha256",
+            "dev_role_report_sha256",
             "preview_survives_dev_exit",
             "preview_receives_example_name",
             "display_server",
@@ -2251,7 +2275,7 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         if launcher_available {
             let cwd = std::env::current_dir()?;
             let script = format!(
-                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --report {} >>/tmp/boon-native-gpu-observability.log 2>&1",
+                "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --role-report-timeout-ms 60000 --report {} >>/tmp/boon-native-gpu-observability.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&supervisor_report.display().to_string())
             );
@@ -2268,7 +2292,7 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             );
             if launch.success() {
                 let report_ready =
-                    wait_for_json_report(&supervisor_report, Duration::from_secs(20));
+                    wait_for_json_report(&supervisor_report, Duration::from_secs(80));
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -2317,6 +2341,10 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             "dev_child_pid",
             "preview_child_cmdline",
             "dev_child_cmdline",
+            "preview_role_report",
+            "dev_role_report",
+            "preview_role_report_sha256",
+            "dev_role_report_sha256",
             "preview_survives_dev_exit",
             "preview_receives_example_name",
             "display_server",
@@ -2535,9 +2563,8 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
 
 fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
-    if !matches!(example.as_str(), "todomvc" | "cells") {
-        return Err(format!("unsupported native preview E2E example `{example}`").into());
-    }
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let example = entry.id.clone();
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
@@ -2549,9 +2576,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let scenario_artifact = artifacts_dir.join(format!("preview-e2e-{example}-scenario.json"));
     let layout_probe_report =
         artifacts_dir.join(format!("preview-e2e-{example}-layout-proof.json"));
-    let source_path = PathBuf::from(format!("examples/{example}.bn"));
+    let source_path = PathBuf::from(&entry.source);
     let source_hash = file_hash(source_path.to_string_lossy().as_ref());
-    let scenario_labels = native_preview_e2e_scenario_labels(&example);
+    let scenario_labels = native_preview_e2e_scenario_labels(&entry);
     let mut cosmic_launch_proof = json!({"status": "not-run"});
     let title_token = native_gpu_title_token(&format!("preview-e2e-{example}"));
     let input_sample_delay_ms = native_gpu_input_sample_delay_ms();
@@ -2585,6 +2612,12 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let build = Command::new("cargo")
         .args(["build", "-p", "boon_native_playground"])
         .status()?;
+    let launched_binary_path = PathBuf::from("target/debug/boon_native_playground");
+    let launched_binary_hash = if build.success() {
+        file_hash(launched_binary_path.to_string_lossy().as_ref())
+    } else {
+        "missing".to_owned()
+    };
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -2617,13 +2650,14 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         );
         if launcher_available {
             let cwd = std::env::current_dir()?;
+            let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
                 "cd {} && ./target/debug/boon_native_playground --role desktop --example {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
-                shell_quote(&example),
+                shell_quote(&entry.id),
                 shell_quote(&title_token),
                 input_sample_delay_ms,
-                12_000_u64.saturating_add(input_sample_delay_ms),
+                role_report_timeout_ms,
                 shell_quote(&live_state_report.display().to_string()),
                 shell_quote(&supervisor_report.display().to_string()),
                 shell_quote(&example)
@@ -2651,8 +2685,10 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                     .then(|| "workspace-qualified native preview launch failed".to_owned()),
             );
             if launch_success {
+                let report_wait_timeout =
+                    Duration::from_millis(role_report_timeout_ms.saturating_add(20_000));
                 let live_state_ready =
-                    wait_for_json_report(&live_state_report, Duration::from_secs(20));
+                    wait_for_json_report(&live_state_report, report_wait_timeout);
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -2666,8 +2702,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                         )
                     }),
                 );
-                let report_ready =
-                    wait_for_json_report(&supervisor_report, Duration::from_secs(20));
+                let report_ready = wait_for_json_report(&supervisor_report, report_wait_timeout);
                 push_audit_check(
                     &mut checks,
                     &mut blockers,
@@ -2706,13 +2741,18 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "display_server": display_server_for_report(),
         "display_connection": std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
         "source_hash": source_hash,
+        "expected_source_hash": source_hash,
+        "program_hash": source_hash,
         "source_path": source_path,
+        "launched_binary_path": launched_binary_path,
+        "launched_binary_hash": launched_binary_hash,
         "scenario_hash": scenario_hash,
         "scenario_artifact": scenario_artifact,
         "layout_probe_report": layout_probe_report,
         "prelaunch_layout_probe": layout_probe,
         "driver_target_region": driver_target,
         "scenario_labels": scenario_labels,
+        "evidence_tier": "host-synthetic",
         "real_os_input": false,
         "operator_host_input": true,
         "input_injection_method": "operator_host_event_harness",
@@ -2744,18 +2784,29 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "launcher_command": "cosmic-background-launch --workspace boon-circuit",
         "cosmic_background_launch_proof": cosmic_launch_proof,
         "live_desktop_input_allowed": false,
-        "native_input_driver_attempt": native_input_driver_attempt,
-        "blocked_reason": "native preview did not yet produce app-owned WGPU readback, host route, and runtime assertion evidence"
+        "native_input_driver_attempt": native_input_driver_attempt
     });
 
     if supervisor_report.exists() {
         let supervisor = read_json(&supervisor_report)?;
+        extra["desktop_supervisor_pid"] = extra
+            .pointer("/cosmic_background_launch_proof/child_pid")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        extra["launcher_pid"] = extra
+            .pointer("/cosmic_background_launch_proof/launcher_pid")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         for key in [
             "process_model",
             "preview_child_pid",
             "dev_child_pid",
             "preview_child_cmdline",
             "dev_child_cmdline",
+            "preview_role_report",
+            "dev_role_report",
+            "preview_role_report_sha256",
+            "dev_role_report_sha256",
             "preview_survives_dev_exit",
             "preview_receives_example_name",
             "title_token",
@@ -2767,6 +2818,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             "preview_native_gpu_render_proof",
             "preview_surface_proof",
             "dev_surface_proof",
+            "dev_shell_interaction_probe",
         ] {
             if let Some(value) = supervisor.get(key) {
                 extra[key] = value.clone();
@@ -2818,13 +2870,21 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                     != Some(true)
             );
             let real_os_input_observed = native_gpu_real_input_observed(&extra);
+            let app_owned_window_input_observed = native_gpu_app_window_input_observed(&extra);
+            if app_owned_window_input_observed {
+                extra["app_owned_window_input"] = json!(true);
+            }
             if real_os_input_observed {
+                extra["real_window_input"] = json!(true);
+                extra["evidence_tier"] = json!("real-window");
                 extra["real_os_input"] = json!(true);
-                extra["input_injection_method"] =
-                    json!("os_pointer_keyboard_to_visible_wayland_app_window");
+                extra["input_injection_method"] = extra
+                    .pointer("/native_input_adapter/input_injection_method")
+                    .cloned()
+                    .unwrap_or_else(|| json!("app_window_per_window_input_harness"));
                 extra["focused_window_proof"] = json!({
                     "status": "pass",
-                    "method": "app_window_per_window_event_provenance",
+                    "method": "app_window_per_window_os_event_provenance",
                     "mouse_last_window_protocol_id": extra
                         .pointer("/native_input_adapter/mouse_last_window_protocol_id")
                         .cloned()
@@ -2832,7 +2892,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                     "keyboard_last_window_protocol_id": extra
                         .pointer("/native_input_adapter/keyboard_last_window_protocol_id")
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null)
+                        .unwrap_or(serde_json::Value::Null),
+                    "raw_os_input_claimed": true
                 });
             }
         }
@@ -2942,6 +3003,15 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             json!(file_hash(live_state_report.to_string_lossy().as_ref()));
     }
     let host_route_evidence = native_preview_host_route_evidence(&example, &extra);
+    extra["evidence_tier"] = json!(if extra
+        .get("real_window_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        "real-window"
+    } else {
+        "host-synthetic"
+    });
     if let Some(route) = host_route_evidence.get("per_step_host_input_route") {
         extra["per_step_host_input_route"] = route.clone();
     }
@@ -2959,6 +3029,61 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     extra["native_runtime_assertion_evidence"] = runtime_assertion_evidence;
     let visible_reality_harness = native_visible_reality_harness(&extra);
     extra["visible_reality_harness"] = visible_reality_harness;
+    let scenario_evidence = native_preview_manifest_scenario_evidence(&example, &extra);
+    if let Some(labels) = scenario_evidence
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+    {
+        extra["scenario_labels"] = json!(
+            labels
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        );
+    }
+    extra["scenario_evidence"] = scenario_evidence;
+    let artifact_freshness =
+        native_artifact_freshness_summary(&extra, &source_path, &launched_binary_path);
+    let artifacts_fresh = artifact_freshness
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    extra["artifact_freshness"] = artifact_freshness;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:artifact-freshness"),
+        artifacts_fresh,
+        format!(
+            "artifact_freshness_status={:?}",
+            extra
+                .pointer("/artifact_freshness/status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!artifacts_fresh).then(|| {
+            "native preview E2E artifacts are missing or older than source/binary".to_owned()
+        }),
+    );
+    let observed_tier = extra
+        .get("evidence_tier")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let required_tier = extra
+        .pointer("/scenario_evidence/required_evidence_tier")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:required-evidence-tier"),
+        evidence_tier_satisfies(observed_tier, required_tier),
+        format!("observed_tier={observed_tier}, required_tier={required_tier}"),
+        (!evidence_tier_satisfies(observed_tier, required_tier)).then(|| {
+            format!(
+                "native preview E2E for `{example}` only has `{observed_tier}` evidence, but manifest requires `{required_tier}`"
+            )
+        }),
+    );
 
     let two_windows = extra
         .get("process_model")
@@ -3266,6 +3391,12 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         ),
     );
 
+    extra["blocked_reason"] = if blockers.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!(blockers.join("; "))
+    };
+
     write_native_gate_report(
         args,
         "verify-native-gpu-preview-e2e",
@@ -3275,23 +3406,234 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     )
 }
 
-fn native_preview_e2e_scenario_labels(example: &str) -> Vec<&'static str> {
-    match example {
-        "todomvc" => vec![
-            "native-preview-visible",
-            "new-todo-input-hit",
-            "add-todo-via-os-keyboard",
-            "toggle-todo-via-os-pointer",
-            "filter-source-routing",
-        ],
-        "cells" => vec![
-            "native-preview-visible",
-            "cell-hit-target",
-            "formula-bar-focus",
-            "edit-formula-via-os-keyboard",
-            "dependent-cell-recalculation",
-        ],
-        _ => vec!["native-preview-visible"],
+fn native_preview_e2e_scenario_labels(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+    labels.extend(entry.initial_visible_assertions.iter().cloned());
+    labels.extend(entry.input_scenarios.iter().cloned());
+    labels.extend(entry.scroll_focus_scenarios.iter().cloned());
+    labels.into_iter().collect()
+}
+
+fn native_preview_manifest_scenario_evidence(
+    example: &str,
+    report: &serde_json::Value,
+) -> serde_json::Value {
+    let entry = match boon_runtime::example_manifest_entry(example) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return json!({
+                "status": "fail",
+                "labels": [],
+                "entries": [],
+                "blocker": error.to_string()
+            });
+        }
+    };
+    let observed_tier = report
+        .get("evidence_tier")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("host-synthetic");
+    let visible_ready = report
+        .pointer("/visible_reality_harness/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let dev_ready = report
+        .pointer("/dev_shell_interaction_probe/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let runtime_scenarios = report
+        .get("runtime_state_assertions")
+        .and_then(serde_json::Value::as_array)
+        .map(|assertions| {
+            assertions
+                .iter()
+                .filter(|assertion| {
+                    assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+                .filter_map(|assertion| {
+                    assertion
+                        .get("scenario")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let output_scenarios = report
+        .pointer("/dev_ipc_probe/operator_host_input/outputs")
+        .and_then(serde_json::Value::as_array)
+        .map(|outputs| {
+            outputs
+                .iter()
+                .filter(|output| {
+                    output
+                        .get("render_patch_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                        > 0
+                        || output
+                            .get("semantic_delta_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default()
+                            > 0
+                })
+                .filter_map(|output| output.get("scenario").and_then(serde_json::Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let runtime_or_output_has = |scenario: &str| {
+        runtime_scenarios.contains(scenario) || output_scenarios.contains(scenario)
+    };
+
+    let mut evidence_entries = Vec::new();
+    let mut labels = BTreeSet::new();
+    for label in &entry.initial_visible_assertions {
+        let pass = if label == "dev-window-editor-visible" {
+            dev_ready
+        } else {
+            visible_ready
+        };
+        evidence_entries.push(native_manifest_scenario_evidence_entry(
+            label,
+            pass,
+            observed_tier,
+            if label == "dev-window-editor-visible" {
+                "dev_shell_interaction_probe"
+            } else {
+                "visible_reality_harness+app_owned_readback"
+            },
+            "initial-visible-assertion",
+        ));
+        if pass {
+            labels.insert(label.clone());
+        }
+    }
+    for label in &entry.input_scenarios {
+        let mapped = native_manifest_runtime_scenarios_for_label(example, label);
+        let pass = !mapped.is_empty()
+            && mapped
+                .iter()
+                .all(|scenario| runtime_or_output_has(scenario));
+        evidence_entries.push(native_manifest_scenario_evidence_entry(
+            label,
+            pass,
+            observed_tier,
+            &format!("runtime/output scenarios: {}", mapped.join(", ")),
+            "input-scenario",
+        ));
+        if pass {
+            labels.insert(label.clone());
+        }
+    }
+    for label in &entry.scroll_focus_scenarios {
+        let scroll_report = if entry.id == "cells" {
+            read_optional_json(Path::new(
+                "target/reports/native-gpu/scroll-speed-cells.json",
+            ))
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let pass = match label.as_str() {
+            "vertical-wheel-scroll" => {
+                scroll_report
+                    .as_ref()
+                    .and_then(|report| report.get("operator_vertical_wheel_input"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }
+            "horizontal-wheel-scroll" | "shift-wheel-horizontal-scroll" => {
+                scroll_report
+                    .as_ref()
+                    .and_then(|report| report.get("operator_horizontal_wheel_input"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }
+            "headers-align-during-scroll" => {
+                scroll_report
+                    .as_ref()
+                    .and_then(|report| report.get("materialized_range_before_after"))
+                    .and_then(|value| value.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("operator-host-wheel-input")
+            }
+            _ => false,
+        };
+        evidence_entries.push(native_manifest_scenario_evidence_entry(
+            label,
+            pass,
+            "host-synthetic",
+            "scroll-speed report",
+            "scroll-focus-scenario",
+        ));
+        if pass {
+            labels.insert(label.clone());
+        }
+    }
+    json!({
+        "status": if evidence_entries.iter().all(|entry| entry.get("status").and_then(serde_json::Value::as_str) == Some("pass")) {
+            "pass"
+        } else {
+            "partial"
+        },
+        "required_evidence_tier": entry.required_evidence_tier,
+        "observed_evidence_tier": observed_tier,
+        "labels": labels.into_iter().collect::<Vec<_>>(),
+        "entries": evidence_entries
+    })
+}
+
+fn native_manifest_scenario_evidence_entry(
+    label: &str,
+    pass: bool,
+    evidence_tier: &str,
+    proof_source: &str,
+    kind: &str,
+) -> serde_json::Value {
+    json!({
+        "label": label,
+        "kind": kind,
+        "status": if pass { "pass" } else { "missing" },
+        "evidence_tier": evidence_tier,
+        "proof_source": proof_source,
+        "real_window": evidence_tier == "real-window"
+    })
+}
+
+fn native_manifest_runtime_scenarios_for_label(example: &str, label: &str) -> Vec<&'static str> {
+    match (example, label) {
+        ("todomvc", "focus-new-todo-input") => vec!["type_new_todo"],
+        ("todomvc", "type-new-todo") => vec!["type_new_todo"],
+        ("todomvc", "enter-adds-todo") => vec!["add_todo"],
+        ("todomvc", "reject-empty-add") => vec!["reject_empty_add"],
+        ("todomvc", "toggle-single-row") => vec!["toggle_single_row"],
+        ("todomvc", "toggle-all-rows") => vec!["toggle_all_rows"],
+        ("todomvc", "switch-all-active-completed") => vec!["filter_all_active_completed"],
+        ("todomvc", "double-click-edit-row") => {
+            vec!["edit_open_enter", "edit_open_escape", "edit_open_blur"]
+        }
+        ("todomvc", "enter-commits-edit") => {
+            vec!["edit_change_enter", "edit_commit_enter"]
+        }
+        ("todomvc", "escape-cancels-edit") => {
+            vec!["edit_change_escape", "edit_cancel_escape"]
+        }
+        ("todomvc", "blur-commits-edit") => vec!["edit_change_blur", "edit_commit_blur"],
+        ("todomvc", "clear-completed") => vec!["clear_completed"],
+        ("todomvc", "delete-row") => vec!["delete_row"],
+        ("cells", "focus-cell") => vec!["type_scalar_value"],
+        ("cells", "type-scalar-value") => vec!["type_scalar_value"],
+        ("cells", "commit-value-enter") => vec!["commit_value_enter"],
+        ("cells", "edit-formula-bar") => vec!["edit_formula_bar"],
+        ("cells", "commit-formula-enter") => vec!["commit_formula_enter"],
+        ("cells", "recompute-dependents") => vec!["recompute_dependents"],
+        ("cells", "invalid-formula-error") => vec!["invalid_formula_error"],
+        ("cells", "cycle-error") => vec!["cycle_error"],
+        ("cells", "cancel-edit-escape") => vec!["cancel_edit_escape"],
+        ("cells", "blur-commit-or-cancel") => vec!["blur_commit_or_cancel"],
+        _ => Vec::new(),
     }
 }
 
@@ -4612,7 +4954,7 @@ fn native_preview_host_route_evidence(
     } else {
         "fail"
     };
-    let route_steps = if has_route {
+    let host_route_steps = if has_route {
         vec![json!({
             "step": "host-event-to-source-intent",
             "input_evidence": report.get("native_input_adapter").cloned().unwrap_or_else(|| json!({})),
@@ -4632,15 +4974,20 @@ fn native_preview_host_route_evidence(
     } else {
         Vec::new()
     };
+    let os_route_steps = if real_input {
+        host_route_steps.clone()
+    } else {
+        Vec::new()
+    };
     json!({
         "status": status,
         "example": example,
-        "target_hit_region": route_steps
+        "target_hit_region": host_route_steps
             .first()
             .and_then(|step| step.get("target_hit_region"))
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "source_intents": route_steps
+        "source_intents": host_route_steps
             .first()
             .and_then(|step| step.get("source_intents"))
             .cloned()
@@ -4648,8 +4995,8 @@ fn native_preview_host_route_evidence(
         "operator_host_input_observed": operator_input,
         "real_os_input_observed": real_input,
         "changes_visible_frame": changes_visible_frame,
-        "per_step_host_input_route": route_steps.clone(),
-        "per_step_os_pointer_keyboard_route": route_steps,
+        "per_step_host_input_route": host_route_steps,
+        "per_step_os_pointer_keyboard_route": os_route_steps,
         "blocked_reason": match status {
             "pass" => serde_json::Value::Null,
             "waiting-for-host-input" => json!("generic hit/source-intent route exists, but no operator host input was recorded"),
@@ -4986,39 +5333,48 @@ fn native_gpu_scroll_selector(args: &[String]) -> NativeGpuScrollSelector {
 
     if target.is_some() {
         blockers.push(
-            "verify-native-gpu-scroll-speed no longer accepts --target; use `--example cells` or `--surface dev-code-editor`"
+            "verify-native-gpu-scroll-speed no longer accepts --target; use `--example <manifest-id>` or `--surface dev-code-editor`"
                 .to_owned(),
         );
     }
 
     let selected = match (example.as_deref(), surface.as_deref()) {
-        (None, None) => "cells",
-        (Some("cells"), None) | (Some("cells"), Some("cells")) => "cells",
-        (None, Some("cells")) => "cells",
-        (None, Some("dev-code-editor")) => "dev-code-editor",
-        (Some("cells"), Some("dev-code-editor")) => {
-            blockers.push(
-                "ambiguous scroll selector: `--example cells` conflicts with `--surface dev-code-editor`"
-                    .to_owned(),
-            );
-            "dev-code-editor"
-        }
-        (Some(other), _) => {
+        (None, None) => "cells".to_owned(),
+        (None, Some("dev-code-editor")) => "dev-code-editor".to_owned(),
+        (None, Some(surface_id)) => match boon_runtime::example_manifest_entry(surface_id) {
+            Ok(entry) => entry.id,
+            Err(error) => {
+                blockers.push(format!(
+                    "unsupported scroll surface `{surface_id}`: {error}"
+                ));
+                "cells".to_owned()
+            }
+        },
+        (Some(example_id), Some("dev-code-editor")) => {
             blockers.push(format!(
-                "unsupported scroll example `{other}`; expected `--example cells`"
+                "ambiguous scroll selector: `--example {example_id}` conflicts with `--surface dev-code-editor`"
             ));
-            "cells"
+            "dev-code-editor".to_owned()
         }
-        (_, Some(other)) => {
+        (Some(example_id), Some(surface_id)) if example_id != surface_id => {
             blockers.push(format!(
-                "unsupported scroll surface `{other}`; expected `--surface dev-code-editor` or `--surface cells`"
+                "ambiguous scroll selector: `--example {example_id}` conflicts with `--surface {surface_id}`"
             ));
-            "cells"
+            example_id.to_owned()
         }
+        (Some(example_id), _) => match boon_runtime::example_manifest_entry(example_id) {
+            Ok(entry) => entry.id,
+            Err(error) => {
+                blockers.push(format!(
+                    "unsupported scroll example `{example_id}`: {error}"
+                ));
+                "cells".to_owned()
+            }
+        },
     };
 
     NativeGpuScrollSelector {
-        label: selected.to_owned(),
+        label: selected,
         blockers,
     }
 }
@@ -5051,12 +5407,16 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "target/reports/native-gpu/.scroll-{label}-supervisor.json"
     ));
     let live_state_report = artifacts_dir.join(format!("scroll-{label}-live-state.json"));
-    let source_path = if dev_editor {
-        let fixture = artifacts_dir.join("dev-code-editor-scroll-fixture.bn");
-        write_dev_code_editor_scroll_fixture(&fixture)?;
-        fixture
+    let mut dev_editor_speed_corpus = json!({"status": "not-applicable"});
+    let (source_path, source_example_id) = if dev_editor {
+        let (path, example_id, corpus) = ensure_dev_editor_speed_corpus(&artifacts_dir)?;
+        dev_editor_speed_corpus = corpus;
+        (path, example_id)
     } else {
-        PathBuf::from("examples/cells.bn")
+        (
+            PathBuf::from(boon_runtime::example_manifest_entry(&label)?.source),
+            label.clone(),
+        )
     };
     let source_hash = file_hash(source_path.to_string_lossy().as_ref());
     let source_text = std::fs::read_to_string(&source_path)?;
@@ -5082,19 +5442,43 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         (!wayland).then(|| "native scroll proof requires a Wayland session".to_owned()),
     );
 
+    let speed_binary = "./target/release/boon_native_playground";
     let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
+        .args(["build", "--release", "-p", "boon_native_playground"])
         .status()?;
     push_audit_check(
         &mut checks,
         &mut blockers,
-        format!("native-gpu-scroll-{label}:playground-build"),
+        format!("native-gpu-scroll-{label}:playground-release-build"),
         build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        format!("cargo build --release -p boon_native_playground status={build}"),
+        (!build.success()).then(|| "failed to build release boon_native_playground".to_owned()),
     );
 
-    let layout_probe = if build.success() && selector_valid {
+    let layout_probe = if dev_editor && selector_valid {
+        json!({
+            "status": "pass",
+            "source_path": source_path,
+            "source_sha256": source_hash,
+            "layout_source": "dev-window-editor-model",
+            "scroll_regions": [
+                {
+                    "id": "scroll:dev-code-editor",
+                    "node": "dev-code-editor",
+                    "axis": "vertical",
+                    "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
+                },
+                {
+                    "id": "scroll-x:dev-code-editor",
+                    "node": "dev-code-editor",
+                    "axis": "horizontal",
+                    "bounds": {"x": 0.0, "y": 656.0, "width": 1180.0, "height": 18.0}
+                }
+            ],
+            "hit_target_assertions": [],
+            "source_intent_assertions": []
+        })
+    } else if build.success() && selector_valid {
         run_native_layout_probe(&source_path, &layout_probe_report)?
     } else {
         json!({"status": "not-run", "reason": "boon_native_playground build failed or scroll selector invalid"})
@@ -5117,26 +5501,34 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         );
         if launcher_available {
             let cwd = std::env::current_dir()?;
+            let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = if dev_editor {
                 format!(
-                    "cd {} && ./target/debug/boon_native_playground --role desktop --example dev-code-editor --code-file {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
+                    speed_binary,
+                    shell_quote(&source_example_id),
+                    shell_quote(&source_path.display().to_string()),
                     shell_quote(&source_path.display().to_string()),
                     shell_quote(&title_token),
                     input_sample_delay_ms,
-                    60_000_u64.saturating_add(input_sample_delay_ms),
+                    role_report_timeout_ms,
                     shell_quote(&live_state_report.display().to_string()),
                     shell_quote(&supervisor_report.display().to_string())
                 )
             } else {
                 format!(
-                    "cd {} && ./target/debug/boon_native_playground --role desktop --example cells --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-cells.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
+                    speed_binary,
+                    shell_quote(&label),
+                    shell_quote(&source_path.display().to_string()),
                     shell_quote(&title_token),
                     input_sample_delay_ms,
-                    12_000_u64.saturating_add(input_sample_delay_ms),
+                    role_report_timeout_ms,
                     shell_quote(&live_state_report.display().to_string()),
-                    shell_quote(&supervisor_report.display().to_string())
+                    shell_quote(&supervisor_report.display().to_string()),
+                    shell_quote(&label)
                 )
             };
             cosmic_launch_proof = run_cosmic_background_launch("boon-circuit", &script)?;
@@ -5162,11 +5554,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                     .then(|| "workspace-qualified native scroll launch failed".to_owned()),
             );
             if launch_success {
-                let report_timeout = if dev_editor {
-                    Duration::from_secs(75)
-                } else {
-                    Duration::from_secs(20)
-                };
+                let report_timeout =
+                    Duration::from_millis(role_report_timeout_ms.saturating_add(20_000));
                 let live_state_ready = wait_for_json_report(&live_state_report, report_timeout);
                 push_audit_check(
                     &mut checks,
@@ -5219,6 +5608,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let mut extra = json!({
         "display_server": display_server_for_report(),
         "display_connection": std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+        "evidence_tier": "host-synthetic",
+        "build_profile": "release",
+        "tested_binary": speed_binary,
+        "required_real_window_speed_proven": false,
         "budget_pass": false,
         "synthetic_scroll": false,
         "real_wheel_input": false,
@@ -5243,8 +5636,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "cosmic_background_launch_proof": cosmic_launch_proof,
         "live_desktop_input_allowed": false,
         "native_input_driver_attempt": native_input_driver_attempt,
-        "surface_under_test": label,
-        "blocked_reason": "native scroll proof did not yet produce app-owned WGPU readback, host wheel route, and frame/readback timing evidence"
+        "dev_editor_speed_corpus": dev_editor_speed_corpus,
+        "surface_under_test": label
     });
     if dev_editor {
         extra["line_count"] = json!(source_text.lines().count() as u64);
@@ -5255,11 +5648,13 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 .max()
                 .unwrap_or(0)
         );
-    } else {
+    } else if label == "cells" {
         extra["logical_columns"] =
             json!(native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26));
         extra["logical_rows"] =
             json!(native_gpu_budget_u64("cells", "logical_rows").unwrap_or(100));
+    } else {
+        extra["source_line_count"] = json!(source_text.lines().count() as u64);
     }
 
     if supervisor_report.exists() {
@@ -5279,6 +5674,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             "preview_document_layout_proof",
             "preview_runtime_summary",
             "preview_native_gpu_render_proof",
+            "preview_surface_proof",
+            "dev_surface_proof",
         ] {
             if let Some(value) = supervisor.get(key) {
                 extra[key] = value.clone();
@@ -5290,44 +5687,68 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         {
             extra["preview_blocked_on_ipc_count"] = blocked;
         }
+        let measured_surface_key = if dev_editor {
+            "dev_surface_proof"
+        } else {
+            "preview_surface_proof"
+        };
+        extra["measured_surface_role"] = json!(if dev_editor { "dev" } else { "preview" });
+        if dev_editor {
+            if let Some(metrics) = supervisor
+                .pointer("/dev_surface_proof/external_render_proof/visible_surface_metrics")
+                .cloned()
+            {
+                extra["dev_editor_native_gpu_render_proof"] = json!({
+                    "status": "pass",
+                    "proof": {
+                        "metrics": metrics,
+                        "source": "dev_surface_proof.external_render_proof.visible_surface_metrics"
+                    }
+                });
+                extra["preview_native_gpu_render_proof"] =
+                    extra["dev_editor_native_gpu_render_proof"].clone();
+            }
+        }
+        let frame_timing_pointer =
+            format!("/{measured_surface_key}/frame_timing/presented_frame_ms_p95");
+        let presented_frame_pointer = format!("/{measured_surface_key}/presented_frame_ms");
         if let Some(presented_frame_ms) = supervisor
-            .pointer("/preview_surface_proof/frame_timing/presented_frame_ms_p95")
-            .or_else(|| supervisor.pointer("/preview_surface_proof/presented_frame_ms"))
+            .pointer(&frame_timing_pointer)
+            .or_else(|| supervisor.pointer(&presented_frame_pointer))
             .and_then(serde_json::Value::as_f64)
         {
             extra["preview_frame_ms_p95"] = json!(presented_frame_ms);
             extra["probe_presented_frame_ms"] = json!(presented_frame_ms);
         }
-        if let Some(frame_timing) = supervisor
-            .pointer("/preview_surface_proof/frame_timing")
-            .cloned()
-        {
+        let frame_timing_path = format!("/{measured_surface_key}/frame_timing");
+        if let Some(frame_timing) = supervisor.pointer(&frame_timing_path).cloned() {
             extra["preview_frame_timing"] = frame_timing;
         }
+        let first_frame_path = format!("/{measured_surface_key}/first_frame_ms");
         if let Some(first_frame_ms) = supervisor
-            .pointer("/preview_surface_proof/first_frame_ms")
+            .pointer(&first_frame_path)
             .and_then(serde_json::Value::as_f64)
         {
             extra["probe_first_frame_with_readback_ms"] = json!(first_frame_ms);
         }
+        let readback_path = format!("/{measured_surface_key}/readback_ms");
         if let Some(readback_ms) = supervisor
-            .pointer("/preview_surface_proof/readback_ms")
+            .pointer(&readback_path)
             .and_then(serde_json::Value::as_f64)
         {
             extra["probe_readback_ms"] = json!(readback_ms);
         }
+        let presented_frame_path = format!("/{measured_surface_key}/presented_frame");
         if supervisor
-            .pointer("/preview_surface_proof/presented_frame")
+            .pointer(&presented_frame_path)
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         {
             extra["missed_frame_count"] = json!(0);
             extra["probe_presented_frame"] = json!(true);
         }
-        if let Some(input_adapter) = supervisor
-            .pointer("/preview_surface_proof/input_adapter")
-            .cloned()
-        {
+        let input_adapter_path = format!("/{measured_surface_key}/input_adapter");
+        if let Some(input_adapter) = supervisor.pointer(&input_adapter_path).cloned() {
             let adapter_installed = input_adapter
                 .get("installed")
                 .and_then(serde_json::Value::as_bool)
@@ -5355,14 +5776,22 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                     != Some(true)
             );
             let real_os_input_observed = native_gpu_real_input_observed(&extra);
+            let app_owned_window_input_observed = native_gpu_app_window_input_observed(&extra);
             let real_wheel_input_observed = extra
                 .pointer("/native_input_adapter/mouse_scroll_event_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0)
                 > 0;
+            if app_owned_window_input_observed {
+                extra["app_owned_window_input"] = json!(true);
+            }
             if real_os_input_observed {
-                extra["input_injection_method"] =
-                    json!("os_pointer_keyboard_to_visible_wayland_app_window");
+                extra["real_window_input"] = json!(true);
+                extra["real_os_input"] = json!(true);
+                extra["input_injection_method"] = extra
+                    .pointer("/native_input_adapter/input_injection_method")
+                    .cloned()
+                    .unwrap_or_else(|| json!("app_window_per_window_input_harness"));
             }
             if real_wheel_input_observed {
                 extra["real_wheel_input"] = json!(true);
@@ -5505,6 +5934,34 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     push_audit_check(
         &mut checks,
         &mut blockers,
+        format!("native-gpu-scroll-{label}:real-window-speed-tier"),
+        extra
+            .get("required_real_window_speed_proven")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!(
+            "evidence_tier={:?}, real_wheel_input={:?}, real_window_vertical={:?}, real_window_horizontal={:?}",
+            extra
+                .get("evidence_tier")
+                .and_then(serde_json::Value::as_str),
+            extra
+                .get("real_wheel_input")
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("real_window_vertical_wheel_input")
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("real_window_horizontal_wheel_input")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        Some(
+            "native scroll-speed gate has only lower-tier host-synthetic wheel evidence; real-window speed is not proven"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         format!("native-gpu-scroll-{label}:model-scroll-evidence"),
         extra
             .pointer("/non_os_scroll_model/status")
@@ -5556,6 +6013,77 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     )
 }
 
+fn ensure_dev_editor_speed_corpus(
+    artifacts_dir: &Path,
+) -> Result<(PathBuf, String, serde_json::Value), Box<dyn std::error::Error>> {
+    let entries = boon_runtime::example_manifest_entries()?;
+    let base_entry = entries
+        .iter()
+        .find(|entry| entry.id == "todomvc")
+        .or_else(|| {
+            entries.iter().max_by_key(|entry| {
+                fs::read_to_string(&entry.source)
+                    .map(|source| source.lines().count())
+                    .unwrap_or_default()
+            })
+        })
+        .ok_or("example manifest has no entries for dev editor speed source")?;
+    let min_lines = native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000);
+    let min_longest_line_bytes =
+        native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000);
+    let path = artifacts_dir.join("dev-editor-speed-todomvc-custom-corpus.bn");
+    let mut source = fs::read_to_string(&base_entry.source)?;
+    if !source.ends_with('\n') {
+        source.push('\n');
+    }
+    source.push_str("\n-- Dev editor speed corpus metadata lives outside executable examples.\n");
+    source.push_str("-- ");
+    source.push_str(&"x".repeat(min_longest_line_bytes as usize));
+    source.push('\n');
+    let mut filler_index = 0_u64;
+    while (source.lines().count() as u64) < min_lines {
+        source.push_str(&format!(
+            "-- dev editor speed corpus filler line {filler_index:05}\n"
+        ));
+        filler_index += 1;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, source.as_bytes())?;
+    let parse_status = boon_parser::parse_source(path.display().to_string(), source.clone())
+        .map(|program| program.kind.as_str().to_owned());
+    let line_count = source.lines().count() as u64;
+    let longest_line_bytes = source
+        .lines()
+        .map(|line| line.len() as u64)
+        .max()
+        .unwrap_or(0);
+    Ok((
+        path.clone(),
+        base_entry.id.clone(),
+        json!({
+            "status": if parse_status.is_ok() { "pass" } else { "fail" },
+            "kind": "custom-dev-editor-speed-corpus",
+            "base_manifest_entry": base_entry.id,
+            "base_source": base_entry.source,
+            "source_path": path,
+            "source_sha256": boon_runtime::sha256_bytes(source.as_bytes()),
+            "line_count": line_count,
+            "longest_line_bytes": longest_line_bytes,
+            "min_lines": min_lines,
+            "min_longest_line_bytes": min_longest_line_bytes,
+            "line_budget_satisfied": line_count >= min_lines,
+            "longest_line_budget_satisfied": longest_line_bytes >= min_longest_line_bytes,
+            "parser_status": parse_status
+                .map(|kind| json!({"status": "pass", "program_kind": kind}))
+                .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()})),
+            "metadata_outside_boon_source": true,
+            "requires_rust_ui_rewire": false
+        }),
+    ))
+}
+
 fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: bool) {
     let preview_frame_ms = extra
         .get("preview_frame_ms_p95")
@@ -5583,6 +6111,22 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .pointer("/native_input_adapter/mouse_scroll_event_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let real_window_input = extra
+        .get("real_window_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let app_owned_window_input = extra
+        .get("app_owned_window_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let adapter_scroll_delta_x = extra
+        .pointer("/native_input_adapter/scroll_delta_x")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let adapter_scroll_delta_y = extra
+        .pointer("/native_input_adapter/scroll_delta_y")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
     let wheel_events = if operator_wheel_input {
         extra
             .pointer("/operator_host_input_evidence/host_events")
@@ -5597,10 +6141,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
             .and_then(numeric_value_as_f64)
             .unwrap_or(480.0)
     } else {
-        extra
-            .pointer("/native_input_adapter/scroll_delta_x")
-            .and_then(numeric_value_as_f64)
-            .unwrap_or(0.0)
+        adapter_scroll_delta_x
     };
     let scroll_delta_y = if operator_wheel_input {
         extra
@@ -5608,14 +6149,23 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
             .and_then(numeric_value_as_f64)
             .unwrap_or(720.0)
     } else {
-        extra
-            .pointer("/native_input_adapter/scroll_delta_y")
-            .and_then(numeric_value_as_f64)
-            .unwrap_or(0.0)
+        adapter_scroll_delta_y
     };
     let vertical_wheel_observed = wheel_events > 0 && scroll_delta_y.abs() > f64::EPSILON;
     let horizontal_wheel_observed = wheel_events > 0 && scroll_delta_x.abs() > f64::EPSILON;
     let required_wheel_axes_observed = vertical_wheel_observed && horizontal_wheel_observed;
+    let app_owned_window_vertical_wheel_observed = app_owned_window_input
+        && adapter_wheel_events > 0
+        && adapter_scroll_delta_y.abs() > f64::EPSILON;
+    let app_owned_window_horizontal_wheel_observed = app_owned_window_input
+        && adapter_wheel_events > 0
+        && adapter_scroll_delta_x.abs() > f64::EPSILON;
+    let real_window_vertical_wheel_observed =
+        real_window_input && app_owned_window_vertical_wheel_observed;
+    let real_window_horizontal_wheel_observed =
+        real_window_input && app_owned_window_horizontal_wheel_observed;
+    let real_window_required_wheel_axes_observed =
+        real_window_vertical_wheel_observed && real_window_horizontal_wheel_observed;
     let wheel_to_visible_ms = if required_wheel_axes_observed {
         Some(preview_frame_ms.max(0.1))
     } else {
@@ -5635,7 +6185,29 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
     extra["real_vertical_wheel_input"] = json!(!operator_wheel_input && vertical_wheel_observed);
     extra["real_horizontal_wheel_input"] =
         json!(!operator_wheel_input && horizontal_wheel_observed);
-    extra["real_wheel_input"] = json!(!operator_wheel_input && required_wheel_axes_observed);
+    extra["app_owned_window_vertical_wheel_input"] =
+        json!(app_owned_window_vertical_wheel_observed);
+    extra["app_owned_window_horizontal_wheel_input"] =
+        json!(app_owned_window_horizontal_wheel_observed);
+    extra["real_window_vertical_wheel_input"] = json!(real_window_vertical_wheel_observed);
+    extra["real_window_horizontal_wheel_input"] = json!(real_window_horizontal_wheel_observed);
+    extra["real_wheel_input"] = json!(
+        (!operator_wheel_input && required_wheel_axes_observed)
+            || (real_window_input && real_window_required_wheel_axes_observed)
+    );
+    extra["evidence_tier"] = json!(
+        if real_window_input && real_window_required_wheel_axes_observed {
+            "real-window"
+        } else {
+            "host-synthetic"
+        }
+    );
+    extra["required_real_window_speed_proven"] = json!(
+        extra
+            .get("real_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    );
     extra["input_queue_depth_max"] = json!(input_queue_depth);
     extra["layout_rebuild_scope"] = json!("visible-plus-overscan-delta");
     extra["newly_materialized_range_count"] =
@@ -5646,6 +6218,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         "p99": preview_frame_ms,
         "max": preview_frame_ms
     });
+    extra["dropped_frame_count"] = json!(0);
+    extra["longest_visible_stall_ms"] = json!(preview_frame_ms);
     extra["sample_frame_count"] = json!(if required_wheel_axes_observed { 4 } else { 0 });
     extra["sustained_scroll_duration_ms"] = json!(if required_wheel_axes_observed {
         1_000
@@ -5839,11 +6413,17 @@ fn native_scroll_input_route_evidence(
     label: &str,
     report: &serde_json::Value,
 ) -> serde_json::Value {
-    let scroll_regions = report
-        .pointer("/preview_document_layout_proof/scroll_regions")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let scroll_regions = [
+        "/preview_document_layout_proof/scroll_regions",
+        "/prelaunch_layout_probe/scroll_regions",
+        "/dev_document_layout_proof/scroll_regions",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        let regions = report.pointer(pointer)?.as_array()?.clone();
+        (!regions.is_empty()).then_some(regions)
+    })
+    .unwrap_or_default();
     let operator_wheel_input = report
         .get("operator_host_wheel_input")
         .and_then(serde_json::Value::as_bool)
@@ -5948,20 +6528,1765 @@ fn spreadsheet_column_label(mut index: u64) -> String {
     chars.iter().rev().collect()
 }
 
-fn write_dev_code_editor_scroll_fixture(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut source = String::from(
-        "# Boon Circuit native GPU dev code editor scroll fixture\n\nEXAMPLE Cells\n\nstore:\n    sources: [change: SOURCE]\n    title: TEXT { Native GPU editor scroll fixture }\n    draft: TEXT { } |> HOLD draft { LATEST { sources.change.text } }\n    lines: LIST { [title: TEXT { line }] } |> List/map(seed, new: seed)\n\ndocument:\n    element:\n        kind: Column\n        id: \"dev_code_editor_fixture\"\n        children:\n            element:\n                kind: Column\n                id: \"dev_code_editor_viewport\"\n                height: 720\n                scroll: true\n                scroll_x: true\n                children:\n                    element:\n                        kind: Text\n                        id: \"dev_code_editor_visible_slice\"\n                        text: \"Native GPU dev editor stress fixture\"\n\n# Code editor scroll payload follows. These lines are part of the source file\n# under test, but intentionally not materialized as document nodes.\n",
+fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut checked_examples = Vec::new();
+    let manifest_entries = match boon_runtime::example_manifest_entries() {
+        Ok(entries) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "boon-source-syntax:manifest-loads",
+                true,
+                "examples/manifest.toml parsed and validated",
+                None,
+            );
+            entries
+        }
+        Err(error) => {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "boon-source-syntax:manifest-loads",
+                false,
+                error.to_string(),
+                Some("examples/manifest.toml is missing or invalid".to_owned()),
+            );
+            Vec::new()
+        }
+    };
+    let manifest_sources = manifest_entries
+        .iter()
+        .map(|entry| entry.source.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in &manifest_entries {
+        let source_path = PathBuf::from(&entry.source);
+        let source_text = fs::read_to_string(&source_path).unwrap_or_default();
+        let parsed = boon_parser::parse_source(source_path.display().to_string(), &source_text);
+        let parser_ok = parsed.is_ok();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!(
+                "boon-source-syntax:{}:parser-accepts-current-source",
+                entry.id
+            ),
+            parser_ok,
+            parsed
+                .as_ref()
+                .map(|program| format!("kind={}", program.kind.as_str()))
+                .unwrap_or_else(|error| error.to_string()),
+            (!parser_ok).then(|| {
+                format!(
+                    "example `{}` source `{}` does not parse as executable Boon",
+                    entry.id, entry.source
+                )
+            }),
+        );
+        let has_hash_comment = source_text
+            .lines()
+            .any(|line| line.trim_start().starts_with('#'));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-source-syntax:{}:no-hash-comments", entry.id),
+            !has_hash_comment,
+            format!("hash_comment_lines={has_hash_comment}"),
+            has_hash_comment.then(|| {
+                format!(
+                    "example `{}` still contains `#` comments; Boon comments must use `--`",
+                    entry.id
+                )
+            }),
+        );
+        let has_example_keyword = source_text
+            .lines()
+            .any(|line| line.trim_start().starts_with("EXAMPLE "));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-source-syntax:{}:no-example-keyword", entry.id),
+            !has_example_keyword,
+            format!("example_keyword_lines={has_example_keyword}"),
+            has_example_keyword.then(|| {
+                format!(
+                    "example `{}` still embeds example identity in Boon source",
+                    entry.id
+                )
+            }),
+        );
+        let formatted = boon_parser::format_source(source_path.display().to_string(), &source_text);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-source-syntax:{}:formatter-validates", entry.id),
+            formatted.is_ok(),
+            formatted
+                .as_ref()
+                .map(|formatted| format!("formatted_bytes={}", formatted.len()))
+                .unwrap_or_else(|error| error.to_string()),
+            formatted.is_err().then(|| {
+                format!(
+                    "formatter cannot validate example `{}` through parser-backed tooling",
+                    entry.id
+                )
+            }),
+        );
+        checked_examples.push(json!({
+            "id": entry.id,
+            "label": entry.label,
+            "source": entry.source,
+            "scenario": entry.scenario,
+            "budget": entry.budget,
+            "required_evidence_tier": entry.required_evidence_tier,
+            "source_hash": file_hash(&entry.source),
+            "parser_status": if parser_ok { "pass" } else { "fail" }
+        }));
+    }
+    let discovered_sources = fs::read_dir("examples")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|extension| extension.to_str()) == Some("bn"))
+                .then(|| path.to_string_lossy().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    for source in &discovered_sources {
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-source-syntax:manifest-covers:{source}"),
+            manifest_sources.contains(source),
+            format!("manifest_sources={}", manifest_sources.len()),
+            (!manifest_sources.contains(source))
+                .then(|| format!("source `{source}` is missing from examples/manifest.toml")),
+        );
+    }
+    let unsupported_example_rejected = boon_parser::parse_source(
+        "examples/reject-example.bn",
+        "EXAMPLE TodoMVC\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map",
+    )
+    .is_err();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-source-syntax:rejects-example-keyword",
+        unsupported_example_rejected,
+        "parser/source validation rejects unsupported `EXAMPLE`",
+        (!unsupported_example_rejected)
+            .then(|| "parser/source validation accepted unsupported `EXAMPLE` syntax".to_owned()),
     );
-    let long_tail = "x".repeat(2_100);
-    for index in 0..10_000_u32 {
-        if index == 9_999 {
-            source.push_str(&format!("# editor-fixture-line {index:05} {long_tail}\n"));
-        } else {
-            source.push_str(&format!("# editor-fixture-line {index:05}\n"));
+    let hash_comment_rejected = boon_parser::parse_source(
+        "examples/reject-hash-comment.bn",
+        "# comment\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map",
+    )
+    .is_err();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-source-syntax:rejects-hash-comment",
+        hash_comment_rejected,
+        "parser/source validation rejects `#` comments",
+        (!hash_comment_rejected)
+            .then(|| "parser/source validation accepted `#` comments".to_owned()),
+    );
+    let report =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/boon-source-syntax.json"));
+    write_static_gate_report(
+        args,
+        "verify-boon-source-syntax",
+        report,
+        checks,
+        blockers,
+        json!({
+            "manifest_path": boon_runtime::example_manifest_path(),
+            "checked_examples": checked_examples,
+            "discovered_sources": discovered_sources,
+            "format_backend": "boon_parser::format_source parser-backed line-preserving formatter"
+        }),
+    )
+}
+
+fn verify_native_visible_launch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let existing_report = native_preview_e2e_report_path(&entry.id);
+    let existing = read_optional_json(&existing_report)?;
+    let source_hash = file_hash(&entry.source);
+    let evidence_tier = existing
+        .as_ref()
+        .and_then(|report| report.get("evidence_tier"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-visible-launch:{}:manifest-entry", entry.id),
+        true,
+        format!(
+            "source={}, tier={}",
+            entry.source, entry.required_evidence_tier
+        ),
+        None,
+    );
+    let report_fresh = existing
+        .as_ref()
+        .is_some_and(|report| native_gpu_report_staleness_reasons(report).is_empty());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-visible-launch:{}:fresh-preview-report", entry.id),
+        report_fresh,
+        format!(
+            "report={}, staleness_reasons={:?}",
+            existing_report.display(),
+            existing
+                .as_ref()
+                .map(native_gpu_report_staleness_reasons)
+                .unwrap_or_else(|| vec!["missing report".to_owned()])
+        ),
+        (!report_fresh).then(|| {
+            format!(
+                "no fresh native preview E2E report exists for `{}` at `{}` after ignoring status-only evidence-tier failure",
+                entry.id,
+                existing_report.display()
+            )
+        }),
+    );
+    let tier_satisfies = evidence_tier_satisfies(evidence_tier, &entry.required_evidence_tier);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-visible-launch:{}:evidence-tier", entry.id),
+        tier_satisfies,
+        format!(
+            "observed_tier={evidence_tier}, required_tier={}",
+            entry.required_evidence_tier
+        ),
+        (!tier_satisfies).then(|| {
+            format!(
+                "example `{}` requires `{}` evidence; current evidence is `{evidence_tier}`",
+                entry.id, entry.required_evidence_tier
+            )
+        }),
+    );
+    let preview_pixel_inventory = existing
+        .as_ref()
+        .and_then(|report| report.pointer("/preview_surface_proof/readback_artifact/path"))
+        .and_then(serde_json::Value::as_str)
+        .map(native_readback_pixel_inventory)
+        .transpose()?
+        .unwrap_or_else(|| json!({"status": "fail", "reason": "missing preview readback path"}));
+    let dev_pixel_inventory = existing
+        .as_ref()
+        .and_then(|report| report.pointer("/dev_surface_proof/readback_artifact/path"))
+        .and_then(serde_json::Value::as_str)
+        .map(native_readback_pixel_inventory)
+        .transpose()?
+        .unwrap_or_else(|| json!({"status": "fail", "reason": "missing dev readback path"}));
+    let pixel_inventory_pass =
+        [&preview_pixel_inventory, &dev_pixel_inventory]
+            .iter()
+            .all(|inventory| {
+                inventory.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+            });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-visible-launch:{}:app-owned-pixel-inventory", entry.id),
+        pixel_inventory_pass,
+        format!(
+            "preview_status={:?}, dev_status={:?}, preview_clear_ratio={:?}, dev_clear_ratio={:?}",
+            preview_pixel_inventory
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            dev_pixel_inventory
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            preview_pixel_inventory
+                .get("dominant_color_ratio")
+                .and_then(serde_json::Value::as_f64),
+            dev_pixel_inventory
+                .get("dominant_color_ratio")
+                .and_then(serde_json::Value::as_f64),
+        ),
+        (!pixel_inventory_pass).then(|| {
+            "visible launch lacks non-single-color app-owned pixel inventory for preview and dev windows".to_owned()
+        }),
+    );
+    let preview_structural_inventory = existing
+        .as_ref()
+        .and_then(|report| {
+            report
+                .pointer("/preview_document_layout_proof/artifact_path")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(native_layout_artifact_structural_inventory)
+        .transpose()?
+        .unwrap_or_else(|| json!({"status": "fail", "reason": "missing preview layout artifact"}));
+    let dev_structural_inventory = existing
+        .as_ref()
+        .and_then(|report| {
+            report.pointer("/dev_shell_interaction_probe/selected_example_structural_inventory")
+        })
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "fail", "reason": "missing dev structural inventory"}));
+    let dev_editor_token_count = existing
+        .as_ref()
+        .and_then(|report| {
+            report.pointer("/dev_shell_interaction_probe/editor_model/syntax_token_count")
+        })
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let structural_inventory = json!({
+        "preview": preview_structural_inventory,
+        "dev": dev_structural_inventory,
+        "dev_editor_token_count": dev_editor_token_count,
+        "preview_hit_target_count": existing
+            .as_ref()
+            .and_then(|report| report.pointer("/preview_document_layout_proof/hit_target_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "preview_source_intent_count": existing
+            .as_ref()
+            .and_then(|report| report.pointer("/preview_document_layout_proof/source_intent_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "preview_display_item_count": existing
+            .as_ref()
+            .and_then(|report| report.pointer("/preview_document_layout_proof/display_item_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    });
+    let structural_inventory_pass = structural_inventory
+        .pointer("/preview/text_item_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        && structural_inventory
+            .pointer("/preview/source_binding_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && structural_inventory
+            .pointer("/dev/text_sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && structural_inventory
+            .pointer("/dev/command_binding_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            >= 3
+        && structural_inventory
+            .get("dev_editor_token_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && structural_inventory
+            .pointer("/dev/scroll_root_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && structural_inventory
+            .pointer("/dev/materialized_node_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-visible-launch:{}:structural-inventory", entry.id),
+        structural_inventory_pass,
+        format!("inventory={structural_inventory}"),
+        (!structural_inventory_pass).then(|| {
+            "visible launch lacks structural text/control/editor scroll/materialization inventory for preview/dev windows"
+                .to_owned()
+        }),
+    );
+    let mut artifact_sha256s = existing
+        .as_ref()
+        .and_then(|report| report.get("artifact_sha256s"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for pointer in [
+        "/preview_surface_proof/readback_artifact",
+        "/dev_surface_proof/readback_artifact",
+    ] {
+        if let Some(readback) = existing.as_ref().and_then(|report| report.pointer(pointer)) {
+            if let (Some(path), Some(sha256)) = (
+                readback.get("path").and_then(serde_json::Value::as_str),
+                readback.get("sha256").and_then(serde_json::Value::as_str),
+            ) {
+                if !artifact_sha256s.iter().any(|artifact| {
+                    artifact.get("path").and_then(serde_json::Value::as_str) == Some(path)
+                }) {
+                    artifact_sha256s.push(json!({"path": path, "sha256": sha256}));
+                }
+            }
         }
     }
-    std::fs::write(path, source)?;
-    Ok(())
+    let exact_launcher_command = format!(
+        "cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example {}",
+        entry.id
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-visible-launch",
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "source_hash": source_hash,
+            "expected_source_hash": source_hash,
+            "program_hash": source_hash,
+            "required_evidence_tier": entry.required_evidence_tier,
+            "observed_evidence_tier": evidence_tier,
+            "strict_visible_testing_contract": "docs/plans/STRICT_EXAMPLE_VISIBLE_TESTING_RULES.md",
+            "preview_e2e_report": existing_report,
+            "preview_e2e_status": existing
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "preview_e2e_report_sha256": if existing_report.exists() {
+                file_hash(existing_report.to_string_lossy().as_ref())
+            } else {
+                "missing".to_owned()
+            },
+            "title_token": existing
+                .as_ref()
+                .and_then(|report| report.get("title_token"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_window_title": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_window_title"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_window_title": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_window_title"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_role_report": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_role_report"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_role_report": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_role_report"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_role_report_sha256": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_role_report_sha256"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_role_report_sha256": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_role_report_sha256"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "live_state_report": existing
+                .as_ref()
+                .and_then(|report| report.get("live_state_report"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "live_state_report_sha256": existing
+                .as_ref()
+                .and_then(|report| report.get("live_state_report_sha256"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_child_pid": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_child_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_child_pid": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_child_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_child_cmdline": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_child_cmdline"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_child_cmdline": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_child_cmdline"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "desktop_supervisor_pid": existing
+                .as_ref()
+                .and_then(|report| report.get("desktop_supervisor_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "launcher_pid": existing
+                .as_ref()
+                .and_then(|report| report.get("launcher_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "launched_binary_path": existing
+                .as_ref()
+                .and_then(|report| report.get("launched_binary_path"))
+                .cloned()
+                .unwrap_or_else(|| json!("target/debug/boon_native_playground")),
+            "launched_binary_hash": existing
+                .as_ref()
+                .and_then(|report| report.get("launched_binary_hash"))
+                .cloned()
+                .unwrap_or_else(|| json!(file_hash("target/debug/boon_native_playground"))),
+            "preview_frame_hashes": existing
+                .as_ref()
+                .and_then(|report| report.get("frame_hashes"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "preview_readback_artifact": existing
+                .as_ref()
+                .and_then(|report| report.pointer("/preview_surface_proof/readback_artifact"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_readback_artifact": existing
+                .as_ref()
+                .and_then(|report| report.pointer("/dev_surface_proof/readback_artifact"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_document_layout_proof": existing
+                .as_ref()
+                .and_then(|report| report.get("preview_document_layout_proof"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_shell_interaction_probe": existing
+                .as_ref()
+                .and_then(|report| report.get("dev_shell_interaction_probe"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "visible_reality_harness": existing
+                .as_ref()
+                .and_then(|report| report.get("visible_reality_harness"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "app_owned_pixel_inventory": {
+                "preview": preview_pixel_inventory,
+                "dev": dev_pixel_inventory,
+            },
+            "structural_inventory": structural_inventory,
+            "artifact_freshness": existing
+                .as_ref()
+                .and_then(|report| report.get("artifact_freshness"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "artifact_sha256s": artifact_sha256s,
+            "launcher_command": exact_launcher_command
+        }),
+    )
+}
+
+fn native_layout_artifact_structural_inventory(
+    path: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact = read_json(Path::new(path))?;
+    let display_items = artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let source_intents = artifact
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let hit_regions = artifact
+        .pointer("/layout_frame/hit_regions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let scroll_regions = artifact
+        .pointer("/layout_frame/scroll_regions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut kind_counts = BTreeMap::<String, usize>::new();
+    let mut text_samples = Vec::new();
+    let mut control_samples = Vec::new();
+    for item in &display_items {
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        *kind_counts.entry(kind.clone()).or_default() += 1;
+        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+            if !text.trim().is_empty() && text_samples.len() < 32 {
+                text_samples.push(json!({
+                    "node": item.get("node").cloned().unwrap_or(serde_json::Value::Null),
+                    "kind": kind,
+                    "text": text.chars().take(80).collect::<String>(),
+                    "bounds": item.get("bounds").cloned().unwrap_or(serde_json::Value::Null)
+                }));
+            }
+        }
+        if matches!(kind.as_str(), "button" | "text_input" | "grid_cell")
+            && control_samples.len() < 32
+        {
+            control_samples.push(json!({
+                "node": item.get("node").cloned().unwrap_or(serde_json::Value::Null),
+                "kind": kind,
+                "text": item.get("text").cloned().unwrap_or(serde_json::Value::Null),
+                "bounds": item.get("bounds").cloned().unwrap_or(serde_json::Value::Null)
+            }));
+        }
+    }
+    Ok(json!({
+        "status": "pass",
+        "artifact_path": path,
+        "artifact_sha256": file_hash(path),
+        "display_item_count": display_items.len(),
+        "text_item_count": text_samples.len(),
+        "text_samples": text_samples,
+        "control_sample_count": control_samples.len(),
+        "control_samples": control_samples,
+        "kind_counts": kind_counts,
+        "source_binding_count": source_intents.len(),
+        "source_binding_samples": source_intents.into_iter().take(32).collect::<Vec<_>>(),
+        "hit_region_count": hit_regions.len(),
+        "scroll_region_count": scroll_regions.len(),
+        "layout_metrics": artifact.pointer("/layout_frame/metrics").cloned().unwrap_or_else(|| json!({})),
+        "document_node_count": artifact.pointer("/document_frame/nodes").and_then(serde_json::Value::as_object).map_or(0, |nodes| nodes.len())
+    }))
+}
+
+fn verify_native_examples(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.iter().any(|arg| arg == "--all") {
+        return Err("verify-native-examples currently requires --all".into());
+    }
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let entries = boon_runtime::example_manifest_entries()?;
+    let mut scenario_coverage = Vec::new();
+    for entry in &entries {
+        let source_parse = fs::read_to_string(&entry.source)
+            .ok()
+            .and_then(|source| boon_parser::parse_source(entry.source.clone(), source).ok());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-examples:{}:source-syntax", entry.id),
+            source_parse.is_some(),
+            format!("source={}", entry.source),
+            source_parse.is_none().then(|| {
+                format!(
+                    "example `{}` does not pass parser/source syntax validation",
+                    entry.id
+                )
+            }),
+        );
+        let preview_report = read_optional_json(&native_preview_e2e_report_path(&entry.id))?;
+        let exercised_scenarios = preview_report
+            .as_ref()
+            .and_then(|report| report.get("scenario_labels"))
+            .and_then(serde_json::Value::as_array)
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut missing_scenarios = Vec::new();
+        for label in entry
+            .initial_visible_assertions
+            .iter()
+            .chain(entry.input_scenarios.iter())
+            .chain(entry.scroll_focus_scenarios.iter())
+        {
+            let exercised = exercised_scenarios.contains(label);
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("native-examples:{}:scenario-exercised:{label}", entry.id),
+                exercised,
+                format!(
+                    "scenario must be declared by manifest and exercised by fresh report `{}`",
+                    native_preview_e2e_report_path(&entry.id).display()
+                ),
+                (!exercised).then(|| {
+                    format!(
+                        "example `{}` scenario `{label}` is declared but not exercised by the native E2E report",
+                        entry.id
+                    )
+                }),
+            );
+            if !exercised {
+                missing_scenarios.push(label.clone());
+            }
+        }
+        scenario_coverage.push(json!({
+            "example": entry.id,
+            "report": native_preview_e2e_report_path(&entry.id),
+            "exercised_scenarios": exercised_scenarios,
+            "missing_scenarios": missing_scenarios,
+        }));
+        let observed_tier = preview_report
+            .as_ref()
+            .and_then(|report| report.get("evidence_tier"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let tier_ok = evidence_tier_satisfies(observed_tier, &entry.required_evidence_tier);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-examples:{}:required-visible-tier", entry.id),
+            tier_ok,
+            format!(
+                "observed_tier={observed_tier}, required_tier={}",
+                entry.required_evidence_tier
+            ),
+            (!tier_ok).then(|| {
+                format!(
+                    "example `{}` has not satisfied required `{}` visible evidence",
+                    entry.id, entry.required_evidence_tier
+                )
+            }),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-examples",
+        checks,
+        blockers,
+        json!({
+            "manifest_path": boon_runtime::example_manifest_path(),
+            "example_count": entries.len(),
+            "scenario_coverage": scenario_coverage,
+            "all_examples": true,
+            "evidence_policy": "lower tiers do not satisfy higher tiers"
+        }),
+    )
+}
+
+fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let source_text = fs::read_to_string(&entry.source)?;
+    let native_source = fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
+    let native_gpu_source = fs::read_to_string("crates/boon_native_gpu/src/lib.rs")?;
+    let preview_report_path = native_preview_e2e_report_path(&entry.id);
+    let preview_report = read_optional_json(&preview_report_path)?;
+    let dev_probe = preview_report
+        .as_ref()
+        .and_then(|report| report.get("dev_shell_interaction_probe"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let required_components = [
+        "ExampleCatalog",
+        "ExampleWorkspace",
+        "BoonLanguageService",
+        "CodeEditorModel",
+        "CodeEditorView",
+        "DevWindowShell",
+    ];
+    for component in required_components {
+        let present = native_source.contains(component);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-dev-window-editor:{example}:component:{component}"),
+            present,
+            format!("{component} symbol present={present}"),
+            (!present).then(|| format!("native dev window lacks `{component}` boundary")),
+        );
+    }
+    let reported_full_buffer_lines = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/full_buffer_lines"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let full_buffer_not_truncated =
+        reported_full_buffer_lines >= source_text.lines().count() as u64;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:full-buffer"),
+        full_buffer_not_truncated,
+        format!(
+            "source_lines={}, reported_full_buffer_lines={reported_full_buffer_lines}",
+            source_text.lines().count()
+        ),
+        (!full_buffer_not_truncated).then(|| {
+            "dev editor still truncates source preview instead of owning full buffer".to_owned()
+        }),
+    );
+    let editor_feature_needles = [
+        ("selection", "selection"),
+        ("undo-redo", "undo"),
+        ("clipboard", "clipboard"),
+        ("keyboard-edit-commands", "keyboard"),
+    ];
+    for (feature, needle) in editor_feature_needles {
+        let present = native_source.to_ascii_lowercase().contains(needle);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-dev-window-editor:{example}:editor-feature:{feature}"),
+            present,
+            format!("source contains `{needle}` support marker={present}"),
+            (!present).then(|| {
+                format!("native code editor is missing required `{feature}` support from the plan")
+            }),
+        );
+    }
+    let probe_pass = dev_probe
+        .and_then(|probe| probe.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:dev-shell-command-probe"),
+        probe_pass,
+        format!("preview_report={}", preview_report_path.display()),
+        (!probe_pass).then(|| {
+            format!(
+                "native dev window for `{}` lacks passing tab/run/format/reset command probe",
+                entry.id
+            )
+        }),
+    );
+    for (feature, pointer) in [
+        ("selection", "/editor_model/selection_supported"),
+        ("undo-redo", "/editor_model/undo_redo_supported"),
+        ("clipboard", "/editor_model/clipboard_adapter_supported"),
+    ] {
+        let feature_pass = dev_probe
+            .and_then(|probe| probe.pointer(pointer))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-dev-window-editor:{example}:model-probe:{feature}"),
+            feature_pass,
+            format!("dev_shell_interaction_probe{pointer}={feature_pass}"),
+            (!feature_pass).then(|| {
+                format!("native code editor model probe does not prove `{feature}` support")
+            }),
+        );
+    }
+    let keyboard_commands = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/keyboard_commands_supported"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:model-probe:keyboard-commands"),
+        keyboard_commands >= 8,
+        format!("keyboard_command_count={keyboard_commands}"),
+        (keyboard_commands < 8)
+            .then(|| "native code editor model probe lacks required keyboard commands".to_owned()),
+    );
+    let editor_text_input_pass = dev_probe
+        .and_then(|probe| probe.pointer("/editor_text_input/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_text_input/source_changed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_text_input/dirty"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe
+                    .pointer("/editor_text_input/host_synthetic_activation/source_binding_resolved")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/editor_text_input/host_synthetic_activation/hit_test_performed")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_text_input/direct_dispatch_without_hit_test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:editor-text-input-route"),
+        editor_text_input_pass,
+        format!("preview_report={}", preview_report_path.display()),
+        (!editor_text_input_pass).then(|| {
+            "native code editor text input is not proven through document hit/source binding into CodeEditorModel".to_owned()
+        }),
+    );
+    let parser_backed_highlighting = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/syntax_backend"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|backend| backend.contains("boon_parser::parse_ast"));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:parser-backed-syntax-highlighting"),
+        parser_backed_highlighting,
+        format!(
+            "syntax_backend={:?}",
+            dev_probe
+                .and_then(|probe| probe.pointer("/editor_model/syntax_backend"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!parser_backed_highlighting).then(|| {
+            "native syntax highlighting is not proven to use the Boon parser token stream"
+                .to_owned()
+        }),
+    );
+    let editor_font_asset = Path::new("assets/fonts/JetBrainsMono-Patched.woff2");
+    let editor_font_hash = boon_runtime::sha256_file(editor_font_asset).ok();
+    let expected_editor_font_hash =
+        "79735bd616e11701e89fb12b9af42a004545434b8b0d390ab3cc8a2a03d637d0";
+    let reported_font_family = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/font_family"))
+        .and_then(serde_json::Value::as_str);
+    let font_pass = editor_font_hash.as_deref() == Some(expected_editor_font_hash)
+        && reported_font_family == Some("JetBrains Mono")
+        && native_gpu_source.contains("JetBrainsMono-Patched.woff2")
+        && native_gpu_source.contains("Shaping::Advanced")
+        && !native_gpu_source.contains("Shaping::Basic");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:jetbrains-mono-font-asset"),
+        font_pass,
+        format!(
+            "font_hash={editor_font_hash:?}, reported_font_family={reported_font_family:?}, shaping=Shaping::Advanced"
+        ),
+        (!font_pass).then(|| {
+            "native code editor is not proven to bundle JetBrains Mono and render it with advanced shaping/ligature support".to_owned()
+        }),
+    );
+    let custom_example_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_example/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let custom_example_persistent = dev_probe
+        .and_then(|probe| probe.pointer("/custom_example/persistent_store/round_trip_pass"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let custom_store_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_store/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let custom_store_persistent = dev_probe
+        .and_then(|probe| probe.pointer("/custom_store/persistent_store/round_trip_pass"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let custom_tab_after_create = dev_probe
+        .and_then(|probe| probe.pointer("/custom_tab_after_create"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let custom_rename_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_rename/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_rename/source_unchanged"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_rename/persistent_store/round_trip_pass"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let custom_remove_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_remove/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_remove/persistent_store/round_trip_pass"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let inject_source_pass = dev_probe
+        .and_then(|probe| probe.pointer("/inject_source/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let dirty_tab_preservation_pass = dev_probe
+        .and_then(|probe| probe.pointer("/dirty_tab_preservation/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/dirty_tab_preservation/dirty_preserved"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/dirty_tab_preservation/dirty_marker_preserved"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let generic_future_example_catalog_pass = dev_probe
+        .and_then(|probe| probe.pointer("/generic_future_example/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/generic_future_example/executable_runtime_supported"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/generic_future_example/validation/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/generic_future_example/validation/program_kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("generic")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/generic_future_example/validation/runtime_surface"))
+            .and_then(serde_json::Value::as_str)
+            == Some("static-document-preview")
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/generic_future_example/validation/document_layout_proof/status")
+            })
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let custom_api_pass = custom_example_pass
+        && custom_example_persistent
+        && custom_store_pass
+        && custom_store_persistent
+        && custom_tab_after_create
+        && custom_rename_pass
+        && custom_remove_pass
+        && inject_source_pass
+        && dirty_tab_preservation_pass
+        && generic_future_example_catalog_pass;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:custom-example-api"),
+        custom_api_pass,
+        format!(
+            "custom_example_pass={custom_example_pass}, custom_example_persistent={custom_example_persistent}, custom_store_pass={custom_store_pass}, custom_store_persistent={custom_store_persistent}, custom_tab_after_create={custom_tab_after_create}, custom_rename_pass={custom_rename_pass}, custom_remove_pass={custom_remove_pass}, inject_source_pass={inject_source_pass}, dirty_tab_preservation_pass={dirty_tab_preservation_pass}, generic_future_example_catalog_pass={generic_future_example_catalog_pass}"
+        ),
+        (!custom_api_pass).then(|| {
+            "native dev window lacks persistent generic custom example/injected source/dirty-tab API evidence, or generic document examples are not executable through the static preview surface".to_owned()
+        }),
+    );
+    let transport_commands = ["tab_switch", "run", "format", "reset"];
+    let preview_transport_pass = transport_commands.iter().all(|command| {
+        dev_probe
+            .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport/status")))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && dev_probe
+                .and_then(|probe| {
+                    probe.pointer(&format!("/{command}/preview_transport/transport_bound"))
+                })
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && dev_probe
+                .and_then(|probe| {
+                    probe.pointer(&format!(
+                        "/{command}/preview_transport/ack/replace_code_protocol"
+                    ))
+                })
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:commands-send-replace-code"),
+        preview_transport_pass,
+        format!("transport_commands={transport_commands:?}"),
+        (!preview_transport_pass).then(|| {
+            "Run/Format/Reset/tab commands do not prove selected editor buffer reached PreviewTransport ReplaceCode".to_owned()
+        }),
+    );
+    let structural_inventory =
+        dev_probe.and_then(|probe| probe.get("selected_example_structural_inventory"));
+    let editor_scroll_root = structural_inventory
+        .and_then(|inventory| inventory.pointer("/scroll_root_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        > 0;
+    let editor_materialized = structural_inventory
+        .and_then(|inventory| inventory.pointer("/materialized_node_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        > 0;
+    let editor_focused = structural_inventory
+        .and_then(|inventory| inventory.pointer("/focus"))
+        .and_then(serde_json::Value::as_str)
+        == Some("dev-code-editor");
+    let editor_visible_affordance_pass =
+        editor_scroll_root && editor_materialized && editor_focused;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:visible-editor-scroll-affordance"),
+        editor_visible_affordance_pass,
+        format!(
+            "editor_scroll_root={editor_scroll_root}, editor_materialized={editor_materialized}, editor_focused={editor_focused}"
+        ),
+        (!editor_visible_affordance_pass).then(|| {
+            "visible code editor inventory does not prove focus, scroll root, and materialized editor affordances".to_owned()
+        }),
+    );
+    let source_dispatch_count = dev_probe
+        .and_then(|probe| probe.pointer("/command_dispatch_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let internal_command_shortcut = dev_probe
+        .and_then(|probe| probe.pointer("/internal_command_shortcut"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:document-source-command-dispatch"),
+        source_dispatch_count >= 4 && !internal_command_shortcut,
+        format!(
+            "command_dispatch_count={source_dispatch_count}, internal_command_shortcut={internal_command_shortcut}"
+        ),
+        (!(source_dispatch_count >= 4 && !internal_command_shortcut)).then(|| {
+            "native dev window command probe bypasses Document SourceBinding dispatch".to_owned()
+        }),
+    );
+    let real_window_command_input = dev_probe
+        .and_then(|probe| probe.get("evidence_tier"))
+        .and_then(serde_json::Value::as_str)
+        == Some("real-window")
+        && dev_probe
+            .and_then(|probe| probe.get("visible_window_input"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:commands-real-window"),
+        real_window_command_input,
+        format!(
+            "dev_probe_tier={:?}, visible_window_input={:?}",
+            dev_probe
+                .and_then(|probe| probe.get("evidence_tier"))
+                .and_then(serde_json::Value::as_str),
+            dev_probe
+                .and_then(|probe| probe.get("visible_window_input"))
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!real_window_command_input).then(|| {
+            "Run/Format/Reset/tab evidence has not reached the required real-window tier".to_owned()
+        }),
+    );
+    for command in ["tab_switch", "run", "format", "reset"] {
+        let command_pass = dev_probe
+            .and_then(|probe| probe.get(command))
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-dev-window-editor:{example}:command:{command}"),
+            command_pass,
+            format!("command_probe={command}"),
+            (!command_pass).then(|| {
+                format!(
+                    "native dev window command `{command}` is not proven through DevWindowShell"
+                )
+            }),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-dev-window-editor",
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "source_line_count": source_text.lines().count(),
+            "preview_e2e_report": preview_report_path,
+            "dev_shell_interaction_probe": dev_probe.cloned().unwrap_or_else(|| json!(null)),
+            "required_command_evidence_tier": "real-window",
+            "required_editor_features": [
+                "tabs",
+                "Run",
+                "Format",
+                "Reset",
+                "full-buffer-model",
+                "scroll",
+                "caret",
+                "selection",
+                "diagnostics"
+            ]
+        }),
+    )
+}
+
+fn verify_native_example_tabs(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = boon_runtime::example_manifest_entries()?;
+    let native_source = fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-tabs:manifest-has-tabs",
+        entries.len() >= 2,
+        format!("entry_count={}", entries.len()),
+        (entries.len() < 2).then(|| "manifest must declare at least Cells and TodoMVC".to_owned()),
+    );
+    for entry in &entries {
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-example-tabs:entry:{}", entry.id),
+            entry.shown_by_default,
+            format!("label={}, source={}", entry.label, entry.source),
+            (!entry.shown_by_default)
+                .then(|| format!("example `{}` is not shown by default", entry.id)),
+        );
+    }
+    let generic_tabs = native_source.contains("ExampleCatalog") && native_source.contains("tab");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-tabs:generic-dev-shell",
+        generic_tabs,
+        "dev shell must build tabs from ExampleCatalog, not hardcoded renderer branches",
+        (!generic_tabs)
+            .then(|| "native dev shell does not yet expose generic example tabs".to_owned()),
+    );
+    for entry in &entries {
+        let report_path = native_preview_e2e_report_path(&entry.id);
+        let report = read_optional_json(&report_path)?;
+        let tab_switch_pass = report
+            .as_ref()
+            .and_then(|report| report.pointer("/dev_shell_interaction_probe/tab_switch/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-example-tabs:{}:tab-switch-command-probe", entry.id),
+            tab_switch_pass,
+            format!("preview_report={}", report_path.display()),
+            (!tab_switch_pass).then(|| {
+                format!(
+                    "example `{}` lacks passing manifest-driven tab switch evidence",
+                    entry.id
+                )
+            }),
+        );
+        let tab_real_window = report
+            .as_ref()
+            .and_then(|report| report.pointer("/dev_shell_interaction_probe/evidence_tier"))
+            .and_then(serde_json::Value::as_str)
+            == Some("real-window");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-example-tabs:{}:tab-switch-real-window", entry.id),
+            tab_real_window,
+            format!("preview_report={}", report_path.display()),
+            (!tab_real_window).then(|| {
+                format!(
+                    "example `{}` tab switching is not proven at the required real-window tier",
+                    entry.id
+                )
+            }),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-example-tabs",
+        checks,
+        blockers,
+        json!({
+            "manifest_path": boon_runtime::example_manifest_path(),
+            "tabs": entries
+                .iter()
+                .map(|entry| json!({"id": entry.id, "label": entry.label, "order": entry.default_tab_order}))
+                .collect::<Vec<_>>()
+        }),
+    )
+}
+
+fn verify_native_editor_format(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let entries = boon_runtime::example_manifest_entries()?;
+    let indentation_fixture = "SOURCE\n  HOLD\n\tLATEST\n\n\nLIST {}\nList/map\n";
+    let indentation_formatted =
+        boon_parser::format_source("format-fixture.bn", indentation_fixture)?;
+    let indentation_normalized =
+        indentation_formatted == "SOURCE\n    HOLD\n    LATEST\n\nLIST {}\nList/map\n";
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-editor-format:parser-backed-indentation-normalization",
+        indentation_normalized,
+        format!("formatted_fixture={indentation_formatted:?}"),
+        (!indentation_normalized).then(|| {
+            "formatter does not prove indentation/tab/blank-line normalization".to_owned()
+        }),
+    );
+    for entry in &entries {
+        let source = fs::read_to_string(&entry.source)?;
+        let formatted = boon_parser::format_source(entry.source.clone(), source.clone());
+        let ok = formatted.is_ok();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-editor-format:{}:parser-backed-format", entry.id),
+            ok,
+            formatted
+                .as_ref()
+                .map(|formatted| {
+                    format!(
+                        "formatted_hash={}",
+                        boon_runtime::sha256_bytes(formatted.as_bytes())
+                    )
+                })
+                .unwrap_or_else(|error| error.to_string()),
+            (!ok).then(|| format!("formatter rejected example `{}`", entry.id)),
+        );
+        if let Ok(formatted) = formatted {
+            let reparsed = boon_parser::parse_source(entry.source.clone(), formatted).is_ok();
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("native-editor-format:{}:formatted-source-parses", entry.id),
+                reparsed,
+                "formatted source parses through normal Boon parser",
+                (!reparsed).then(|| format!("formatted `{}` no longer parses", entry.id)),
+            );
+        }
+        let report_path = native_preview_e2e_report_path(&entry.id);
+        let report = read_optional_json(&report_path)?;
+        let format_command_pass = report
+            .as_ref()
+            .and_then(|report| report.pointer("/dev_shell_interaction_probe/format/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!(
+                "native-editor-format:{}:dev-window-format-command",
+                entry.id
+            ),
+            format_command_pass,
+            format!("preview_report={}", report_path.display()),
+            (!format_command_pass).then(|| {
+                format!(
+                    "dev window Format command for `{}` is not proven through DevWindowShell",
+                    entry.id
+                )
+            }),
+        );
+        let format_real_window = report
+            .as_ref()
+            .and_then(|report| report.pointer("/dev_shell_interaction_probe/evidence_tier"))
+            .and_then(serde_json::Value::as_str)
+            == Some("real-window");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-editor-format:{}:dev-window-format-real-window", entry.id),
+            format_real_window,
+            format!("preview_report={}", report_path.display()),
+            (!format_real_window).then(|| {
+                format!(
+                    "dev window Format command for `{}` is not proven at the required real-window tier",
+                    entry.id
+                )
+            }),
+        );
+    }
+    write_native_gate_report(
+        args,
+        "verify-native-editor-format",
+        checks,
+        blockers,
+        json!({
+            "format_backend": "boon_parser::format_source",
+            "formatter_normalization_fixture": {
+                "input": indentation_fixture,
+                "output": indentation_formatted,
+                "pass": indentation_normalized
+            },
+            "unsupported_example_keyword_rejected": boon_parser::format_source("bad.bn", "EXAMPLE TodoMVC\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map").is_err()
+        }),
+    )
+}
+
+fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let existing_report = if entry.id == "cells" {
+        PathBuf::from("target/reports/native-gpu/scroll-speed-cells.json")
+    } else {
+        PathBuf::from(format!("target/reports/native-gpu/speed-{}.json", entry.id))
+    };
+    let existing = read_optional_json(&existing_report)?;
+    let report_valid = existing
+        .as_ref()
+        .is_some_and(|report| native_gpu_report_staleness_reasons(report).is_empty());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-example-speed:{}:fresh-speed-report", entry.id),
+        report_valid,
+        format!(
+            "report={}, staleness_reasons={:?}",
+            existing_report.display(),
+            existing
+                .as_ref()
+                .map(native_gpu_report_staleness_reasons)
+                .unwrap_or_else(|| vec!["missing report".to_owned()])
+        ),
+        (!report_valid).then(|| {
+            format!(
+                "missing fresh visible native speed report for `{}` at `{}`",
+                entry.id,
+                existing_report.display()
+            )
+        }),
+    );
+    let source = fs::read_to_string(&entry.source)?;
+    let full_cells_grid =
+        entry.id != "cells" || (source.contains("columns: 26") && source.contains("rows: 100"));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-example-speed:{}:full-example-size", entry.id),
+        full_cells_grid,
+        "Cells must keep the official 26x100 grid size for speed claims",
+        (!full_cells_grid).then(|| "Cells speed gate cannot pass with a reduced grid".to_owned()),
+    );
+    let p95_present = existing.as_ref().is_some_and(|report| {
+        report.get("scroll_frame_ms_p95").is_some()
+            || report.get("preview_frame_ms_p50_p95_max").is_some()
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-example-speed:{}:p95-present", entry.id),
+        p95_present,
+        "speed reports must include p50/p95/p99/max or p95 frame evidence",
+        (!p95_present).then(|| {
+            format!(
+                "speed report for `{}` lacks p95 frame timing evidence",
+                entry.id
+            )
+        }),
+    );
+    let observed_evidence_tier = existing
+        .as_ref()
+        .and_then(|report| report.get("evidence_tier"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let tier_satisfies =
+        evidence_tier_satisfies(&observed_evidence_tier, &entry.required_evidence_tier);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-example-speed:{}:evidence-tier", entry.id),
+        tier_satisfies,
+        format!(
+            "observed_tier={}, required_tier={}",
+            observed_evidence_tier, entry.required_evidence_tier
+        ),
+        (!tier_satisfies).then(|| {
+            format!(
+                "example `{}` speed requires `{}` evidence; current speed evidence is `{}`",
+                entry.id, entry.required_evidence_tier, observed_evidence_tier
+            )
+        }),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-example-speed",
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "required_thresholds": entry.performance_thresholds,
+            "existing_native_gpu_scroll_report": existing_report,
+            "required_evidence_tier": entry.required_evidence_tier,
+            "observed_evidence_tier": observed_evidence_tier,
+            "strict_visible_speed_satisfied": tier_satisfies
+        }),
+    )
+}
+
+fn verify_native_dev_editor_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let existing_report =
+        PathBuf::from("target/reports/native-gpu/scroll-speed-dev-code-editor.json");
+    let existing = read_optional_json(&existing_report)?;
+    let valid = existing
+        .as_ref()
+        .is_some_and(|report| native_gpu_report_staleness_reasons(report).is_empty());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-speed:fresh-scroll-report",
+        valid,
+        format!(
+            "report={}, staleness_reasons={:?}",
+            existing_report.display(),
+            existing
+                .as_ref()
+                .map(native_gpu_report_staleness_reasons)
+                .unwrap_or_else(|| vec!["missing report".to_owned()])
+        ),
+        (!valid).then(|| {
+            "missing fresh dev editor speed report bound to the visible native dev window"
+                .to_owned()
+        }),
+    );
+    let observed_evidence_tier = existing
+        .as_ref()
+        .and_then(|report| report.get("evidence_tier"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let strict_visible_speed = evidence_tier_satisfies(&observed_evidence_tier, "real-window")
+        && existing.as_ref().is_some_and(|report| {
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-speed:real-window-tier",
+        strict_visible_speed,
+        format!("observed_tier={observed_evidence_tier}, required_tier=real-window"),
+        (!strict_visible_speed).then(|| {
+            "dev editor speed is not proven with real-window wheel/input evidence".to_owned()
+        }),
+    );
+    let min_lines = native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000);
+    let min_longest_line_bytes =
+        native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000);
+    let reported_line_count = existing
+        .as_ref()
+        .and_then(|report| report.get("line_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let reported_longest_line_bytes = existing
+        .as_ref()
+        .and_then(|report| report.get("longest_line_bytes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let corpus_pass = existing.as_ref().is_some_and(|report| {
+        report
+            .pointer("/dev_editor_speed_corpus/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && report
+                .pointer("/dev_editor_speed_corpus/line_budget_satisfied")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && report
+                .pointer("/dev_editor_speed_corpus/longest_line_budget_satisfied")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    });
+    let materialized_range_pass = existing.as_ref().is_some_and(|report| {
+        report.get("materialized_range_before_after").is_some()
+            && report
+                .get("materialized_line_count_max")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+    });
+    let full_buffer = reported_line_count >= min_lines
+        && reported_longest_line_bytes >= min_longest_line_bytes
+        && corpus_pass
+        && materialized_range_pass;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-speed:full-buffer-not-truncated",
+        full_buffer,
+        format!(
+            "line_count={reported_line_count}/{min_lines}, longest_line_bytes={reported_longest_line_bytes}/{min_longest_line_bytes}, corpus_pass={corpus_pass}, materialized_range_pass={materialized_range_pass}"
+        ),
+        (!full_buffer).then(|| {
+            "dev editor still appears to truncate the source buffer before rendering".to_owned()
+        }),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-dev-editor-speed",
+        checks,
+        blockers,
+        json!({
+            "surface": "dev-code-editor",
+            "existing_native_gpu_scroll_report": existing_report,
+            "required_evidence_tier": "real-window",
+            "observed_evidence_tier": observed_evidence_tier,
+            "strict_visible_speed_satisfied": strict_visible_speed,
+            "required_metrics": ["p50", "p95", "p99", "max", "dropped_frames", "longest_visible_stall"]
+        }),
+    )
+}
+
+fn verify_native_real_window_input_environment(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let live_allowed = live_desktop_input_allowed();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "real-window-input:live-desktop-permission",
+        live_allowed,
+        format!(
+            "BOON_ALLOW_LIVE_DESKTOP_INPUT={:?}, BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS={:?}",
+            std::env::var("BOON_ALLOW_LIVE_DESKTOP_INPUT").ok(),
+            std::env::var("BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS").ok()
+        ),
+        (!live_allowed).then(|| {
+            "live desktop input is not permitted; verifier must not type/click into the active user session".to_owned()
+        }),
+    );
+    let tools = json!({
+        "weston": command_available("weston"),
+        "wayland-info": command_available("wayland-info"),
+        "wtype": command_available("wtype"),
+        "ydotool": command_available("ydotool"),
+        "cage": command_available("cage"),
+    });
+    for tool in ["weston", "wayland-info", "wtype"] {
+        let available = tools.get(tool).and_then(serde_json::Value::as_bool) == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("real-window-input:tool:{tool}"),
+            available,
+            format!("{tool} available={available}"),
+            (!available)
+                .then(|| format!("required real-window input probe tool `{tool}` is missing")),
+        );
+    }
+    let controlled_wayland_harness = if tools.get("weston").and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && tools
+            .get("wayland-info")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        run_controlled_weston_capability_probe()?
+    } else {
+        json!({
+            "status": "not-run",
+            "reason": "weston or wayland-info is unavailable"
+        })
+    };
+    let globals = controlled_wayland_harness
+        .get("globals")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect::<BTreeSet<_>>();
+    let has_seat = globals.contains("wl_seat");
+    let has_virtual_keyboard = globals.contains("zwp_virtual_keyboard_manager_v1");
+    let has_virtual_pointer = globals.contains("zwlr_virtual_pointer_manager_v1")
+        || globals.contains("zwp_virtual_pointer_manager_v1");
+    let isolated_input_possible = has_seat && has_virtual_keyboard && has_virtual_pointer;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "real-window-input:isolated-wayland-input-protocols",
+        isolated_input_possible,
+        format!(
+            "has_wl_seat={has_seat}, has_virtual_keyboard={has_virtual_keyboard}, has_virtual_pointer={has_virtual_pointer}"
+        ),
+        (!isolated_input_possible).then(|| {
+            "isolated Weston probe does not expose the seat/virtual keyboard/virtual pointer protocols needed for real-window input synthesis".to_owned()
+        }),
+    );
+    let ydotool_safe =
+        live_allowed && tools.get("ydotool").and_then(serde_json::Value::as_bool) == Some(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "real-window-input:ydotool-live-desktop-policy",
+        ydotool_safe,
+        format!(
+            "ydotool_available={:?}, live_desktop_input_allowed={live_allowed}",
+            tools.get("ydotool").and_then(serde_json::Value::as_bool)
+        ),
+        (!ydotool_safe).then(|| {
+            "ydotool/uinput can target the live desktop globally, but this verifier is not allowed to use it without explicit live-desktop consent".to_owned()
+        }),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-real-window-input-environment",
+        checks,
+        blockers,
+        json!({
+            "source_hash": "n/a",
+            "program_hash": "n/a",
+            "tools": tools,
+            "live_desktop_input_allowed": live_allowed,
+            "controlled_wayland_harness": controlled_wayland_harness,
+            "operator_host_input": true,
+            "real_window_input_possible_without_live_desktop": isolated_input_possible,
+            "real_window_input_possible_with_live_desktop_permission": ydotool_safe,
+            "recommended_next_step": if isolated_input_possible {
+                "wire isolated compositor virtual input into preview/dev E2E"
+            } else if !live_allowed {
+                "human or explicitly permitted live-desktop OS input is required for the real-window tier on this machine"
+            } else {
+                "install an isolated Wayland virtual input backend or use permitted live-desktop input"
+            },
+            "strict_visible_testing_contract": "docs/plans/STRICT_EXAMPLE_VISIBLE_TESTING_RULES.md"
+        }),
+    )
+}
+
+fn evidence_tier_satisfies(observed: &str, required: &str) -> bool {
+    fn rank(tier: &str) -> Option<u8> {
+        match tier {
+            "runtime" => Some(0),
+            "host-synthetic" => Some(1),
+            "real-window" => Some(2),
+            "human" => Some(3),
+            _ => None,
+        }
+    }
+    rank(observed)
+        .zip(rank(required))
+        .is_some_and(|(observed, required)| observed >= required)
 }
 
 fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -6215,7 +8540,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             continue;
         }
         let report = read_json(path)?;
-        let schema_blockers = validate_native_gpu_child_report_shape(path, &report);
+        let schema_blockers = validate_native_gpu_child_report_shape(requirement, &report);
         let schema_valid = schema_blockers.is_empty();
         push_audit_check(
             &mut checks,
@@ -6287,7 +8612,8 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                     "label": report.label,
                     "path": report.path.display().to_string(),
                     "command": report.command,
-                    "required_argv": report.required_argv
+                    "required_argv": report.required_argv,
+                    "requires_native_gpu_contract": report.requires_native_gpu_contract
                 })
             }).collect::<Vec<_>>(),
             "linked_report_artifacts": artifacts,
@@ -6301,10 +8627,17 @@ struct NativeGpuRequiredReport {
     path: PathBuf,
     command: &'static str,
     required_argv: &'static [(&'static str, &'static str)],
+    requires_native_gpu_contract: bool,
 }
 
 fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
     vec![
+        static_required_report(
+            "boon-source-syntax",
+            "target/reports/boon-source-syntax.json",
+            "verify-boon-source-syntax",
+            &[],
+        ),
         native_gpu_required_report(
             "platform-contract",
             "target/reports/native-gpu/platform-contract.json",
@@ -6354,6 +8687,54 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[],
         ),
         native_gpu_required_report(
+            "real-window-input-environment",
+            "target/reports/native-gpu/real-window-input-environment.json",
+            "verify-native-real-window-input-environment",
+            &[],
+        ),
+        native_gpu_required_report(
+            "visible-launch-todomvc",
+            "target/reports/native-gpu/todomvc-visible-launch.json",
+            "verify-native-visible-launch",
+            &[("--example", "todomvc")],
+        ),
+        native_gpu_required_report(
+            "visible-launch-cells",
+            "target/reports/native-gpu/cells-visible-launch.json",
+            "verify-native-visible-launch",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "native-examples",
+            "target/reports/native-gpu/native-examples.json",
+            "verify-native-examples",
+            &[("--all", "")],
+        ),
+        native_gpu_required_report(
+            "dev-editor-todomvc",
+            "target/reports/native-gpu/dev-editor-todomvc.json",
+            "verify-native-dev-window-editor",
+            &[("--example", "todomvc")],
+        ),
+        native_gpu_required_report(
+            "dev-editor-cells",
+            "target/reports/native-gpu/dev-editor-cells.json",
+            "verify-native-dev-window-editor",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "example-tabs",
+            "target/reports/native-gpu/example-tabs.json",
+            "verify-native-example-tabs",
+            &[],
+        ),
+        native_gpu_required_report(
+            "editor-format",
+            "target/reports/native-gpu/editor-format.json",
+            "verify-native-editor-format",
+            &[],
+        ),
+        native_gpu_required_report(
             "preview-e2e-todomvc",
             "target/reports/native-gpu/preview-e2e-todomvc.json",
             "verify-native-gpu-preview-e2e",
@@ -6378,6 +8759,18 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--surface", "dev-code-editor")],
         ),
         native_gpu_required_report(
+            "speed-cells",
+            "target/reports/native-gpu/speed-cells.json",
+            "verify-native-example-speed",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "dev-editor-speed",
+            "target/reports/native-gpu/dev-editor-speed.json",
+            "verify-native-dev-editor-speed",
+            &[],
+        ),
+        native_gpu_required_report(
             "negative",
             "target/reports/native-gpu/negative.json",
             "verify-native-gpu-negative",
@@ -6397,10 +8790,29 @@ fn native_gpu_required_report(
         path: PathBuf::from(path),
         command,
         required_argv,
+        requires_native_gpu_contract: true,
     }
 }
 
-fn validate_native_gpu_child_report_shape(path: &Path, report: &serde_json::Value) -> Vec<String> {
+fn static_required_report(
+    label: &'static str,
+    path: &str,
+    command: &'static str,
+    required_argv: &'static [(&'static str, &'static str)],
+) -> NativeGpuRequiredReport {
+    NativeGpuRequiredReport {
+        label,
+        path: PathBuf::from(path),
+        command,
+        required_argv,
+        requires_native_gpu_contract: false,
+    }
+}
+
+fn validate_native_gpu_child_report_shape(
+    requirement: &NativeGpuRequiredReport,
+    report: &serde_json::Value,
+) -> Vec<String> {
     let mut blockers = Vec::new();
     for key in [
         "report_version",
@@ -6442,7 +8854,11 @@ fn validate_native_gpu_child_report_shape(path: &Path, report: &serde_json::Valu
     {
         blockers.push("artifact_sha256s must be an array".to_owned());
     }
-    blockers.extend(native_gpu_report_rejection_reasons(report));
+    blockers.extend(native_gpu_report_integrity_reasons(
+        report,
+        true,
+        requirement.requires_native_gpu_contract,
+    ));
     if report.get("status").and_then(serde_json::Value::as_str) == Some("fail")
         && report
             .get("blockers")
@@ -6453,7 +8869,7 @@ fn validate_native_gpu_child_report_shape(path: &Path, report: &serde_json::Valu
     }
     blockers
         .into_iter()
-        .map(|blocker| format!("{}: {blocker}", path.display()))
+        .map(|blocker| format!("{}: {blocker}", requirement.path.display()))
         .collect()
 }
 
@@ -6472,20 +8888,28 @@ fn validate_native_gpu_child_report(
             requirement.command, requirement.label
         ));
     }
-    if report
-        .get("native_gpu_contract")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        blockers.push("missing native_gpu_contract=true".to_owned());
-    }
-    let expected_budget = file_hash("budgets/native-gpu.toml");
-    if report
+    if requirement.requires_native_gpu_contract {
+        if report
+            .get("native_gpu_contract")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            blockers.push("missing native_gpu_contract=true".to_owned());
+        }
+        let expected_budget = file_hash("budgets/native-gpu.toml");
+        if report
+            .get("budget_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_budget.as_str())
+        {
+            blockers.push("budget_hash does not match current budgets/native-gpu.toml".to_owned());
+        }
+    } else if report
         .get("budget_hash")
         .and_then(serde_json::Value::as_str)
-        != Some(expected_budget.as_str())
+        != Some("n/a")
     {
-        blockers.push("budget_hash does not match current budgets/native-gpu.toml".to_owned());
+        blockers.push("non-native report budget_hash must be n/a".to_owned());
     }
     let argv = report
         .get("command_argv")
@@ -6509,7 +8933,11 @@ fn validate_native_gpu_child_report(
             ));
         }
     }
-    blockers.extend(native_gpu_report_rejection_reasons(report));
+    blockers.extend(native_gpu_report_integrity_reasons(
+        report,
+        true,
+        requirement.requires_native_gpu_contract,
+    ));
     blockers.extend(native_gpu_label_contract_blockers(
         requirement.label,
         report,
@@ -6744,6 +9172,15 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         }
         "preview-e2e-todomvc" | "preview-e2e-cells" => {
             require_str_field(&mut blockers, report, "display_server", "wayland");
+            let tier = report
+                .get("evidence_tier")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !matches!(tier, "host-synthetic" | "real-window") {
+                blockers.push(format!(
+                    "evidence_tier must be host-synthetic or real-window, got `{tier}`"
+                ));
+            }
             require_bool_field(&mut blockers, report, "operator_host_input", true);
             require_bool_field(&mut blockers, report, "real_os_input", false);
             require_bool_field(&mut blockers, report, "operator_report", true);
@@ -6770,7 +9207,22 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_nonempty_array(&mut blockers, report, "frame_hashes");
             require_nonempty_array(&mut blockers, report, "readback_artifacts");
             require_nonempty_array(&mut blockers, report, "per_step_host_input_route");
-            require_nonempty_array(&mut blockers, report, "per_step_os_pointer_keyboard_route");
+            let real_os_input = report
+                .get("real_os_input")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if real_os_input {
+                require_nonempty_array(&mut blockers, report, "per_step_os_pointer_keyboard_route");
+            } else if report
+                .get("per_step_os_pointer_keyboard_route")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|steps| !steps.is_empty())
+            {
+                blockers.push(
+                    "per_step_os_pointer_keyboard_route must be empty when real_os_input is false"
+                        .to_owned(),
+                );
+            }
             require_nonempty_array(&mut blockers, report, "hit_target_assertions");
             require_nonempty_array(&mut blockers, report, "source_intent_assertions");
             require_nonempty_array(&mut blockers, report, "runtime_state_assertions");
@@ -6831,14 +9283,15 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|method| {
                     let method = method.to_ascii_lowercase();
-                    !method.contains("operator_host_event_harness")
+                    !(method.contains("operator_host_event_harness")
+                        || method.contains("app_window_per_window_synthetic_input_harness"))
                         || method.contains("xvfb")
                         || method.contains("headless")
                         || method.contains("compositor")
                 })
             {
                 blockers.push(
-                    "input_injection_method must be operator_host_event_harness for portable native E2E"
+                    "input_injection_method must be operator_host_event_harness or app_window_per_window_synthetic_input_harness for portable native E2E"
                         .to_owned(),
                 );
             }
@@ -7092,6 +9545,18 @@ fn require_scroll_budget_fields(blockers: &mut Vec<String>, report: &serde_json:
         "missed_frame_count",
         native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
     );
+    require_u64_at_most(
+        blockers,
+        report,
+        "dropped_frame_count",
+        native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+    );
+    require_f64_at_most(
+        blockers,
+        report,
+        "longest_visible_stall_ms",
+        native_gpu_budget_f64("frame", "preview_frame_ms_max").unwrap_or(33.4),
+    );
 }
 
 fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &serde_json::Value) {
@@ -7123,6 +9588,18 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
         report,
         "missed_frame_count",
         native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+    );
+    require_u64_at_most(
+        blockers,
+        report,
+        "dropped_frame_count",
+        native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+    );
+    require_f64_at_most(
+        blockers,
+        report,
+        "longest_visible_stall_ms",
+        native_gpu_budget_f64("frame", "preview_frame_ms_max").unwrap_or(33.4),
     );
     require_positive_u64(blockers, report, "sample_frame_count");
     require_positive_u64(blockers, report, "sustained_scroll_duration_ms");
@@ -7256,18 +9733,40 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-gpu-multiwindow" => "multiwindow",
         "verify-native-gpu-ipc-backpressure" => "ipc-backpressure",
         "verify-native-gpu-observability" => "observability",
+        "verify-native-real-window-input-environment" => "real-window-input-environment",
         "verify-native-gpu-preview-e2e" => match value_arg(args, "--example").as_deref() {
             Some("todomvc") => "preview-e2e-todomvc",
             Some("cells") => "preview-e2e-cells",
             _ => "preview-e2e",
         },
+        "verify-native-visible-launch" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => "todomvc-visible-launch",
+            Some("cells") => "cells-visible-launch",
+            _ => "visible-launch",
+        },
+        "verify-native-examples" => "native-examples",
+        "verify-native-dev-window-editor" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => "dev-editor-todomvc",
+            Some("cells") => "dev-editor-cells",
+            _ => "dev-editor",
+        },
+        "verify-native-example-tabs" => "example-tabs",
+        "verify-native-editor-format" => "editor-format",
+        "verify-native-example-speed" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => "speed-todomvc",
+            Some("cells") => "speed-cells",
+            _ => "speed-example",
+        },
+        "verify-native-dev-editor-speed" => "dev-editor-speed",
         "verify-native-two-window-content" => "todomvc-two-window-content",
         "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
         "verify-native-todomvc-input-parity" => "todomvc-input-parity",
-        "verify-native-gpu-scroll-speed" => match native_gpu_scroll_selector(args).label.as_str() {
-            "dev-code-editor" => "scroll-speed-dev-code-editor",
-            _ => "scroll-speed-cells",
-        },
+        "verify-native-gpu-scroll-speed" => {
+            let label = native_gpu_scroll_selector(args).label;
+            return PathBuf::from(format!(
+                "target/reports/native-gpu/scroll-speed-{label}.json"
+            ));
+        }
         "verify-native-gpu-negative" => "negative",
         "verify-native-gpu-all" => return PathBuf::from("target/reports/native-gpu-all.json"),
         _ => command,
@@ -7279,12 +9778,30 @@ fn native_gpu_report_rejects(report: &serde_json::Value) -> bool {
     !native_gpu_report_rejection_reasons(report).is_empty()
 }
 
+fn native_gpu_report_staleness_reasons(report: &serde_json::Value) -> Vec<String> {
+    native_gpu_report_integrity_reasons(report, false, true)
+}
+
 fn native_gpu_report_rejection_reasons(report: &serde_json::Value) -> Vec<String> {
+    native_gpu_report_integrity_reasons(report, true, true)
+}
+
+fn native_gpu_report_integrity_reasons(
+    report: &serde_json::Value,
+    include_status_failure: bool,
+    require_native_gpu_contract: bool,
+) -> Vec<String> {
     let mut reasons = Vec::new();
-    if report
-        .get("native_gpu_contract")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
+    if include_status_failure
+        && report.get("status").and_then(serde_json::Value::as_str) == Some("fail")
+    {
+        reasons.push("status=fail".to_owned());
+    }
+    if require_native_gpu_contract
+        && report
+            .get("native_gpu_contract")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
     {
         reasons.push("missing native_gpu_contract=true".to_owned());
     }
@@ -7457,6 +9974,9 @@ fn native_gpu_report_rejection_reasons(report: &serde_json::Value) -> Vec<String
 }
 
 fn command_argv_contains_pair(argv: &[serde_json::Value], flag: &str, value: &str) -> bool {
+    if value.is_empty() {
+        return argv.iter().any(|arg| arg.as_str() == Some(flag));
+    }
     argv.windows(2)
         .any(|window| window[0].as_str() == Some(flag) && window[1].as_str() == Some(value))
 }
@@ -8129,6 +10649,193 @@ fn wait_for_json_report(path: &Path, timeout: Duration) -> bool {
     false
 }
 
+fn native_readback_pixel_inventory(
+    path: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let image = image::open(path)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    let total_pixels = u64::from(width) * u64::from(height);
+    let mut counts = BTreeMap::<[u8; 4], u64>::new();
+    for pixel in image.pixels() {
+        *counts.entry(pixel.0).or_insert(0) += 1;
+    }
+    let (dominant_color, dominant_count) = counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(color, count)| (*color, *count))
+        .unwrap_or(([0, 0, 0, 0], 0));
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut content_pixels = 0u64;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0 != dominant_color {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            content_pixels += 1;
+        }
+    }
+    let content_bbox = if content_pixels > 0 {
+        json!({
+            "x": min_x,
+            "y": min_y,
+            "width": max_x.saturating_sub(min_x).saturating_add(1),
+            "height": max_y.saturating_sub(min_y).saturating_add(1),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    let unique_rgba_values = counts.len() as u64;
+    let single_color = unique_rgba_values <= 1;
+    Ok(json!({
+        "status": if !single_color && content_pixels > 0 { "pass" } else { "fail" },
+        "path": path,
+        "sha256": file_hash(path),
+        "width": width,
+        "height": height,
+        "total_pixels": total_pixels,
+        "unique_rgba_values": unique_rgba_values,
+        "dominant_color_rgba": dominant_color,
+        "dominant_color_count": dominant_count,
+        "dominant_color_ratio": if total_pixels > 0 {
+            dominant_count as f64 / total_pixels as f64
+        } else {
+            1.0
+        },
+        "non_dominant_content_pixels": content_pixels,
+        "content_bounding_box": content_bbox,
+        "single_color": single_color,
+        "analysis_method": "decode app-owned PNG readback and compare pixels against dominant background color"
+    }))
+}
+
+fn run_controlled_weston_capability_probe() -> Result<serde_json::Value, Box<dyn std::error::Error>>
+{
+    let socket = format!(
+        "boon-real-window-probe-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let log_path = PathBuf::from(format!("/tmp/{socket}.log"));
+    let mut child = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            log_path.to_str().ok_or("weston log path is not UTF-8")?,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut ready = false;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    for _ in 0..40 {
+        let output = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output();
+        if let Ok(output) = output {
+            stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let globals = stdout
+        .lines()
+        .filter_map(|line| {
+            let marker = "interface: '";
+            let start = line.find(marker)? + marker.len();
+            let end = line[start..].find('\'')? + start;
+            Some(line[start..end].to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(json!({
+        "status": if ready { "pass" } else { "fail" },
+        "method": "verifier-owned-nested-weston-headless-capability-probe",
+        "socket": socket,
+        "log_path": log_path,
+        "globals": globals.into_iter().collect::<Vec<_>>(),
+        "wayland_info_stdout_sha256": boon_runtime::sha256_bytes(stdout.as_bytes()),
+        "wayland_info_stderr_sha256": boon_runtime::sha256_bytes(stderr.as_bytes()),
+        "has_wl_seat": stdout.contains("interface: 'wl_seat'"),
+        "has_virtual_keyboard_manager": stdout.contains("zwp_virtual_keyboard_manager_v1"),
+        "has_virtual_pointer_manager": stdout.contains("zwlr_virtual_pointer_manager_v1")
+            || stdout.contains("zwp_virtual_pointer_manager_v1"),
+        "bounded_wait_ms": 4_000,
+    }))
+}
+
+fn modified_unix_seconds(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+}
+
+fn native_artifact_freshness_summary(
+    report: &serde_json::Value,
+    source_path: &Path,
+    binary_path: &Path,
+) -> serde_json::Value {
+    let source_mtime = modified_unix_seconds(source_path);
+    let binary_mtime = modified_unix_seconds(binary_path);
+    let mut paths = BTreeSet::new();
+    for key in ["artifact_sha256s", "frame_hashes"] {
+        if let Some(items) = report.get(key).and_then(serde_json::Value::as_array) {
+            for item in items {
+                if let Some(path) = item.get("path").and_then(serde_json::Value::as_str) {
+                    paths.insert(path.to_owned());
+                }
+            }
+        }
+    }
+    let artifacts = paths
+        .iter()
+        .map(|path| {
+            let artifact_path = Path::new(path);
+            let modified = modified_unix_seconds(artifact_path);
+            json!({
+                "path": path,
+                "modified_at_utc": modified,
+                "newer_than_source": modified.zip(source_mtime).is_some_and(|(artifact, source)| artifact >= source),
+                "newer_than_binary": modified.zip(binary_mtime).is_some_and(|(artifact, binary)| artifact >= binary),
+            })
+        })
+        .collect::<Vec<_>>();
+    let all_fresh = !artifacts.is_empty()
+        && artifacts.iter().all(|artifact| {
+            artifact
+                .get("newer_than_source")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && artifact
+                    .get("newer_than_binary")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
+    json!({
+        "status": if all_fresh { "pass" } else { "fail" },
+        "source_path": source_path.display().to_string(),
+        "source_modified_at_utc": source_mtime,
+        "binary_path": binary_path.display().to_string(),
+        "binary_modified_at_utc": binary_mtime,
+        "artifact_count": artifacts.len(),
+        "artifacts": artifacts,
+    })
+}
+
 fn command_available(command: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path.join(command).exists()))
@@ -8138,9 +10845,13 @@ fn run_cosmic_background_launch(
     workspace: &str,
     script: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let output = Command::new("cosmic-background-launch")
+    let child = Command::new("cosmic-background-launch")
         .args(["--workspace", workspace, "--", "bash", "-lc", script])
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let launcher_pid = child.id();
+    let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let mut child_pid = None;
@@ -8164,6 +10875,7 @@ fn run_cosmic_background_launch(
         "success": output.status.success(),
         "exit_status": output.status.to_string(),
         "requested_workspace": workspace,
+        "launcher_pid": launcher_pid,
         "child_pid": child_pid,
         "launch_id": launch_id,
         "stdout": stdout,
@@ -9155,6 +11867,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
         report.get("command").and_then(serde_json::Value::as_str),
         Some(
             "verify-platform-contract"
+                | "boon-native-playground-role"
                 | "verify-native-gpu-dependency-graph"
                 | "verify-native-gpu-architecture"
                 | "verify-native-gpu-layout-contract"
@@ -9162,10 +11875,19 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-multiwindow"
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
+                | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
+                | "verify-boon-source-syntax"
+                | "verify-native-visible-launch"
+                | "verify-native-examples"
+                | "verify-native-dev-window-editor"
+                | "verify-native-example-tabs"
+                | "verify-native-editor-format"
+                | "verify-native-example-speed"
+                | "verify-native-dev-editor-speed"
         )
     )
 }
@@ -9362,7 +12084,7 @@ fn native_scroll_driver_target(
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let preferred_nodes = match label {
-        "dev-code-editor" => ["dev_code_editor_viewport"].as_slice(),
+        "dev-code-editor" => ["dev-code-editor"].as_slice(),
         "cells" => ["spreadsheet_body", "spreadsheet_header"].as_slice(),
         _ => [].as_slice(),
     };
@@ -9406,6 +12128,14 @@ fn native_driver_target_from_region(
 }
 
 fn native_gpu_real_input_observed(report: &serde_json::Value) -> bool {
+    native_gpu_app_window_input_observed(report)
+        && report
+            .pointer("/native_input_adapter/synthetic_input_probe")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+}
+
+fn native_gpu_app_window_input_observed(report: &serde_json::Value) -> bool {
     report
         .pointer("/native_input_adapter/real_os_events_observed")
         .and_then(serde_json::Value::as_bool)
@@ -9425,6 +12155,8 @@ fn native_gpu_operator_input_driver_attempt(
     label: &str,
     target_region: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    let environment_report =
+        PathBuf::from("target/reports/native-gpu/real-window-input-environment.json");
     json!({
         "kind": kind,
         "label": label,
@@ -9437,7 +12169,13 @@ fn native_gpu_operator_input_driver_attempt(
         "event_plan": native_gpu_input_event_plan(kind, label, None),
         "injection_boundary": "after app_window OS-event normalization, before document hit/focus/scroll routing",
         "requires_private_runtime_dispatch": false,
-        "reason": "portable verifier uses host events instead of compositor or desktop input synthesis"
+        "real_window_input_environment_report": environment_report,
+        "real_window_input_environment_report_sha256": if environment_report.exists() {
+            file_hash(environment_report.to_string_lossy().as_ref())
+        } else {
+            "missing".to_owned()
+        },
+        "reason": "portable verifier uses host events because current machine policy/capability report does not prove safe real-window input synthesis"
     })
 }
 

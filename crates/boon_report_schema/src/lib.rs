@@ -199,6 +199,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
             "audit-machine-readiness"
                 | "audit-goal-readiness"
                 | "audit-manual-readiness"
+                | "boon-native-playground-role"
                 | "verify-runtime-finality"
                 | "verify-cells-wayland-scroll-speed"
                 | "verify-platform-contract"
@@ -209,10 +210,19 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-multiwindow"
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
+                | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
+                | "verify-boon-source-syntax"
+                | "verify-native-visible-launch"
+                | "verify-native-examples"
+                | "verify-native-dev-window-editor"
+                | "verify-native-example-tabs"
+                | "verify-native-editor-format"
+                | "verify-native-example-speed"
+                | "verify-native-dev-editor-speed"
         )
     )
 }

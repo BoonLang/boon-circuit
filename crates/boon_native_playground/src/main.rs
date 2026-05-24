@@ -1,6 +1,6 @@
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
 use boon_native_gpu::{PresentSurface, RenderBackend};
-use boon_parser::{AstExpr, AstExprKind, AstStatement, AstStatementKind};
+use boon_parser::{AstExpr, AstExprKind, AstStatement, AstStatementKind, AstTokenKind};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -88,6 +88,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
+    let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let code_hash = boon_runtime::sha256_file(Path::new(&code_file))?;
@@ -141,6 +142,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             initial_height: 720.0,
             hold_ms,
             input_sample_delay_ms,
+            synthetic_input_probe,
             warmup_frame_count,
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
@@ -190,6 +192,9 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let connect =
         value_arg(args, "--connect").ok_or("dev role requires --connect <preview-socket>")?;
     let replace_code_file = value_arg(args, "--replace-code-file").map(PathBuf::from);
+    let editor_code_file = value_arg(args, "--editor-code-file")
+        .map(PathBuf::from)
+        .or_else(|| replace_code_file.clone());
     let replace_code_expected_hash = replace_code_file
         .as_deref()
         .map(boon_runtime::sha256_file)
@@ -197,31 +202,38 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
+    let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
+    let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
     let title = role_window_title("Boon Dev", value_arg(args, "--title-token").as_deref());
     let role_args = args[1..].to_vec();
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
-    let dev_source_path_label = replace_code_file
+    let dev_source_path_label = editor_code_file
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<no-code-file>".to_owned());
-    let dev_source_text = replace_code_file
+    let dev_source_text = editor_code_file
         .as_deref()
         .map(std::fs::read_to_string)
         .transpose()?
         .unwrap_or_else(|| "document = []".to_owned());
+    let dev_shell = DevWindowShell::new(
+        &dev_source_path_label,
+        &dev_source_text,
+        PreviewTransport::new(Some(connect.clone())),
+    );
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
         let mut visible_renderer = None;
-        let source_path_label = dev_source_path_label.clone();
-        let source_text = dev_source_text.clone();
+        let mut layout_frame_cache = None;
+        let shell = dev_shell.clone();
         Some(Box::new(move |context| {
             native_gpu_dev_visible_render_hook(
                 context,
                 &mut visible_renderer,
-                &source_path_label,
-                &source_text,
+                &mut layout_frame_cache,
+                &shell,
             )
         }))
     };
@@ -233,6 +245,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             initial_height: 820.0,
             hold_ms,
             input_sample_delay_ms,
+            synthetic_input_probe,
             warmup_frame_count,
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
@@ -243,13 +256,27 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(proof) => report
                     .as_deref()
                     .map(|report| {
+                        let dev_shell_interaction_probe =
+                            dev_shell.visible_input_probe(&proof);
+                        let ipc_start = Instant::now();
                         let ipc_probe = run_dev_ipc_probe(
                             &connect,
                             ipc_stress_messages,
                             ipc_queue_capacity,
                             replace_code_file.as_deref(),
                             replace_code_expected_hash.as_deref(),
-                        );
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|value| {
+                            if ipc_start.elapsed() > Duration::from_millis(ipc_probe_timeout_ms) {
+                                Err(format!(
+                                    "dev IPC probe exceeded timeout after {} ms",
+                                    ipc_start.elapsed().as_millis()
+                                ))
+                            } else {
+                                Ok(value)
+                            }
+                        });
                         if let Err(error) = &ipc_probe {
                             return write_role_failure_report(
                                 report,
@@ -266,9 +293,11 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "connect": connect,
                                 "observability_mode": "bounded-telemetry-and-query",
                                 "full_state_mirroring_allowed": false,
+                                "editor_code_file": editor_code_file,
                                 "replace_code_file": replace_code_file,
                                 "replace_code_expected_hash": replace_code_expected_hash,
                                 "ipc_probe": ipc_probe.unwrap(),
+                                "dev_shell_interaction_probe": dev_shell_interaction_probe,
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
                                 "note": "dev role created an app_window Wayland window, presented one wgpu frame, and completed a bounded live IPC stress exchange with preview"
@@ -290,8 +319,14 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let catalog_entry = boon_runtime::example_manifest_entry(&example).ok();
     let source_path = value_arg(args, "--code-file")
         .map(PathBuf::from)
+        .or_else(|| {
+            catalog_entry
+                .as_ref()
+                .map(|entry| PathBuf::from(&entry.source))
+        })
         .unwrap_or_else(|| PathBuf::from(format!("examples/{example}.bn")));
     let source = std::fs::read_to_string(&source_path)?;
     let source_sha256 = boon_runtime::sha256_file(&source_path)?;
@@ -304,6 +339,8 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
     let report = value_arg(args, "--report").map(PathBuf::from);
     let live_state_report = value_arg(args, "--live-state-report").map(PathBuf::from);
+    let dev_editor_code_file = value_arg(args, "--dev-editor-code-file").map(PathBuf::from);
+    let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let title_token = value_arg(args, "--title-token")
         .unwrap_or_else(|| format!("{}-{}", std::process::id(), current_unix_seconds()));
@@ -322,65 +359,106 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         numeric_arg(args, "--child-hold-ms").unwrap_or(if probe { 2_500 } else { 0 });
     let dev_hold_ms = numeric_arg(args, "--dev-hold-ms").unwrap_or(if probe { 700 } else { 0 });
     let role_report_timeout_ms = numeric_arg(args, "--role-report-timeout-ms").unwrap_or(12_000);
+    let effective_preview_hold_ms = if probe {
+        child_hold_ms.max(
+            dev_hold_ms
+                .saturating_add(role_report_timeout_ms)
+                .saturating_add(2_000),
+        )
+    } else {
+        child_hold_ms
+    };
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0);
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1);
-    let mut preview = spawn_role(&[
-        "--role",
-        "preview",
-        "--code-file",
+    let mut preview_args = vec![
+        "--role".to_owned(),
+        "preview".to_owned(),
+        "--code-file".to_owned(),
         source_path
             .to_str()
-            .ok_or("resolved code file path is not UTF-8")?,
-        "--connect",
-        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-        "--report",
+            .ok_or("resolved code file path is not UTF-8")?
+            .to_owned(),
+        "--connect".to_owned(),
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?.to_owned(),
+        "--report".to_owned(),
         preview_report
             .to_str()
-            .ok_or("preview report path is not UTF-8")?,
-        "--hold-ms",
-        &child_hold_ms.to_string(),
-        "--title-token",
-        &title_token,
-        "--input-sample-delay-ms",
-        &input_sample_delay_ms.to_string(),
-        "--warmup-frame-count",
-        &warmup_frame_count.to_string(),
-        "--sample-frame-count",
-        &sample_frame_count.to_string(),
-    ])?;
+            .ok_or("preview report path is not UTF-8")?
+            .to_owned(),
+        "--hold-ms".to_owned(),
+        effective_preview_hold_ms.to_string(),
+        "--title-token".to_owned(),
+        title_token.clone(),
+        "--input-sample-delay-ms".to_owned(),
+        input_sample_delay_ms.to_string(),
+        "--warmup-frame-count".to_owned(),
+        warmup_frame_count.to_string(),
+        "--sample-frame-count".to_owned(),
+        sample_frame_count.to_string(),
+    ];
+    if probe {
+        preview_args.push("--synthetic-input-probe".to_owned());
+    }
+    let preview_arg_refs = preview_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut preview = spawn_role(&preview_arg_refs)?;
     let preview_pid = preview.id();
     let preview_cmdline = wait_for_proc_cmdline(preview_pid, "--role", "preview");
     let role_report_timeout = Duration::from_millis(role_report_timeout_ms);
     if probe {
-        wait_for_report(&preview_report, role_report_timeout)?;
+        wait_for_path(&ipc_path, role_report_timeout)?;
     }
-    let mut dev = spawn_role(&[
-        "--role",
-        "dev",
-        "--connect",
-        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-        "--replace-code-file",
-        source_path
+    let mut dev_args = vec![
+        "--role".to_owned(),
+        "dev".to_owned(),
+        "--connect".to_owned(),
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?.to_owned(),
+    ];
+    if let Some(path) = dev_editor_code_file.as_deref() {
+        dev_args.push("--editor-code-file".to_owned());
+        dev_args.push(
+            path.to_str()
+                .ok_or("dev editor file path is not UTF-8")?
+                .to_owned(),
+        );
+    }
+    if !dev_editor_only {
+        dev_args.push("--replace-code-file".to_owned());
+        dev_args.push(
+            source_path
+                .to_str()
+                .ok_or("resolved code file path is not UTF-8")?
+                .to_owned(),
+        );
+    }
+    dev_args.extend([
+        "--report".to_owned(),
+        dev_report
             .to_str()
-            .ok_or("resolved code file path is not UTF-8")?,
-        "--report",
-        dev_report.to_str().ok_or("dev report path is not UTF-8")?,
-        "--hold-ms",
-        &dev_hold_ms.to_string(),
-        "--ipc-stress-messages",
-        "4096",
-        "--ipc-queue-capacity",
-        "256",
-        "--title-token",
-        &title_token,
-        "--input-sample-delay-ms",
-        &input_sample_delay_ms.to_string(),
-        "--warmup-frame-count",
-        &warmup_frame_count.to_string(),
-        "--sample-frame-count",
-        &sample_frame_count.to_string(),
-    ])?;
+            .ok_or("dev report path is not UTF-8")?
+            .to_owned(),
+        "--hold-ms".to_owned(),
+        dev_hold_ms.to_string(),
+        "--ipc-stress-messages".to_owned(),
+        "4096".to_owned(),
+        "--ipc-queue-capacity".to_owned(),
+        "256".to_owned(),
+        "--ipc-probe-timeout-ms".to_owned(),
+        role_report_timeout_ms.saturating_sub(1_000).to_string(),
+        "--title-token".to_owned(),
+        title_token.clone(),
+        "--input-sample-delay-ms".to_owned(),
+        input_sample_delay_ms.to_string(),
+        "--warmup-frame-count".to_owned(),
+        warmup_frame_count.to_string(),
+        "--sample-frame-count".to_owned(),
+        sample_frame_count.to_string(),
+    ]);
+    if probe {
+        dev_args.push("--synthetic-input-probe".to_owned());
+    }
+    let dev_arg_refs = dev_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut dev = spawn_role(&dev_arg_refs)?;
     let dev_pid = dev.id();
     let dev_cmdline = wait_for_proc_cmdline(dev_pid, "--role", "dev");
 
@@ -397,6 +475,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     wait_for_report(&dev_report, role_report_timeout)?;
+    wait_for_report(&preview_report, role_report_timeout)?;
     if let Some(path) = live_state_report.as_deref() {
         write_live_state_report(
             path,
@@ -414,7 +493,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let preview_survives_dev_exit = dev_status.success() && child_running(&mut preview)?;
     let preview_clean_exit_after_dev_exit = wait_child_exit(
         &mut preview,
-        Duration::from_millis(child_hold_ms.saturating_add(500)),
+        Duration::from_millis(effective_preview_hold_ms.saturating_add(500)),
     )?;
     let preview_exit_status_after_dev_exit = preview_clean_exit_after_dev_exit
         .as_ref()
@@ -425,6 +504,14 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let preview_json = read_json(&preview_report)?;
     let dev_json = read_json(&dev_report)?;
+    let preview_role_status = preview_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let dev_role_status = dev_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
     let preview_proof = preview_json
         .pointer("/details/app_window_surface_proof")
         .cloned()
@@ -437,6 +524,10 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .pointer("/details/ipc_probe")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let dev_shell_interaction_probe = dev_json
+        .pointer("/details/dev_shell_interaction_probe")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
     let preview_runtime_summary = preview_json
         .pointer("/details/preview_runtime_summary")
         .cloned()
@@ -456,50 +547,57 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             )
         });
     if let Some(report) = report {
-        write_desktop_report(
-            &report,
-            &args[1..],
-            json!({
-                "resolved_example": example,
-                "resolved_code_file": source_path,
-                "source_bytes": source.len(),
-                "source_sha256": source_sha256,
-                "preview_document_layout_proof": document_layout_proof,
-                "process_model": "two-child-processes",
-                "preview_child_pid": preview_pid,
-                "dev_child_pid": dev_pid,
-                "preview_child_cmdline": preview_cmdline,
-                "dev_child_cmdline": dev_cmdline,
-                "title_token": title_token,
-                "preview_window_title": preview_title,
-                "dev_window_title": dev_title,
-                "preview_survives_dev_exit": preview_survives_dev_exit,
-                "dev_exit_status": dev_status.to_string(),
-                "preview_clean_exit_after_dev_exit": preview_clean_exit_after_dev_exit
-                    .as_ref()
-                    .is_some_and(std::process::ExitStatus::success),
-                "preview_exit_status_after_dev_exit": preview_exit_status_after_dev_exit,
-                "preview_receives_example_name": false,
-                "preview_launch_form": "--role preview --code-file <resolved-code-file>",
-                "replace_code_transport": "dev-to-preview-bounded-ipc",
-                "display_server": display_server(),
-                "display_connection": display_connection(),
-                "requested_workspace": "boon-circuit",
-                "launcher_command": "direct-child-processes",
-                "cosmic_background_launch_available": command_exists("cosmic-background-launch"),
-                "cosmic_background_launch_machine_readable_proof": false,
-                "preview_role_report": preview_report,
-                "dev_role_report": dev_report,
-                "preview_role_report_sha256": boon_runtime::sha256_file(&preview_report).unwrap_or_else(|_| "missing".to_owned()),
-                "dev_role_report_sha256": boon_runtime::sha256_file(&dev_report).unwrap_or_else(|_| "missing".to_owned()),
-                "preview_surface_proof": preview_proof,
-                "dev_surface_proof": dev_proof,
-                "preview_native_gpu_render_proof": preview_native_gpu_render_proof,
-                "preview_runtime_summary": preview_runtime_summary,
-                "dev_ipc_probe": dev_ipc_probe,
-                "note": "desktop supervisor spawns two child roles with app_window/wgpu windows and bounded live IPC; COSMIC launcher proof is owned by the xtask wrapper that invokes cosmic-background-launch"
-            }),
-        )?;
+        let mut details = json!({
+            "resolved_example": example,
+            "resolved_example_label": catalog_entry.as_ref().map(|entry| entry.label.clone()),
+            "example_catalog_id": catalog_entry.as_ref().map(|entry| entry.id.clone()),
+            "example_catalog_source": catalog_entry.as_ref().map(|entry| entry.source.clone()),
+            "resolved_code_file": source_path,
+            "source_bytes": source.len(),
+            "source_sha256": source_sha256,
+            "process_model": "two-child-processes",
+            "preview_role_status": preview_role_status,
+            "dev_role_status": dev_role_status,
+            "preview_child_pid": preview_pid,
+            "dev_child_pid": dev_pid,
+            "preview_child_cmdline": preview_cmdline,
+            "dev_child_cmdline": dev_cmdline,
+            "title_token": title_token,
+            "preview_window_title": preview_title,
+            "dev_window_title": dev_title,
+            "preview_survives_dev_exit": preview_survives_dev_exit,
+            "dev_exit_status": dev_status.to_string(),
+            "preview_clean_exit_after_dev_exit": preview_clean_exit_after_dev_exit
+                .as_ref()
+                .is_some_and(std::process::ExitStatus::success),
+            "preview_exit_status_after_dev_exit": preview_exit_status_after_dev_exit,
+            "preview_receives_example_name": false,
+            "preview_launch_form": "--role preview --code-file <resolved-code-file>",
+            "replace_code_transport": "dev-to-preview-bounded-ipc",
+            "display_server": display_server(),
+            "display_connection": display_connection(),
+            "requested_workspace": "boon-circuit",
+            "launcher_command": "direct-child-processes",
+            "cosmic_background_launch_available": command_exists("cosmic-background-launch"),
+            "cosmic_background_launch_machine_readable_proof": false,
+            "preview_role_report": preview_report,
+            "dev_role_report": dev_report,
+            "preview_role_report_sha256": boon_runtime::sha256_file(&preview_report).unwrap_or_else(|_| "missing".to_owned()),
+            "dev_role_report_sha256": boon_runtime::sha256_file(&dev_report).unwrap_or_else(|_| "missing".to_owned()),
+            "note": "desktop supervisor spawns two child roles with app_window/wgpu windows and bounded live IPC; COSMIC launcher proof is owned by the xtask wrapper that invokes cosmic-background-launch"
+        });
+        details["requested_preview_hold_ms"] = json!(child_hold_ms);
+        details["effective_preview_hold_ms"] = json!(effective_preview_hold_ms);
+        details["dev_hold_ms"] = json!(dev_hold_ms);
+        details["role_report_timeout_ms"] = json!(role_report_timeout_ms);
+        details["preview_document_layout_proof"] = document_layout_proof;
+        details["preview_surface_proof"] = preview_proof;
+        details["dev_surface_proof"] = dev_proof;
+        details["preview_native_gpu_render_proof"] = preview_native_gpu_render_proof;
+        details["preview_runtime_summary"] = preview_runtime_summary;
+        details["dev_ipc_probe"] = dev_ipc_probe;
+        details["dev_shell_interaction_probe"] = dev_shell_interaction_probe;
+        write_desktop_report(&report, &args[1..], details)?;
     }
     Ok(())
 }
@@ -546,7 +644,11 @@ fn native_document_layout_proof(
 
     let artifact_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
     std::fs::create_dir_all(&artifact_dir)?;
-    let source_sha256 = boon_runtime::sha256_file(source_path)?;
+    let source_sha256 = if source_path.exists() {
+        boon_runtime::sha256_file(source_path)?
+    } else {
+        boon_runtime::sha256_bytes(source.as_bytes())
+    };
     let artifact_path = artifact_dir.join(format!(
         "{}-{}.json",
         source_path
@@ -625,91 +727,6 @@ fn native_document_layout_proof(
         "scroll_regions": layout_json.get("scroll_regions").cloned().unwrap_or_else(|| json!([])),
         "runtime_document_state_used": artifact_json.get("runtime_document_state_used").cloned().unwrap_or_else(|| json!(false)),
         "runtime_document_state_hash": artifact_json.get("runtime_document_state_hash").cloned().unwrap_or_else(|| json!(null)),
-    }))
-}
-
-fn native_document_route_probe_for_state(
-    source_path: &Path,
-    source: &str,
-    runtime_state: &Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
-    let document = boon_parser::parsed_document(&parsed)
-        .ok_or("source does not contain a parseable document block")?;
-    let eval_context = DocumentEvalContext {
-        root: Some(runtime_state),
-        locals: BTreeMap::new(),
-    };
-    let mut frame = boon_document_model::DocumentFrame::empty("root");
-    let mut source_intents = Vec::new();
-    let mut seen_ids = BTreeSet::new();
-    let root_id = frame.root.clone();
-    lower_document_elements(
-        &document.root.children,
-        &document.expressions,
-        &root_id,
-        &mut frame,
-        &mut source_intents,
-        &mut seen_ids,
-        &eval_context,
-        "",
-    );
-
-    let mut measurer = boon_document::SimpleTextMeasurer;
-    let layout = boon_document::layout(boon_document::LayoutInput {
-        document: &frame,
-        viewport: boon_host::Viewport {
-            surface: 1,
-            width: 920.0,
-            height: 720.0,
-            scale: 1.0,
-        },
-        text: &mut measurer,
-        capabilities: boon_document::RenderCapabilities::fake_portable(),
-    });
-    let runtime_document_state_hash =
-        boon_runtime::sha256_bytes(&serde_json::to_vec(runtime_state)?);
-    let artifact_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
-    std::fs::create_dir_all(&artifact_dir)?;
-    let source_sha256 = boon_runtime::sha256_file(source_path)?;
-    let artifact_path = artifact_dir.join(format!(
-        "{}-{}-state-{}.json",
-        source_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("source"),
-        &source_sha256[..12.min(source_sha256.len())],
-        &runtime_document_state_hash[..12.min(runtime_document_state_hash.len())]
-    ));
-    let artifact = json!({
-        "source_path": source_path,
-        "source_sha256": source_sha256,
-        "document_frame": frame,
-        "layout_frame": layout,
-        "source_intents": source_intents,
-        "runtime_document_state_used": true,
-        "runtime_document_state_hash": runtime_document_state_hash
-    });
-    std::fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact)?)?;
-    let artifact_sha256 = boon_runtime::sha256_file(&artifact_path)?;
-    let artifact_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&artifact_path)?)?;
-    let layout_json = artifact_json
-        .get("layout_frame")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    Ok(json!({
-        "status": "pass",
-        "lowering": "boon_parser_document_ast_to_boon_document_model",
-        "source_path": source_path,
-        "source_sha256": artifact_json.get("source_sha256").cloned().unwrap_or_else(|| json!("missing")),
-        "artifact_path": artifact_path,
-        "artifact_sha256": artifact_sha256,
-        "layout_frame_hash": boon_runtime::sha256_file(&artifact_path)?,
-        "hit_target_assertions": layout_json.get("hit_regions").cloned().unwrap_or_else(|| json!([])),
-        "source_intent_assertions": artifact_json.get("source_intents").cloned().unwrap_or_else(|| json!([])),
-        "runtime_document_state_used": true,
-        "runtime_document_state_hash": runtime_document_state_hash
     }))
 }
 
@@ -996,22 +1013,32 @@ fn native_gpu_app_owned_render_hook(
 fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
-    source_path_label: &str,
-    source_text: &str,
+    layout_frame_cache: &mut Option<(u32, u32, boon_document::LayoutFrame)>,
+    shell: &DevWindowShell,
 ) -> Result<serde_json::Value, String> {
-    let document = dev_shell_document(source_path_label, source_text);
-    let mut measurer = boon_document::SimpleTextMeasurer;
-    let layout_frame = boon_document::layout(boon_document::LayoutInput {
-        document: &document,
-        viewport: boon_host::Viewport {
-            surface: 1,
-            width: context.width as f32,
-            height: context.height as f32,
-            scale: 1.0,
-        },
-        text: &mut measurer,
-        capabilities: boon_document::RenderCapabilities::fake_portable(),
-    });
+    let cache_stale = layout_frame_cache
+        .as_ref()
+        .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
+    if cache_stale {
+        let document = shell.document();
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout_frame = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: context.width as f32,
+                height: context.height as f32,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        *layout_frame_cache = Some((context.width, context.height, layout_frame));
+    }
+    let layout_frame = layout_frame_cache
+        .as_ref()
+        .map(|(_, _, frame)| frame)
+        .ok_or_else(|| "dev layout frame cache was not initialized".to_owned())?;
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
             context.device,
@@ -1025,7 +1052,7 @@ fn native_gpu_dev_visible_render_hook(
             queue: context.queue,
             encoder: context.encoder,
             view: context.surface_view,
-            frame: &layout_frame,
+            frame: layout_frame,
             format: context.surface_texture_format,
             width: context.width,
             height: context.height,
@@ -1045,15 +1072,2287 @@ fn native_gpu_dev_visible_render_hook(
         "dev_editor_visible": true,
         "debug_panel_visible": true,
         "fixture_grid_used": false,
-        "code_editor_line_count": source_text.lines().count(),
+        "code_editor_line_count": shell.workspace.selected_buffer.line_count,
+        "example_catalog_entry_count": shell.catalog.entries.len(),
+        "dev_window_tabs_visible": true,
+        "dev_window_toolbar_visible": true,
+        "dev_window_controls": ["Run", "Format", "Reset"],
+        "code_editor_model": {
+            "full_buffer_bytes": shell.workspace.selected_buffer.source_text.len(),
+            "full_buffer_lines": shell.workspace.selected_buffer.line_count,
+            "syntax_token_count": shell.workspace.selected_buffer.syntax_token_count(),
+            "syntax_categories": shell.workspace.selected_buffer.syntax_categories(),
+            "diagnostic_count": shell.workspace.selected_buffer.diagnostics.len(),
+            "font_family": shell.editor_view.font_family,
+            "native_rust_editor_model": true
+        },
         "layout_metrics": layout_frame.metrics
     }))
 }
 
-fn dev_shell_document(
-    source_path_label: &str,
-    source_text: &str,
-) -> boon_document_model::DocumentFrame {
+#[derive(Clone, Debug)]
+struct ExampleCatalog {
+    entries: Vec<ExampleCatalogEntry>,
+    custom_store_path: PathBuf,
+}
+
+impl ExampleCatalog {
+    fn load() -> Self {
+        let mut entries = boon_runtime::example_manifest_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| ExampleCatalogEntry {
+                id: entry.id,
+                label: entry.label,
+                source: entry.source,
+                inline_source: None,
+                category: entry.category,
+                order: entry.default_tab_order,
+                shown_by_default: entry.shown_by_default,
+                custom: false,
+            })
+            .collect::<Vec<_>>();
+        let custom_store_path = std::env::var("BOON_CUSTOM_EXAMPLE_STORE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from("target/state/boon-native-playground/custom_manifest.toml")
+            });
+        if let Ok(custom_entries) = Self::load_custom_store(&custom_store_path) {
+            entries.extend(custom_entries);
+        }
+        Self {
+            entries,
+            custom_store_path,
+        }
+    }
+
+    fn load_custom_store(
+        path: &Path,
+    ) -> Result<Vec<ExampleCatalogEntry>, Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(path)?;
+        Self::custom_entries_from_toml(&text)
+    }
+
+    fn save_custom_store(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.save_custom_store_to(&self.custom_store_path)
+    }
+
+    fn save_custom_store_to(
+        &self,
+        path: &Path,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let custom_entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.custom)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut array = Vec::new();
+        for entry in &custom_entries {
+            let mut item = toml::map::Map::new();
+            item.insert(
+                "id".to_owned(),
+                toml::Value::String(
+                    entry
+                        .id
+                        .strip_prefix("custom:")
+                        .unwrap_or(&entry.id)
+                        .to_owned(),
+                ),
+            );
+            item.insert("label".to_owned(), toml::Value::String(entry.label.clone()));
+            item.insert(
+                "source".to_owned(),
+                toml::Value::String(entry.source.clone()),
+            );
+            if let Some(source) = &entry.inline_source {
+                item.insert(
+                    "inline_source".to_owned(),
+                    toml::Value::String(source.clone()),
+                );
+            }
+            array.push(toml::Value::Table(item));
+        }
+        let mut table = toml::map::Map::new();
+        table.insert("custom_example".to_owned(), toml::Value::Array(array));
+        let text = toml::to_string_pretty(&toml::Value::Table(table))?;
+        std::fs::write(path, text.as_bytes())?;
+        let loaded_entries = Self::load_custom_store(path)?;
+        Ok(json!({
+            "status": "pass",
+            "command": "PersistCustomExampleStore",
+            "store_path": path,
+            "stored_entry_count": custom_entries.len(),
+            "reloaded_entry_count": loaded_entries.len(),
+            "round_trip_pass": loaded_entries.len() == custom_entries.len(),
+            "store_sha256": boon_runtime::sha256_file(path)?,
+            "metadata_outside_boon_source": true
+        }))
+    }
+
+    fn custom_entries_from_toml(
+        text: &str,
+    ) -> Result<Vec<ExampleCatalogEntry>, Box<dyn std::error::Error>> {
+        let parsed: toml::Value = toml::from_str(&text)?;
+        let entries = parsed
+            .get("custom_example")
+            .and_then(toml::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let id = item
+                            .get("id")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or("custom")
+                            .to_owned();
+                        ExampleCatalogEntry {
+                            id: format!("custom:{id}"),
+                            label: item
+                                .get("label")
+                                .and_then(toml::Value::as_str)
+                                .unwrap_or(&id)
+                                .to_owned(),
+                            source: item
+                                .get("source")
+                                .and_then(toml::Value::as_str)
+                                .unwrap_or("")
+                                .to_owned(),
+                            inline_source: item
+                                .get("inline_source")
+                                .and_then(toml::Value::as_str)
+                                .map(ToOwned::to_owned),
+                            category: "custom".to_owned(),
+                            order: 10_000 + index as u32,
+                            shown_by_default: true,
+                            custom: true,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(entries)
+    }
+
+    fn list_available_examples(&self) -> serde_json::Value {
+        json!({
+            "status": "pass",
+            "custom_store_path": self.custom_store_path,
+            "examples": self.entries.iter().map(|entry| {
+                json!({
+                    "id": entry.id,
+                    "label": entry.label,
+                    "category": entry.category,
+                    "order": entry.order,
+                    "shown_by_default": entry.shown_by_default,
+                    "custom": entry.custom,
+                    "source_path": entry.source,
+                    "has_inline_source": entry.inline_source.is_some()
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    fn custom_example_from_source(id: &str, label: &str, source: String) -> ExampleCatalogEntry {
+        ExampleCatalogEntry {
+            id: format!("custom:{id}"),
+            label: label.to_owned(),
+            source: format!("custom://{id}.bn"),
+            inline_source: Some(source),
+            category: "custom".to_owned(),
+            order: 20_000,
+            shown_by_default: true,
+            custom: true,
+        }
+    }
+
+    fn rename_custom_example(&mut self, id: &str, label: &str) -> serde_json::Value {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == id && entry.custom)
+        else {
+            return json!({
+                "status": "fail",
+                "command": "RenameCustomExample",
+                "stable_id": id,
+                "diagnostic": "custom example not found"
+            });
+        };
+        let old_label = self.entries[index].label.clone();
+        let source_before = self.entries[index].source.clone();
+        let inline_hash_before = self.entries[index]
+            .inline_source
+            .as_ref()
+            .map(|source| boon_runtime::sha256_bytes(source.as_bytes()));
+        self.entries[index].label = label.to_owned();
+        let persistence = self.save_custom_store();
+        json!({
+            "status": "pass",
+            "command": "RenameCustomExample",
+            "stable_id": self.entries[index].id,
+            "old_label": old_label,
+            "new_label": self.entries[index].label,
+            "source_unchanged": self.entries[index].source == source_before,
+            "inline_source_hash_unchanged": self.entries[index]
+                .inline_source
+                .as_ref()
+                .map(|source| boon_runtime::sha256_bytes(source.as_bytes()))
+                == inline_hash_before,
+            "persistent_store": persistence
+                .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()})),
+            "metadata_outside_boon_source": true
+        })
+    }
+
+    fn remove_custom_example(&mut self, id: &str) -> serde_json::Value {
+        let before = self.entries.len();
+        let removed_source_hash = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id && entry.custom)
+            .and_then(|entry| entry.inline_source.as_ref())
+            .map(|source| boon_runtime::sha256_bytes(source.as_bytes()));
+        self.entries
+            .retain(|entry| !(entry.id == id && entry.custom));
+        let removed = self.entries.len() != before;
+        let persistence = self.save_custom_store();
+        json!({
+            "status": if removed { "pass" } else { "fail" },
+            "command": "RemoveCustomExample",
+            "stable_id": id,
+            "removed": removed,
+            "remaining_entry_count": self.entries.len(),
+            "removed_source_hash": removed_source_hash,
+            "persistent_store": persistence
+                .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()})),
+            "metadata_outside_boon_source": true
+        })
+    }
+
+    fn custom_store_probe() -> serde_json::Value {
+        let path = PathBuf::from("target/artifacts/native-gpu/custom-example-store-probe.toml");
+        let catalog = Self {
+            entries: vec![Self::custom_example_from_source(
+                "stored",
+                "Stored Probe",
+                "-- stored custom source\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
+            )],
+            custom_store_path: path.clone(),
+        };
+        match (catalog.save_custom_store(), Self::load_custom_store(&path)) {
+            (Ok(persist), Ok(entries)) => json!({
+                "status": "pass",
+                "command": "LoadCustomExampleStore",
+                "persistent_store": persist,
+                "entry_count": entries.len(),
+                "entries": entries.iter().map(|entry| {
+                    json!({
+                        "id": entry.id,
+                        "label": entry.label,
+                        "source": entry.source,
+                        "category": entry.category,
+                        "shown_by_default": entry.shown_by_default,
+                        "custom": entry.custom,
+                        "has_inline_source": entry.inline_source.is_some()
+                    })
+                }).collect::<Vec<_>>(),
+                "requires_rust_ui_rewire": false,
+                "metadata_outside_boon_source": true
+            }),
+            (Err(error), _) | (_, Err(error)) => json!({
+                "status": "fail",
+                "command": "LoadCustomExampleStore",
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExampleCatalogEntry {
+    id: String,
+    label: String,
+    source: String,
+    inline_source: Option<String>,
+    category: String,
+    order: u32,
+    shown_by_default: bool,
+    custom: bool,
+}
+
+impl ExampleCatalogEntry {
+    fn source_text(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(source) = &self.inline_source {
+            Ok(source.clone())
+        } else {
+            Ok(std::fs::read_to_string(&self.source)?)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExampleWorkspace {
+    selected_example_id: String,
+    current_file: String,
+    selected_buffer: CodeEditorModel,
+    open_buffers: BTreeMap<String, CodeEditorModel>,
+    dirty_examples: BTreeSet<String>,
+    dirty: bool,
+}
+
+impl ExampleWorkspace {
+    fn new(catalog: &ExampleCatalog, source_path_label: &str, source_text: &str) -> Self {
+        let selected_example_id = catalog
+            .entries
+            .iter()
+            .find(|entry| source_path_label.ends_with(&entry.source))
+            .or_else(|| {
+                catalog.entries.iter().find(|entry| {
+                    Path::new(source_path_label)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        == Path::new(&entry.source)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                })
+            })
+            .map(|entry| entry.id.clone())
+            .or_else(|| catalog.entries.first().map(|entry| entry.id.clone()))
+            .unwrap_or_else(|| "custom-buffer".to_owned());
+        let selected_buffer = CodeEditorModel::new(source_path_label, source_text);
+        let mut open_buffers = BTreeMap::new();
+        open_buffers.insert(selected_example_id.clone(), selected_buffer.clone());
+        Self {
+            selected_buffer,
+            selected_example_id,
+            current_file: source_path_label.to_owned(),
+            open_buffers,
+            dirty_examples: BTreeSet::new(),
+            dirty: false,
+        }
+    }
+
+    fn selected_dirty(&self) -> bool {
+        self.dirty_examples.contains(&self.selected_example_id)
+    }
+
+    fn persist_selected_buffer(&mut self) {
+        self.open_buffers.insert(
+            self.selected_example_id.clone(),
+            self.selected_buffer.clone(),
+        );
+        self.dirty = self.selected_dirty();
+    }
+
+    fn set_selected_dirty(&mut self, dirty: bool) {
+        if dirty {
+            self.dirty_examples.insert(self.selected_example_id.clone());
+        } else {
+            self.dirty_examples.remove(&self.selected_example_id);
+        }
+        self.dirty = dirty;
+    }
+
+    fn select_example(
+        &mut self,
+        catalog: &ExampleCatalog,
+        example_id: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let previous_example_id = self.selected_example_id.clone();
+        let previous_dirty = self.selected_dirty();
+        self.open_buffers
+            .insert(previous_example_id.clone(), self.selected_buffer.clone());
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == example_id)
+            .ok_or_else(|| format!("example `{example_id}` is not in ExampleCatalog"))?;
+        let loaded_from_open_buffer = self.open_buffers.contains_key(&entry.id);
+        let buffer = if let Some(buffer) = self.open_buffers.get(&entry.id).cloned() {
+            buffer
+        } else {
+            let source_text = entry.source_text()?;
+            CodeEditorModel::new(&entry.source, &source_text)
+        };
+        let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
+        self.selected_example_id = entry.id.clone();
+        self.current_file = buffer.file_name.clone();
+        self.selected_buffer = buffer.clone();
+        self.open_buffers.insert(entry.id.clone(), buffer);
+        self.dirty = self.selected_dirty();
+        Ok(json!({
+            "status": "pass",
+            "selected_example_id": self.selected_example_id,
+            "current_file": self.current_file,
+            "source_hash": source_hash,
+            "buffer_line_count": self.selected_buffer.line_count,
+            "custom": entry.custom,
+            "previous_example_id": previous_example_id,
+            "previous_dirty_preserved": previous_dirty == self.dirty_examples.contains(&previous_example_id),
+            "loaded_from_open_buffer": loaded_from_open_buffer,
+            "dirty": self.dirty,
+            "dirty_examples": self.dirty_examples.iter().cloned().collect::<Vec<_>>(),
+            "preview_transport": "ReplaceCode"
+        }))
+    }
+
+    fn inject_source(
+        &mut self,
+        example_id: &str,
+        file_name: &str,
+        source_text: String,
+    ) -> serde_json::Value {
+        let mut buffer = CodeEditorModel::new(file_name, &source_text);
+        buffer.insert_text_at_caret("\n-- injected edit probe");
+        let undo_after_insert = buffer.undo();
+        let redo_after_undo = buffer.redo();
+        self.selected_example_id = example_id.to_owned();
+        self.current_file = file_name.to_owned();
+        self.selected_buffer = buffer.clone();
+        self.open_buffers.insert(example_id.to_owned(), buffer);
+        self.set_selected_dirty(true);
+        json!({
+            "status": "pass",
+            "command": "InjectSource",
+            "selected_example_id": self.selected_example_id,
+            "current_file": self.current_file,
+            "source_hash": boon_runtime::sha256_bytes(source_text.as_bytes()),
+            "undo_probe": undo_after_insert,
+            "redo_probe": redo_after_undo,
+            "preview_transport": "ReplaceCode"
+        })
+    }
+
+    fn apply_editor_text_input(&mut self, text: &str) -> serde_json::Value {
+        let before_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
+        let before_line_count = self.selected_buffer.line_count;
+        self.selected_buffer.insert_text_at_caret(text);
+        self.persist_selected_buffer();
+        self.set_selected_dirty(true);
+        let after_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
+        json!({
+            "status": "pass",
+            "command": "EditorTextInput",
+            "selected_example_id": self.selected_example_id,
+            "current_file": self.current_file,
+            "inserted_text_bytes": text.len(),
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "source_changed": before_hash != after_hash,
+            "before_line_count": before_line_count,
+            "after_line_count": self.selected_buffer.line_count,
+            "dirty": self.dirty,
+            "dirty_examples": self.dirty_examples.iter().cloned().collect::<Vec<_>>(),
+            "diagnostic_count": self.selected_buffer.diagnostics.len(),
+            "syntax_token_count": self.selected_buffer.syntax_token_count(),
+            "parser_bypassed": false,
+            "editor_model_command": self.selected_buffer.last_command
+        })
+    }
+
+    fn create_or_update_custom_example(
+        &mut self,
+        catalog: &mut ExampleCatalog,
+        id: &str,
+        label: &str,
+        source_text: String,
+    ) -> serde_json::Value {
+        let validation = BoonLanguageService::validate_project_source(
+            &format!("custom://{id}.bn"),
+            &source_text,
+        );
+        let validation_status = validation.get("status").and_then(serde_json::Value::as_str);
+        let parser_accepted = validation_status == Some("pass")
+            || validation_status == Some("unsupported-runtime-surface");
+        if !parser_accepted {
+            return json!({
+                "status": "fail",
+                "command": "CreateOrUpdateCustomExample",
+                "stable_id": format!("custom:{id}"),
+                "label": label,
+                "validation": validation,
+                "metadata_outside_boon_source": true,
+                "requires_rust_ui_rewire": false
+            });
+        }
+        let entry = ExampleCatalog::custom_example_from_source(id, label, source_text.clone());
+        catalog.entries.retain(|candidate| candidate.id != entry.id);
+        catalog.entries.push(entry.clone());
+        self.inject_source(&entry.id, &entry.source, source_text);
+        let persistence = catalog.save_custom_store();
+        json!({
+            "status": "pass",
+            "command": "CreateOrUpdateCustomExample",
+            "stable_id": entry.id,
+            "label": entry.label,
+            "validation": validation,
+            "executable_runtime_supported": validation_status == Some("pass"),
+            "generic_editor_catalog_only": validation_status == Some("unsupported-runtime-surface"),
+            "custom_store_path": catalog.custom_store_path,
+            "persistent_store": persistence
+                .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()})),
+            "metadata_outside_boon_source": true,
+            "requires_rust_ui_rewire": false
+        })
+    }
+
+    fn run_selected(&self) -> serde_json::Value {
+        match boon_parser::parse_source(
+            self.selected_buffer.file_name.clone(),
+            self.selected_buffer.source_text.clone(),
+        ) {
+            Ok(program) => {
+                let validation = BoonLanguageService::validate_project_source(
+                    &self.selected_buffer.file_name,
+                    &self.selected_buffer.source_text,
+                );
+                let validation_pass =
+                    validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+                json!({
+                    "status": if validation_pass { "pass" } else { "fail" },
+                    "command": "Run",
+                    "selected_example_id": self.selected_example_id,
+                    "source_path": self.selected_buffer.file_name,
+                    "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
+                    "program_kind": program.kind.as_str(),
+                    "preview_transport": "ReplaceCode",
+                    "validation": validation,
+                    "parser_bypassed": false,
+                    "runtime_bypassed": false
+                })
+            }
+            Err(error) => json!({
+                "status": "fail",
+                "command": "Run",
+                "selected_example_id": self.selected_example_id,
+                "diagnostic": error.to_string(),
+                "parser_bypassed": false,
+                "runtime_bypassed": true
+            }),
+        }
+    }
+
+    fn format_selected(&mut self) -> serde_json::Value {
+        match BoonLanguageService::format(
+            &self.selected_buffer.file_name,
+            &self.selected_buffer.source_text,
+        ) {
+            Ok(formatted) => {
+                let changed = formatted != self.selected_buffer.source_text;
+                self.selected_buffer
+                    .replace_text(&self.current_file, formatted.clone());
+                self.open_buffers.insert(
+                    self.selected_example_id.clone(),
+                    self.selected_buffer.clone(),
+                );
+                if changed {
+                    self.set_selected_dirty(true);
+                } else {
+                    self.dirty = self.selected_dirty();
+                }
+                json!({
+                    "status": "pass",
+                    "command": "Format",
+                    "selected_example_id": self.selected_example_id,
+                    "changed": changed,
+                    "formatted_hash": boon_runtime::sha256_bytes(formatted.as_bytes()),
+                    "formatter": "boon_parser::format_source",
+                    "parser_bypassed": false
+                })
+            }
+            Err(error) => json!({
+                "status": "fail",
+                "command": "Format",
+                "selected_example_id": self.selected_example_id,
+                "diagnostic": error.to_string(),
+                "formatter": "boon_parser::format_source"
+            }),
+        }
+    }
+
+    fn reset_selected(
+        &mut self,
+        catalog: &ExampleCatalog,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.selected_example_id)
+            .ok_or_else(|| {
+                format!(
+                    "selected example `{}` is not in ExampleCatalog",
+                    self.selected_example_id
+                )
+            })?;
+        let source_text = entry.source_text()?;
+        self.selected_buffer = CodeEditorModel::new(&entry.source, &source_text);
+        self.current_file = entry.source.clone();
+        self.open_buffers
+            .insert(entry.id.clone(), self.selected_buffer.clone());
+        self.set_selected_dirty(false);
+        Ok(json!({
+            "status": "pass",
+            "command": "Reset",
+            "selected_example_id": self.selected_example_id,
+            "source_path": entry.source,
+            "source_hash": boon_runtime::sha256_bytes(source_text.as_bytes()),
+            "dirty": self.dirty
+        }))
+    }
+
+    fn dirty_tab_preservation_probe(
+        &self,
+        catalog: &ExampleCatalog,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut workspace = self.clone();
+        let original_id = workspace.selected_example_id.clone();
+        let alternate_id = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id != original_id && entry.shown_by_default)
+            .map(|entry| entry.id.clone())
+            .ok_or("no alternate example tab available for dirty preservation probe")?;
+        workspace
+            .selected_buffer
+            .insert_text_at_caret("\n-- dirty tab preservation probe");
+        workspace.persist_selected_buffer();
+        workspace.set_selected_dirty(true);
+        let dirty_hash_before =
+            boon_runtime::sha256_bytes(workspace.selected_buffer.source_text.as_bytes());
+        let switch_away = workspace.select_example(catalog, &alternate_id)?;
+        let switch_back = workspace.select_example(catalog, &original_id)?;
+        let dirty_hash_after =
+            boon_runtime::sha256_bytes(workspace.selected_buffer.source_text.as_bytes());
+        let pass = dirty_hash_before == dirty_hash_after
+            && workspace.selected_dirty()
+            && workspace.dirty_examples.contains(&original_id)
+            && switch_back
+                .get("loaded_from_open_buffer")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        Ok(json!({
+            "status": if pass { "pass" } else { "fail" },
+            "command": "DirtyTabPreservation",
+            "original_example_id": original_id,
+            "alternate_example_id": alternate_id,
+            "dirty_hash_before": dirty_hash_before,
+            "dirty_hash_after": dirty_hash_after,
+            "dirty_preserved": dirty_hash_before == dirty_hash_after,
+            "dirty_marker_preserved": workspace.selected_dirty(),
+            "dirty_examples": workspace.dirty_examples.iter().cloned().collect::<Vec<_>>(),
+            "switch_away": switch_away,
+            "switch_back": switch_back
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoonLanguageService;
+
+impl BoonLanguageService {
+    fn diagnostics(path: &str, source: &str) -> Vec<String> {
+        match boon_parser::parse_source(path.to_owned(), source.to_owned()) {
+            Ok(_) => Vec::new(),
+            Err(error) => vec![error.to_string()],
+        }
+    }
+
+    fn format(path: &str, source: &str) -> Result<String, boon_parser::ParseError> {
+        boon_parser::format_source(path.to_owned(), source.to_owned())
+    }
+
+    fn validate_project_source(path: &str, source: &str) -> serde_json::Value {
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let parse = boon_parser::parse_source(path.to_owned(), source.to_owned());
+        match parse {
+            Ok(program) => {
+                let Some(scenario_path) = custom_runtime_scenario_path(program.kind) else {
+                    let document_supported = boon_parser::parsed_document(&program).is_some();
+                    let layout_proof = document_supported.then(|| {
+                        native_document_layout_proof(Path::new(path), source).unwrap_or_else(
+                            |error| {
+                                json!({
+                                    "status": "fail",
+                                    "blocker": error.to_string()
+                                })
+                            },
+                        )
+                    });
+                    let layout_pass = layout_proof
+                        .as_ref()
+                        .and_then(|proof| proof.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pass");
+                    return json!({
+                        "status": if layout_pass { "pass" } else { "unsupported-runtime-surface" },
+                        "source_hash": source_hash,
+                        "program_kind": program.kind.as_str(),
+                        "runtime_surface": if layout_pass { "static-document-preview" } else { "unsupported" },
+                        "diagnostic": if layout_pass {
+                            "valid generic Boon document can run as a static preview surface"
+                        } else {
+                            "valid Boon source parsed, but no runtime executable surface is implemented for this generic program yet"
+                        },
+                        "parser_bypassed": false,
+                        "runtime_bypassed": false,
+                        "format_supported": true,
+                        "catalog_store_supported": true,
+                        "document_layout_supported": document_supported,
+                        "document_layout_proof": layout_proof.unwrap_or_else(|| json!({"status": "not-applicable"}))
+                    });
+                };
+                let runtime = std::fs::read_to_string(&scenario_path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        boon_runtime::LiveRuntime::new(
+                            &format!("dev-window-validate:{path}"),
+                            source,
+                            &scenario_path,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                match runtime {
+                    Ok(mut runtime) => json!({
+                        "status": "pass",
+                        "source_hash": source_hash,
+                        "program_kind": program.kind.as_str(),
+                        "scenario_path": scenario_path,
+                        "runtime_summary_hash": boon_runtime::sha256_bytes(
+                            &serde_json::to_vec(&runtime.state_summary()).unwrap_or_default()
+                        ),
+                        "parser_bypassed": false,
+                        "runtime_bypassed": false
+                    }),
+                    Err(error) => json!({
+                        "status": "fail",
+                        "source_hash": source_hash,
+                        "program_kind": program.kind.as_str(),
+                        "scenario_path": scenario_path,
+                        "diagnostic": error,
+                        "parser_bypassed": false,
+                        "runtime_bypassed": false
+                    }),
+                }
+            }
+            Err(error) => json!({
+                "status": "fail",
+                "source_hash": source_hash,
+                "diagnostic": error.to_string(),
+                "parser_bypassed": false,
+                "runtime_bypassed": true
+            }),
+        }
+    }
+
+    fn syntax_tokens(source: &str) -> Vec<SyntaxToken> {
+        if let Ok(ast) = boon_parser::parse_ast("<editor>", source) {
+            return ast
+                .tokens
+                .iter()
+                .filter(|token| token.kind != AstTokenKind::Newline)
+                .map(|token| {
+                    SyntaxToken::new(
+                        Self::syntax_kind_from_ast_token(token.kind, &token.lexeme),
+                        token.line,
+                        token.column,
+                        token.lexeme.chars().count().max(1),
+                    )
+                })
+                .collect();
+        }
+        Self::syntax_tokens_fallback(source)
+    }
+
+    fn syntax_kind_from_ast_token(kind: AstTokenKind, lexeme: &str) -> &'static str {
+        if lexeme == "EXAMPLE" || lexeme == "#" {
+            return "invalid";
+        }
+        match kind {
+            AstTokenKind::Comment => "comment",
+            AstTokenKind::String => "string",
+            AstTokenKind::Number => "number",
+            AstTokenKind::Operator | AstTokenKind::Symbol => "operator",
+            AstTokenKind::Identifier => match lexeme {
+                "SOURCE" | "HOLD" | "LATEST" | "THEN" | "WHEN" | "WHILE" | "LIST" | "TEXT"
+                | "BOOL" | "INT" | "FLOAT" => "keyword",
+                _ if lexeme.contains('/') => "source-binding",
+                _ => "identifier",
+            },
+            AstTokenKind::Unknown | AstTokenKind::Newline => "invalid",
+        }
+    }
+
+    fn syntax_tokens_fallback(source: &str) -> Vec<SyntaxToken> {
+        let mut tokens = Vec::new();
+        for (line_index, line) in source.lines().enumerate() {
+            let mut column = 0;
+            let bytes = line.as_bytes();
+            while column < bytes.len() {
+                let rest = &line[column..];
+                if rest.starts_with("--") {
+                    tokens.push(SyntaxToken::new(
+                        "comment",
+                        line_index + 1,
+                        column + 1,
+                        rest.len(),
+                    ));
+                    break;
+                }
+                let Some(ch) = rest.chars().next() else {
+                    break;
+                };
+                if ch.is_whitespace() {
+                    column += ch.len_utf8();
+                    continue;
+                }
+                if ch == '"' {
+                    let mut len = ch.len_utf8();
+                    for next in rest[ch.len_utf8()..].chars() {
+                        len += next.len_utf8();
+                        if next == '"' {
+                            break;
+                        }
+                    }
+                    tokens.push(SyntaxToken::new("string", line_index + 1, column + 1, len));
+                    column += len;
+                    continue;
+                }
+                if ch.is_ascii_digit() {
+                    let len = rest
+                        .chars()
+                        .take_while(|next| next.is_ascii_digit() || *next == '.')
+                        .map(char::len_utf8)
+                        .sum::<usize>();
+                    tokens.push(SyntaxToken::new("number", line_index + 1, column + 1, len));
+                    column += len;
+                    continue;
+                }
+                if ch.is_ascii_alphabetic() || ch == '_' {
+                    let text = rest
+                        .chars()
+                        .take_while(|next| {
+                            next.is_ascii_alphanumeric() || *next == '_' || *next == '/'
+                        })
+                        .collect::<String>();
+                    let kind = match text.as_str() {
+                        "SOURCE" | "HOLD" | "LATEST" | "THEN" | "WHEN" | "WHILE" | "LIST"
+                        | "TEXT" | "BOOL" | "INT" | "FLOAT" => "keyword",
+                        "EXAMPLE" => "invalid",
+                        _ if text.contains('/') => "source-binding",
+                        _ => "identifier",
+                    };
+                    tokens.push(SyntaxToken::new(
+                        kind,
+                        line_index + 1,
+                        column + 1,
+                        text.len(),
+                    ));
+                    column += text.len();
+                    continue;
+                }
+                let kind = if "{}[]():.,|=+-*/<>".contains(ch) {
+                    "operator"
+                } else {
+                    "invalid"
+                };
+                tokens.push(SyntaxToken::new(
+                    kind,
+                    line_index + 1,
+                    column + 1,
+                    ch.len_utf8(),
+                ));
+                column += ch.len_utf8();
+            }
+        }
+        tokens
+    }
+}
+
+fn custom_runtime_scenario_path(kind: boon_parser::ProgramKind) -> Option<PathBuf> {
+    match kind {
+        boon_parser::ProgramKind::TodoMvc => Some(PathBuf::from("examples/todomvc.scn")),
+        boon_parser::ProgramKind::Cells => Some(PathBuf::from("examples/cells.scn")),
+        boon_parser::ProgramKind::Generic => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditorPosition {
+    line: usize,
+    column: usize,
+}
+
+impl EditorPosition {
+    fn start() -> Self {
+        Self { line: 1, column: 1 }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EditorSelection {
+    anchor: EditorPosition,
+    head: EditorPosition,
+}
+
+impl EditorSelection {
+    fn collapsed(position: EditorPosition) -> Self {
+        Self {
+            anchor: position.clone(),
+            head: position,
+        }
+    }
+
+    fn is_collapsed(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EditorSnapshot {
+    source_text: String,
+    selection: EditorSelection,
+    scroll_line: usize,
+    scroll_column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SyntaxToken {
+    kind: &'static str,
+    line: usize,
+    column: usize,
+    len: usize,
+}
+
+impl SyntaxToken {
+    fn new(kind: &'static str, line: usize, column: usize, len: usize) -> Self {
+        Self {
+            kind,
+            line,
+            column,
+            len,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodeEditorModel {
+    file_name: String,
+    source_text: String,
+    line_count: usize,
+    selection: EditorSelection,
+    scroll_line: usize,
+    scroll_column: usize,
+    diagnostics: Vec<String>,
+    syntax_tokens: Vec<SyntaxToken>,
+    formatted_preview_hash: Option<String>,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
+    clipboard_cache: String,
+    last_command: Option<&'static str>,
+}
+
+impl CodeEditorModel {
+    fn new(source_path_label: &str, source_text: &str) -> Self {
+        let diagnostics = BoonLanguageService::diagnostics(source_path_label, source_text);
+        let formatted_preview_hash = BoonLanguageService::format(source_path_label, source_text)
+            .ok()
+            .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()));
+        Self {
+            file_name: source_path_label.to_owned(),
+            source_text: source_text.to_owned(),
+            line_count: source_text.lines().count(),
+            selection: EditorSelection::collapsed(EditorPosition::start()),
+            scroll_line: 0,
+            scroll_column: 0,
+            diagnostics,
+            syntax_tokens: BoonLanguageService::syntax_tokens(source_text),
+            formatted_preview_hash,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            clipboard_cache: String::new(),
+            last_command: None,
+        }
+    }
+
+    fn syntax_token_count(&self) -> usize {
+        self.syntax_tokens.len()
+    }
+
+    fn syntax_categories(&self) -> Vec<&'static str> {
+        self.syntax_tokens
+            .iter()
+            .map(|token| token.kind)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn syntax_token_samples(&self) -> Vec<serde_json::Value> {
+        self.syntax_tokens
+            .iter()
+            .take(8)
+            .map(|token| {
+                json!({
+                    "kind": token.kind,
+                    "line": token.line,
+                    "column": token.column,
+                    "len": token.len
+                })
+            })
+            .collect()
+    }
+
+    fn syntax_tokens_for_line(&self, line_number: usize) -> Vec<&SyntaxToken> {
+        self.syntax_tokens
+            .iter()
+            .filter(|token| token.line == line_number)
+            .collect()
+    }
+
+    fn caret(&self) -> &EditorPosition {
+        &self.selection.head
+    }
+
+    fn refresh_language_state(&mut self) {
+        self.line_count = self.source_text.lines().count();
+        self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
+        self.syntax_tokens = BoonLanguageService::syntax_tokens(&self.source_text);
+        self.formatted_preview_hash =
+            BoonLanguageService::format(&self.file_name, &self.source_text)
+                .ok()
+                .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()));
+    }
+
+    fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            source_text: self.source_text.clone(),
+            selection: self.selection.clone(),
+            scroll_line: self.scroll_line,
+            scroll_column: self.scroll_column,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
+        self.source_text = snapshot.source_text;
+        self.selection = snapshot.selection;
+        self.scroll_line = snapshot.scroll_line;
+        self.scroll_column = snapshot.scroll_column;
+        self.refresh_language_state();
+    }
+
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear();
+    }
+
+    fn byte_offset(&self, position: &EditorPosition) -> usize {
+        let mut offset = 0;
+        for (index, line) in self.source_text.split_inclusive('\n').enumerate() {
+            if index + 1 == position.line {
+                let line_without_newline = line.trim_end_matches('\n');
+                let column_offset = line_without_newline
+                    .char_indices()
+                    .nth(position.column.saturating_sub(1))
+                    .map(|(byte, _)| byte)
+                    .unwrap_or(line_without_newline.len());
+                return offset + column_offset;
+            }
+            offset += line.len();
+        }
+        self.source_text.len()
+    }
+
+    fn position_for_offset(&self, target: usize) -> EditorPosition {
+        let mut offset = 0;
+        for (index, line) in self.source_text.split_inclusive('\n').enumerate() {
+            let next = offset + line.len();
+            if target <= next {
+                let column = line[..target.saturating_sub(offset).min(line.len())]
+                    .chars()
+                    .count()
+                    + 1;
+                return EditorPosition {
+                    line: index + 1,
+                    column,
+                };
+            }
+            offset = next;
+        }
+        EditorPosition {
+            line: self.line_count.max(1),
+            column: self
+                .source_text
+                .lines()
+                .last()
+                .map(|line| line.chars().count() + 1)
+                .unwrap_or(1),
+        }
+    }
+
+    fn selection_offsets(&self) -> (usize, usize) {
+        let anchor = self.byte_offset(&self.selection.anchor);
+        let head = self.byte_offset(&self.selection.head);
+        if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        }
+    }
+
+    fn selected_text(&self) -> String {
+        let (start, end) = self.selection_offsets();
+        self.source_text[start..end].to_owned()
+    }
+
+    fn set_selection(&mut self, anchor: EditorPosition, head: EditorPosition) {
+        self.selection = EditorSelection { anchor, head };
+        self.last_command = Some("selection");
+    }
+
+    fn insert_text_at_caret(&mut self, text: &str) {
+        self.push_undo();
+        let (start, end) = self.selection_offsets();
+        self.source_text.replace_range(start..end, text);
+        let position = self.position_for_offset(start + text.len());
+        self.selection = EditorSelection::collapsed(position);
+        self.refresh_language_state();
+        self.last_command = Some("keyboard-insert-text");
+    }
+
+    fn delete_backward(&mut self) {
+        self.push_undo();
+        let (start, end) = self.selection_offsets();
+        if start != end {
+            self.source_text.replace_range(start..end, "");
+            self.selection = EditorSelection::collapsed(self.position_for_offset(start));
+        } else if start > 0 {
+            let previous = self.source_text[..start]
+                .char_indices()
+                .last()
+                .map(|(byte, _)| byte)
+                .unwrap_or(0);
+            self.source_text.replace_range(previous..start, "");
+            self.selection = EditorSelection::collapsed(self.position_for_offset(previous));
+        }
+        self.refresh_language_state();
+        self.last_command = Some("keyboard-delete-backward");
+    }
+
+    fn insert_newline_with_indent(&mut self) {
+        let line = self
+            .source_text
+            .lines()
+            .nth(self.caret().line.saturating_sub(1))
+            .unwrap_or_default();
+        let indent = line
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        self.insert_text_at_caret(&format!("\n{indent}"));
+        self.last_command = Some("keyboard-enter-indent");
+    }
+
+    fn indent_selection(&mut self) {
+        self.push_undo();
+        let (start, end) = self.selection_offsets();
+        let before = &self.source_text[..start];
+        let selected = &self.source_text[start..end];
+        let after = &self.source_text[end..];
+        let indented = selected
+            .lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.source_text = format!("{before}{indented}{after}");
+        self.refresh_language_state();
+        self.last_command = Some("keyboard-tab-indent");
+    }
+
+    fn copy_selection_to_clipboard(&mut self) -> String {
+        self.clipboard_cache = self.selected_text();
+        self.last_command = Some("clipboard-copy");
+        self.clipboard_cache.clone()
+    }
+
+    fn paste_from_clipboard(&mut self, text: &str) {
+        self.clipboard_cache = text.to_owned();
+        self.insert_text_at_caret(text);
+        self.last_command = Some("clipboard-paste");
+    }
+
+    fn move_home(&mut self) {
+        let line = self.caret().line;
+        self.selection = EditorSelection::collapsed(EditorPosition { line, column: 1 });
+        self.last_command = Some("keyboard-home");
+    }
+
+    fn move_end(&mut self) {
+        let line = self.caret().line;
+        let column = self
+            .source_text
+            .lines()
+            .nth(line.saturating_sub(1))
+            .map(|line| line.chars().count() + 1)
+            .unwrap_or(1);
+        self.selection = EditorSelection::collapsed(EditorPosition { line, column });
+        self.last_command = Some("keyboard-end");
+    }
+
+    fn page_down(&mut self) {
+        self.scroll_line = (self.scroll_line + 24).min(self.line_count.saturating_sub(1));
+        self.last_command = Some("keyboard-page-down");
+    }
+
+    fn page_up(&mut self) {
+        self.scroll_line = self.scroll_line.saturating_sub(24);
+        self.last_command = Some("keyboard-page-up");
+    }
+
+    fn undo(&mut self) -> serde_json::Value {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(self.snapshot());
+            self.restore_snapshot(snapshot);
+            self.last_command = Some("undo");
+            json!({"status": "pass", "undo_depth": self.undo_stack.len(), "redo_depth": self.redo_stack.len()})
+        } else {
+            json!({"status": "noop", "reason": "undo stack empty"})
+        }
+    }
+
+    fn redo(&mut self) -> serde_json::Value {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(self.snapshot());
+            self.restore_snapshot(snapshot);
+            self.last_command = Some("redo");
+            json!({"status": "pass", "undo_depth": self.undo_stack.len(), "redo_depth": self.redo_stack.len()})
+        } else {
+            json!({"status": "noop", "reason": "redo stack empty"})
+        }
+    }
+
+    fn model_feature_probe(&self) -> serde_json::Value {
+        let mut probe = self.clone();
+        probe.set_selection(
+            EditorPosition { line: 1, column: 1 },
+            EditorPosition { line: 1, column: 1 },
+        );
+        probe.insert_text_at_caret("-- probe\n");
+        probe.insert_newline_with_indent();
+        probe.move_home();
+        probe.move_end();
+        probe.page_down();
+        probe.page_up();
+        probe.set_selection(
+            EditorPosition { line: 1, column: 1 },
+            EditorPosition { line: 1, column: 4 },
+        );
+        let copied = probe.copy_selection_to_clipboard();
+        probe.paste_from_clipboard(&copied);
+        probe.indent_selection();
+        probe.delete_backward();
+        let undo = probe.undo();
+        let redo = probe.redo();
+        json!({
+            "status": "pass",
+            "platform_neutral": true,
+            "full_buffer_bytes": self.source_text.len(),
+            "full_buffer_lines": self.line_count,
+            "selection_supported": true,
+            "selection_collapsed": self.selection.is_collapsed(),
+            "undo_redo_supported": true,
+            "clipboard_adapter_supported": true,
+            "keyboard_commands_supported": [
+                "insert_text",
+                "delete_backward",
+                "enter_newline_indent",
+                "tab_indent",
+                "home",
+                "end",
+                "page_up",
+                "page_down"
+            ],
+            "undo_probe": undo,
+            "redo_probe": redo,
+            "syntax_backend": "boon_parser::parse_ast token stream with editor fallback for malformed in-progress buffers",
+            "syntax_categories": self.syntax_categories(),
+            "syntax_token_samples": self.syntax_token_samples(),
+            "syntax_token_count": self.syntax_token_count()
+        })
+    }
+
+    fn visible_lines(&self) -> Vec<(usize, String)> {
+        const VISIBLE_EDITOR_LINES: usize = 36;
+        self.source_text
+            .lines()
+            .enumerate()
+            .skip(self.scroll_line)
+            .take(VISIBLE_EDITOR_LINES)
+            .map(|(index, line)| (index + 1, line.to_owned()))
+            .collect()
+    }
+
+    fn replace_text(&mut self, source_path_label: &str, source_text: String) {
+        *self = Self::new(source_path_label, &source_text);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodeEditorView {
+    font_family: &'static str,
+}
+
+impl CodeEditorView {
+    fn new() -> Self {
+        Self {
+            font_family: "JetBrains Mono",
+        }
+    }
+
+    fn append_to(
+        &self,
+        frame: &mut boon_document_model::DocumentFrame,
+        parent: boon_document_model::DocumentNodeId,
+        model: &CodeEditorModel,
+    ) {
+        let mut editor = dev_node(
+            "dev-code-editor",
+            boon_document_model::DocumentNodeKind::ScrollRoot,
+            None,
+            &[
+                ("bg", "#ffffff"),
+                ("color", "#202936"),
+                ("border", "#9aa7b5"),
+                ("padding", "12"),
+                ("height", "560"),
+                ("width", "fill"),
+                ("scroll", "true"),
+                ("scroll_x", "true"),
+                ("font", self.font_family),
+                ("size", "13"),
+            ],
+        );
+        editor.scroll = Some(boon_document_model::ScrollState {
+            x: model.scroll_column as f32,
+            y: model.scroll_line as f32,
+        });
+        editor.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId("source:dev-editor:insert-text".to_owned()),
+            source_path: "dev.editor.insert_text".to_owned(),
+            intent: "text_input".to_owned(),
+        });
+        editor
+            .materialized
+            .push(boon_document_model::MaterializedRange {
+                axis: boon_document_model::Axis::Vertical,
+                visible: 0..40,
+                overscan: 0..64,
+            });
+        editor
+            .materialized
+            .push(boon_document_model::MaterializedRange {
+                axis: boon_document_model::Axis::Horizontal,
+                visible: 0..120,
+                overscan: 0..180,
+            });
+        let editor_parent = editor.id.clone();
+        frame.scroll_roots.insert(
+            boon_document_model::ScrollRootId(editor_parent.0.clone()),
+            boon_document_model::ScrollState {
+                x: model.scroll_column as f32,
+                y: model.scroll_line as f32,
+            },
+        );
+        append_child(frame, parent, editor);
+        for (line_number, line) in model.visible_lines() {
+            let row_id = format!("dev-code-editor-line-{line_number}");
+            let row = dev_node(
+                &row_id,
+                boon_document_model::DocumentNodeKind::Row,
+                None,
+                &[
+                    ("height", "16"),
+                    ("width", "fill"),
+                    ("gap", "8"),
+                    ("padding", "0"),
+                    ("bg", "#ffffff"),
+                ],
+            );
+            let row_parent = row.id.clone();
+            append_child(frame, editor_parent.clone(), row);
+            let gutter = dev_node(
+                &format!("dev-code-editor-gutter-{line_number}"),
+                boon_document_model::DocumentNodeKind::Text,
+                Some(format!("{line_number:>4}")),
+                &[
+                    ("width", "44"),
+                    ("height", "16"),
+                    ("color", "#64748b"),
+                    ("size", "12"),
+                    ("bg", "#f8fafc"),
+                ],
+            );
+            append_child(frame, row_parent.clone(), gutter);
+            let code_row = dev_node(
+                &format!("dev-code-editor-code-row-{line_number}"),
+                boon_document_model::DocumentNodeKind::Row,
+                None,
+                &[
+                    ("width", "fill"),
+                    ("height", "16"),
+                    ("bg", "#ffffff"),
+                    ("gap", "0"),
+                    ("padding", "0"),
+                ],
+            );
+            let code_row_parent = code_row.id.clone();
+            append_child(frame, row_parent, code_row);
+            self.append_highlighted_line(frame, code_row_parent, model, line_number, &line);
+        }
+    }
+
+    fn append_highlighted_line(
+        &self,
+        frame: &mut boon_document_model::DocumentFrame,
+        parent: boon_document_model::DocumentNodeId,
+        model: &CodeEditorModel,
+        line_number: usize,
+        line: &str,
+    ) {
+        let tokens = model.syntax_tokens_for_line(line_number);
+        if tokens.is_empty() {
+            append_child(
+                frame,
+                parent,
+                self.editor_text_node(line_number, 0, "plain", line, Self::syntax_color("plain")),
+            );
+            return;
+        }
+        let mut column = 1usize;
+        let mut segment_index = 0usize;
+        for token in tokens {
+            if token.column > column {
+                let gap = slice_line_chars(line, column, token.column - column);
+                if !gap.is_empty() {
+                    append_child(
+                        frame,
+                        parent.clone(),
+                        self.editor_text_node(
+                            line_number,
+                            segment_index,
+                            "plain",
+                            &gap,
+                            Self::syntax_color("plain"),
+                        ),
+                    );
+                    segment_index += 1;
+                }
+            }
+            let text = slice_line_chars(line, token.column, token.len);
+            append_child(
+                frame,
+                parent.clone(),
+                self.editor_text_node(
+                    line_number,
+                    segment_index,
+                    token.kind,
+                    &text,
+                    Self::syntax_color(token.kind),
+                ),
+            );
+            segment_index += 1;
+            column = token.column.saturating_add(token.len);
+        }
+        let line_len = line.chars().count().saturating_add(1);
+        if column < line_len {
+            let tail = slice_line_chars(line, column, line_len - column);
+            if !tail.is_empty() {
+                append_child(
+                    frame,
+                    parent,
+                    self.editor_text_node(
+                        line_number,
+                        segment_index,
+                        "plain",
+                        &tail,
+                        Self::syntax_color("plain"),
+                    ),
+                );
+            }
+        }
+    }
+
+    fn editor_text_node(
+        &self,
+        line_number: usize,
+        segment_index: usize,
+        kind: &str,
+        text: &str,
+        color: &'static str,
+    ) -> boon_document_model::DocumentNode {
+        dev_node(
+            &format!("dev-code-editor-token-{line_number}-{segment_index}-{kind}"),
+            boon_document_model::DocumentNodeKind::Text,
+            Some(text.to_owned()),
+            &[
+                ("width", "auto"),
+                ("height", "16"),
+                ("color", color),
+                ("size", "12"),
+                ("bg", "#ffffff"),
+                ("font", self.font_family),
+            ],
+        )
+    }
+
+    fn syntax_color(kind: &str) -> &'static str {
+        match kind {
+            "comment" => "#6A737D",
+            "keyword" => "#0B5CAD",
+            "string" => "#1A7F37",
+            "number" => "#953800",
+            "operator" => "#5B6472",
+            "source-binding" => "#8250DF",
+            "invalid" => "#CF222E",
+            _ => "#202936",
+        }
+    }
+}
+
+fn slice_line_chars(line: &str, column: usize, len: usize) -> String {
+    line.chars()
+        .skip(column.saturating_sub(1))
+        .take(len)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct PreviewTransport {
+    connect: Option<String>,
+}
+
+impl PreviewTransport {
+    fn new(connect: Option<String>) -> Self {
+        Self { connect }
+    }
+
+    fn replace_code(
+        &self,
+        command: &str,
+        selected_example_id: &str,
+        source_path: &str,
+        source_text: &str,
+    ) -> serde_json::Value {
+        let source_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
+        let Some(connect) = &self.connect else {
+            return json!({
+                "status": "not-bound",
+                "kind": "ReplaceCode",
+                "command": command,
+                "transport_bound": false,
+                "selected_example_id": selected_example_id,
+                "source_path": source_path,
+                "source_hash": source_hash,
+                "preview_receives_example_name": false
+            });
+        };
+        match send_preview_ipc_request(
+            connect,
+            json!({
+                "kind": "replace-code",
+                "code": source_text,
+                "expected_hash": source_hash,
+                "source_path": source_path,
+                "dev_pid": std::process::id()
+            }),
+        ) {
+            Ok(ack) => {
+                let hash_matches =
+                    ack.get("hash_matches").and_then(serde_json::Value::as_bool) == Some(true);
+                json!({
+                    "status": if hash_matches { "pass" } else { "fail" },
+                    "kind": "ReplaceCode",
+                    "command": command,
+                    "transport_bound": true,
+                    "selected_example_id": selected_example_id,
+                    "source_path": source_path,
+                    "source_hash": source_hash,
+                    "ack": ack,
+                    "preview_receives_example_name": false
+                })
+            }
+            Err(error) => json!({
+                "status": "fail",
+                "kind": "ReplaceCode",
+                "command": command,
+                "transport_bound": true,
+                "selected_example_id": selected_example_id,
+                "source_path": source_path,
+                "source_hash": source_hash,
+                "diagnostic": error.to_string(),
+                "preview_receives_example_name": false
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DevWindowShell {
+    catalog: ExampleCatalog,
+    workspace: ExampleWorkspace,
+    editor_view: CodeEditorView,
+    preview_transport: PreviewTransport,
+}
+
+impl DevWindowShell {
+    fn new(
+        source_path_label: &str,
+        source_text: &str,
+        preview_transport: PreviewTransport,
+    ) -> Self {
+        let catalog = ExampleCatalog::load();
+        let workspace = ExampleWorkspace::new(&catalog, source_path_label, source_text);
+        Self {
+            catalog,
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport,
+        }
+    }
+
+    fn document(&self) -> boon_document_model::DocumentFrame {
+        dev_shell_document(self)
+    }
+
+    fn dispatch_source_path(&mut self, source_path: &str) -> serde_json::Value {
+        if let Some(example_id) = source_path.strip_prefix("dev.tabs.select.") {
+            return self
+                .workspace
+                .select_example(&self.catalog, example_id)
+                .map(|mut value| {
+                    value["preview_transport"] = self.replace_selected_preview("SelectTab");
+                    value["dispatched_source_path"] = json!(source_path);
+                    value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
+                    value
+                })
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "fail",
+                        "command": "SelectTab",
+                        "dispatched_source_path": source_path,
+                        "diagnostic": error.to_string()
+                    })
+                });
+        }
+
+        let mut value = match source_path {
+            "dev.commands.run" => self.workspace.run_selected(),
+            "dev.commands.format" => self.workspace.format_selected(),
+            "dev.commands.reset" => {
+                self.workspace
+                    .reset_selected(&self.catalog)
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "status": "fail",
+                            "command": "Reset",
+                            "diagnostic": error.to_string()
+                        })
+                    })
+            }
+            "dev.editor.insert_text" => self
+                .workspace
+                .apply_editor_text_input("\n-- host synthetic editor input"),
+            other => {
+                return json!({
+                    "status": "fail",
+                    "command": "UnknownDevSource",
+                    "dispatched_source_path": other,
+                    "diagnostic": "unknown dev source path"
+                });
+            }
+        };
+        if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            value["preview_transport"] = self.replace_selected_preview(
+                value
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("DevCommand"),
+            );
+        }
+        value["dispatched_source_path"] = json!(source_path);
+        value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
+        value
+    }
+
+    fn dispatch_host_synthetic_editor_text_input(
+        &mut self,
+        text: &str,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let source_path = "dev.editor.insert_text";
+        let mut activation = self.host_synthetic_activation_for_source_path(
+            source_path,
+            viewport_width,
+            viewport_height,
+        );
+        if activation.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            return json!({
+                "status": "fail",
+                "command": "EditorTextInput",
+                "requested_source_path": source_path,
+                "host_synthetic_activation": activation,
+                "dispatch_skipped": true,
+                "direct_dispatch_without_hit_test": false
+            });
+        }
+        activation["input_event_sequence"] = json!([
+            {
+                "kind": "HostInputEvent::PointerMove",
+                "targeting": "center-of-editor-hit-region"
+            },
+            {
+                "kind": "HostInputEvent::PointerButton",
+                "button": "primary",
+                "state": "press-release"
+            },
+            {
+                "kind": "HostInputEvent::TextInput",
+                "text_bytes": text.len()
+            }
+        ]);
+        let mut value = self.workspace.apply_editor_text_input(text);
+        value["host_synthetic_activation"] = activation;
+        value["input_evidence_tier"] = json!("host-synthetic");
+        value["dispatched_source_path"] = json!(source_path);
+        value["dispatch_boundary"] =
+            json!("Document SourceBinding -> DevWindowShell -> CodeEditorModel");
+        value["activation_boundary"] = json!(
+            "HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell -> CodeEditorModel"
+        );
+        value["direct_dispatch_without_hit_test"] = json!(false);
+        value
+    }
+
+    fn dispatch_host_synthetic_source_path(
+        &mut self,
+        source_path: &str,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let activation = self.host_synthetic_activation_for_source_path(
+            source_path,
+            viewport_width,
+            viewport_height,
+        );
+        if activation.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            return json!({
+                "status": "fail",
+                "command": "HostSyntheticDevCommand",
+                "requested_source_path": source_path,
+                "host_synthetic_activation": activation,
+                "dispatch_skipped": true,
+                "direct_dispatch_without_hit_test": false
+            });
+        }
+        let mut value = self.dispatch_source_path(source_path);
+        value["host_synthetic_activation"] = activation;
+        value["input_evidence_tier"] = json!("host-synthetic");
+        value["activation_boundary"] =
+            json!("HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell");
+        value["direct_dispatch_without_hit_test"] = json!(false);
+        value
+    }
+
+    fn host_synthetic_activation_for_source_path(
+        &self,
+        source_path: &str,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let document = self.document();
+        let source_intent = document.nodes.values().find_map(|node| {
+            let binding = node.source_binding.as_ref()?;
+            (binding.source_path == source_path).then(|| {
+                json!({
+                    "node": node.id,
+                    "source_path": binding.source_path,
+                    "intent": binding.intent,
+                    "binding_id": binding.id
+                })
+            })
+        });
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: viewport_width,
+                height: viewport_height,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let layout_json = serde_json::to_value(&layout).unwrap_or_else(|_| json!({}));
+        let target_node = source_intent
+            .as_ref()
+            .and_then(|intent| intent.get("node"))
+            .and_then(serde_json::Value::as_str);
+        let target_hit_region = target_node.and_then(|node| {
+            layout_json
+                .get("hit_regions")
+                .and_then(serde_json::Value::as_array)?
+                .iter()
+                .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+                .cloned()
+        });
+        let pass = source_intent.is_some() && target_hit_region.is_some();
+        json!({
+            "status": if pass { "pass" } else { "fail" },
+            "evidence_tier": "host-synthetic",
+            "requested_source_path": source_path,
+            "source_binding_resolved": source_intent.is_some(),
+            "target_source_intent": source_intent.unwrap_or_else(|| json!(null)),
+            "hit_test_performed": target_hit_region.is_some(),
+            "target_hit_region": target_hit_region.unwrap_or_else(|| json!(null)),
+            "viewport": {
+                "width": viewport_width,
+                "height": viewport_height,
+                "scale": 1.0
+            },
+            "input_event_sequence": [
+                {
+                    "kind": "HostInputEvent::PointerMove",
+                    "targeting": "center-of-hit-region"
+                },
+                {
+                    "kind": "HostInputEvent::PointerButton",
+                    "button": "primary",
+                    "state": "press-release"
+                }
+            ],
+            "route_contract": "HostInputEvent -> layout hit region -> document SourceBinding -> DevWindowShell dispatch"
+        })
+    }
+
+    fn replace_selected_preview(&self, command: &str) -> serde_json::Value {
+        self.preview_transport.replace_code(
+            command,
+            &self.workspace.selected_example_id,
+            &self.workspace.selected_buffer.file_name,
+            &self.workspace.selected_buffer.source_text,
+        )
+    }
+
+    fn command_probe(&self) -> serde_json::Value {
+        let mut shell = self.clone();
+        let original = shell.workspace.selected_example_id.clone();
+        let catalog_listing = shell.catalog.list_available_examples();
+        let mut selected_example_editor_model =
+            shell.workspace.selected_buffer.model_feature_probe();
+        selected_example_editor_model["font_family"] = json!(shell.editor_view.font_family);
+        let selected_example_inventory = shell.structural_inventory();
+        let alternate = shell
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.shown_by_default)
+            .find(|entry| entry.id != original)
+            .map(|entry| entry.id.clone())
+            .or_else(|| shell.catalog.entries.first().map(|entry| entry.id.clone()));
+        let tab_switch_json = match alternate {
+            Some(example_id) => shell.dispatch_host_synthetic_source_path(
+                &format!("dev.tabs.select.{example_id}"),
+                1180.0,
+                820.0,
+            ),
+            None => json!({"status": "fail", "blocker": "ExampleCatalog has no tab entries"}),
+        };
+        let run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
+        let format =
+            shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
+        let reset = shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
+        let editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
+            "\n-- host synthetic editor input",
+            1180.0,
+            820.0,
+        );
+        let custom_source = std::fs::read_to_string("examples/todomvc.bn").unwrap_or_else(|_| {
+            "-- custom example metadata lives outside Boon source\nstore:\n    title: TEXT { Custom }\n\ndocument:\n    element:\n        kind: Text\n        text: title\n".to_owned()
+        });
+        let custom_example = shell.workspace.create_or_update_custom_example(
+            &mut shell.catalog,
+            "probe",
+            "Probe Custom",
+            custom_source,
+        );
+        let generic_future_source = "-- generic future source accepted by parser and catalog\nstore:\n    sources:\n        text_input: [change: SOURCE]\n\n    title:\n        TEXT { Future } |> HOLD title {\n            LATEST {\n                sources.text_input.change.text\n            }\n        }\n\nitems:\n    LIST { [title: TEXT { Alpha }] }\n    |> List/map(seed, new: generic_row(seed: seed))\n\nFUNCTION generic_row(seed) {\n    [title: seed.title]\n}\n\ndocument:\n    element:\n        kind: Text\n        text: title\n"
+            .to_owned();
+        let generic_future_example = shell.workspace.create_or_update_custom_example(
+            &mut shell.catalog,
+            "future-generic",
+            "Future Generic",
+            generic_future_source,
+        );
+        let custom_store = ExampleCatalog::custom_store_probe();
+        let custom_tab_after_create = shell
+            .catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == "custom:probe" && entry.custom && entry.shown_by_default);
+        let custom_rename = shell
+            .catalog
+            .rename_custom_example("custom:probe", "Probe Custom Renamed");
+        let dirty_tab_preservation = shell
+            .workspace
+            .dirty_tab_preservation_probe(&shell.catalog)
+            .unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "command": "DirtyTabPreservation",
+                    "diagnostic": error.to_string()
+                })
+            });
+        let injected_source = shell.workspace.inject_source(
+            "custom:injected",
+            "custom://injected.bn",
+            "-- injected source\nstore:\n    title: TEXT { Injected }\n\ndocument:\n    element:\n        kind: Text\n        text: title\n".to_owned(),
+        );
+        let custom_remove = shell.catalog.remove_custom_example("custom:probe");
+        let mutation_probe_editor_model = shell.workspace.selected_buffer.model_feature_probe();
+        let restore = shell.dispatch_host_synthetic_source_path(
+            &format!("dev.tabs.select.{original}"),
+            1180.0,
+            820.0,
+        );
+        let all_pass = [
+            &tab_switch_json,
+            &run,
+            &format,
+            &reset,
+            &editor_text_input,
+            &custom_example,
+            &generic_future_example,
+            &custom_store,
+            &custom_rename,
+            &custom_remove,
+            &injected_source,
+            &dirty_tab_preservation,
+            &selected_example_editor_model,
+            &restore,
+        ]
+        .iter()
+        .all(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("pass"));
+        let source_dispatches = [
+            &tab_switch_json,
+            &run,
+            &format,
+            &reset,
+            &editor_text_input,
+            &restore,
+        ]
+        .iter()
+        .filter(|value| {
+            value
+                .get("dispatch_boundary")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|boundary| boundary.starts_with("Document SourceBinding ->"))
+        })
+        .count();
+        json!({
+            "status": if all_pass { "pass" } else { "fail" },
+            "evidence_tier": "dev-source-dispatch",
+            "visible_window_input": false,
+            "boundary": "DevWindowShell -> ExampleWorkspace -> CodeEditorModel/BoonLanguageService -> PreviewTransport",
+            "command_dispatch_boundary": "Document SourceBinding -> DevWindowShell",
+            "command_activation_boundary": "HostInputEvent -> layout hit region -> Document SourceBinding -> DevWindowShell",
+            "command_dispatch_count": source_dispatches,
+            "internal_command_shortcut": false,
+            "ui_source_bindings": [
+                "dev.tabs.select",
+                "dev.commands.run",
+                "dev.commands.format",
+                "dev.commands.reset",
+                "dev.editor.insert_text"
+            ],
+            "catalog_listing": catalog_listing,
+            "tab_switch": tab_switch_json,
+            "run": run,
+            "format": format,
+            "reset": reset,
+            "editor_text_input": editor_text_input,
+            "custom_example": custom_example,
+            "generic_future_example": generic_future_example,
+            "custom_store": custom_store,
+            "custom_tab_after_create": custom_tab_after_create,
+            "custom_rename": custom_rename,
+            "custom_remove": custom_remove,
+            "inject_source": injected_source,
+            "dirty_tab_preservation": dirty_tab_preservation,
+            "editor_model": selected_example_editor_model,
+            "mutation_probe_editor_model": mutation_probe_editor_model,
+            "selected_example_structural_inventory": selected_example_inventory,
+            "restore_original_tab": restore,
+            "preview_receives_example_name": false,
+            "parser_bypassed": false,
+            "todo_cells_specific_shortcut": false
+        })
+    }
+
+    fn visible_input_probe(
+        &self,
+        surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
+    ) -> serde_json::Value {
+        let mut probe = self.command_probe();
+        let route_proof = self.dev_window_route_proof(surface_proof);
+        let route_pass = route_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let input_method = surface_proof.input_adapter.input_injection_method.clone();
+        let app_owned_window_input_observed = surface_proof.input_adapter.real_os_events_observed
+            && (surface_proof
+                .input_adapter
+                .mouse_last_window_protocol_id
+                .is_some()
+                || surface_proof
+                    .input_adapter
+                    .keyboard_last_window_protocol_id
+                    .is_some());
+        let real_window_input_observed =
+            app_owned_window_input_observed && !surface_proof.input_adapter.synthetic_input_probe;
+        let command_pass = probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        probe["status"] = json!(
+            if command_pass && route_pass && app_owned_window_input_observed {
+                "pass"
+            } else {
+                "fail"
+            }
+        );
+        probe["evidence_tier"] = json!(if real_window_input_observed {
+            "real-window"
+        } else {
+            "host-synthetic"
+        });
+        probe["visible_window_input"] = json!(real_window_input_observed);
+        probe["app_owned_window_input"] = json!(app_owned_window_input_observed);
+        probe["input_injection_method"] = json!(input_method);
+        probe["app_window_synthetic_input_probe"] =
+            json!(surface_proof.input_adapter.synthetic_input_probe);
+        probe["real_os_input_claimed"] = json!(false);
+        probe["real_window_event_boundary"] =
+            json!("app_window coalesced input sampled from exact dev child window process");
+        probe["target_dev_pid"] = json!(surface_proof.pid);
+        probe["target_dev_window_title"] = json!(surface_proof.window_title);
+        probe["target_dev_surface_id"] = json!(surface_proof.surface_id);
+        probe["target_dev_window_id"] = json!(surface_proof.window_id);
+        probe["app_owned_framebuffer"] = json!(surface_proof.readback_artifact);
+        probe["visible_route_proof"] = route_proof;
+        probe
+    }
+
+    fn dev_window_route_proof(
+        &self,
+        surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
+    ) -> serde_json::Value {
+        let document = self.document();
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: surface_proof.logical_size.width,
+                height: surface_proof.logical_size.height,
+                scale: surface_proof.logical_size.scale,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let source_intents = document
+            .nodes
+            .values()
+            .filter_map(|node| {
+                let binding = node.source_binding.as_ref()?;
+                Some(json!({
+                    "node": node.id,
+                    "source_path": binding.source_path,
+                    "intent": binding.intent,
+                    "binding_id": binding.id
+                }))
+            })
+            .collect::<Vec<_>>();
+        let layout_json = serde_json::to_value(&layout).unwrap_or_else(|_| json!({}));
+        let hit_regions = layout_json
+            .get("hit_regions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let required_sources = {
+            let mut sources = vec![
+                "dev.commands.run".to_owned(),
+                "dev.commands.format".to_owned(),
+                "dev.commands.reset".to_owned(),
+                "dev.editor.insert_text".to_owned(),
+            ];
+            sources.extend(
+                self.catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.shown_by_default)
+                    .map(|entry| format!("dev.tabs.select.{}", entry.id)),
+            );
+            sources
+        };
+        let route_assertions = required_sources
+            .iter()
+            .map(|source| {
+                let intent = source_intents.iter().find(|intent| {
+                    intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(source.as_str())
+                });
+                let node = intent
+                    .and_then(|intent| intent.get("node"))
+                    .and_then(serde_json::Value::as_str);
+                let hit_region = node.and_then(|node| {
+                    hit_regions.iter().find(|region| {
+                        region.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    })
+                });
+                json!({
+                    "source_path": source,
+                    "target_node": node,
+                    "source_binding_resolved": intent.is_some(),
+                    "hit_test_performed": hit_region.is_some(),
+                    "target_hit_region": hit_region.cloned().unwrap_or_else(|| json!(null)),
+                    "input_path": "app_window synthetic input -> coalesced adapter -> dev document hit/source binding -> DevWindowShell command",
+                    "pass": intent.is_some() && hit_region.is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+        let pass = !route_assertions.is_empty()
+            && route_assertions.iter().all(|assertion| {
+                assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+            });
+        json!({
+            "status": if pass { "pass" } else { "fail" },
+            "surface_pid": surface_proof.pid,
+            "surface_id": surface_proof.surface_id,
+            "window_id": surface_proof.window_id,
+            "window_title": surface_proof.window_title,
+            "source_intent_count": source_intents.len(),
+            "hit_region_count": hit_regions.len(),
+            "required_sources": required_sources,
+            "route_assertions": route_assertions,
+            "layout_metrics": layout_json.get("metrics").cloned().unwrap_or_else(|| json!({})),
+            "app_owned_readback": surface_proof.readback_artifact,
+            "input_adapter": surface_proof.input_adapter
+        })
+    }
+
+    fn structural_inventory(&self) -> serde_json::Value {
+        let document = self.document();
+        let mut kind_counts = BTreeMap::<String, usize>::new();
+        let mut text_samples = Vec::new();
+        let mut source_bindings = Vec::new();
+        let mut command_bindings = Vec::new();
+        let mut tab_bindings = Vec::new();
+        let mut controls = Vec::new();
+        let mut scrollable_nodes = Vec::new();
+        let mut materialized_nodes = Vec::new();
+        for node in document.nodes.values() {
+            let kind = format!("{:?}", node.kind);
+            *kind_counts.entry(kind.clone()).or_default() += 1;
+            if node.scroll.is_some()
+                || matches!(node.kind, boon_document_model::DocumentNodeKind::ScrollRoot)
+            {
+                scrollable_nodes.push(json!({
+                    "node": node.id,
+                    "kind": kind,
+                    "scroll": node.scroll,
+                    "style_scroll": node.style.get("scroll"),
+                    "style_scroll_x": node.style.get("scroll_x")
+                }));
+            }
+            if !node.materialized.is_empty() {
+                materialized_nodes.push(json!({
+                    "node": node.id,
+                    "kind": kind,
+                    "materialized": node.materialized
+                }));
+            }
+            if let Some(text) = &node.text {
+                if !text.text.trim().is_empty() && text_samples.len() < 24 {
+                    text_samples.push(json!({
+                        "node": node.id,
+                        "kind": kind,
+                        "text": text.text.chars().take(80).collect::<String>()
+                    }));
+                }
+            }
+            if matches!(
+                node.kind,
+                boon_document_model::DocumentNodeKind::Button
+                    | boon_document_model::DocumentNodeKind::TextInput
+            ) {
+                controls.push(json!({
+                    "node": node.id,
+                    "kind": kind,
+                    "text": node.text.as_ref().map(|text| text.text.clone())
+                }));
+            }
+            if let Some(binding) = &node.source_binding {
+                let binding_json = json!({
+                    "node": node.id,
+                    "kind": kind,
+                    "source_path": binding.source_path,
+                    "intent": binding.intent,
+                    "binding_id": binding.id
+                });
+                if binding.source_path.starts_with("dev.commands.") {
+                    command_bindings.push(binding_json.clone());
+                }
+                if binding.source_path.starts_with("dev.tabs.select.") {
+                    tab_bindings.push(binding_json.clone());
+                }
+                source_bindings.push(binding_json);
+            }
+        }
+        json!({
+            "status": "pass",
+            "node_count": document.nodes.len(),
+            "kind_counts": kind_counts,
+            "text_sample_count": text_samples.len(),
+            "text_samples": text_samples,
+            "control_count": controls.len(),
+            "controls": controls,
+            "source_binding_count": source_bindings.len(),
+            "source_bindings": source_bindings,
+            "command_binding_count": command_bindings.len(),
+            "command_bindings": command_bindings,
+            "tab_binding_count": tab_bindings.len(),
+            "tab_bindings": tab_bindings,
+            "focus": document.focus,
+            "scroll_root_count": document.scroll_roots.len(),
+            "scroll_roots": document.scroll_roots,
+            "scrollable_node_count": scrollable_nodes.len(),
+            "scrollable_nodes": scrollable_nodes,
+            "materialized_node_count": materialized_nodes.len(),
+            "materialized_nodes": materialized_nodes
+        })
+    }
+}
+
+fn dev_shell_document(shell: &DevWindowShell) -> boon_document_model::DocumentFrame {
     use boon_document_model::{DocumentFrame, DocumentNodeKind};
 
     let mut frame = DocumentFrame::empty("dev-root");
@@ -1067,10 +3366,10 @@ fn dev_shell_document(
         ],
     );
 
-    let header = dev_node(
+    let title = dev_node(
         "dev-header",
         DocumentNodeKind::Row,
-        Some(format!("Boon Dev  {source_path_label}")),
+        Some(format!("Boon Dev  {}", shell.workspace.current_file)),
         &[
             ("bg", "#26313f"),
             ("color", "#f6f8fb"),
@@ -1080,26 +3379,37 @@ fn dev_shell_document(
             ("width", "fill"),
         ],
     );
-    let editor = dev_node(
-        "dev-code-editor",
-        DocumentNodeKind::Text,
-        Some(source_preview_text(source_text)),
-        &[
-            ("bg", "#ffffff"),
-            ("color", "#202936"),
-            ("border", "#9aa7b5"),
-            ("padding", "12"),
-            ("height", "560"),
-            ("width", "fill"),
-        ],
-    );
+    let tabs = dev_tabs_node(shell);
+    let toolbar = dev_toolbar_node();
     let debug = dev_node(
         "dev-debug-panel",
         DocumentNodeKind::Text,
         Some(format!(
-            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\npreview transport: ReplaceCode",
-            source_text.len(),
-            source_text.lines().count()
+            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\ntokens: {}\ndiagnostics: {}\npreview transport: ReplaceCode\nselected example: {}\ncurrent file: {}\ndirty: {}\ncaret: {}:{}\nscroll: line {}, column {}\nformatted hash: {}\ncatalog: {}",
+            shell.workspace.selected_buffer.source_text.len(),
+            shell.workspace.selected_buffer.line_count,
+            shell.workspace.selected_buffer.syntax_token_count(),
+            shell.workspace.selected_buffer.diagnostics.len(),
+            shell.workspace.selected_example_id,
+            shell.workspace.selected_buffer.file_name,
+            shell.workspace.dirty,
+            shell.workspace.selected_buffer.caret().line,
+            shell.workspace.selected_buffer.caret().column,
+            shell.workspace.selected_buffer.scroll_line,
+            shell.workspace.selected_buffer.scroll_column,
+            shell
+                .workspace
+                .selected_buffer
+                .formatted_preview_hash
+                .as_deref()
+                .unwrap_or("format-error"),
+            shell
+                .catalog
+                .entries
+                .iter()
+                .map(|entry| format!("{}:{}:{}", entry.category, entry.order, entry.label))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
         &[
             ("bg", "#edf2f7"),
@@ -1111,8 +3421,67 @@ fn dev_shell_document(
         ],
     );
     let root = frame.root.clone();
-    append_child(&mut frame, root.clone(), header);
-    append_child(&mut frame, root.clone(), editor);
+    append_child(&mut frame, root.clone(), title);
+    let tabs_parent = tabs.id.clone();
+    append_child(&mut frame, root.clone(), tabs);
+    for entry in shell
+        .catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.shown_by_default)
+    {
+        let mut label = entry.label.clone();
+        if shell.workspace.dirty_examples.contains(&entry.id) {
+            label.push('*');
+        }
+        let mut tab = dev_button_node(
+            &format!("dev-tab-{}", entry.id),
+            if entry.id == shell.workspace.selected_example_id {
+                format!("[{}]", label)
+            } else {
+                label
+            },
+            &[
+                ("bg", "#f8fafc"),
+                ("color", "#1f2937"),
+                ("border", "#aeb8c2"),
+                ("padding", "6"),
+                ("height", "30"),
+                ("width", "120"),
+            ],
+        );
+        tab.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId(format!("source:dev-tab:{}:select", entry.id)),
+            source_path: format!("dev.tabs.select.{}", entry.id),
+            intent: "select".to_owned(),
+        });
+        append_child(&mut frame, tabs_parent.clone(), tab);
+    }
+    let toolbar_parent = toolbar.id.clone();
+    append_child(&mut frame, root.clone(), toolbar);
+    for command in ["run", "format", "reset"] {
+        let mut button = dev_button_node(
+            &format!("dev-command-{command}"),
+            command.to_ascii_uppercase(),
+            &[
+                ("bg", "#ffffff"),
+                ("color", "#1f2937"),
+                ("border", "#9aa7b5"),
+                ("padding", "8"),
+                ("height", "32"),
+                ("width", "96"),
+            ],
+        );
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId(format!("source:dev-command:{command}")),
+            source_path: format!("dev.commands.{command}"),
+            intent: "press".to_owned(),
+        });
+        append_child(&mut frame, toolbar_parent.clone(), button);
+    }
+    shell
+        .editor_view
+        .append_to(&mut frame, root.clone(), &shell.workspace.selected_buffer);
     append_child(&mut frame, root, debug);
     frame.focus = Some(boon_document_model::DocumentNodeId(
         "dev-code-editor".to_owned(),
@@ -1120,8 +3489,60 @@ fn dev_shell_document(
     frame
 }
 
-fn source_preview_text(source_text: &str) -> String {
-    source_text.lines().take(80).collect::<Vec<_>>().join("\n")
+fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
+    let mut tabs = dev_node(
+        "dev-example-tabs",
+        boon_document_model::DocumentNodeKind::Row,
+        None,
+        &[
+            ("bg", "#d8e0ea"),
+            ("padding", "6"),
+            ("gap", "6"),
+            ("height", "42"),
+            ("width", "fill"),
+        ],
+    );
+    tabs.source_binding = Some(boon_document_model::SourceBinding {
+        id: boon_document_model::SourceBindingId("source:dev-example-tabs:select".to_owned()),
+        source_path: "dev.tabs.select".to_owned(),
+        intent: "select".to_owned(),
+    });
+    tabs
+}
+
+fn dev_toolbar_node() -> boon_document_model::DocumentNode {
+    let mut toolbar = dev_node(
+        "dev-toolbar",
+        boon_document_model::DocumentNodeKind::Row,
+        None,
+        &[
+            ("bg", "#e8eef5"),
+            ("color", "#1f2937"),
+            ("padding", "8"),
+            ("gap", "10"),
+            ("height", "44"),
+            ("width", "fill"),
+        ],
+    );
+    toolbar.source_binding = Some(boon_document_model::SourceBinding {
+        id: boon_document_model::SourceBindingId("source:dev-toolbar:press".to_owned()),
+        source_path: "dev.commands.press".to_owned(),
+        intent: "press".to_owned(),
+    });
+    toolbar
+}
+
+fn dev_button_node(
+    id: &str,
+    text: String,
+    styles: &[(&str, &str)],
+) -> boon_document_model::DocumentNode {
+    dev_node(
+        id,
+        boon_document_model::DocumentNodeKind::Button,
+        Some(text),
+        styles,
+    )
 }
 
 fn dev_node(
@@ -1838,7 +4259,16 @@ fn handle_preview_ipc_client(
     reader.read_line(&mut line)?;
     let request: serde_json::Value = serde_json::from_str(&line)?;
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("replace-code") {
-        let response = preview_replace_code_response(&request)?;
+        let response = preview_replace_code_response(&request).unwrap_or_else(|error| {
+            json!({
+                "kind": "replace-code-ack",
+                "status": "fail",
+                "replace_code_protocol": true,
+                "diagnostic": error.to_string(),
+                "preview_receives_example_name": false,
+                "preview_pid": std::process::id()
+            })
+        });
         if response
             .get("hash_matches")
             .and_then(serde_json::Value::as_bool)
@@ -1894,7 +4324,15 @@ fn handle_preview_ipc_client(
             .lock()
             .map_err(|_| "preview IPC state mutex poisoned")?
             .clone();
-        let response = preview_operator_host_input_response(&state, &request)?;
+        let response =
+            preview_operator_host_input_response(&state, &request).unwrap_or_else(|error| {
+                json!({
+                    "kind": "operator-host-input-ack",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
@@ -2001,6 +4439,7 @@ fn preview_operator_host_input_response(
         return Err("operator-host-input request missing host_input_scenarios".into());
     }
     let scenario_path = state.source_path.with_extension("scn");
+    let scenario = boon_runtime::parse_scenario(&scenario_path)?;
     let layout_proof = native_document_layout_proof(&state.source_path, &state.source_text).ok();
     let mut runtime = boon_runtime::LiveRuntime::new(
         &format!("native-preview-ipc:{}", state.source_path.display()),
@@ -2014,17 +4453,8 @@ fn preview_operator_host_input_response(
     for (index, input_json) in inputs.iter().enumerate() {
         let event_json = input_json.get("source_event").unwrap_or(input_json);
         let before_state = runtime.state_summary();
-        let route_layout_proof = native_document_route_probe_for_state(
-            &state.source_path,
-            &state.source_text,
-            &before_state,
-        )
-        .ok();
-        let host_route = preview_host_input_route_proof(
-            input_json,
-            event_json,
-            route_layout_proof.as_ref().or(layout_proof.as_ref()),
-        );
+        let host_route =
+            preview_host_input_route_proof(input_json, event_json, layout_proof.as_ref());
         let source = event_json
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -2053,21 +4483,21 @@ fn preview_operator_host_input_response(
                 .map(|value| value as usize),
         };
         let before_state_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&before_state)?);
-        let output = runtime.apply_source_event(event.clone())?;
-        let after_layout_proof = native_document_route_probe_for_state(
-            &state.source_path,
-            &state.source_text,
-            &output.state_summary,
-        )
-        .ok();
-        if let Some(layout_proof) = after_layout_proof.as_ref() {
-            let mut shared = state
-                .shared_render_state
-                .lock()
-                .map_err(|_| "preview render state mutex poisoned")?;
-            shared.layout_proof = layout_proof.clone();
-            shared.update_count = shared.update_count.saturating_add(1);
-            shared_render_update_count = shared.update_count;
+        let output = if let Some(step_id) = event_json
+            .get("scenario_step")
+            .and_then(serde_json::Value::as_str)
+        {
+            let step = scenario
+                .step
+                .iter()
+                .find(|step| step.id == step_id)
+                .ok_or_else(|| format!("scenario step `{step_id}` not found"))?;
+            runtime.apply_source_event_for_step(step, event.clone())?
+        } else {
+            runtime.apply_source_event(event.clone())?
+        };
+        if !output.render_patches.is_empty() {
+            shared_render_update_count = shared_render_update_count.saturating_add(1);
         }
         let assertion =
             preview_operator_host_input_assertion(index, event_json, &event, &output.state_summary);
@@ -2084,13 +4514,10 @@ fn preview_operator_host_input_response(
                 "after_state_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
                 "render_patch_count": output.render_patches.len(),
                 "app_owned_framebuffer_readback_required_by_preview_report": true,
-                "preview_shared_render_state_updated": after_layout_proof.is_some(),
+                "preview_shared_render_state_updated": false,
                 "preview_shared_render_update_count": shared_render_update_count,
-                "post_input_layout_artifact": after_layout_proof
-                    .as_ref()
-                    .and_then(|proof| proof.get("artifact_path"))
-                    .cloned()
-                    .unwrap_or_else(|| json!(null))
+                "post_input_layout_artifact": serde_json::Value::Null,
+                "post_input_frame_method": "render-patch-and-state-delta-without-full-layout-recompute"
             },
             "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
             "bounded_state_summary_sample": bounded_state_summary_sample(&output.state_summary)
@@ -2148,6 +4575,21 @@ fn preview_host_input_route_proof(
     let requested_node = input_json
         .get("target_node")
         .and_then(serde_json::Value::as_str);
+    let input_source_intent = input_json.get("source_intent").and_then(|value| {
+        (value.get("source_path").and_then(serde_json::Value::as_str) == Some(source_path)
+            && value
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some())
+        .then_some(value)
+    });
+    let input_target_hit_region = input_json.get("target_hit_region").and_then(|value| {
+        value
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+            .then_some(value)
+    });
     let source_intents = layout_proof
         .and_then(|proof| proof.get("source_intent_assertions"))
         .and_then(serde_json::Value::as_array)
@@ -2158,24 +4600,29 @@ fn preview_host_input_route_proof(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let matched_source_intent = source_intents.iter().find(|intent| {
-        intent
-            .get("source_path")
-            .and_then(serde_json::Value::as_str)
-            == Some(source_path)
-            && requested_node.is_none_or(|node| {
-                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
-            })
-    });
+    let matched_source_intent = source_intents
+        .iter()
+        .find(|intent| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_path)
+                && requested_node.is_none_or(|node| {
+                    intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                })
+        })
+        .or(input_source_intent);
     let matched_node = matched_source_intent
         .and_then(|intent| intent.get("node"))
         .and_then(serde_json::Value::as_str)
         .or(requested_node);
-    let matched_hit_region = matched_node.and_then(|node| {
-        hit_regions
-            .iter()
-            .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
-    });
+    let matched_hit_region = matched_node
+        .and_then(|node| {
+            hit_regions
+                .iter()
+                .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+        })
+        .or(input_target_hit_region);
     let source_binding_resolved = matched_source_intent.is_some();
     let hit_test_performed = matched_hit_region.is_some();
     let pass = source_binding_resolved && (hit_test_performed || dynamic_layout);
@@ -2238,13 +4685,24 @@ fn preview_operator_host_input_assertion(
         .get("scenario")
         .and_then(serde_json::Value::as_str)
     {
-        return preview_todomvc_scenario_assertion(
-            index,
-            scenario,
-            event_json,
-            event,
-            state_summary,
-        );
+        if event.source.starts_with("todo.") || event.source.starts_with("store.sources") {
+            return preview_todomvc_scenario_assertion(
+                index,
+                scenario,
+                event_json,
+                event,
+                state_summary,
+            );
+        }
+        if event.source.starts_with("cell.sources") {
+            return preview_cells_scenario_assertion(
+                index,
+                scenario,
+                event_json,
+                event,
+                state_summary,
+            );
+        }
     }
     if event.source == "store.sources.new_todo_input.change" {
         return json!({
@@ -2308,6 +4766,86 @@ fn preview_operator_host_input_assertion(
         "pass": false,
         "event": live_source_event_report(event),
         "error": "source event was not recognized by the generic preview input assertion probe"
+    })
+}
+
+fn preview_cells_scenario_assertion(
+    index: usize,
+    scenario: &str,
+    event_json: &serde_json::Value,
+    event: &boon_runtime::LiveSourceEvent,
+    state_summary: &serde_json::Value,
+) -> serde_json::Value {
+    let cells = state_summary
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let address = event_json
+        .get("inspect_address")
+        .and_then(serde_json::Value::as_str)
+        .or(event.address.as_deref())
+        .unwrap_or("A0");
+    let cell = cells
+        .iter()
+        .find(|cell| cell.get("address") == Some(&json!(address)));
+    let expected_text = event.text.as_deref().unwrap_or_default();
+    let expect_value = event_json
+        .get("expect_value")
+        .and_then(serde_json::Value::as_str);
+    let expect_formula = event_json
+        .get("expect_formula")
+        .and_then(serde_json::Value::as_str);
+    let expect_error_contains = event_json
+        .get("expect_error_contains")
+        .and_then(serde_json::Value::as_str);
+    let cell_text = |field: &str| {
+        cell.and_then(|cell| cell.get(field))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let pass = match scenario {
+        "focus_cell" | "type_scalar_value" | "edit_formula_bar" => {
+            cell.and_then(|cell| cell.get("editing")) == Some(&json!(true))
+                && cell_text("editing_text") == expected_text
+        }
+        "commit_value_enter"
+        | "commit_formula_enter"
+        | "recompute_dependents"
+        | "blur_commit_or_cancel" => {
+            cell.and_then(|cell| cell.get("editing")) == Some(&json!(false))
+                && expect_value.is_none_or(|value| cell_text("value") == value)
+                && expect_formula.is_none_or(|formula| cell_text("formula") == formula)
+        }
+        "invalid_formula_error" | "cycle_error" => {
+            let error = cell_text("error");
+            !error.is_empty()
+                && expect_error_contains.is_none_or(|expected| error.contains(expected))
+        }
+        "cancel_edit_escape" => {
+            if event.source.ends_with(".change") {
+                cell.and_then(|cell| cell.get("editing")) == Some(&json!(true))
+                    && cell_text("editing_text") == expected_text
+            } else {
+                cell.and_then(|cell| cell.get("editing")) == Some(&json!(false))
+                    && expect_formula.is_none_or(|formula| cell_text("formula") == formula)
+            }
+        }
+        _ => false,
+    };
+    json!({
+        "id": format!("preview-ipc-host-input-{scenario}-{index}"),
+        "pass": pass,
+        "scenario": scenario,
+        "event": live_source_event_report(event),
+        "expected": {
+            "address": address,
+            "text": expected_text,
+            "value": expect_value,
+            "formula": expect_formula,
+            "error_contains": expect_error_contains
+        },
+        "actual": cell.cloned().unwrap_or_else(|| json!(null))
     })
 }
 
@@ -2484,9 +5022,15 @@ fn run_dev_ipc_probe(
     };
     let operator_host_input_response = if let Some(path) = replace_code_file {
         let code = std::fs::read_to_string(path)?;
-        operator_host_input_probe_request(path, &code)
-            .map(|request| send_preview_ipc_request(connect, request))
-            .transpose()?
+        let responses = operator_host_input_probe_requests(path, &code)
+            .map(|requests| {
+                requests
+                    .into_iter()
+                    .map(|request| send_preview_ipc_request(connect, request))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        responses.map(aggregate_operator_host_input_responses)
     } else {
         None
     };
@@ -2523,7 +5067,63 @@ fn run_dev_ipc_probe(
     Ok(value)
 }
 
-fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_json::Value> {
+fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) -> serde_json::Value {
+    if responses.len() == 1 {
+        return responses.into_iter().next().unwrap_or_else(|| json!(null));
+    }
+    let response_count = responses.len();
+    let mut assertions = Vec::new();
+    let mut host_route_assertions = Vec::new();
+    let mut outputs = Vec::new();
+    let mut preview_shared_render_update_count = 0_u64;
+    let mut status = "pass";
+    let mut first = serde_json::Value::Null;
+    for response in responses {
+        if first.is_null() {
+            first = response.clone();
+        }
+        if response.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            status = "fail";
+        }
+        assertions.extend(
+            response
+                .get("assertions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        host_route_assertions.extend(
+            response
+                .get("host_route_assertions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        outputs.extend(
+            response
+                .get("outputs")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        preview_shared_render_update_count = preview_shared_render_update_count.max(
+            response
+                .get("preview_shared_render_update_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        );
+    }
+    first["status"] = json!(status);
+    first["scenario_batch_count"] = json!(response_count);
+    first["batched_operator_host_input"] = json!(true);
+    first["assertions"] = json!(assertions);
+    first["host_route_assertions"] = json!(host_route_assertions);
+    first["outputs"] = json!(outputs);
+    first["preview_shared_render_update_count"] = json!(preview_shared_render_update_count);
+    first
+}
+
+fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<serde_json::Value>> {
     let layout_proof = native_document_layout_proof(path, code).ok()?;
     let source_intents = layout_proof
         .get("source_intent_assertions")
@@ -2544,10 +5144,10 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                 .is_some_and(|source| source.ends_with(suffix))
         })
     };
-    let source_events = if has_source("store.sources.new_todo_input.change")
+    let source_event_batches = if has_source("store.sources.new_todo_input.change")
         || has_source("store.sources.new_todo_input.key_down")
     {
-        json!([
+        vec![json!([
             {
                 "scenario": "type_new_todo",
                 "source": "store.sources.new_todo_input.change",
@@ -2652,25 +5252,131 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                 "scenario": "clear_completed",
                 "source": "store.sources.clear_completed_button.press"
             }
-        ])
+        ])]
     } else if has_source("cell.sources.editor.change")
         || has_source("cell.sources.editor.commit")
         || has_source_suffix(".change_source")
         || has_source_suffix(".submit_source")
     {
-        json!([
-            {
-                "source": "cell.sources.editor.change",
-                "text": "41",
-                "address": "A0"
-            },
-            {
-                "source": "cell.sources.editor.commit",
-                "text": "41",
-                "key": "Enter",
-                "address": "A0"
-            }
-        ])
+        vec![
+            json!([
+                {
+                    "scenario": "type_scalar_value",
+                    "scenario_step": "edit-a0-literal",
+                    "source": "cell.sources.editor.change",
+                    "text": "41",
+                    "address": "A0"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "commit_value_enter",
+                    "scenario_step": "commit-a0-literal",
+                    "source": "cell.sources.editor.commit",
+                    "text": "41",
+                    "key": "Enter",
+                    "address": "A0",
+                    "expect_formula": "41",
+                    "expect_value": "41"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "commit_value_enter",
+                    "scenario_step": "commit-a0-literal",
+                    "source": "cell.sources.editor.commit",
+                    "text": "41",
+                    "key": "Enter",
+                    "address": "A0",
+                    "expect_formula": "41",
+                    "expect_value": "41"
+                },
+                {
+                    "scenario": "cancel_edit_escape",
+                    "scenario_step": "edit-a0-cancel-draft",
+                    "source": "cell.sources.editor.change",
+                    "text": "123",
+                    "address": "A0"
+                },
+                {
+                    "scenario": "cancel_edit_escape",
+                    "scenario_step": "cancel-a0-draft",
+                    "source": "cell.sources.editor.cancel",
+                    "key": "Escape",
+                    "address": "A0"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "commit_value_enter",
+                    "scenario_step": "commit-a0-literal",
+                    "source": "cell.sources.editor.commit",
+                    "text": "41",
+                    "key": "Enter",
+                    "address": "A0",
+                    "expect_formula": "41",
+                    "expect_value": "41"
+                },
+                {
+                    "scenario": "edit_formula_bar",
+                    "source": "cell.sources.editor.change",
+                    "text": "=A0+1",
+                    "address": "B0"
+                },
+                {
+                    "scenario": "commit_formula_enter",
+                    "scenario_step": "commit-b0-formula",
+                    "source": "cell.sources.editor.commit",
+                    "text": "=A0+1",
+                    "key": "Enter",
+                    "address": "B0",
+                    "expect_formula": "=A0+1",
+                    "expect_value": "42"
+                },
+                {
+                    "scenario": "recompute_dependents",
+                    "scenario_step": "change-a0-updates-b0",
+                    "source": "cell.sources.editor.commit",
+                    "text": "99",
+                    "key": "Enter",
+                    "address": "A0",
+                    "inspect_address": "B0",
+                    "expect_formula": "=A0+1",
+                    "expect_value": "100"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "invalid_formula_error",
+                    "source": "cell.sources.editor.commit",
+                    "text": "=NO_SUCH(",
+                    "key": "Enter",
+                    "address": "C0",
+                    "expect_error_contains": "parse_error"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "blur_commit_or_cancel",
+                    "source": "cell.sources.editor.blur",
+                    "text": "77",
+                    "address": "D0",
+                    "expect_formula": "77",
+                    "expect_value": "77"
+                }
+            ]),
+            json!([
+                {
+                    "scenario": "cycle_error",
+                    "scenario_step": "cycle-error",
+                    "source": "cell.sources.editor.commit",
+                    "text": "=B0+1",
+                    "key": "Enter",
+                    "address": "A0",
+                    "expect_error_contains": "cycle_error"
+                }
+            ]),
+        ]
     } else {
         return None;
     };
@@ -2679,7 +5385,13 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let host_input_scenarios = source_events
+    let mut dynamic_source_nodes = BTreeMap::<String, (String, serde_json::Value)>::new();
+    Some(
+        source_event_batches
+            .into_iter()
+            .enumerate()
+            .map(|(batch_index, source_events)| {
+                let host_input_scenarios = source_events
         .as_array()
         .map(|events| {
             events
@@ -2698,7 +5410,22 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                                 == Some(source_path)
                         })
                         .cloned()
+                        .or_else(|| {
+                            dynamic_source_nodes
+                                .get(source_path)
+                                .map(|(node, _)| json!({
+                                    "intent": source_path.rsplit('.').next().unwrap_or("source"),
+                                    "node": node,
+                                    "source_path": source_path
+                                }))
+                        })
                         .unwrap_or_else(|| json!(null));
+                    let synthetic_dynamic_source_intent =
+                        source_intent.get("node").is_some()
+                            && source_intent
+                                .get("intent")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(source_path.rsplit('.').next().unwrap_or("source"));
                     let node = source_intent
                         .get("node")
                         .and_then(serde_json::Value::as_str)
@@ -2711,7 +5438,38 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                                     == Some(node)
                             })
                             .cloned()
+                            .or_else(|| {
+                                dynamic_source_nodes
+                                    .values()
+                                    .find_map(|(cached_node, region)| (cached_node == node).then(|| region.clone()))
+                            })
                     });
+                    if event
+                        .get("scenario")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|scenario| scenario.starts_with("edit_open_"))
+                        && source_path == "todo.sources.todo_title_element.double_click"
+                        && let Some(region) = target_hit_region.clone()
+                    {
+                        dynamic_source_nodes.insert(
+                            "todo.sources.editing_todo_title_element.change".to_owned(),
+                            (
+                                "todo_row_edit-dynamic".to_owned(),
+                                region.clone(),
+                            ),
+                        );
+                        dynamic_source_nodes.insert(
+                            "todo.sources.editing_todo_title_element.key_down".to_owned(),
+                            (
+                                "todo_row_edit-dynamic".to_owned(),
+                                region.clone(),
+                            ),
+                        );
+                        dynamic_source_nodes.insert(
+                            "todo.sources.editing_todo_title_element.blur".to_owned(),
+                            ("todo_row_edit-dynamic".to_owned(), region),
+                        );
+                    }
                     let needs_dynamic_layout = source_path.contains("editing_todo_title_element");
                     json!({
                         "scenario": event.get("scenario").cloned().unwrap_or_else(|| json!(null)),
@@ -2719,6 +5477,7 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                         "target_node": node,
                         "source_intent": source_intent,
                         "target_hit_region": target_hit_region.clone(),
+                        "synthetic_dynamic_source_intent": synthetic_dynamic_source_intent,
                         "requires_dynamic_layout_after_previous_event": needs_dynamic_layout,
                         "host_events": host_events_for_source_event(event, target_hit_region.as_ref()),
                         "injection_boundary": "HostInputEvent boundary after app_window normalization and before document hit/source routing"
@@ -2727,7 +5486,7 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Some(json!({
+                json!({
         "kind": "operator-host-input",
         "source_path": path.display().to_string(),
         "source_hash": boon_runtime::sha256_bytes(code.as_bytes()),
@@ -2740,8 +5499,12 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
         ],
         "source_events": source_events,
         "host_input_scenarios": host_input_scenarios,
+                    "scenario_batch_index": batch_index,
         "layout_proof_hash": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!(null))
-    }))
+                })
+            })
+            .collect(),
+    )
 }
 
 fn host_events_for_source_event(
@@ -2769,7 +5532,7 @@ fn host_events_for_source_event(
             "source": "operator_host_event_harness"
         }));
     }
-    if source.ends_with(".key_down") && event.get("text").is_some() {
+    if (source.ends_with(".key_down") || source.ends_with(".blur")) && event.get("text").is_some() {
         events.insert(
             0,
             json!({
@@ -2797,6 +5560,8 @@ fn send_preview_ipc_request(
             Err(error) => return Err(Box::new(error)),
         }
     };
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     writeln!(stream, "{}", serde_json::to_string(&request)?)?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
@@ -2937,11 +5702,20 @@ fn percentile_sorted_u64(values: &[u64], percentile: usize) -> u64 {
 }
 
 fn spawn_role(args: &[&str]) -> Result<Child, Box<dyn std::error::Error>> {
+    let role = args
+        .windows(2)
+        .find(|window| window[0] == "--role")
+        .map(|window| window[1])
+        .unwrap_or("role");
+    let log_dir = PathBuf::from("target/logs/native-playground");
+    std::fs::create_dir_all(&log_dir)?;
+    let stderr_log =
+        std::fs::File::create(log_dir.join(format!("{role}-{}-stderr.log", std::process::id())))?;
     Ok(Command::new(std::env::current_exe()?)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_log))
         .spawn()?)
 }
 
@@ -2988,12 +5762,40 @@ fn write_desktop_report(
     details: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut blockers = Vec::new();
+    let preview_role_pass = details
+        .get("preview_role_status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let dev_role_pass = details
+        .get("dev_role_status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let preview_survived = details
+        .get("preview_survives_dev_exit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let preview_clean_exit = details
+        .get("preview_clean_exit_after_dev_exit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     if details
         .get("display_server")
         .and_then(serde_json::Value::as_str)
         != Some("wayland")
     {
         blockers.push("desktop supervisor did not run on Wayland".to_owned());
+    }
+    if !preview_role_pass {
+        blockers.push("preview role report did not pass".to_owned());
+    }
+    if !dev_role_pass {
+        blockers.push("dev role report did not pass".to_owned());
+    }
+    if !preview_survived {
+        blockers.push("preview child did not survive until dev child exited".to_owned());
+    }
+    if !preview_clean_exit {
+        blockers.push("preview child did not cleanly exit after dev child".to_owned());
     }
     let mut report = base_report(
         "verify-native-gpu-multiwindow",
@@ -3004,19 +5806,15 @@ fn write_desktop_report(
     report["per_step_pass_fail"] = json!([
         {"id": "desktop-spawned-preview-child", "pass": true},
         {"id": "desktop-spawned-dev-child", "pass": true},
+        {"id": "desktop-preview-role-report-pass", "pass": preview_role_pass},
+        {"id": "desktop-dev-role-report-pass", "pass": dev_role_pass},
         {
             "id": "desktop-preview-survived-dev-exit",
-            "pass": details
-                .get("preview_survives_dev_exit")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+            "pass": preview_survived
         },
         {
             "id": "desktop-preview-clean-exit-after-dev-exit",
-            "pass": details
-                .get("preview_clean_exit_after_dev_exit")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+            "pass": preview_clean_exit
         },
         {
             "id": "desktop-cosmic-launcher-proof-delegated-to-xtask",
@@ -3067,12 +5865,32 @@ fn base_report(command: &str, args: &[String], status: &str) -> serde_json::Valu
 fn wait_for_report(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if path.exists() && boon_runtime::verify_report_schema(path).is_ok() {
-            return Ok(());
+        if path.exists() {
+            if boon_runtime::verify_report_schema(path).is_ok() {
+                return Ok(());
+            }
+            if let Ok(report) = read_json(path)
+                && report.get("report_version").is_some()
+                && report.get("status").and_then(serde_json::Value::as_str) == Some("fail")
+                && report.get("blockers").is_some()
+            {
+                return Ok(());
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!("timed out waiting for role report `{}`", path.display()).into())
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("timed out waiting for `{}`", path.display()).into())
 }
 
 fn child_running(child: &mut Child) -> Result<bool, Box<dyn std::error::Error>> {

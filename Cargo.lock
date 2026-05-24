@@ -575,6 +575,7 @@ dependencies = [
  "boon_parser",
  "boon_runtime",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

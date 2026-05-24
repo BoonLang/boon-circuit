@@ -372,6 +372,18 @@ impl Keyboard {
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
+
+    /// Injects a deterministic in-process keyboard sample for app-owned window
+    /// tests.
+    ///
+    /// This is not a compositor or hardware event. It is intended for isolated
+    /// render/input harnesses that need to exercise the same coalesced input
+    /// boundary as normal platform events without typing into the user's
+    /// desktop.
+    pub fn inject_test_key(&self, key: KeyboardKey, down: bool, window_protocol_id: u64) {
+        self.shared
+            .set_key_state(key, down, window_protocol_id as usize as *mut c_void);
+    }
 }
 
 // Trait implementations for Keyboard

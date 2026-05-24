@@ -917,21 +917,143 @@ pub use boon_report_schema::{
     verify_semantic_delta_protocol_batches, write_json,
 };
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExampleManifest {
+    #[serde(default)]
+    pub example: Vec<ExampleManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExampleManifestEntry {
+    pub id: String,
+    pub label: String,
+    pub source: String,
+    pub scenario: String,
+    pub budget: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub order: u32,
+    #[serde(default)]
+    pub default_tab_order: u32,
+    #[serde(default = "default_example_shown")]
+    pub shown_by_default: bool,
+    #[serde(default = "default_required_evidence_tier")]
+    pub required_evidence_tier: String,
+    #[serde(default)]
+    pub human_testing_needed: bool,
+    #[serde(default)]
+    pub initial_visible_assertions: Vec<String>,
+    #[serde(default)]
+    pub input_scenarios: Vec<String>,
+    #[serde(default)]
+    pub scroll_focus_scenarios: Vec<String>,
+    #[serde(default)]
+    pub visual_artifacts: Vec<String>,
+    #[serde(default)]
+    pub performance_thresholds: Vec<String>,
+}
+
+fn default_example_shown() -> bool {
+    true
+}
+
+fn default_required_evidence_tier() -> String {
+    "real-window".to_owned()
+}
+
+pub fn example_manifest_path() -> PathBuf {
+    resolve_repo_file("examples/manifest.toml")
+}
+
+pub fn example_manifest_entries() -> RuntimeResult<Vec<ExampleManifestEntry>> {
+    let path = example_manifest_path();
+    let manifest_text = fs::read_to_string(&path)?;
+    let manifest: ExampleManifest = toml::from_str(&manifest_text)?;
+    validate_example_manifest(&path, &manifest)?;
+    let mut entries = manifest.example;
+    entries.sort_by_key(|entry| (entry.default_tab_order, entry.order, entry.label.clone()));
+    Ok(entries)
+}
+
+pub fn example_manifest_entry(name: &str) -> RuntimeResult<ExampleManifestEntry> {
+    let requested = if name == "todo" { "todomvc" } else { name };
+    example_manifest_entries()?
+        .into_iter()
+        .find(|entry| {
+            entry.id == requested
+                || entry.label.eq_ignore_ascii_case(requested)
+                || Path::new(&entry.source)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    == Some(requested)
+        })
+        .ok_or_else(|| format!("example `{name}` is missing from examples/manifest.toml").into())
+}
+
+fn validate_example_manifest(path: &Path, manifest: &ExampleManifest) -> RuntimeResult<()> {
+    if manifest.example.is_empty() {
+        return Err(format!("example manifest `{}` has no entries", path.display()).into());
+    }
+    let mut ids = BTreeSet::new();
+    for entry in &manifest.example {
+        if entry.id.trim().is_empty() {
+            return Err(
+                format!("example manifest `{}` contains an empty id", path.display()).into(),
+            );
+        }
+        if !ids.insert(entry.id.clone()) {
+            return Err(format!(
+                "duplicate example id `{}` in `{}`",
+                entry.id,
+                path.display()
+            )
+            .into());
+        }
+        if entry.label.trim().is_empty() {
+            return Err(format!("example `{}` has an empty label", entry.id).into());
+        }
+        if !matches!(
+            entry.required_evidence_tier.as_str(),
+            "runtime" | "host-synthetic" | "real-window" | "human"
+        ) {
+            return Err(format!(
+                "example `{}` has unsupported required_evidence_tier `{}`",
+                entry.id, entry.required_evidence_tier
+            )
+            .into());
+        }
+        for relative in [&entry.source, &entry.scenario, &entry.budget] {
+            let resolved = resolve_repo_file(relative);
+            if !resolved.exists() {
+                return Err(format!(
+                    "example `{}` references missing file `{}`",
+                    entry.id,
+                    resolved.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn example_paths(name: &str) -> RuntimeResult<(PathBuf, PathBuf, PathBuf)> {
-    let example = if name == "todo" { "todomvc" } else { name };
-    if !example
+    let requested = if name == "todo" { "todomvc" } else { name };
+    if !requested
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
     {
         return Err(format!("invalid example name `{name}`").into());
     }
-    let source = resolve_example_file(example, "bn");
-    let scenario = resolve_example_file(example, "scn");
-    let budget = resolve_example_file(example, "budget.toml");
+    let entry = example_manifest_entry(requested)?;
+    let source = resolve_repo_file(&entry.source);
+    let scenario = resolve_repo_file(&entry.scenario);
+    let budget = resolve_repo_file(&entry.budget);
     for required in [&source, &scenario, &budget] {
         if !required.exists() {
             return Err(format!(
-                "example `{example}` is missing required file `{}`",
+                "example `{requested}` is missing required file `{}`",
                 required.display()
             )
             .into());
@@ -940,20 +1062,20 @@ pub fn example_paths(name: &str) -> RuntimeResult<(PathBuf, PathBuf, PathBuf)> {
     Ok((source, scenario, budget))
 }
 
-fn resolve_example_file(example: &str, extension: &str) -> PathBuf {
-    let relative = PathBuf::from(format!("examples/{example}.{extension}"));
+fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
+    let relative = relative.as_ref();
     if relative.exists() {
-        return relative;
+        return relative.to_path_buf();
     }
     if let Ok(cwd) = std::env::current_dir() {
         for ancestor in cwd.ancestors() {
-            let candidate = ancestor.join(&relative);
+            let candidate = ancestor.join(relative);
             if candidate.exists() {
                 return candidate;
             }
         }
     }
-    relative
+    relative.to_path_buf()
 }
 
 fn run_loaded_scenario(
@@ -5697,14 +5819,16 @@ impl GenericScheduledRuntime {
                 "value": cell.get("value").and_then(JsonValue::as_str).unwrap_or(""),
                 "change_source": "cell.sources.editor.change",
                 "submit_source": "cell.sources.editor.commit",
-                "cancel_source": "cell.sources.editor.cancel"
+                "cancel_source": "cell.sources.editor.cancel",
+                "blur_source": "cell.sources.editor.blur"
             })).unwrap_or_else(|| json!({
                 "address": "A0",
                 "edit_value": "",
                 "value": "",
                 "change_source": "cell.sources.editor.change",
                 "submit_source": "cell.sources.editor.commit",
-                "cancel_source": "cell.sources.editor.cancel"
+                "cancel_source": "cell.sources.editor.cancel",
+                "blur_source": "cell.sources.editor.blur"
             })),
             "grid_columns": grid_columns,
             "grid_rows": grid_rows,

@@ -3161,8 +3161,7 @@ fn gather_field_defs_from_statements(
                     scope.pop();
                 }
             }
-            AstStatementKind::Example { .. }
-            | AstStatementKind::Block
+            AstStatementKind::Block
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
             | AstStatementKind::List { .. }
@@ -3654,8 +3653,7 @@ mod tests {
     #[test]
     fn state_initial_values_are_lowered_from_ast_exprs() {
         let source = r#"
-EXAMPLE TodoMVC
-# True False TEXT { comment } seed.title must not become an initializer
+-- True False TEXT { comment } seed.title must not become an initializer
 store: [
     sources: [
         click: SOURCE
@@ -3710,7 +3708,6 @@ FUNCTION new_todo(seed) {
     #[test]
     fn derived_value_kind_uses_ast_operators_not_text_tokens() {
         let source = r#"
-EXAMPLE TodoMVC
 store: [
     sources: [
         click: SOURCE
@@ -3740,7 +3737,6 @@ FUNCTION new_todo(seed) {
     #[test]
     fn direct_source_refs_use_ast_paths_not_text_literals() {
         let source = r#"
-EXAMPLE TodoMVC
 store: [
     sources: [
         real_button: [press: SOURCE]
@@ -3783,7 +3779,6 @@ FUNCTION new_todo(seed) {
     #[test]
     fn list_append_lowering_uses_ast_then_record() {
         let source = r#"
-EXAMPLE TodoMVC
 store: [
     sources: [
         input: [
@@ -3826,7 +3821,6 @@ FUNCTION new_todo(seed) {
     #[test]
     fn list_remove_predicates_use_ast_then_outputs() {
         let source = r#"
-EXAMPLE TodoMVC
 store: [
     sources: [
         clear_done: [press: SOURCE]
@@ -4196,7 +4190,6 @@ FUNCTION new_todo(seed) {
     #[test]
     fn indexed_lowering_uses_parsed_row_scopes_not_fixed_names() {
         let source = r#"
-EXAMPLE TodoMVC
 	store:
 	    selected:
 	        "All" |> HOLD selected { LATEST {} }
@@ -4231,7 +4224,7 @@ EXAMPLE TodoMVC
 document:
     children:
 "#;
-        let parsed = boon_parser::parse_source("renamed-row-scope.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert!(parsed.row_scope_functions.iter().any(|scope| {
             scope.function == "make_entry" && scope.list == "entries" && scope.row_scope == "entry"

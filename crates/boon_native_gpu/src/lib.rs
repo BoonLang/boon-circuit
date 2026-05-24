@@ -18,6 +18,8 @@ pub mod generated {
 
 pub const REQUIRED_WGPU_VERSION: &str = "29.0.1";
 pub const REQUIRED_GLYPHON_VERSION: &str = "0.11.0";
+const JETBRAINS_MONO_FONT_BYTES: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched.woff2");
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -312,14 +314,15 @@ fn encode_layout_to_surface_with_pipeline(
         pass.set_vertex_buffer(1, color_buffer.slice(..));
         pass.draw(0..vertex_count, 0..1);
     }
-    let text_runs_shaped = text_runs(request.frame).len() as u32;
+    let visible_text_runs = text_runs(request.frame, width, height);
+    let text_runs_shaped = visible_text_runs.len() as u32;
     let rendered_text_runs = match text.as_mut() {
         Some(text) => text.render(
             request.device,
             request.queue,
             request.encoder,
             request.view,
-            request.frame,
+            visible_text_runs,
             width,
             height,
         )?,
@@ -496,11 +499,44 @@ struct GlyphonTextState {
     atlas: TextAtlas,
     renderer: TextRenderer,
     buffers: Vec<Buffer>,
+    buffer_signatures: Vec<TextRunSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextRunSignature {
+    text: String,
+    font_family: String,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    size: u32,
+    color: [u8; 4],
+    align: TextAlign,
+}
+
+impl TextRunSignature {
+    fn from_run(run: &TextRun) -> Self {
+        Self {
+            text: run.text.clone(),
+            font_family: run.font_family.clone(),
+            x: run.bounds.x.to_bits(),
+            y: run.bounds.y.to_bits(),
+            width: run.bounds.width.to_bits(),
+            height: run.bounds.height.to_bits(),
+            size: run.size.to_bits(),
+            color: run.color,
+            align: run.align,
+        }
+    }
 }
 
 impl GlyphonTextState {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let font_system = FontSystem::new();
+        let mut font_system = FontSystem::new();
+        font_system
+            .db_mut()
+            .load_font_data(JETBRAINS_MONO_FONT_BYTES.to_vec());
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
@@ -514,6 +550,7 @@ impl GlyphonTextState {
             atlas,
             renderer,
             buffers: Vec::new(),
+            buffer_signatures: Vec::new(),
         }
     }
 
@@ -523,39 +560,45 @@ impl GlyphonTextState {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        frame: &LayoutFrame,
+        runs: Vec<TextRun>,
         width: u32,
         height: u32,
     ) -> Result<u32, RenderError> {
-        let runs = text_runs(frame);
         if runs.is_empty() {
             return Ok(0);
         }
         self.viewport.update(queue, Resolution { width, height });
-        self.buffers.clear();
-        self.buffers.reserve(runs.len());
-        for run in &runs {
-            let bounds = run.bounds;
-            let text = &run.text;
-            let font_size = run.size.clamp(8.0, 120.0);
-            let mut buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(font_size, font_size * 1.25),
-            );
-            buffer.set_size(
-                &mut self.font_system,
-                Some(bounds.width.max(1.0)),
-                Some(bounds.height.max(font_size * 1.25)),
-            );
-            buffer.set_text(
-                &mut self.font_system,
-                text,
-                &Attrs::new().family(Family::SansSerif),
-                Shaping::Advanced,
-                None,
-            );
-            buffer.shape_until_scroll(&mut self.font_system, false);
-            self.buffers.push(buffer);
+        let signatures = runs
+            .iter()
+            .map(TextRunSignature::from_run)
+            .collect::<Vec<_>>();
+        if self.buffer_signatures != signatures {
+            self.buffers.clear();
+            self.buffers.reserve(runs.len());
+            for run in &runs {
+                let bounds = run.bounds;
+                let text = &run.text;
+                let font_size = run.size.clamp(8.0, 120.0);
+                let mut buffer = Buffer::new(
+                    &mut self.font_system,
+                    Metrics::new(font_size, font_size * 1.25),
+                );
+                buffer.set_size(
+                    &mut self.font_system,
+                    Some(bounds.width.max(1.0)),
+                    Some(bounds.height.max(font_size * 1.25)),
+                );
+                buffer.set_text(
+                    &mut self.font_system,
+                    text,
+                    &Attrs::new().family(Family::Name(&run.font_family)),
+                    Shaping::Advanced,
+                    None,
+                );
+                buffer.shape_until_scroll(&mut self.font_system, false);
+                self.buffers.push(buffer);
+            }
+            self.buffer_signatures = signatures;
         }
         let mut areas = Vec::with_capacity(self.buffers.len());
         for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
@@ -607,7 +650,6 @@ impl GlyphonTextState {
                     message: format!("glyphon render: {error}"),
                 })?;
         }
-        self.atlas.trim();
         Ok(self.buffers.len() as u32)
     }
 }
@@ -615,21 +657,30 @@ impl GlyphonTextState {
 struct TextRun {
     bounds: Rect,
     text: String,
+    font_family: String,
     color: [u8; 4],
     size: f32,
     align: TextAlign,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextAlign {
     Left,
     Center,
     Right,
 }
 
-fn text_runs(frame: &LayoutFrame) -> Vec<TextRun> {
+fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    };
     frame
         .display_list
         .iter()
+        .filter(|item| rect_intersects(item.bounds, viewport))
         .filter_map(|item| {
             let size = style_number(&item.style, "size").unwrap_or(14.0);
             let text = item.text.as_deref().unwrap_or_default().trim();
@@ -661,12 +712,15 @@ fn text_runs(frame: &LayoutFrame) -> Vec<TextRun> {
             Some(TextRun {
                 bounds: item.bounds,
                 text,
+                font_family: style_text(&item.style, "font")
+                    .unwrap_or("JetBrains Mono")
+                    .to_owned(),
                 color,
                 size,
                 align: text_align(&item.style),
             })
         })
-        .take(256)
+        .take(160)
         .collect()
 }
 
@@ -677,6 +731,13 @@ fn text_left(run: &TextRun) -> f32 {
         TextAlign::Center => run.bounds.x + ((run.bounds.width - estimated_width) / 2.0).max(4.0),
         TextAlign::Right => run.bounds.x + (run.bounds.width - estimated_width - 4.0).max(4.0),
     }
+}
+
+fn rect_intersects(rect: Rect, viewport: Rect) -> bool {
+    rect.x < viewport.x + viewport.width
+        && rect.x + rect.width > viewport.x
+        && rect.y < viewport.y + viewport.height
+        && rect.y + rect.height > viewport.y
 }
 
 fn text_align(style: &StyleMap) -> TextAlign {
@@ -735,7 +796,19 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
         height,
         [0.965, 0.972, 0.982, 1.0],
     );
-    for (index, item) in frame.display_list.iter().enumerate().take(512) {
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+    };
+    for (index, item) in frame
+        .display_list
+        .iter()
+        .filter(|item| rect_intersects(item.bounds, viewport))
+        .take(512)
+        .enumerate()
+    {
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));

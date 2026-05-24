@@ -405,13 +405,19 @@ fn indexed_row_source_ports(ir: &boon_ir::TypedProgram) -> Vec<String> {
 }
 
 fn default_scenario(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let source_path = Path::new(source);
+    if let Some(entry) = boon_runtime::example_manifest_entries()?
+        .into_iter()
+        .find(|entry| {
+            let entry_source = Path::new(&entry.source);
+            entry_source == source_path || entry_source.file_name() == source_path.file_name()
+        })
+    {
+        return Ok(entry.scenario);
+    }
     let source_text = std::fs::read_to_string(source)?;
     let parsed = boon_parser::parse_source(source.to_owned(), source_text)?;
-    let scenario = match parsed.kind {
-        boon_parser::ProgramKind::TodoMvc => "examples/todomvc.scn",
-        boon_parser::ProgramKind::Cells => "examples/cells.scn",
-    };
-    Ok(scenario.to_owned())
+    Ok(boon_runtime::example_manifest_entry(parsed.kind.as_str())?.scenario)
 }
 
 fn default_cli_report(source: &str, scenario: &str) -> Option<PathBuf> {
@@ -484,12 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn default_scenario_uses_parsed_example_marker_not_text_substrings() {
+    fn default_scenario_uses_manifest_and_parser_not_text_substrings() {
         let path = temp_file_path("boon-cli-todomvc-looking-cells-path.bn");
-        let source = include_str!("../../../examples/todomvc.bn").replace(
-            "EXAMPLE TodoMVC",
-            "# EXAMPLE Cells\nlabel: \"cells\"\nEXAMPLE TodoMVC",
-        );
+        let source = include_str!("../../../examples/todomvc.bn");
         fs::write(&path, source).unwrap();
 
         let scenario = default_scenario(path.to_str().unwrap()).unwrap();

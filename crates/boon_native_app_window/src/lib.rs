@@ -101,6 +101,7 @@ pub struct NativeWindowOptions {
     pub initial_height: f32,
     pub hold_ms: u64,
     pub input_sample_delay_ms: u64,
+    pub synthetic_input_probe: bool,
     pub warmup_frame_count: u32,
     pub sample_frame_count: u32,
     pub readback_artifact_dir: Option<String>,
@@ -171,6 +172,7 @@ pub struct NativeInputAdapterProof {
     pub sampled_after_visible_window: bool,
     pub real_os_events_observed: bool,
     pub input_injection_method: String,
+    pub synthetic_input_probe: bool,
     pub mouse_last_window_protocol_id: Option<u64>,
     pub keyboard_last_window_protocol_id: Option<u64>,
     pub mouse_motion_event_count: u64,
@@ -271,6 +273,7 @@ where
     app_window::application::main(move || {
         let (sender, receiver) =
             mpsc::sync_channel::<Result<AppWindowSurfaceProof, NativeWindowError>>(0);
+        let (callback_done_sender, callback_done_receiver) = mpsc::sync_channel::<()>(0);
         std::thread::Builder::new()
             .name(format!("boon-native-{}-render", options.role.as_str()))
             .spawn({
@@ -281,6 +284,7 @@ where
                         render_hook,
                         main_thread_id,
                         sender,
+                        callback_done_receiver,
                     ));
                 }
             })
@@ -290,6 +294,7 @@ where
             Ok(result) => on_ready(result),
             Err(_) => on_ready(Err(NativeWindowError::MissingProof)),
         }
+        let _ = callback_done_sender.send(());
     });
     std::process::exit(0);
 }
@@ -299,9 +304,16 @@ async fn run_surface_probe_async(
     render_hook: Option<NativeRenderHook>,
     main_thread_id: String,
     ready_sender: mpsc::SyncSender<Result<AppWindowSurfaceProof, NativeWindowError>>,
+    callback_done_receiver: mpsc::Receiver<()>,
 ) -> ! {
-    if let Err(error) =
-        run_surface_probe_inner(options, render_hook, main_thread_id, ready_sender.clone()).await
+    if let Err(error) = run_surface_probe_inner(
+        options,
+        render_hook,
+        main_thread_id,
+        ready_sender.clone(),
+        callback_done_receiver,
+    )
+    .await
     {
         let exit_status = if matches!(error, NativeWindowError::Failed(_)) {
             1
@@ -319,6 +331,7 @@ async fn run_surface_probe_inner(
     mut render_hook: Option<NativeRenderHook>,
     main_thread_id: String,
     ready_sender: mpsc::SyncSender<Result<AppWindowSurfaceProof, NativeWindowError>>,
+    callback_done_receiver: mpsc::Receiver<()>,
 ) -> Result<(), NativeWindowError> {
     let mut window = Window::new(
         Position::new(120.0, 120.0),
@@ -535,7 +548,10 @@ async fn run_surface_probe_inner(
     if options.input_sample_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(options.input_sample_delay_ms));
     }
-    let input_adapter = sample_input_adapter(&mut mouse, &keyboard);
+    if options.synthetic_input_probe {
+        inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
+    }
+    let input_adapter = sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
 
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
@@ -643,6 +659,7 @@ async fn run_surface_probe_inner(
         frame.present();
         std::thread::sleep(Duration::from_millis(16));
     }
+    let _ = callback_done_receiver.recv_timeout(Duration::from_secs(30));
     drop(surface);
     drop(app_surface);
     drop(window);
@@ -803,7 +820,35 @@ fn sha256_file(path: &Path) -> Result<String, NativeWindowError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn sample_input_adapter(mouse: &mut Mouse, keyboard: &Keyboard) -> NativeInputAdapterProof {
+fn inject_synthetic_input_probe(
+    mouse: &mut Mouse,
+    keyboard: &Keyboard,
+    window_id: &WindowId,
+    width: u32,
+    height: u32,
+) {
+    let protocol_id = u64::from_str_radix(&stable_debug_hash(window_id), 16)
+        .unwrap_or(1)
+        .max(1);
+    mouse.inject_test_motion(
+        f64::from(width) / 2.0,
+        f64::from(height) / 2.0,
+        f64::from(width),
+        f64::from(height),
+        protocol_id,
+    );
+    mouse.inject_test_button(MOUSE_BUTTON_LEFT, true, protocol_id);
+    mouse.inject_test_button(MOUSE_BUTTON_LEFT, false, protocol_id);
+    mouse.inject_test_scroll(320.0, 640.0, protocol_id);
+    keyboard.inject_test_key(KeyboardKey::A, true, protocol_id);
+    keyboard.inject_test_key(KeyboardKey::A, false, protocol_id);
+}
+
+fn sample_input_adapter(
+    mouse: &mut Mouse,
+    keyboard: &Keyboard,
+    synthetic_input_probe: bool,
+) -> NativeInputAdapterProof {
     let mouse_window_pos = mouse
         .window_pos()
         .map(|position| NativeMouseWindowPosition {
@@ -853,7 +898,12 @@ fn sample_input_adapter(mouse: &mut Mouse, keyboard: &Keyboard) -> NativeInputAd
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed,
-        input_injection_method: "none-observation-only".to_owned(),
+        input_injection_method: if synthetic_input_probe {
+            "app_window_per_window_synthetic_input_harness".to_owned()
+        } else {
+            "none-observation-only".to_owned()
+        },
+        synthetic_input_probe,
         mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
         keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
         mouse_motion_event_count: mouse_provenance.motion_event_count,

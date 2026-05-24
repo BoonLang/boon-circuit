@@ -1,6 +1,4 @@
-# Boon Circuit executable example: 7GUIs Cells
-
-EXAMPLE Cells
+-- Boon Circuit executable example: 7GUIs Cells
 
 cells:
     Grid/cells(columns: 26, rows: 100)
@@ -12,6 +10,7 @@ FUNCTION new_cell(seed) {
             change: SOURCE
             commit: SOURCE
             cancel: SOURCE
+            blur: SOURCE
         ]
     ]
 
@@ -24,6 +23,7 @@ FUNCTION new_cell(seed) {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
                     sources.editor.commit.text
+                    sources.editor.blur.text
                 }
             }
 
@@ -31,6 +31,7 @@ FUNCTION new_cell(seed) {
             seed.default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
+                    sources.editor.blur.text
                 }
             }
 
@@ -40,6 +41,7 @@ FUNCTION new_cell(seed) {
                     sources.editor.change |> THEN { True }
                     sources.editor.commit |> THEN { False }
                     sources.editor.cancel |> THEN { False }
+                    sources.editor.blur |> THEN { False }
                 }
             }
 
@@ -114,6 +116,7 @@ document:
                                     change: "$selected_input.change_source"
                                     submit: "$selected_input.submit_source"
                                     cancel: "$selected_input.cancel_source"
+                                    blur: "$selected_input.blur_source"
                                     address: "$selected_input.address"
                                     focus_proxy: true
                                     size: 12
@@ -203,6 +206,7 @@ document:
                                                     change: cell.sources.editor.change
                                                     submit: cell.sources.editor.commit
                                                     cancel: cell.sources.editor.cancel
+                                                    blur: cell.sources.editor.blur
                                                     address: "$cell.address"
                                                     size: 10
                                                     bg: "#FFFFFF"

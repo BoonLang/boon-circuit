@@ -945,6 +945,39 @@ fn view_data_path(value: &str) -> Option<String> {
     (!path.trim().is_empty()).then(|| path.to_owned())
 }
 
+fn view_data_path_for_expr(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String> {
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+            view_data_path(value)
+        }
+        AstExprKind::Identifier(value) => Some(value.clone()),
+        AstExprKind::Path(parts) => Some(parts.join(".")),
+        AstExprKind::Infix { left, .. } => {
+            view_data_path_for_expr(expressions.get(*left)?, expressions)
+        }
+        _ => None,
+    }
+}
+
+fn attr_can_bind_data(attr: &str) -> bool {
+    matches!(
+        attr,
+        "text"
+            | "value"
+            | "display_value"
+            | "edit_value"
+            | "placeholder"
+            | "checked"
+            | "visible"
+            | "selected"
+            | "target"
+            | "key"
+            | "address"
+            | "color_if"
+            | "strike_if"
+    )
+}
+
 fn collect_document_view_bindings(
     statements: &[AstStatement],
     expressions: &[AstExpr],
@@ -993,7 +1026,24 @@ fn collect_document_element_bindings(
         let Some(value) = document_statement_value(child, expressions) else {
             continue;
         };
-        if let Some(path) = view_data_path(&value) {
+        if attr != "target"
+            && let Some((path, source_id)) = source_paths
+                .iter()
+                .find(|(source_path, _)| *source_path == value)
+        {
+            bindings.push(ViewBinding {
+                id: ViewBindingId(bindings.len()),
+                node_kind: node_kind.to_owned(),
+                attr,
+                path: (*path).to_owned(),
+                kind: ViewBindingKind::Source,
+                scope_id: scope_id_for_path(row_scopes, path),
+                source_id: Some(*source_id),
+            });
+        } else if attr_can_bind_data(&attr)
+            && let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id))
+            && let Some(path) = view_data_path_for_expr(expr, expressions)
+        {
             bindings.push(ViewBinding {
                 id: ViewBindingId(bindings.len()),
                 node_kind: node_kind.to_owned(),
@@ -1006,19 +1056,6 @@ fn collect_document_element_bindings(
                     ViewBindingKind::Data
                 },
                 path,
-            });
-        } else if let Some((path, source_id)) = source_paths
-            .iter()
-            .find(|(source_path, _)| *source_path == value)
-        {
-            bindings.push(ViewBinding {
-                id: ViewBindingId(bindings.len()),
-                node_kind: node_kind.to_owned(),
-                attr,
-                path: (*path).to_owned(),
-                kind: ViewBindingKind::Source,
-                scope_id: scope_id_for_path(row_scopes, path),
-                source_id: Some(*source_id),
             });
         }
     }

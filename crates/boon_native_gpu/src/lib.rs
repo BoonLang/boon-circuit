@@ -534,9 +534,19 @@ impl GlyphonTextState {
         self.viewport.update(queue, Resolution { width, height });
         self.buffers.clear();
         self.buffers.reserve(runs.len());
-        for (_, text, _) in &runs {
-            let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-            buffer.set_size(&mut self.font_system, Some(4096.0), Some(64.0));
+        for run in &runs {
+            let bounds = run.bounds;
+            let text = &run.text;
+            let font_size = run.size.clamp(8.0, 120.0);
+            let mut buffer = Buffer::new(
+                &mut self.font_system,
+                Metrics::new(font_size, font_size * 1.25),
+            );
+            buffer.set_size(
+                &mut self.font_system,
+                Some(bounds.width.max(1.0)),
+                Some(bounds.height.max(font_size * 1.25)),
+            );
             buffer.set_text(
                 &mut self.font_system,
                 text,
@@ -548,16 +558,16 @@ impl GlyphonTextState {
             self.buffers.push(buffer);
         }
         let mut areas = Vec::with_capacity(self.buffers.len());
-        for ((bounds, _, color), buffer) in runs.iter().zip(self.buffers.iter()) {
-            let left = bounds.x + 4.0;
-            let top = bounds.y + 4.0;
+        for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
+            let left = text_left(run);
+            let top = run.bounds.y + 4.0;
             areas.push(TextArea {
                 buffer,
                 left,
                 top,
                 scale: 1.0,
-                bounds: text_bounds(*bounds, width, height),
-                default_color: Color::rgba(color[0], color[1], color[2], color[3]),
+                bounds: text_bounds(run.bounds, width, height),
+                default_color: Color::rgba(run.color[0], run.color[1], run.color[2], run.color[3]),
                 custom_glyphs: &[],
             });
         }
@@ -602,22 +612,102 @@ impl GlyphonTextState {
     }
 }
 
-fn text_runs(frame: &LayoutFrame) -> Vec<(Rect, String, [u8; 4])> {
+struct TextRun {
+    bounds: Rect,
+    text: String,
+    color: [u8; 4],
+    size: f32,
+    align: TextAlign,
+}
+
+enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+fn text_runs(frame: &LayoutFrame) -> Vec<TextRun> {
     frame
         .display_list
         .iter()
         .filter_map(|item| {
-            let text = item.text.as_deref()?.trim();
-            (!text.is_empty()).then(|| {
-                (
-                    item.bounds,
-                    text.to_owned(),
-                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
-                )
+            let size = style_number(&item.style, "size").unwrap_or(14.0);
+            let text = item.text.as_deref().unwrap_or_default().trim();
+            let (text, color) = if text.is_empty() {
+                if style_bool(&item.style, "checked") == Some(true) {
+                    (
+                        "✓".to_owned(),
+                        style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
+                    )
+                } else if let Some(placeholder) = style_text(&item.style, "placeholder") {
+                    (
+                        placeholder.to_owned(),
+                        style_color_u8(&item.style, "placeholder_color")
+                            .unwrap_or([154, 154, 154, 255]),
+                    )
+                } else {
+                    return None;
+                }
+            } else {
+                let color = if style_bool(&item.style, "color_if") == Some(true) {
+                    style_color_u8(&item.style, "if_color")
+                        .or_else(|| style_color_u8(&item.style, "color"))
+                        .unwrap_or([36, 44, 58, 255])
+                } else {
+                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255])
+                };
+                (text.to_owned(), color)
+            };
+            Some(TextRun {
+                bounds: item.bounds,
+                text,
+                color,
+                size,
+                align: text_align(&item.style),
             })
         })
         .take(256)
         .collect()
+}
+
+fn text_left(run: &TextRun) -> f32 {
+    let estimated_width = run.text.chars().count() as f32 * run.size * 0.55;
+    match run.align {
+        TextAlign::Left => run.bounds.x + 4.0,
+        TextAlign::Center => run.bounds.x + ((run.bounds.width - estimated_width) / 2.0).max(4.0),
+        TextAlign::Right => run.bounds.x + (run.bounds.width - estimated_width - 4.0).max(4.0),
+    }
+}
+
+fn text_align(style: &StyleMap) -> TextAlign {
+    match style_text(style, "align") {
+        Some("center") => TextAlign::Center,
+        Some("right") => TextAlign::Right,
+        _ => TextAlign::Left,
+    }
+}
+
+fn style_number(style: &StyleMap, key: &str) -> Option<f32> {
+    match style.get(key)? {
+        StyleValue::Number(value) => Some(*value as f32),
+        StyleValue::Text(value) => value.parse::<f32>().ok(),
+        StyleValue::Bool(_) => None,
+    }
+}
+
+fn style_bool(style: &StyleMap, key: &str) -> Option<bool> {
+    match style.get(key)? {
+        StyleValue::Bool(value) => Some(*value),
+        StyleValue::Text(value) => value.parse::<bool>().ok(),
+        StyleValue::Number(_) => None,
+    }
+}
+
+fn style_text<'a>(style: &'a StyleMap, key: &str) -> Option<&'a str> {
+    match style.get(key)? {
+        StyleValue::Text(value) => Some(value.as_str()),
+        StyleValue::Number(_) | StyleValue::Bool(_) => None,
+    }
 }
 
 fn text_bounds(bounds: Rect, width: u32, height: u32) -> TextBounds {
@@ -657,7 +747,10 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
             height,
             fill,
         );
-        if let Some(border) = style_color_f32(&item.style, "border") {
+        let selected_border = (style_bool(&item.style, "selected") == Some(true))
+            .then(|| style_color_f32(&item.style, "selected_border"))
+            .flatten();
+        if let Some(border) = selected_border.or_else(|| style_color_f32(&item.style, "border")) {
             push_border(
                 &mut positions,
                 &mut colors,
@@ -669,6 +762,24 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
                 } else {
                     border
                 },
+            );
+        }
+        if style_bool(&item.style, "strike_if") == Some(true) {
+            let color = style_color_f32(&item.style, "if_color")
+                .or_else(|| style_color_f32(&item.style, "color"))
+                .unwrap_or([0.58, 0.58, 0.58, 1.0]);
+            push_rect(
+                &mut positions,
+                &mut colors,
+                Rect {
+                    x: item.bounds.x + 4.0,
+                    y: item.bounds.y + item.bounds.height * 0.58,
+                    width: (item.bounds.width - 8.0).max(1.0),
+                    height: 2.0,
+                },
+                width,
+                height,
+                color,
             );
         }
     }

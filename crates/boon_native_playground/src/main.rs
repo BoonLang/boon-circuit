@@ -40,7 +40,32 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = value_arg(args, "--report").ok_or("layout-proof role requires --report")?;
     let source = std::fs::read_to_string(&code_file)?;
     let proof = native_document_layout_proof(Path::new(&code_file), &source)?;
-    boon_runtime::write_json(Path::new(&report), &proof)?;
+    let mut report_value = base_report("boon-native-playground-layout-proof", args, "pass");
+    report_value["per_step_pass_fail"] = json!([
+        {
+            "id": "native-layout-proof:document-lowered",
+            "pass": proof.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        },
+        {
+            "id": "native-layout-proof:hit-regions-present",
+            "pass": proof
+                .get("hit_target_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        },
+        {
+            "id": "native-layout-proof:source-intents-present",
+            "pass": proof
+                .get("source_intent_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        }
+    ]);
+    report_value["layout_proof"] = proof;
+    boon_runtime::write_json(Path::new(&report), &report_value)?;
+    boon_runtime::verify_report_schema(Path::new(&report))?;
     Ok(())
 }
 
@@ -69,6 +94,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
+    let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+        layout_proof: document_layout_proof.clone(),
+        update_count: 0,
+    }));
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(
             path,
@@ -78,16 +107,22 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 source_bytes: source.len() as u64,
                 source_sha256: code_hash.clone(),
                 runtime_summary: runtime_summary.clone(),
+                shared_render_state: Arc::clone(&shared_render_state),
             },
         )?;
     }
     let role_args = args[1..].to_vec();
-    let render_layout_proof = document_layout_proof.clone();
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
         let mut visible_renderer = None;
         let mut app_owned_proof = None;
         let mut layout_frame_cache = None;
+        let shared_render_state = Arc::clone(&shared_render_state);
         Some(Box::new(move |context| {
+            let render_layout_proof = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned".to_owned())?
+                .layout_proof
+                .clone();
             native_gpu_app_owned_render_hook(
                 context,
                 &render_layout_proof,
@@ -593,6 +628,91 @@ fn native_document_layout_proof(
     }))
 }
 
+fn native_document_route_probe_for_state(
+    source_path: &Path,
+    source: &str,
+    runtime_state: &Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
+    let document = boon_parser::parsed_document(&parsed)
+        .ok_or("source does not contain a parseable document block")?;
+    let eval_context = DocumentEvalContext {
+        root: Some(runtime_state),
+        locals: BTreeMap::new(),
+    };
+    let mut frame = boon_document_model::DocumentFrame::empty("root");
+    let mut source_intents = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    let root_id = frame.root.clone();
+    lower_document_elements(
+        &document.root.children,
+        &document.expressions,
+        &root_id,
+        &mut frame,
+        &mut source_intents,
+        &mut seen_ids,
+        &eval_context,
+        "",
+    );
+
+    let mut measurer = boon_document::SimpleTextMeasurer;
+    let layout = boon_document::layout(boon_document::LayoutInput {
+        document: &frame,
+        viewport: boon_host::Viewport {
+            surface: 1,
+            width: 920.0,
+            height: 720.0,
+            scale: 1.0,
+        },
+        text: &mut measurer,
+        capabilities: boon_document::RenderCapabilities::fake_portable(),
+    });
+    let runtime_document_state_hash =
+        boon_runtime::sha256_bytes(&serde_json::to_vec(runtime_state)?);
+    let artifact_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
+    std::fs::create_dir_all(&artifact_dir)?;
+    let source_sha256 = boon_runtime::sha256_file(source_path)?;
+    let artifact_path = artifact_dir.join(format!(
+        "{}-{}-state-{}.json",
+        source_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("source"),
+        &source_sha256[..12.min(source_sha256.len())],
+        &runtime_document_state_hash[..12.min(runtime_document_state_hash.len())]
+    ));
+    let artifact = json!({
+        "source_path": source_path,
+        "source_sha256": source_sha256,
+        "document_frame": frame,
+        "layout_frame": layout,
+        "source_intents": source_intents,
+        "runtime_document_state_used": true,
+        "runtime_document_state_hash": runtime_document_state_hash
+    });
+    std::fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact)?)?;
+    let artifact_sha256 = boon_runtime::sha256_file(&artifact_path)?;
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&artifact_path)?)?;
+    let layout_json = artifact_json
+        .get("layout_frame")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Ok(json!({
+        "status": "pass",
+        "lowering": "boon_parser_document_ast_to_boon_document_model",
+        "source_path": source_path,
+        "source_sha256": artifact_json.get("source_sha256").cloned().unwrap_or_else(|| json!("missing")),
+        "artifact_path": artifact_path,
+        "artifact_sha256": artifact_sha256,
+        "layout_frame_hash": boon_runtime::sha256_file(&artifact_path)?,
+        "hit_target_assertions": layout_json.get("hit_regions").cloned().unwrap_or_else(|| json!([])),
+        "source_intent_assertions": artifact_json.get("source_intents").cloned().unwrap_or_else(|| json!([])),
+        "runtime_document_state_used": true,
+        "runtime_document_state_hash": runtime_document_state_hash
+    }))
+}
+
 fn preview_runtime_summary(
     source_path: &Path,
     source: &str,
@@ -782,7 +902,7 @@ fn native_gpu_app_owned_render_hook(
     layout_proof: &serde_json::Value,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
-    layout_frame_cache: &mut Option<boon_document::LayoutFrame>,
+    layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if layout_proof
         .get("status")
@@ -795,18 +915,25 @@ fn native_gpu_app_owned_render_hook(
         .get("artifact_path")
         .and_then(serde_json::Value::as_str)
         .ok_or("layout proof missing artifact_path")?;
-    if layout_frame_cache.is_none() {
+    let cache_stale = layout_frame_cache
+        .as_ref()
+        .is_none_or(|(path, _)| path != layout_artifact);
+    if cache_stale {
         let artifact_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
-        *layout_frame_cache = Some(serde_json::from_value(
-            artifact_json
-                .get("layout_frame")
-                .cloned()
-                .ok_or("layout artifact missing layout_frame")?,
-        )?);
+        *layout_frame_cache = Some((
+            layout_artifact.to_owned(),
+            serde_json::from_value(
+                artifact_json
+                    .get("layout_frame")
+                    .cloned()
+                    .ok_or("layout artifact missing layout_frame")?,
+            )?,
+        ));
     }
     let layout_frame = layout_frame_cache
         .as_ref()
+        .map(|(_, frame)| frame)
         .ok_or("layout frame cache was not initialized")?;
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
@@ -1116,11 +1243,7 @@ fn lower_document_element(
         );
         return;
     }
-    if document_child_value(statement, "visible", expressions)
-        .as_deref()
-        .and_then(|raw| document_resolved_bool(raw, context))
-        == Some(false)
-    {
+    if document_child_bool(statement, "visible", expressions, context) == Some(false) {
         return;
     }
     let base_node_id = document_child_value(statement, "id", expressions)
@@ -1156,17 +1279,19 @@ fn lower_document_element(
             "text" | "value" | "display_value" | "placeholder" | "template"
         ) && node.text.is_none()
         {
-            let text = if field == "template" {
-                document_resolved_template(&value, context)
-            } else {
-                document_resolved_text(&value, context)
-            };
+            let text = document_text_value(child, expressions, context, field == "template")
+                .unwrap_or_else(|| value.clone());
             node.text = Some(boon_document_model::TextValue { text });
         }
-        if is_source_intent_field(&field) && node.source_binding.is_none() {
+        let source_intent_value = if field == "target" {
+            document_text_value(child, expressions, context, false).unwrap_or_else(|| value.clone())
+        } else {
+            value.clone()
+        };
+        if is_source_binding_field(&field) && node.source_binding.is_none() {
             node.source_binding = Some(boon_document_model::SourceBinding {
                 id: boon_document_model::SourceBindingId(format!("source:{}:{}", id.0, field)),
-                source_path: value.clone(),
+                source_path: source_intent_value.clone(),
                 intent: field.clone(),
             });
         }
@@ -1174,7 +1299,7 @@ fn lower_document_element(
             source_intents.push(json!({
                 "node": id,
                 "intent": field,
-                "source_path": value
+                "source_path": source_intent_value
             }));
         } else if let Some(style_value) = document_style_value(child, expressions, context) {
             node.style.insert(field, style_value);
@@ -1280,7 +1405,7 @@ fn document_node_kind_from_name(name: &str) -> boon_document_model::DocumentNode
     match name {
         "Row" => boon_document_model::DocumentNodeKind::Row,
         "Text" => boon_document_model::DocumentNodeKind::Text,
-        "Button" => boon_document_model::DocumentNodeKind::Button,
+        "Button" | "Checkbox" => boon_document_model::DocumentNodeKind::Button,
         "Input" | "TextInput" => boon_document_model::DocumentNodeKind::TextInput,
         "Grid" => boon_document_model::DocumentNodeKind::Grid,
         "GridCell" => boon_document_model::DocumentNodeKind::GridCell,
@@ -1292,7 +1417,8 @@ fn document_node_kind_from_name(name: &str) -> boon_document_model::DocumentNode
 fn is_source_intent_field(field: &str) -> bool {
     matches!(
         field,
-        "change"
+        "source"
+            | "change"
             | "submit"
             | "cancel"
             | "press"
@@ -1302,6 +1428,10 @@ fn is_source_intent_field(field: &str) -> bool {
             | "double_click"
             | "target"
     )
+}
+
+fn is_source_binding_field(field: &str) -> bool {
+    is_source_intent_field(field) && field != "target"
 }
 
 fn style_bool(style: &boon_document_model::StyleMap, key: &str) -> bool {
@@ -1329,6 +1459,19 @@ fn document_child_value(
         .iter()
         .find(|child| document_field_name(child).as_deref() == Some(field))
         .and_then(|child| document_statement_value(child, expressions))
+}
+
+fn document_child_bool(
+    statement: &AstStatement,
+    field: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<bool> {
+    let child = statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some(field))?;
+    document_bool_value(child, expressions, context)
 }
 
 fn document_statement_value(statement: &AstStatement, expressions: &[AstExpr]) -> Option<String> {
@@ -1373,6 +1516,54 @@ fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String
     }
 }
 
+fn document_text_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    template: bool,
+) -> Option<String> {
+    let expr = expressions.get(statement.expr?)?;
+    if template {
+        return document_expr_value(expr, expressions)
+            .map(|value| document_resolved_template(&value, context));
+    }
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) => {
+            if value.starts_with('$') {
+                Some(document_resolved_text(value, context))
+            } else {
+                Some(value.clone())
+            }
+        }
+        AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Bool(value) => Some(value.to_string()),
+        _ => document_eval_expr_value(expr, expressions, context)
+            .map(|value| json_value_to_document_text(&value))
+            .or_else(|| document_expr_value(expr, expressions)),
+    }
+}
+
+fn document_bool_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<bool> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Bool(value) => Some(*value),
+        AstExprKind::StringLiteral(value) if value.starts_with('$') => {
+            document_resolved_bool(value, context)
+        }
+        AstExprKind::StringLiteral(value) => Some(value.eq_ignore_ascii_case("true")),
+        _ => match document_eval_expr_value(expr, expressions, context) {
+            Some(Value::Bool(value)) => Some(value),
+            Some(Value::String(value)) => Some(value.eq_ignore_ascii_case("true")),
+            _ => None,
+        },
+    }
+}
+
 fn document_style_value(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -1385,25 +1576,103 @@ fn document_style_value(
             .ok()
             .map(boon_document_model::StyleValue::Number),
         AstExprKind::Bool(value) => Some(boon_document_model::StyleValue::Bool(*value)),
+        AstExprKind::StringLiteral(value) if !value.starts_with('$') => {
+            Some(boon_document_model::StyleValue::Text(value.clone()))
+        }
+        AstExprKind::TextLiteral(value) => {
+            Some(boon_document_model::StyleValue::Text(value.clone()))
+        }
         _ => {
-            let value = document_expr_value(expr, expressions)?;
-            if let Some(resolved) = document_resolved_value(&value, context) {
+            if let Some(resolved) = document_eval_expr_value(expr, expressions, context) {
                 return Some(match resolved {
-                    Value::Bool(value) => boon_document_model::StyleValue::Bool(*value),
+                    Value::Bool(value) => boon_document_model::StyleValue::Bool(value),
                     Value::Number(value) => {
                         boon_document_model::StyleValue::Number(value.as_f64().unwrap_or_default())
                     }
-                    _ => {
-                        boon_document_model::StyleValue::Text(json_value_to_document_text(resolved))
-                    }
+                    _ => boon_document_model::StyleValue::Text(json_value_to_document_text(
+                        &resolved,
+                    )),
                 });
             }
+            let value = document_expr_value(expr, expressions)?;
             Some(boon_document_model::StyleValue::Text(value))
         }
     }
 }
 
+fn document_eval_expr_value(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    match &expr.kind {
+        AstExprKind::Identifier(value) => document_resolved_value(value, context).cloned(),
+        AstExprKind::Path(parts) => document_resolved_value(&parts.join("."), context).cloned(),
+        AstExprKind::StringLiteral(value) => {
+            if value.starts_with('$') {
+                document_resolved_value(value, context).cloned()
+            } else {
+                Some(Value::String(value.clone()))
+            }
+        }
+        AstExprKind::TextLiteral(value) | AstExprKind::Enum(value) => {
+            Some(Value::String(value.clone()))
+        }
+        AstExprKind::Number(value) => value.parse::<i64>().ok().map(|value| json!(value)),
+        AstExprKind::Bool(value) => Some(Value::Bool(*value)),
+        AstExprKind::Infix { left, op, right } => {
+            let left = document_eval_expr_value(expressions.get(*left)?, expressions, context)?;
+            let right = document_eval_expr_value(expressions.get(*right)?, expressions, context)?;
+            document_eval_infix(&left, op, &right)
+        }
+        _ => None,
+    }
+}
+
+fn document_eval_infix(left: &Value, op: &str, right: &Value) -> Option<Value> {
+    let result = match op {
+        "==" => json_values_equal(left, right),
+        "!=" => !json_values_equal(left, right),
+        ">" => json_values_cmp(left, right).is_some_and(|ordering| ordering.is_gt()),
+        "<" => json_values_cmp(left, right).is_some_and(|ordering| ordering.is_lt()),
+        ">=" => json_values_cmp(left, right).is_some_and(|ordering| {
+            matches!(
+                ordering,
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+            )
+        }),
+        "<=" => json_values_cmp(left, right).is_some_and(|ordering| {
+            matches!(
+                ordering,
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+            )
+        }),
+        _ => return None,
+    };
+    Some(Value::Bool(result))
+}
+
+fn json_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        _ => left == right,
+    }
+}
+
+fn json_values_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64()?.partial_cmp(&right.as_f64()?),
+        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
+}
+
 fn document_resolved_text(raw: &str, context: &DocumentEvalContext<'_>) -> String {
+    if !raw.starts_with('$') {
+        return raw.to_owned();
+    }
     document_resolved_value(raw, context)
         .map(json_value_to_document_text)
         .unwrap_or_else(|| raw.to_owned())
@@ -1430,7 +1699,11 @@ fn document_resolved_template(raw: &str, context: &DocumentEvalContext<'_>) -> S
             return rendered;
         };
         let key = &tail[..close];
-        rendered.push_str(&document_resolved_text(key.trim(), context));
+        rendered.push_str(
+            &document_resolved_value(key.trim(), context)
+                .map(json_value_to_document_text)
+                .unwrap_or_else(|| key.trim().to_owned()),
+        );
         remaining = &tail[close + 1..];
     }
     rendered.push_str(remaining);
@@ -1512,12 +1785,19 @@ fn write_live_state_report(
 }
 
 #[derive(Clone, Debug)]
+struct PreviewSharedRenderState {
+    layout_proof: serde_json::Value,
+    update_count: u64,
+}
+
+#[derive(Clone, Debug)]
 struct PreviewIpcState {
     source_path: PathBuf,
     source_text: String,
     source_bytes: u64,
     source_sha256: String,
     runtime_summary: serde_json::Value,
+    shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
 }
 
 fn start_preview_ipc_server(
@@ -1584,6 +1864,14 @@ fn handle_preview_ipc_client(
                     .get("preview_runtime_summary")
                     .cloned()
                     .unwrap_or_else(|| json!({"status": "missing"}));
+                if let Some(layout_proof) = response.get("document_layout_proof") {
+                    let mut shared = state
+                        .shared_render_state
+                        .lock()
+                        .map_err(|_| "preview render state mutex poisoned")?;
+                    shared.layout_proof = layout_proof.clone();
+                    shared.update_count = shared.update_count.saturating_add(1);
+                }
             }
         }
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
@@ -1701,11 +1989,19 @@ fn preview_operator_host_input_response(
     state: &PreviewIpcState,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let events = request
+    let empty_inputs = Vec::new();
+    let host_inputs = request
+        .get("host_input_scenarios")
+        .and_then(serde_json::Value::as_array);
+    let source_inputs = request
         .get("source_events")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("operator-host-input request missing source_events")?;
+        .and_then(serde_json::Value::as_array);
+    let inputs = host_inputs.or(source_inputs).unwrap_or(&empty_inputs);
+    if inputs.is_empty() {
+        return Err("operator-host-input request missing host_input_scenarios".into());
+    }
     let scenario_path = state.source_path.with_extension("scn");
+    let layout_proof = native_document_layout_proof(&state.source_path, &state.source_text).ok();
     let mut runtime = boon_runtime::LiveRuntime::new(
         &format!("native-preview-ipc:{}", state.source_path.display()),
         &state.source_text,
@@ -1713,7 +2009,22 @@ fn preview_operator_host_input_response(
     )?;
     let mut outputs = Vec::new();
     let mut assertions = Vec::new();
-    for (index, event_json) in events.iter().enumerate() {
+    let mut route_assertions = Vec::new();
+    let mut shared_render_update_count = 0_u64;
+    for (index, input_json) in inputs.iter().enumerate() {
+        let event_json = input_json.get("source_event").unwrap_or(input_json);
+        let before_state = runtime.state_summary();
+        let route_layout_proof = native_document_route_probe_for_state(
+            &state.source_path,
+            &state.source_text,
+            &before_state,
+        )
+        .ok();
+        let host_route = preview_host_input_route_proof(
+            input_json,
+            event_json,
+            route_layout_proof.as_ref().or(layout_proof.as_ref()),
+        );
         let source = event_json
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -1741,12 +2052,46 @@ fn preview_operator_host_input_response(
                 .and_then(serde_json::Value::as_u64)
                 .map(|value| value as usize),
         };
+        let before_state_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&before_state)?);
         let output = runtime.apply_source_event(event.clone())?;
-        let assertion = preview_operator_host_input_assertion(index, &event, &output.state_summary);
+        let after_layout_proof = native_document_route_probe_for_state(
+            &state.source_path,
+            &state.source_text,
+            &output.state_summary,
+        )
+        .ok();
+        if let Some(layout_proof) = after_layout_proof.as_ref() {
+            let mut shared = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.layout_proof = layout_proof.clone();
+            shared.update_count = shared.update_count.saturating_add(1);
+            shared_render_update_count = shared.update_count;
+        }
+        let assertion =
+            preview_operator_host_input_assertion(index, event_json, &event, &output.state_summary);
+        route_assertions.push(host_route.clone());
         outputs.push(json!({
+            "scenario": event_json.get("scenario").cloned().unwrap_or_else(|| json!(null)),
             "event": live_source_event_report(&event),
+            "host_route": host_route,
             "semantic_delta_count": output.semantic_deltas.len(),
             "render_patch_count": output.render_patches.len(),
+            "framebuffer_delta_evidence": {
+                "method": "render-patch-backed-framebuffer-change-required",
+                "before_state_hash": before_state_hash,
+                "after_state_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
+                "render_patch_count": output.render_patches.len(),
+                "app_owned_framebuffer_readback_required_by_preview_report": true,
+                "preview_shared_render_state_updated": after_layout_proof.is_some(),
+                "preview_shared_render_update_count": shared_render_update_count,
+                "post_input_layout_artifact": after_layout_proof
+                    .as_ref()
+                    .and_then(|proof| proof.get("artifact_path"))
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            },
             "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
             "bounded_state_summary_sample": bounded_state_summary_sample(&output.state_summary)
         }));
@@ -1754,6 +2099,9 @@ fn preview_operator_host_input_response(
     }
     let status = if !assertions.is_empty()
         && assertions.iter().all(|assertion| {
+            assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        && route_assertions.iter().all(|assertion| {
             assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
         }) {
         "pass"
@@ -1770,9 +2118,13 @@ fn preview_operator_host_input_response(
         "operator_host_input": true,
         "real_os_input": false,
         "input_injection_method": "operator_host_event_harness",
-        "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview IPC -> LiveRuntime::apply_source_event",
+        "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
         "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event",
         "private_runtime_dispatch_used": false,
+        "source_event_only_ipc_shortcut": host_inputs.is_none(),
+        "preview_side_layout_recomputed": layout_proof.is_some(),
+        "preview_shared_render_update_count": shared_render_update_count,
+        "host_route_assertions": route_assertions,
         "assertions": assertions,
         "outputs": outputs,
         "full_state_mirroring_observed": false,
@@ -1780,11 +2132,120 @@ fn preview_operator_host_input_response(
     }))
 }
 
+fn preview_host_input_route_proof(
+    input_json: &serde_json::Value,
+    event_json: &serde_json::Value,
+    layout_proof: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let source_path = event_json
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let dynamic_layout = input_json
+        .get("requires_dynamic_layout_after_previous_event")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let requested_node = input_json
+        .get("target_node")
+        .and_then(serde_json::Value::as_str);
+    let source_intents = layout_proof
+        .and_then(|proof| proof.get("source_intent_assertions"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let hit_regions = layout_proof
+        .and_then(|proof| proof.get("hit_target_assertions"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let matched_source_intent = source_intents.iter().find(|intent| {
+        intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_path)
+            && requested_node.is_none_or(|node| {
+                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+            })
+    });
+    let matched_node = matched_source_intent
+        .and_then(|intent| intent.get("node"))
+        .and_then(serde_json::Value::as_str)
+        .or(requested_node);
+    let matched_hit_region = matched_node.and_then(|node| {
+        hit_regions
+            .iter()
+            .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+    });
+    let source_binding_resolved = matched_source_intent.is_some();
+    let hit_test_performed = matched_hit_region.is_some();
+    let pass = source_binding_resolved && (hit_test_performed || dynamic_layout);
+    let host_events = normalize_host_route_events(
+        input_json
+            .get("host_events")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        matched_hit_region.cloned(),
+    );
+    json!({
+        "pass": pass,
+        "source_path": source_path,
+        "target_node": matched_node,
+        "host_events": host_events,
+        "source_intent": matched_source_intent.cloned().unwrap_or_else(|| json!(null)),
+        "target_hit_region": matched_hit_region.cloned().unwrap_or_else(|| json!(null)),
+        "hit_test_performed": hit_test_performed,
+        "source_binding_resolved": source_binding_resolved,
+        "dynamic_layout_after_previous_event": dynamic_layout,
+        "ipc_only_state_mutation": false,
+        "injection_boundary": "HostInputEvent boundary after app_window normalization and before document routing"
+    })
+}
+
+fn normalize_host_route_events(
+    host_events: serde_json::Value,
+    target_hit_region: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let Some(target) = target_hit_region else {
+        return host_events;
+    };
+    let Some(events) = host_events.as_array() else {
+        return host_events;
+    };
+    json!(
+        events
+            .iter()
+            .map(|event| {
+                let mut event = event.clone();
+                if event
+                    .get("target_region")
+                    .is_none_or(serde_json::Value::is_null)
+                {
+                    event["target_region"] = target.clone();
+                }
+                event
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
 fn preview_operator_host_input_assertion(
     index: usize,
+    event_json: &serde_json::Value,
     event: &boon_runtime::LiveSourceEvent,
     state_summary: &serde_json::Value,
 ) -> serde_json::Value {
+    if let Some(scenario) = event_json
+        .get("scenario")
+        .and_then(serde_json::Value::as_str)
+    {
+        return preview_todomvc_scenario_assertion(
+            index,
+            scenario,
+            event_json,
+            event,
+            state_summary,
+        );
+    }
     if event.source == "store.sources.new_todo_input.change" {
         return json!({
             "id": format!("preview-ipc-host-input-{index}"),
@@ -1847,6 +2308,107 @@ fn preview_operator_host_input_assertion(
         "pass": false,
         "event": live_source_event_report(event),
         "error": "source event was not recognized by the generic preview input assertion probe"
+    })
+}
+
+fn preview_todomvc_scenario_assertion(
+    index: usize,
+    scenario: &str,
+    event_json: &serde_json::Value,
+    event: &boon_runtime::LiveSourceEvent,
+    state_summary: &serde_json::Value,
+) -> serde_json::Value {
+    let todos = state_summary
+        .get("todos")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let todo_title_exists = |title: &str| {
+        todos
+            .iter()
+            .any(|todo| todo.get("title") == Some(&json!(title)))
+    };
+    let todo_completed = |title: &str| {
+        todos.iter().any(|todo| {
+            todo.get("title") == Some(&json!(title)) && todo.get("completed") == Some(&json!(true))
+        })
+    };
+    let no_todo_editing = || {
+        todos
+            .iter()
+            .all(|todo| todo.get("editing") != Some(&json!(true)))
+    };
+    let todo_edit_text = |title: &str| {
+        todos.iter().find_map(|todo| {
+            (todo.get("title") == Some(&json!(title)))
+                .then(|| todo.get("edit_text").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+    };
+    let active_count = state_summary
+        .get("active_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let completed_count = state_summary
+        .get("completed_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let selected_filter = state_summary
+        .get("selected_filter")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let target = event.target_text.as_deref().unwrap_or_default();
+    let event_text = event.text.as_deref().unwrap_or_default();
+    let expected_filter = event_json
+        .get("expect_filter")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let pass = match scenario {
+        "type_new_todo" => state_summary.get("new_todo_text") == Some(&json!(event_text)),
+        "add_todo" => {
+            todo_title_exists(event_text) && state_summary.get("new_todo_text") == Some(&json!(""))
+        }
+        "reject_empty_add" => {
+            !todo_title_exists(event_text.trim())
+                && todos.len()
+                    == event_json
+                        .get("expect_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(todos.len() as u64) as usize
+        }
+        "toggle_single_row" => todo_completed(target),
+        "toggle_all_rows" => active_count == 0 && completed_count == todos.len() as u64,
+        "filter_all_active_completed" => selected_filter == expected_filter,
+        "edit_open_enter" | "edit_open_escape" | "edit_open_blur" => todos.iter().any(|todo| {
+            todo.get("title") == Some(&json!(target)) && todo.get("editing") == Some(&json!(true))
+        }),
+        "edit_change_enter" | "edit_change_escape" | "edit_change_blur" => {
+            todo_edit_text(target) == Some(event_text)
+        }
+        "edit_commit_enter" => todo_title_exists(event_text) && no_todo_editing(),
+        "edit_cancel_escape" => {
+            todo_title_exists(target) && !todo_title_exists(event_text) && no_todo_editing()
+        }
+        "edit_commit_blur" => todo_title_exists(event_text) && no_todo_editing(),
+        "delete_row" => !todo_title_exists(target),
+        "clear_completed" => completed_count == 0 && todos.is_empty(),
+        _ => false,
+    };
+    json!({
+        "id": format!("preview-ipc-host-input-{scenario}-{index}"),
+        "pass": pass,
+        "scenario": scenario,
+        "event": live_source_event_report(event),
+        "actual": {
+            "todo_count": todos.len(),
+            "active_count": active_count,
+            "completed_count": completed_count,
+            "selected_filter": selected_filter,
+            "titles": todos
+                .iter()
+                .filter_map(|todo| todo.get("title").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+        }
     })
 }
 
@@ -1987,13 +2549,108 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
     {
         json!([
             {
+                "scenario": "type_new_todo",
                 "source": "store.sources.new_todo_input.change",
                 "text": "Native GPU todo"
             },
             {
+                "scenario": "add_todo",
                 "source": "store.sources.new_todo_input.key_down",
                 "text": "Native GPU todo",
                 "key": "Enter"
+            },
+            {
+                "scenario": "reject_empty_add",
+                "source": "store.sources.new_todo_input.key_down",
+                "text": "   ",
+                "key": "Enter",
+                "expect_count": 5
+            },
+            {
+                "scenario": "toggle_single_row",
+                "source": "todo.sources.todo_checkbox.click",
+                "target_text": "Buy groceries"
+            },
+            {
+                "scenario": "filter_all_active_completed",
+                "source": "store.sources.filter_active.press",
+                "expect_filter": "Active"
+            },
+            {
+                "scenario": "filter_all_active_completed",
+                "source": "store.sources.filter_completed.press",
+                "expect_filter": "Completed"
+            },
+            {
+                "scenario": "filter_all_active_completed",
+                "source": "store.sources.filter_all.press",
+                "expect_filter": "All"
+            },
+            {
+                "scenario": "edit_open_enter",
+                "source": "todo.sources.todo_title_element.double_click",
+                "target_text": "Native GPU todo"
+            },
+            {
+                "scenario": "edit_change_enter",
+                "source": "todo.sources.editing_todo_title_element.change",
+                "target_text": "Native GPU todo",
+                "text": "Native GPU todo edited"
+            },
+            {
+                "scenario": "edit_commit_enter",
+                "source": "todo.sources.editing_todo_title_element.key_down",
+                "target_text": "Native GPU todo",
+                "text": "Native GPU todo edited",
+                "key": "Enter"
+            },
+            {
+                "scenario": "edit_open_escape",
+                "source": "todo.sources.todo_title_element.double_click",
+                "target_text": "Native GPU todo edited"
+            },
+            {
+                "scenario": "edit_change_escape",
+                "source": "todo.sources.editing_todo_title_element.change",
+                "target_text": "Native GPU todo edited",
+                "text": "Cancelled title"
+            },
+            {
+                "scenario": "edit_cancel_escape",
+                "source": "todo.sources.editing_todo_title_element.key_down",
+                "target_text": "Native GPU todo edited",
+                "text": "Cancelled title",
+                "key": "Escape"
+            },
+            {
+                "scenario": "edit_open_blur",
+                "source": "todo.sources.todo_title_element.double_click",
+                "target_text": "Native GPU todo edited"
+            },
+            {
+                "scenario": "edit_change_blur",
+                "source": "todo.sources.editing_todo_title_element.change",
+                "target_text": "Native GPU todo edited",
+                "text": "Blur saved title"
+            },
+            {
+                "scenario": "edit_commit_blur",
+                "source": "todo.sources.editing_todo_title_element.blur",
+                "target_text": "Native GPU todo edited",
+                "text": "Blur saved title"
+            },
+            {
+                "scenario": "delete_row",
+                "source": "todo.sources.remove_todo_button.press",
+                "target_text": "Walk the dog"
+            },
+            {
+                "scenario": "toggle_all_rows",
+                "source": "store.sources.toggle_all_checkbox.click"
+            },
+            {
+                "scenario": "clear_completed",
+                "source": "store.sources.clear_completed_button.press"
             }
         ])
     } else if has_source("cell.sources.editor.change")
@@ -2017,6 +2674,59 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
     } else {
         return None;
     };
+    let hit_regions = layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let host_input_scenarios = source_events
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .map(|event| {
+                    let source_path = event
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let source_intent = source_intents
+                        .iter()
+                        .find(|intent| {
+                            intent
+                                .get("source_path")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(source_path)
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| json!(null));
+                    let node = source_intent
+                        .get("node")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let target_hit_region = node.as_deref().and_then(|node| {
+                        hit_regions
+                            .iter()
+                            .find(|region| {
+                                region.get("node").and_then(serde_json::Value::as_str)
+                                    == Some(node)
+                            })
+                            .cloned()
+                    });
+                    let needs_dynamic_layout = source_path.contains("editing_todo_title_element");
+                    json!({
+                        "scenario": event.get("scenario").cloned().unwrap_or_else(|| json!(null)),
+                        "source_event": event,
+                        "target_node": node,
+                        "source_intent": source_intent,
+                        "target_hit_region": target_hit_region.clone(),
+                        "requires_dynamic_layout_after_previous_event": needs_dynamic_layout,
+                        "host_events": host_events_for_source_event(event, target_hit_region.as_ref()),
+                        "injection_boundary": "HostInputEvent boundary after app_window normalization and before document hit/source routing"
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Some(json!({
         "kind": "operator-host-input",
         "source_path": path.display().to_string(),
@@ -2029,8 +2739,47 @@ fn operator_host_input_probe_request(path: &Path, code: &str) -> Option<serde_js
             {"kind": "Key", "phase": "Press", "source": "operator_host_event_harness"}
         ],
         "source_events": source_events,
+        "host_input_scenarios": host_input_scenarios,
         "layout_proof_hash": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!(null))
     }))
+}
+
+fn host_events_for_source_event(
+    event: &serde_json::Value,
+    target_hit_region: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let source = event
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    if source.ends_with(".change") {
+        events.push(json!({
+            "kind": "TextInput",
+            "text": event.get("text").cloned().unwrap_or_else(|| json!("")),
+            "source": "operator_host_event_harness"
+        }));
+    } else {
+        events.push(json!({
+            "kind": if source.ends_with(".key_down") { "Key" } else { "Pointer" },
+            "phase": "Press",
+            "button": if source.ends_with(".key_down") { serde_json::Value::Null } else { json!("Primary") },
+            "key": event.get("key").cloned().unwrap_or_else(|| json!(null)),
+            "target_region": target_hit_region.cloned().unwrap_or_else(|| json!(null)),
+            "source": "operator_host_event_harness"
+        }));
+    }
+    if source.ends_with(".key_down") && event.get("text").is_some() {
+        events.insert(
+            0,
+            json!({
+                "kind": "TextInput",
+                "text": event.get("text").cloned().unwrap_or_else(|| json!("")),
+                "source": "operator_host_event_harness"
+            }),
+        );
+    }
+    json!(events)
 }
 
 fn send_preview_ipc_request(

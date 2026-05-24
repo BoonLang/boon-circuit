@@ -3,9 +3,9 @@
 
 use bitvec::prelude::*;
 use boon_ir::{
-    DerivedValueKind, FormulaOperationKind, InitialValue, ListInitializer, ListOperationKind,
-    ListPredicate, SourceId, SourcePayloadField, TypedProgram, UpdateExpression, debug_tables,
-    lower, verify_hidden_identity, verify_static_schedule,
+    DerivedValueKind, FieldId, FormulaOperationKind, InitialValue, ListId, ListInitializer,
+    ListOperationKind, ListPredicate, SourceId, SourcePayloadField, TypedProgram, UpdateExpression,
+    debug_tables, lower, verify_hidden_identity, verify_static_schedule,
 };
 use boon_parser::{DocumentAst, ParsedProgram, parse_source};
 use serde::ser::{SerializeMap, SerializeStruct};
@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,7 +160,7 @@ impl<'a> GenericSourceEvent<'a> {
 #[derive(Clone, Copy, Debug)]
 struct GenericRoutedSourceEvent<'a> {
     event: GenericSourceEvent<'a>,
-    route_kind: GenericSourceRouteKind,
+    route_kind: SourceActionKind,
 }
 
 impl<'a> GenericRoutedSourceEvent<'a> {
@@ -267,12 +267,12 @@ pub struct LiveStepOutput {
 #[derive(Clone, Debug)]
 pub struct SemanticDelta<'a> {
     pub kind: &'static str,
-    pub list_id: Option<&'static str>,
+    pub list_id: Option<Cow<'a, str>>,
     pub key: Option<u64>,
     pub generation: Option<u64>,
     pub source_id: Option<u64>,
     pub bind_epoch: Option<u64>,
-    pub field_path: Option<&'static str>,
+    pub field_path: Option<Cow<'a, str>>,
     pub value: ProtocolValue<'a>,
 }
 
@@ -281,7 +281,7 @@ pub struct RenderPatch<'a> {
     pub kind: &'static str,
     pub target: RenderTarget<'a>,
     pub value: ProtocolValue<'a>,
-    pub list_id: Option<&'static str>,
+    pub list_id: Option<Cow<'a, str>>,
     pub key: Option<u64>,
     pub generation: Option<u64>,
     pub source_id: Option<u64>,
@@ -300,7 +300,7 @@ pub enum ProtocolValue<'a> {
         editing: bool,
     },
     SourceBinding {
-        source_path: &'static str,
+        source_path: Cow<'a, str>,
         source_id: u64,
         bind_epoch: u64,
     },
@@ -309,26 +309,32 @@ pub enum ProtocolValue<'a> {
 
 #[derive(Clone, Debug)]
 pub enum RenderTarget<'a> {
-    Static(&'static str),
+    Static(Cow<'a, str>),
     Borrowed(Cow<'a, str>),
     TodoRow(u64),
     TodoTitle(u64),
     TodoEdit(u64),
     TodoCheckbox(u64),
     TodoPosition(u64),
-    TodoSource(u64, &'static str),
+    TodoSource(u64, Cow<'a, str>),
 }
 
 impl<'a> SemanticDelta<'a> {
     fn to_static(&self) -> SemanticDelta<'static> {
         SemanticDelta {
             kind: self.kind,
-            list_id: self.list_id,
+            list_id: self
+                .list_id
+                .as_ref()
+                .map(|value| Cow::Owned(value.to_string())),
             key: self.key,
             generation: self.generation,
             source_id: self.source_id,
             bind_epoch: self.bind_epoch,
-            field_path: self.field_path,
+            field_path: self
+                .field_path
+                .as_ref()
+                .map(|value| Cow::Owned(value.to_string())),
             value: self.value.to_static(),
         }
     }
@@ -340,7 +346,10 @@ impl<'a> RenderPatch<'a> {
             kind: self.kind,
             target: self.target.to_static(),
             value: self.value.to_static(),
-            list_id: self.list_id,
+            list_id: self
+                .list_id
+                .as_ref()
+                .map(|value| Cow::Owned(value.to_string())),
             key: self.key,
             generation: self.generation,
             source_id: self.source_id,
@@ -370,7 +379,7 @@ impl<'a> ProtocolValue<'a> {
                 source_id,
                 bind_epoch,
             } => ProtocolValue::SourceBinding {
-                source_path,
+                source_path: Cow::Owned(source_path.to_string()),
                 source_id: *source_id,
                 bind_epoch: *bind_epoch,
             },
@@ -382,14 +391,16 @@ impl<'a> ProtocolValue<'a> {
 impl<'a> RenderTarget<'a> {
     fn to_static(&self) -> RenderTarget<'static> {
         match self {
-            Self::Static(value) => RenderTarget::Static(value),
+            Self::Static(value) => RenderTarget::Static(Cow::Owned(value.to_string())),
             Self::Borrowed(value) => RenderTarget::Borrowed(Cow::Owned(value.to_string())),
             Self::TodoRow(key) => RenderTarget::TodoRow(*key),
             Self::TodoTitle(key) => RenderTarget::TodoTitle(*key),
             Self::TodoEdit(key) => RenderTarget::TodoEdit(*key),
             Self::TodoCheckbox(key) => RenderTarget::TodoCheckbox(*key),
             Self::TodoPosition(key) => RenderTarget::TodoPosition(*key),
-            Self::TodoSource(key, source_path) => RenderTarget::TodoSource(*key, source_path),
+            Self::TodoSource(key, source_path) => {
+                RenderTarget::TodoSource(*key, Cow::Owned(source_path.to_string()))
+            }
         }
     }
 }
@@ -1033,21 +1044,21 @@ impl LoadedRuntime {
                 )
             })?;
         match routed.route_kind {
-            GenericSourceRouteKind::RootText
-            | GenericSourceRouteKind::ListAppend
-            | GenericSourceRouteKind::RootScalar
-            | GenericSourceRouteKind::ListRemove
-            | GenericSourceRouteKind::IndexedBoolBulk => {}
-            GenericSourceRouteKind::IndexedTextChange
-            | GenericSourceRouteKind::IndexedTextCommit
-            | GenericSourceRouteKind::IndexedTextIdentity
-            | GenericSourceRouteKind::IndexedTextKey
-            | GenericSourceRouteKind::IndexedTextOpen
-            | GenericSourceRouteKind::IndexedBoolToggle => return Ok(None),
+            SourceActionKind::RootText
+            | SourceActionKind::ListAppend
+            | SourceActionKind::RootScalar
+            | SourceActionKind::ListRemove
+            | SourceActionKind::IndexedBoolBulk => {}
+            SourceActionKind::IndexedTextChange
+            | SourceActionKind::IndexedTextCommit
+            | SourceActionKind::IndexedTextIdentity
+            | SourceActionKind::IndexedTextKey
+            | SourceActionKind::IndexedTextOpen
+            | SourceActionKind::IndexedBoolToggle => return Ok(None),
         }
         assert_routed_source_event_matches(step, routed.event)?;
         match routed.route_kind {
-            GenericSourceRouteKind::RootText | GenericSourceRouteKind::RootScalar => {
+            SourceActionKind::RootText | SourceActionKind::RootScalar => {
                 let seq = TickSeq(state.next_source_seq);
                 state.next_source_seq += 1;
                 let input = generic.source_action_input_for_event(
@@ -1065,7 +1076,7 @@ impl LoadedRuntime {
                     },
                 )?;
             }
-            GenericSourceRouteKind::ListAppend => {
+            SourceActionKind::ListAppend => {
                 let seq = TickSeq(state.next_source_seq);
                 state.next_source_seq += 1;
                 let input = generic.source_action_input_for_event(
@@ -1086,7 +1097,7 @@ impl LoadedRuntime {
                     }
                 }
             }
-            GenericSourceRouteKind::ListRemove => {
+            SourceActionKind::ListRemove => {
                 let source_event = GenericSourceEvent {
                     source: routed.source(),
                     text: None,
@@ -1110,7 +1121,7 @@ impl LoadedRuntime {
                     },
                 )?;
             }
-            GenericSourceRouteKind::IndexedBoolBulk => {
+            SourceActionKind::IndexedBoolBulk => {
                 let all_completed = generic.todomvc_all_completed();
                 let input = generic.source_action_input_for_list_index(
                     &step.id,
@@ -1131,12 +1142,12 @@ impl LoadedRuntime {
                     },
                 )?;
             }
-            GenericSourceRouteKind::IndexedTextChange
-            | GenericSourceRouteKind::IndexedTextCommit
-            | GenericSourceRouteKind::IndexedTextIdentity
-            | GenericSourceRouteKind::IndexedTextKey
-            | GenericSourceRouteKind::IndexedTextOpen
-            | GenericSourceRouteKind::IndexedBoolToggle => unreachable!("filtered above"),
+            SourceActionKind::IndexedTextChange
+            | SourceActionKind::IndexedTextCommit
+            | SourceActionKind::IndexedTextIdentity
+            | SourceActionKind::IndexedTextKey
+            | SourceActionKind::IndexedTextOpen
+            | SourceActionKind::IndexedBoolToggle => unreachable!("filtered above"),
         }
         Ok(Some(StepExecutionMetrics {
             dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
@@ -1174,17 +1185,17 @@ impl LoadedRuntime {
                 )
             })?;
         match routed.route_kind {
-            GenericSourceRouteKind::IndexedBoolToggle
-            | GenericSourceRouteKind::IndexedTextOpen
-            | GenericSourceRouteKind::IndexedTextChange
-            | GenericSourceRouteKind::IndexedTextKey
-            | GenericSourceRouteKind::IndexedTextCommit
-            | GenericSourceRouteKind::ListRemove => {}
-            GenericSourceRouteKind::RootText
-            | GenericSourceRouteKind::ListAppend
-            | GenericSourceRouteKind::RootScalar
-            | GenericSourceRouteKind::IndexedBoolBulk
-            | GenericSourceRouteKind::IndexedTextIdentity => return Ok(None),
+            SourceActionKind::IndexedBoolToggle
+            | SourceActionKind::IndexedTextOpen
+            | SourceActionKind::IndexedTextChange
+            | SourceActionKind::IndexedTextKey
+            | SourceActionKind::IndexedTextCommit
+            | SourceActionKind::ListRemove => {}
+            SourceActionKind::RootText
+            | SourceActionKind::ListAppend
+            | SourceActionKind::RootScalar
+            | SourceActionKind::IndexedBoolBulk
+            | SourceActionKind::IndexedTextIdentity => return Ok(None),
         }
         assert_routed_source_event_matches(step, routed.event)?;
         let target_occurrence = step
@@ -1225,7 +1236,7 @@ impl LoadedRuntime {
         let resolved_index =
             generic.find_visible_row_index_by_occurrence("todos", "title", target_text, occurrence);
         match routed.route_kind {
-            GenericSourceRouteKind::IndexedBoolToggle => {
+            SourceActionKind::IndexedBoolToggle => {
                 let index = resolved_index?;
                 let all_completed = generic.todomvc_all_completed();
                 let input = generic.source_action_input_for_list_index(
@@ -1247,7 +1258,7 @@ impl LoadedRuntime {
                     },
                 )?;
             }
-            GenericSourceRouteKind::IndexedTextOpen => {
+            SourceActionKind::IndexedTextOpen => {
                 let index = resolved_index?;
                 close_other_todomvc_editors(generic, index, deltas, patches)?;
                 let all_completed = generic.todomvc_all_completed();
@@ -1284,7 +1295,7 @@ impl LoadedRuntime {
                     patches,
                 )?;
             }
-            GenericSourceRouteKind::IndexedTextChange => {
+            SourceActionKind::IndexedTextChange => {
                 let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
                 let source_event = GenericSourceEvent {
                     text: Some(routed.require_text(&step.id)?),
@@ -1306,7 +1317,7 @@ impl LoadedRuntime {
                     },
                 )?;
             }
-            GenericSourceRouteKind::IndexedTextKey => {
+            SourceActionKind::IndexedTextKey => {
                 let key = routed.event.key.unwrap_or_default();
                 if matches!(key, "Enter" | "Escape") {
                     let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
@@ -1355,7 +1366,7 @@ impl LoadedRuntime {
                     )?;
                 }
             }
-            GenericSourceRouteKind::IndexedTextCommit => {
+            SourceActionKind::IndexedTextCommit => {
                 let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
                 let all_completed = generic.todomvc_all_completed();
                 let source_event = GenericSourceEvent {
@@ -1391,7 +1402,7 @@ impl LoadedRuntime {
                     patches,
                 )?;
             }
-            GenericSourceRouteKind::ListRemove => {
+            SourceActionKind::ListRemove => {
                 let index = resolved_index?;
                 let mut removed = false;
                 let input = generic.source_action_input_for_list_index(
@@ -1536,10 +1547,10 @@ fn close_other_todomvc_editors<'a>(
         let (key, generation) =
             generic.commit_indexed_bool_field("todos", index, "editing", false)?;
         let commit = GenericBoolFieldCommit {
-            list: "todos",
+            list: "todos".to_owned(),
             key,
             generation,
-            field: "editing",
+            field: "editing".to_owned(),
             value: false,
         };
         deltas.push(commit.semantic_delta());
@@ -1763,7 +1774,7 @@ fn apply_loaded_cells_step_into<'a>(
     };
     assert_routed_source_event_matches(step, routed.event)?;
     match routed.route_kind {
-        GenericSourceRouteKind::IndexedTextChange => {
+        SourceActionKind::IndexedTextChange => {
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
@@ -1797,7 +1808,7 @@ fn apply_loaded_cells_step_into<'a>(
             batch.require_text(source, "editing-text update", "editing_text")?;
             batch.require_bool(source, "editing update", "editing")?;
         }
-        GenericSourceRouteKind::IndexedTextCommit => {
+        SourceActionKind::IndexedTextCommit => {
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
@@ -1808,7 +1819,7 @@ fn apply_loaded_cells_step_into<'a>(
                 generic, state, source, address, text, deltas, patches, recomputed,
             )?;
         }
-        GenericSourceRouteKind::IndexedTextIdentity => {
+        SourceActionKind::IndexedTextIdentity => {
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
@@ -1833,10 +1844,10 @@ fn apply_loaded_cells_step_into<'a>(
                 batch.require_identity(source, "editing-text cancel", "editing_text")?;
             let editing = batch.require_bool(source, "editing cancel", "editing")?;
             let index = loaded_cell_index(state, address)?;
-            let value = generic.list_row_textlike("cells", index, editing_text.field)?;
+            let value = generic.list_row_textlike("cells", index, &editing_text.field)?;
             let identity_value = cells_protocol_text(state, value);
             emit_cells_default_protocol_mutation(
-                GenericSourceMutation::TextFieldIdentity(editing_text),
+                GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
                 address,
                 Some(identity_value),
                 false,
@@ -1857,7 +1868,7 @@ fn apply_loaded_cells_step_into<'a>(
                 "SetCellText",
                 RenderTarget::Borrowed(Cow::Borrowed(address)),
                 cells_protocol_text(state, &state.cells[index].value),
-                editing_text.list,
+                editing_text.list.clone(),
                 editing_text.key,
                 editing_text.generation,
             ));
@@ -1900,11 +1911,11 @@ fn route_loaded_cells_source_event<'a>(
         .filter(|candidate| is_cell_address(candidate))
         .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
     match routed.route_kind {
-        GenericSourceRouteKind::IndexedTextCommit | GenericSourceRouteKind::IndexedTextChange => {
+        SourceActionKind::IndexedTextCommit | SourceActionKind::IndexedTextChange => {
             routed.require_text(&step.id)?;
             Ok(Some(routed))
         }
-        GenericSourceRouteKind::IndexedTextIdentity => Ok(Some(routed)),
+        SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
         route_kind => Err(format!(
             "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
             step.id
@@ -1953,7 +1964,7 @@ fn loaded_cells_commit_from_source<'a>(
     let display_key = formula.key;
     let display_generation = formula.generation;
     let display_value = generic.formula_equations.cell_value_protocol(cell)?;
-    let display_error = cell.error;
+    let display_error = cell.error.as_deref();
     emit_cells_default_protocol_mutation(
         GenericSourceMutation::TextField(formula),
         address,
@@ -2040,7 +2051,7 @@ fn sync_loaded_cell_derived_fields(
         index,
         fields,
         &state.cells[index].value,
-        state.cells[index].error,
+        state.cells[index].error.as_deref(),
         &state.cells[index].dependency_text,
     )
 }
@@ -2138,6 +2149,7 @@ struct ExecutableSurfaceProfile {
 
 #[derive(Clone, Debug)]
 struct CompiledProgram {
+    symbols: RuntimeSymbols,
     surface: ExecutableSurfaceProfile,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
@@ -2174,8 +2186,128 @@ struct CompiledProgram {
     unsupported_list_operation_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct RuntimeSymbolId(u32);
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeSymbols {
+    paths: Vec<Box<str>>,
+    by_path: BTreeMap<Box<str>, RuntimeSymbolId>,
+}
+
+impl RuntimeSymbols {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let mut symbols = Self::default();
+        for source in &ir.sources {
+            symbols.intern(&source.path);
+        }
+        for cell in &ir.state_cells {
+            symbols.intern(&cell.path);
+        }
+        for list in &ir.lists {
+            symbols.intern(&list.name);
+        }
+        for value in &ir.derived_values {
+            symbols.intern(&value.path);
+            for source in &value.sources {
+                symbols.intern(source);
+            }
+        }
+        for branch in &ir.update_branches {
+            symbols.intern(&branch.target);
+            symbols.intern(&branch.source);
+            match &branch.expression {
+                UpdateExpression::SourcePayload { path }
+                | UpdateExpression::Const { value: path }
+                | UpdateExpression::PreviousValue { path }
+                | UpdateExpression::BoolNot { path } => {
+                    symbols.intern(path);
+                }
+                UpdateExpression::TextTrimOrPrevious { path, previous } => {
+                    symbols.intern(path);
+                    symbols.intern(previous);
+                }
+                UpdateExpression::Unknown { summary } => {
+                    symbols.intern(summary);
+                }
+            }
+        }
+        for operation in &ir.list_operations {
+            symbols.intern(&operation.list);
+            match &operation.kind {
+                ListOperationKind::Append { trigger, fields } => {
+                    symbols.intern(trigger);
+                    for field in fields {
+                        symbols.intern(&field.name);
+                        symbols.intern(&field.source);
+                    }
+                }
+                ListOperationKind::Remove { source, predicate } => {
+                    symbols.intern(source);
+                    symbols.intern_list_predicate(predicate);
+                }
+                ListOperationKind::Retain { target, predicate }
+                | ListOperationKind::Count { target, predicate } => {
+                    symbols.intern(target);
+                    symbols.intern_list_predicate(predicate);
+                }
+            }
+        }
+        for operation in &ir.formula_operations {
+            symbols.intern(&operation.target);
+            match &operation.kind {
+                FormulaOperationKind::Parse { input }
+                | FormulaOperationKind::Dependencies { input } => {
+                    symbols.intern(input);
+                }
+                FormulaOperationKind::Eval { formula, read } => {
+                    symbols.intern(formula);
+                    symbols.intern(read);
+                }
+                FormulaOperationKind::Error { formula, value } => {
+                    symbols.intern(formula);
+                    symbols.intern(value);
+                }
+            }
+        }
+        symbols
+    }
+
+    fn intern_list_predicate(&mut self, predicate: &ListPredicate) {
+        match predicate {
+            ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
+                self.intern(path);
+            }
+            ListPredicate::SelectedFilterVisibility {
+                selector,
+                row_field,
+            } => {
+                self.intern(selector);
+                self.intern(row_field);
+            }
+            ListPredicate::AlwaysTrue | ListPredicate::Unknown { .. } => {}
+        }
+    }
+
+    fn intern(&mut self, path: &str) -> RuntimeSymbolId {
+        if let Some(id) = self.by_path.get(path) {
+            return *id;
+        }
+        let id = RuntimeSymbolId(self.paths.len() as u32);
+        let owned: Box<str> = path.into();
+        self.paths.push(owned.clone());
+        self.by_path.insert(owned, id);
+        id
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
+}
+
 impl CompiledProgram {
     fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
+        let symbols = RuntimeSymbols::from_ir(ir);
         let surface = ExecutableSurfaceProfile::infer(ir)?;
         for cell in &ir.state_cells {
             if let InitialValue::Unknown { summary } = &cell.initial_value {
@@ -2260,6 +2392,7 @@ impl CompiledProgram {
         let source_payload_counts = SourcePayloadCounts::from_ir(ir);
         let storage_layout_counts = TypedStorageLayoutCounts::from_ir(ir);
         Ok(Self {
+            symbols,
             surface,
             scalar_equations,
             derived_equations,
@@ -2301,6 +2434,8 @@ impl CompiledProgram {
     fn report(&self) -> JsonValue {
         json!({
             "compiled_from_typed_ir": true,
+            "runtime_symbol_count": self.symbols.len(),
+            "runtime_symbol_ownership": "compiled_program_owned",
             "executable_surface": self.surface.kind.as_str(),
             "executable_surface_inferred_from_ir": self.surface.inferred_from_ir,
             "schedule_node_count": self.schedule_node_count,
@@ -2629,10 +2764,10 @@ struct StepExecutionMetrics {
     extra: StepExecutionExtra,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DirtyKeyEntry {
-    list_id: &'static str,
-    field_id: &'static str,
+    list_id: String,
+    field_id: String,
     key: u64,
 }
 
@@ -2652,10 +2787,10 @@ impl DirtyKeySets {
         self.entries.clear();
     }
 
-    fn mark(&mut self, list_id: &'static str, field_id: &'static str, key: u64) {
+    fn mark(&mut self, list_id: &str, field_id: &str, key: u64) {
         let entry = DirtyKeyEntry {
-            list_id,
-            field_id,
+            list_id: list_id.to_owned(),
+            field_id: field_id.to_owned(),
             key,
         };
         if !self.entries.contains(&entry) {
@@ -2664,14 +2799,17 @@ impl DirtyKeySets {
     }
 
     fn mark_delta(&mut self, delta: &SemanticDelta<'_>) {
-        let Some(list_id) = delta.list_id else {
+        let Some(list_id) = delta.list_id.as_ref() else {
             return;
         };
         let Some(key) = delta.key else {
             return;
         };
-        let field_id = delta.field_path.unwrap_or(delta.kind);
-        self.mark(list_id, field_id, key);
+        let field_id = delta
+            .field_path
+            .as_ref()
+            .map_or(delta.kind, |field| field.as_ref());
+        self.mark(list_id.as_ref(), field_id, key);
     }
 
     fn mark_deltas(&mut self, deltas: &[SemanticDelta<'_>]) -> usize {
@@ -2682,7 +2820,7 @@ impl DirtyKeySets {
         self.key_count()
     }
 
-    fn mark_indexes(&mut self, list_id: &'static str, field_id: &'static str, indexes: &[usize]) {
+    fn mark_indexes(&mut self, list_id: &str, field_id: &str, indexes: &[usize]) {
         self.clear();
         for index in indexes {
             self.mark(list_id, field_id, *index as u64 + 1);
@@ -3099,7 +3237,7 @@ fn base_example_report(
 fn remaining_example_specific_shells(
     compiled: &CompiledProgram,
     generic_runtime_slices: &JsonValue,
-) -> Vec<&'static str> {
+) -> Vec<String> {
     let Some(slices) = generic_runtime_slices.as_object() else {
         return Vec::new();
     };
@@ -3119,16 +3257,22 @@ fn remaining_example_specific_shells(
         "source_action_mutation_batch",
         "source_effects_through_action_executor",
     ]) {
-        shells.push(match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => "todomvc_scenario_glue",
-            ExecutableSurfaceKind::Cells => "cells_scenario_glue",
-        });
+        shells.push(
+            match compiled.surface.kind {
+                ExecutableSurfaceKind::TodoMvc => "todomvc_scenario_glue",
+                ExecutableSurfaceKind::Cells => "cells_scenario_glue",
+            }
+            .to_owned(),
+        );
     }
     if active_slice(&["scenario_expectation_assertions", "assertion_executor"]) {
-        shells.push(match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => "todomvc_assertion_glue",
-            ExecutableSurfaceKind::Cells => "cells_assertion_glue",
-        });
+        shells.push(
+            match compiled.surface.kind {
+                ExecutableSurfaceKind::TodoMvc => "todomvc_assertion_glue",
+                ExecutableSurfaceKind::Cells => "cells_assertion_glue",
+            }
+            .to_owned(),
+        );
     }
     if active_slice(&[
         "summary_reads_authoritative_storage",
@@ -3136,10 +3280,13 @@ fn remaining_example_specific_shells(
         "hidden_grid_keys_from_generic_storage",
         "formula_display_mutation_emitter",
     ]) {
-        shells.push(match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => "todomvc_report_glue",
-            ExecutableSurfaceKind::Cells => "cells_report_glue",
-        });
+        shells.push(
+            match compiled.surface.kind {
+                ExecutableSurfaceKind::TodoMvc => "todomvc_report_glue",
+                ExecutableSurfaceKind::Cells => "cells_report_glue",
+            }
+            .to_owned(),
+        );
     }
     if active_slice(&[
         "render_patch_lowering",
@@ -3147,16 +3294,22 @@ fn remaining_example_specific_shells(
         "render_only_patch_lowering",
         "formula_display_protocol_lowering",
     ]) {
-        shells.push(match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => "todomvc_render_patch_report_glue",
-            ExecutableSurfaceKind::Cells => "cells_render_patch_report_glue",
-        });
+        shells.push(
+            match compiled.surface.kind {
+                ExecutableSurfaceKind::TodoMvc => "todomvc_render_patch_report_glue",
+                ExecutableSurfaceKind::Cells => "cells_render_patch_report_glue",
+            }
+            .to_owned(),
+        );
     }
     if active_slice(&["stress_profile_executor"]) {
-        shells.push(match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => "todomvc_stress_report_glue",
-            ExecutableSurfaceKind::Cells => "cells_stress_report_glue",
-        });
+        shells.push(
+            match compiled.surface.kind {
+                ExecutableSurfaceKind::TodoMvc => "todomvc_stress_report_glue",
+                ExecutableSurfaceKind::Cells => "cells_stress_report_glue",
+            }
+            .to_owned(),
+        );
     }
     shells
 }
@@ -3967,53 +4120,63 @@ struct KeyedRow<T> {
     value: T,
 }
 
-#[derive(Clone, Debug)]
-struct KeyedList<T> {
-    slots: Vec<Option<KeyedRow<T>>>,
+#[derive(Clone, Debug, Default)]
+struct ListMemory {
+    keys: Vec<Option<u64>>,
+    generations: Vec<u64>,
     order: Vec<usize>,
-    valid_slots: BitVec,
+    valid: BitVec,
     free_slots: Vec<usize>,
     key_slots: Vec<Option<usize>>,
     order_slots: Vec<Option<usize>>,
+    text_columns: Vec<TextColumn>,
+    bool_columns: Vec<BoolColumn>,
+    enum_columns: Vec<TextColumn>,
     next_key: u64,
 }
 
-impl<T> KeyedList<T> {
-    fn from_values(values: impl IntoIterator<Item = T>) -> Self {
-        let slots = values
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| KeyedRow {
-                key: index as u64 + 1,
-                generation: 1,
-                value,
-            })
-            .map(Some)
-            .collect::<Vec<_>>();
-        let order = (0..slots.len()).collect::<Vec<_>>();
-        let valid_slots = bitvec![1; slots.len()];
-        let order_slots = (0..slots.len()).map(Some).collect::<Vec<_>>();
-        let mut key_slots = vec![None; slots.len() + 1];
-        for (index, row) in slots.iter().flatten().enumerate() {
-            key_slots[row.key as usize] = Some(index);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextColumn {
+    field_id: FieldSlotId,
+    values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoolColumn {
+    field_id: FieldSlotId,
+    values: BitVec,
+}
+
+impl ListMemory {
+    fn from_values(values: impl IntoIterator<Item = RuntimeRowSnapshot>) -> Self {
+        let mut memory = Self {
+            next_key: 1,
+            ..Self::default()
+        };
+        for value in values {
+            let key = memory.next_key;
+            memory.next_key += 1;
+            memory.append_with_identity(key, 1, value);
         }
-        Self {
-            next_key: slots.len() as u64 + 1,
-            slots,
-            order,
-            valid_slots,
-            free_slots: Vec::new(),
-            key_slots,
-            order_slots,
-        }
+        memory
     }
 
     fn reserve(&mut self, additional: usize) {
-        self.slots.reserve(additional);
+        self.keys.reserve(additional);
+        self.generations.reserve(additional);
         self.order.reserve(additional);
-        self.valid_slots.reserve(additional);
+        self.valid.reserve(additional);
         self.free_slots.reserve(additional);
         self.order_slots.reserve(additional);
+        for column in &mut self.text_columns {
+            column.values.reserve(additional);
+        }
+        for column in &mut self.bool_columns {
+            column.values.reserve(additional);
+        }
+        for column in &mut self.enum_columns {
+            column.values.reserve(additional);
+        }
         let required_key_slots = self.next_key as usize + additional;
         if self.key_slots.len() < required_key_slots {
             self.key_slots.resize(required_key_slots, None);
@@ -4024,40 +4187,55 @@ impl<T> KeyedList<T> {
         self.order.len()
     }
 
-    fn append(&mut self, value: T) -> (u64, u64) {
+    fn append(&mut self, value: RuntimeRowSnapshot) -> (u64, u64) {
         let key = self.next_key;
         self.next_key += 1;
+        self.append_with_identity(key, 1, value)
+    }
+
+    fn append_with_identity(
+        &mut self,
+        key: u64,
+        generation: u64,
+        value: RuntimeRowSnapshot,
+    ) -> (u64, u64) {
         self.ensure_key_slot(key);
         let slot = self.free_slots.pop().unwrap_or_else(|| {
-            let slot = self.slots.len();
-            self.slots.push(None);
-            self.valid_slots.push(false);
+            let slot = self.keys.len();
+            self.keys.push(None);
+            self.generations.push(0);
+            self.valid.push(false);
             self.order_slots.push(None);
+            self.push_column_defaults();
             slot
         });
-        self.slots[slot] = Some(KeyedRow {
-            key,
-            generation: 1,
-            value,
-        });
-        self.valid_slots.set(slot, true);
+        self.ensure_columns(&value.columns);
+        self.keys[slot] = Some(key);
+        self.generations[slot] = generation;
+        self.write_slot_columns(slot, value.columns);
+        self.valid.set(slot, true);
         self.order_slots[slot] = Some(self.order.len());
         self.order.push(slot);
         self.key_slots[key as usize] = Some(slot);
-        (key, 1)
+        (key, generation)
     }
 
-    fn remove_index(&mut self, index: usize) -> KeyedRow<T> {
+    fn remove_index(&mut self, index: usize) -> KeyedRow<RuntimeRowSnapshot> {
         let slot = self.order.remove(index);
-        let row = self.slots[slot]
-            .take()
-            .expect("visible keyed list order slot must be valid");
-        self.valid_slots.set(slot, false);
+        let key = self.keys[slot].expect("visible list slot must carry a key");
+        let generation = self.generations[slot];
+        let value = self.snapshot_slot(slot);
+        self.keys[slot] = None;
+        self.valid.set(slot, false);
         self.order_slots[slot] = None;
-        self.clear_key_slot(row.key);
+        self.clear_key_slot(key);
         self.free_slots.push(slot);
         self.refresh_order_slots_from(index);
-        row
+        KeyedRow {
+            key,
+            generation,
+            value,
+        }
     }
 
     fn move_index(&mut self, from: usize, to: usize) -> RuntimeResult<(u64, u64)> {
@@ -4065,15 +4243,15 @@ impl<T> KeyedList<T> {
             return Err(format!("cannot move list row from {from} to {to}").into());
         }
         if from == to {
-            let row = self.row(from).expect("visible keyed list index must exist");
-            return Ok((row.key, row.generation));
+            let slot = self.order[from];
+            return Ok((
+                self.keys[slot].expect("visible list slot must carry a key"),
+                self.generations[slot],
+            ));
         }
         let slot = self.order.remove(from);
-        let row = self.slots[slot]
-            .as_ref()
-            .expect("visible keyed list order slot must be valid");
-        let key = row.key;
-        let generation = row.generation;
+        let key = self.keys[slot].expect("visible list slot must carry a key");
+        let generation = self.generations[slot];
         self.order.insert(to, slot);
         self.refresh_order_slots_from(from.min(to));
         Ok((key, generation))
@@ -4081,33 +4259,153 @@ impl<T> KeyedList<T> {
 
     fn bound_index(&self, key: u64, generation: u64) -> Option<usize> {
         let slot = self.key_slots.get(key as usize).copied().flatten()?;
-        self.slots
-            .get(slot)
-            .and_then(Option::as_ref)
-            .filter(|row| row.key == key && row.generation == generation)
-            .and_then(|_| self.order_slots.get(slot).copied().flatten())
+        (self.keys.get(slot).copied().flatten() == Some(key)
+            && self.generations.get(slot).copied() == Some(generation)
+            && self.valid.get(slot).is_some_and(|valid| *valid))
+        .then(|| self.order_slots.get(slot).copied().flatten())
+        .flatten()
     }
 
-    fn row(&self, index: usize) -> Option<&KeyedRow<T>> {
+    fn row_identity(&self, index: usize) -> Option<(u64, u64)> {
         let slot = *self.order.get(index)?;
-        self.valid_slots
-            .get(slot)
-            .is_some_and(|valid| *valid)
-            .then(|| self.slots.get(slot)?.as_ref())
-            .flatten()
-    }
-
-    fn row_mut(&mut self, index: usize) -> Option<&mut KeyedRow<T>> {
-        let slot = *self.order.get(index)?;
-        if !self.valid_slots.get(slot).is_some_and(|valid| *valid) {
+        if !self.valid.get(slot).is_some_and(|valid| *valid) {
             return None;
         }
-        self.slots.get_mut(slot)?.as_mut()
+        Some((self.keys[slot]?, self.generations[slot]))
+    }
+
+    fn value(&self, index: usize, field: &str) -> Option<FieldValueRef<'_>> {
+        let slot = self.visible_slot(index)?;
+        let field_id = FieldSlotId::from_path(field);
+        if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+            Some(FieldValueRef::Text(&self.text_columns[index].values[slot]))
+        } else if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+            Some(FieldValueRef::Bool(self.bool_columns[index].values[slot]))
+        } else {
+            text_column_index(&self.enum_columns, &field_id)
+                .map(|index| FieldValueRef::Enum(&self.enum_columns[index].values[slot]))
+        }
+    }
+
+    fn textlike(&self, index: usize, field: &str) -> Option<&str> {
+        let slot = self.visible_slot(index)?;
+        let field_id = FieldSlotId::from_path(field);
+        text_column_index(&self.text_columns, &field_id)
+            .map(|index| self.text_columns[index].values[slot].as_str())
+            .or_else(|| {
+                text_column_index(&self.enum_columns, &field_id)
+                    .map(|index| self.enum_columns[index].values[slot].as_str())
+            })
+    }
+
+    fn bool_value(&self, index: usize, field: &str) -> Option<bool> {
+        let slot = self.visible_slot(index)?;
+        let field_id = FieldSlotId::from_path(field);
+        bool_column_index(&self.bool_columns, &field_id)
+            .map(|index| self.bool_columns[index].values[slot])
+    }
+
+    fn set_textlike(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
+        let slot = self
+            .visible_slot(index)
+            .ok_or_else(|| format!("generic list has no index {index}"))?;
+        let field_id = FieldSlotId::from_path(field);
+        if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+            let current = &mut self.text_columns[index].values[slot];
+            current.clear();
+            current.push_str(value);
+            Ok(())
+        } else if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+            let current = &mut self.enum_columns[index].values[slot];
+            current.clear();
+            current.push_str(value);
+            Ok(())
+        } else if bool_column_index(&self.bool_columns, &field_id).is_some() {
+            Err("cannot write text into bool runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn set_or_insert_text(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
+        let slot = self
+            .visible_slot(index)
+            .ok_or_else(|| format!("generic list has no index {index}"))?;
+        let field_id = FieldSlotId::from_path(field);
+        if text_column_index(&self.text_columns, &field_id).is_some()
+            || text_column_index(&self.enum_columns, &field_id).is_some()
+        {
+            return self.set_textlike(index, field, value);
+        }
+        if bool_column_index(&self.bool_columns, &field_id).is_some() {
+            return Err("cannot write text into bool runtime value".into());
+        }
+        let column = self.insert_text_column(field_id, false);
+        self.text_columns[column].values[slot].push_str(value);
+        Ok(())
+    }
+
+    fn set_bool(&mut self, index: usize, field: &str, value: bool) -> RuntimeResult<()> {
+        let slot = self
+            .visible_slot(index)
+            .ok_or_else(|| format!("generic list has no index {index}"))?;
+        let field_id = FieldSlotId::from_path(field);
+        if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+            self.bool_columns[index].values.set(slot, value);
+            Ok(())
+        } else if text_column_index(&self.text_columns, &field_id).is_some()
+            || text_column_index(&self.enum_columns, &field_id).is_some()
+        {
+            Err("cannot write bool into text runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn copy_textlike(
+        &mut self,
+        index: usize,
+        source_field: &str,
+        target_field: &str,
+    ) -> RuntimeResult<()> {
+        if source_field == target_field {
+            return Ok(());
+        }
+        let value = self
+            .textlike(index, source_field)
+            .ok_or_else(|| {
+                format!("generic row missing field `{source_field}` or `{target_field}`")
+            })?
+            .to_owned();
+        self.set_textlike(index, target_field, &value)
+    }
+
+    fn reserve_textlike(
+        &mut self,
+        index: usize,
+        field: &str,
+        additional: usize,
+    ) -> RuntimeResult<()> {
+        let slot = self
+            .visible_slot(index)
+            .ok_or_else(|| format!("generic list has no index {index}"))?;
+        let field_id = FieldSlotId::from_path(field);
+        if let Some(index) = text_column_index(&self.text_columns, &field_id) {
+            self.text_columns[index].values[slot].reserve(additional);
+            Ok(())
+        } else if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+            self.enum_columns[index].values[slot].reserve(additional);
+            Ok(())
+        } else if bool_column_index(&self.bool_columns, &field_id).is_some() {
+            Err("cannot reserve text capacity on bool runtime value".into())
+        } else {
+            Err(format!("generic row missing field `{field}`").into())
+        }
     }
 
     #[cfg(test)]
     fn slot_capacity(&self) -> usize {
-        self.slots.len()
+        self.keys.len()
     }
 
     #[cfg(test)]
@@ -4117,7 +4415,120 @@ impl<T> KeyedList<T> {
 
     #[cfg(test)]
     fn valid_slot_count(&self) -> usize {
-        self.valid_slots.count_ones()
+        self.valid.count_ones()
+    }
+
+    fn visible_slot(&self, index: usize) -> Option<usize> {
+        let slot = *self.order.get(index)?;
+        self.valid
+            .get(slot)
+            .is_some_and(|valid| *valid)
+            .then_some(slot)
+    }
+
+    fn snapshot_slot(&self, slot: usize) -> RuntimeRowSnapshot {
+        let mut columns = ValueColumns::default();
+        for column in &self.text_columns {
+            columns.insert_value(
+                column.field_id.as_str().to_owned(),
+                FieldValue::Text(column.values[slot].clone()),
+            );
+        }
+        for column in &self.bool_columns {
+            columns.insert_value(
+                column.field_id.as_str().to_owned(),
+                FieldValue::Bool(column.values[slot]),
+            );
+        }
+        for column in &self.enum_columns {
+            columns.insert_value(
+                column.field_id.as_str().to_owned(),
+                FieldValue::Enum(column.values[slot].clone()),
+            );
+        }
+        RuntimeRowSnapshot { columns }
+    }
+
+    fn ensure_columns(&mut self, columns: &ValueColumns) {
+        for slot in &columns.text {
+            if text_column_index(&self.text_columns, &slot.field_id).is_none() {
+                self.insert_text_column(slot.field_id.clone(), false);
+            }
+        }
+        for slot in &columns.bools {
+            if bool_column_index(&self.bool_columns, &slot.field_id).is_none() {
+                self.insert_bool_column(slot.field_id.clone());
+            }
+        }
+        for slot in &columns.enums {
+            if text_column_index(&self.enum_columns, &slot.field_id).is_none() {
+                self.insert_text_column(slot.field_id.clone(), true);
+            }
+        }
+    }
+
+    fn write_slot_columns(&mut self, slot: usize, columns: ValueColumns) {
+        for column in &mut self.text_columns {
+            column.values[slot].clear();
+        }
+        for column in &mut self.bool_columns {
+            column.values.set(slot, false);
+        }
+        for column in &mut self.enum_columns {
+            column.values[slot].clear();
+        }
+        for value in columns.text {
+            if let Some(index) = text_column_index(&self.text_columns, &value.field_id) {
+                self.text_columns[index].values[slot] = value.value;
+            }
+        }
+        for value in columns.bools {
+            if let Some(index) = bool_column_index(&self.bool_columns, &value.field_id) {
+                self.bool_columns[index].values.set(slot, value.value);
+            }
+        }
+        for value in columns.enums {
+            if let Some(index) = text_column_index(&self.enum_columns, &value.field_id) {
+                self.enum_columns[index].values[slot] = value.value;
+            }
+        }
+    }
+
+    fn insert_text_column(&mut self, field_id: FieldSlotId, is_enum: bool) -> usize {
+        let values = vec![String::new(); self.keys.len()];
+        let columns = if is_enum {
+            &mut self.enum_columns
+        } else {
+            &mut self.text_columns
+        };
+        let index = columns
+            .binary_search_by(|slot| slot.field_id.cmp(&field_id))
+            .unwrap_or_else(|index| index);
+        columns.insert(index, TextColumn { field_id, values });
+        index
+    }
+
+    fn insert_bool_column(&mut self, field_id: FieldSlotId) -> usize {
+        let values = bitvec![0; self.keys.len()];
+        let index = self
+            .bool_columns
+            .binary_search_by(|slot| slot.field_id.cmp(&field_id))
+            .unwrap_or_else(|index| index);
+        self.bool_columns
+            .insert(index, BoolColumn { field_id, values });
+        index
+    }
+
+    fn push_column_defaults(&mut self) {
+        for column in &mut self.text_columns {
+            column.values.push(String::new());
+        }
+        for column in &mut self.bool_columns {
+            column.values.push(false);
+        }
+        for column in &mut self.enum_columns {
+            column.values.push(String::new());
+        }
     }
 
     fn ensure_key_slot(&mut self, key: u64) {
@@ -4143,69 +4554,57 @@ impl<T> KeyedList<T> {
     }
 }
 
-impl<T> Index<usize> for KeyedList<T> {
-    type Output = KeyedRow<T>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        self.row(index)
-            .expect("visible keyed list index must reference a valid slot")
-    }
+fn text_column_index(slots: &[TextColumn], field_id: &FieldSlotId) -> Option<usize> {
+    slots
+        .binary_search_by(|slot| slot.field_id.cmp(field_id))
+        .ok()
 }
 
-impl<T> IndexMut<usize> for KeyedList<T> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        self.row_mut(index)
-            .expect("visible keyed list index must reference a valid slot")
-    }
+fn bool_column_index(slots: &[BoolColumn], field_id: &FieldSlotId) -> Option<usize> {
+    slots
+        .binary_search_by(|slot| slot.field_id.cmp(field_id))
+        .ok()
 }
 
 #[derive(Clone, Debug)]
 struct SourceBinding {
-    list_id: &'static str,
+    list_id: String,
     key: u64,
     generation: u64,
     source_id: u64,
     bind_epoch: u64,
-    source_path: &'static str,
+    source_path: String,
 }
-
-const MAX_ROW_SOURCE_BINDINGS: usize = 32;
 
 #[derive(Clone, Debug)]
 struct RowSourceSlots {
-    list_id: &'static str,
+    list_id: String,
     key: u64,
     generation: u64,
-    slots: [usize; MAX_ROW_SOURCE_BINDINGS],
-    len: usize,
+    slots: Vec<usize>,
 }
 
 impl RowSourceSlots {
-    fn new(list_id: &'static str, key: u64, generation: u64) -> Self {
+    fn new(list_id: &str, key: u64, generation: u64) -> Self {
         Self {
-            list_id,
+            list_id: list_id.to_owned(),
             key,
             generation,
-            slots: [0; MAX_ROW_SOURCE_BINDINGS],
-            len: 0,
+            slots: Vec::new(),
         }
     }
 
-    fn matches(&self, list_id: &'static str, key: u64, generation: u64) -> bool {
+    fn matches(&self, list_id: &str, key: u64, generation: u64) -> bool {
         self.list_id == list_id && self.key == key && self.generation == generation
     }
 
     fn push(&mut self, slot: usize) -> RuntimeResult<()> {
-        if self.len >= MAX_ROW_SOURCE_BINDINGS {
-            return Err(format!(
-                "row source binding slot capacity exceeded for `{}` key={} generation={} limit={MAX_ROW_SOURCE_BINDINGS}",
-                self.list_id, self.key, self.generation
-            )
-            .into());
-        }
-        self.slots[self.len] = slot;
-        self.len += 1;
+        self.slots.push(slot);
         Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -4248,31 +4647,26 @@ impl SourceStore {
 
     fn bind_row(
         &mut self,
-        list_id: &'static str,
+        list_id: &str,
         key: u64,
         generation: u64,
-        source_paths: &[&'static str],
+        source_paths: &[String],
     ) -> RuntimeResult<()> {
         let existing_len = self
             .row_slots
             .get(key as usize)
             .and_then(Option::as_ref)
             .filter(|slot| slot.matches(list_id, key, generation))
-            .map_or(0, |slot| slot.len);
-        if existing_len.saturating_add(source_paths.len()) > MAX_ROW_SOURCE_BINDINGS {
-            return Err(format!(
-                "row source binding slot capacity exceeded for `{list_id}` key={key} generation={generation} limit={MAX_ROW_SOURCE_BINDINGS}"
-            )
-            .into());
-        }
+            .map_or(0, RowSourceSlots::len);
+        self.reserve(existing_len.saturating_add(source_paths.len()));
         for source_path in source_paths {
             let binding = SourceBinding {
-                list_id,
+                list_id: list_id.to_owned(),
                 key,
                 generation,
                 source_id: self.next_source_id,
                 bind_epoch: self.next_bind_epoch,
-                source_path,
+                source_path: source_path.clone(),
             };
             let slot = self.active_bindings.len();
             self.ensure_source_slot(binding.source_id);
@@ -4289,7 +4683,7 @@ impl SourceStore {
         Ok(())
     }
 
-    fn unbind_row(&mut self, list_id: &'static str, key: u64, generation: u64) {
+    fn unbind_row(&mut self, list_id: &str, key: u64, generation: u64) {
         let Some(row_slot) = self
             .row_slots
             .get_mut(key as usize)
@@ -4298,7 +4692,7 @@ impl SourceStore {
         else {
             return;
         };
-        for slot in &row_slot.slots[..row_slot.len] {
+        for slot in &row_slot.slots {
             let Some(binding) = self.active_bindings.get_mut(*slot).and_then(Option::take) else {
                 continue;
             };
@@ -4310,7 +4704,7 @@ impl SourceStore {
 
     fn binding_matches_row(
         binding: &SourceBinding,
-        list_id: &'static str,
+        list_id: &str,
         key: u64,
         generation: u64,
     ) -> bool {
@@ -4319,7 +4713,7 @@ impl SourceStore {
 
     fn binding_matches_source(
         binding: &SourceBinding,
-        list_id: &'static str,
+        list_id: &str,
         key: u64,
         generation: u64,
         source_path: &str,
@@ -4360,7 +4754,7 @@ impl SourceStore {
 
     fn is_bound(
         &self,
-        list_id: &'static str,
+        list_id: &str,
         key: u64,
         generation: u64,
         source_path: &str,
@@ -4402,7 +4796,7 @@ impl SourceStore {
 
     fn row_bindings(
         &self,
-        list_id: &'static str,
+        list_id: &str,
         key: u64,
         generation: u64,
     ) -> impl Iterator<Item = &SourceBinding> {
@@ -4411,13 +4805,13 @@ impl SourceStore {
             .and_then(Option::as_ref)
             .filter(move |slot| slot.matches(list_id, key, generation))
             .into_iter()
-            .flat_map(|slot| slot.slots[..slot.len].iter())
+            .flat_map(|slot| slot.slots.iter())
             .filter_map(|slot| self.active_bindings.get(*slot))
             .filter_map(Option::as_ref)
     }
 
     #[cfg(test)]
-    fn row_binding_count(&self, list_id: &'static str, key: u64, generation: u64) -> usize {
+    fn row_binding_count(&self, list_id: &str, key: u64, generation: u64) -> usize {
         self.row_bindings(list_id, key, generation).count()
     }
 
@@ -4440,7 +4834,7 @@ enum FieldValue {
 }
 
 #[derive(Clone, Debug, Default)]
-struct RuntimeRecord {
+struct RuntimeRowSnapshot {
     columns: ValueColumns,
 }
 
@@ -4464,7 +4858,10 @@ struct BoolValueSlot {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct FieldSlotId(Box<str>);
+struct FieldSlotId {
+    id: FieldId,
+    label: Box<str>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FieldValueRef<'a> {
@@ -4476,21 +4873,54 @@ enum FieldValueRef<'a> {
 impl FieldSlotId {
     fn from_path(path: &str) -> Self {
         let name = row_field_name(path);
-        Self(name.into())
+        Self {
+            id: runtime_field_id_from_name(name),
+            label: name.into(),
+        }
     }
 
     fn as_str(&self) -> &str {
-        &self.0
+        &self.label
     }
 }
 
+fn runtime_field_id_from_name(name: &str) -> FieldId {
+    let index = match name {
+        "title" => 1,
+        "completed" => 2,
+        "editing" => 3,
+        "edit_text" => 4,
+        "visible" => 5,
+        "address" => 6,
+        "default_formula" => 7,
+        "formula_text" => 8,
+        "editing_text" => 9,
+        "parsed_formula" => 10,
+        "dependencies" => 11,
+        "value" => 12,
+        "error" => 13,
+        _ => stable_runtime_field_id(name),
+    };
+    FieldId(index)
+}
+
+fn stable_runtime_field_id(name: &str) -> usize {
+    const OFFSET: usize = 10_000;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    OFFSET + (hash as usize & 0x000f_ffff)
+}
+
 #[derive(Clone, Debug, Default)]
-struct RuntimeRecordTemplate {
-    fields: Vec<RuntimeRecordFieldTemplate>,
+struct RuntimeRowSnapshotTemplate {
+    fields: Vec<RuntimeRowSnapshotFieldTemplate>,
 }
 
 #[derive(Clone, Debug)]
-struct RuntimeRecordFieldTemplate {
+struct RuntimeRowSnapshotFieldTemplate {
     field_name: Box<str>,
     field_id: FieldSlotId,
     initial_value: InitialValue,
@@ -4512,32 +4942,29 @@ struct RuntimeListStore {
 struct RuntimeListSlot {
     list_id: ListSlotId,
     name: String,
-    memory: KeyedList<RuntimeRecord>,
+    memory: ListMemory,
     capacity: Option<usize>,
-    row_template: RuntimeRecordTemplate,
-    spare_rows: Vec<RuntimeRecord>,
+    row_template: RuntimeRowSnapshotTemplate,
+    spare_rows: Vec<RuntimeRowSnapshot>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ListSlotId(Box<str>);
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListSlotId(ListId);
 
 impl ListSlotId {
-    fn from_name(name: &str) -> Self {
-        Self(name.into())
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
+    fn from_ir(id: ListId) -> Self {
+        Self(id)
     }
 }
 
 impl RuntimeListStore {
     fn insert(
         &mut self,
+        id: ListId,
         name: String,
-        memory: KeyedList<RuntimeRecord>,
+        memory: ListMemory,
         capacity: Option<usize>,
-        row_template: RuntimeRecordTemplate,
+        row_template: RuntimeRowSnapshotTemplate,
     ) {
         if let Some(slot) = self.slot_mut(&name) {
             slot.memory = memory;
@@ -4546,10 +4973,8 @@ impl RuntimeListStore {
             slot.spare_rows.clear();
             return;
         }
-        let list_id = ListSlotId::from_name(&name);
-        let index = self
-            .list_slot_index(list_id.clone(), &name)
-            .unwrap_or_else(|index| index);
+        let list_id = ListSlotId::from_ir(id);
+        let index = self.list_slot_index(list_id).unwrap_or_else(|index| index);
         self.list_slots.insert(
             index,
             RuntimeListSlot {
@@ -4563,11 +4988,11 @@ impl RuntimeListStore {
         );
     }
 
-    fn memory(&self, name: &str) -> Option<&KeyedList<RuntimeRecord>> {
+    fn memory(&self, name: &str) -> Option<&ListMemory> {
         Some(&self.slot(name)?.memory)
     }
 
-    fn memory_mut(&mut self, name: &str) -> Option<&mut KeyedList<RuntimeRecord>> {
+    fn memory_mut(&mut self, name: &str) -> Option<&mut ListMemory> {
         Some(&mut self.slot_mut(name)?.memory)
     }
 
@@ -4575,7 +5000,7 @@ impl RuntimeListStore {
         self.slot(name).and_then(|slot| slot.capacity)
     }
 
-    fn row_template(&self, name: &str) -> Option<&RuntimeRecordTemplate> {
+    fn row_template(&self, name: &str) -> Option<&RuntimeRowSnapshotTemplate> {
         Some(&self.slot(name)?.row_template)
     }
 
@@ -4585,39 +5010,32 @@ impl RuntimeListStore {
             .unwrap_or_default()
     }
 
-    fn spare_rows_mut(&mut self, name: &str) -> Option<&mut Vec<RuntimeRecord>> {
+    fn spare_rows_mut(&mut self, name: &str) -> Option<&mut Vec<RuntimeRowSnapshot>> {
         Some(&mut self.slot_mut(name)?.spare_rows)
     }
 
-    fn push_spare(&mut self, name: &str, row: RuntimeRecord) -> RuntimeResult<()> {
+    fn push_spare(&mut self, name: &str, row: RuntimeRowSnapshot) -> RuntimeResult<()> {
         self.spare_rows_mut(name)
             .ok_or_else(|| format!("generic runtime has no list `{name}`"))?
             .push(row);
         Ok(())
     }
 
-    fn pop_spare(&mut self, name: &str) -> Option<RuntimeRecord> {
+    fn pop_spare(&mut self, name: &str) -> Option<RuntimeRowSnapshot> {
         self.slot_mut(name)?.spare_rows.pop()
     }
 
     fn slot(&self, name: &str) -> Option<&RuntimeListSlot> {
-        let list_id = ListSlotId::from_name(name);
-        self.list_slot_index(list_id, name)
-            .ok()
-            .and_then(|index| self.list_slots.get(index))
+        self.list_slots.iter().find(|slot| slot.name == name)
     }
 
     fn slot_mut(&mut self, name: &str) -> Option<&mut RuntimeListSlot> {
-        let list_id = ListSlotId::from_name(name);
-        self.list_slot_index(list_id, name)
-            .ok()
-            .and_then(|index| self.list_slots.get_mut(index))
+        self.list_slots.iter_mut().find(|slot| slot.name == name)
     }
 
-    fn list_slot_index(&self, list_id: ListSlotId, name: &str) -> Result<usize, usize> {
-        self.list_slots.binary_search_by(|slot| {
-            (slot.list_id.as_str(), slot.name.as_str()).cmp(&(list_id.as_str(), name))
-        })
+    fn list_slot_index(&self, list_id: ListSlotId) -> Result<usize, usize> {
+        self.list_slots
+            .binary_search_by(|slot| slot.list_id.cmp(&list_id))
     }
 }
 
@@ -4666,7 +5084,7 @@ impl GenericScheduledRuntime {
         }
     }
 
-    fn row_source_paths(&self, list: &str) -> RuntimeResult<&[&'static str]> {
+    fn row_source_paths(&self, list: &str) -> RuntimeResult<&[String]> {
         self.list_source_bindings.source_paths(list)
     }
 
@@ -4675,62 +5093,102 @@ impl GenericScheduledRuntime {
         primary_list: &str,
         indexed_commit_field: &str,
         source_event: GenericSourceEvent<'_>,
-    ) -> RuntimeResult<GenericSourceRouteKind> {
+    ) -> RuntimeResult<SourceActionKind> {
         let source = source_event.source;
         let source_id = self.source_routes.require_source_id(source)?;
-        let route = self
-            .source_routes
-            .for_source_id(source_id)
-            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?;
+        let actions = self.source_routes.actions_for_source_id(source_id)?;
+        let has_list_append = actions.iter().any(|action| {
+            matches!(action, SourceAction::ListAppend { list, .. } if list == primary_list)
+        });
+        let has_list_remove = actions.iter().any(
+            |action| matches!(action, SourceAction::ListRemove { list } if list == primary_list),
+        );
+        let has_root_scalar = actions
+            .iter()
+            .any(|action| matches!(action, SourceAction::RootScalar));
+        let has_bool_not = actions.iter().any(|action| {
+            matches!(
+                action,
+                SourceAction::IndexedBool {
+                    kind: SourceRouteBoolAction::BoolNot,
+                    ..
+                }
+            )
+        });
+        let has_const_true = actions.iter().any(|action| {
+            matches!(
+                action,
+                SourceAction::IndexedBool {
+                    kind: SourceRouteBoolAction::ConstTrue,
+                    ..
+                }
+            )
+        });
+        let has_indexed_text = |expected| {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    SourceAction::IndexedText { kind, .. } if *kind == expected
+                )
+            })
+        };
+        let has_indexed_text_target = |expected, field: &str| {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    SourceAction::IndexedText { kind, target }
+                        if *kind == expected && row_field_name(target) == field
+                )
+            })
+        };
         let has_row_context = source_event.target_text.is_some() || source_event.address.is_some();
         if !has_row_context {
-            if route.has_list_append_target(primary_list) {
-                return Ok(GenericSourceRouteKind::ListAppend);
+            if has_list_append {
+                return Ok(SourceActionKind::ListAppend);
             }
-            if source_event.text.is_some() && route.single_root_scalar_target()?.is_some() {
-                return Ok(GenericSourceRouteKind::RootText);
+            if source_event.text.is_some() && has_root_scalar {
+                return Ok(SourceActionKind::RootText);
             }
-            if route.has_list_remove_target(primary_list) {
-                return Ok(GenericSourceRouteKind::ListRemove);
+            if has_list_remove {
+                return Ok(SourceActionKind::ListRemove);
             }
-            if route.has_indexed_bool_action(SourceRouteBoolAction::BoolNot) {
-                return Ok(GenericSourceRouteKind::IndexedBoolBulk);
+            if has_bool_not {
+                return Ok(SourceActionKind::IndexedBoolBulk);
             }
-            if route.has_root_scalar_action() {
-                return Ok(GenericSourceRouteKind::RootScalar);
+            if has_root_scalar {
+                return Ok(SourceActionKind::RootScalar);
             }
         } else {
-            if route.has_list_remove_target(primary_list) {
-                return Ok(GenericSourceRouteKind::ListRemove);
+            if has_list_remove {
+                return Ok(SourceActionKind::ListRemove);
             }
-            if route.has_indexed_bool_action(SourceRouteBoolAction::BoolNot) {
-                return Ok(GenericSourceRouteKind::IndexedBoolToggle);
+            if has_bool_not {
+                return Ok(SourceActionKind::IndexedBoolToggle);
             }
-            if route.has_indexed_text_action_where(SourceRouteTextAction::SourceText, |target| {
-                row_field_name(target) == indexed_commit_field
-            }) {
-                return Ok(GenericSourceRouteKind::IndexedTextCommit);
+            if has_indexed_text_target(SourceRouteTextAction::SourceText, indexed_commit_field) {
+                return Ok(SourceActionKind::IndexedTextCommit);
             }
-            if source_event.key.is_some() {
-                return Ok(GenericSourceRouteKind::IndexedTextKey);
+            if source_event.key.is_some()
+                && (has_indexed_text(SourceRouteTextAction::SourceText)
+                    || has_indexed_text(SourceRouteTextAction::TextTrimOrPrevious))
+            {
+                return Ok(SourceActionKind::IndexedTextKey);
             }
-            if route.has_indexed_text_action_where(
+            if has_indexed_text_target(
                 SourceRouteTextAction::TextTrimOrPrevious,
-                |target| row_field_name(target) == indexed_commit_field,
+                indexed_commit_field,
             ) {
-                return Ok(GenericSourceRouteKind::IndexedTextCommit);
+                return Ok(SourceActionKind::IndexedTextCommit);
             }
             if source_event.text.is_some() {
-                return Ok(GenericSourceRouteKind::IndexedTextChange);
+                return Ok(SourceActionKind::IndexedTextChange);
             }
-            let has_previous_text =
-                route.has_indexed_text_action(SourceRouteTextAction::PreviousValue);
-            if route.has_indexed_bool_action(SourceRouteBoolAction::ConstTrue) && has_previous_text
-            {
-                return Ok(GenericSourceRouteKind::IndexedTextOpen);
+            let has_previous_text = has_indexed_text(SourceRouteTextAction::PreviousValue);
+            if has_const_true && has_previous_text {
+                return Ok(SourceActionKind::IndexedTextOpen);
             }
             if has_previous_text {
-                return Ok(GenericSourceRouteKind::IndexedTextIdentity);
+                return Ok(SourceActionKind::IndexedTextIdentity);
             }
         }
         Err(format!("source `{source}` has no supported generic route kind").into())
@@ -4755,13 +5213,10 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source_event: GenericSourceEvent<'a>,
         seq: TickSeq,
-        mut resolve_index: impl FnMut(
-            &'static str,
-            GenericSourceEvent<'a>,
-        ) -> RuntimeResult<Option<usize>>,
+        mut resolve_index: impl FnMut(&str, GenericSourceEvent<'a>) -> RuntimeResult<Option<usize>>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
         let list = self.source_action_list_for_event(step_id, source_event.source)?;
-        let index = match list {
+        let index = match list.as_deref() {
             Some(list) => resolve_index(list, source_event)?,
             None => None,
         };
@@ -4782,11 +5237,11 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source_event: GenericSourceEvent<'a>,
         seq: TickSeq,
-        field: &'static str,
+        field: &str,
         value: Option<&'a str>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
         let list = self.source_action_list_for_event(step_id, source_event.source)?;
-        let index = match list {
+        let index = match list.as_deref() {
             Some(list) => {
                 let value = value.ok_or_else(|| {
                     format!(
@@ -4824,11 +5279,11 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source_event: GenericSourceEvent<'a>,
         seq: TickSeq,
-        expected_list: &'static str,
+        expected_list: &str,
         index: Option<usize>,
     ) -> RuntimeResult<GenericSourceActionInput<'a>> {
         let list = self.source_action_list_for_event(step_id, source_event.source)?;
-        if list != Some(expected_list) {
+        if list.as_deref() != Some(expected_list) {
             return Err(format!(
                 "{step_id} source `{}` routed to {:?}, expected list `{expected_list}`",
                 source_event.source, list
@@ -4851,23 +5306,24 @@ impl GenericScheduledRuntime {
         &self,
         step_id: &str,
         source: &str,
-    ) -> RuntimeResult<Option<&'static str>> {
+    ) -> RuntimeResult<Option<String>> {
         let source_id = self.source_routes.require_source_id(source)?;
         let actions = self.source_routes.actions_for_source_id(source_id)?;
         let mut list = None;
-        for action in actions.iter().copied() {
+        for action in actions {
             let action_list = match action {
-                SourceRouteAction::RootScalar | SourceRouteAction::DerivedText { .. } => None,
-                SourceRouteAction::ListRemove { list }
-                | SourceRouteAction::ListAppend { list, .. } => Some(list),
-                SourceRouteAction::IndexedText { target, .. }
-                | SourceRouteAction::IndexedBool { target, .. } => {
-                    Some(self.indexed_target_list(target)?)
+                SourceAction::RootScalar | SourceAction::DerivedText { .. } => None,
+                SourceAction::ListRemove { list } | SourceAction::ListAppend { list, .. } => {
+                    Some(list.clone())
+                }
+                SourceAction::IndexedText { target, .. }
+                | SourceAction::IndexedBool { target, .. } => {
+                    Some(self.indexed_target_list(target)?.to_owned())
                 }
             };
             if let Some(action_list) = action_list {
-                if let Some(existing) = list
-                    && existing != action_list
+                if let Some(existing) = list.as_ref()
+                    && existing != &action_list
                 {
                     return Err(format!(
                         "{step_id} source `{source}` routes to multiple lists: `{existing}` and `{action_list}`"
@@ -4882,7 +5338,7 @@ impl GenericScheduledRuntime {
 
     fn resolve_bound_source_index(
         &self,
-        list: &'static str,
+        list: &str,
         action: Option<&BTreeMap<String, toml::Value>>,
         source_event: Option<GenericSourceEvent<'_>>,
     ) -> RuntimeResult<GenericBoundSourceIndex> {
@@ -4911,8 +5367,8 @@ impl GenericScheduledRuntime {
 
     fn resolve_visible_row_occurrence(
         &self,
-        list: &'static str,
-        text_field: &'static str,
+        list: &str,
+        text_field: &str,
         action: Option<&BTreeMap<String, toml::Value>>,
         source_event: Option<GenericSourceEvent<'_>>,
         target_text: &str,
@@ -5418,7 +5874,7 @@ impl GenericScheduledRuntime {
         Ok(requirements)
     }
 
-    fn indexed_target_list(&self, target: &str) -> RuntimeResult<&'static str> {
+    fn indexed_target_list(&self, target: &str) -> RuntimeResult<&str> {
         let scope = target
             .split_once('.')
             .map(|(scope, _)| scope)
@@ -5435,9 +5891,9 @@ impl GenericScheduledRuntime {
         mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
         let actions = self.source_routes.actions_for_source_id(input.source_id)?;
-        for action in actions.iter().copied() {
+        for action in actions {
             match action {
-                SourceRouteAction::RootScalar => {
+                SourceAction::RootScalar => {
                     if let Some(commit) = self.storage.apply_root_text_action_source(
                         &self.source_routes,
                         &self.scalar_equations,
@@ -5449,8 +5905,8 @@ impl GenericScheduledRuntime {
                         observe(GenericSourceMutation::RootText(commit))?;
                     }
                 }
-                SourceRouteAction::DerivedText { .. } => {}
-                SourceRouteAction::ListAppend { list, trigger } => {
+                SourceAction::DerivedText { .. } => {}
+                SourceAction::ListAppend { list, trigger } => {
                     let source_paths = self.list_source_bindings.source_paths(list)?;
                     let Some(value) = self.storage.eval_derived_text_transform(
                         &self.derived_equations,
@@ -5471,14 +5927,14 @@ impl GenericScheduledRuntime {
                     )?;
                     observe(GenericSourceMutation::ListAppend(
                         GenericTextListAppendCommit {
-                            list,
+                            list: list.to_owned(),
                             key: insert.key,
                             generation: insert.generation,
                             value,
                         },
                     ))?;
                 }
-                SourceRouteAction::ListRemove { list } => {
+                SourceAction::ListRemove { list } => {
                     if let Some(index) = input.index {
                         let Some((key, generation)) =
                             self.storage.remove_index_source_action_and_unbind_sources(
@@ -5494,7 +5950,7 @@ impl GenericScheduledRuntime {
                             continue;
                         };
                         observe(GenericSourceMutation::ListRemove {
-                            list,
+                            list: list.to_owned(),
                             key,
                             generation,
                         })?;
@@ -5509,7 +5965,7 @@ impl GenericScheduledRuntime {
                                 }
                                 GenericListRemoveObservation::RowRemoved { key, generation } => {
                                     observe(GenericSourceMutation::ListRemove {
-                                        list,
+                                        list: list.to_owned(),
                                         key,
                                         generation,
                                     })
@@ -5518,8 +5974,8 @@ impl GenericScheduledRuntime {
                         )?;
                     }
                 }
-                SourceRouteAction::IndexedText { kind, target } => {
-                    let Some(list) = input.list else {
+                SourceAction::IndexedText { kind, target } => {
+                    let Some(list) = input.list.as_deref() else {
                         return Err(format!(
                             "source `{}` indexed text action `{target}` needs a list context",
                             input.source
@@ -5533,7 +5989,7 @@ impl GenericScheduledRuntime {
                         )
                         .into());
                     };
-                    if kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
+                    if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
                         let commit = self.storage.commit_indexed_previous_text_target_source(
                             &self.scalar_equations,
                             list,
@@ -5553,8 +6009,8 @@ impl GenericScheduledRuntime {
                         observe(GenericSourceMutation::TextField(commit))?;
                     }
                 }
-                SourceRouteAction::IndexedBool { target, .. } => {
-                    let Some(list) = input.list else {
+                SourceAction::IndexedBool { target, .. } => {
+                    let Some(list) = input.list.as_deref() else {
                         return Err(format!(
                             "source `{}` indexed bool action `{target}` needs a list context",
                             input.source
@@ -5623,7 +6079,7 @@ impl GenericScheduledRuntime {
     #[cfg(test)]
     fn append_text_row_source_action_and_bind_sources<'a>(
         &mut self,
-        list: &'static str,
+        list: &str,
         source: &str,
         key: Option<&str>,
         text: Option<&'a str>,
@@ -5677,7 +6133,7 @@ impl GenericCircuitRuntime {
                 .iter()
                 .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
                 .collect::<Vec<_>>();
-            let row_template = RuntimeRecordTemplate::from_cells(&row_scope, &indexed_cells)?;
+            let row_template = RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells)?;
             let rows = match &list.initializer {
                 ListInitializer::RecordLiteral { rows } => rows
                     .iter()
@@ -5732,8 +6188,9 @@ impl GenericCircuitRuntime {
                 .into());
             }
             runtime.lists.insert(
+                list.id,
                 list.name.clone(),
-                KeyedList::from_values(rows),
+                ListMemory::from_values(rows),
                 list.capacity,
                 row_template,
             );
@@ -5758,7 +6215,7 @@ impl GenericCircuitRuntime {
     fn apply_root_text_source<'a>(
         &mut self,
         equations: &ScalarEquationPlan,
-        target: &'static str,
+        target: &str,
         source: &str,
         payload_text: Option<&'a str>,
         seq: TickSeq,
@@ -5792,7 +6249,10 @@ impl GenericCircuitRuntime {
         else {
             return Ok(None);
         };
-        Ok(Some(GenericRootTextCommit { target, value }))
+        Ok(Some(GenericRootTextCommit {
+            target: target.to_owned(),
+            value,
+        }))
     }
 
     fn eval_derived_text_transform<'a>(
@@ -5808,7 +6268,7 @@ impl GenericCircuitRuntime {
 
     fn commit_root_text_candidate<'a>(
         &mut self,
-        target: &'static str,
+        target: &str,
         candidate: LatestCandidate<Cow<'a, str>>,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) = latest_value(target, &[candidate])? else {
@@ -5840,21 +6300,21 @@ impl GenericCircuitRuntime {
 
     fn bind_row_sources(
         &mut self,
-        list: &'static str,
+        list: &str,
         key: u64,
         generation: u64,
-        source_paths: &[&'static str],
+        source_paths: &[String],
     ) -> RuntimeResult<()> {
         self.sources.bind_row(list, key, generation, source_paths)
     }
 
-    fn unbind_row_sources(&mut self, list: &'static str, key: u64, generation: u64) {
+    fn unbind_row_sources(&mut self, list: &str, key: u64, generation: u64) {
         self.sources.unbind_row(list, key, generation);
     }
 
     fn is_row_source_bound(
         &self,
-        list: &'static str,
+        list: &str,
         key: u64,
         generation: u64,
         source_path: &str,
@@ -5867,7 +6327,7 @@ impl GenericCircuitRuntime {
 
     fn row_source_bindings(
         &self,
-        list: &'static str,
+        list: &str,
         key: u64,
         generation: u64,
     ) -> impl Iterator<Item = &SourceBinding> {
@@ -5875,7 +6335,7 @@ impl GenericCircuitRuntime {
     }
 
     #[cfg(test)]
-    fn row_source_binding_count(&self, list: &'static str, key: u64, generation: u64) -> usize {
+    fn row_source_binding_count(&self, list: &str, key: u64, generation: u64) -> usize {
         self.sources.row_binding_count(list, key, generation)
     }
 
@@ -5919,44 +6379,6 @@ impl GenericCircuitRuntime {
         Ok(row)
     }
 
-    fn semantic_field_delta<'a>(
-        list_id: Option<&'static str>,
-        key: Option<u64>,
-        generation: Option<u64>,
-        field: &'static str,
-        value: ProtocolValue<'a>,
-    ) -> SemanticDelta<'a> {
-        SemanticDelta {
-            kind: "FieldSet",
-            list_id,
-            key,
-            generation,
-            source_id: None,
-            bind_epoch: None,
-            field_path: Some(field),
-            value,
-        }
-    }
-
-    fn semantic_list_delta<'a>(
-        kind: &'static str,
-        list_id: &'static str,
-        key: u64,
-        generation: u64,
-        value: ProtocolValue<'a>,
-    ) -> SemanticDelta<'a> {
-        SemanticDelta {
-            kind,
-            list_id: Some(list_id),
-            key: Some(key),
-            generation: Some(generation),
-            source_id: None,
-            bind_epoch: None,
-            field_path: None,
-            value,
-        }
-    }
-
     fn semantic_source_delta<'a>(
         kind: &'static str,
         binding: &SourceBinding,
@@ -5964,12 +6386,12 @@ impl GenericCircuitRuntime {
     ) -> SemanticDelta<'a> {
         SemanticDelta {
             kind,
-            list_id: Some(binding.list_id),
+            list_id: Some(Cow::Owned(binding.list_id.clone())),
             key: Some(binding.key),
             generation: Some(binding.generation),
             source_id: Some(binding.source_id),
             bind_epoch: Some(binding.bind_epoch),
-            field_path: Some(binding.source_path),
+            field_path: Some(Cow::Owned(binding.source_path.clone())),
             value,
         }
     }
@@ -5985,15 +6407,11 @@ impl GenericCircuitRuntime {
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         for index in 0..rows.len() {
-            let row = rows
-                .row_mut(index)
-                .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-            let current =
-                row.value.columns.textlike(field).ok_or_else(|| {
-                    format!("generic list `{list}` field `{field}` is not text-like")
-                })?;
+            let current = rows
+                .textlike(index, field)
+                .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like"))?;
             let additional = additional_by_row(index, current);
-            row.value.columns.reserve_textlike(field, additional)?;
+            rows.reserve_textlike(index, field, additional)?;
         }
         Ok(())
     }
@@ -6008,15 +6426,10 @@ impl GenericCircuitRuntime {
         if source_field == target_field {
             return Ok(());
         }
-        let row = self
-            .lists
+        self.lists
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row_mut(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        row.value
-            .columns
-            .copy_textlike(source_field, target_field)
+            .copy_textlike(index, source_field, target_field)
             .map_err(|_| {
                 format!("generic list `{list}` field `{target_field}` is not text-like").into()
             })
@@ -6026,11 +6439,7 @@ impl GenericCircuitRuntime {
         self.lists
             .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
-            .value
-            .columns
-            .textlike(field)
+            .textlike(index, field)
             .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
     }
 
@@ -6053,12 +6462,7 @@ impl GenericCircuitRuntime {
     }
 
     fn list_row_textlike_opt(&self, list: &str, index: usize, field: &str) -> Option<&str> {
-        self.lists
-            .memory(list)?
-            .row(index)?
-            .value
-            .columns
-            .textlike(field)
+        self.lists.memory(list)?.textlike(index, field)
     }
 
     fn list_row_bool(&self, list: &str, index: usize, field: &str) -> RuntimeResult<bool> {
@@ -6068,12 +6472,7 @@ impl GenericCircuitRuntime {
     }
 
     fn list_row_bool_opt(&self, list: &str, index: usize, field: &str) -> Option<bool> {
-        self.lists
-            .memory(list)?
-            .row(index)?
-            .value
-            .columns
-            .bool_value(field)
+        self.lists.memory(list)?.bool_value(index, field)
     }
 
     fn set_list_row_textlike(
@@ -6086,11 +6485,7 @@ impl GenericCircuitRuntime {
         self.lists
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row_mut(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
-            .value
-            .columns
-            .set_textlike(field, value)
+            .set_textlike(index, field, value)
     }
 
     fn set_or_insert_list_row_textlike(
@@ -6100,13 +6495,10 @@ impl GenericCircuitRuntime {
         field: &str,
         value: &str,
     ) -> RuntimeResult<()> {
-        let row = self
-            .lists
+        self.lists
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row_mut(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        row.value.columns.set_or_insert_text(field, value)
+            .set_or_insert_text(index, field, value)
     }
 
     fn set_list_row_bool(
@@ -6119,11 +6511,7 @@ impl GenericCircuitRuntime {
         self.lists
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row_mut(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
-            .value
-            .columns
-            .set_bool(field, value)
+            .set_bool(index, field, value)
     }
 
     fn commit_indexed_text_field(
@@ -6151,9 +6539,9 @@ impl GenericCircuitRuntime {
     fn commit_indexed_text_source<'a>(
         &mut self,
         equations: &ScalarEquationPlan,
-        list: &'static str,
+        list: &str,
         index: usize,
-        target: &'static str,
+        target: &str,
         source: &str,
         payload_text: Option<&'a str>,
     ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
@@ -6180,10 +6568,10 @@ impl GenericCircuitRuntime {
         let field = row_field_name(target);
         let (key, generation) = self.commit_indexed_text_field(list, index, field, value)?;
         Ok(Some(GenericTextFieldCommit {
-            list,
+            list: list.to_owned(),
             key,
             generation,
-            field,
+            field: field.to_owned(),
             value,
         }))
     }
@@ -6191,9 +6579,9 @@ impl GenericCircuitRuntime {
     fn commit_indexed_bool_source(
         &mut self,
         equations: &ScalarEquationPlan,
-        list: &'static str,
+        list: &str,
         index: usize,
-        target: &'static str,
+        target: &str,
         source: &str,
         read_extra_bool: impl Fn(&str) -> Option<bool>,
     ) -> RuntimeResult<GenericBoolFieldCommit> {
@@ -6202,10 +6590,10 @@ impl GenericCircuitRuntime {
         let field = row_field_name(target);
         let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
         Ok(GenericBoolFieldCommit {
-            list,
+            list: list.to_owned(),
             key,
             generation,
-            field,
+            field: field.to_owned(),
             value,
         })
     }
@@ -6213,9 +6601,9 @@ impl GenericCircuitRuntime {
     fn commit_indexed_previous_text_target_source(
         &mut self,
         equations: &ScalarEquationPlan,
-        list: &'static str,
+        list: &str,
         index: usize,
-        target: &'static str,
+        target: &str,
         source: &str,
     ) -> RuntimeResult<GenericTextFieldIdentity> {
         let previous =
@@ -6235,21 +6623,21 @@ impl GenericCircuitRuntime {
                 }
             };
         let field = row_field_name(target);
-        self.copy_list_row_textlike_field(list, index, previous, field)?;
+        self.copy_list_row_textlike_field(list, index, &previous, field)?;
         let (key, generation) = self.row_identity(list, index)?;
         Ok(GenericTextFieldIdentity {
-            list,
+            list: list.to_owned(),
             key,
             generation,
-            field,
+            field: field.to_owned(),
         })
     }
 
     fn commit_each_indexed_bool_source(
         &mut self,
         equations: &ScalarEquationPlan,
-        list: &'static str,
-        target: &'static str,
+        list: &str,
+        target: &str,
         source: &str,
         read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
         mut observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
@@ -6267,10 +6655,10 @@ impl GenericCircuitRuntime {
             let field = row_field_name(target);
             let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
             observe(GenericBoolFieldCommit {
-                list,
+                list: list.to_owned(),
                 key,
                 generation,
-                field,
+                field: field.to_owned(),
                 value,
             })?;
         }
@@ -6293,7 +6681,7 @@ impl GenericCircuitRuntime {
         else {
             return Err(format!("no text branch for `{target}` from `{source}`").into());
         };
-        match branch.expression {
+        match &branch.expression {
             ScalarUpdateExpression::SourceText => {
                 let value = payload_text.ok_or_else(|| {
                     format!("text update `{target}` from `{source}` requires text payload")
@@ -6302,7 +6690,7 @@ impl GenericCircuitRuntime {
             }
             ScalarUpdateExpression::PreviousValue(path) => {
                 let Some(value) = payload_text else {
-                    return Ok(IndexedTextCandidate::PreviousField(path));
+                    return Ok(IndexedTextCandidate::PreviousField(path.clone()));
                 };
                 let current = self.list_row_textlike(list, index, path)?;
                 if value != current {
@@ -6314,7 +6702,7 @@ impl GenericCircuitRuntime {
                 Ok(IndexedTextCandidate::PreviousText(value))
             }
             ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
-                let raw = match path {
+                let raw = match path.as_str() {
                     "text" => payload_text.ok_or_else(|| {
                         format!("title update from `{source}` requires source text payload")
                     })?,
@@ -6373,7 +6761,7 @@ impl GenericCircuitRuntime {
         equations: &ListEquationPlan,
         list: &str,
         trigger: &str,
-        row: RuntimeRecord,
+        row: RuntimeRowSnapshot,
     ) -> RuntimeResult<(u64, u64)> {
         let expected = equations.append_trigger(list)?;
         if expected != trigger {
@@ -6446,16 +6834,16 @@ impl GenericCircuitRuntime {
     fn append_row_for_trigger_text_and_bind_sources(
         &mut self,
         equations: &ListEquationPlan,
-        list: &'static str,
+        list: &str,
         trigger: &str,
         trigger_value: &str,
-        source_paths: &[&'static str],
+        source_paths: &[String],
     ) -> RuntimeResult<GenericListRowCommit> {
         let (key, generation) =
             self.append_row_for_trigger_text(equations, list, trigger, trigger_value)?;
         self.bind_row_sources(list, key, generation, source_paths)?;
         Ok(GenericListRowCommit {
-            list,
+            list: list.to_owned(),
             key,
             generation,
         })
@@ -6467,11 +6855,11 @@ impl GenericCircuitRuntime {
         routes: &SourceRoutePlan,
         derived: &DerivedEquationPlan,
         lists: &ListEquationPlan,
-        list: &'static str,
+        list: &str,
         source: &str,
         key: Option<&str>,
         text: Option<&'a str>,
-        source_paths: &[&'static str],
+        source_paths: &[String],
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
         let trigger = routes.list_append_trigger(source, list)?;
         let Some(value) = self.eval_derived_text_transform(derived, trigger, source, key, text)?
@@ -6486,14 +6874,14 @@ impl GenericCircuitRuntime {
             source_paths,
         )?;
         Ok(Some(GenericTextListAppendCommit {
-            list,
+            list: list.to_owned(),
             key: insert.key,
             generation: insert.generation,
             value,
         }))
     }
 
-    fn spare_row(&mut self, list: &'static str, row: RuntimeRecord) -> RuntimeResult<()> {
+    fn spare_row(&mut self, list: &str, row: RuntimeRowSnapshot) -> RuntimeResult<()> {
         self.lists.push_spare(list, row)
     }
 
@@ -6502,13 +6890,13 @@ impl GenericCircuitRuntime {
         list: &str,
         predicate: RuntimeListPredicate,
         index: usize,
-    ) -> RuntimeResult<Option<KeyedRow<RuntimeRecord>>> {
+    ) -> RuntimeResult<Option<KeyedRow<RuntimeRowSnapshot>>> {
         if predicate == RuntimeListPredicate::Unsupported {
             return Err(
                 format!("remove over list `{list}` has unsupported predicate in IR").into(),
             );
         }
-        if !self.list_row_matches_predicate(list, index, predicate)? {
+        if !self.list_row_matches_predicate(list, index, &predicate)? {
             return Ok(None);
         }
         self.remove_row(list, index).map(Some)
@@ -6516,12 +6904,12 @@ impl GenericCircuitRuntime {
 
     fn remove_row_for_predicate_and_unbind_sources(
         &mut self,
-        list: &'static str,
-        predicate: RuntimeListPredicate,
+        list: &str,
+        predicate: &RuntimeListPredicate,
         index: usize,
         mut observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
-    ) -> RuntimeResult<Option<KeyedRow<RuntimeRecord>>> {
-        let Some(row) = self.remove_row_for_predicate(list, predicate, index)? else {
+    ) -> RuntimeResult<Option<KeyedRow<RuntimeRowSnapshot>>> {
+        let Some(row) = self.remove_row_for_predicate(list, predicate.clone(), index)? else {
             return Ok(None);
         };
         for binding in self.row_source_bindings(list, row.key, row.generation) {
@@ -6534,7 +6922,7 @@ impl GenericCircuitRuntime {
     fn remove_where_source_action_and_unbind_sources(
         &mut self,
         routes: &SourceRoutePlan,
-        list: &'static str,
+        list: &str,
         source_id: SourceId,
         mut observe: impl FnMut(GenericListRemoveObservation<'_>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
@@ -6543,7 +6931,7 @@ impl GenericCircuitRuntime {
         while index < self.list_len(list)? {
             let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
                 list,
-                predicate,
+                &predicate,
                 index,
                 |binding| observe(GenericListRemoveObservation::SourceUnbind(binding)),
             )?
@@ -6561,7 +6949,7 @@ impl GenericCircuitRuntime {
     fn remove_index_source_action_and_unbind_sources(
         &mut self,
         routes: &SourceRoutePlan,
-        list: &'static str,
+        list: &str,
         source_id: SourceId,
         index: usize,
         observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
@@ -6569,7 +6957,7 @@ impl GenericCircuitRuntime {
         let predicate = routes.list_remove_predicate_for_source_id(source_id, list)?;
         let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
             list,
-            predicate,
+            &predicate,
             index,
             observe_binding,
         )?
@@ -6584,10 +6972,10 @@ impl GenericCircuitRuntime {
     #[cfg(test)]
     fn remove_row_and_unbind_sources(
         &mut self,
-        list: &'static str,
+        list: &str,
         index: usize,
         mut observe_binding: impl FnMut(&SourceBinding),
-    ) -> RuntimeResult<KeyedRow<RuntimeRecord>> {
+    ) -> RuntimeResult<KeyedRow<RuntimeRowSnapshot>> {
         let row = self.remove_row(list, index)?;
         for binding in self.row_source_bindings(list, row.key, row.generation) {
             observe_binding(binding);
@@ -6596,7 +6984,7 @@ impl GenericCircuitRuntime {
         Ok(row)
     }
 
-    fn append_row(&mut self, list: &str, row: RuntimeRecord) -> RuntimeResult<(u64, u64)> {
+    fn append_row(&mut self, list: &str, row: RuntimeRowSnapshot) -> RuntimeResult<(u64, u64)> {
         if let Some(capacity) = self.lists.capacity(list) {
             let len = self.list_len(list)?;
             if len >= capacity {
@@ -6613,7 +7001,11 @@ impl GenericCircuitRuntime {
             .append(row))
     }
 
-    fn remove_row(&mut self, list: &str, index: usize) -> RuntimeResult<KeyedRow<RuntimeRecord>> {
+    fn remove_row(
+        &mut self,
+        list: &str,
+        index: usize,
+    ) -> RuntimeResult<KeyedRow<RuntimeRowSnapshot>> {
         let rows = self
             .lists
             .memory_mut(list)
@@ -6626,7 +7018,7 @@ impl GenericCircuitRuntime {
 
     fn move_row(
         &mut self,
-        list: &'static str,
+        list: &str,
         from: usize,
         to: usize,
     ) -> RuntimeResult<GenericListRowCommit> {
@@ -6636,20 +7028,18 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .move_index(from, to)?;
         Ok(GenericListRowCommit {
-            list,
+            list: list.to_owned(),
             key,
             generation,
         })
     }
 
     fn row_identity(&self, list: &str, index: usize) -> RuntimeResult<(u64, u64)> {
-        let row = self
-            .lists
+        self.lists
             .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?;
-        Ok((row.key, row.generation))
+            .row_identity(index)
+            .ok_or_else(|| format!("generic list `{list}` has no index {index}").into())
     }
 
     fn bound_index(&self, list: &str, key: u64, generation: u64) -> RuntimeResult<Option<usize>> {
@@ -6663,7 +7053,7 @@ impl GenericCircuitRuntime {
     fn list_len(&self, list: &str) -> RuntimeResult<usize> {
         self.lists
             .memory(list)
-            .map(KeyedList::len)
+            .map(ListMemory::len)
             .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
     }
 
@@ -6671,7 +7061,7 @@ impl GenericCircuitRuntime {
         &self,
         list: &str,
         index: usize,
-        predicate: RuntimeListPredicate,
+        predicate: &RuntimeListPredicate,
     ) -> RuntimeResult<bool> {
         match predicate {
             RuntimeListPredicate::AlwaysTrue => Ok(true),
@@ -6720,7 +7110,7 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut count = 0usize;
         for index in 0..rows.len() {
-            if self.list_row_matches_predicate(list, index, predicate)? {
+            if self.list_row_matches_predicate(list, index, &predicate)? {
                 count += 1;
             }
         }
@@ -6756,7 +7146,7 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         let mut values = Vec::new();
         for index in 0..rows.len() {
-            let visible = self.list_row_matches_predicate(list, index, predicate)?;
+            let visible = self.list_row_matches_predicate(list, index, &predicate)?;
             if let Some(value) = while_value(visible, self.list_row_textlike(list, index, field)?) {
                 values.push(value.to_owned());
             }
@@ -6949,11 +7339,7 @@ impl GenericCircuitRuntime {
         self.lists
             .memory(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .row(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}"))?
-            .value
-            .columns
-            .value(field)
+            .value(index, field)
             .ok_or_else(|| format!("generic list `{list}` row missing field `{field}`").into())
     }
 }
@@ -7013,17 +7399,6 @@ impl ValueColumns {
             || Self::text_slot_index(&self.enums, &field_id).is_ok()
     }
 
-    fn value(&self, field: &str) -> Option<FieldValueRef<'_>> {
-        if let Some(index) = self.text_index(field) {
-            Some(FieldValueRef::Text(&self.text[index].value))
-        } else if let Some(index) = self.bool_index(field) {
-            Some(FieldValueRef::Bool(self.bools[index].value))
-        } else {
-            self.enum_index(field)
-                .map(|index| FieldValueRef::Enum(&self.enums[index].value))
-        }
-    }
-
     fn owned_value(&self, field: &str) -> Option<FieldValue> {
         if let Some(index) = self.text_index(field) {
             Some(FieldValue::Text(self.text[index].value.clone()))
@@ -7044,6 +7419,7 @@ impl ValueColumns {
             })
     }
 
+    #[cfg(test)]
     fn bool_value(&self, field: &str) -> Option<bool> {
         self.bool_index(field).map(|index| self.bools[index].value)
     }
@@ -7066,57 +7442,7 @@ impl ValueColumns {
         }
     }
 
-    fn copy_textlike(&mut self, source_field: &str, target_field: &str) -> RuntimeResult<()> {
-        if source_field == target_field {
-            return Ok(());
-        }
-        if let (Some(source_index), Some(target_index)) =
-            (self.text_index(source_field), self.text_index(target_field))
-        {
-            return copy_textlike_same_slots(
-                &mut self.text,
-                source_index,
-                target_index,
-                source_field,
-                target_field,
-            );
-        }
-        if let (Some(source_index), Some(target_index)) =
-            (self.enum_index(source_field), self.enum_index(target_field))
-        {
-            return copy_textlike_same_slots(
-                &mut self.enums,
-                source_index,
-                target_index,
-                source_field,
-                target_field,
-            );
-        }
-        if let Some(source_index) = self.text_index(source_field)
-            && let Some(target_index) = self.enum_index(target_field)
-        {
-            let source = &self.text[source_index].value;
-            let target = &mut self.enums[target_index].value;
-            target.clear();
-            target.push_str(source);
-            return Ok(());
-        }
-        if let Some(source_index) = self.enum_index(source_field)
-            && let Some(target_index) = self.text_index(target_field)
-        {
-            let source = &self.enums[source_index].value;
-            let target = &mut self.text[target_index].value;
-            target.clear();
-            target.push_str(source);
-            return Ok(());
-        }
-        if self.bool_index(source_field).is_some() || self.bool_index(target_field).is_some() {
-            Err("cannot copy text-like runtime value through bool field".into())
-        } else {
-            Err(format!("generic row missing field `{source_field}` or `{target_field}`").into())
-        }
-    }
-
+    #[cfg(test)]
     fn set_or_insert_text(&mut self, field: &str, value: &str) -> RuntimeResult<()> {
         if self.contains_key(field) {
             self.set_textlike(field, value)
@@ -7196,38 +7522,12 @@ impl ValueColumns {
     }
 
     fn text_slot_index(slots: &[TextValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
-        slots.binary_search_by(|slot| slot.field_id.as_str().cmp(field_id.as_str()))
+        slots.binary_search_by(|slot| slot.field_id.cmp(field_id))
     }
 
     fn bool_slot_index(slots: &[BoolValueSlot], field_id: &FieldSlotId) -> Result<usize, usize> {
-        slots.binary_search_by(|slot| slot.field_id.as_str().cmp(field_id.as_str()))
+        slots.binary_search_by(|slot| slot.field_id.cmp(field_id))
     }
-}
-
-fn copy_textlike_same_slots(
-    values: &mut [TextValueSlot],
-    source_index: usize,
-    target_index: usize,
-    source_field: &str,
-    target_field: &str,
-) -> RuntimeResult<()> {
-    let (source_ptr, source_len) = values
-        .get(source_index)
-        .map(|source| (source.value.as_ptr(), source.value.len()))
-        .ok_or_else(|| format!("generic row missing field `{source_field}`"))?;
-    let target = values
-        .get_mut(target_index)
-        .map(|target| &mut target.value)
-        .ok_or_else(|| format!("generic row missing field `{target_field}`"))?;
-    target.clear();
-    // The source and target are different existing String values in the same
-    // map. Mutating the target may reallocate only the target buffer; it does
-    // not move or mutate the source buffer.
-    let source = unsafe {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(source_ptr, source_len))
-    };
-    target.push_str(source);
-    Ok(())
 }
 
 fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns> {
@@ -7241,7 +7541,7 @@ fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns
     Ok(columns)
 }
 
-impl RuntimeRecordTemplate {
+impl RuntimeRowSnapshotTemplate {
     fn from_cells(row_scope: &str, indexed_cells: &[&boon_ir::StateCell]) -> RuntimeResult<Self> {
         let mut fields = Vec::with_capacity(indexed_cells.len());
         for cell in indexed_cells {
@@ -7255,7 +7555,7 @@ impl RuntimeRecordTemplate {
                     )
                 })?
                 .to_owned();
-            fields.push(RuntimeRecordFieldTemplate {
+            fields.push(RuntimeRowSnapshotFieldTemplate {
                 field_id: FieldSlotId::from_path(&field),
                 field_name: field.into_boxed_str(),
                 initial_value: cell.initial_value.clone(),
@@ -7264,7 +7564,7 @@ impl RuntimeRecordTemplate {
         Ok(Self { fields })
     }
 
-    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<RuntimeRecord> {
+    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
         for field in &self.fields {
             if seed_fields.contains_key_id(field.field_id.clone()) {
                 continue;
@@ -7272,14 +7572,14 @@ impl RuntimeRecordTemplate {
             let value = runtime_value_from_initial(&field.initial_value, &seed_fields)?;
             seed_fields.insert_value(field.field_name.to_string(), value);
         }
-        Ok(RuntimeRecord {
+        Ok(RuntimeRowSnapshot {
             columns: seed_fields,
         })
     }
 
     fn reset_from_text_seeds<'a>(
         &self,
-        row: &mut RuntimeRecord,
+        row: &mut RuntimeRowSnapshot,
         seed_text: impl Fn(&str) -> Option<&'a str>,
     ) -> RuntimeResult<()> {
         for field in &self.fields {
@@ -7308,7 +7608,7 @@ impl RuntimeRecordTemplate {
     }
 }
 
-impl RuntimeRecord {
+impl RuntimeRowSnapshot {
     fn reserve_textlike_fields(&mut self, additional: usize) -> RuntimeResult<()> {
         self.columns.reserve_all_textlike(additional);
         Ok(())
@@ -7332,7 +7632,7 @@ fn runtime_value_from_initial(
     }
 }
 
-fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut RuntimeRecord) {
+fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut RuntimeRowSnapshot) {
     for value in ir
         .derived_values
         .iter()
@@ -7371,13 +7671,13 @@ fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
 }
 
 #[cfg(test)]
-fn todo_generic_row(title: &str) -> RuntimeRecord {
+fn todo_generic_row(title: &str) -> RuntimeRowSnapshot {
     let mut columns = ValueColumns::default();
     columns.insert_value("title".to_owned(), FieldValue::Text(title.to_owned()));
     columns.insert_value("edit_text".to_owned(), FieldValue::Text(title.to_owned()));
     columns.insert_value("completed".to_owned(), FieldValue::Bool(false));
     columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
-    RuntimeRecord { columns }
+    RuntimeRowSnapshot { columns }
 }
 
 #[cfg(test)]
@@ -7394,16 +7694,17 @@ fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
         })
     });
     runtime.lists.insert(
+        ListId(0),
         "cells".to_owned(),
-        KeyedList::from_values(cell_rows),
+        ListMemory::from_values(cell_rows),
         Some(columns.saturating_mul(rows)),
-        RuntimeRecordTemplate::default(),
+        RuntimeRowSnapshotTemplate::default(),
     );
     runtime
 }
 
 #[cfg(test)]
-fn cell_generic_row(address: &str) -> RuntimeRecord {
+fn cell_generic_row(address: &str) -> RuntimeRowSnapshot {
     let mut columns = ValueColumns::default();
     columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
     columns.insert_value("editing_text".to_owned(), FieldValue::Text(String::new()));
@@ -7412,7 +7713,7 @@ fn cell_generic_row(address: &str) -> RuntimeRecord {
     columns.insert_value("error".to_owned(), FieldValue::Text(String::new()));
     columns.insert_value("dependencies".to_owned(), FieldValue::Text(String::new()));
     columns.insert_value("editing".to_owned(), FieldValue::Bool(false));
-    RuntimeRecord { columns }
+    RuntimeRowSnapshot { columns }
 }
 
 #[derive(Clone, Debug)]
@@ -7422,37 +7723,40 @@ struct ScalarEquationPlan {
 
 #[derive(Clone, Debug)]
 struct ScalarUpdateBranch {
-    target: &'static str,
-    source: &'static str,
+    target: String,
+    source: String,
     expression: ScalarUpdateExpression,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ScalarUpdateExpression {
     SourceText,
-    Const(&'static str),
-    PreviousValue(&'static str),
-    TextTrimOrPrevious {
-        path: &'static str,
-        previous: &'static str,
-    },
-    BoolNot(&'static str),
+    Const(String),
+    PreviousValue(String),
+    TextTrimOrPrevious { path: String, previous: String },
+    BoolNot(String),
     Unsupported,
 }
 
 impl ScalarUpdateExpression {
-    fn is_indexed_text_expression(self) -> bool {
+    fn is_indexed_text_expression(&self) -> bool {
         matches!(
             self,
             Self::SourceText | Self::PreviousValue(_) | Self::TextTrimOrPrevious { .. }
         )
     }
 
-    fn is_indexed_bool_expression(self) -> bool {
-        matches!(
-            self,
-            Self::Const("True") | Self::Const("False") | Self::BoolNot(_)
-        )
+    fn is_indexed_bool_expression(&self) -> bool {
+        matches!(self, Self::Const(value) if value == "True" || value == "False")
+            || matches!(self, Self::BoolNot(_))
+    }
+
+    fn const_bool(&self) -> Option<bool> {
+        match self {
+            Self::Const(value) if value == "True" => Some(true),
+            Self::Const(value) if value == "False" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -7462,59 +7766,59 @@ enum ScalarTextValue<'a> {
     PreviousValue,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum IndexedTextCandidate<'a> {
     SourceText(&'a str),
     PreviousText(&'a str),
-    PreviousField(&'static str),
+    PreviousField(String),
     TrimmedOrSkip(Option<&'a str>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericTextFieldCommit<'a> {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
-    field: &'static str,
+    field: String,
     value: &'a str,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericTextFieldIdentity {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
-    field: &'static str,
+    field: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericBoolFieldCommit {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
-    field: &'static str,
+    field: String,
     value: bool,
 }
 
 #[derive(Clone, Debug)]
 struct GenericValueFieldCommit<'a> {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
-    field: &'static str,
+    field: String,
     value: ProtocolValue<'a>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericListRowCommit {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericTextListAppendCommit<'a> {
-    list: &'static str,
+    list: String,
     key: u64,
     generation: u64,
     value: &'a str,
@@ -7522,7 +7826,7 @@ struct GenericTextListAppendCommit<'a> {
 
 #[derive(Clone, Debug)]
 struct GenericRootTextCommit<'a> {
-    target: &'static str,
+    target: String,
     value: Cow<'a, str>,
 }
 
@@ -7541,37 +7845,46 @@ struct GenericRenderContext<'a> {
 
 impl<'a> GenericTextFieldCommit<'a> {
     fn semantic_delta(&self) -> SemanticDelta<'a> {
-        GenericCircuitRuntime::semantic_field_delta(
-            Some(self.list),
-            Some(self.key),
-            Some(self.generation),
-            self.field,
-            ProtocolValue::Text(Cow::Borrowed(self.value)),
-        )
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: Some(Cow::Owned(self.list.clone())),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.field.clone())),
+            value: ProtocolValue::Text(Cow::Borrowed(self.value)),
+        }
     }
 }
 
 impl GenericBoolFieldCommit {
     fn semantic_delta(&self) -> SemanticDelta<'static> {
-        GenericCircuitRuntime::semantic_field_delta(
-            Some(self.list),
-            Some(self.key),
-            Some(self.generation),
-            self.field,
-            ProtocolValue::Bool(self.value),
-        )
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: Some(Cow::Owned(self.list.clone())),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.field.clone())),
+            value: ProtocolValue::Bool(self.value),
+        }
     }
 }
 
 impl<'a> GenericValueFieldCommit<'a> {
     fn semantic_delta(&self) -> SemanticDelta<'a> {
-        GenericCircuitRuntime::semantic_field_delta(
-            Some(self.list),
-            Some(self.key),
-            Some(self.generation),
-            self.field,
-            self.value.clone(),
-        )
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: Some(Cow::Owned(self.list.clone())),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.field.clone())),
+            value: self.value.clone(),
+        }
     }
 }
 
@@ -7579,12 +7892,12 @@ impl GenericListRowCommit {
     fn semantic_move_delta(&self, to: usize) -> SemanticDelta<'static> {
         SemanticDelta {
             kind: "ListMove",
-            list_id: Some(self.list),
+            list_id: Some(Cow::Owned(self.list.clone())),
             key: Some(self.key),
             generation: Some(self.generation),
             source_id: None,
             bind_epoch: None,
-            field_path: Some("position"),
+            field_path: Some(Cow::Borrowed("position")),
             value: ProtocolValue::NumberText(to as i64),
         }
     }
@@ -7592,37 +7905,46 @@ impl GenericListRowCommit {
 
 impl GenericTextFieldIdentity {
     fn semantic_delta_with_value<'a>(&self, value: ProtocolValue<'a>) -> SemanticDelta<'a> {
-        GenericCircuitRuntime::semantic_field_delta(
-            Some(self.list),
-            Some(self.key),
-            Some(self.generation),
-            self.field,
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: Some(Cow::Owned(self.list.clone())),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.field.clone())),
             value,
-        )
+        }
     }
 }
 
 impl<'a> GenericTextListAppendCommit<'a> {
     fn semantic_delta(&self) -> SemanticDelta<'a> {
-        GenericCircuitRuntime::semantic_list_delta(
-            "ListInsert",
-            self.list,
-            self.key,
-            self.generation,
-            ProtocolValue::Text(Cow::Borrowed(self.value)),
-        )
+        SemanticDelta {
+            kind: "ListInsert",
+            list_id: Some(Cow::Owned(self.list.clone())),
+            key: Some(self.key),
+            generation: Some(self.generation),
+            source_id: None,
+            bind_epoch: None,
+            field_path: None,
+            value: ProtocolValue::Text(Cow::Borrowed(self.value)),
+        }
     }
 }
 
 impl<'a> GenericRootTextCommit<'a> {
     fn semantic_delta(&self) -> SemanticDelta<'a> {
-        GenericCircuitRuntime::semantic_field_delta(
-            None,
-            None,
-            None,
-            self.target,
-            ProtocolValue::Text(self.value.clone()),
-        )
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: None,
+            key: None,
+            generation: None,
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.target.clone())),
+            value: ProtocolValue::Text(self.value.clone()),
+        }
     }
 }
 
@@ -7656,25 +7978,25 @@ impl GenericRenderLoweringPlan {
         context: GenericRenderContext<'a>,
     ) -> RuntimeResult<Option<RenderPatch<'a>>> {
         match mutation {
-            GenericSourceMutation::RootText(commit) => match commit.target {
+            GenericSourceMutation::RootText(commit) => match commit.target.as_str() {
                 "store.new_todo_text" => Ok(Some(patch(
                     "SetInputValue",
-                    RenderTarget::Static("new_todo_input"),
+                    RenderTarget::Static(Cow::Borrowed("new_todo_input")),
                     ProtocolValue::Text(commit.value.clone()),
                 ))),
                 "store.selected_filter" => Ok(Some(patch(
                     "SetSelectedFilter",
-                    RenderTarget::Static("filters"),
+                    RenderTarget::Static(Cow::Borrowed("filters")),
                     ProtocolValue::Text(commit.value.clone()),
                 ))),
                 _ => Err(format!("unsupported scalar render target `{}`", commit.target).into()),
             },
-            GenericSourceMutation::TextField(commit) => match commit.field {
+            GenericSourceMutation::TextField(commit) => match commit.field.as_str() {
                 "title" => Ok(Some(keyed_patch(
                     "SetText",
                     RenderTarget::TodoTitle(commit.key),
                     ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 ))),
@@ -7682,18 +8004,18 @@ impl GenericRenderLoweringPlan {
                     "SetEditInput",
                     RenderTarget::TodoEdit(commit.key),
                     ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 ))),
                 _ => Ok(None),
             },
-            GenericSourceMutation::BoolField(commit) => match commit.field {
+            GenericSourceMutation::BoolField(commit) => match commit.field.as_str() {
                 "completed" => Ok(Some(keyed_patch(
                     "SetProperty",
                     RenderTarget::TodoCheckbox(commit.key),
                     ProtocolValue::CheckedProperty(commit.value),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 ))),
@@ -7701,7 +8023,7 @@ impl GenericRenderLoweringPlan {
                     "HideEditInput",
                     RenderTarget::TodoEdit(commit.key),
                     ProtocolValue::Bool(commit.value),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 ))),
@@ -7710,7 +8032,7 @@ impl GenericRenderLoweringPlan {
                         "ShowEditInput",
                         RenderTarget::TodoEdit(commit.key),
                         ProtocolValue::Text(Cow::Borrowed(text)),
-                        commit.list,
+                        commit.list.clone(),
                         commit.key,
                         commit.generation,
                     )
@@ -7725,19 +8047,19 @@ impl GenericRenderLoweringPlan {
                 "RemoveElement",
                 RenderTarget::TodoRow(*key),
                 ProtocolValue::Null,
-                list,
+                list.clone(),
                 *key,
                 *generation,
             ))),
             GenericSourceMutation::SourceBind(binding) => Ok(Some(source_patch(
                 "BindSource",
-                RenderTarget::TodoSource(binding.key, binding.source_path),
+                RenderTarget::TodoSource(binding.key, Cow::Owned(binding.source_path.clone())),
                 source_binding_value(binding),
                 binding,
             ))),
             GenericSourceMutation::SourceUnbind(binding) => Ok(Some(source_patch(
                 "UnbindSource",
-                RenderTarget::TodoSource(binding.key, binding.source_path),
+                RenderTarget::TodoSource(binding.key, Cow::Owned(binding.source_path.clone())),
                 source_binding_value(binding),
                 binding,
             ))),
@@ -7745,7 +8067,7 @@ impl GenericRenderLoweringPlan {
                 "InsertElement",
                 RenderTarget::TodoRow(commit.key),
                 ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                commit.list,
+                commit.list.clone(),
                 commit.key,
                 commit.generation,
             ))),
@@ -7790,7 +8112,7 @@ impl GenericRenderLoweringPlan {
             "MoveElement",
             RenderTarget::TodoPosition(commit.key),
             ProtocolValue::NumberText(to as i64),
-            commit.list,
+            commit.list.clone(),
             commit.key,
             commit.generation,
         ))
@@ -7816,7 +8138,7 @@ impl GenericRenderLoweringPlan {
                     "SetCellEditor",
                     RenderTarget::Borrowed(Cow::Borrowed(address()?)),
                     ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 )))
@@ -7826,7 +8148,7 @@ impl GenericRenderLoweringPlan {
                     "SetCellText",
                     RenderTarget::Borrowed(Cow::Borrowed(address()?)),
                     commit.value.clone(),
-                    commit.list,
+                    commit.list.clone(),
                     commit.key,
                     commit.generation,
                 )))
@@ -7857,17 +8179,20 @@ impl<'a> GenericSourceMutation<'a> {
                 list,
                 key,
                 generation,
-            } => Some(GenericCircuitRuntime::semantic_list_delta(
-                "ListRemove",
-                list,
-                *key,
-                *generation,
-                ProtocolValue::Null,
-            )),
+            } => Some(SemanticDelta {
+                kind: "ListRemove",
+                list_id: Some(Cow::Owned(list.clone())),
+                key: Some(*key),
+                generation: Some(*generation),
+                source_id: None,
+                bind_epoch: None,
+                field_path: None,
+                value: ProtocolValue::Null,
+            }),
             Self::SourceBind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
                 "SourceBind",
                 binding,
-                ProtocolValue::Text(Cow::Borrowed(binding.source_path)),
+                ProtocolValue::Text(Cow::Owned(binding.source_path.clone())),
             )),
             Self::SourceUnbind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
                 "SourceUnbind",
@@ -7883,11 +8208,11 @@ enum GenericListRemoveObservation<'a> {
     RowRemoved { key: u64, generation: u64 },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GenericSourceActionInput<'a> {
     source: &'a str,
     source_id: SourceId,
-    list: Option<&'static str>,
+    list: Option<String>,
     index: Option<usize>,
     key: Option<&'a str>,
     text: Option<&'a str>,
@@ -7915,7 +8240,7 @@ enum GenericVisibleRowOccurrence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenericSourceRouteKind {
+enum SourceActionKind {
     RootText,
     RootScalar,
     ListAppend,
@@ -7929,7 +8254,7 @@ enum GenericSourceRouteKind {
     IndexedBoolBulk,
 }
 
-impl GenericSourceRouteKind {
+impl SourceActionKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::RootText => "root_text",
@@ -7956,7 +8281,7 @@ enum GenericSourceMutation<'a> {
     BoolField(GenericBoolFieldCommit),
     ListAppend(GenericTextListAppendCommit<'a>),
     ListRemove {
-        list: &'static str,
+        list: String,
         key: u64,
         generation: u64,
     },
@@ -7966,40 +8291,40 @@ enum GenericSourceMutation<'a> {
 
 #[derive(Debug)]
 struct GenericSourceMutationBatch<'a> {
-    root_texts: [Option<(&'static str, GenericRootTextCommit<'a>)>; 4],
-    text_fields: [Option<(&'static str, GenericTextFieldCommit<'a>)>; 8],
-    identity_fields: [Option<(&'static str, GenericTextFieldIdentity)>; 8],
-    bool_fields: [Option<(&'static str, GenericBoolFieldCommit)>; 8],
-    list_appends: [Option<(&'static str, GenericTextListAppendCommit<'a>)>; 4],
+    root_texts: [Option<(String, GenericRootTextCommit<'a>)>; 4],
+    text_fields: [Option<(String, GenericTextFieldCommit<'a>)>; 8],
+    identity_fields: [Option<(String, GenericTextFieldIdentity)>; 8],
+    bool_fields: [Option<(String, GenericBoolFieldCommit)>; 8],
+    list_appends: [Option<(String, GenericTextListAppendCommit<'a>)>; 4],
 }
 
 impl<'a> GenericSourceMutationBatch<'a> {
     fn new() -> Self {
         Self {
             root_texts: std::array::from_fn(|_| None),
-            text_fields: [None; 8],
-            identity_fields: [None; 8],
-            bool_fields: [None; 8],
-            list_appends: [None; 4],
+            text_fields: std::array::from_fn(|_| None),
+            identity_fields: std::array::from_fn(|_| None),
+            bool_fields: std::array::from_fn(|_| None),
+            list_appends: std::array::from_fn(|_| None),
         }
     }
 
     fn observe(&mut self, mutation: &GenericSourceMutation<'a>) -> RuntimeResult<()> {
         match mutation {
             GenericSourceMutation::RootText(commit) => {
-                Self::insert_root_text(&mut self.root_texts, commit.target, commit.clone())?;
+                Self::insert_root_text(&mut self.root_texts, &commit.target, commit.clone())?;
             }
             GenericSourceMutation::TextField(commit) => {
-                Self::insert_text(&mut self.text_fields, commit.field, *commit)?;
+                Self::insert_text(&mut self.text_fields, &commit.field, commit.clone())?;
             }
             GenericSourceMutation::TextFieldIdentity(commit) => {
-                Self::insert_identity(&mut self.identity_fields, commit.field, *commit)?;
+                Self::insert_identity(&mut self.identity_fields, &commit.field, commit.clone())?;
             }
             GenericSourceMutation::BoolField(commit) => {
-                Self::insert_bool(&mut self.bool_fields, commit.field, *commit)?;
+                Self::insert_bool(&mut self.bool_fields, &commit.field, commit.clone())?;
             }
             GenericSourceMutation::ListAppend(commit) => {
-                Self::insert_append(&mut self.list_appends, commit.list, *commit)?;
+                Self::insert_append(&mut self.list_appends, &commit.list, commit.clone())?;
             }
             GenericSourceMutation::ValueField(_)
             | GenericSourceMutation::ListRemove { .. }
@@ -8010,18 +8335,18 @@ impl<'a> GenericSourceMutationBatch<'a> {
     }
 
     fn insert_root_text(
-        slots: &mut [Option<(&'static str, GenericRootTextCommit<'a>)>; 4],
-        target: &'static str,
+        slots: &mut [Option<(String, GenericRootTextCommit<'a>)>; 4],
+        target: &str,
         commit: GenericRootTextCommit<'a>,
     ) -> RuntimeResult<()> {
         for slot in slots.iter_mut() {
             match slot {
-                Some((existing, value)) if *existing == target => {
+                Some((existing, value)) if existing == target => {
                     *value = commit;
                     return Ok(());
                 }
                 None => {
-                    *slot = Some((target, commit));
+                    *slot = Some((target.to_owned(), commit));
                     return Ok(());
                 }
                 _ => {}
@@ -8031,18 +8356,18 @@ impl<'a> GenericSourceMutationBatch<'a> {
     }
 
     fn insert_text(
-        slots: &mut [Option<(&'static str, GenericTextFieldCommit<'a>)>; 8],
-        field: &'static str,
+        slots: &mut [Option<(String, GenericTextFieldCommit<'a>)>; 8],
+        field: &str,
         commit: GenericTextFieldCommit<'a>,
     ) -> RuntimeResult<()> {
         for slot in slots.iter_mut() {
             match slot {
-                Some((existing, value)) if *existing == field => {
+                Some((existing, value)) if existing == field => {
                     *value = commit;
                     return Ok(());
                 }
                 None => {
-                    *slot = Some((field, commit));
+                    *slot = Some((field.to_owned(), commit));
                     return Ok(());
                 }
                 _ => {}
@@ -8052,18 +8377,18 @@ impl<'a> GenericSourceMutationBatch<'a> {
     }
 
     fn insert_identity(
-        slots: &mut [Option<(&'static str, GenericTextFieldIdentity)>; 8],
-        field: &'static str,
+        slots: &mut [Option<(String, GenericTextFieldIdentity)>; 8],
+        field: &str,
         commit: GenericTextFieldIdentity,
     ) -> RuntimeResult<()> {
         for slot in slots.iter_mut() {
             match slot {
-                Some((existing, value)) if *existing == field => {
+                Some((existing, value)) if existing == field => {
                     *value = commit;
                     return Ok(());
                 }
                 None => {
-                    *slot = Some((field, commit));
+                    *slot = Some((field.to_owned(), commit));
                     return Ok(());
                 }
                 _ => {}
@@ -8073,18 +8398,18 @@ impl<'a> GenericSourceMutationBatch<'a> {
     }
 
     fn insert_bool(
-        slots: &mut [Option<(&'static str, GenericBoolFieldCommit)>; 8],
-        field: &'static str,
+        slots: &mut [Option<(String, GenericBoolFieldCommit)>; 8],
+        field: &str,
         commit: GenericBoolFieldCommit,
     ) -> RuntimeResult<()> {
         for slot in slots.iter_mut() {
             match slot {
-                Some((existing, value)) if *existing == field => {
+                Some((existing, value)) if existing == field => {
                     *value = commit;
                     return Ok(());
                 }
                 None => {
-                    *slot = Some((field, commit));
+                    *slot = Some((field.to_owned(), commit));
                     return Ok(());
                 }
                 _ => {}
@@ -8094,18 +8419,18 @@ impl<'a> GenericSourceMutationBatch<'a> {
     }
 
     fn insert_append(
-        slots: &mut [Option<(&'static str, GenericTextListAppendCommit<'a>)>; 4],
-        list: &'static str,
+        slots: &mut [Option<(String, GenericTextListAppendCommit<'a>)>; 4],
+        list: &str,
         commit: GenericTextListAppendCommit<'a>,
     ) -> RuntimeResult<()> {
         for slot in slots.iter_mut() {
             match slot {
-                Some((existing, value)) if *existing == list => {
+                Some((existing, value)) if existing == list => {
                     *value = commit;
                     return Ok(());
                 }
                 None => {
-                    *slot = Some((list, commit));
+                    *slot = Some((list.to_owned(), commit));
                     return Ok(());
                 }
                 _ => {}
@@ -8118,16 +8443,16 @@ impl<'a> GenericSourceMutationBatch<'a> {
         &self,
         source: &str,
         label: &str,
-        field: &'static str,
+        field: &str,
     ) -> RuntimeResult<GenericTextFieldCommit<'a>> {
         self.text(field).ok_or_else(|| {
             format!("{label} from `{source}` produced no `{field}` text change").into()
         })
     }
 
-    fn text(&self, field: &'static str) -> Option<GenericTextFieldCommit<'a>> {
+    fn text(&self, field: &str) -> Option<GenericTextFieldCommit<'a>> {
         self.text_fields.iter().find_map(|slot| match slot {
-            Some((existing, commit)) if *existing == field => Some(*commit),
+            Some((existing, commit)) if existing == field => Some(commit.clone()),
             _ => None,
         })
     }
@@ -8136,12 +8461,12 @@ impl<'a> GenericSourceMutationBatch<'a> {
         &self,
         source: &str,
         label: &str,
-        field: &'static str,
+        field: &str,
     ) -> RuntimeResult<GenericTextFieldIdentity> {
         self.identity_fields
             .iter()
             .find_map(|slot| match slot {
-                Some((existing, commit)) if *existing == field => Some(*commit),
+                Some((existing, commit)) if existing == field => Some(commit.clone()),
                 _ => None,
             })
             .ok_or_else(|| format!("{label} from `{source}` produced no `{field}` identity").into())
@@ -8151,30 +8476,30 @@ impl<'a> GenericSourceMutationBatch<'a> {
         &self,
         source: &str,
         label: &str,
-        field: &'static str,
+        field: &str,
     ) -> RuntimeResult<GenericBoolFieldCommit> {
         self.bool(field).ok_or_else(|| {
             format!("{label} from `{source}` produced no `{field}` bool change").into()
         })
     }
 
-    fn bool(&self, field: &'static str) -> Option<GenericBoolFieldCommit> {
+    fn bool(&self, field: &str) -> Option<GenericBoolFieldCommit> {
         self.bool_fields.iter().find_map(|slot| match slot {
-            Some((existing, commit)) if *existing == field => Some(*commit),
+            Some((existing, commit)) if existing == field => Some(commit.clone()),
             _ => None,
         })
     }
 
-    fn list_append(&self, list: &'static str) -> Option<GenericTextListAppendCommit<'a>> {
+    fn list_append(&self, list: &str) -> Option<GenericTextListAppendCommit<'a>> {
         self.list_appends.iter().find_map(|slot| match slot {
-            Some((existing, commit)) if *existing == list => Some(*commit),
+            Some((existing, commit)) if existing == list => Some(commit.clone()),
             _ => None,
         })
     }
 
-    fn root_text(&self, target: &'static str) -> Option<GenericRootTextCommit<'a>> {
+    fn root_text(&self, target: &str) -> Option<GenericRootTextCommit<'a>> {
         self.root_texts.iter().find_map(|slot| match slot {
-            Some((existing, commit)) if *existing == target => Some(commit.clone()),
+            Some((existing, commit)) if existing == target => Some(commit.clone()),
             _ => None,
         })
     }
@@ -8187,8 +8512,8 @@ struct DerivedEquationPlan {
 
 #[derive(Clone, Debug)]
 struct RuntimeDerivedTextTransform {
-    target: &'static str,
-    source: &'static str,
+    target: String,
+    source: String,
     expression: RuntimeDerivedTextExpression,
 }
 
@@ -8203,6 +8528,29 @@ struct SourceRoutePlan {
     route_slots: Vec<SourceRoute>,
     id_slots: Vec<Option<SourceRouteIndex>>,
     label_slots: Vec<SourceBoundaryLabel>,
+    action_table: SourceActionTable,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceActionTable {
+    by_source: Vec<Vec<SourceAction>>,
+}
+
+impl SourceActionTable {
+    fn set(&mut self, source_id: SourceId, actions: Vec<SourceAction>) {
+        let slot = source_id.as_usize();
+        if self.by_source.len() <= slot {
+            self.by_source.resize_with(slot + 1, Vec::new);
+        }
+        self.by_source[slot] = actions;
+    }
+
+    fn actions(&self, source_id: SourceId) -> Option<&[SourceAction]> {
+        self.by_source
+            .get(source_id.as_usize())
+            .map(Vec::as_slice)
+            .filter(|actions| !actions.is_empty())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8214,9 +8562,9 @@ impl SourceRouteIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceBoundaryLabel {
-    source: &'static str,
+    source: String,
     source_id: SourceId,
 }
 
@@ -8227,61 +8575,61 @@ struct ListSourceBindingPlan {
 
 #[derive(Clone, Debug)]
 struct ListSourceBindingSlot {
-    list: &'static str,
-    source_paths: Vec<&'static str>,
+    list: String,
+    source_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 struct SourceRoute {
     source_id: SourceId,
-    source: &'static str,
+    source: String,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
-    derived_text_targets: Vec<&'static str>,
+    derived_text_targets: Vec<String>,
     list_append_targets: Vec<SourceRouteListAppend>,
     list_remove_targets: Vec<SourceRouteListRemove>,
-    actions: Vec<SourceRouteAction>,
+    actions: Vec<SourceAction>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceRouteScalarTarget {
-    target: &'static str,
+    target: String,
     expression: ScalarUpdateExpression,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceRouteListRemove {
-    list: &'static str,
+    list: String,
     predicate: RuntimeListPredicate,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceRouteListAppend {
-    list: &'static str,
-    trigger: &'static str,
+    list: String,
+    trigger: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceRouteAction {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceAction {
     RootScalar,
     DerivedText {
-        target: &'static str,
+        target: String,
     },
     ListRemove {
-        list: &'static str,
+        list: String,
     },
     ListAppend {
-        list: &'static str,
-        trigger: &'static str,
+        list: String,
+        trigger: String,
     },
     IndexedText {
         kind: SourceRouteTextAction,
-        target: &'static str,
+        target: String,
     },
     IndexedBool {
         kind: SourceRouteBoolAction,
-        target: &'static str,
+        target: String,
     },
 }
 
@@ -8306,49 +8654,42 @@ struct ListEquationPlan {
 
 #[derive(Clone, Debug)]
 struct RuntimeListOperation {
-    list: &'static str,
+    list: String,
     kind: RuntimeListOperationKind,
 }
 
 #[derive(Clone, Debug)]
 enum RuntimeListOperationKind {
     Append {
-        trigger: &'static str,
+        trigger: String,
         fields: Vec<RuntimeListAppendField>,
     },
     Remove {
-        source: &'static str,
+        source: String,
         predicate: RuntimeListPredicate,
     },
     Retain {
-        target: &'static str,
+        target: String,
         predicate: RuntimeListPredicate,
     },
     Count {
-        target: &'static str,
+        target: String,
         predicate: RuntimeListPredicate,
     },
 }
 
 #[derive(Clone, Debug)]
 struct RuntimeListAppendField {
-    name: &'static str,
-    source: &'static str,
+    name: String,
+    source: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeListPredicate {
     AlwaysTrue,
-    FieldBool {
-        path: &'static str,
-    },
-    FieldBoolNot {
-        path: &'static str,
-    },
-    SelectorVisibility {
-        selector: &'static str,
-        row_field: &'static str,
-    },
+    FieldBool { path: String },
+    FieldBoolNot { path: String },
+    SelectorVisibility { selector: String, row_field: String },
     Unsupported,
 }
 
@@ -8358,26 +8699,26 @@ impl ScalarEquationPlan {
             .update_branches
             .iter()
             .map(|branch| ScalarUpdateBranch {
-                target: leak_runtime_path(branch.target.clone()),
-                source: leak_runtime_path(branch.source.clone()),
+                target: branch.target.clone(),
+                source: branch.source.clone(),
                 expression: match &branch.expression {
                     UpdateExpression::SourcePayload { path } if path == "text" => {
                         ScalarUpdateExpression::SourceText
                     }
                     UpdateExpression::Const { value } => {
-                        ScalarUpdateExpression::Const(leak_runtime_path(value.clone()))
+                        ScalarUpdateExpression::Const(value.clone())
                     }
                     UpdateExpression::PreviousValue { path } => {
-                        ScalarUpdateExpression::PreviousValue(leak_runtime_path(path.clone()))
+                        ScalarUpdateExpression::PreviousValue(path.clone())
                     }
                     UpdateExpression::TextTrimOrPrevious { path, previous } => {
                         ScalarUpdateExpression::TextTrimOrPrevious {
-                            path: leak_runtime_path(path.clone()),
-                            previous: leak_runtime_path(previous.clone()),
+                            path: path.clone(),
+                            previous: previous.clone(),
                         }
                     }
                     UpdateExpression::BoolNot { path } => {
-                        ScalarUpdateExpression::BoolNot(leak_runtime_path(path.clone()))
+                        ScalarUpdateExpression::BoolNot(path.clone())
                     }
                     _ => ScalarUpdateExpression::Unsupported,
                 },
@@ -8414,7 +8755,7 @@ impl ScalarEquationPlan {
         else {
             return Ok(None);
         };
-        match branch.expression {
+        match &branch.expression {
             ScalarUpdateExpression::SourceText => {
                 let text = payload_text.ok_or_else(|| {
                     format!("source `{source}` for `{target}` requires a text payload")
@@ -8422,7 +8763,7 @@ impl ScalarEquationPlan {
                 Ok(Some(ScalarTextValue::Text(Cow::Borrowed(text))))
             }
             ScalarUpdateExpression::Const(value) => {
-                Ok(Some(ScalarTextValue::Text(Cow::Borrowed(value))))
+                Ok(Some(ScalarTextValue::Text(Cow::Owned(value.clone()))))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::TextTrimOrPrevious { .. }
@@ -8444,9 +8785,8 @@ impl ScalarEquationPlan {
         else {
             return Ok(None);
         };
-        match branch.expression {
-            ScalarUpdateExpression::Const("True") => Ok(Some(true)),
-            ScalarUpdateExpression::Const("False") => Ok(Some(false)),
+        match &branch.expression {
+            expression if expression.const_bool().is_some() => Ok(expression.const_bool()),
             ScalarUpdateExpression::BoolNot(path) => {
                 let value = read_bool(path).ok_or_else(|| {
                     format!("source `{source}` for `{target}` cannot read bool path `{path}`")
@@ -8489,12 +8829,8 @@ impl DerivedEquationPlan {
                     && append_triggers.contains(value.path.as_str())
             })
             .map(|value| RuntimeDerivedTextTransform {
-                target: leak_runtime_path(value.path.clone()),
-                source: value
-                    .sources
-                    .first()
-                    .map(|source| leak_runtime_path(source.clone()))
-                    .unwrap_or(""),
+                target: value.path.clone(),
+                source: value.sources.first().cloned().unwrap_or_default(),
                 expression: if value.sources.len() == 1 {
                     RuntimeDerivedTextExpression::EnterKeyTextTrimNonEmpty
                 } else {
@@ -8548,13 +8884,13 @@ impl SourceRoutePlan {
     ) -> RuntimeResult<Self> {
         let mut routes = Self::default();
         for branch in &scalar.branches {
-            let source_id = source_id_for_path(ir, branch.source)?;
-            let route = routes.route_mut(branch.source, source_id);
+            let source_id = source_id_for_path(ir, &branch.source)?;
+            let route = routes.route_mut(&branch.source, source_id);
             let scalar_target = SourceRouteScalarTarget {
-                target: branch.target,
-                expression: branch.expression,
+                target: branch.target.clone(),
+                expression: branch.expression.clone(),
             };
-            if root_targets.contains(branch.target) {
+            if root_targets.contains(branch.target.as_str()) {
                 route.root_scalar_targets.push(scalar_target);
             } else if branch.expression.is_indexed_text_expression() {
                 route.indexed_text_targets.push(scalar_target);
@@ -8563,11 +8899,11 @@ impl SourceRoutePlan {
             }
         }
         for transform in &derived.text_transforms {
-            let source_id = source_id_for_path(ir, transform.source)?;
+            let source_id = source_id_for_path(ir, &transform.source)?;
             routes
-                .route_mut(transform.source, source_id)
+                .route_mut(&transform.source, source_id)
                 .derived_text_targets
-                .push(transform.target);
+                .push(transform.target.clone());
         }
         for operation in &lists.operations {
             match &operation.kind {
@@ -8578,8 +8914,8 @@ impl SourceRoutePlan {
                         .filter(|route| route.derived_text_targets.contains(trigger))
                     {
                         route.list_append_targets.push(SourceRouteListAppend {
-                            list: operation.list,
-                            trigger,
+                            list: operation.list.clone(),
+                            trigger: trigger.clone(),
                         });
                     }
                 }
@@ -8589,8 +8925,8 @@ impl SourceRoutePlan {
                         .route_mut(source, source_id)
                         .list_remove_targets
                         .push(SourceRouteListRemove {
-                            list: operation.list,
-                            predicate: *predicate,
+                            list: operation.list.clone(),
+                            predicate: predicate.clone(),
                         });
                 }
                 RuntimeListOperationKind::Retain { .. }
@@ -8600,6 +8936,7 @@ impl SourceRoutePlan {
         for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
+        routes.rebuild_action_table();
         Ok(routes)
     }
 
@@ -8623,7 +8960,7 @@ impl SourceRoutePlan {
 
     fn source_id(&self, source: &str) -> Option<SourceId> {
         self.label_slots
-            .binary_search_by(|label| label.source.cmp(source))
+            .binary_search_by(|label| label.source.as_str().cmp(source))
             .ok()
             .and_then(|index| self.label_slots.get(index))
             .map(|label| label.source_id)
@@ -8640,18 +8977,20 @@ impl SourceRoutePlan {
             .ok_or_else(|| format!("source `{source}` has no compiled route").into())
     }
 
-    fn actions_for_source_id(&self, source_id: SourceId) -> RuntimeResult<&[SourceRouteAction]> {
-        Ok(self
-            .for_source_id(source_id)
-            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
-            .actions
-            .as_slice())
+    fn actions_for_source_id(&self, source_id: SourceId) -> RuntimeResult<&[SourceAction]> {
+        self.action_table.actions(source_id).ok_or_else(|| {
+            format!(
+                "SourceId `{}` has no compiled source action table entry",
+                source_id.as_usize()
+            )
+            .into()
+        })
     }
 
     fn single_root_scalar_target_for_source_id(
         &self,
         source_id: SourceId,
-    ) -> RuntimeResult<Option<&'static str>> {
+    ) -> RuntimeResult<Option<&str>> {
         self.for_source_id(source_id)
             .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))?
             .single_root_scalar_target()
@@ -8668,11 +9007,11 @@ impl SourceRoutePlan {
     }
 
     #[cfg(test)]
-    fn list_append_trigger(&self, source: &str, list: &str) -> RuntimeResult<&'static str> {
+    fn list_append_trigger(&self, source: &str, list: &str) -> RuntimeResult<&str> {
         self.require_source(source)?.list_append_trigger(list)
     }
 
-    fn route_mut(&mut self, source: &'static str, source_id: SourceId) -> &mut SourceRoute {
+    fn route_mut(&mut self, source: &str, source_id: SourceId) -> &mut SourceRoute {
         let source_slot = source_id.as_usize();
         if self.id_slots.len() <= source_slot {
             self.id_slots.resize(source_slot + 1, None);
@@ -8683,15 +9022,18 @@ impl SourceRoutePlan {
 
         let index = SourceRouteIndex(self.route_slots.len());
         self.id_slots[source_slot] = Some(index);
-        let label = SourceBoundaryLabel { source, source_id };
+        let label = SourceBoundaryLabel {
+            source: source.to_owned(),
+            source_id,
+        };
         let label_index = self
             .label_slots
-            .binary_search_by(|candidate| candidate.source.cmp(source))
+            .binary_search_by(|candidate| candidate.source.as_str().cmp(source))
             .unwrap_or_else(|index| index);
         self.label_slots.insert(label_index, label);
         self.route_slots.push(SourceRoute {
             source_id,
-            source,
+            source: source.to_owned(),
             root_scalar_targets: Vec::new(),
             indexed_text_targets: Vec::new(),
             indexed_bool_targets: Vec::new(),
@@ -8703,6 +9045,14 @@ impl SourceRoutePlan {
         self.route_slots
             .last_mut()
             .expect("route was just pushed and must exist")
+    }
+
+    fn rebuild_action_table(&mut self) {
+        self.action_table = SourceActionTable::default();
+        for route in &self.route_slots {
+            self.action_table
+                .set(route.source_id, route.actions.clone());
+        }
     }
 }
 
@@ -8724,11 +9074,11 @@ impl ListSourceBindingPlan {
                 .sources
                 .iter()
                 .filter(|source| source.scoped && source.path.starts_with(&prefix))
-                .map(|source| leak_runtime_path(source.path.clone()))
+                .map(|source| source.path.clone())
                 .collect::<Vec<_>>();
             if !source_paths.is_empty() {
                 list_slots.push(ListSourceBindingSlot {
-                    list: leak_runtime_path(list.name.clone()),
+                    list: list.name.clone(),
                     source_paths,
                 });
             }
@@ -8736,7 +9086,7 @@ impl ListSourceBindingPlan {
         Self { list_slots }
     }
 
-    fn source_paths(&self, list: &str) -> RuntimeResult<&[&'static str]> {
+    fn source_paths(&self, list: &str) -> RuntimeResult<&[String]> {
         self.list_slots
             .iter()
             .find_map(|binding| (binding.list == list).then_some(binding.source_paths.as_slice()))
@@ -8747,10 +9097,10 @@ impl ListSourceBindingPlan {
         self.source_paths(list).map(<[_]>::len)
     }
 
-    fn list_for_row_scope(&self, scope: &str) -> Option<&'static str> {
-        self.list_slots
-            .iter()
-            .find_map(|binding| row_scope_matches_list(binding.list, scope).then_some(binding.list))
+    fn list_for_row_scope(&self, scope: &str) -> Option<&str> {
+        self.list_slots.iter().find_map(|binding| {
+            row_scope_matches_list(&binding.list, scope).then_some(binding.list.as_str())
+        })
     }
 }
 
@@ -8760,31 +9110,34 @@ impl SourceRoute {
         self.actions.extend(
             self.root_scalar_targets
                 .iter()
-                .map(|_| SourceRouteAction::RootScalar),
+                .map(|_| SourceAction::RootScalar),
         );
         self.actions.extend(
             self.derived_text_targets
                 .iter()
-                .copied()
-                .map(|target| SourceRouteAction::DerivedText { target }),
+                .cloned()
+                .map(|target| SourceAction::DerivedText { target }),
         );
-        self.actions.extend(
-            self.list_remove_targets
-                .iter()
-                .map(|target| SourceRouteAction::ListRemove { list: target.list }),
-        );
+        self.actions
+            .extend(
+                self.list_remove_targets
+                    .iter()
+                    .map(|target| SourceAction::ListRemove {
+                        list: target.list.clone(),
+                    }),
+            );
         self.actions
             .extend(
                 self.list_append_targets
                     .iter()
-                    .map(|target| SourceRouteAction::ListAppend {
-                        list: target.list,
-                        trigger: target.trigger,
+                    .map(|target| SourceAction::ListAppend {
+                        list: target.list.clone(),
+                        trigger: target.trigger.clone(),
                     }),
             );
         self.actions
             .extend(self.indexed_text_targets.iter().filter_map(|target| {
-                let kind = match target.expression {
+                let kind = match &target.expression {
                     ScalarUpdateExpression::SourceText => SourceRouteTextAction::SourceText,
                     ScalarUpdateExpression::PreviousValue(_) => {
                         SourceRouteTextAction::PreviousValue
@@ -8796,99 +9149,60 @@ impl SourceRoute {
                     | ScalarUpdateExpression::BoolNot(_)
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
-                Some(SourceRouteAction::IndexedText {
+                Some(SourceAction::IndexedText {
                     kind,
-                    target: target.target,
+                    target: target.target.clone(),
                 })
             }));
         self.actions
             .extend(self.indexed_bool_targets.iter().filter_map(|target| {
-                let kind = match target.expression {
+                let kind = match &target.expression {
                     ScalarUpdateExpression::BoolNot(_) => SourceRouteBoolAction::BoolNot,
-                    ScalarUpdateExpression::Const("True") => SourceRouteBoolAction::ConstTrue,
-                    ScalarUpdateExpression::Const("False") => SourceRouteBoolAction::ConstFalse,
+                    ScalarUpdateExpression::Const(value) if value == "True" => {
+                        SourceRouteBoolAction::ConstTrue
+                    }
+                    ScalarUpdateExpression::Const(value) if value == "False" => {
+                        SourceRouteBoolAction::ConstFalse
+                    }
                     ScalarUpdateExpression::SourceText
                     | ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
-                Some(SourceRouteAction::IndexedBool {
+                Some(SourceAction::IndexedBool {
                     kind,
-                    target: target.target,
+                    target: target.target.clone(),
                 })
             }));
     }
 
-    fn has_action(&self, matches: impl Fn(SourceRouteAction) -> bool) -> bool {
-        self.actions.iter().copied().any(matches)
+    #[cfg(test)]
+    fn has_action(&self, matches: impl Fn(&SourceAction) -> bool) -> bool {
+        self.actions.iter().any(matches)
     }
 
-    fn has_root_scalar_action(&self) -> bool {
-        self.has_action(|action| matches!(action, SourceRouteAction::RootScalar))
-    }
-
-    fn has_indexed_text_action(&self, expected: SourceRouteTextAction) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::IndexedText { kind, .. } if kind == expected
-            )
-        })
-    }
-
-    fn has_indexed_text_action_where(
-        &self,
-        expected: SourceRouteTextAction,
-        matches_target: impl Fn(&'static str) -> bool,
-    ) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::IndexedText { kind, target }
-                    if kind == expected && matches_target(target)
-            )
-        })
-    }
-
-    fn has_indexed_bool_action(&self, expected: SourceRouteBoolAction) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::IndexedBool { kind, .. } if kind == expected
-            )
-        })
-    }
-
-    fn single_root_scalar_target(&self) -> RuntimeResult<Option<&'static str>> {
+    fn single_root_scalar_target(&self) -> RuntimeResult<Option<&str>> {
         let mut target = None;
         for candidate in &self.root_scalar_targets {
-            if target.is_some_and(|current| current != candidate.target) {
+            if target.is_some_and(|current| current != candidate.target.as_str()) {
                 return Err(format!(
                     "source `{}` drives multiple root scalar targets in this runtime slice",
                     self.source
                 )
                 .into());
             }
-            target = Some(candidate.target);
+            target = Some(candidate.target.as_str());
         }
         Ok(target)
     }
 
-    fn has_list_remove_target(&self, list: &str) -> bool {
-        self.has_action(|action| {
-            matches!(
-                action,
-                SourceRouteAction::ListRemove { list: candidate } if candidate == list
-            )
-        })
-    }
-
+    #[cfg(test)]
     fn has_list_append_target(&self, list: &str) -> bool {
         self.has_action(|action| {
             matches!(
                 action,
-                SourceRouteAction::ListAppend {
+                SourceAction::ListAppend {
                     list: candidate,
                     ..
                 } if candidate == list
@@ -8899,7 +9213,7 @@ impl SourceRoute {
     fn list_remove_predicate(&self, list: &str) -> RuntimeResult<RuntimeListPredicate> {
         self.list_remove_targets
             .iter()
-            .find_map(|candidate| (candidate.list == list).then_some(candidate.predicate))
+            .find_map(|candidate| (candidate.list == list).then_some(candidate.predicate.clone()))
             .ok_or_else(|| {
                 format!(
                     "source `{}` has no compiled list-remove route for `{list}`",
@@ -8910,20 +9224,20 @@ impl SourceRoute {
     }
 
     #[cfg(test)]
-    fn list_append_trigger(&self, list: &str) -> RuntimeResult<&'static str> {
+    fn list_append_trigger(&self, list: &str) -> RuntimeResult<&str> {
         let mut trigger = None;
         for candidate in &self.list_append_targets {
             if candidate.list != list {
                 continue;
             }
-            if trigger.is_some_and(|current| current != candidate.trigger) {
+            if trigger.is_some_and(|current| current != candidate.trigger.as_str()) {
                 return Err(format!(
                     "source `{}` has multiple list-append triggers for `{list}`",
                     self.source
                 )
                 .into());
             }
-            trigger = Some(candidate.trigger);
+            trigger = Some(candidate.trigger.as_str());
         }
         trigger.ok_or_else(|| {
             format!(
@@ -8941,35 +9255,35 @@ impl ListEquationPlan {
             .list_operations
             .iter()
             .map(|operation| {
-                let list = leak_runtime_path(operation.list.clone());
+                let list = operation.list.clone();
                 let kind = match &operation.kind {
                     ListOperationKind::Append { trigger, fields } => {
                         RuntimeListOperationKind::Append {
-                            trigger: leak_runtime_path(trigger.clone()),
+                            trigger: trigger.clone(),
                             fields: fields
                                 .iter()
                                 .map(|field| RuntimeListAppendField {
-                                    name: leak_runtime_path(field.name.clone()),
-                                    source: leak_runtime_path(field.source.clone()),
+                                    name: field.name.clone(),
+                                    source: field.source.clone(),
                                 })
                                 .collect(),
                         }
                     }
                     ListOperationKind::Remove { source, predicate } => {
                         RuntimeListOperationKind::Remove {
-                            source: leak_runtime_path(source.clone()),
+                            source: source.clone(),
                             predicate: runtime_list_predicate(predicate),
                         }
                     }
                     ListOperationKind::Retain { target, predicate } => {
                         RuntimeListOperationKind::Retain {
-                            target: leak_runtime_path(target.clone()),
+                            target: target.clone(),
                             predicate: runtime_list_predicate(predicate),
                         }
                     }
                     ListOperationKind::Count { target, predicate } => {
                         RuntimeListOperationKind::Count {
-                            target: leak_runtime_path(target.clone()),
+                            target: target.clone(),
                             predicate: runtime_list_predicate(predicate),
                         }
                     }
@@ -8987,12 +9301,12 @@ impl ListEquationPlan {
         }
     }
 
-    fn append_trigger(&self, list: &str) -> RuntimeResult<&'static str> {
+    fn append_trigger(&self, list: &str) -> RuntimeResult<&str> {
         self.operations
             .iter()
             .find_map(|operation| match &operation.kind {
                 RuntimeListOperationKind::Append { trigger, .. } if operation.list == list => {
-                    Some(*trigger)
+                    Some(trigger.as_str())
                 }
                 RuntimeListOperationKind::Append { .. }
                 | RuntimeListOperationKind::Remove { .. }
@@ -9063,7 +9377,7 @@ impl ListEquationPlan {
                 RuntimeListOperationKind::Count {
                     target: candidate,
                     predicate,
-                } if operation.list == list && *candidate == target => Some(*predicate),
+                } if operation.list == list && *candidate == target => Some(predicate.clone()),
                 RuntimeListOperationKind::Append { .. }
                 | RuntimeListOperationKind::Remove { .. }
                 | RuntimeListOperationKind::Retain { .. }
@@ -9079,7 +9393,7 @@ impl ListEquationPlan {
                 RuntimeListOperationKind::Retain {
                     target: candidate,
                     predicate,
-                } if operation.list == list && *candidate == target => Some(*predicate),
+                } if operation.list == list && *candidate == target => Some(predicate.clone()),
                 RuntimeListOperationKind::Append { .. }
                 | RuntimeListOperationKind::Remove { .. }
                 | RuntimeListOperationKind::Retain { .. }
@@ -9092,18 +9406,18 @@ impl ListEquationPlan {
 fn runtime_list_predicate(predicate: &ListPredicate) -> RuntimeListPredicate {
     match predicate {
         ListPredicate::AlwaysTrue => RuntimeListPredicate::AlwaysTrue,
-        ListPredicate::RowFieldBool { path } => RuntimeListPredicate::FieldBool {
-            path: leak_runtime_path(path.clone()),
-        },
-        ListPredicate::RowFieldBoolNot { path } => RuntimeListPredicate::FieldBoolNot {
-            path: leak_runtime_path(path.clone()),
-        },
+        ListPredicate::RowFieldBool { path } => {
+            RuntimeListPredicate::FieldBool { path: path.clone() }
+        }
+        ListPredicate::RowFieldBoolNot { path } => {
+            RuntimeListPredicate::FieldBoolNot { path: path.clone() }
+        }
         ListPredicate::SelectedFilterVisibility {
             selector,
             row_field,
         } => RuntimeListPredicate::SelectorVisibility {
-            selector: leak_runtime_path(selector.clone()),
-            row_field: leak_runtime_path(row_field.clone()),
+            selector: selector.clone(),
+            row_field: row_field.clone(),
         },
         _ => RuntimeListPredicate::Unsupported,
     }
@@ -9149,8 +9463,9 @@ fn seeded_todomvc_generic(
         rows.push(row_template.materialize(seed_fields)?);
     }
     runtime.storage.lists.insert(
+        ListId(0),
         "todos".to_owned(),
-        KeyedList::from_values(rows),
+        ListMemory::from_values(rows),
         capacity,
         row_template,
     );
@@ -9265,7 +9580,7 @@ impl TodoRuntime {
             TodoEvent::HoverDelete { .. } => {}
         }
         match event {
-            TodoEvent::Source(routed) if routed.route_kind == GenericSourceRouteKind::RootText => {
+            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::RootText => {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9282,9 +9597,7 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::Source(routed)
-                if routed.route_kind == GenericSourceRouteKind::ListAppend =>
-            {
+            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::ListAppend => {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9306,9 +9619,7 @@ impl TodoRuntime {
                     }
                 }
             }
-            TodoEvent::Source(routed)
-                if routed.route_kind == GenericSourceRouteKind::RootScalar =>
-            {
+            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::RootScalar => {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9325,14 +9636,10 @@ impl TodoRuntime {
                     },
                 )?;
             }
-            TodoEvent::Source(routed)
-                if routed.route_kind == GenericSourceRouteKind::ListRemove =>
-            {
+            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::ListRemove => {
                 self.remove_where_source(&step.id, routed.source(), deltas, patches)?;
             }
-            TodoEvent::Source(routed)
-                if routed.route_kind == GenericSourceRouteKind::IndexedBoolBulk =>
-            {
+            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::IndexedBoolBulk => {
                 let all_completed = self.all_completed();
                 let input = self.generic.source_action_input_for_list_index(
                     &step.id,
@@ -9366,7 +9673,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 target_occurrence,
-            } if routed.route_kind == GenericSourceRouteKind::IndexedBoolToggle => {
+            } if routed.route_kind == SourceActionKind::IndexedBoolToggle => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
                 self.apply_todo_bool_source_action(
@@ -9383,7 +9690,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 target_occurrence,
-            } if routed.route_kind == GenericSourceRouteKind::IndexedTextOpen => {
+            } if routed.route_kind == SourceActionKind::IndexedTextOpen => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 close_other_todomvc_editors(&mut self.generic, index, deltas, patches)?;
                 let all_completed = self.all_completed();
@@ -9424,7 +9731,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 ..
-            } if routed.route_kind == GenericSourceRouteKind::IndexedTextChange => {
+            } if routed.route_kind == SourceActionKind::IndexedTextChange => {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
@@ -9452,7 +9759,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 ..
-            } if routed.route_kind == GenericSourceRouteKind::IndexedTextKey => {
+            } if routed.route_kind == SourceActionKind::IndexedTextKey => {
                 let key = routed.event.key.unwrap_or_default();
                 if matches!(key, "Enter" | "Escape") {
                     let index = self
@@ -9507,7 +9814,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 ..
-            } if routed.route_kind == GenericSourceRouteKind::IndexedTextCommit => {
+            } if routed.route_kind == SourceActionKind::IndexedTextCommit => {
                 let index = self
                     .find_index(target_text)
                     .or_else(|_| self.find_editing_index())?;
@@ -9549,7 +9856,7 @@ impl TodoRuntime {
                 routed,
                 target_text,
                 target_occurrence,
-            } if routed.route_kind == GenericSourceRouteKind::ListRemove => {
+            } if routed.route_kind == SourceActionKind::ListRemove => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 if !self.remove_index_source(
                     &step.id,
@@ -9647,22 +9954,22 @@ impl TodoRuntime {
             .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
         if source_event.target_text.is_none() {
             match route_kind {
-                GenericSourceRouteKind::ListAppend
-                | GenericSourceRouteKind::RootText
-                | GenericSourceRouteKind::ListRemove
-                | GenericSourceRouteKind::IndexedBoolBulk
-                | GenericSourceRouteKind::RootScalar => {
+                SourceActionKind::ListAppend
+                | SourceActionKind::RootText
+                | SourceActionKind::ListRemove
+                | SourceActionKind::IndexedBoolBulk
+                | SourceActionKind::RootScalar => {
                     return Ok(Some(TodoEvent::Source(GenericRoutedSourceEvent {
                         event: source_event,
                         route_kind,
                     })));
                 }
-                GenericSourceRouteKind::IndexedTextChange
-                | GenericSourceRouteKind::IndexedTextCommit
-                | GenericSourceRouteKind::IndexedTextIdentity
-                | GenericSourceRouteKind::IndexedTextKey
-                | GenericSourceRouteKind::IndexedTextOpen
-                | GenericSourceRouteKind::IndexedBoolToggle => {}
+                SourceActionKind::IndexedTextChange
+                | SourceActionKind::IndexedTextCommit
+                | SourceActionKind::IndexedTextIdentity
+                | SourceActionKind::IndexedTextKey
+                | SourceActionKind::IndexedTextOpen
+                | SourceActionKind::IndexedBoolToggle => {}
             }
             return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
         }
@@ -9677,20 +9984,20 @@ impl TodoRuntime {
         };
         if matches!(
             route_kind,
-            GenericSourceRouteKind::IndexedTextKey
-                | GenericSourceRouteKind::IndexedTextCommit
-                | GenericSourceRouteKind::IndexedTextChange
+            SourceActionKind::IndexedTextKey
+                | SourceActionKind::IndexedTextCommit
+                | SourceActionKind::IndexedTextChange
         ) {
             self.editing_title()?;
         }
         if matches!(
             route_kind,
-            GenericSourceRouteKind::ListRemove
-                | GenericSourceRouteKind::IndexedBoolToggle
-                | GenericSourceRouteKind::IndexedTextKey
-                | GenericSourceRouteKind::IndexedTextCommit
-                | GenericSourceRouteKind::IndexedTextChange
-                | GenericSourceRouteKind::IndexedTextOpen
+            SourceActionKind::ListRemove
+                | SourceActionKind::IndexedBoolToggle
+                | SourceActionKind::IndexedTextKey
+                | SourceActionKind::IndexedTextCommit
+                | SourceActionKind::IndexedTextChange
+                | SourceActionKind::IndexedTextOpen
         ) {
             return Ok(Some(TodoEvent::RowSource {
                 routed: GenericRoutedSourceEvent {
@@ -9893,7 +10200,7 @@ impl TodoRuntime {
         self.generic.spare_row("todos", generic_row.value)?;
         emit_todomvc_default_protocol_mutation(
             GenericSourceMutation::ListRemove {
-                list: "todos",
+                list: "todos".to_owned(),
                 key,
                 generation,
             },
@@ -10110,10 +10417,10 @@ fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonVa
     let (key, generation) = runtime.commit_indexed_bool_field("todos", index, "completed", true)?;
     emit_todomvc_default_protocol_mutation(
         GenericSourceMutation::BoolField(GenericBoolFieldCommit {
-            list: "todos",
+            list: "todos".to_owned(),
             key,
             generation,
-            field: "completed",
+            field: "completed".to_owned(),
             value: true,
         }),
         &mut deltas,
@@ -10171,7 +10478,7 @@ fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonValu
 struct Cell {
     value: String,
     value_number: Option<i64>,
-    error: Option<&'static str>,
+    error: Option<String>,
     deps: Vec<usize>,
     dependency_text: String,
     parsed: FormulaAst,
@@ -10214,33 +10521,23 @@ struct FormulaEquationPlan {
 
 #[derive(Clone, Debug)]
 struct RuntimeFormulaOperation {
-    target: &'static str,
+    target: String,
     kind: RuntimeFormulaOperationKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct FormulaDerivedStorageFields {
-    value: &'static str,
-    error: &'static str,
-    dependencies: &'static str,
+    value: String,
+    error: String,
+    dependencies: String,
 }
 
 #[derive(Clone, Debug)]
 enum RuntimeFormulaOperationKind {
-    Parse {
-        input: &'static str,
-    },
-    Dependencies {
-        input: &'static str,
-    },
-    Eval {
-        formula: &'static str,
-        read: &'static str,
-    },
-    Error {
-        formula: &'static str,
-        value: &'static str,
-    },
+    Parse { input: String },
+    Dependencies { input: String },
+    Eval { formula: String, read: String },
+    Error { formula: String, value: String },
 }
 
 impl FormulaEquationPlan {
@@ -10249,26 +10546,26 @@ impl FormulaEquationPlan {
             .formula_operations
             .iter()
             .map(|operation| RuntimeFormulaOperation {
-                target: leak_runtime_path(operation.target.clone()),
+                target: operation.target.clone(),
                 kind: match &operation.kind {
                     FormulaOperationKind::Parse { input } => RuntimeFormulaOperationKind::Parse {
-                        input: leak_runtime_path(input.clone()),
+                        input: input.clone(),
                     },
                     FormulaOperationKind::Dependencies { input } => {
                         RuntimeFormulaOperationKind::Dependencies {
-                            input: leak_runtime_path(input.clone()),
+                            input: input.clone(),
                         }
                     }
                     FormulaOperationKind::Eval { formula, read } => {
                         RuntimeFormulaOperationKind::Eval {
-                            formula: leak_runtime_path(formula.clone()),
-                            read: leak_runtime_path(read.clone()),
+                            formula: formula.clone(),
+                            read: read.clone(),
                         }
                     }
                     FormulaOperationKind::Error { formula, value } => {
                         RuntimeFormulaOperationKind::Error {
-                            formula: leak_runtime_path(formula.clone()),
-                            value: leak_runtime_path(value.clone()),
+                            formula: formula.clone(),
+                            value: value.clone(),
                         }
                     }
                 },
@@ -10282,29 +10579,29 @@ impl FormulaEquationPlan {
         Self {
             operations: vec![
                 RuntimeFormulaOperation {
-                    target: "cell.parsed_formula",
+                    target: "cell.parsed_formula".to_owned(),
                     kind: RuntimeFormulaOperationKind::Parse {
-                        input: "formula_text",
+                        input: "formula_text".to_owned(),
                     },
                 },
                 RuntimeFormulaOperation {
-                    target: "cell.dependencies",
+                    target: "cell.dependencies".to_owned(),
                     kind: RuntimeFormulaOperationKind::Dependencies {
-                        input: "parsed_formula",
+                        input: "parsed_formula".to_owned(),
                     },
                 },
                 RuntimeFormulaOperation {
-                    target: "cell.value",
+                    target: "cell.value".to_owned(),
                     kind: RuntimeFormulaOperationKind::Eval {
-                        formula: "parsed_formula",
-                        read: "cell_value_reader",
+                        formula: "parsed_formula".to_owned(),
+                        read: "cell_value_reader".to_owned(),
                     },
                 },
                 RuntimeFormulaOperation {
-                    target: "cell.error",
+                    target: "cell.error".to_owned(),
                     kind: RuntimeFormulaOperationKind::Error {
-                        formula: "parsed_formula",
-                        value: "value",
+                        formula: "parsed_formula".to_owned(),
+                        value: "value".to_owned(),
                     },
                 },
             ],
@@ -10345,13 +10642,13 @@ impl FormulaEquationPlan {
         key: u64,
         generation: u64,
         value: ProtocolValue<'a>,
-        error: Option<&'static str>,
+        error: Option<&str>,
         mut emit: impl FnMut(GenericSourceMutation<'a>, bool) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
         let value_field = self.value_field()?;
         emit(
             GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                list: "cells",
+                list: "cells".to_owned(),
                 key,
                 generation,
                 field: value_field,
@@ -10363,11 +10660,11 @@ impl FormulaEquationPlan {
             let error_field = self.error_field()?;
             emit(
                 GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                    list: "cells",
+                    list: "cells".to_owned(),
                     key,
                     generation,
                     field: error_field,
-                    value: ProtocolValue::Text(Cow::Borrowed(error)),
+                    value: ProtocolValue::Text(Cow::Owned(error.to_owned())),
                 }),
                 false,
             )?;
@@ -10380,7 +10677,7 @@ impl FormulaEquationPlan {
         key: u64,
         generation: u64,
         value: ProtocolValue<'a>,
-        error: Option<&'static str>,
+        error: Option<&str>,
         address: &'a str,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
@@ -10418,7 +10715,7 @@ impl FormulaEquationPlan {
             .any(|operation| {
                 operation.target == target
                     && matches!(
-                        operation.kind,
+                        &operation.kind,
                         RuntimeFormulaOperationKind::Parse { input: candidate } if candidate == input
                     )
             })
@@ -10432,7 +10729,7 @@ impl FormulaEquationPlan {
             .any(|operation| {
                 operation.target == target
                     && matches!(
-                        operation.kind,
+                        &operation.kind,
                         RuntimeFormulaOperationKind::Dependencies { input: candidate } if candidate == input
                     )
             })
@@ -10448,7 +10745,7 @@ impl FormulaEquationPlan {
             .any(|operation| {
                 operation.target == target
                     && matches!(
-                        operation.kind,
+                        &operation.kind,
                         RuntimeFormulaOperationKind::Eval { formula: candidate_formula, read: candidate_read }
                             if candidate_formula == formula && candidate_read == read
                     )
@@ -10465,7 +10762,7 @@ impl FormulaEquationPlan {
             .any(|operation| {
                 operation.target == target
                     && matches!(
-                        operation.kind,
+                        &operation.kind,
                         RuntimeFormulaOperationKind::Error { formula: candidate_formula, value: candidate_value }
                             if candidate_formula == formula && candidate_value == value
                     )
@@ -10476,32 +10773,32 @@ impl FormulaEquationPlan {
             })
     }
 
-    fn dependencies_field(&self) -> RuntimeResult<&'static str> {
+    fn dependencies_field(&self) -> RuntimeResult<String> {
         self.operations
             .iter()
             .find(|operation| {
                 matches!(
-                    operation.kind,
+                    &operation.kind,
                     RuntimeFormulaOperationKind::Dependencies { .. }
                 )
             })
-            .map(|operation| row_field_name(operation.target))
+            .map(|operation| row_field_name(&operation.target).to_owned())
             .ok_or_else(|| "missing Formula/dependencies operation".into())
     }
 
-    fn value_field(&self) -> RuntimeResult<&'static str> {
+    fn value_field(&self) -> RuntimeResult<String> {
         self.operations
             .iter()
-            .find(|operation| matches!(operation.kind, RuntimeFormulaOperationKind::Eval { .. }))
-            .map(|operation| row_field_name(operation.target))
+            .find(|operation| matches!(&operation.kind, RuntimeFormulaOperationKind::Eval { .. }))
+            .map(|operation| row_field_name(&operation.target).to_owned())
             .ok_or_else(|| "missing Formula/eval operation".into())
     }
 
-    fn error_field(&self) -> RuntimeResult<&'static str> {
+    fn error_field(&self) -> RuntimeResult<String> {
         self.operations
             .iter()
-            .find(|operation| matches!(operation.kind, RuntimeFormulaOperationKind::Error { .. }))
-            .map(|operation| row_field_name(operation.target))
+            .find(|operation| matches!(&operation.kind, RuntimeFormulaOperationKind::Error { .. }))
+            .map(|operation| row_field_name(&operation.target).to_owned())
             .ok_or_else(|| "missing Formula/error operation".into())
     }
 }
@@ -10542,7 +10839,7 @@ struct GenericFormulaDependencyCache {
 #[derive(Clone, Debug)]
 struct GenericFormulaEvaluationCache {
     visiting: Vec<bool>,
-    eval_cache: Vec<Option<Result<i64, &'static str>>>,
+    eval_cache: Vec<Option<Result<i64, String>>>,
     last_eval_calls: usize,
 }
 
@@ -10623,33 +10920,33 @@ impl GenericFormulaEvaluationCache {
         self.visiting.fill(false);
     }
 
-    fn eval_cell(&mut self, cells: &[Cell], index: usize) -> Result<i64, &'static str> {
+    fn eval_cell(&mut self, cells: &[Cell], index: usize) -> Result<i64, String> {
         self.last_eval_calls += 1;
-        if let Some(result) = self.eval_cache[index] {
-            return result;
+        if let Some(result) = &self.eval_cache[index] {
+            return result.clone();
         }
         if self.visiting[index] {
-            return Err("cycle_error");
+            return Err("cycle_error".to_owned());
         }
         self.visiting[index] = true;
         let result = self.eval_formula(cells, index);
         self.visiting[index] = false;
-        self.eval_cache[index] = Some(result);
+        self.eval_cache[index] = Some(result.clone());
         result
     }
 
-    fn cached_result(&self, index: usize) -> Option<Result<i64, &'static str>> {
-        self.eval_cache[index]
+    fn cached_result(&self, index: usize) -> Option<Result<i64, String>> {
+        self.eval_cache[index].clone()
     }
 
     fn apply_result_to_cell(
         index: usize,
         changed_index: usize,
-        result: Result<i64, &'static str>,
+        result: Result<i64, String>,
         cell: &mut Cell,
     ) -> RuntimeResult<bool> {
         let previous_value = cell.value_number;
-        let previous_error = cell.error;
+        let previous_error = cell.error.clone();
         match result {
             Ok(value) => {
                 cell.error = None;
@@ -10676,7 +10973,7 @@ impl GenericFormulaEvaluationCache {
         self.last_eval_calls
     }
 
-    fn eval_formula(&mut self, cells: &[Cell], index: usize) -> Result<i64, &'static str> {
+    fn eval_formula(&mut self, cells: &[Cell], index: usize) -> Result<i64, String> {
         match cells[index].parsed {
             FormulaAst::Empty => Ok(0),
             FormulaAst::Number(value) => Ok(value),
@@ -10688,7 +10985,7 @@ impl GenericFormulaEvaluationCache {
                     FormulaOp::Add => Ok(left + right),
                     FormulaOp::Subtract => Ok(left - right),
                     FormulaOp::Multiply => Ok(left * right),
-                    FormulaOp::Divide if right == 0 => Err("div_by_zero"),
+                    FormulaOp::Divide if right == 0 => Err("div_by_zero".to_owned()),
                     FormulaOp::Divide => Ok(left / right),
                 }
             }
@@ -10710,11 +11007,11 @@ impl GenericFormulaEvaluationCache {
                 }
                 Ok(sum)
             }
-            FormulaAst::ParseError => Err("parse_error"),
+            FormulaAst::ParseError => Err("parse_error".to_owned()),
         }
     }
 
-    fn eval_term(&mut self, cells: &[Cell], term: FormulaTerm) -> Result<i64, &'static str> {
+    fn eval_term(&mut self, cells: &[Cell], term: FormulaTerm) -> Result<i64, String> {
         match term {
             FormulaTerm::Number(value) => Ok(value),
             FormulaTerm::Cell(index) => self.eval_cell(cells, index),
@@ -10727,17 +11024,17 @@ fn sync_formula_derived_fields(
     index: usize,
     fields: FormulaDerivedStorageFields,
     value: &str,
-    error: Option<&'static str>,
+    error: Option<&str>,
     dependencies: &str,
 ) -> RuntimeResult<()> {
-    runtime.set_or_insert_list_row_textlike("cells", index, fields.value, value)?;
+    runtime.set_or_insert_list_row_textlike("cells", index, &fields.value, value)?;
     runtime.set_or_insert_list_row_textlike(
         "cells",
         index,
-        fields.error,
+        &fields.error,
         error.unwrap_or_default(),
     )?;
-    runtime.set_or_insert_list_row_textlike("cells", index, fields.dependencies, dependencies)
+    runtime.set_or_insert_list_row_textlike("cells", index, &fields.dependencies, dependencies)
 }
 
 #[cfg(test)]
@@ -10833,7 +11130,7 @@ impl CellsRuntime {
         };
         assert_routed_source_event_matches(step, routed.event)?;
         match routed.route_kind {
-            GenericSourceRouteKind::IndexedTextChange => {
+            SourceActionKind::IndexedTextChange => {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
@@ -10869,7 +11166,7 @@ impl CellsRuntime {
                 batch.require_text(source, "editing-text update", "editing_text")?;
                 batch.require_bool(source, "editing update", "editing")?;
             }
-            GenericSourceRouteKind::IndexedTextCommit => {
+            SourceActionKind::IndexedTextCommit => {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
@@ -10880,7 +11177,7 @@ impl CellsRuntime {
                 let text = routed.require_text(&step.id)?;
                 self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
             }
-            GenericSourceRouteKind::IndexedTextIdentity => {
+            SourceActionKind::IndexedTextIdentity => {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
@@ -10909,10 +11206,10 @@ impl CellsRuntime {
                     batch.require_identity(source, "editing-text cancel", "editing_text")?;
                 let editing = batch.require_bool(source, "editing cancel", "editing")?;
                 let index = self.cell_index(address)?;
-                let value = self.cell_text_field(index, editing_text.field)?;
+                let value = self.cell_text_field(index, &editing_text.field)?;
                 let identity_value = self.protocol_text(value);
                 emit_cells_default_protocol_mutation(
-                    GenericSourceMutation::TextFieldIdentity(editing_text),
+                    GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
                     address,
                     Some(identity_value),
                     false,
@@ -10933,7 +11230,7 @@ impl CellsRuntime {
                     "SetCellText",
                     RenderTarget::Borrowed(Cow::Borrowed(address)),
                     self.protocol_text(&self.cells[index].value),
-                    editing_text.list,
+                    editing_text.list.clone(),
                     editing_text.key,
                     editing_text.generation,
                 ));
@@ -10977,12 +11274,12 @@ impl CellsRuntime {
             .filter(|candidate| is_cell_address(candidate))
             .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
         match routed.route_kind {
-            GenericSourceRouteKind::IndexedTextCommit
-            | GenericSourceRouteKind::IndexedTextChange => {
+            SourceActionKind::IndexedTextCommit
+            | SourceActionKind::IndexedTextChange => {
                 routed.require_text(&step.id)?;
                 Ok(Some(routed))
             }
-            GenericSourceRouteKind::IndexedTextIdentity => Ok(Some(routed)),
+            SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
             route_kind => Err(format!(
                 "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
                 step.id
@@ -11051,7 +11348,7 @@ impl CellsRuntime {
         let display_key = formula.key;
         let display_generation = formula.generation;
         let display_value = self.generic.formula_equations.cell_value_protocol(cell)?;
-        let display_error = cell.error;
+        let display_error = cell.error.as_deref();
         emit_cells_default_protocol_mutation(
             GenericSourceMutation::TextField(formula),
             address,
@@ -11133,7 +11430,7 @@ impl CellsRuntime {
             index,
             fields,
             &self.cells[index].value,
-            self.cells[index].error,
+            self.cells[index].error.as_deref(),
             &self.cells[index].dependency_text,
         )
     }
@@ -11647,7 +11944,7 @@ fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> 
 fn default_cells_list_source_bindings() -> ListSourceBindingPlan {
     ListSourceBindingPlan {
         list_slots: vec![ListSourceBindingSlot {
-            list: "cells",
+            list: "cells".to_owned(),
             source_paths: Vec::new(),
         }],
     }
@@ -11662,10 +11959,6 @@ fn default_cells_scalar_equations() -> ScalarEquationPlan {
     .expect("checked-in Cells source should parse");
     let ir = lower(&parsed).expect("checked-in Cells source should lower");
     ScalarEquationPlan::from_ir(&ir)
-}
-
-fn leak_runtime_path(path: String) -> &'static str {
-    Box::leak(path.into_boxed_str())
 }
 
 fn cells_grid_dimensions_from_ir(ir: &TypedProgram) -> Option<(usize, usize)> {
@@ -11764,10 +12057,19 @@ fn assert_source_event_field(
 fn field_delta<'a>(
     key: Option<u64>,
     generation: Option<u64>,
-    field: &'static str,
+    field: &str,
     value: ProtocolValue<'a>,
 ) -> SemanticDelta<'a> {
-    GenericCircuitRuntime::semantic_field_delta(key.map(|_| "todos"), key, generation, field, value)
+    SemanticDelta {
+        kind: "FieldSet",
+        list_id: key.map(|_| Cow::Borrowed("todos")),
+        key,
+        generation,
+        source_id: None,
+        bind_epoch: None,
+        field_path: Some(Cow::Owned(field.to_owned())),
+        value,
+    }
 }
 
 fn emit_todomvc_default_protocol_mutation<'a>(
@@ -11787,7 +12089,7 @@ fn emit_todo_insert_from_generic<'a>(
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
-    let list = insert.list;
+    let list = insert.list.clone();
     let key = insert.key;
     let generation = insert.generation;
     emit_todomvc_default_protocol_mutation(
@@ -11795,7 +12097,7 @@ fn emit_todo_insert_from_generic<'a>(
         deltas,
         patches,
     )?;
-    for binding in generic.row_source_bindings(list, key, generation) {
+    for binding in generic.row_source_bindings(&list, key, generation) {
         emit_todomvc_default_protocol_mutation(
             GenericSourceMutation::SourceBind(binding.clone()),
             deltas,
@@ -11827,7 +12129,7 @@ fn emit_cells_default_protocol_mutation<'a>(
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
     let lowerer = GenericRenderLoweringPlan::cells();
-    match mutation {
+    match &mutation {
         GenericSourceMutation::TextFieldIdentity(commit) => {
             let value = identity_value.ok_or_else(|| {
                 format!(
@@ -11859,7 +12161,7 @@ fn emit_cells_default_protocol_mutation<'a>(
 
 fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
     ProtocolValue::SourceBinding {
-        source_path: binding.source_path,
+        source_path: Cow::Owned(binding.source_path.clone()),
         source_id: binding.source_id,
         bind_epoch: binding.bind_epoch,
     }
@@ -11902,7 +12204,7 @@ fn keyed_patch<'a>(
     kind: &'static str,
     target: RenderTarget<'a>,
     value: ProtocolValue<'a>,
-    list_id: &'static str,
+    list_id: impl Into<Cow<'a, str>>,
     key: u64,
     generation: u64,
 ) -> RenderPatch<'a> {
@@ -11910,7 +12212,7 @@ fn keyed_patch<'a>(
         kind,
         target,
         value,
-        list_id: Some(list_id),
+        list_id: Some(list_id.into()),
         key: Some(key),
         generation: Some(generation),
         source_id: None,
@@ -11928,7 +12230,7 @@ fn source_patch<'a>(
         kind,
         target,
         value,
-        list_id: Some(binding.list_id),
+        list_id: Some(Cow::Owned(binding.list_id.clone())),
         key: Some(binding.key),
         generation: Some(binding.generation),
         source_id: Some(binding.source_id),
@@ -11997,7 +12299,11 @@ fn assert_delta_expectations(
 
 fn semantic_delta_matches(delta: &SemanticDelta<'_>, expected: &str) -> bool {
     if let Some((kind, field)) = expected.split_once(':') {
-        return delta.kind == kind && delta.field_path == Some(field);
+        return delta.kind == kind
+            && delta
+                .field_path
+                .as_ref()
+                .is_some_and(|actual| actual.as_ref() == field);
     }
     delta.kind == expected
 }
@@ -12007,7 +12313,7 @@ fn render_patch_matches(patch: &RenderPatch<'_>, expected: &str) -> bool {
 }
 
 fn delta_signature(delta: &SemanticDelta<'_>) -> String {
-    match delta.field_path {
+    match &delta.field_path {
         Some(field) => format!("{}:{field}", delta.kind),
         None => delta.kind.to_owned(),
     }
@@ -12102,7 +12408,7 @@ mod tests {
                 .semantic_deltas
                 .iter()
                 .any(|delta| delta.kind == "ListRemove"
-                    && delta.list_id == Some("todos")
+                    && delta.list_id.as_deref() == Some("todos")
                     && delta.key.is_some()
                     && delta.generation.is_some())
         );
@@ -12156,7 +12462,8 @@ mod tests {
         assert_eq!(output.report["status"], "pass");
         assert!(output.semantic_deltas.iter().any(|delta| matches!(
             (&delta.field_path, &delta.value),
-            (Some("error"), ProtocolValue::Text(error)) if error.as_ref() == "cycle_error"
+            (Some(field), ProtocolValue::Text(error))
+                if field.as_ref() == "error" && error.as_ref() == "cycle_error"
         )));
         assert_eq!(output.state_summary["cells"][0]["error"], JsonValue::Null);
     }
@@ -12565,7 +12872,7 @@ mod tests {
             .iter()
             .find(|delta| delta.kind == "ListInsert")
             .expect("TodoMVC append should emit a keyed generic list insert");
-        assert_eq!(insert.list_id, Some("todos"));
+        assert_eq!(insert.list_id.as_deref(), Some("todos"));
         assert!(insert.key.is_some());
         assert!(insert.generation.is_some());
         assert!(matches!(
@@ -12585,9 +12892,9 @@ mod tests {
         let formula = cells_output
             .semantic_deltas
             .iter()
-            .find(|delta| delta.field_path == Some("formula_text"))
+            .find(|delta| delta.field_path.as_deref() == Some("formula_text"))
             .expect("Cells commit should emit a keyed generic field delta");
-        assert_eq!(formula.list_id, Some("cells"));
+        assert_eq!(formula.list_id.as_deref(), Some("cells"));
         assert!(formula.key.is_some());
         assert!(formula.generation.is_some());
     }
@@ -12617,7 +12924,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(todo_input.source, "store.sources.new_todo_input.key_down");
-        assert_eq!(todo_input.list, Some("todos"));
+        assert_eq!(todo_input.list.as_deref(), Some("todos"));
         assert_eq!(todo_input.index, None);
         assert_eq!(todo_input.key, Some("Enter"));
         assert_eq!(todo_input.text, Some("Test todo"));
@@ -12646,7 +12953,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cells_input.source, "cell.sources.editor.commit");
-        assert_eq!(cells_input.list, Some("cells"));
+        assert_eq!(cells_input.list.as_deref(), Some("cells"));
         assert_eq!(cells_input.index, Some(0));
         assert_eq!(cells_input.text, Some("41"));
     }
@@ -12859,7 +13166,7 @@ mod tests {
             output
                 .semantic_deltas
                 .iter()
-                .any(|delta| delta.field_path == Some("value"))
+                .any(|delta| delta.field_path.as_deref() == Some("value"))
         );
     }
 
@@ -13083,13 +13390,14 @@ mod tests {
         assert!(patches.iter().any(|patch| matches!(
             (&patch.target, &patch.value),
             (
-                RenderTarget::TodoSource(_, "todo.sources.todo_checkbox.click"),
+                RenderTarget::TodoSource(_, source_target),
                 ProtocolValue::SourceBinding {
-                    source_path: "todo.sources.todo_checkbox.click",
+                    source_path,
                     source_id: _,
                     bind_epoch: _,
                 }
-            )
+            ) if source_target.as_ref() == "todo.sources.todo_checkbox.click"
+                && source_path.as_ref() == "todo.sources.todo_checkbox.click"
         )));
     }
 
@@ -13104,8 +13412,16 @@ mod tests {
             .list_source_bindings
             .source_paths("todos")
             .unwrap();
-        assert!(row_source_paths.contains(&"todo.sources.done_checkbox.click"));
-        assert!(!row_source_paths.contains(&"todo.sources.todo_checkbox.click"));
+        assert!(
+            row_source_paths
+                .iter()
+                .any(|path| path == "todo.sources.done_checkbox.click")
+        );
+        assert!(
+            !row_source_paths
+                .iter()
+                .any(|path| path == "todo.sources.todo_checkbox.click")
+        );
         let (key, generation) = runtime.todo_row_identity(0).unwrap();
         assert!(
             runtime
@@ -13164,7 +13480,7 @@ mod tests {
             "IR routed text"
         );
         assert!(deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path == Some("store.new_todo_text")
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.new_todo_text")
         }));
 
         deltas.clear();
@@ -13197,7 +13513,7 @@ mod tests {
             "Active"
         );
         assert!(deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path == Some("store.selected_filter")
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.selected_filter")
         }));
     }
 
@@ -13265,7 +13581,7 @@ mod tests {
         assert_eq!(
             deltas
                 .iter()
-                .filter(|delta| delta.field_path == Some("completed"))
+                .filter(|delta| delta.field_path.as_deref() == Some("completed"))
                 .count(),
             runtime.todo_len()
         );
@@ -13386,7 +13702,7 @@ mod tests {
         assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Buy groceries");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet"
-                && delta.field_path == Some("editing")
+                && delta.field_path.as_deref() == Some("editing")
                 && matches!(delta.value, ProtocolValue::Bool(false))
         }));
     }
@@ -13470,11 +13786,9 @@ mod tests {
             .apply_step_into(&commit_step, &mut deltas, &mut patches)
             .unwrap();
         assert_eq!(runtime.todo_title_for_test(buy_index), "Committed via IR");
-        assert!(
-            deltas
-                .iter()
-                .any(|delta| { delta.kind == "FieldSet" && delta.field_path == Some("title") })
-        );
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("title")
+        }));
 
         deltas.clear();
         patches.clear();
@@ -13579,11 +13893,9 @@ mod tests {
             .apply_step_into(&blur_step, &mut deltas, &mut patches)
             .unwrap();
         assert_eq!(runtime.todo_title_for_test(buy_index), "Blur via IR");
-        assert!(
-            deltas
-                .iter()
-                .any(|delta| { delta.kind == "FieldSet" && delta.field_path == Some("title") })
-        );
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("title")
+        }));
     }
 
     #[test]
@@ -13752,7 +14064,7 @@ mod tests {
             .unwrap();
         assert!(
             generic
-                .remove_row_for_predicate("todos", clear_predicate, 0)
+                .remove_row_for_predicate("todos", clear_predicate.clone(), 0)
                 .unwrap()
                 .is_none(),
             "clear completed must not remove an active row"
@@ -13805,9 +14117,19 @@ mod tests {
             .source_routes
             .for_source_id(input_source.id)
             .expect("TodoMVC input source id must resolve through dense route slots");
+        let input_actions = compiled
+            .source_routes
+            .actions_for_source_id(input_source.id)
+            .expect("TodoMVC input source id must resolve through SourceActionTable");
         assert!(
             input_route.has_list_append_target("todos"),
             "append routing must be found from SourceId, not a label scan"
+        );
+        assert!(
+            input_actions.iter().any(
+                |action| matches!(action, SourceAction::ListAppend { list, .. } if list == "todos")
+            ),
+            "append action must be found from SourceActionTable, not route-kind inference"
         );
         assert_eq!(
             compiled.source_routes.source_id(&input_source.path),
@@ -13824,6 +14146,14 @@ mod tests {
         );
 
         let report = compiled.report();
+        assert!(
+            report["runtime_symbol_count"].as_u64().unwrap_or_default() > 0,
+            "compiled programs must own diagnostic symbols instead of relying on leaked strings"
+        );
+        assert_eq!(
+            report["runtime_symbol_ownership"],
+            json!("compiled_program_owned")
+        );
         assert_eq!(
             report["source_route_index_kind"],
             json!("dense_source_id_slots")
@@ -13907,12 +14237,17 @@ mod tests {
     }
 
     #[test]
-    fn keyed_list_dense_key_slots_survive_remove_and_move() {
-        let mut list = KeyedList::from_values(["a", "b", "c", "d"]);
-        let first_key = list[0].key;
-        let second_key = list[1].key;
-        let third_key = list[2].key;
-        let fourth_key = list[3].key;
+    fn list_memory_dense_key_slots_survive_remove_and_move() {
+        let mut list = ListMemory::from_values([
+            todo_generic_row("a"),
+            todo_generic_row("b"),
+            todo_generic_row("c"),
+            todo_generic_row("d"),
+        ]);
+        let (first_key, _) = list.row_identity(0).unwrap();
+        let (second_key, _) = list.row_identity(1).unwrap();
+        let (third_key, _) = list.row_identity(2).unwrap();
+        let (fourth_key, _) = list.row_identity(3).unwrap();
 
         let removed = list.remove_index(1);
         assert_eq!(removed.key, second_key);
@@ -13930,7 +14265,7 @@ mod tests {
         assert_eq!(list.bound_index(first_key, 1), Some(1));
         assert_eq!(list.bound_index(third_key, 1), Some(2));
 
-        let (new_key, generation) = list.append("e");
+        let (new_key, generation) = list.append(todo_generic_row("e"));
         assert_eq!(generation, 1);
         assert_ne!(new_key, second_key);
         assert_eq!(list.slot_capacity(), 4);
@@ -13948,8 +14283,8 @@ mod tests {
                 10,
                 1,
                 &[
-                    "todo.sources.todo_checkbox.click",
-                    "todo.sources.title_input.commit",
+                    "todo.sources.todo_checkbox.click".to_owned(),
+                    "todo.sources.title_input.commit".to_owned(),
                 ],
             )
             .unwrap();
@@ -13962,7 +14297,7 @@ mod tests {
             "todos",
             10,
             1,
-            binding.source_path,
+            &binding.source_path,
             Some(binding.source_id),
             Some(binding.bind_epoch),
         ));
@@ -13972,24 +14307,19 @@ mod tests {
             "todos",
             10,
             1,
-            binding.source_path,
+            &binding.source_path,
             Some(binding.source_id),
             Some(binding.bind_epoch),
         ));
     }
 
     #[test]
-    fn source_store_row_binding_overflow_returns_error() {
-        let mut sources = SourceStore::with_capacity(MAX_ROW_SOURCE_BINDINGS + 1);
-        let path_refs = vec!["todo.sources.dynamic.change"; MAX_ROW_SOURCE_BINDINGS + 1];
-        let err = sources
-            .bind_row("todos", 10, 1, &path_refs)
-            .expect_err("overflow should return an error instead of panicking");
-        assert!(
-            err.to_string()
-                .contains("row source binding slot capacity exceeded")
-        );
-        assert_eq!(sources.len(), 0);
+    fn source_store_row_binding_storage_grows_without_panic() {
+        let mut sources = SourceStore::with_capacity(64);
+        let path_refs = vec!["todo.sources.dynamic.change".to_owned(); 64];
+        sources.bind_row("todos", 10, 1, &path_refs).unwrap();
+        assert_eq!(sources.len(), 64);
+        assert_eq!(sources.row_binding_count("todos", 10, 1), 64);
     }
 
     #[test]
@@ -14036,13 +14366,14 @@ mod tests {
         assert!(patches.iter().any(|patch| matches!(
             (&patch.target, &patch.value),
             (
-                RenderTarget::TodoSource(_, "todo.sources.todo_checkbox.click"),
+                RenderTarget::TodoSource(_, source_target),
                 ProtocolValue::SourceBinding {
-                    source_path: "todo.sources.todo_checkbox.click",
+                    source_path,
                     source_id: _,
                     bind_epoch: _,
                 }
-            )
+            ) if source_target.as_ref() == "todo.sources.todo_checkbox.click"
+                && source_path.as_ref() == "todo.sources.todo_checkbox.click"
         )));
     }
 
@@ -14171,10 +14502,10 @@ mod tests {
         assert_eq!(runtime.todo_key(1), moved_key);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, "ListMove");
-        assert_eq!(deltas[0].list_id, Some("todos"));
+        assert_eq!(deltas[0].list_id.as_deref(), Some("todos"));
         assert_eq!(deltas[0].key, Some(moved_key));
         assert_eq!(deltas[0].generation, Some(1));
-        assert_eq!(deltas[0].field_path, Some("position"));
+        assert_eq!(deltas[0].field_path.as_deref(), Some("position"));
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].kind, "MoveElement");
     }
@@ -14192,7 +14523,11 @@ mod tests {
         runtime
             .commit("A0", "41", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert!(deltas.iter().all(|delta| delta.list_id == Some("cells")));
+        assert!(
+            deltas
+                .iter()
+                .all(|delta| delta.list_id.as_deref() == Some("cells"))
+        );
         assert!(deltas.iter().all(|delta| delta.key == Some(expected_key)));
         assert_ne!(expected_key, cell_address_hash_for_test("A0"));
     }
@@ -14405,35 +14740,37 @@ mod tests {
     fn runtime_list_store_keeps_hidden_list_slots_sorted_for_dense_lookup() {
         let mut store = RuntimeListStore::default();
         store.insert(
+            ListId(0),
             "todos".to_owned(),
-            KeyedList::from_values([todo_generic_row("A")]),
+            ListMemory::from_values([todo_generic_row("A")]),
             Some(4),
-            RuntimeRecordTemplate::default(),
+            RuntimeRowSnapshotTemplate::default(),
         );
         store.insert(
+            ListId(1),
             "cells".to_owned(),
-            KeyedList::from_values([cell_generic_row("A0")]),
+            ListMemory::from_values([cell_generic_row("A0")]),
             Some(26),
-            RuntimeRecordTemplate::default(),
+            RuntimeRowSnapshotTemplate::default(),
         );
         store.insert(
+            ListId(0),
             "todos".to_owned(),
-            KeyedList::from_values([todo_generic_row("B")]),
+            ListMemory::from_values([todo_generic_row("B")]),
             Some(8),
-            RuntimeRecordTemplate::default(),
+            RuntimeRowSnapshotTemplate::default(),
         );
 
         assert_eq!(store.capacity("todos"), Some(8));
         assert_eq!(store.capacity("cells"), Some(26));
         assert_eq!(store.memory("todos").unwrap().len(), 1);
         assert_eq!(store.memory("cells").unwrap().len(), 1);
-        assert!(store.list_slots.windows(2).all(|window| (
-            window[0].list_id.as_str(),
-            window[0].name.as_str()
-        ) < (
-            window[1].list_id.as_str(),
-            window[1].name.as_str()
-        )));
+        assert!(
+            store
+                .list_slots
+                .windows(2)
+                .all(|window| window[0].list_id < window[1].list_id)
+        );
     }
 
     #[test]
@@ -14540,7 +14877,10 @@ mod tests {
         runtime
             .commit("A0", "=8/0", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();
-        assert_eq!(runtime.cell("A0").unwrap().error, Some("div_by_zero"));
+        assert_eq!(
+            runtime.cell("A0").unwrap().error.as_deref(),
+            Some("div_by_zero")
+        );
         runtime
             .commit("D0", "", &mut deltas, &mut patches, &mut recomputed)
             .unwrap();

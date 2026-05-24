@@ -6,6 +6,7 @@ use boon_runtime::{
 };
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -19,6 +20,10 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
+    "verify-runtime-production-hardening",
+    "verify-runtime-finality",
+    "verify-playground-genericity",
+    "audit-machine-readiness",
     "verify-todomvc-semantic",
     "verify-todomvc-speed",
     "verify-todomvc-negative",
@@ -37,6 +42,9 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-ipc-backpressure",
     "verify-native-gpu-observability",
     "verify-native-gpu-preview-e2e",
+    "verify-native-two-window-content",
+    "verify-native-todomvc-reference-parity",
+    "verify-native-todomvc-input-parity",
     "verify-native-gpu-scroll-speed",
     "verify-native-gpu-negative",
     "verify-native-gpu-all",
@@ -68,6 +76,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-negative" => verify_negative(&args),
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(),
+        "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
+        "verify-runtime-finality" => verify_runtime_finality(&args),
+        "verify-playground-genericity" => verify_playground_genericity(&args),
+        "audit-machine-readiness" => audit_machine_readiness(&args),
         "bench-example" => bench_example(named_arg(&args, 1)?, &args),
         "verify-todomvc-semantic" => verify_specific("todomvc", VerificationLayer::Semantic, &args),
         "verify-todomvc-speed" => verify_specific("todomvc", VerificationLayer::Speed, &args),
@@ -87,6 +99,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-gpu-ipc-backpressure" => verify_native_gpu_ipc_backpressure(&args),
         "verify-native-gpu-observability" => verify_native_gpu_observability(&args),
         "verify-native-gpu-preview-e2e" => verify_native_gpu_preview_e2e(&args),
+        "verify-native-two-window-content" => verify_native_two_window_content(&args),
+        "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
+        "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
         "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
         "verify-native-gpu-all" => verify_native_gpu_all(&args),
@@ -124,16 +139,13 @@ fn legacy_ply_cosmic_testing_command(command: &str) -> bool {
             | "prepare-example-human-report"
             | "verify-example-all"
             | "verify-examples-all"
-            | "verify-runtime-finality"
             | "verify-todomvc-reference-parity"
             | "verify-os-input-probe"
             | "verify-playground-launch"
             | "verify-playground-background-launch"
             | "verify-playground-split-wayland"
-            | "verify-playground-genericity"
             | "verify-playground-custom-source"
             | "write-manual-handoff"
-            | "audit-machine-readiness"
             | "audit-goal-readiness"
             | "audit-manual-readiness"
             | "verify-todomvc-ply-headless"
@@ -553,6 +565,348 @@ fn text_tail(text: &str, max_chars: usize) -> String {
         return text.to_owned();
     }
     text.chars().skip(char_count - max_chars).collect()
+}
+
+fn verify_runtime_production_hardening(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_path = Path::new("crates/boon_runtime/src/lib.rs");
+    let runtime = fs::read_to_string(runtime_path)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:no-leak-runtime-path",
+        !runtime.contains("leak_runtime_path"),
+        "production runtime must not contain the leak_runtime_path bridge",
+        Some(
+            "delete leak_runtime_path and replace callers with owned symbols/dense IDs".to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:no-box-leak",
+        !runtime.contains("Box::leak"),
+        "production runtime must not leak strings or other values",
+        Some("replace production Box::leak usage with owned program storage".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:no-static-path-identity",
+        !runtime_contains_runtime_static_identity(&runtime),
+        "compiled runtime path/list/source/field identity must not be &'static str",
+        Some("compiled plan structs still use &'static str for runtime identity".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:source-action-table",
+        runtime.contains("SourceActionTable")
+            && runtime.contains("SourceAction")
+            && !runtime.contains("enum GenericSourceRouteKind"),
+        "runtime source dispatch must be SourceId -> [SourceAction], without GenericSourceRouteKind inference",
+        Some(
+            "source routing is still route-kind inferred instead of fully action-table driven"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:list-level-columnar-storage",
+        runtime.contains("struct ListMemory")
+            && runtime.contains("text_columns")
+            && runtime.contains("bool_columns")
+            && !runtime.contains("KeyedList<RuntimeRecord>")
+            && !runtime.contains("struct RuntimeRecord"),
+        "list memory must be list-level columns, not row-owned RuntimeRecord columns",
+        Some("runtime list storage is still row-owned or not proven list-columnar".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:dense-field-list-ids",
+        runtime.contains("FieldId")
+            && runtime.contains("ListId")
+            && !runtime.contains("struct FieldSlotId(Box<str>)")
+            && !runtime.contains("struct ListSlotId(Box<str>)"),
+        "field/list hot storage must use dense compiler IDs, not name slot IDs",
+        Some(
+            "field/list storage still uses name-based slot IDs instead of dense compiler IDs"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:no-fixed-row-source-binding-array",
+        !runtime.contains("MAX_ROW_SOURCE_BINDINGS")
+            && !runtime.contains("slots: [usize; MAX_ROW_SOURCE_BINDINGS]"),
+        "row source binding capacity must not be a panic-prone fixed array bound",
+        Some("row source binding storage still exposes MAX_ROW_SOURCE_BINDINGS".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-production:no-capacity-assert-panic",
+        !runtime_has_capacity_panic_path(&runtime),
+        "capacity overflow must report structured errors, not panic",
+        Some("runtime still contains panic/assert capacity behavior".to_owned()),
+    );
+
+    write_static_gate_report(
+        args,
+        "verify-runtime-production-hardening",
+        report_arg(args)
+            .unwrap_or_else(|| PathBuf::from("target/reports/runtime-production-hardening.json")),
+        checks,
+        blockers,
+        json!({
+            "plan": "docs/plans/RUNTIME_PRODUCTION_AND_NATIVE_TODOMVC_PARITY_PLAN.md",
+            "runtime_source": runtime_path,
+            "static_scan_contract": "leak-free-owned-symbols-dense-id-action-table-columnar-storage",
+            "hot_path_static_identity_forbidden": true
+        }),
+    )
+}
+
+fn runtime_contains_runtime_static_identity(runtime: &str) -> bool {
+    [
+        "target: &'static str",
+        "source: &'static str",
+        "list: &'static str",
+        "field: &'static str",
+        "list_id: &'static str",
+        "source_path: &'static str",
+        "Vec<&'static str>",
+        "Option<&'static str>",
+    ]
+    .iter()
+    .any(|needle| runtime.contains(needle))
+}
+
+fn runtime_has_capacity_panic_path(runtime: &str) -> bool {
+    let production_runtime = runtime.split("#[cfg(test)]").next().unwrap_or(runtime);
+    let mut recent_capacity_context = false;
+    for line in production_runtime.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("capacity") || trimmed.contains("exceeded") {
+            recent_capacity_context = true;
+        }
+        if recent_capacity_context
+            && (trimmed.contains("panic!(")
+                || trimmed.contains("assert!(")
+                || trimmed.contains("assert_eq!(")
+                || trimmed.contains("unreachable!("))
+        {
+            return true;
+        }
+        if trimmed.ends_with(';') || trimmed.ends_with('}') {
+            recent_capacity_context = false;
+        }
+    }
+    false
+}
+
+fn verify_runtime_finality(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/runtime-finality.json"));
+    let hardening_report = PathBuf::from("target/reports/runtime-production-hardening.json");
+    let hardening = if hardening_report.exists() {
+        read_json(&hardening_report)?
+    } else {
+        json!({"status": "missing"})
+    };
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-finality:production-hardening-report-present",
+        hardening_report.exists(),
+        format!(
+            "{} exists={}",
+            hardening_report.display(),
+            hardening_report.exists()
+        ),
+        Some("run verify-runtime-production-hardening first".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "runtime-finality:production-hardening-pass",
+        hardening.get("status").and_then(serde_json::Value::as_str) == Some("pass"),
+        format!(
+            "runtime-production-hardening status={:?}",
+            hardening.get("status").and_then(serde_json::Value::as_str)
+        ),
+        Some("runtime production hardening gate has not passed".to_owned()),
+    );
+    write_static_gate_report(
+        args,
+        "verify-runtime-finality",
+        report,
+        checks,
+        blockers,
+        json!({
+            "runtime_production_hardening_report": hardening_report,
+            "runtime_production_hardening_report_sha256": hardening_report
+                .exists()
+                .then(|| file_hash(hardening_report.to_string_lossy().as_ref())),
+            "finality_contract": "runtime production hardening is a prerequisite for finality"
+        }),
+    )
+}
+
+fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let scan_paths = [
+        "crates/boon_native_gpu/src",
+        "crates/boon_document/src",
+        "crates/boon_document_model/src",
+        "crates/boon_native_app_window/src",
+    ];
+    for path in scan_paths {
+        let todo_hits = rg_count(path, "todomvc")?;
+        let cells_hits = rg_count(path, "cells")?;
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("playground-genericity:{path}:no-todomvc-renderer-branch"),
+            todo_hits == 0,
+            format!("{todo_hits} `todomvc` hits in {path}"),
+            (todo_hits != 0)
+                .then(|| format!("generic renderer/document boundary `{path}` mentions todomvc")),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("playground-genericity:{path}:no-cells-renderer-branch"),
+            cells_hits == 0,
+            format!("{cells_hits} `cells` hits in {path}"),
+            (cells_hits != 0)
+                .then(|| format!("generic renderer/document boundary `{path}` mentions cells")),
+        );
+    }
+    let native_playground = fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "playground-genericity:preview-source-only",
+        native_playground.contains("preview role must not receive --example")
+            && native_playground.contains("ReplaceCode"),
+        "preview role must load code, not branch on example names",
+        Some("preview/dev role protocol does not prove source-only ReplaceCode flow".to_owned()),
+    );
+    write_static_gate_report(
+        args,
+        "verify-playground-genericity",
+        report_arg(args)
+            .unwrap_or_else(|| PathBuf::from("target/reports/playground-genericity.json")),
+        checks,
+        blockers,
+        json!({
+            "allowed_example_specific_locations": ["examples", "scenario files", "docs", "xtask report labels"],
+            "renderer_scanned_paths": scan_paths,
+        }),
+    )
+}
+
+fn audit_machine_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/debug/machine-readiness.json"));
+    let required = [
+        (
+            "runtime-production-hardening",
+            PathBuf::from("target/reports/runtime-production-hardening.json"),
+        ),
+        (
+            "runtime-finality",
+            PathBuf::from("target/reports/runtime-finality.json"),
+        ),
+        (
+            "native-preview-e2e-todomvc",
+            PathBuf::from("target/reports/native-gpu/preview-e2e-todomvc.json"),
+        ),
+        (
+            "native-two-window-content",
+            PathBuf::from("target/reports/native-gpu/todomvc-two-window-content.json"),
+        ),
+        (
+            "native-todomvc-reference-parity",
+            PathBuf::from("target/reports/native-gpu/todomvc-reference-parity.json"),
+        ),
+        (
+            "native-todomvc-input-parity",
+            PathBuf::from("target/reports/native-gpu/todomvc-input-parity.json"),
+        ),
+        (
+            "playground-genericity",
+            PathBuf::from("target/reports/playground-genericity.json"),
+        ),
+    ];
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut linked = Vec::new();
+    for (label, path) in required {
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("machine-readiness:report-present:{label}"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing required readiness report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+        let child = read_json(&path)?;
+        let pass = child.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let fresh = child.get("git_commit").and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("machine-readiness:report-pass:{label}"),
+            pass,
+            format!("{} status={:?}", path.display(), child.get("status")),
+            (!pass).then(|| format!("required report `{}` did not pass", path.display())),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("machine-readiness:report-fresh:{label}"),
+            fresh,
+            format!("{} git_fresh={fresh}", path.display()),
+            (!fresh).then(|| {
+                format!(
+                    "required report `{}` is stale for current git commit",
+                    path.display()
+                )
+            }),
+        );
+        linked.push(json!({
+            "label": label,
+            "path": path.display().to_string(),
+            "sha256": file_hash(path.to_string_lossy().as_ref())
+        }));
+    }
+    write_static_gate_report(
+        args,
+        "audit-machine-readiness",
+        report,
+        checks,
+        blockers,
+        json!({
+            "readiness_contract": "combined runtime production plus native TodoMVC parity gates",
+            "required_reports": linked,
+            "human_testing_required_after_machine_pass": true
+        }),
+    )
 }
 
 fn verify_native_platform_contract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -2747,6 +3101,53 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             != Some(true))
         .then(|| "native preview E2E lacks operator host-input evidence".to_owned()),
     );
+    let operator_ack = extra.pointer("/dev_ipc_probe/operator_host_input");
+    let host_route_assertions = operator_ack
+        .and_then(|ack| ack.get("host_route_assertions"))
+        .and_then(serde_json::Value::as_array);
+    let host_route_all_pass = host_route_assertions.is_some_and(|routes| {
+        !routes.is_empty()
+            && routes.iter().all(|route| {
+                route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    && route
+                        .get("hit_test_performed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && route
+                        .get("source_binding_resolved")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && route
+                        .get("ipc_only_state_mutation")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            })
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:operator-host-route-ack"),
+        operator_ack
+            .and_then(|ack| ack.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && operator_ack
+                .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && host_route_all_pass,
+        format!(
+            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}",
+            operator_ack
+                .and_then(|ack| ack.get("status"))
+                .and_then(serde_json::Value::as_str),
+            operator_ack
+                .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
+                .and_then(serde_json::Value::as_bool),
+            host_route_assertions.map_or(0, Vec::len)
+        ),
+        Some("operator host input must resolve through preview-side hit regions and document source bindings, not source-event-only IPC".to_owned()),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -2892,6 +3293,1248 @@ fn native_preview_e2e_scenario_labels(example: &str) -> Vec<&'static str> {
         ],
         _ => vec!["native-preview-visible"],
     }
+}
+
+fn verify_native_two_window_content(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let preview_e2e_report = native_preview_e2e_report_path("todomvc");
+    let report_value = read_optional_json(&preview_e2e_report)?;
+    let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
+    let layout_artifact = preview_layout_artifact(report)?;
+    let title_region = todomvc_title_region(&layout_artifact);
+    let preview_artifact_path = report
+        .pointer("/preview_surface_proof/readback_artifact/path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let freshness_evidence = native_preview_e2e_freshness_evidence(
+        &preview_e2e_report,
+        preview_artifact_path.as_deref(),
+    );
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:preview-e2e-report-present",
+        preview_e2e_report.exists(),
+        format!(
+            "{} exists={}",
+            preview_e2e_report.display(),
+            preview_e2e_report.exists()
+        ),
+        Some("run verify-native-gpu-preview-e2e --example todomvc first".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:preview-e2e-pass",
+        report.get("status").and_then(serde_json::Value::as_str) == Some("pass"),
+        format!("preview E2E status={:?}", report.get("status")),
+        Some("TodoMVC preview E2E report has not passed".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:fresh-current-preview-evidence",
+        freshness_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("freshness_evidence={freshness_evidence}"),
+        Some(
+            "native two-window content is using stale preview E2E report or framebuffer evidence"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:two-process-windows",
+        report
+            .get("process_model")
+            .and_then(serde_json::Value::as_str)
+            == Some("two-child-processes"),
+        format!("process_model={:?}", report.get("process_model")),
+        Some("native TodoMVC did not prove two child process windows".to_owned()),
+    );
+    require_content_surface_check(
+        &mut checks,
+        &mut blockers,
+        report,
+        "preview_surface_proof",
+        "preview",
+    );
+    require_content_surface_check(
+        &mut checks,
+        &mut blockers,
+        report,
+        "dev_surface_proof",
+        "dev",
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:dev-editor-filled",
+        report
+            .pointer("/dev_surface_proof/external_render_proof/code_editor_line_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|lines| lines >= 100)
+            && report
+                .pointer("/dev_surface_proof/external_render_proof/dev_editor_visible")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+        format!(
+            "line_count={:?}, visible={:?}",
+            report.pointer("/dev_surface_proof/external_render_proof/code_editor_line_count"),
+            report.pointer("/dev_surface_proof/external_render_proof/dev_editor_visible")
+        ),
+        Some("dev window does not prove a filled visible code editor".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-two-window-content:todomvc-title-region",
+        title_region.as_ref().is_some_and(|region| {
+            region
+                .get("width")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                >= 500.0
+                && region
+                    .get("height")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_default()
+                    >= 100.0
+        }),
+        format!("title_region={title_region:?}"),
+        Some(
+            "TodoMVC title is missing or too small; this catches the small red `4` regression"
+                .to_owned(),
+        ),
+    );
+
+    write_native_gate_report(
+        args,
+        "verify-native-two-window-content",
+        checks,
+        blockers,
+        json!({
+            "source_report": preview_e2e_report,
+            "layout_artifact_loaded": layout_artifact.is_object(),
+            "todomvc_title_region": title_region,
+            "freshness_evidence": freshness_evidence,
+            "content_contract": "both native windows must have app-owned nonblank readbacks and filled logical content"
+        }),
+    )
+}
+
+fn verify_native_todomvc_reference_parity(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let reference =
+        PathBuf::from("/home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png");
+    let preview_e2e_report = native_preview_e2e_report_path("todomvc");
+    let report_value = read_optional_json(&preview_e2e_report)?;
+    let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
+    let layout_artifact = preview_layout_artifact(report)?;
+    let title_region = todomvc_title_region(&layout_artifact);
+    let reference_dimensions = image::image_dimensions(&reference).ok();
+    let preview_artifact_path = report
+        .pointer("/preview_surface_proof/readback_artifact/path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let preview_dimensions = preview_artifact_path
+        .as_deref()
+        .and_then(|path| image::image_dimensions(path).ok());
+    let freshness_evidence = native_preview_e2e_freshness_evidence(
+        &preview_e2e_report,
+        preview_artifact_path.as_deref(),
+    );
+    let layout_evidence = todomvc_layout_reference_evidence(&layout_artifact);
+    let pixel_evidence = preview_artifact_path
+        .as_deref()
+        .and_then(|path| todomvc_pixel_reference_evidence(path, &reference, &layout_evidence).ok())
+        .unwrap_or_else(|| {
+            json!({
+                "pass": false,
+                "missing": ["preview artifact unavailable for pixel evidence"]
+            })
+        });
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:reference-exists",
+        reference.exists() && reference_dimensions == Some((1400, 1400)),
+        format!(
+            "reference={} dimensions={reference_dimensions:?}",
+            reference.display()
+        ),
+        Some(
+            "TodoMVC reference screenshot is missing or not the expected 1400x1400 image"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:preview-app-owned-readback",
+        preview_artifact_path
+            .as_ref()
+            .is_some_and(|path| path.exists())
+            && preview_dimensions.is_some(),
+        format!("preview_artifact={preview_artifact_path:?} dimensions={preview_dimensions:?}"),
+        Some("native preview does not have a fresh app-owned readback artifact".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:fresh-current-preview-evidence",
+        freshness_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("freshness_evidence={freshness_evidence}"),
+        Some(
+            "TodoMVC visual parity is using a stale preview E2E report or framebuffer artifact"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:canonical-title",
+        title_region.is_some(),
+        format!("title_region={title_region:?}"),
+        Some("native TodoMVC layout artifact does not contain canonical `todos` title".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:structural-regions",
+        layout_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("layout_evidence={layout_evidence}"),
+        Some(
+            "native TodoMVC layout is structurally incomplete compared with the reference"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:pixel-regions",
+        pixel_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("pixel_evidence={pixel_evidence}"),
+        Some(
+            "native TodoMVC framebuffer does not contain the expected title/panel/text pixel regions"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:visual-comparator-not-placeholder",
+        report
+            .pointer("/preview_native_gpu_render_proof/proof/artifact/unique_rgba_values")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|unique| unique >= 64),
+        format!(
+            "unique_rgba_values={:?}",
+            report.pointer("/preview_native_gpu_render_proof/proof/artifact/unique_rgba_values")
+        ),
+        Some(
+            "preview app-owned artifact is not visually rich enough for TodoMVC parity".to_owned(),
+        ),
+    );
+
+    write_native_gate_report(
+        args,
+        "verify-native-todomvc-reference-parity",
+        checks,
+        blockers,
+        json!({
+            "reference_screenshot": reference,
+            "reference_dimensions": reference_dimensions,
+            "preview_e2e_report": preview_e2e_report,
+            "preview_readback_artifact": preview_artifact_path,
+            "preview_dimensions": preview_dimensions,
+            "freshness_evidence": freshness_evidence,
+            "layout_evidence": layout_evidence,
+            "pixel_evidence": pixel_evidence,
+            "moonzoon_reference_source": "/home/martinkavik/repos/MoonZoon/examples/todomvc/frontend/src/main.rs",
+            "visual_comparator_contract": "structural reference parity plus app-owned framebuffer title geometry, crop, and diff evidence"
+        }),
+    )
+}
+
+fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let preview_e2e_report = native_preview_e2e_report_path("todomvc");
+    let report_value = read_optional_json(&preview_e2e_report)?;
+    let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
+    let expected = [
+        "add_todo",
+        "reject_empty_add",
+        "toggle_single_row",
+        "toggle_all_rows",
+        "filter_all_active_completed",
+        "edit_commit_enter",
+        "edit_cancel_escape",
+        "edit_commit_blur",
+        "clear_completed",
+        "delete_row",
+    ];
+    let observed = report
+        .pointer("/dev_ipc_probe/operator_host_input/assertions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let observed_sources = report
+        .pointer("/dev_ipc_probe/operator_host_input/outputs")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let operator_ack = report.pointer("/dev_ipc_probe/operator_host_input");
+    let host_route_assertions = operator_ack
+        .and_then(|ack| ack.get("host_route_assertions"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-input-parity:operator-host-input-route",
+        report
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass"),
+        format!(
+            "route_status={:?}",
+            report
+                .pointer("/native_host_input_route_evidence/status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        Some("operator host input did not route through hit regions and source intents".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-input-parity:preview-side-host-route-ack",
+        operator_ack
+            .and_then(|ack| ack.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && operator_ack
+                .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && !host_route_assertions.is_empty()
+            && host_route_assertions.iter().all(|route| {
+                route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    && route
+                        .get("hit_test_performed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && route
+                        .get("source_binding_resolved")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && route
+                        .get("ipc_only_state_mutation")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            }),
+        format!(
+            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}",
+            operator_ack
+                .and_then(|ack| ack.get("status"))
+                .and_then(serde_json::Value::as_str),
+            operator_ack
+                .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
+                .and_then(serde_json::Value::as_bool),
+            host_route_assertions.len()
+        ),
+        Some("TodoMVC input parity must use preview-side host-event to hit-region/source-binding route proof".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-input-parity:runtime-and-render-deltas",
+        observed_sources.iter().any(|output| {
+            output
+                .get("semantic_delta_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0
+                && output
+                    .get("render_patch_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+                    > 0
+        }),
+        format!("observed_output_count={}", observed_sources.len()),
+        Some(
+            "input parity has no event that changes both runtime state and render patches"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-input-parity:framebuffer-delta-contract",
+        observed_sources.iter().all(|output| {
+            let scenario = output
+                .get("scenario")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let before_hash = output
+                .pointer("/framebuffer_delta_evidence/before_state_hash")
+                .and_then(serde_json::Value::as_str);
+            let after_hash = output
+                .pointer("/framebuffer_delta_evidence/after_state_hash")
+                .and_then(serde_json::Value::as_str);
+            let render_patch_count = output
+                .pointer("/framebuffer_delta_evidence/render_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let expected_noop_rejection = scenario == "reject_empty_add";
+            output
+                .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_required_by_preview_report")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && if expected_noop_rejection {
+                    render_patch_count == 0 && before_hash == after_hash
+                } else {
+                    render_patch_count > 0 && before_hash != after_hash
+                }
+        }),
+        format!("observed_output_count={}", observed_sources.len()),
+        Some("TodoMVC input parity must bind each scenario to runtime and render-patch backed framebuffer-change evidence".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-input-parity:preview-shared-render-updates",
+        operator_ack
+            .and_then(|ack| ack.get("preview_shared_render_update_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            >= observed_sources.len() as u64
+            && observed_sources.iter().all(|output| {
+                output
+                    .pointer("/framebuffer_delta_evidence/preview_shared_render_state_updated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && output
+                        .pointer("/framebuffer_delta_evidence/post_input_layout_artifact")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            }),
+        format!(
+            "shared_update_count={:?}, observed_output_count={}",
+            operator_ack
+                .and_then(|ack| ack.get("preview_shared_render_update_count"))
+                .and_then(serde_json::Value::as_u64),
+            observed_sources.len()
+        ),
+        Some("TodoMVC input parity must update the preview render state used by the visible window after synthesized input".to_owned()),
+    );
+    for scenario in expected {
+        let present = observed.iter().any(|assertion| {
+            assertion
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.contains(scenario))
+        });
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-todomvc-input-parity:scenario:{scenario}"),
+            present,
+            format!("scenario `{scenario}` present={present}"),
+            (!present).then(|| format!("missing synthesized TodoMVC input scenario `{scenario}`")),
+        );
+    }
+
+    write_native_gate_report(
+        args,
+        "verify-native-todomvc-input-parity",
+        checks,
+        blockers,
+        json!({
+            "preview_e2e_report": preview_e2e_report,
+            "observed_assertion_count": observed.len(),
+            "observed_output_count": observed_sources.len(),
+            "host_route_assertion_count": host_route_assertions.len(),
+            "host_route_assertions": host_route_assertions,
+            "operator_host_input": operator_ack.cloned().unwrap_or_else(|| json!(null)),
+            "required_scenarios": expected,
+            "input_contract": "HostInputEvent -> hit test -> source binding -> LiveRuntime -> render patch -> framebuffer change"
+        }),
+    )
+}
+
+fn native_preview_e2e_report_path(example: &str) -> PathBuf {
+    match example {
+        "todomvc" => PathBuf::from("target/reports/native-gpu/preview-e2e-todomvc.json"),
+        "cells" => PathBuf::from("target/reports/native-gpu/preview-e2e-cells.json"),
+        _ => PathBuf::from("target/reports/native-gpu/preview-e2e.json"),
+    }
+}
+
+fn read_optional_json(
+    path: &Path,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    if path.exists() {
+        Ok(Some(read_json(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn require_content_surface_check(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    surface_key: &str,
+    role: &str,
+) {
+    let base = format!("/{surface_key}");
+    push_audit_check(
+        checks,
+        blockers,
+        format!("native-two-window-content:{role}:surface-readback"),
+        report
+            .pointer(&format!("{base}/readback_artifact/path"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| Path::new(path).exists())
+            && report
+                .pointer(&format!("{base}/readback_artifact/unique_rgba_values"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|unique| unique > 16),
+        format!(
+            "path={:?}, unique_rgba={:?}",
+            report.pointer(&format!("{base}/readback_artifact/path")),
+            report.pointer(&format!("{base}/readback_artifact/unique_rgba_values"))
+        ),
+        Some(format!(
+            "{role} window lacks app-owned nonblank content readback"
+        )),
+    );
+    push_audit_check(
+        checks,
+        blockers,
+        format!("native-two-window-content:{role}:external-render-proof"),
+        report
+            .pointer(&format!("{base}/external_render_proof/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && report
+                .pointer(&format!(
+                    "{base}/external_render_proof/visible_surface_rendered"
+                ))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+        format!(
+            "render_status={:?}, visible={:?}",
+            report.pointer(&format!("{base}/external_render_proof/status")),
+            report.pointer(&format!(
+                "{base}/external_render_proof/visible_surface_rendered"
+            ))
+        ),
+        Some(format!(
+            "{role} window did not prove visible generic rendering"
+        )),
+    );
+}
+
+fn preview_layout_artifact(
+    report: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let Some(path) = report
+        .pointer("/preview_document_layout_proof/artifact_path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    if !Path::new(path).exists() {
+        return Ok(serde_json::Value::Null);
+    }
+    read_json(Path::new(path))
+}
+
+fn native_preview_e2e_freshness_evidence(
+    report_path: &Path,
+    readback_artifact_path: Option<&Path>,
+) -> serde_json::Value {
+    let source_paths = [
+        "crates/boon_native_playground/src/main.rs",
+        "crates/boon_native_gpu/src/lib.rs",
+        "crates/boon_document/src/lib.rs",
+        "crates/boon_document_model/src/lib.rs",
+        "crates/boon_runtime/src/lib.rs",
+        "crates/boon_ir/src/lib.rs",
+        "crates/boon_parser/src/lib.rs",
+        "examples/todomvc.bn",
+    ];
+    let source_mtimes = source_paths
+        .iter()
+        .filter_map(|path| file_modified_unix_secs(Path::new(path)).map(|mtime| (*path, mtime)))
+        .collect::<Vec<_>>();
+    let newest_source_mtime = source_mtimes
+        .iter()
+        .map(|(_, mtime)| *mtime)
+        .max()
+        .unwrap_or_default();
+    let report_mtime = file_modified_unix_secs(report_path);
+    let artifact_mtime = readback_artifact_path.and_then(file_modified_unix_secs);
+    let pass = report_mtime.is_some_and(|mtime| mtime >= newest_source_mtime)
+        && artifact_mtime.is_some_and(|mtime| mtime >= newest_source_mtime);
+    json!({
+        "pass": pass,
+        "basis": "preview E2E report and app-owned framebuffer artifact must be newer than native/example source files",
+        "newest_source_mtime": newest_source_mtime,
+        "source_mtimes": source_mtimes
+            .into_iter()
+            .map(|(path, mtime)| json!({"path": path, "mtime": mtime}))
+            .collect::<Vec<_>>(),
+        "preview_e2e_report": report_path,
+        "preview_e2e_report_mtime": report_mtime,
+        "readback_artifact": readback_artifact_path,
+        "readback_artifact_mtime": artifact_mtime
+    })
+}
+
+fn file_modified_unix_secs(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn todomvc_title_region(layout_artifact: &serde_json::Value) -> Option<serde_json::Value> {
+    layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some("todos"))
+        .and_then(|item| item.get("bounds").cloned())
+}
+
+fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> serde_json::Value {
+    let Some(items) = layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return json!({"pass": false, "missing": ["layout display list"]});
+    };
+    let has_text = |text: &str| {
+        items
+            .iter()
+            .any(|item| item.get("text").and_then(serde_json::Value::as_str) == Some(text))
+    };
+    let has_node = |node: &str| {
+        let scoped_prefix = format!("{node}-");
+        items.iter().any(|item| {
+            item.get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|candidate| candidate == node || candidate.starts_with(&scoped_prefix))
+        })
+    };
+    let item_bounds = |node: &str| {
+        let scoped_prefix = format!("{node}-");
+        items.iter().find_map(|item| {
+            let candidate = item.get("node").and_then(serde_json::Value::as_str)?;
+            (candidate == node || candidate.starts_with(&scoped_prefix))
+                .then(|| item.get("bounds").cloned())
+                .flatten()
+        })
+    };
+    let title_bounds = items
+        .iter()
+        .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some("todos"))
+        .and_then(|item| item.get("bounds").cloned());
+    let row_title_count = items
+        .iter()
+        .filter(|item| {
+            item.get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|node| node.starts_with("todo_row_title"))
+        })
+        .count();
+    let checked_count = items
+        .iter()
+        .filter(|item| {
+            item.pointer("/style/checked")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .count();
+    let placeholder_present = items.iter().any(|item| {
+        item.pointer("/style/placeholder")
+            .and_then(serde_json::Value::as_str)
+            == Some("What needs to be done?")
+    });
+
+    let mut missing = Vec::new();
+    if !has_text("todos") {
+        missing.push("title text");
+    }
+    if !has_node("todomvc_surface") {
+        missing.push("surface");
+    }
+    if !has_node("todo_new_input") || !placeholder_present {
+        missing.push("new todo input with placeholder");
+    }
+    if row_title_count < 4 {
+        missing.push("four initial todo rows");
+    }
+    if checked_count < 1 {
+        missing.push("checked completed row");
+    }
+    if !has_node("todomvc_footer") {
+        missing.push("controls footer");
+    }
+    if !has_text("Clear completed") {
+        missing.push("clear completed button");
+    }
+    if !has_text("Double-click to edit a todo") {
+        missing.push("info footer");
+    }
+    let title_large_and_centered = bounds_pass(&title_bounds, |bounds| {
+        bounds.width >= 240.0
+            && bounds.height >= 80.0
+            && bounds.center_x >= 300.0
+            && bounds.center_x <= 500.0
+            && bounds.y <= 40.0
+    });
+    if !title_large_and_centered {
+        missing.push("large centered todos title bounds");
+    }
+    let surface_reference_sized = bounds_pass(&item_bounds("todomvc_surface"), |bounds| {
+        bounds.width >= 500.0
+            && bounds.width <= 620.0
+            && bounds.height >= 300.0
+            && bounds.center_x >= 340.0
+            && bounds.center_x <= 460.0
+            && bounds.y >= 80.0
+            && bounds.y <= 150.0
+    });
+    if !surface_reference_sized {
+        missing.push("reference-sized centered app surface");
+    }
+    let input_reference_sized = bounds_pass(&item_bounds("todo_new_input"), |bounds| {
+        bounds.width >= 440.0
+            && bounds.height >= 48.0
+            && bounds.height <= 70.0
+            && bounds.y >= 115.0
+            && bounds.y <= 155.0
+    });
+    if !input_reference_sized {
+        missing.push("reference-sized new todo input row");
+    }
+    json!({
+        "pass": missing.is_empty(),
+        "missing": missing,
+        "title_bounds": title_bounds,
+        "surface_bounds": item_bounds("todomvc_surface"),
+        "input_bounds": item_bounds("todo_new_input"),
+        "footer_bounds": item_bounds("todomvc_footer"),
+        "row_title_count": row_title_count,
+        "checked_count": checked_count,
+        "placeholder_present": placeholder_present,
+        "title_large_and_centered": title_large_and_centered,
+        "surface_reference_sized": surface_reference_sized,
+        "input_reference_sized": input_reference_sized
+    })
+}
+
+fn todomvc_pixel_reference_evidence(
+    path: &Path,
+    reference: &Path,
+    layout_evidence: &serde_json::Value,
+) -> Result<serde_json::Value, image::ImageError> {
+    let image = image::open(path)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    let reference_image = image::open(reference)?.to_rgba8();
+    let visual_artifacts =
+        write_todomvc_visual_artifacts(&image, &reference_image, path, reference, layout_evidence)?;
+    let red_title = count_region_pixels(&image, 0, 0, width, height / 4, |r, g, b, _| {
+        r > 150 && g < 100 && b < 120
+    });
+    let dark_text = count_region_pixels(&image, 0, height / 5, width, height, |r, g, b, _| {
+        r < 110 && g < 110 && b < 110
+    });
+    let white_panel = count_region_pixels(&image, 0, height / 8, width, height, |r, g, b, _| {
+        r > 245 && g > 245 && b > 245
+    });
+    let teal_check = count_region_pixels(&image, 0, height / 5, width / 2, height, |r, g, b, _| {
+        r < 130 && g > 150 && b > 130
+    });
+    let title_pixel_bounds = color_pixel_bounds(&image, 0, 0, width, height / 4, |r, g, b, a| {
+        a > 180 && r > 150 && g < 120 && b < 140
+    });
+    let title_pixel_bounds_pass = title_pixel_bounds.as_ref().is_some_and(|bounds| {
+        let width_ratio = bounds.width() as f64 / width.max(1) as f64;
+        let height_ratio = bounds.height() as f64 / height.max(1) as f64;
+        let center_ratio = bounds.center_x() / width.max(1) as f64;
+        width_ratio >= 0.22
+            && width_ratio <= 0.38
+            && height_ratio >= 0.08
+            && height_ratio <= 0.16
+            && center_ratio >= 0.42
+            && center_ratio <= 0.68
+            && bounds.y0 <= height / 8
+    });
+    let reference_title_bounds = color_pixel_bounds(
+        &reference_image,
+        0,
+        0,
+        reference_image.width(),
+        reference_image.height() / 4,
+        |r, g, b, a| a > 180 && r > 150 && g < 120 && b < 140,
+    );
+    let crop_diff_pass = visual_artifacts
+        .get("normalized_crop_mean_abs_diff")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|diff| diff <= 30.0);
+    let diff_p95_pass = visual_artifacts
+        .get("normalized_crop_p95_abs_diff")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|diff| diff <= 115.0);
+    let high_diff_ratio_pass = visual_artifacts
+        .get("normalized_crop_high_diff_ratio")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio <= 0.11);
+    let connected_mismatch_pass = visual_artifacts
+        .get("normalized_crop_largest_mismatch_region_ratio")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio <= 0.035);
+    let mut missing = Vec::new();
+    if red_title < 600 {
+        missing.push("large red title pixels");
+    }
+    if !title_pixel_bounds_pass {
+        missing.push("large centered red title pixel bounds");
+    }
+    if dark_text < 900 {
+        missing.push("todo/footer dark text pixels");
+    }
+    if white_panel < 20_000 {
+        missing.push("large white panel pixels");
+    }
+    if teal_check < 20 {
+        missing.push("completed-row check pixels");
+    }
+    if !crop_diff_pass {
+        missing.push("normalized reference/native crop similarity");
+    }
+    if !diff_p95_pass {
+        missing.push("normalized crop p95 similarity");
+    }
+    if !high_diff_ratio_pass {
+        missing.push("bounded high-difference pixel ratio");
+    }
+    if !connected_mismatch_pass {
+        missing.push("no large connected mismatch regions");
+    }
+    Ok(json!({
+        "pass": missing.is_empty(),
+        "missing": missing,
+        "dimensions": [width, height],
+        "red_title_pixels": red_title,
+        "dark_text_pixels": dark_text,
+        "white_panel_pixels": white_panel,
+        "teal_check_pixels": teal_check,
+        "title_pixel_bounds": title_pixel_bounds.map(|bounds| bounds.to_json()),
+        "reference_title_pixel_bounds": reference_title_bounds.map(|bounds| bounds.to_json()),
+        "title_pixel_bounds_pass": title_pixel_bounds_pass,
+        "visual_artifacts": visual_artifacts,
+        "thresholds": {
+            "normalized_crop_mean_abs_diff_max": 30.0,
+            "normalized_crop_p95_abs_diff_max": 115.0,
+            "normalized_crop_high_diff_ratio_max": 0.11,
+            "normalized_crop_largest_mismatch_region_ratio_max": 0.035
+        }
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct ImageBounds {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl ImageBounds {
+    fn width(self) -> u32 {
+        self.x1.saturating_sub(self.x0).saturating_add(1)
+    }
+
+    fn height(self) -> u32 {
+        self.y1.saturating_sub(self.y0).saturating_add(1)
+    }
+
+    fn center_x(self) -> f64 {
+        self.x0 as f64 + self.width() as f64 / 2.0
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        json!({
+            "x": self.x0,
+            "y": self.y0,
+            "width": self.width(),
+            "height": self.height(),
+            "center_x": self.center_x()
+        })
+    }
+}
+
+struct JsonBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    center_x: f64,
+}
+
+fn parse_json_bounds(value: &serde_json::Value) -> Option<JsonBounds> {
+    let x = value.get("x").and_then(serde_json::Value::as_f64)?;
+    let y = value.get("y").and_then(serde_json::Value::as_f64)?;
+    let width = value.get("width").and_then(serde_json::Value::as_f64)?;
+    let height = value.get("height").and_then(serde_json::Value::as_f64)?;
+    Some(JsonBounds {
+        x,
+        y,
+        width,
+        height,
+        center_x: x + width / 2.0,
+    })
+}
+
+fn bounds_pass(
+    value: &Option<serde_json::Value>,
+    predicate: impl FnOnce(&JsonBounds) -> bool,
+) -> bool {
+    value
+        .as_ref()
+        .and_then(parse_json_bounds)
+        .is_some_and(|bounds| predicate(&bounds))
+}
+
+fn color_pixel_bounds(
+    image: &image::RgbaImage,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    predicate: impl Fn(u8, u8, u8, u8) -> bool,
+) -> Option<ImageBounds> {
+    let mut bounds: Option<ImageBounds> = None;
+    for y in y0.min(image.height())..y1.min(image.height()) {
+        for x in x0.min(image.width())..x1.min(image.width()) {
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            if predicate(r, g, b, a) {
+                bounds = Some(match bounds {
+                    Some(existing) => ImageBounds {
+                        x0: existing.x0.min(x),
+                        y0: existing.y0.min(y),
+                        x1: existing.x1.max(x),
+                        y1: existing.y1.max(y),
+                    },
+                    None => ImageBounds {
+                        x0: x,
+                        y0: y,
+                        x1: x,
+                        y1: y,
+                    },
+                });
+            }
+        }
+    }
+    bounds
+}
+
+fn write_todomvc_visual_artifacts(
+    native: &image::RgbaImage,
+    reference: &image::RgbaImage,
+    native_path: &Path,
+    reference_path: &Path,
+    layout_evidence: &serde_json::Value,
+) -> Result<serde_json::Value, image::ImageError> {
+    let artifact_dir = PathBuf::from("target/reports/native-gpu");
+    let _ = fs::create_dir_all(&artifact_dir);
+    let native_crop_path = artifact_dir.join("todomvc-native-normalized-crop.png");
+    let reference_crop_path = artifact_dir.join("todomvc-reference-normalized-crop.png");
+    let diff_path = artifact_dir.join("todomvc-reference-diff-heatmap.png");
+
+    let native_crop = crop_native_todomvc_frame(native, layout_evidence);
+    let reference_crop = crop_reference_todomvc_frame(reference);
+    let native_normalized = image::imageops::resize(
+        &native_crop,
+        700,
+        700,
+        image::imageops::FilterType::Triangle,
+    );
+    let reference_normalized = image::imageops::resize(
+        &reference_crop,
+        700,
+        700,
+        image::imageops::FilterType::Triangle,
+    );
+    let (heatmap, diff_metrics) = todomvc_diff_heatmap(&native_normalized, &reference_normalized);
+    native_normalized.save(&native_crop_path)?;
+    reference_normalized.save(&reference_crop_path)?;
+    heatmap.save(&diff_path)?;
+
+    Ok(json!({
+        "native_source": native_path,
+        "reference_source": reference_path,
+        "native_normalized_crop": native_crop_path,
+        "reference_normalized_crop": reference_crop_path,
+        "diff_heatmap": diff_path,
+        "normalized_crop_dimensions": [700, 700],
+        "normalized_crop_mean_abs_diff": diff_metrics.mean_abs_diff,
+        "normalized_crop_p95_abs_diff": diff_metrics.p95_abs_diff,
+        "normalized_crop_high_diff_ratio": diff_metrics.high_diff_ratio,
+        "normalized_crop_largest_mismatch_region_ratio": diff_metrics.largest_mismatch_region_ratio,
+        "normalized_crop_high_diff_threshold": diff_metrics.high_diff_threshold
+    }))
+}
+
+fn crop_native_todomvc_frame(
+    image: &image::RgbaImage,
+    layout_evidence: &serde_json::Value,
+) -> image::RgbaImage {
+    let title = layout_evidence
+        .get("title_bounds")
+        .and_then(parse_json_bounds);
+    let surface = layout_evidence
+        .get("surface_bounds")
+        .and_then(parse_json_bounds);
+    let footer = layout_evidence
+        .get("footer_bounds")
+        .and_then(parse_json_bounds);
+    let x0 = [title.as_ref(), surface.as_ref(), footer.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|bounds| bounds.x)
+        .fold(f64::INFINITY, f64::min)
+        .floor()
+        .max(0.0) as u32;
+    let x1 = [title.as_ref(), surface.as_ref(), footer.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|bounds| bounds.x + bounds.width)
+        .fold(0.0, f64::max)
+        .ceil()
+        .min(image.width() as f64) as u32;
+    let y0 = title
+        .as_ref()
+        .map(|bounds| bounds.y)
+        .unwrap_or(0.0)
+        .floor()
+        .max(0.0) as u32;
+    let y1 = surface
+        .as_ref()
+        .map(|bounds| bounds.y + bounds.height + 140.0)
+        .unwrap_or(image.height() as f64)
+        .ceil()
+        .min(image.height() as f64) as u32;
+    crop_nonempty(image, x0, y0, x1, y1)
+}
+
+fn crop_reference_todomvc_frame(image: &image::RgbaImage) -> image::RgbaImage {
+    let title_bounds = color_pixel_bounds(
+        image,
+        0,
+        0,
+        image.width(),
+        image.height() / 4,
+        |r, g, b, a| a > 180 && r > 150 && g < 120 && b < 140,
+    );
+    let center = title_bounds
+        .map(ImageBounds::center_x)
+        .unwrap_or(image.width() as f64 / 2.0);
+    let crop_width = 640.0f64.min(image.width() as f64);
+    let x0 = (center - crop_width / 2.0).floor().max(0.0) as u32;
+    let x1 = (x0 as f64 + crop_width).min(image.width() as f64) as u32;
+    let y1 = (image.height() as f64 * 0.48).ceil() as u32;
+    crop_nonempty(image, x0, 0, x1, y1)
+}
+
+fn crop_nonempty(image: &image::RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> image::RgbaImage {
+    let x0 = x0.min(image.width().saturating_sub(1));
+    let y0 = y0.min(image.height().saturating_sub(1));
+    let width = x1.saturating_sub(x0).max(1).min(image.width() - x0);
+    let height = y1.saturating_sub(y0).max(1).min(image.height() - y0);
+    image::imageops::crop_imm(image, x0, y0, width, height).to_image()
+}
+
+struct TodoMvcDiffMetrics {
+    mean_abs_diff: f64,
+    p95_abs_diff: f64,
+    high_diff_ratio: f64,
+    largest_mismatch_region_ratio: f64,
+    high_diff_threshold: u8,
+}
+
+fn todomvc_diff_heatmap(
+    native: &image::RgbaImage,
+    reference: &image::RgbaImage,
+) -> (image::RgbaImage, TodoMvcDiffMetrics) {
+    let width = native.width().min(reference.width());
+    let height = native.height().min(reference.height());
+    let mut heatmap = image::RgbaImage::new(width, height);
+    let mut diffs = Vec::with_capacity(width as usize * height as usize);
+    let mut total = 0u64;
+    for y in 0..height {
+        for x in 0..width {
+            let [nr, ng, nb, _] = native.get_pixel(x, y).0;
+            let [rr, rg, rb, _] = reference.get_pixel(x, y).0;
+            let diff = ((nr as i16 - rr as i16).unsigned_abs() as u32
+                + (ng as i16 - rg as i16).unsigned_abs() as u32
+                + (nb as i16 - rb as i16).unsigned_abs() as u32)
+                / 3;
+            total += diff as u64;
+            diffs.push(diff as u8);
+            heatmap.put_pixel(
+                x,
+                y,
+                image::Rgba([diff as u8, 0, 255u8.saturating_sub(diff as u8), 255]),
+            );
+        }
+    }
+    diffs.sort_unstable();
+    let pixel_count = width.max(1) as usize * height.max(1) as usize;
+    let mean = total as f64 / pixel_count as f64;
+    let p95_index = pixel_count.saturating_sub(1).min(pixel_count * 95 / 100);
+    let p95 = diffs.get(p95_index).copied().unwrap_or_default() as f64;
+    let high_diff_threshold = 70u8;
+    let high_diff_pixels = diffs
+        .iter()
+        .filter(|diff| **diff >= high_diff_threshold)
+        .count();
+    let high_diff_ratio = high_diff_pixels as f64 / pixel_count as f64;
+    let largest_mismatch_region_ratio =
+        largest_diff_region_ratio(native, reference, high_diff_threshold);
+    (
+        heatmap,
+        TodoMvcDiffMetrics {
+            mean_abs_diff: mean,
+            p95_abs_diff: p95,
+            high_diff_ratio,
+            largest_mismatch_region_ratio,
+            high_diff_threshold,
+        },
+    )
+}
+
+fn largest_diff_region_ratio(
+    native: &image::RgbaImage,
+    reference: &image::RgbaImage,
+    threshold: u8,
+) -> f64 {
+    let width = native.width().min(reference.width());
+    let height = native.height().min(reference.height());
+    let pixel_count = width.max(1) as usize * height.max(1) as usize;
+    let mut visited = vec![false; width as usize * height as usize];
+    let mut largest = 0usize;
+    let mut stack = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            if visited[index] || !pixel_diff_at_least(native, reference, x, y, threshold) {
+                visited[index] = true;
+                continue;
+            }
+            visited[index] = true;
+            stack.push((x, y));
+            let mut region = 0usize;
+            while let Some((cx, cy)) = stack.pop() {
+                region += 1;
+                for (nx, ny) in diff_neighbors(cx, cy, width, height) {
+                    let neighbor_index = (ny * width + nx) as usize;
+                    if visited[neighbor_index] {
+                        continue;
+                    }
+                    visited[neighbor_index] = true;
+                    if pixel_diff_at_least(native, reference, nx, ny, threshold) {
+                        stack.push((nx, ny));
+                    }
+                }
+            }
+            largest = largest.max(region);
+        }
+    }
+    largest as f64 / pixel_count as f64
+}
+
+fn diff_neighbors(x: u32, y: u32, width: u32, height: u32) -> impl Iterator<Item = (u32, u32)> {
+    let mut neighbors = Vec::with_capacity(4);
+    if x > 0 {
+        neighbors.push((x - 1, y));
+    }
+    if x + 1 < width {
+        neighbors.push((x + 1, y));
+    }
+    if y > 0 {
+        neighbors.push((x, y - 1));
+    }
+    if y + 1 < height {
+        neighbors.push((x, y + 1));
+    }
+    neighbors.into_iter()
+}
+
+fn pixel_diff_at_least(
+    native: &image::RgbaImage,
+    reference: &image::RgbaImage,
+    x: u32,
+    y: u32,
+    threshold: u8,
+) -> bool {
+    let [nr, ng, nb, _] = native.get_pixel(x, y).0;
+    let [rr, rg, rb, _] = reference.get_pixel(x, y).0;
+    let diff = ((nr as i16 - rr as i16).unsigned_abs() as u32
+        + (ng as i16 - rg as i16).unsigned_abs() as u32
+        + (nb as i16 - rb as i16).unsigned_abs() as u32)
+        / 3;
+    diff >= threshold as u32
+}
+
+fn count_region_pixels(
+    image: &image::RgbaImage,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    predicate: impl Fn(u8, u8, u8, u8) -> bool,
+) -> u64 {
+    let mut count = 0u64;
+    for y in y0.min(image.height())..y1.min(image.height()) {
+        for x in x0.min(image.width())..x1.min(image.width()) {
+            let [r, g, b, a] = image.get_pixel(x, y).0;
+            if predicate(r, g, b, a) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn native_preview_host_route_evidence(
@@ -5553,6 +7196,56 @@ fn write_native_gate_report(
     }
 }
 
+fn write_static_gate_report(
+    args: &[String],
+    command: &str,
+    report: PathBuf,
+    checks: Vec<serde_json::Value>,
+    blockers: Vec<String>,
+    extra: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = std::fs::remove_file(&report);
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_owned(), json!(status));
+    object.insert("report_version".to_owned(), json!(1));
+    object.insert(
+        "generated_at_utc".to_owned(),
+        json!(current_unix_seconds().to_string()),
+    );
+    object.insert("command".to_owned(), json!(command));
+    object.insert("command_argv".to_owned(), json!(args));
+    object.insert(
+        "exit_status".to_owned(),
+        json!(if blockers.is_empty() { 0 } else { 1 }),
+    );
+    object.insert("git_commit".to_owned(), json!(git_commit()));
+    object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
+    object.insert("source_hash".to_owned(), json!("n/a"));
+    object.insert("scenario_hash".to_owned(), json!("n/a"));
+    object.insert("program_hash".to_owned(), json!("n/a"));
+    object.insert("budget_hash".to_owned(), json!("n/a"));
+    object.insert("graph_node_count".to_owned(), json!(0));
+    object.insert("per_step_pass_fail".to_owned(), json!(checks));
+    object.insert("artifact_sha256s".to_owned(), json!([]));
+    if !blockers.is_empty() {
+        object.insert("blockers".to_owned(), json!(blockers));
+    }
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    write_json(&report, &serde_json::Value::Object(object))?;
+    verify_report_schema(&report)?;
+    if blockers.is_empty() {
+        println!("wrote {}", report.display());
+        Ok(())
+    } else {
+        Err(format!("gate `{command}` blocked; wrote {}", report.display()).into())
+    }
+}
+
 fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
     let name = match command {
         "verify-platform-contract" => "platform-contract",
@@ -5568,6 +7261,9 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("cells") => "preview-e2e-cells",
             _ => "preview-e2e",
         },
+        "verify-native-two-window-content" => "todomvc-two-window-content",
+        "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
+        "verify-native-todomvc-input-parity" => "todomvc-input-parity",
         "verify-native-gpu-scroll-speed" => match native_gpu_scroll_selector(args).label.as_str() {
             "dev-code-editor" => "scroll-speed-dev-code-editor",
             _ => "scroll-speed-cells",
@@ -7634,7 +9330,8 @@ fn run_native_layout_probe(
             "report": report
         }));
     }
-    read_json(report)
+    let value = read_json(report)?;
+    Ok(value.get("layout_proof").cloned().unwrap_or(value))
 }
 
 fn native_preview_driver_target(

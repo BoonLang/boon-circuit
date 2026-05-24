@@ -217,8 +217,15 @@ impl LayoutBuilder<'_, '_> {
         };
         let padding = style_spacing(&node.style, "padding").unwrap_or(0.0);
         let gap = style_spacing(&node.style, "gap").unwrap_or(0.0);
-        let explicit_width = style_dimension(&node.style, "width", available_width);
-        let explicit_height = style_dimension(&node.style, "height", 0.0);
+        let control_size = style_spacing(&node.style, "size").filter(|_| {
+            matches!(
+                node.kind,
+                DocumentNodeKind::Button | DocumentNodeKind::GridCell
+            ) && node.text.is_none()
+        });
+        let explicit_width =
+            style_dimension(&node.style, "width", available_width).or(control_size);
+        let explicit_height = style_dimension(&node.style, "height", 0.0).or(control_size);
         let text = node.text.as_ref().map(|value| value.text.clone());
         let measured = text
             .as_deref()
@@ -235,12 +242,18 @@ impl LayoutBuilder<'_, '_> {
             .unwrap_or_else(|| measured.width.max(available_width))
             .max(1.0);
         let mut height = explicit_height.unwrap_or_else(|| measured.height.max(24.0));
+        let centered = style_bool(&node.style, "center").unwrap_or(false);
+        let node_x = if centered && width < available_width {
+            x + (available_width - width) / 2.0
+        } else {
+            x
+        };
         let display_index = self.display_list.len();
         self.display_list.push(DisplayItem {
             node: node.id.clone(),
             kind: node.kind.clone(),
             bounds: Rect {
-                x,
+                x: node_x,
                 y,
                 width,
                 height,
@@ -251,7 +264,7 @@ impl LayoutBuilder<'_, '_> {
         });
 
         if !node.children.is_empty() {
-            let content_x = x + padding;
+            let content_x = node_x + padding;
             let content_y = y + padding;
             let content_width = (width - padding * 2.0).max(1.0);
             match node.kind {
@@ -263,9 +276,6 @@ impl LayoutBuilder<'_, '_> {
                             self.layout_node(child, cursor_x, content_y, content_width);
                         cursor_x += child_rect.width + gap;
                         max_child_height = max_child_height.max(child_rect.height);
-                    }
-                    if explicit_width.is_none() {
-                        width = (cursor_x - x - gap).max(1.0) + padding;
                     }
                     if explicit_height.is_none() {
                         height = (max_child_height + padding * 2.0).max(24.0);
@@ -291,7 +301,7 @@ impl LayoutBuilder<'_, '_> {
         }
 
         let rect = Rect {
-            x,
+            x: node_x,
             y,
             width,
             height,
@@ -326,6 +336,14 @@ fn style_spacing(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<f32>
             .next()
             .and_then(|value| value.trim().parse::<f32>().ok()),
         StyleValue::Bool(_) => None,
+    }
+}
+
+fn style_bool(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<bool> {
+    match style.get(key)? {
+        StyleValue::Bool(value) => Some(*value),
+        StyleValue::Text(value) => value.parse::<bool>().ok(),
+        StyleValue::Number(_) => None,
     }
 }
 

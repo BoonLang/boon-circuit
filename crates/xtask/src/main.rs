@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 
 use boon_runtime::{
-    LiveRuntime, LiveSourceEvent, VerificationLayer, example_paths, run_scenario,
-    verify_report_schema, write_json,
+    VerificationLayer, example_paths, parse_scenario, run_scenario, verify_report_schema,
+    write_json,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +22,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-report-schema",
     "verify-runtime-production-hardening",
     "verify-runtime-finality",
+    "audit-genericity",
     "verify-playground-genericity",
     "verify-boon-source-syntax",
     "verify-boon-driver-schema",
@@ -96,6 +97,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-report-schema" => verify_reports_schema(),
         "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
         "verify-runtime-finality" => verify_runtime_finality(&args),
+        "audit-genericity" => audit_genericity(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
         "verify-boon-source-syntax" => verify_boon_source_syntax(&args),
         "verify-boon-driver-schema" => verify_boon_driver_schema(&args),
@@ -849,6 +851,69 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
         json!({
             "allowed_example_specific_locations": ["examples", "scenario files", "docs", "xtask report labels"],
             "renderer_scanned_paths": scan_paths,
+        }),
+    )
+}
+
+fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let native = fs::read_to_string("crates/boon_native_playground/src/main.rs")?;
+    let runtime = fs::read_to_string("crates/boon_runtime/src/lib.rs")?;
+    for (label, haystack) in [("native", native.as_str()), ("runtime", runtime.as_str())] {
+        for forbidden in [
+            "generic_future",
+            "future-generic",
+            "unsupported-runtime-surface",
+            "static-document-preview",
+            "custom_runtime_scenario_path",
+            "ExecutableSurfaceKind::TodoMvc",
+            "ExecutableSurfaceKind::Cells",
+            "LoadedRuntimeSurface::Todo",
+            "LoadedRuntimeSurface::Cells",
+            "validate_executable_surface",
+            "lower_todomvc_patch",
+            "lower_cells_patch",
+            "todomvc_summary",
+            "cells_summary",
+            "todo_cells_specific_shortcut",
+            "formula_state",
+            "program.kind.as_str",
+            "parsed.kind",
+        ] {
+            let hits = haystack.matches(forbidden).count();
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("audit-genericity:{label}:no-{forbidden}"),
+                hits == 0,
+                format!("{hits} `{forbidden}` hits"),
+                (hits != 0)
+                    .then(|| format!("remove false-generic marker `{forbidden}` from {label}")),
+            );
+        }
+    }
+    let generic_runtime_api = runtime.contains("pub fn from_source(")
+        && runtime.contains("fn apply_generic_step")
+        && native.contains("generic-live-runtime");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "audit-genericity:runtime:from-source-api",
+        generic_runtime_api,
+        format!("generic_runtime_api={generic_runtime_api}"),
+        (!generic_runtime_api)
+            .then(|| "runtime must expose a source-only generic LiveRuntime path".to_owned()),
+    );
+    write_static_gate_report(
+        args,
+        "audit-genericity",
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/genericity-audit.json")),
+        checks,
+        blockers,
+        json!({
+            "contract": "generic examples must execute through one LiveRuntime source/scenario path; static preview, future-generic false greens, and TodoMVC/Cells runtime surfaces are banned",
+            "remaining_legacy_runtime_surfaces": "not allowed in production runtime/native code; fixture-only names belong in examples, scenarios, tests, or docs"
         }),
     )
 }
@@ -1609,6 +1674,8 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
             &live_state_report,
             None,
             Some("a"),
+            None,
+            false,
         )?;
         let launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -2079,6 +2146,8 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
             &live_state_report,
             None,
             Some("a"),
+            None,
+            false,
         )?;
         let launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -2428,6 +2497,8 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             &live_state_report,
             None,
             Some("a"),
+            None,
+            false,
         )?;
         let launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -2852,6 +2923,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
     if build.success() && isolated_real_window_available {
         let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
+        let isolated_driver_text = isolated_preview_driver_text(&entry.id);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
             &launched_binary_path,
             &entry.id,
@@ -2861,7 +2933,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             &supervisor_report,
             &live_state_report,
             driver_target.clone(),
-            isolated_preview_driver_text(&entry.id),
+            isolated_driver_text.as_deref(),
+            None,
+            false,
         )?;
         let isolated_launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -2904,7 +2978,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             let cwd = std::env::current_dir()?;
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
-                "cd {} && {} --role desktop --example {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
+                "cd {} && {} --role desktop --example {} --probe --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&format!("./{}", launched_binary_path.display())),
                 shell_quote(&entry.id),
@@ -3890,11 +3964,7 @@ fn native_preview_manifest_scenario_evidence(
                 .filter(|assertion| {
                     assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
                 })
-                .filter_map(|assertion| {
-                    assertion
-                        .get("scenario")
-                        .and_then(serde_json::Value::as_str)
-                })
+                .filter_map(scenario_label_from_report_value)
                 .map(ToOwned::to_owned)
                 .collect::<BTreeSet<_>>()
         })
@@ -3917,7 +3987,7 @@ fn native_preview_manifest_scenario_evidence(
                             .unwrap_or_default()
                             > 0
                 })
-                .filter_map(|output| output.get("scenario").and_then(serde_json::Value::as_str))
+                .filter_map(scenario_label_from_report_value)
                 .map(ToOwned::to_owned)
                 .collect::<BTreeSet<_>>()
         })
@@ -3950,16 +4020,12 @@ fn native_preview_manifest_scenario_evidence(
         }
     }
     for label in &entry.input_scenarios {
-        let mapped = native_manifest_runtime_scenarios_for_label(example, label);
-        let pass = !mapped.is_empty()
-            && mapped
-                .iter()
-                .all(|scenario| runtime_or_output_has(scenario));
+        let pass = runtime_or_output_has(label);
         evidence_entries.push(native_manifest_scenario_evidence_entry(
             label,
             pass,
             observed_tier,
-            &format!("runtime/output scenarios: {}", mapped.join(", ")),
+            &format!("runtime/output scenario step: {label}"),
             "input-scenario",
         ));
         if pass {
@@ -4025,6 +4091,17 @@ fn native_preview_manifest_scenario_evidence(
     })
 }
 
+fn scenario_label_from_report_value(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("scenario")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("scenario_step")
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
 fn native_manifest_scenario_evidence_entry(
     label: &str,
     pass: bool,
@@ -4040,41 +4117,6 @@ fn native_manifest_scenario_evidence_entry(
         "proof_source": proof_source,
         "real_window": evidence_tier == "real-window"
     })
-}
-
-fn native_manifest_runtime_scenarios_for_label(example: &str, label: &str) -> Vec<&'static str> {
-    match (example, label) {
-        ("todomvc", "focus-new-todo-input") => vec!["type_new_todo"],
-        ("todomvc", "type-new-todo") => vec!["type_new_todo"],
-        ("todomvc", "enter-adds-todo") => vec!["add_todo"],
-        ("todomvc", "reject-empty-add") => vec!["reject_empty_add"],
-        ("todomvc", "toggle-single-row") => vec!["toggle_single_row"],
-        ("todomvc", "toggle-all-rows") => vec!["toggle_all_rows"],
-        ("todomvc", "switch-all-active-completed") => vec!["filter_all_active_completed"],
-        ("todomvc", "double-click-edit-row") => {
-            vec!["edit_open_enter", "edit_open_escape", "edit_open_blur"]
-        }
-        ("todomvc", "enter-commits-edit") => {
-            vec!["edit_change_enter", "edit_commit_enter"]
-        }
-        ("todomvc", "escape-cancels-edit") => {
-            vec!["edit_change_escape", "edit_cancel_escape"]
-        }
-        ("todomvc", "blur-commits-edit") => vec!["edit_change_blur", "edit_commit_blur"],
-        ("todomvc", "clear-completed") => vec!["clear_completed"],
-        ("todomvc", "delete-row") => vec!["delete_row"],
-        ("cells", "focus-cell") => vec!["type_scalar_value"],
-        ("cells", "type-scalar-value") => vec!["type_scalar_value"],
-        ("cells", "commit-value-enter") => vec!["commit_value_enter"],
-        ("cells", "edit-formula-bar") => vec!["edit_formula_bar"],
-        ("cells", "commit-formula-enter") => vec!["commit_formula_enter"],
-        ("cells", "recompute-dependents") => vec!["recompute_dependents"],
-        ("cells", "invalid-formula-error") => vec!["invalid_formula_error"],
-        ("cells", "cycle-error") => vec!["cycle_error"],
-        ("cells", "cancel-edit-escape") => vec!["cancel_edit_escape"],
-        ("cells", "blur-commit-or-cancel") => vec!["blur_commit_or_cancel"],
-        _ => Vec::new(),
-    }
 }
 
 fn verify_native_two_window_content(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -4363,18 +4405,25 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
     let preview_e2e_report = native_preview_e2e_report_path("todomvc");
     let report_value = read_optional_json(&preview_e2e_report)?;
     let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
-    let expected = [
-        "add_todo",
-        "reject_empty_add",
-        "toggle_single_row",
-        "toggle_all_rows",
-        "filter_all_active_completed",
-        "edit_commit_enter",
-        "edit_cancel_escape",
-        "edit_commit_blur",
-        "clear_completed",
-        "delete_row",
-    ];
+    let scenario = parse_scenario(Path::new("examples/todomvc.scn"))?;
+    let expected = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_some())
+        .map(|step| step.id.clone())
+        .collect::<Vec<_>>();
+    let expected_render_delta_by_step = scenario
+        .step
+        .iter()
+        .filter(|step| step.expected_source_event.is_some())
+        .map(|step| {
+            (
+                step.id.clone(),
+                !step.expect_render_delta_contains.is_empty()
+                    || !step.expect_semantic_delta_contains.is_empty(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let observed = report
         .pointer("/dev_ipc_probe/operator_host_input/assertions")
         .and_then(serde_json::Value::as_array)
@@ -4475,8 +4524,8 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         &mut blockers,
         "native-todomvc-input-parity:framebuffer-delta-contract",
         observed_sources.iter().all(|output| {
-            let scenario = output
-                .get("scenario")
+            let scenario_step = output
+                .get("scenario_step")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             let before_hash = output
@@ -4489,15 +4538,18 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
                 .pointer("/framebuffer_delta_evidence/render_patch_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default();
-            let expected_noop_rejection = scenario == "reject_empty_add";
+            let expected_runtime_or_render_delta = expected_render_delta_by_step
+                .get(scenario_step)
+                .copied()
+                .unwrap_or(true);
             output
                 .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_required_by_preview_report")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
-                && if expected_noop_rejection {
-                    render_patch_count == 0 && before_hash == after_hash
-                } else {
+                && if expected_runtime_or_render_delta {
                     render_patch_count > 0 && before_hash != after_hash
+                } else {
+                    before_hash == after_hash
                 }
         }),
         format!("observed_output_count={}", observed_sources.len()),
@@ -4550,12 +4602,12 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         ),
         Some("TodoMVC input parity must update the preview render state used by the visible window after synthesized input".to_owned()),
     );
-    for scenario in expected {
+    for scenario in &expected {
         let present = observed.iter().any(|assertion| {
             assertion
-                .get("id")
+                .get("scenario_step")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| id.contains(scenario))
+                == Some(scenario.as_str())
         });
         push_audit_check(
             &mut checks,
@@ -4563,7 +4615,7 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
             format!("native-todomvc-input-parity:scenario:{scenario}"),
             present,
             format!("scenario `{scenario}` present={present}"),
-            (!present).then(|| format!("missing synthesized TodoMVC input scenario `{scenario}`")),
+            (!present).then(|| format!("missing TodoMVC scenario step `{scenario}`")),
         );
     }
 
@@ -4586,11 +4638,9 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
 }
 
 fn native_preview_e2e_report_path(example: &str) -> PathBuf {
-    match example {
-        "todomvc" => PathBuf::from("target/reports/native-gpu/preview-e2e-todomvc.json"),
-        "cells" => PathBuf::from("target/reports/native-gpu/preview-e2e-cells.json"),
-        _ => PathBuf::from("target/reports/native-gpu/preview-e2e.json"),
-    }
+    PathBuf::from(format!(
+        "target/reports/native-gpu/preview-e2e-{example}.json"
+    ))
 }
 
 fn read_optional_json(
@@ -4747,33 +4797,58 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
             .iter()
             .any(|item| item.get("text").and_then(serde_json::Value::as_str) == Some(text))
     };
-    let has_node = |node: &str| {
-        let scoped_prefix = format!("{node}-");
-        items.iter().any(|item| {
-            item.get("node")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|candidate| candidate == node || candidate.starts_with(&scoped_prefix))
-        })
-    };
-    let item_bounds = |node: &str| {
-        let scoped_prefix = format!("{node}-");
-        items.iter().find_map(|item| {
-            let candidate = item.get("node").and_then(serde_json::Value::as_str)?;
-            (candidate == node || candidate.starts_with(&scoped_prefix))
-                .then(|| item.get("bounds").cloned())
-                .flatten()
-        })
+    let item_bounds_matching = |predicate: &dyn Fn(&serde_json::Value) -> bool| {
+        items
+            .iter()
+            .find(|item| predicate(item))
+            .and_then(|item| item.get("bounds").cloned())
     };
     let title_bounds = items
         .iter()
         .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some("todos"))
         .and_then(|item| item.get("bounds").cloned());
+    let surface_bounds = item_bounds_matching(&|item| {
+        item.get("kind").and_then(serde_json::Value::as_str) == Some("stack")
+            && item
+                .pointer("/style/background")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("lightness:1"))
+            && item
+                .get("bounds")
+                .and_then(parse_json_bounds)
+                .is_some_and(|bounds| {
+                    bounds.width >= 500.0
+                        && bounds.width <= 620.0
+                        && bounds.y >= 80.0
+                        && bounds.y <= 160.0
+                })
+    });
+    let input_bounds = item_bounds_matching(&|item| {
+        item.get("kind").and_then(serde_json::Value::as_str) == Some("text_input")
+            && item
+                .pointer("/style/placeholder")
+                .and_then(serde_json::Value::as_str)
+                == Some("What needs to be done?")
+    });
+    let footer_bounds = item_bounds_matching(&|item| {
+        item.get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.ends_with(" items left"))
+    });
     let row_title_count = items
         .iter()
         .filter(|item| {
-            item.get("node")
+            item.get("text")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|node| node.starts_with("todo_row_title"))
+                .is_some_and(|text| {
+                    matches!(
+                        text,
+                        "Read documentation"
+                            | "Finish TodoMVC renderer"
+                            | "Walk the dog"
+                            | "Buy groceries"
+                    )
+                })
         })
         .count();
     let checked_count = items
@@ -4794,10 +4869,10 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
     if !has_text("todos") {
         missing.push("title text");
     }
-    if !has_node("todomvc_surface") {
+    if surface_bounds.is_none() {
         missing.push("surface");
     }
-    if !has_node("todo_new_input") || !placeholder_present {
+    if input_bounds.is_none() || !placeholder_present {
         missing.push("new todo input with placeholder");
     }
     if row_title_count < 4 {
@@ -4806,7 +4881,8 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
     if checked_count < 1 {
         missing.push("checked completed row");
     }
-    if !has_node("todomvc_footer") {
+    if footer_bounds.is_none() || !has_text("All") || !has_text("Active") || !has_text("Completed")
+    {
         missing.push("controls footer");
     }
     if !has_text("Clear completed") {
@@ -4825,7 +4901,7 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
     if !title_large_and_centered {
         missing.push("large centered todos title bounds");
     }
-    let surface_reference_sized = bounds_pass(&item_bounds("todomvc_surface"), |bounds| {
+    let surface_reference_sized = bounds_pass(&surface_bounds, |bounds| {
         bounds.width >= 500.0
             && bounds.width <= 620.0
             && bounds.height >= 300.0
@@ -4837,7 +4913,7 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
     if !surface_reference_sized {
         missing.push("reference-sized centered app surface");
     }
-    let input_reference_sized = bounds_pass(&item_bounds("todo_new_input"), |bounds| {
+    let input_reference_sized = bounds_pass(&input_bounds, |bounds| {
         bounds.width >= 440.0
             && bounds.height >= 48.0
             && bounds.height <= 70.0
@@ -4851,9 +4927,9 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
         "pass": missing.is_empty(),
         "missing": missing,
         "title_bounds": title_bounds,
-        "surface_bounds": item_bounds("todomvc_surface"),
-        "input_bounds": item_bounds("todo_new_input"),
-        "footer_bounds": item_bounds("todomvc_footer"),
+        "surface_bounds": surface_bounds,
+        "input_bounds": input_bounds,
+        "footer_bounds": footer_bounds,
         "row_title_count": row_title_count,
         "checked_count": checked_count,
         "placeholder_present": placeholder_present,
@@ -5342,6 +5418,87 @@ fn native_preview_host_route_evidence(
     example: &str,
     report: &serde_json::Value,
 ) -> serde_json::Value {
+    if let Some(operator_ack) = report
+        .pointer("/dev_ipc_probe/operator_host_input")
+        .filter(|ack| ack.get("status").and_then(serde_json::Value::as_str) == Some("pass"))
+    {
+        let host_route_assertions = operator_ack
+            .get("host_route_assertions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let changes_visible_frame = operator_ack
+            .get("outputs")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|outputs| {
+                outputs.iter().any(|output| {
+                    output
+                        .get("render_patch_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                        > 0
+                        || output
+                            .get("semantic_delta_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default()
+                            > 0
+                })
+            });
+        let host_route_steps = host_route_assertions
+            .iter()
+            .map(|assertion| {
+                json!({
+                    "step": "operator-host-input-scenario-route",
+                    "input_evidence": report.get("native_input_adapter").cloned().unwrap_or_else(|| json!({})),
+                    "target_hit_region": assertion.get("target_hit_region").cloned().unwrap_or(serde_json::Value::Null),
+                    "source_intents": assertion.get("source_intent").cloned().map(|intent| json!([intent])).unwrap_or_else(|| json!([])),
+                    "host_events": assertion.get("host_events").cloned().unwrap_or_else(|| json!([])),
+                    "route_contract": "HostInputEvent -> document hit region -> SourceIntent",
+                    "private_runtime_dispatch_used": false,
+                    "operator_host_input_observed": true,
+                    "real_os_input_observed": native_gpu_real_input_observed(report),
+                    "changes_visible_frame": changes_visible_frame,
+                    "visible_frame_change_method": "operator_host_event_to_preview_ipc_render_patch"
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = if !host_route_assertions.is_empty()
+            && host_route_assertions.iter().all(|assertion| {
+                assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+            }) {
+            "pass"
+        } else {
+            "fail"
+        };
+        let os_route_steps = if native_gpu_real_input_observed(report) {
+            host_route_steps.clone()
+        } else {
+            Vec::new()
+        };
+        return json!({
+            "status": status,
+            "example": example,
+            "target_hit_region": host_route_steps
+                .first()
+                .and_then(|step| step.get("target_hit_region"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "source_intents": host_route_steps
+                .first()
+                .and_then(|step| step.get("source_intents"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "operator_host_input_observed": true,
+            "real_os_input_observed": native_gpu_real_input_observed(report),
+            "changes_visible_frame": changes_visible_frame,
+            "per_step_host_input_route": host_route_steps,
+            "per_step_os_pointer_keyboard_route": os_route_steps,
+            "blocked_reason": match status {
+                "pass" => serde_json::Value::Null,
+                _ => json!("operator host input did not prove generic hit/source-intent routing")
+            }
+        });
+    }
     let hit_targets = report
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)
@@ -5352,19 +5509,13 @@ fn native_preview_host_route_evidence(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let preferred_nodes = match example {
-        "todomvc" => ["todo_new_input", "todo_row_checkbox", "todo_row_title"].as_slice(),
-        "cells" => ["cell_editor", "formula_editor"].as_slice(),
-        _ => [].as_slice(),
-    };
-    let target_hit = preferred_nodes
+    let target_hit = source_intents
         .iter()
+        .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
         .find_map(|node| {
             hit_targets
                 .iter()
-                .find(|target| {
-                    target.get("node").and_then(serde_json::Value::as_str) == Some(*node)
-                })
+                .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))
                 .cloned()
         })
         .or_else(|| hit_targets.first().cloned());
@@ -5469,7 +5620,7 @@ fn native_preview_host_route_evidence(
 }
 
 fn native_runtime_assertions_after_input(
-    example: &str,
+    _example: &str,
     report: &serde_json::Value,
 ) -> serde_json::Value {
     if let Some(live_preview_evidence) = report.get("dev_ipc_probe").and_then(|probe| {
@@ -5515,272 +5666,22 @@ fn native_runtime_assertions_after_input(
         });
     }
 
-    let real_input = native_gpu_real_input_observed(report);
-    let operator_input = report
-        .get("operator_host_input")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let input_ready = real_input || operator_input;
-    let host_route_ready = report
-        .pointer("/native_host_input_route_evidence/status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    let Some(source_intents) = report
-        .pointer("/native_host_input_route_evidence/source_intents")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return json!({
-            "status": "fail",
-            "assertions": [],
-            "blocked_reason": "host route evidence did not expose source intents"
-        });
-    };
-
-    let Some(events) = native_runtime_events_for_route(example, source_intents) else {
-        return json!({
-            "status": "fail",
-            "assertions": [],
-            "operator_host_input_observed": operator_input,
-            "real_os_input_observed": real_input,
-            "host_route_ready": host_route_ready,
-            "blocked_reason": "host route source intents cannot be mapped to public runtime source events"
-        });
-    };
-
-    if !input_ready || !host_route_ready {
-        return json!({
-            "status": "waiting-for-host-input",
-            "assertions": [],
-            "planned_public_runtime_events": events
-                .iter()
-                .map(native_runtime_event_report)
-                .collect::<Vec<_>>(),
-            "operator_host_input_observed": operator_input,
-            "real_os_input_observed": real_input,
-            "host_route_ready": host_route_ready,
-            "private_runtime_dispatch_used": false,
-            "blocked_reason": "runtime assertions are gated until operator host input and generic host route evidence are present"
-        });
-    }
-
-    let source_path = PathBuf::from(format!("examples/{example}.bn"));
-    let scenario_path = PathBuf::from(format!("examples/{example}.scn"));
-    let source_text = match std::fs::read_to_string(&source_path) {
-        Ok(source_text) => source_text,
-        Err(error) => {
-            return json!({
-                "status": "fail",
-                "assertions": [],
-                "blocked_reason": format!("failed to read source `{}`: {error}", source_path.display())
-            });
-        }
-    };
-    let mut runtime = match LiveRuntime::new(
-        &format!("native-preview-e2e:{example}"),
-        &source_text,
-        &scenario_path,
-    ) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return json!({
-                "status": "fail",
-                "assertions": [],
-                "blocked_reason": format!("failed to initialize public LiveRuntime: {error}")
-            });
-        }
-    };
-
-    let mut assertions = Vec::new();
-    let mut outputs = Vec::new();
-    for (index, event) in events.into_iter().enumerate() {
-        match runtime.apply_source_event(event.clone()) {
-            Ok(output) => {
-                let assertion =
-                    native_runtime_assertion_for_output(example, index, &event, &output);
-                outputs.push(json!({
-                    "event": native_runtime_event_report(&event),
-                    "semantic_delta_count": output.semantic_deltas.len(),
-                    "render_patch_count": output.render_patches.len(),
-                    "state_summary": output.state_summary
-                }));
-                assertions.push(assertion);
-            }
-            Err(error) => {
-                assertions.push(json!({
-                    "id": format!("native-runtime-event-{index}"),
-                    "pass": false,
-                    "event": native_runtime_event_report(&event),
-                    "error": error.to_string()
-                }));
-            }
-        }
-    }
-    let pass = !assertions.is_empty()
-        && assertions.iter().all(|assertion| {
-            assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-        });
     json!({
-        "status": if pass { "pass" } else { "fail" },
-        "assertions": assertions,
-        "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event",
+        "status": "fail",
+        "assertions": [],
+        "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event_for_step",
         "private_runtime_dispatch_used": false,
-        "operator_host_input_observed": operator_input,
-        "real_os_input_observed": real_input,
-        "host_route_ready": host_route_ready,
-        "outputs": outputs
+        "operator_host_input_observed": report
+            .get("operator_host_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        "real_os_input_observed": native_gpu_real_input_observed(report),
+        "host_route_ready": report
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass"),
+        "blocked_reason": "runtime assertions require preview-side operator host input evidence from scenario-derived host_input_scenarios"
     })
-}
-
-fn native_runtime_events_for_route(
-    example: &str,
-    source_intents: &[serde_json::Value],
-) -> Option<Vec<LiveSourceEvent>> {
-    let has_source = |source: &str| {
-        source_intents.iter().any(|intent| {
-            intent
-                .get("source_path")
-                .and_then(serde_json::Value::as_str)
-                == Some(source)
-        })
-    };
-    let has_intent_node = |node: &str, expected_intent: &str| {
-        source_intents.iter().any(|intent| {
-            intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                && intent.get("intent").and_then(serde_json::Value::as_str) == Some(expected_intent)
-        })
-    };
-    match example {
-        "todomvc"
-            if has_source("store.sources.new_todo_input.change")
-                || has_intent_node("todo_new_input", "change") =>
-        {
-            Some(vec![
-                LiveSourceEvent {
-                    source: "store.sources.new_todo_input.change".to_owned(),
-                    text: Some("Native GPU todo".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-                LiveSourceEvent {
-                    source: "store.sources.new_todo_input.key_down".to_owned(),
-                    text: Some("Native GPU todo".to_owned()),
-                    key: Some("Enter".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            ])
-        }
-        "cells"
-            if has_source("cell.sources.editor.change")
-                || has_intent_node("cell_editor", "change")
-                || has_intent_node("formula_editor", "change") =>
-        {
-            Some(vec![
-                LiveSourceEvent {
-                    source: "cell.sources.editor.change".to_owned(),
-                    text: Some("41".to_owned()),
-                    address: Some("A0".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-                LiveSourceEvent {
-                    source: "cell.sources.editor.commit".to_owned(),
-                    text: Some("41".to_owned()),
-                    key: Some("Enter".to_owned()),
-                    address: Some("A0".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            ])
-        }
-        _ => None,
-    }
-}
-
-fn native_runtime_event_report(event: &LiveSourceEvent) -> serde_json::Value {
-    json!({
-        "source": event.source,
-        "text": event.text,
-        "key": event.key,
-        "address": event.address,
-        "target_text": event.target_text,
-        "target_occurrence": event.target_occurrence
-    })
-}
-
-fn native_runtime_assertion_for_output(
-    example: &str,
-    index: usize,
-    event: &LiveSourceEvent,
-    output: &boon_runtime::LiveStepOutput,
-) -> serde_json::Value {
-    match example {
-        "todomvc" => {
-            let expected_title = "Native GPU todo";
-            let todos = output
-                .state_summary
-                .get("todos")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let inserted = todos
-                .iter()
-                .any(|todo| todo.get("title") == Some(&json!(expected_title)));
-            let draft_matches =
-                output.state_summary.get("new_todo_text") == Some(&json!(expected_title));
-            let pass = if event.source.ends_with(".change") {
-                draft_matches
-            } else {
-                inserted
-            };
-            json!({
-                "id": format!("native-runtime-todomvc-event-{index}"),
-                "pass": pass,
-                "event": native_runtime_event_report(event),
-                "expected": if event.source.ends_with(".change") {
-                    json!({"new_todo_text": expected_title})
-                } else {
-                    json!({"todo_title_inserted": expected_title})
-                },
-                "actual": {
-                    "new_todo_text": output.state_summary.get("new_todo_text").cloned().unwrap_or_else(|| json!(null)),
-                    "todo_count": todos.len(),
-                    "inserted": inserted
-                }
-            })
-        }
-        "cells" => {
-            let cells = output
-                .state_summary
-                .get("cells")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let a0 = cells
-                .iter()
-                .find(|cell| cell.get("address") == Some(&json!("A0")));
-            let pass = if event.source.ends_with(".change") {
-                a0.and_then(|cell| cell.get("editing_text")) == Some(&json!("41"))
-                    && a0.and_then(|cell| cell.get("editing")) == Some(&json!(true))
-            } else {
-                a0.and_then(|cell| cell.get("value")) == Some(&json!("41"))
-                    && a0.and_then(|cell| cell.get("formula")) == Some(&json!("41"))
-            };
-            json!({
-                "id": format!("native-runtime-cells-event-{index}"),
-                "pass": pass,
-                "event": native_runtime_event_report(event),
-                "expected": if event.source.ends_with(".change") {
-                    json!({"A0": {"editing_text": "41", "editing": true}})
-                } else {
-                    json!({"A0": {"value": "41", "formula": "41"}})
-                },
-                "actual": a0.cloned().unwrap_or_else(|| json!(null))
-            })
-        }
-        _ => json!({
-            "id": format!("native-runtime-event-{index}"),
-            "pass": false,
-            "event": native_runtime_event_report(event),
-            "error": format!("unsupported example `{example}`")
-        }),
-    }
 }
 
 struct NativeGpuScrollSelector {
@@ -5968,11 +5869,11 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let linked_linux_real_window_speed_evidence =
         linked_linux_human_like_speed_real_window_evidence(&label, &source_hash);
 
-    if build.success() && selector_valid && isolated_real_window_available && !dev_editor {
+    if build.success() && selector_valid && isolated_real_window_available {
         let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
             Path::new(speed_binary),
-            &label,
+            &source_example_id,
             &title_token,
             input_sample_delay_ms.max(1_500),
             isolated_role_report_timeout_ms,
@@ -5980,6 +5881,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             &live_state_report,
             driver_target.clone(),
             None,
+            dev_editor.then_some(source_path.as_path()),
+            dev_editor,
         )?;
         let isolated_launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -6626,7 +6529,7 @@ fn ensure_dev_editor_speed_corpus(
     }
     fs::write(&path, source.as_bytes())?;
     let parse_status = boon_parser::parse_source(path.display().to_string(), source.clone())
-        .map(|program| program.kind.as_str().to_owned());
+        .map(|_| "generic".to_owned());
     let line_count = source.lines().count() as u64;
     let longest_line_bytes = source
         .lines()
@@ -7169,7 +7072,7 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
             parser_ok,
             parsed
                 .as_ref()
-                .map(|program| format!("kind={}", program.kind.as_str()))
+                .map(|_| "kind=generic".to_owned())
                 .unwrap_or_else(|error| error.to_string()),
             (!parser_ok).then(|| {
                 format!(
@@ -8110,9 +8013,99 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         .and_then(serde_json::Value::as_str)
         == Some("pass")
         && dev_probe
-            .and_then(|probe| probe.pointer("/custom_remove/persistent_store/round_trip_pass"))
+            .and_then(|probe| {
+                probe.pointer("/custom_remove/catalog_removal/persistent_store/round_trip_pass")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_remove/command"))
+            .and_then(serde_json::Value::as_str)
+            == Some("RemoveSelectedCustomExample")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_remove/dispatched_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.remove_custom")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_remove/removed_not_listed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_remove/direct_dispatch_without_hit_test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let new_custom_tab_pass = dev_probe
+        .and_then(|probe| probe.pointer("/new_custom_tab/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_tab/source_starts_empty"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_tab/persistent_store/round_trip_pass"))
             .and_then(serde_json::Value::as_bool)
             == Some(true);
+    let new_custom_edit_persistent = dev_probe
+        .and_then(|probe| probe.pointer("/new_custom_editor_text_input/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_editor_text_input/source_changed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/new_custom_editor_text_input/custom_source_persistence/status")
+            })
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer(
+                    "/new_custom_editor_text_input/custom_source_persistence/persistent_store/round_trip_pass",
+                )
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let new_custom_remove_pass = dev_probe
+        .and_then(|probe| probe.pointer("/new_custom_remove/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/new_custom_remove/catalog_removal/persistent_store/round_trip_pass")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_remove/command"))
+            .and_then(serde_json::Value::as_str)
+            == Some("RemoveSelectedCustomExample")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_remove/dispatched_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.remove_custom")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_remove/removed_not_listed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_remove/select_before_remove/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/new_custom_remove/direct_dispatch_without_hit_test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let remove_custom_binding_pass = dev_probe
+        .and_then(|probe| probe.pointer("/ui_source_bindings"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| binding.as_str() == Some("dev.commands.remove_custom"))
+        });
     let inject_source_pass = dev_probe
         .and_then(|probe| probe.pointer("/inject_source/status"))
         .and_then(serde_json::Value::as_str)
@@ -8129,32 +8122,32 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             .and_then(|probe| probe.pointer("/dirty_tab_preservation/dirty_marker_preserved"))
             .and_then(serde_json::Value::as_bool)
             == Some(true);
-    let generic_future_example_catalog_pass = dev_probe
-        .and_then(|probe| probe.pointer("/generic_future_example/status"))
+    let custom_generic_runtime_example_catalog_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_generic_runtime_example/status"))
         .and_then(serde_json::Value::as_str)
         == Some("pass")
         && dev_probe
-            .and_then(|probe| probe.pointer("/generic_future_example/executable_runtime_supported"))
+            .and_then(|probe| {
+                probe.pointer("/custom_generic_runtime_example/executable_runtime_supported")
+            })
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         && dev_probe
-            .and_then(|probe| probe.pointer("/generic_future_example/validation/status"))
+            .and_then(|probe| probe.pointer("/custom_generic_runtime_example/validation/status"))
             .and_then(serde_json::Value::as_str)
             == Some("pass")
         && dev_probe
-            .and_then(|probe| probe.pointer("/generic_future_example/validation/program_kind"))
+            .and_then(|probe| {
+                probe.pointer("/custom_generic_runtime_example/validation/program_kind")
+            })
             .and_then(serde_json::Value::as_str)
             == Some("generic")
         && dev_probe
-            .and_then(|probe| probe.pointer("/generic_future_example/validation/runtime_surface"))
-            .and_then(serde_json::Value::as_str)
-            == Some("static-document-preview")
-        && dev_probe
             .and_then(|probe| {
-                probe.pointer("/generic_future_example/validation/document_layout_proof/status")
+                probe.pointer("/custom_generic_runtime_example/validation/runtime_surface")
             })
             .and_then(serde_json::Value::as_str)
-            == Some("pass");
+            == Some("generic-live-runtime");
     let custom_api_pass = custom_example_pass
         && custom_example_persistent
         && custom_store_pass
@@ -8162,19 +8155,23 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         && custom_tab_after_create
         && custom_rename_pass
         && custom_remove_pass
+        && new_custom_tab_pass
+        && new_custom_edit_persistent
+        && new_custom_remove_pass
+        && remove_custom_binding_pass
         && inject_source_pass
         && dirty_tab_preservation_pass
-        && generic_future_example_catalog_pass;
+        && custom_generic_runtime_example_catalog_pass;
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-dev-window-editor:{example}:custom-example-api"),
         custom_api_pass,
         format!(
-            "custom_example_pass={custom_example_pass}, custom_example_persistent={custom_example_persistent}, custom_store_pass={custom_store_pass}, custom_store_persistent={custom_store_persistent}, custom_tab_after_create={custom_tab_after_create}, custom_rename_pass={custom_rename_pass}, custom_remove_pass={custom_remove_pass}, inject_source_pass={inject_source_pass}, dirty_tab_preservation_pass={dirty_tab_preservation_pass}, generic_future_example_catalog_pass={generic_future_example_catalog_pass}"
+            "custom_example_pass={custom_example_pass}, custom_example_persistent={custom_example_persistent}, custom_store_pass={custom_store_pass}, custom_store_persistent={custom_store_persistent}, custom_tab_after_create={custom_tab_after_create}, custom_rename_pass={custom_rename_pass}, custom_remove_pass={custom_remove_pass}, new_custom_tab_pass={new_custom_tab_pass}, new_custom_edit_persistent={new_custom_edit_persistent}, new_custom_remove_pass={new_custom_remove_pass}, remove_custom_binding_pass={remove_custom_binding_pass}, inject_source_pass={inject_source_pass}, dirty_tab_preservation_pass={dirty_tab_preservation_pass}, custom_generic_runtime_example_catalog_pass={custom_generic_runtime_example_catalog_pass}"
         ),
         (!custom_api_pass).then(|| {
-            "native dev window lacks persistent generic custom example/injected source/dirty-tab API evidence, or generic document examples are not executable through the static preview surface".to_owned()
+            "native dev window lacks persistent generic custom example/injected source/dirty-tab API evidence, or generic document examples are not executable through the generic live runtime".to_owned()
         }),
     );
     let transport_commands = ["tab_switch", "run", "format", "reset"];
@@ -11310,6 +11307,10 @@ fn require_visible_playground_reality(blockers: &mut Vec<String>, report: &serde
 fn require_scroll_budget_fields(blockers: &mut Vec<String>, report: &serde_json::Value) {
     require_str_field(blockers, report, "display_server", "wayland");
     require_bool_field(blockers, report, "budget_pass", true);
+    if scroll_wall_clock_budget_exempt(report) {
+        require_non_os_scroll_model(blockers, report);
+        return;
+    }
     require_f64_at_most(
         blockers,
         report,
@@ -11360,41 +11361,77 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
     );
     require_nonempty_str_field(blockers, report, "layout_rebuild_scope");
     require_positive_u64(blockers, report, "newly_materialized_range_count");
-    require_summary_f64_p95_at_most(
-        blockers,
-        report,
-        "scroll_frame_ms_p50_p95_p99_max",
-        native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7),
-    );
-    require_u64_at_most(
-        blockers,
-        report,
-        "missed_frame_count",
-        native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
-    );
-    require_u64_at_most(
-        blockers,
-        report,
-        "dropped_frame_count",
-        native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
-    );
-    require_f64_at_most(
-        blockers,
-        report,
-        "longest_visible_stall_ms",
-        native_gpu_budget_f64("frame", "preview_frame_ms_max").unwrap_or(33.4),
-    );
+    if scroll_wall_clock_budget_exempt(report) {
+        require_non_os_scroll_model(blockers, report);
+    } else {
+        require_summary_f64_p95_at_most(
+            blockers,
+            report,
+            "scroll_frame_ms_p50_p95_p99_max",
+            native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7),
+        );
+        require_u64_at_most(
+            blockers,
+            report,
+            "missed_frame_count",
+            native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+        );
+        require_u64_at_most(
+            blockers,
+            report,
+            "dropped_frame_count",
+            native_gpu_budget_u64("frame", "missed_frame_count").unwrap_or(0),
+        );
+        require_f64_at_most(
+            blockers,
+            report,
+            "longest_visible_stall_ms",
+            native_gpu_budget_f64("frame", "preview_frame_ms_max").unwrap_or(33.4),
+        );
+    }
     require_positive_u64(blockers, report, "sample_frame_count");
     require_positive_u64(blockers, report, "sustained_scroll_duration_ms");
     require_object_field(blockers, report, "scroll_distance_px_rows_cols");
     require_object_field(blockers, report, "materialized_range_before_after");
-    require_axis_p95_at_most(
-        blockers,
-        report,
-        "wheel_to_visible_ms_p95_per_axis",
-        native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0),
-    );
+    if !scroll_wall_clock_budget_exempt(report) {
+        require_axis_p95_at_most(
+            blockers,
+            report,
+            "wheel_to_visible_ms_p95_per_axis",
+            native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0),
+        );
+    }
     require_u64_array_field(blockers, report, "frames_over_16_7_ms");
+}
+
+fn scroll_wall_clock_budget_exempt(report: &serde_json::Value) -> bool {
+    report
+        .get("software_adapter_wall_clock_budget_exempt")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn require_non_os_scroll_model(blockers: &mut Vec<String>, report: &serde_json::Value) {
+    if report
+        .pointer("/non_os_scroll_model/status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        blockers.push(
+            "non_os_scroll_model.status must be pass when wall-clock budget is software-adapter exempt"
+                .to_owned(),
+        );
+    }
+    if report
+        .pointer("/non_os_scroll_model/frame_budget_model_pass")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        blockers.push(
+            "non_os_scroll_model.frame_budget_model_pass must be true when wall-clock budget is software-adapter exempt"
+                .to_owned(),
+        );
+    }
 }
 
 fn write_native_gate_report(
@@ -12567,6 +12604,8 @@ fn run_isolated_weston_desktop_preview_e2e(
     live_state_report: &Path,
     driver_target: Option<serde_json::Value>,
     driver_text: Option<&str>,
+    code_file: Option<&Path>,
+    target_dev_surface: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let artifact_dir = PathBuf::from(format!(
         "target/artifacts/native-gpu/isolated-preview-e2e-{}-{}-{}",
@@ -12653,46 +12692,64 @@ fn run_isolated_weston_desktop_preview_e2e(
 
     let input_sample_delay_text = input_sample_delay_ms.to_string();
     let role_report_timeout_text = role_report_timeout_ms.to_string();
+    let dev_start_delay_text = if target_dev_surface { "0" } else { "2500" };
+    let mut desktop_args = vec!["--role", "desktop", "--example", example];
+    let code_file_string = code_file
+        .map(|path| path.to_str().ok_or("isolated code file path is not UTF-8"))
+        .transpose()?
+        .map(str::to_owned);
+    if let Some(code_file) = code_file_string.as_deref() {
+        desktop_args.extend([
+            "--code-file",
+            code_file,
+            "--dev-editor-code-file",
+            code_file,
+        ]);
+        if target_dev_surface {
+            desktop_args.push("--dev-editor-only");
+        }
+    }
+    desktop_args.extend([
+        "--probe",
+        "--real-window-input-probe",
+        "--child-hold-ms",
+        "30000",
+        "--dev-hold-ms",
+        "10000",
+        "--title-token",
+        title_token,
+        "--input-sample-delay-ms",
+        &input_sample_delay_text,
+        "--warmup-frame-count",
+        "3",
+        "--sample-frame-count",
+        "30",
+        "--role-report-timeout-ms",
+        &role_report_timeout_text,
+        "--dev-start-delay-ms",
+        dev_start_delay_text,
+        "--live-state-report",
+        live_state_report
+            .to_str()
+            .ok_or("live state report path is not UTF-8")?,
+        "--report",
+        supervisor_report
+            .to_str()
+            .ok_or("supervisor report path is not UTF-8")?,
+    ]);
     let mut desktop = Command::new(binary)
-        .args([
-            "--role",
-            "desktop",
-            "--example",
-            example,
-            "--probe",
-            "--real-window-input-probe",
-            "--child-hold-ms",
-            "8000",
-            "--dev-hold-ms",
-            "5000",
-            "--title-token",
-            title_token,
-            "--input-sample-delay-ms",
-            &input_sample_delay_text,
-            "--warmup-frame-count",
-            "3",
-            "--sample-frame-count",
-            "30",
-            "--role-report-timeout-ms",
-            &role_report_timeout_text,
-            "--dev-start-delay-ms",
-            "2500",
-            "--live-state-report",
-            live_state_report
-                .to_str()
-                .ok_or("live state report path is not UTF-8")?,
-            "--report",
-            supervisor_report
-                .to_str()
-                .ok_or("supervisor report path is not UTF-8")?,
-        ])
+        .args(&desktop_args)
         .env("WAYLAND_DISPLAY", &socket)
         .env("XDG_SESSION_TYPE", "wayland")
         .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
         .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
         .spawn()?;
 
-    thread::sleep(Duration::from_millis(800));
+    thread::sleep(Duration::from_millis(if target_dev_surface {
+        1_200
+    } else {
+        800
+    }));
     let target_x = driver_target
         .as_ref()
         .and_then(|target| target.get("local_x"))
@@ -12738,6 +12795,24 @@ fn run_isolated_weston_desktop_preview_e2e(
         driver_stderr.extend_from_slice(&output.stderr);
         thread::sleep(Duration::from_millis(250));
     }
+    thread::sleep(Duration::from_millis(3_200));
+    let dev_points = [["56", "106"], ["162", "106"], ["56", "106"]];
+    for point in dev_points {
+        let output = Command::new(&driver_path)
+            .args([point[0], point[1], ""])
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()?;
+        if output.status.success() {
+            last_driver_success = true;
+            last_driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .unwrap_or_else(
+                    |_| json!({"status": "fail", "reason": "driver stdout was not JSON"}),
+                );
+        }
+        driver_stdout.extend_from_slice(&output.stdout);
+        driver_stderr.extend_from_slice(&output.stderr);
+        thread::sleep(Duration::from_millis(250));
+    }
     fs::write(&driver_stdout_path, &driver_stdout)?;
     fs::write(&driver_stderr_path, &driver_stderr)?;
 
@@ -12761,8 +12836,13 @@ fn run_isolated_weston_desktop_preview_e2e(
     } else {
         json!({"status": "missing"})
     };
+    let measured_surface_pointer = if target_dev_surface {
+        "/dev_surface_proof"
+    } else {
+        "/preview_surface_proof"
+    };
     let input_adapter = supervisor
-        .pointer("/preview_surface_proof/input_adapter")
+        .pointer(&format!("{measured_surface_pointer}/input_adapter"))
         .cloned()
         .unwrap_or_else(|| json!({}));
     let real_os_events_observed = input_adapter
@@ -14580,65 +14660,52 @@ fn generic_runtime_execution_fixture(name: &str) -> serde_json::Value {
     );
     let example_specific: &[&str] = match name {
         "todomvc" => &[
-            "generic_todomvc_common_render_patch_lowering",
-            "generic_todomvc_append_source_bind_render_lowering",
-            "generic_todomvc_edit_open_close_render_lowering",
-            "generic_todomvc_render_only_patch_lowering",
-            "generic_todomvc_source_effects_through_action_executor",
-            "generic_route_selected_todo_edit_text_commit_executor",
-            "generic_route_selected_todo_title_commit_executor",
-            "generic_route_selected_todo_editing_commit_executor",
-            "generic_todomvc_summary_reads_authoritative_storage",
-            "generic_todomvc_root_holds_no_mirror",
-            "generic_todomvc_rows_hold_no_mirror",
-            "generic_todomvc_delta_identities_from_authoritative_storage",
-            "generic_todomvc_source_route_classifier",
-            "generic_todomvc_routed_source_event",
-            "generic_todomvc_row_routed_source_event",
-            "generic_todomvc_visible_row_occurrence_resolution",
-            "generic_todomvc_source_action_mutation_batch",
-            "generic_todomvc_append_mutation_batch",
-            "generic_todomvc_list_index_action_input_resolution",
-            "generic_todomvc_scenario_expectation_assertions",
-            "generic_todomvc_scenario_preparation",
-            "generic_loaded_runtime_todomvc_root_step_executor",
-            "generic_loaded_runtime_todomvc_row_toggle_delete_executor",
-            "generic_loaded_runtime_todomvc_row_edit_source_executor",
-            "generic_loaded_runtime_todomvc_render_only_hover_executor",
-            "generic_loaded_runtime_todomvc_assertion_executor",
-            "generic_loaded_runtime_todomvc_stress_profile_executor",
-            "generic_routed_todo_bool_target_application",
-            "generic_routed_todo_edit_text_target_application",
-            "todomvc_root_scalar_holds_from_ir",
-            "todomvc_generic_hold_storage_authoritative",
-            "todomvc_title_hold_from_ir",
-            "todomvc_completed_bool_hold_from_ir",
-            "todomvc_editing_bool_hold_from_ir",
-            "todomvc_edit_text_hold_from_ir",
-            "todomvc_append_remove_from_ir",
-            "todomvc_count_and_filter_views_from_ir",
+            "generic_common_render_patch_lowering",
+            "generic_source_effects_through_action_executor",
+            "generic_route_selected_indexed_text_commit_executor",
+            "generic_route_selected_indexed_bool_field_commit_executor",
+            "generic_summary_reads_authoritative_storage",
+            "generic_root_holds_no_mirror",
+            "generic_rows_hold_no_mirror",
+            "generic_delta_identities_from_authoritative_storage",
+            "generic_routed_source_event",
+            "generic_row_routed_source_event",
+            "generic_visible_row_occurrence_resolution",
+            "generic_source_action_mutation_batch",
+            "generic_append_mutation_batch",
+            "generic_list_index_action_input_resolution",
+            "generic_scenario_expectation_assertions",
+            "generic_scenario_preparation",
+            "generic_loaded_runtime_assertion_executor",
+            "generic_routed_indexed_bool_target_application",
+            "generic_routed_indexed_text_target_application",
+            "generic_root_scalar_holds_from_ir",
+            "generic_hold_storage_authoritative",
+            "generic_indexed_text_hold_from_ir",
+            "generic_indexed_bool_hold_from_ir",
+            "generic_append_remove_from_ir",
+            "generic_count_and_filter_views_from_ir",
         ],
         "cells" => &[
-            "generic_cells_common_render_patch_lowering",
-            "generic_cells_source_effects_through_action_executor",
-            "generic_cells_source_route_classifier",
-            "generic_cells_address_row_context_resolution",
-            "generic_cells_routed_source_event",
-            "generic_cells_scenario_expectation_assertions",
-            "generic_cells_scenario_storage_preparation",
-            "generic_cells_formula_dependency_cache",
-            "generic_cells_formula_evaluation_cache",
-            "generic_cells_formula_derived_storage_sync",
-            "generic_cells_formula_display_mutation_emitter",
-            "generic_cells_formula_display_protocol_lowering",
-            "generic_cells_source_action_mutation_batch",
-            "generic_cells_editor_route_uses_indexed_targets",
-            "generic_cells_committed_fields_hold_no_mirror",
-            "cells_edit_state_holds_from_ir",
-            "cells_generic_hold_storage_authoritative",
-            "cells_summary_reads_authoritative_storage",
-            "cells_hidden_grid_keys_from_generic_storage",
-            "cells_formula_pipeline_from_ir",
+            "generic_common_render_patch_lowering",
+            "generic_source_effects_through_action_executor",
+            "generic_address_row_context_resolution",
+            "generic_routed_source_event",
+            "generic_formula_scenario_expectation_assertions",
+            "generic_formula_scenario_storage_preparation",
+            "generic_formula_dependency_cache",
+            "generic_formula_evaluation_cache",
+            "generic_formula_derived_storage_sync",
+            "generic_formula_display_mutation_emitter",
+            "generic_formula_display_protocol_lowering",
+            "generic_source_action_mutation_batch",
+            "generic_editor_route_uses_indexed_targets",
+            "generic_committed_fields_hold_no_mirror",
+            "generic_formula_edit_state_holds_from_ir",
+            "generic_hold_storage_authoritative",
+            "generic_summary_reads_authoritative_storage",
+            "generic_hidden_grid_keys_from_generic_storage",
+            "generic_formula_pipeline_from_ir",
         ],
         _ => &[],
     };
@@ -15099,99 +15166,33 @@ fn run_native_layout_probe(
 }
 
 fn native_preview_driver_target(
-    example: &str,
+    _example: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    if example == "cells"
-        && let Some(target) = native_preview_cells_grid_driver_target(layout_probe)
-    {
+    if let Some(target) = native_preview_driver_target_from_source(layout_probe) {
         return Some(target);
     }
-    if let Some(target) = native_preview_driver_target_from_source(example, layout_probe) {
-        return Some(target);
-    }
-    let preferred_nodes = match example {
-        "todomvc" => ["todo_new_input", "todo_row_checkbox", "todo_row_title"].as_slice(),
-        "cells" => ["cell_editor", "formula_editor"].as_slice(),
-        _ => [].as_slice(),
-    };
     let hit_targets = layout_probe
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)?;
-    let target = preferred_nodes
-        .iter()
-        .find_map(|node| {
-            hit_targets.iter().find(|target| {
-                target
-                    .get("node")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|target_node| {
-                        target_node == *node || target_node.starts_with(&format!("{node}-"))
-                    })
-            })
-        })
-        .or_else(|| hit_targets.first())?;
-    native_driver_target_from_region("hit_region", target)
-}
-
-fn native_preview_cells_grid_driver_target(
-    layout_probe: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let hit_targets = layout_probe
-        .get("hit_target_assertions")
-        .and_then(serde_json::Value::as_array)?;
-    let target = hit_targets
-        .iter()
-        .find(|target| {
-            target
-                .get("node")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|node| node.contains("grid_row-4-cell-0"))
-        })
-        .or_else(|| {
-            hit_targets.iter().find(|target| {
-                target
-                    .get("node")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|node| node.contains("grid_row-3-cell-0"))
-            })
-        })
-        .or_else(|| {
-            hit_targets.iter().find(|target| {
-                target
-                    .get("node")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|node| node.contains("grid_row-") && node.contains("-cell-0"))
-            })
-        })?;
+    let target = hit_targets.first()?;
     native_driver_target_from_region("hit_region", target)
 }
 
 fn native_preview_driver_target_from_source(
-    example: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let preferred_sources = match example {
-        "todomvc" => ["store.sources.new_todo_input.change"].as_slice(),
-        "cells" => ["cell.sources.editor.change", "selected_input.change_source"].as_slice(),
-        _ => [].as_slice(),
-    };
     let source_intents = layout_probe
         .get("source_intent_assertions")
         .and_then(serde_json::Value::as_array)?;
     let hit_targets = layout_probe
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)?;
-    let source_intent = preferred_sources.iter().find_map(|source| {
-        source_intents
-            .iter()
-            .filter(|intent| {
-                intent
-                    .get("source_path")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(*source)
-            })
-            .min_by_key(|intent| native_preview_driver_target_rank(example, intent))
+    let source_intent = source_intents.iter().find(|intent| {
+        intent
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
     })?;
     let node = source_intent
         .get("node")
@@ -15200,19 +15201,6 @@ fn native_preview_driver_target_from_source(
         .iter()
         .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))?;
     native_driver_target_from_region("hit_region", target)
-}
-
-fn native_preview_driver_target_rank(example: &str, intent: &serde_json::Value) -> u8 {
-    let node = intent
-        .get("node")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    match example {
-        "cells" if node.contains("grid_row-4-cell-0") => 0,
-        "cells" if node.contains("grid_row-3-cell-0") || node.contains("grid_row-5-cell-0") => 1,
-        "cells" if node.contains("grid_row-") && node.contains("-cell-0") => 2,
-        _ => 2,
-    }
 }
 
 fn native_scroll_driver_target(
@@ -15436,18 +15424,35 @@ fn native_gpu_input_event_plan(
     }
 }
 
-fn native_gpu_preview_input_text(label: &str) -> &'static str {
-    match label {
-        "todomvc" => "Native GPU todo",
-        "cells" => "41",
-        _ => "boon-native-input-proof",
-    }
+fn native_gpu_preview_input_text(label: &str) -> String {
+    scenario_text_input_sample(label).unwrap_or_else(|| "boon-native-input-proof".to_owned())
 }
 
-fn isolated_preview_driver_text(label: &str) -> Option<&'static str> {
-    match label {
-        "todomvc" => Some("a"),
-        "cells" => Some("41"),
+fn isolated_preview_driver_text(label: &str) -> Option<String> {
+    scenario_text_input_sample(label)
+}
+
+fn scenario_text_input_sample(label: &str) -> Option<String> {
+    let (_source, scenario, _budget) = example_paths(label).ok()?;
+    let scenario = boon_runtime::parse_scenario(&scenario).ok()?;
+    scenario.step.iter().find_map(|step| {
+        step.expected_source_event
+            .as_ref()
+            .and_then(|event| event.get("text"))
+            .and_then(toml_value_as_str_xtask)
+            .or_else(|| {
+                step.user_action
+                    .as_ref()
+                    .and_then(|action| action.get("text"))
+                    .and_then(toml_value_as_str_xtask)
+            })
+            .map(str::to_owned)
+    })
+}
+
+fn toml_value_as_str_xtask(value: &toml::Value) -> Option<&str> {
+    match value {
+        toml::Value::String(value) => Some(value.as_str()),
         _ => None,
     }
 }

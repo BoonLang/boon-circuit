@@ -240,7 +240,7 @@ pub fn app_owned_dev_window_proof(report: &Value) -> Value {
             == Some(false)
         && probe.get("parser_bypassed").and_then(Value::as_bool) == Some(false)
         && probe
-            .get("todo_cells_specific_shortcut")
+            .get("example_specific_shortcut")
             .and_then(Value::as_bool)
             == Some(false);
     json!({

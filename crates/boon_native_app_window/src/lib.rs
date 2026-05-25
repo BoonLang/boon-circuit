@@ -285,6 +285,7 @@ where
         let (sender, receiver) =
             mpsc::sync_channel::<Result<AppWindowSurfaceProof, NativeWindowError>>(0);
         let (callback_done_sender, callback_done_receiver) = mpsc::sync_channel::<()>(0);
+        let (render_done_sender, render_done_receiver) = mpsc::sync_channel::<()>(0);
         std::thread::Builder::new()
             .name(format!("boon-native-{}-render", options.role.as_str()))
             .spawn({
@@ -297,6 +298,7 @@ where
                         sender,
                         callback_done_receiver,
                     ));
+                    let _ = render_done_sender.send(());
                 }
             })
             .expect("failed to spawn app_window render thread");
@@ -306,6 +308,7 @@ where
             Err(_) => on_ready(Err(NativeWindowError::MissingProof)),
         }
         let _ = callback_done_sender.send(());
+        let _ = render_done_receiver.recv();
     });
     std::process::exit(0);
 }
@@ -316,7 +319,7 @@ async fn run_surface_probe_async(
     main_thread_id: String,
     ready_sender: mpsc::SyncSender<Result<AppWindowSurfaceProof, NativeWindowError>>,
     callback_done_receiver: mpsc::Receiver<()>,
-) -> ! {
+) {
     if let Err(error) = run_surface_probe_inner(
         options,
         render_hook,
@@ -326,15 +329,8 @@ async fn run_surface_probe_async(
     )
     .await
     {
-        let exit_status = if matches!(error, NativeWindowError::Failed(_)) {
-            1
-        } else {
-            0
-        };
         let _ = ready_sender.send(Err(error));
-        std::process::exit(exit_status);
     }
-    std::process::exit(0);
 }
 
 async fn run_surface_probe_inner(

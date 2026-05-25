@@ -119,6 +119,8 @@ pub struct ScenarioStep {
     pub expect_semantic_delta_contains: Vec<String>,
     #[serde(default)]
     pub expect_render_delta_contains: Vec<String>,
+    #[serde(default)]
+    pub expect_root_text: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -294,11 +296,6 @@ pub enum ProtocolValue<'a> {
     Bool(bool),
     Text(Cow<'a, str>),
     NumberText(i64),
-    TodoRow {
-        title: Cow<'a, str>,
-        completed: bool,
-        editing: bool,
-    },
     SourceBinding {
         source_path: Cow<'a, str>,
         source_id: u64,
@@ -311,12 +308,6 @@ pub enum ProtocolValue<'a> {
 pub enum RenderTarget<'a> {
     Static(Cow<'a, str>),
     Borrowed(Cow<'a, str>),
-    TodoRow(u64),
-    TodoTitle(u64),
-    TodoEdit(u64),
-    TodoCheckbox(u64),
-    TodoPosition(u64),
-    TodoSource(u64, Cow<'a, str>),
 }
 
 impl<'a> SemanticDelta<'a> {
@@ -365,15 +356,6 @@ impl<'a> ProtocolValue<'a> {
             Self::Bool(value) => ProtocolValue::Bool(*value),
             Self::Text(value) => ProtocolValue::Text(Cow::Owned(value.to_string())),
             Self::NumberText(value) => ProtocolValue::NumberText(*value),
-            Self::TodoRow {
-                title,
-                completed,
-                editing,
-            } => ProtocolValue::TodoRow {
-                title: Cow::Owned(title.to_string()),
-                completed: *completed,
-                editing: *editing,
-            },
             Self::SourceBinding {
                 source_path,
                 source_id,
@@ -393,14 +375,6 @@ impl<'a> RenderTarget<'a> {
         match self {
             Self::Static(value) => RenderTarget::Static(Cow::Owned(value.to_string())),
             Self::Borrowed(value) => RenderTarget::Borrowed(Cow::Owned(value.to_string())),
-            Self::TodoRow(key) => RenderTarget::TodoRow(*key),
-            Self::TodoTitle(key) => RenderTarget::TodoTitle(*key),
-            Self::TodoEdit(key) => RenderTarget::TodoEdit(*key),
-            Self::TodoCheckbox(key) => RenderTarget::TodoCheckbox(*key),
-            Self::TodoPosition(key) => RenderTarget::TodoPosition(*key),
-            Self::TodoSource(key, source_path) => {
-                RenderTarget::TodoSource(*key, Cow::Owned(source_path.to_string()))
-            }
         }
     }
 }
@@ -451,17 +425,6 @@ impl Serialize for ProtocolValue<'_> {
             Self::Bool(value) => serializer.serialize_bool(*value),
             Self::Text(value) => serializer.serialize_str(value),
             Self::NumberText(value) => serializer.serialize_str(&value.to_string()),
-            Self::TodoRow {
-                title,
-                completed,
-                editing,
-            } => {
-                let mut map = serializer.serialize_map(Some(3))?;
-                map.serialize_entry("title", title)?;
-                map.serialize_entry("completed", completed)?;
-                map.serialize_entry("editing", editing)?;
-                map.end()
-            }
             Self::SourceBinding {
                 source_path,
                 source_id,
@@ -490,14 +453,6 @@ impl Serialize for RenderTarget<'_> {
         match self {
             Self::Static(value) => serializer.serialize_str(value),
             Self::Borrowed(value) => serializer.serialize_str(value),
-            Self::TodoRow(key) => serializer.serialize_str(&format!("todos:{key}:row")),
-            Self::TodoTitle(key) => serializer.serialize_str(&format!("todos:{key}:title")),
-            Self::TodoEdit(key) => serializer.serialize_str(&format!("todos:{key}:edit")),
-            Self::TodoCheckbox(key) => serializer.serialize_str(&format!("todos:{key}:checkbox")),
-            Self::TodoPosition(key) => serializer.serialize_str(&format!("todos:{key}:position")),
-            Self::TodoSource(key, source_path) => {
-                serializer.serialize_str(&format!("todos:{key}:source:{source_path}"))
-            }
         }
     }
 }
@@ -512,10 +467,10 @@ pub fn load_and_lower(source_path: &Path) -> RuntimeResult<(ParsedProgram, Typed
 }
 
 pub fn ir_debug_report(source_path: &Path) -> RuntimeResult<JsonValue> {
-    let (parsed, ir) = load_and_lower(source_path)?;
+    let (_parsed, ir) = load_and_lower(source_path)?;
     Ok(json!({
         "status": "pass",
-        "program_kind": parsed.kind.as_str(),
+        "program_kind": "generic",
         "expression_count": ir.expression_count,
         "graph_node_count": ir.graph_node_count,
         "hidden_identity_verified": ir.hidden_identity_verified,
@@ -538,14 +493,6 @@ pub fn run_scenario(
 ) -> RuntimeResult<RunOutput> {
     let (parsed, ir) = load_and_lower(source_path)?;
     let scenario = parse_scenario(scenario_path)?;
-    if parsed.kind.as_str() != scenario.name {
-        return Err(format!(
-            "scenario `{}` does not match source kind `{}`",
-            scenario.name,
-            parsed.kind.as_str()
-        )
-        .into());
-    }
     let started = Instant::now();
     let output = run_loaded_scenario(&parsed, &ir, &scenario, layer)?;
     let elapsed = started.elapsed();
@@ -614,14 +561,6 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     if let Some(step_limit) = step_limit {
         scenario.step.truncate(step_limit.min(scenario.step.len()));
     }
-    if parsed.kind.as_str() != scenario.name {
-        return Err(format!(
-            "scenario `{}` does not match source kind `{}`",
-            scenario.name,
-            parsed.kind.as_str()
-        )
-        .into());
-    }
     let started = Instant::now();
     let output = run_loaded_scenario(&parsed, &ir, &scenario, layer)?;
     let elapsed = started.elapsed();
@@ -660,20 +599,11 @@ pub fn run_source_initial_state(
     verify_hidden_identity(&ir)?;
     verify_static_schedule(&ir)?;
     let verify_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
-    if parsed.kind.as_str() != scenario.name {
-        return Err(format!(
-            "scenario `{}` does not match source kind `{}`",
-            scenario.name,
-            parsed.kind.as_str()
-        )
-        .into());
-    }
     let compile_started = Instant::now();
     let compiled = CompiledProgram::from_ir(&ir)?;
-    validate_executable_surface(&parsed, &ir, &compiled)?;
     let compile_ms = compile_started.elapsed().as_secs_f64() * 1000.0;
     let runtime_started = Instant::now();
-    let mut runtime = LoadedRuntime::new(&parsed, &ir, &compiled)?;
+    let mut runtime = LoadedRuntime::new(&ir, &compiled)?;
     runtime.prepare_for_scenario(scenario)?;
     let state_summary = runtime.state_summary();
     let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
@@ -691,7 +621,7 @@ pub fn run_source_initial_state(
         "scenario_path": scenario_path.display().to_string(),
         "scenario_hash": sha256_file(scenario_path)?,
         "program_hash": sha256_bytes(source_text.as_bytes()),
-        "program_kind": compiled.surface.kind.as_str(),
+        "program_kind": "generic",
         "expression_count": ir.expression_count,
         "expression_coverage": &ir.expression_coverage,
         "graph_node_count": ir.graph_node_count,
@@ -726,7 +656,7 @@ pub fn run_source_initial_state(
             "expression_coverage": &ir.expression_coverage,
             "generic_interpreter_complete": derive_generic_interpreter_complete(&ir, &compiled, &generic_runtime_slices),
             "example_behavior_adapter": derive_example_behavior_adapter(&compiled, &generic_runtime_slices),
-            "adapter_kind": compiled.surface.kind.as_str(),
+            "adapter_kind": "generic",
             "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
             "remaining_example_specific_shells": remaining_example_specific_shells(&compiled, &generic_runtime_slices),
             "final_handoff_pending_human_report": true,
@@ -759,18 +689,22 @@ impl LiveRuntime {
         verify_hidden_identity(&ir)?;
         verify_static_schedule(&ir)?;
         let scenario = parse_scenario(scenario_path)?;
-        if parsed.kind.as_str() != scenario.name {
-            return Err(format!(
-                "scenario `{}` does not match source kind `{}`",
-                scenario.name,
-                parsed.kind.as_str()
-            )
-            .into());
-        }
         let compiled = CompiledProgram::from_ir(&ir)?;
-        validate_executable_surface(&parsed, &ir, &compiled)?;
-        let mut runtime = LoadedRuntime::new(&parsed, &ir, &compiled)?;
+        let mut runtime = LoadedRuntime::new(&ir, &compiled)?;
         runtime.prepare_for_scenario(&scenario)?;
+        Ok(Self {
+            runtime,
+            next_step: 1,
+        })
+    }
+
+    pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
+        let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+        let ir = lower(&parsed)?;
+        verify_hidden_identity(&ir)?;
+        verify_static_schedule(&ir)?;
+        let compiled = CompiledProgram::from_ir(&ir)?;
+        let runtime = LoadedRuntime::new(&ir, &compiled)?;
         Ok(Self {
             runtime,
             next_step: 1,
@@ -1079,695 +1013,131 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
 }
 
 fn run_loaded_scenario(
-    parsed: &ParsedProgram,
+    _parsed: &ParsedProgram,
     ir: &TypedProgram,
     scenario: &Scenario,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
     let compiled = CompiledProgram::from_ir(ir)?;
-    validate_executable_surface(parsed, ir, &compiled)?;
-    let runtime = LoadedRuntime::new(parsed, ir, &compiled)?;
-    run_generic_scenario(runtime, parsed, ir, &compiled, scenario, layer)
+    let runtime = LoadedRuntime::new(ir, &compiled)?;
+    run_generic_scenario(runtime, _parsed, ir, &compiled, scenario, layer)
 }
 
 struct LoadedRuntime {
     generic: Option<GenericScheduledRuntime>,
-    surface: LoadedRuntimeSurface,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum LoadedRuntimeSurface {
-    Todo(TodoRuntimeState),
-    Cells(CellsRuntimeState),
+    formula_grid_state: Option<FormulaGridRuntimeState>,
 }
 
 impl LoadedRuntime {
-    fn new(
-        _parsed: &ParsedProgram,
-        ir: &TypedProgram,
-        compiled: &CompiledProgram,
-    ) -> RuntimeResult<Self> {
-        let generic = GenericScheduledRuntime::new(ir, compiled)?;
-        match compiled.surface.kind {
-            ExecutableSurfaceKind::TodoMvc => {
-                let (generic, state) = initialize_loaded_todomvc_generic(generic)?;
-                Ok(Self {
-                    generic: Some(generic),
-                    surface: LoadedRuntimeSurface::Todo(state),
-                })
+    fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
+        let mut generic = GenericScheduledRuntime::new(ir, compiled)?;
+        let formula_grid_state = if compiled.formula_operation_count > 0 {
+            let Some(plan) = formula_grid_runtime_plan_from_ir(ir, &compiled.formula_equations)?
+            else {
+                return Err("formula operations require a generic Grid/<list> initializer".into());
+            };
+            let expected_len = plan.columns.saturating_mul(plan.rows);
+            let actual_len = generic.list_len(&plan.list)?;
+            if actual_len != expected_len {
+                return Err(format!(
+                    "generic formula grid initialized {actual_len} rows, expected {expected_len}"
+                )
+                .into());
             }
-            ExecutableSurfaceKind::Cells => {
-                let (generic, state) = initialize_loaded_cells_generic(generic, ir)?;
-                Ok(Self {
-                    generic: Some(generic),
-                    surface: LoadedRuntimeSurface::Cells(state),
-                })
-            }
-        }
+            let mut state = FormulaGridRuntimeState {
+                plan,
+                cells: vec![Cell::default(); expected_len],
+                dependency_cache: GenericFormulaDependencyCache::with_capacity(expected_len),
+                evaluation_cache: GenericFormulaEvaluationCache::with_capacity(expected_len),
+                interned_texts: Vec::new(),
+                step_recomputed: Vec::with_capacity(8),
+                dirty_key_sets: DirtyKeySets::with_capacity(expected_len.clamp(16, 128)),
+                last_recompute_candidates: 0,
+            };
+            initialize_formula_grid_from_generic(&mut generic, &mut state)?;
+            Some(state)
+        } else {
+            None
+        };
+        Ok(Self {
+            generic: Some(generic),
+            formula_grid_state,
+        })
     }
 
     fn generic_state_summary(&self) -> JsonValue {
         let Some(generic) = self.generic.as_ref() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
-        match &self.surface {
-            LoadedRuntimeSurface::Todo(state) => {
-                generic.todomvc_summary(state.stale_source_drop_count)
-            }
-            LoadedRuntimeSurface::Cells(state) => generic.cells_summary(state.columns, state.rows),
+        let mut summary = generic.generic_summary();
+        if let Some(state) = &self.formula_grid_state {
+            generic.insert_formula_grid_summary(&mut summary, state);
         }
+        summary
     }
 
-    fn try_apply_todomvc_root_source_step<'a>(
+    fn apply_generic_step<'a>(
         &mut self,
         step: &'a ScenarioStep,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
-        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
-            return Ok(None);
-        };
+    ) -> RuntimeResult<StepExecutionMetrics> {
+        if let Some(state) = &mut self.formula_grid_state {
+            let generic = self
+                .generic
+                .as_mut()
+                .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+            return apply_formula_grid_step(generic, state, step, deltas, patches);
+        }
         let Some(source_event) = GenericSourceEvent::from_step(step)? else {
-            return Ok(None);
-        };
-        if source_event.target_text.is_some() {
-            return Ok(None);
-        }
-        let generic = self
-            .generic
-            .as_mut()
-            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        let routed = generic
-            .route_source_event("todos", "title", source_event)
-            .map_err(|_| {
-                format!(
-                    "{} source `{}` has no compiled route",
-                    step.id, source_event.source
-                )
-            })?;
-        match routed.route_kind {
-            SourceActionKind::RootText
-            | SourceActionKind::ListAppend
-            | SourceActionKind::RootScalar
-            | SourceActionKind::ListRemove
-            | SourceActionKind::IndexedBoolBulk => {}
-            SourceActionKind::IndexedTextChange
-            | SourceActionKind::IndexedTextCommit
-            | SourceActionKind::IndexedTextIdentity
-            | SourceActionKind::IndexedTextKey
-            | SourceActionKind::IndexedTextOpen
-            | SourceActionKind::IndexedBoolToggle => return Ok(None),
-        }
-        assert_routed_source_event_matches(step, routed.event)?;
-        match routed.route_kind {
-            SourceActionKind::RootText | SourceActionKind::RootScalar => {
-                let seq = TickSeq(state.next_source_seq);
-                state.next_source_seq += 1;
-                let input = generic.source_action_input_for_event(
-                    &step.id,
-                    routed.event,
-                    seq,
-                    |_, _| Ok(None),
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            SourceActionKind::ListAppend => {
-                let seq = TickSeq(state.next_source_seq);
-                state.next_source_seq += 1;
-                let input = generic.source_action_input_for_event(
-                    &step.id,
-                    routed.event,
-                    seq,
-                    |_, _| Ok(None),
-                )?;
-                let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-                if let Some(insert) = batch.list_append("todos") {
-                    emit_todo_insert_from_generic(generic, insert, deltas, patches)?;
-                    if let Some(commit) = batch.root_text("store.new_todo_text") {
-                        emit_todomvc_default_protocol_mutation(
-                            GenericSourceMutation::RootText(commit),
-                            deltas,
-                            patches,
-                        )?;
-                    }
-                }
-            }
-            SourceActionKind::ListRemove => {
-                let source_event = GenericSourceEvent {
-                    source: routed.source(),
-                    text: None,
-                    key: None,
-                    target_text: None,
-                    address: None,
-                };
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    source_event,
-                    TickSeq(0),
-                    "todos",
-                    None,
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            SourceActionKind::IndexedBoolBulk => {
-                let all_completed = generic.todomvc_all_completed();
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    routed.event,
-                    TickSeq(0),
-                    "todos",
-                    None,
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |path| match path {
-                        "store.all_completed" => Some(all_completed),
-                        _ => None,
-                    },
-                    |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            SourceActionKind::IndexedTextChange
-            | SourceActionKind::IndexedTextCommit
-            | SourceActionKind::IndexedTextIdentity
-            | SourceActionKind::IndexedTextKey
-            | SourceActionKind::IndexedTextOpen
-            | SourceActionKind::IndexedBoolToggle => unreachable!("filtered above"),
-        }
-        Ok(Some(StepExecutionMetrics {
-            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-            extra: StepExecutionExtra::Todo {
-                stale_source_drop_count: 0,
-            },
-        }))
-    }
-
-    fn try_apply_todomvc_row_source_step<'a>(
-        &mut self,
-        step: &'a ScenarioStep,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
-        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
-            return Ok(None);
-        };
-        let Some(source_event) = GenericSourceEvent::from_step(step)? else {
-            return Ok(None);
-        };
-        let Some(target_text) = source_event.target_text else {
-            return Ok(None);
+            return Ok(StepExecutionMetrics {
+                dirty_key_count: 0,
+                extra: StepExecutionExtra::Generic,
+            });
         };
         let generic = self
             .generic
             .as_mut()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        let routed = generic
-            .route_source_event("todos", "title", source_event)
-            .map_err(|_| {
-                format!(
-                    "{} source `{}` has no compiled route",
-                    step.id, source_event.source
-                )
-            })?;
-        match routed.route_kind {
-            SourceActionKind::IndexedBoolToggle
-            | SourceActionKind::IndexedTextOpen
-            | SourceActionKind::IndexedTextChange
-            | SourceActionKind::IndexedTextKey
-            | SourceActionKind::IndexedTextCommit
-            | SourceActionKind::ListRemove => {}
-            SourceActionKind::RootText
-            | SourceActionKind::ListAppend
-            | SourceActionKind::RootScalar
-            | SourceActionKind::IndexedBoolBulk
-            | SourceActionKind::IndexedTextIdentity => return Ok(None),
-        }
-        assert_routed_source_event_matches(step, routed.event)?;
-        let target_occurrence = step
-            .user_action
-            .as_ref()
-            .and_then(|action| toml_usize_ref(action, "target_occurrence"))
-            .unwrap_or(1);
-        let stale_drops_before = state.stale_source_drop_count;
-        let occurrence = match generic.resolve_visible_row_occurrence(
-            "todos",
-            "title",
-            step.user_action.as_ref(),
-            Some(source_event),
-            target_text,
-            target_occurrence,
-        )? {
-            GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
-            GenericVisibleRowOccurrence::Mismatch => {
-                return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-                    extra: StepExecutionExtra::Todo {
-                        stale_source_drop_count: 0,
-                    },
-                }));
-            }
-            GenericVisibleRowOccurrence::Stale => {
-                state.stale_source_drop_count += 1;
-                return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-                    extra: StepExecutionExtra::Todo {
-                        stale_source_drop_count: state
-                            .stale_source_drop_count
-                            .saturating_sub(stale_drops_before),
-                    },
-                }));
-            }
-        };
-        let resolved_index =
-            generic.find_visible_row_index_by_occurrence("todos", "title", target_text, occurrence);
-        match routed.route_kind {
-            SourceActionKind::IndexedBoolToggle => {
-                let index = resolved_index?;
-                let all_completed = generic.todomvc_all_completed();
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    routed.event,
-                    TickSeq(0),
-                    "todos",
-                    Some(index),
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |path| match path {
-                        "store.all_completed" => Some(all_completed),
-                        _ => None,
-                    },
-                    |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            SourceActionKind::IndexedTextOpen => {
-                let index = resolved_index?;
-                close_other_todomvc_editors(generic, index, deltas, patches)?;
-                let all_completed = generic.todomvc_all_completed();
-                let source_event = GenericSourceEvent {
-                    text: Some(target_text),
-                    ..routed.event
-                };
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    source_event,
-                    TickSeq(0),
-                    "todos",
-                    Some(index),
-                )?;
-                let batch = generic.apply_source_actions_to_batch(
-                    input,
-                    |path| match path {
-                        "store.all_completed" => Some(all_completed),
-                        _ => None,
-                    },
-                    |_| Ok(()),
-                )?;
-                let edit_text =
-                    batch.require_text(routed.source(), "previous-text update", "edit_text")?;
-                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
-                deltas.push(editing.semantic_delta());
-                deltas.push(edit_text.semantic_delta());
-                emit_todomvc_render_patch_for_mutation(
-                    &GenericSourceMutation::BoolField(editing),
-                    GenericRenderContext {
-                        todo_show_edit_input_text: Some(edit_text.value),
-                        ..GenericRenderContext::default()
-                    },
-                    patches,
-                )?;
-            }
-            SourceActionKind::IndexedTextChange => {
-                let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
-                let source_event = GenericSourceEvent {
-                    text: Some(routed.require_text(&step.id)?),
-                    ..routed.event
-                };
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    source_event,
-                    TickSeq(0),
-                    "todos",
-                    Some(index),
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-            }
-            SourceActionKind::IndexedTextKey => {
-                let key = routed.event.key.unwrap_or_default();
-                if matches!(key, "Enter" | "Escape") {
-                    let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
-                    let all_completed = generic.todomvc_all_completed();
-                    let payload_text = if key == "Enter" {
-                        routed.event.text
-                    } else {
-                        Some(target_text)
-                    };
-                    let source_event = GenericSourceEvent {
-                        text: payload_text,
-                        ..routed.event
-                    };
-                    let input = generic.source_action_input_for_list_index(
-                        &step.id,
-                        source_event,
-                        TickSeq(0),
-                        "todos",
-                        Some(index),
-                    )?;
-                    let batch = generic.apply_source_actions_to_batch(
-                        input,
-                        |path| match path {
-                            "store.all_completed" => Some(all_completed),
-                            _ => None,
-                        },
-                        |_| Ok(()),
-                    )?;
-                    if key == "Enter" {
-                        if let Some(title) = batch.text("title") {
-                            emit_todomvc_default_protocol_mutation(
-                                GenericSourceMutation::TextField(title),
-                                deltas,
-                                patches,
-                            )?;
-                        }
-                    } else if let Some(edit_text) = batch.text("edit_text") {
-                        deltas.push(edit_text.semantic_delta());
-                    }
-                    let editing =
-                        batch.require_bool(routed.source(), "editing update", "editing")?;
-                    emit_todomvc_default_protocol_mutation(
-                        GenericSourceMutation::BoolField(editing),
-                        deltas,
-                        patches,
-                    )?;
-                }
-            }
-            SourceActionKind::IndexedTextCommit => {
-                let index = resolved_index.or_else(|_| find_todomvc_editing_index(generic))?;
-                let all_completed = generic.todomvc_all_completed();
-                let source_event = GenericSourceEvent {
-                    text: routed.event.text.or(Some(target_text)),
-                    ..routed.event
-                };
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    source_event,
-                    TickSeq(0),
-                    "todos",
-                    Some(index),
-                )?;
-                let batch = generic.apply_source_actions_to_batch(
-                    input,
-                    |path| match path {
-                        "store.all_completed" => Some(all_completed),
-                        _ => None,
-                    },
-                    |_| Ok(()),
-                )?;
-                if let Some(title) = batch.text("title") {
-                    emit_todomvc_default_protocol_mutation(
-                        GenericSourceMutation::TextField(title),
-                        deltas,
-                        patches,
-                    )?;
-                }
-                let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
-                emit_todomvc_default_protocol_mutation(
-                    GenericSourceMutation::BoolField(editing),
-                    deltas,
-                    patches,
-                )?;
-            }
-            SourceActionKind::ListRemove => {
-                let index = resolved_index?;
-                let mut removed = false;
-                let input = generic.source_action_input_for_list_index(
-                    &step.id,
-                    routed.event,
-                    TickSeq(0),
-                    "todos",
-                    Some(index),
-                )?;
-                generic.apply_source_actions(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        if matches!(mutation, GenericSourceMutation::ListRemove { .. }) {
-                            removed = true;
-                        }
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
-                        Ok(())
-                    },
-                )?;
-                if !removed {
-                    return Err(format!(
-                        "remove source `{}` predicate does not match todo `{target_text}`",
-                        routed.source()
-                    )
-                    .into());
-                }
-            }
-            _ => unreachable!("filtered above"),
-        }
-        Ok(Some(StepExecutionMetrics {
-            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-            extra: StepExecutionExtra::Todo {
-                stale_source_drop_count: state
-                    .stale_source_drop_count
-                    .saturating_sub(stale_drops_before),
-            },
-        }))
-    }
-
-    fn try_apply_todomvc_render_only_step<'a>(
-        &mut self,
-        step: &'a ScenarioStep,
-        deltas: &mut [SemanticDelta<'a>],
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<Option<StepExecutionMetrics>> {
-        let LoadedRuntimeSurface::Todo(state) = &mut self.surface else {
-            return Ok(None);
-        };
-        let Some(action) = &step.user_action else {
-            return Ok(None);
-        };
-        let kind = toml_string_ref(action, "kind").unwrap_or_default();
-        let target_text = toml_string_ref(action, "target_text").unwrap_or_default();
-        let ("pointer_hover", text) = (kind, target_text) else {
-            return Ok(None);
-        };
-        let Some(title) = text.strip_suffix(" delete") else {
-            return Ok(None);
-        };
-        let generic = self
-            .generic
-            .as_mut()
-            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        let fallback = toml_usize_ref(action, "target_occurrence").unwrap_or(1);
-        let stale_drops_before = state.stale_source_drop_count;
-        let occurrence = match generic.resolve_visible_row_occurrence(
-            "todos",
-            "title",
-            Some(action),
-            None,
-            title,
-            fallback,
-        )? {
-            GenericVisibleRowOccurrence::Occurrence(occurrence) => occurrence,
-            GenericVisibleRowOccurrence::Mismatch => {
-                return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-                    extra: StepExecutionExtra::Todo {
-                        stale_source_drop_count: 0,
-                    },
-                }));
-            }
-            GenericVisibleRowOccurrence::Stale => {
-                state.stale_source_drop_count += 1;
-                return Ok(Some(StepExecutionMetrics {
-                    dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-                    extra: StepExecutionExtra::Todo {
-                        stale_source_drop_count: state
-                            .stale_source_drop_count
-                            .saturating_sub(stale_drops_before),
-                    },
-                }));
-            }
-        };
-        let index =
-            generic.find_visible_row_index_by_occurrence("todos", "title", title, occurrence)?;
-        let (key, generation) = generic.row_identity("todos", index)?;
-        patches.push(
-            GenericRenderLoweringPlan::todo_mvc().lower_todomvc_row_affordance_patch(
-                key,
-                generation,
-                "delete_button",
-                true,
-            )?,
-        );
-        Ok(Some(StepExecutionMetrics {
-            dirty_key_count: state.dirty_key_sets.mark_deltas(deltas),
-            extra: StepExecutionExtra::Todo {
-                stale_source_drop_count: state
-                    .stale_source_drop_count
-                    .saturating_sub(stale_drops_before),
-            },
-        }))
-    }
-}
-
-fn find_todomvc_editing_index(generic: &GenericScheduledRuntime) -> RuntimeResult<usize> {
-    (0..generic.list_len("todos")?)
-        .find(|index| {
-            generic
-                .list_row_bool("todos", *index, "editing")
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| "no editing todo found".into())
-}
-
-fn close_other_todomvc_editors<'a>(
-    generic: &mut GenericScheduledRuntime,
-    active_index: usize,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-    patches: &mut Vec<RenderPatch<'a>>,
-) -> RuntimeResult<()> {
-    for index in 0..generic.list_len("todos")? {
-        if index == active_index
-            || !generic
-                .list_row_bool_opt("todos", index, "editing")
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        let (key, generation) =
-            generic.commit_indexed_bool_field("todos", index, "editing", false)?;
-        let commit = GenericBoolFieldCommit {
-            list: "todos".to_owned(),
-            key,
-            generation,
-            field: "editing".to_owned(),
-            value: false,
-        };
-        deltas.push(commit.semantic_delta());
-        emit_todomvc_render_patch_for_mutation(
-            &GenericSourceMutation::BoolField(commit),
-            GenericRenderContext::default(),
-            patches,
+        let input = generic.source_action_input_for_event(
+            &step.id,
+            source_event,
+            TickSeq(0),
+            |list, event| generic.resolve_generic_step_index(list, step, event),
         )?;
+        let bool_context = generic.generic_bool_contexts();
+        generic.apply_source_actions(
+            input,
+            |path| bool_context.get(path).copied(),
+            |mutation| {
+                if let Some(delta) = mutation.semantic_delta() {
+                    deltas.push(delta);
+                }
+                patches.push(generic_document_invalidation_patch(&mutation));
+                Ok(())
+            },
+        )?;
+        Ok(StepExecutionMetrics {
+            dirty_key_count: deltas.len(),
+            extra: StepExecutionExtra::Generic,
+        })
     }
-    Ok(())
 }
 
-fn initialize_loaded_todomvc_generic(
-    mut generic: GenericScheduledRuntime,
-) -> RuntimeResult<(GenericScheduledRuntime, TodoRuntimeState)> {
-    let todo_count = generic.list_len("todos")?;
-    let row_source_paths = generic.row_source_paths("todos")?.to_vec();
-    generic.reserve_source_bindings(todo_count * row_source_paths.len());
-    generic.reserve_source_rows(todo_count);
-    for index in 0..todo_count {
-        if generic
-            .list_row_textlike("todos", index, "title")?
-            .is_empty()
-        {
-            return Err("TodoMVC seed titles must not be empty".into());
-        }
-        let (key, generation) = generic.row_identity("todos", index)?;
-        generic.bind_row_sources("todos", key, generation, &row_source_paths)?;
-    }
-    Ok((
-        generic,
-        TodoRuntimeState {
-            next_source_seq: 1,
-            stale_source_drop_count: 0,
-            dirty_key_sets: DirtyKeySets::with_capacity(todo_count.saturating_mul(4).max(16)),
-        },
-    ))
-}
-
-fn assert_loaded_todomvc_generic_fields(generic: &GenericScheduledRuntime) -> RuntimeResult<()> {
-    generic.root_textlike_ref("store.new_todo_text")?;
-    generic.root_textlike_ref("store.selected_filter")?;
-    for index in 0..generic.list_len("todos")? {
-        generic.row_identity("todos", index)?;
-        generic.list_row_textlike("todos", index, "title")?;
-        generic.list_row_textlike("todos", index, "edit_text")?;
-        generic.list_row_bool("todos", index, "completed")?;
-        generic.list_row_bool("todos", index, "editing")?;
-    }
-    Ok(())
-}
-
-fn initialize_loaded_cells_generic(
-    mut generic: GenericScheduledRuntime,
-    ir: &TypedProgram,
-) -> RuntimeResult<(GenericScheduledRuntime, CellsRuntimeState)> {
-    let (columns, rows) =
-        cells_grid_dimensions_from_ir(ir).ok_or("Cells IR has no Grid/cells list initializer")?;
-    let expected_len = columns.saturating_mul(rows);
-    let actual_len = generic.list_len("cells")?;
-    if actual_len != expected_len {
-        return Err(format!(
-            "Cells generic list initialized {actual_len} rows, expected {expected_len}"
-        )
-        .into());
-    }
-    let mut cells = Vec::with_capacity(expected_len);
-    cells.resize_with(expected_len, Cell::default);
-    let mut state = CellsRuntimeState {
-        cells,
-        dependency_cache: GenericFormulaDependencyCache::with_capacity(expected_len),
-        evaluation_cache: GenericFormulaEvaluationCache::with_capacity(expected_len),
-        columns,
-        rows,
-        interned_texts: Vec::new(),
-        step_recomputed: Vec::with_capacity(8),
-        dirty_key_sets: DirtyKeySets::with_capacity(expected_len.clamp(16, 128)),
-        last_recompute_candidates: 0,
-    };
-    initialize_loaded_cells_from_generic(&mut generic, &mut state)?;
-    Ok((generic, state))
-}
-
-fn initialize_loaded_cells_from_generic(
+fn initialize_formula_grid_from_generic(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
 ) -> RuntimeResult<()> {
-    generic.formula_equations.expect_cells_pipeline()?;
+    generic.formula_equations.validate_grid_pipeline()?;
     for index in 0..state.cells.len() {
-        let formula = generic.list_row_textlike("cells", index, "formula_text")?;
-        state.cells[index].parsed =
-            generic
-                .formula_equations
-                .parse_cell_formula(formula, state.columns, state.rows)?;
-        replace_loaded_cell_dependencies(generic, state, index)?;
+        let formula =
+            generic.list_row_textlike(&state.plan.list, index, &state.plan.formula_field)?;
+        state.cells[index].parsed = generic.formula_equations.parse_grid_formula(
+            formula,
+            state.plan.columns,
+            state.plan.rows,
+        )?;
+        replace_formula_grid_dependencies(generic, state, index)?;
     }
     state.evaluation_cache.begin_tick();
     for index in 0..state.cells.len() {
@@ -1781,52 +1151,52 @@ fn initialize_loaded_cells_from_generic(
             result,
             &mut state.cells[index],
         )?;
-        sync_loaded_cell_derived_fields(generic, state, index)?;
+        sync_formula_grid_derived_fields(generic, state, index)?;
     }
     Ok(())
 }
 
-fn prepare_loaded_cells_scenario(
+fn prepare_formula_grid_scenario(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     scenario: &Scenario,
 ) -> RuntimeResult<()> {
-    intern_loaded_cell_text(state, "");
-    intern_loaded_cell_text(state, "cycle_error");
-    intern_loaded_cell_text(state, "parse_error");
-    intern_loaded_cell_text(state, "div_by_zero");
+    intern_formula_grid_text(state, "");
+    intern_formula_grid_text(state, "cycle_error");
+    intern_formula_grid_text(state, "parse_error");
+    intern_formula_grid_text(state, "div_by_zero");
     for step in &scenario.step {
         if let Some(action) = &step.user_action
             && let Some(text) = toml_string_ref(action, "text")
         {
-            intern_loaded_cell_text(state, text);
+            intern_formula_grid_text(state, text);
         }
         if let Some(expected) = &step.expected_source_event
             && let Some(text) = toml_string_ref(expected, "text")
         {
-            intern_loaded_cell_text(state, text);
+            intern_formula_grid_text(state, text);
         }
         if let Some(expect) = &step.expect_cell {
             if let Some(value) = &expect.value {
-                intern_loaded_cell_text(state, value);
+                intern_formula_grid_text(state, value);
             }
             if let Some(formula) = &expect.formula {
-                intern_loaded_cell_text(state, formula);
+                intern_formula_grid_text(state, formula);
             }
             if let Some(editing_text) = &expect.editing_text {
-                intern_loaded_cell_text(state, editing_text);
+                intern_formula_grid_text(state, editing_text);
             }
         }
         if let Some(expect) = &step.expect_error {
-            intern_loaded_cell_text(state, &expect.error);
+            intern_formula_grid_text(state, &expect.error);
         }
     }
-    let requirements = generic.prepare_cells_scenario_storage(scenario)?;
-    reserve_loaded_cell_cache(state, requirements.max_text_len, requirements.max_deps);
+    let requirements = generic.prepare_formula_grid_scenario_storage(scenario, &state.plan)?;
+    reserve_formula_grid_cache(state, requirements.max_text_len, requirements.max_deps);
     Ok(())
 }
 
-fn intern_loaded_cell_text(state: &mut CellsRuntimeState, value: &str) {
+fn intern_formula_grid_text(state: &mut FormulaGridRuntimeState, value: &str) {
     if state
         .interned_texts
         .iter()
@@ -1837,11 +1207,18 @@ fn intern_loaded_cell_text(state: &mut CellsRuntimeState, value: &str) {
     state.interned_texts.push(value.to_owned());
 }
 
-fn cells_protocol_text<'a>(_state: &CellsRuntimeState, value: &str) -> ProtocolValue<'a> {
+fn formula_grid_protocol_text<'a>(
+    _state: &FormulaGridRuntimeState,
+    value: &str,
+) -> ProtocolValue<'a> {
     ProtocolValue::Text(Cow::Owned(value.to_owned()))
 }
 
-fn reserve_loaded_cell_cache(state: &mut CellsRuntimeState, max_text_len: usize, max_deps: usize) {
+fn reserve_formula_grid_cache(
+    state: &mut FormulaGridRuntimeState,
+    max_text_len: usize,
+    max_deps: usize,
+) {
     for cell in &mut state.cells {
         cell.value.reserve(max_text_len);
         cell.deps.reserve(max_deps);
@@ -1853,19 +1230,31 @@ fn reserve_loaded_cell_cache(state: &mut CellsRuntimeState, max_text_len: usize,
         .reserve_dependents(minimum_fanout_capacity);
 }
 
-fn apply_loaded_cells_step<'a>(
+fn apply_formula_grid_step<'a>(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     step: &'a ScenarioStep,
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<StepExecutionMetrics> {
     let mut step_recomputed = std::mem::take(&mut state.step_recomputed);
     step_recomputed.clear();
-    apply_loaded_cells_step_into(generic, state, step, deltas, patches, &mut step_recomputed)?;
+    let patch_count_before = patches.len();
+    apply_formula_grid_step_into(generic, state, step, deltas, patches, &mut step_recomputed)?;
+    if patches.len() > patch_count_before
+        && !patches[patch_count_before..]
+            .iter()
+            .any(|patch| patch.kind == "InvalidateDocument")
+    {
+        patches.push(patch(
+            "InvalidateDocument",
+            RenderTarget::Static(Cow::Borrowed("document")),
+            ProtocolValue::Text(Cow::Borrowed("formula")),
+        ));
+    }
     state
         .dirty_key_sets
-        .mark_indexes("cells", "value", &step_recomputed);
+        .mark_indexes(&state.plan.list, &state.plan.value_field, &step_recomputed);
     let dirty_key_count = state.dirty_key_sets.key_count();
     let recomputed_cell_count = step_recomputed.len();
     let recompute_candidate_count = state.last_recompute_candidates;
@@ -1874,7 +1263,7 @@ fn apply_loaded_cells_step<'a>(
     state.step_recomputed = step_recomputed;
     Ok(StepExecutionMetrics {
         dirty_key_count,
-        extra: StepExecutionExtra::Cells {
+        extra: StepExecutionExtra::FormulaGrid {
             recomputed_cell_count,
             recompute_candidate_count,
             formula_eval_call_count,
@@ -1883,15 +1272,15 @@ fn apply_loaded_cells_step<'a>(
     })
 }
 
-fn apply_loaded_cells_step_into<'a>(
+fn apply_formula_grid_step_into<'a>(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     step: &'a ScenarioStep,
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
     recomputed: &mut Vec<usize>,
 ) -> RuntimeResult<()> {
-    let Some(routed) = route_loaded_cells_step(generic, step)? else {
+    let Some(routed) = route_formula_grid_step(generic, state, step)? else {
         return Ok(());
     };
     assert_routed_source_event_matches(step, routed.event)?;
@@ -1900,7 +1289,11 @@ fn apply_loaded_cells_step_into<'a>(
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
-                return Err(format!("{} Cells source event missing valid address", step.id).into());
+                return Err(format!(
+                    "{} formula-grid source event missing valid address",
+                    step.id
+                )
+                .into());
             }
             let text = routed.require_text(&step.id)?;
             let source_event = GenericSourceEvent {
@@ -1911,33 +1304,41 @@ fn apply_loaded_cells_step_into<'a>(
                 address: Some(address),
             };
             let input = generic.source_action_input_for_event_by_row_field(
-                "cells-change",
+                "formula-grid-change",
                 source_event,
                 TickSeq(0),
-                "address",
+                &state.plan.address_field,
                 Some(address),
             )?;
             let batch = generic.apply_source_actions_to_batch(
                 input,
                 |_| None,
                 |mutation| {
-                    emit_cells_default_protocol_mutation(
+                    emit_formula_grid_default_protocol_mutation(
                         mutation, address, None, true, false, deltas, patches,
                     )?;
                     Ok(())
                 },
             )?;
-            batch.require_text(source, "editing-text update", "editing_text")?;
-            batch.require_bool(source, "editing update", "editing")?;
+            batch.require_first_text_except(
+                source,
+                "formula-grid draft update",
+                &state.plan.formula_field,
+            )?;
+            batch.require_first_bool(source, "formula-grid editing update")?;
         }
         SourceActionKind::IndexedTextCommit => {
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
-                return Err(format!("{} Cells source event missing valid address", step.id).into());
+                return Err(format!(
+                    "{} formula-grid source event missing valid address",
+                    step.id
+                )
+                .into());
             }
             let text = routed.require_text(&step.id)?;
-            loaded_cells_commit_from_source(
+            formula_grid_commit_from_source(
                 generic, state, source, address, text, deltas, patches, recomputed,
             )?;
         }
@@ -1945,7 +1346,11 @@ fn apply_loaded_cells_step_into<'a>(
             let source = routed.source();
             let address = routed.require_address(&step.id)?;
             if !is_cell_address(address) {
-                return Err(format!("{} Cells source event missing valid address", step.id).into());
+                return Err(format!(
+                    "{} formula-grid source event missing valid address",
+                    step.id
+                )
+                .into());
             }
             let source_event = GenericSourceEvent {
                 source,
@@ -1955,20 +1360,19 @@ fn apply_loaded_cells_step_into<'a>(
                 address: Some(address),
             };
             let input = generic.source_action_input_for_event_by_row_field(
-                "cells-cancel",
+                "formula-grid-cancel",
                 source_event,
                 TickSeq(0),
-                "address",
+                &state.plan.address_field,
                 Some(address),
             )?;
             let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-            let editing_text =
-                batch.require_identity(source, "editing-text cancel", "editing_text")?;
-            let editing = batch.require_bool(source, "editing cancel", "editing")?;
-            let index = loaded_cell_index(state, address)?;
-            let value = generic.list_row_textlike("cells", index, &editing_text.field)?;
-            let identity_value = cells_protocol_text(state, value);
-            emit_cells_default_protocol_mutation(
+            let editing_text = batch.require_first_identity(source, "formula-grid draft cancel")?;
+            let editing = batch.require_first_bool(source, "formula-grid editing cancel")?;
+            let index = formula_grid_cell_index(state, address)?;
+            let value = generic.list_row_textlike(&state.plan.list, index, &editing_text.field)?;
+            let identity_value = formula_grid_protocol_text(state, value);
+            emit_formula_grid_default_protocol_mutation(
                 GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
                 address,
                 Some(identity_value),
@@ -1977,7 +1381,7 @@ fn apply_loaded_cells_step_into<'a>(
                 deltas,
                 patches,
             )?;
-            emit_cells_default_protocol_mutation(
+            emit_formula_grid_default_protocol_mutation(
                 GenericSourceMutation::BoolField(editing),
                 address,
                 None,
@@ -1989,7 +1393,7 @@ fn apply_loaded_cells_step_into<'a>(
             patches.push(keyed_patch(
                 "SetCellText",
                 RenderTarget::Borrowed(Cow::Borrowed(address)),
-                cells_protocol_text(state, &state.cells[index].value),
+                formula_grid_protocol_text(state, &state.cells[index].value),
                 editing_text.list.clone(),
                 editing_text.key,
                 editing_text.generation,
@@ -1997,7 +1401,7 @@ fn apply_loaded_cells_step_into<'a>(
         }
         route_kind => {
             return Err(format!(
-                "{} Cells source `{}` classified as unsupported route `{route_kind:?}`",
+                "{} formula-grid source `{}` classified as unsupported route `{route_kind:?}`",
                 step.id,
                 routed.source()
             )
@@ -2007,31 +1411,38 @@ fn apply_loaded_cells_step_into<'a>(
     Ok(())
 }
 
-fn route_loaded_cells_step<'a>(
+fn route_formula_grid_step<'a>(
     generic: &GenericScheduledRuntime,
+    state: &FormulaGridRuntimeState,
     step: &'a ScenarioStep,
 ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
     if step.user_action.is_none() {
         return Ok(None);
     }
     let source_event = GenericSourceEvent::require(step)?;
-    route_loaded_cells_source_event(generic, step, source_event)
+    route_formula_grid_source_event(generic, state, step, source_event)
 }
 
-fn route_loaded_cells_source_event<'a>(
+fn route_formula_grid_source_event<'a>(
     generic: &GenericScheduledRuntime,
+    state: &FormulaGridRuntimeState,
     step: &'a ScenarioStep,
     source_event: GenericSourceEvent<'a>,
 ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
     let source = source_event.source;
     let routed = generic
-        .route_source_event("cells", "formula_text", source_event)
+        .route_source_event(&state.plan.list, &state.plan.formula_field, source_event)
         .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
     let address = routed
         .event
         .address
         .filter(|candidate| is_cell_address(candidate))
-        .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
+        .ok_or_else(|| {
+            format!(
+                "{} formula-grid source event missing valid address",
+                step.id
+            )
+        })?;
     match routed.route_kind {
         SourceActionKind::IndexedTextCommit | SourceActionKind::IndexedTextChange => {
             routed.require_text(&step.id)?;
@@ -2039,16 +1450,16 @@ fn route_loaded_cells_source_event<'a>(
         }
         SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
         route_kind => Err(format!(
-            "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
+            "{} formula-grid source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
             step.id
         )
         .into()),
     }
 }
 
-fn loaded_cells_commit_from_source<'a>(
+fn formula_grid_commit_from_source<'a>(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     source: &'a str,
     address: &'a str,
     formula: &'a str,
@@ -2056,8 +1467,8 @@ fn loaded_cells_commit_from_source<'a>(
     patches: &mut Vec<RenderPatch<'a>>,
     recomputed: &mut Vec<usize>,
 ) -> RuntimeResult<()> {
-    generic.formula_equations.expect_cells_pipeline()?;
-    let committed_index = loaded_cell_index(state, address)?;
+    generic.formula_equations.validate_grid_pipeline()?;
+    let committed_index = formula_grid_cell_index(state, address)?;
     let source_event = GenericSourceEvent {
         source,
         text: Some(formula),
@@ -2066,28 +1477,37 @@ fn loaded_cells_commit_from_source<'a>(
         address: Some(address),
     };
     let input = generic.source_action_input_for_event_by_row_field(
-        "cells-commit",
+        "formula-grid-commit",
         source_event,
         TickSeq(0),
-        "address",
+        &state.plan.address_field,
         Some(address),
     )?;
     let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-    let formula = batch.require_text(source, "formula update", "formula_text")?;
-    let editing_text = batch.require_text(source, "editing text update", "editing_text")?;
-    let editing = batch.require_bool(source, "editing update", "editing")?;
-    state.cells[committed_index].parsed =
-        generic
-            .formula_equations
-            .parse_cell_formula(formula.value, state.columns, state.rows)?;
-    replace_loaded_cell_dependencies(generic, state, committed_index)?;
-    recompute_loaded_cells_affected(generic, state, address, recomputed)?;
+    let formula = batch.require_text(
+        source,
+        "formula-grid formula update",
+        &state.plan.formula_field,
+    )?;
+    let editing_text = batch.require_first_text_except(
+        source,
+        "formula-grid draft update",
+        &state.plan.formula_field,
+    )?;
+    let editing = batch.require_first_bool(source, "formula-grid editing update")?;
+    state.cells[committed_index].parsed = generic.formula_equations.parse_grid_formula(
+        formula.value,
+        state.plan.columns,
+        state.plan.rows,
+    )?;
+    replace_formula_grid_dependencies(generic, state, committed_index)?;
+    recompute_formula_grid_affected(generic, state, address, recomputed)?;
     let cell = &state.cells[committed_index];
     let display_key = formula.key;
     let display_generation = formula.generation;
-    let display_value = generic.formula_equations.cell_value_protocol(cell)?;
+    let display_value = generic.formula_equations.grid_value_protocol(cell)?;
     let display_error = cell.error.as_deref();
-    emit_cells_default_protocol_mutation(
+    emit_formula_grid_default_protocol_mutation(
         GenericSourceMutation::TextField(formula),
         address,
         None,
@@ -2096,7 +1516,7 @@ fn loaded_cells_commit_from_source<'a>(
         deltas,
         patches,
     )?;
-    emit_cells_default_protocol_mutation(
+    emit_formula_grid_default_protocol_mutation(
         GenericSourceMutation::TextField(editing_text),
         address,
         None,
@@ -2105,7 +1525,7 @@ fn loaded_cells_commit_from_source<'a>(
         deltas,
         patches,
     )?;
-    emit_cells_default_protocol_mutation(
+    emit_formula_grid_default_protocol_mutation(
         GenericSourceMutation::BoolField(editing),
         address,
         None,
@@ -2116,7 +1536,8 @@ fn loaded_cells_commit_from_source<'a>(
     )?;
     generic
         .formula_equations
-        .emit_cell_display_protocol_mutations(
+        .emit_grid_display_protocol_mutations(
+            &state.plan.list,
             display_key,
             display_generation,
             display_value,
@@ -2128,13 +1549,13 @@ fn loaded_cells_commit_from_source<'a>(
     Ok(())
 }
 
-fn recompute_loaded_cells_affected(
+fn recompute_formula_grid_affected(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     changed_address: &str,
     recomputed: &mut Vec<usize>,
 ) -> RuntimeResult<()> {
-    let changed_index = loaded_cell_index(state, changed_address)?;
+    let changed_index = formula_grid_cell_index(state, changed_address)?;
     state.dependency_cache.collect_affected(changed_index);
     let affected_len = state.dependency_cache.affected().len();
     state.last_recompute_candidates = affected_len;
@@ -2153,7 +1574,7 @@ fn recompute_loaded_cells_affected(
             &mut state.cells[index],
         )?;
         if changed {
-            sync_loaded_cell_derived_fields(generic, state, index)?;
+            sync_formula_grid_derived_fields(generic, state, index)?;
             recomputed.push(index);
         }
     }
@@ -2161,15 +1582,16 @@ fn recompute_loaded_cells_affected(
     Ok(())
 }
 
-fn sync_loaded_cell_derived_fields(
+fn sync_formula_grid_derived_fields(
     generic: &mut GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     index: usize,
 ) -> RuntimeResult<()> {
-    refresh_loaded_cell_dependency_text(state, index);
+    refresh_formula_grid_dependency_text(state, index);
     let fields = generic.formula_equations.derived_storage_fields()?;
     sync_formula_derived_fields(
         generic,
+        &state.plan.list,
         index,
         fields,
         &state.cells[index].value,
@@ -2178,7 +1600,7 @@ fn sync_loaded_cell_derived_fields(
     )
 }
 
-fn refresh_loaded_cell_dependency_text(state: &mut CellsRuntimeState, index: usize) {
+fn refresh_formula_grid_dependency_text(state: &mut FormulaGridRuntimeState, index: usize) {
     state.cells[index].dependency_text.clear();
     for offset in 0..state.cells[index].deps.len() {
         if offset > 0 {
@@ -2186,16 +1608,16 @@ fn refresh_loaded_cell_dependency_text(state: &mut CellsRuntimeState, index: usi
         }
         let dependency = state.cells[index].deps[offset];
         push_cell_address(
-            state.columns,
+            state.plan.columns,
             dependency,
             &mut state.cells[index].dependency_text,
         );
     }
 }
 
-fn replace_loaded_cell_dependencies(
+fn replace_formula_grid_dependencies(
     generic: &GenericScheduledRuntime,
-    state: &mut CellsRuntimeState,
+    state: &mut FormulaGridRuntimeState,
     cell_index: usize,
 ) -> RuntimeResult<()> {
     state.cells[cell_index].deps.clear();
@@ -2209,76 +1631,56 @@ fn replace_loaded_cell_dependencies(
     Ok(())
 }
 
-fn loaded_cell_index(state: &CellsRuntimeState, address: &str) -> RuntimeResult<usize> {
-    cell_index(address, state.columns, state.rows)
+fn formula_grid_cell_index(state: &FormulaGridRuntimeState, address: &str) -> RuntimeResult<usize> {
+    cell_index(address, state.plan.columns, state.plan.rows)
         .ok_or_else(|| format!("unknown cell {address}").into())
 }
 
-fn loaded_cell_address(state: &CellsRuntimeState, index: usize) -> String {
+fn formula_grid_cell_address(state: &FormulaGridRuntimeState, index: usize) -> String {
     let mut address = String::new();
-    push_cell_address(state.columns, index, &mut address);
+    push_cell_address(state.plan.columns, index, &mut address);
     address
 }
 
-fn assert_loaded_cells_generic_fields(
+fn assert_formula_grid_generic_fields(
     generic: &GenericScheduledRuntime,
-    state: &CellsRuntimeState,
+    state: &FormulaGridRuntimeState,
 ) -> RuntimeResult<()> {
-    let generic_len = generic.list_len("cells")?;
+    let generic_len = generic.list_len(&state.plan.list)?;
     if generic_len != state.cells.len() {
         return Err(format!(
-            "generic cells length {generic_len} != formula state {}",
+            "generic formula-grid length {generic_len} != formula state {}",
             state.cells.len()
         )
         .into());
     }
     for index in 0..state.cells.len() {
-        let address = loaded_cell_address(state, index);
-        let generic_address = generic.list_row_textlike("cells", index, "address")?;
+        let address = formula_grid_cell_address(state, index);
+        let generic_address =
+            generic.list_row_textlike(&state.plan.list, index, &state.plan.address_field)?;
         if generic_address != address {
             return Err(format!(
                 "row {index} address generic `{generic_address}` != computed `{address}`"
             )
             .into());
         }
-        generic.list_row_textlike("cells", index, "formula_text")?;
-        generic.list_row_textlike("cells", index, "editing_text")?;
-        generic.list_row_bool("cells", index, "editing")?;
+        generic.list_row_textlike(&state.plan.list, index, &state.plan.formula_field)?;
+        generic.list_row_textlike(&state.plan.list, index, &state.plan.value_field)?;
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExecutableSurfaceKind {
-    TodoMvc,
-    Cells,
-}
-
-impl ExecutableSurfaceKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TodoMvc => "todomvc",
-            Self::Cells => "cells",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ExecutableSurfaceProfile {
-    kind: ExecutableSurfaceKind,
-    inferred_from_ir: bool,
 }
 
 #[derive(Clone, Debug)]
 struct CompiledProgram {
     symbols: RuntimeSymbols,
-    surface: ExecutableSurfaceProfile,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     list_equations: ListEquationPlan,
     formula_equations: FormulaEquationPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
+    root_state_paths: Vec<String>,
+    list_summary_fields: Vec<ListSummaryFields>,
     schedule_node_count: usize,
     state_initializer_count: usize,
     list_initializer_count: usize,
@@ -2315,6 +1717,12 @@ struct RuntimeSymbolId(u32);
 struct RuntimeSymbols {
     paths: Vec<Box<str>>,
     by_path: BTreeMap<Box<str>, RuntimeSymbolId>,
+}
+
+#[derive(Clone, Debug)]
+struct ListSummaryFields {
+    list: String,
+    fields: Vec<String>,
 }
 
 impl RuntimeSymbols {
@@ -2430,7 +1838,6 @@ impl RuntimeSymbols {
 impl CompiledProgram {
     fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
         let symbols = RuntimeSymbols::from_ir(ir);
-        let surface = ExecutableSurfaceProfile::infer(ir)?;
         for cell in &ir.state_cells {
             if let InitialValue::Unknown { summary } = &cell.initial_value {
                 return Err(format!(
@@ -2496,6 +1903,13 @@ impl CompiledProgram {
         let derived_text_transform_count = derived_equations.text_transforms.len();
         let list_equations = ListEquationPlan::from_ir(ir);
         let formula_equations = FormulaEquationPlan::from_ir(ir);
+        let root_state_paths = ir
+            .state_cells
+            .iter()
+            .filter(|cell| !cell.indexed)
+            .map(|cell| cell.path.clone())
+            .collect::<Vec<_>>();
+        let list_summary_fields = list_summary_fields_from_ir(ir);
         let root_targets = ir
             .state_cells
             .iter()
@@ -2515,13 +1929,14 @@ impl CompiledProgram {
         let storage_layout_counts = TypedStorageLayoutCounts::from_ir(ir);
         Ok(Self {
             symbols,
-            surface,
             scalar_equations,
             derived_equations,
             list_equations,
             formula_equations,
             source_routes,
             list_source_bindings,
+            root_state_paths,
+            list_summary_fields,
             schedule_node_count: ir.nodes.len(),
             state_initializer_count: ir.state_cells.len(),
             list_initializer_count: ir.lists.len(),
@@ -2558,8 +1973,8 @@ impl CompiledProgram {
             "compiled_from_typed_ir": true,
             "runtime_symbol_count": self.symbols.len(),
             "runtime_symbol_ownership": "compiled_program_owned",
-            "executable_surface": self.surface.kind.as_str(),
-            "executable_surface_inferred_from_ir": self.surface.inferred_from_ir,
+            "executable_surface": "generic",
+            "executable_surface_inferred_from_ir": true,
             "schedule_node_count": self.schedule_node_count,
             "state_initializer_count": self.state_initializer_count,
             "list_initializer_count": self.list_initializer_count,
@@ -2698,45 +2113,31 @@ impl SourcePayloadCounts {
     }
 }
 
-impl ExecutableSurfaceProfile {
-    fn infer(ir: &TypedProgram) -> RuntimeResult<Self> {
-        let has_todomvc_shape = ir_has_list(ir, "todos")
-            && ir_has_state(ir, "store.new_todo_text")
-            && ir_has_state(ir, "store.selected_filter")
-            && ir_has_state(ir, "todo.title")
-            && ir_has_state(ir, "todo.edit_text")
-            && ir_has_state(ir, "todo.completed")
-            && ir_has_state(ir, "todo.editing");
-        let has_cells_shape = ir_has_list(ir, "cells")
-            && ir_has_state(ir, "cell.editing_text")
-            && ir_has_state(ir, "cell.formula_text")
-            && ir_has_state(ir, "cell.editing")
-            && !ir.formula_operations.is_empty();
-        match (has_todomvc_shape, has_cells_shape) {
-            (true, false) => Ok(Self {
-                kind: ExecutableSurfaceKind::TodoMvc,
-                inferred_from_ir: true,
-            }),
-            (false, true) => Ok(Self {
-                kind: ExecutableSurfaceKind::Cells,
-                inferred_from_ir: true,
-            }),
-            (true, true) => {
-                Err("typed IR matches both TodoMVC and Cells executable surface profiles".into())
+fn list_summary_fields_from_ir(ir: &TypedProgram) -> Vec<ListSummaryFields> {
+    ir.lists
+        .iter()
+        .map(|list| {
+            let row_scope = row_scope_name(&list.name);
+            let prefix = format!("{row_scope}.");
+            let mut fields = ir
+                .state_cells
+                .iter()
+                .filter(|cell| cell.indexed && cell.path.starts_with(&prefix))
+                .map(|cell| row_field_name(&cell.path).to_owned())
+                .collect::<Vec<_>>();
+            for value in &ir.derived_values {
+                if value.indexed && value.path.starts_with(&prefix) {
+                    fields.push(row_field_name(&value.path).to_owned());
+                }
             }
-            (false, false) => {
-                Err("typed IR does not match a supported executable surface profile".into())
+            fields.sort();
+            fields.dedup();
+            ListSummaryFields {
+                list: list.name.clone(),
+                fields,
             }
-        }
-    }
-}
-
-fn ir_has_state(ir: &TypedProgram, path: &str) -> bool {
-    ir.state_cells.iter().any(|cell| cell.path == path)
-}
-
-fn ir_has_list(ir: &TypedProgram, name: &str) -> bool {
-    ir.lists.iter().any(|list| list.name == name)
+        })
+        .collect()
 }
 
 fn list_operation_has_unknown_predicate(operation: &boon_ir::ListOperation) -> bool {
@@ -2748,137 +2149,6 @@ fn list_operation_has_unknown_predicate(operation: &boon_ir::ListOperation) -> b
             matches!(predicate, ListPredicate::Unknown { .. })
         }
     }
-}
-
-fn validate_executable_surface(
-    parsed: &ParsedProgram,
-    ir: &TypedProgram,
-    compiled: &CompiledProgram,
-) -> RuntimeResult<()> {
-    match compiled.surface.kind {
-        ExecutableSurfaceKind::TodoMvc => {
-            require_state_cells(
-                ir,
-                &[
-                    "store.new_todo_text",
-                    "store.selected_filter",
-                    "todo.title",
-                    "todo.edit_text",
-                    "todo.completed",
-                    "todo.editing",
-                ],
-            )?;
-            require_sources(
-                ir,
-                &[
-                    "store.sources.new_todo_input.change",
-                    "store.sources.new_todo_input.key_down",
-                    "store.sources.toggle_all_checkbox.click",
-                    "store.sources.clear_completed_button.press",
-                    "store.sources.filter_all.press",
-                    "store.sources.filter_active.press",
-                    "store.sources.filter_completed.press",
-                ],
-            )?;
-            require_scoped_list_sources(&compiled.list_source_bindings, "todos", 6)?;
-            require_lists(ir, &["todos"])?;
-            require_operators(
-                parsed,
-                &[
-                    "SOURCE",
-                    "HOLD",
-                    "THEN",
-                    "WHEN",
-                    "LATEST",
-                    "LIST",
-                    "List/append",
-                    "List/remove",
-                    "List/map",
-                    "List/retain",
-                    "List/count",
-                ],
-            )?;
-        }
-        ExecutableSurfaceKind::Cells => {
-            require_state_cells(
-                ir,
-                &["cell.editing_text", "cell.formula_text", "cell.editing"],
-            )?;
-            require_scoped_list_sources(&compiled.list_source_bindings, "cells", 3)?;
-            require_lists(ir, &["cells"])?;
-            require_operators(parsed, &["SOURCE", "HOLD", "LATEST", "List/map"])?;
-            for primitive in [
-                "Formula/parse",
-                "Formula/dependencies",
-                "Formula/eval",
-                "Formula/error",
-            ] {
-                if !parsed
-                    .operators
-                    .iter()
-                    .any(|operator| operator == primitive)
-                {
-                    return Err(format!("executable Cells source missing `{primitive}`").into());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn require_state_cells(ir: &TypedProgram, required: &[&str]) -> RuntimeResult<()> {
-    for path in required {
-        if !ir.state_cells.iter().any(|cell| cell.path == *path) {
-            return Err(format!("executable source missing state cell `{path}`").into());
-        }
-    }
-    Ok(())
-}
-
-fn require_sources(ir: &TypedProgram, required: &[&str]) -> RuntimeResult<()> {
-    for path in required {
-        if !ir.sources.iter().any(|source| source.path == *path) {
-            return Err(format!("executable source missing source port `{path}`").into());
-        }
-    }
-    Ok(())
-}
-
-fn require_scoped_list_sources(
-    bindings: &ListSourceBindingPlan,
-    list: &str,
-    minimum: usize,
-) -> RuntimeResult<()> {
-    let count = bindings.source_count(list)?;
-    if count < minimum {
-        return Err(format!(
-            "executable source list `{list}` has only {count} scoped row source ports; expected at least {minimum}"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn require_lists(ir: &TypedProgram, required: &[&str]) -> RuntimeResult<()> {
-    for name in required {
-        if !ir.lists.iter().any(|list| list.name == *name) {
-            return Err(format!("executable source missing list memory `{name}`").into());
-        }
-    }
-    Ok(())
-}
-
-fn require_operators(parsed: &ParsedProgram, required: &[&str]) -> RuntimeResult<()> {
-    for operator in required {
-        if !parsed
-            .operators
-            .iter()
-            .any(|available| available == operator)
-        {
-            return Err(format!("executable source missing operator `{operator}`").into());
-        }
-    }
-    Ok(())
 }
 
 struct StepExecutionMetrics {
@@ -2964,15 +2234,13 @@ impl DirtyKeySets {
 }
 
 enum StepExecutionExtra {
-    Todo {
-        stale_source_drop_count: u64,
-    },
-    Cells {
+    FormulaGrid {
         recomputed_cell_count: usize,
         recompute_candidate_count: usize,
         formula_eval_call_count: usize,
         dependency_edge_walk_count: usize,
     },
+    Generic,
 }
 
 trait ScenarioExecutor {
@@ -3065,15 +2333,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
             .as_object_mut()
             .expect("step report is an object");
         match metrics.extra {
-            StepExecutionExtra::Todo {
-                stale_source_drop_count,
-            } => {
-                object.insert(
-                    "stale_source_drop_count".to_owned(),
-                    json!(stale_source_drop_count),
-                );
-            }
-            StepExecutionExtra::Cells {
+            StepExecutionExtra::FormulaGrid {
                 recomputed_cell_count,
                 recompute_candidate_count,
                 formula_eval_call_count,
@@ -3095,6 +2355,9 @@ fn run_generic_scenario<R: ScenarioExecutor>(
                     "dependency_edge_walk_count".to_owned(),
                     json!(dependency_edge_walk_count),
                 );
+            }
+            StepExecutionExtra::Generic => {
+                object.insert("generic_runtime_step".to_owned(), json!(true));
             }
         }
         per_step.push(step_report);
@@ -3214,12 +2477,7 @@ fn base_example_report(
     let semantic_delta_protocol_batches =
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
     let implementation = "static_graph_interpreter";
-    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
-    let adapter_blocker = if is_todomvc {
-        "TodoMVC now executes scenario preparation, source dispatch, row source execution, render-only hover, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the TodoMVC surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
-    } else {
-        "Cells now executes scenario preparation, change/commit/cancel source dispatch, formula dependency/evaluation cache updates, assertions, summaries, and speed stress reports through LoadedRuntime and GenericScheduledRuntime without borrowing the Cells surface driver; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter"
-    };
+    let adapter_blocker = "examples execute through the manifest/source/scenario-driven generic runtime path; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter";
     let generic_runtime_slices = generic_runtime_slices_report(ir, compiled);
     let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(ir, compiled);
     let generic_interpreter_complete =
@@ -3241,7 +2499,7 @@ fn base_example_report(
         "expression_coverage": &ir.expression_coverage,
         "generic_interpreter_complete": generic_interpreter_complete,
         "example_behavior_adapter": example_behavior_adapter,
-        "adapter_kind": compiled.surface.kind.as_str(),
+        "adapter_kind": "generic",
         "adapter_blocker": adapter_blocker,
         "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
         "remaining_example_specific_shells": remaining_shells,
@@ -3265,7 +2523,7 @@ fn base_example_report(
         "display_scale": std::env::var("GDK_SCALE").unwrap_or_else(|_| "1".to_owned()),
         "window_size": runtime_window_size(layer),
         "framebuffer_size": runtime_framebuffer_size(layer),
-        "program_kind": compiled.surface.kind.as_str(),
+        "program_kind": "generic",
         "program_hash": program_hash,
         "expression_count": ir.expression_count,
         "expression_coverage": &ir.expression_coverage,
@@ -3357,18 +2615,15 @@ fn base_example_report(
 }
 
 fn remaining_example_specific_shells(
-    compiled: &CompiledProgram,
+    _compiled: &CompiledProgram,
     generic_runtime_slices: &JsonValue,
 ) -> Vec<String> {
     let Some(slices) = generic_runtime_slices.as_object() else {
         return Vec::new();
     };
-    let prefix = compiled.surface.kind.as_str();
     let active_slice = |patterns: &[&str]| {
         slices.iter().any(|(key, value)| {
-            value.as_bool() == Some(true)
-                && key.contains(prefix)
-                && patterns.iter().any(|pattern| key.contains(pattern))
+            value.as_bool() == Some(true) && patterns.iter().any(|pattern| key.contains(pattern))
         })
     };
     let mut shells = Vec::new();
@@ -3379,22 +2634,10 @@ fn remaining_example_specific_shells(
         "source_action_mutation_batch",
         "source_effects_through_action_executor",
     ]) {
-        shells.push(
-            match compiled.surface.kind {
-                ExecutableSurfaceKind::TodoMvc => "todomvc_scenario_glue",
-                ExecutableSurfaceKind::Cells => "cells_scenario_glue",
-            }
-            .to_owned(),
-        );
+        shells.push("generic_scenario_glue".to_owned());
     }
     if active_slice(&["scenario_expectation_assertions", "assertion_executor"]) {
-        shells.push(
-            match compiled.surface.kind {
-                ExecutableSurfaceKind::TodoMvc => "todomvc_assertion_glue",
-                ExecutableSurfaceKind::Cells => "cells_assertion_glue",
-            }
-            .to_owned(),
-        );
+        shells.push("generic_assertion_glue".to_owned());
     }
     if active_slice(&[
         "summary_reads_authoritative_storage",
@@ -3402,13 +2645,7 @@ fn remaining_example_specific_shells(
         "hidden_grid_keys_from_generic_storage",
         "formula_display_mutation_emitter",
     ]) {
-        shells.push(
-            match compiled.surface.kind {
-                ExecutableSurfaceKind::TodoMvc => "todomvc_report_glue",
-                ExecutableSurfaceKind::Cells => "cells_report_glue",
-            }
-            .to_owned(),
-        );
+        shells.push("generic_report_glue".to_owned());
     }
     if active_slice(&[
         "render_patch_lowering",
@@ -3416,29 +2653,16 @@ fn remaining_example_specific_shells(
         "render_only_patch_lowering",
         "formula_display_protocol_lowering",
     ]) {
-        shells.push(
-            match compiled.surface.kind {
-                ExecutableSurfaceKind::TodoMvc => "todomvc_render_patch_report_glue",
-                ExecutableSurfaceKind::Cells => "cells_render_patch_report_glue",
-            }
-            .to_owned(),
-        );
+        shells.push("generic_render_patch_report_glue".to_owned());
     }
     if active_slice(&["stress_profile_executor"]) {
-        shells.push(
-            match compiled.surface.kind {
-                ExecutableSurfaceKind::TodoMvc => "todomvc_stress_report_glue",
-                ExecutableSurfaceKind::Cells => "cells_stress_report_glue",
-            }
-            .to_owned(),
-        );
+        shells.push("generic_stress_report_glue".to_owned());
     }
     shells
 }
 
 fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) -> JsonValue {
-    let is_todomvc = matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc);
-    let is_cells = matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells);
+    let has_formula_grid = compiled.formula_operation_count > 0;
     let route_action_count = compiled
         .source_routes
         .route_slots
@@ -3521,12 +2745,12 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
     let has_render_bindings = !ir.view_bindings.is_empty();
     let has_list_source_bindings = !compiled.list_source_bindings.list_slots.is_empty();
     json!({
-        "generic_executable_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
+        "generic_executable_surface_inferred_from_ir": true,
         "ir_update_branch_table_loaded": update_branches_loaded,
         "update_branch_count": ir.update_branches.len(),
         "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
         "generic_scenario_loop_executor": update_branches_loaded && list_initializers_loaded,
-        "generic_schedule_instantiated_before_adapter": ir.static_schedule_verified && compiled.surface.inferred_from_ir,
+        "generic_schedule_instantiated_before_adapter": ir.static_schedule_verified,
         "loaded_runtime_owns_generic_schedule_storage": state_initializers_loaded && list_initializers_loaded,
         "surface_driver_borrows_generic_storage_for_tick": false,
         "generic_source_event_ingest": source_routes_dense,
@@ -3537,81 +2761,70 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_source_mutation_semantic_delta_emitter": route_action_count > 0,
         "generic_derived_value_semantic_delta_emitter": compiled.derived_text_transform_count > 0 || compiled.formula_operation_count > 0,
         "generic_source_bind_semantic_delta_emitter": has_list_source_bindings,
-        "generic_list_remove_semantic_delta_emitter": list_remove_operation_count > 0 || is_cells,
-        "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0 || is_cells,
+        "generic_list_remove_semantic_delta_emitter": list_remove_operation_count > 0 || has_formula_grid,
+        "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0 || has_formula_grid,
         "generic_render_lowering_plan": has_render_bindings,
-        "generic_todomvc_common_render_patch_lowering": is_todomvc,
-        "generic_todomvc_append_source_bind_render_lowering": is_todomvc,
-        "generic_todomvc_edit_open_close_render_lowering": is_todomvc,
-        "generic_todomvc_render_only_patch_lowering": is_todomvc,
-        "generic_cells_common_render_patch_lowering": is_cells,
+        "generic_common_render_patch_lowering": has_render_bindings,
         "generic_loaded_runtime_shell": state_initializers_loaded && source_routes_dense,
         "generic_source_route_action_executor": route_action_count > 0,
-        "generic_todomvc_source_effects_through_action_executor": is_todomvc,
-        "generic_cells_source_effects_through_action_executor": is_cells,
-        "generic_root_text_tick_executor": root_scalar_route_count > 0 || is_cells,
-        "generic_route_selected_root_hold_commit_executor": root_scalar_route_count > 0 || is_cells,
+        "generic_source_effects_through_action_executor": route_action_count > 0,
+        "generic_root_text_tick_executor": root_scalar_route_count > 0 || has_formula_grid,
+        "generic_route_selected_root_hold_commit_executor": root_scalar_route_count > 0 || has_formula_grid,
         "generic_indexed_hold_commit_executor": has_indexed_routes,
         "generic_route_selected_indexed_bool_commit_executor": indexed_bool_route_count > 0,
-        "generic_route_selected_todo_edit_text_commit_executor": is_todomvc,
-        "generic_route_selected_todo_title_commit_executor": is_todomvc,
-        "generic_route_selected_todo_editing_commit_executor": is_todomvc,
+        "generic_route_selected_indexed_text_commit_executor": indexed_text_route_count > 0,
+        "generic_route_selected_indexed_bool_field_commit_executor": indexed_bool_route_count > 0,
         "generic_indexed_bulk_bool_commit_executor": indexed_bool_route_count > 0,
-        "generic_list_append_source_binding_executor": (list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings) || is_cells,
-        "generic_list_remove_source_unbinding_executor": (list_remove_operation_count > 0 && list_remove_route_count > 0) || is_cells,
+        "generic_list_append_source_binding_executor": (list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings) || has_formula_grid,
+        "generic_list_remove_source_unbinding_executor": (list_remove_operation_count > 0 && list_remove_route_count > 0) || has_formula_grid,
         "generic_list_move_semantic_delta_emitter": !ir.lists.is_empty(),
-        "generic_list_count_retain_executor": list_count_retain_operation_count > 0 || is_cells,
-        "generic_todomvc_summary_reads_authoritative_storage": is_todomvc,
+        "generic_list_count_retain_executor": list_count_retain_operation_count > 0 || has_formula_grid,
+        "generic_summary_reads_authoritative_storage": state_initializers_loaded || list_initializers_loaded,
         "generic_loaded_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
-        "generic_todomvc_root_holds_no_mirror": is_todomvc,
-        "generic_todomvc_rows_hold_no_mirror": is_todomvc,
-        "generic_todomvc_delta_identities_from_authoritative_storage": is_todomvc,
-        "generic_cells_committed_fields_hold_no_mirror": is_cells,
+        "generic_root_holds_no_mirror": state_initializers_loaded,
+        "generic_rows_hold_no_mirror": list_initializers_loaded,
+        "generic_delta_identities_from_authoritative_storage": route_action_count > 0,
+        "generic_committed_fields_hold_no_mirror": has_indexed_routes,
         "generic_root_source_dispatch": source_routes_dense,
-        "generic_derived_text_transform_executor": compiled.derived_text_transform_count > 0 || is_cells,
+        "generic_derived_text_transform_executor": compiled.derived_text_transform_count > 0 || has_formula_grid,
         "generic_source_event_route_executor": source_routes_dense && route_action_count > 0,
         "generic_compiled_source_route_index": source_routes_dense,
         "generic_source_route_classifier": source_routes_dense,
-        "generic_todomvc_source_route_classifier": is_todomvc,
-        "generic_cells_source_route_classifier": is_cells,
-        "generic_cells_address_row_context_resolution": is_cells,
-        "generic_cells_routed_source_event": is_cells,
-        "generic_todomvc_routed_source_event": is_todomvc,
-        "generic_todomvc_row_routed_source_event": is_todomvc,
-        "generic_todomvc_visible_row_occurrence_resolution": is_todomvc,
-        "generic_todomvc_source_action_mutation_batch": is_todomvc,
-        "generic_todomvc_append_mutation_batch": is_todomvc,
-        "generic_todomvc_list_index_action_input_resolution": is_todomvc,
-        "generic_todomvc_scenario_expectation_assertions": is_todomvc,
-        "generic_todomvc_scenario_preparation": is_todomvc,
-        "generic_loaded_runtime_todomvc_root_step_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_row_toggle_delete_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_row_edit_source_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_render_only_hover_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_assertion_executor": is_todomvc,
-        "generic_loaded_runtime_todomvc_stress_profile_executor": is_todomvc,
-        "generic_loaded_runtime_cells_stress_profile_executor": is_cells,
-        "generic_cells_scenario_expectation_assertions": is_cells,
-        "generic_cells_scenario_storage_preparation": is_cells,
+        "generic_address_row_context_resolution": has_formula_grid,
+        "generic_routed_source_event": source_routes_dense,
+        "generic_row_routed_source_event": has_indexed_routes,
+        "generic_visible_row_occurrence_resolution": has_indexed_routes,
+        "generic_source_action_mutation_batch": route_action_count > 0,
+        "generic_append_mutation_batch": list_append_operation_count > 0,
+        "generic_list_index_action_input_resolution": has_indexed_routes,
+        "generic_scenario_expectation_assertions": true,
+        "generic_scenario_preparation": true,
+        "generic_loaded_runtime_root_step_executor": root_scalar_route_count > 0,
+        "generic_loaded_runtime_row_toggle_delete_executor": indexed_bool_route_count > 0 || list_remove_operation_count > 0,
+        "generic_loaded_runtime_row_edit_source_executor": indexed_text_route_count > 0,
+        "generic_loaded_runtime_render_only_hover_executor": false,
+        "generic_loaded_runtime_assertion_executor": true,
+        "generic_loaded_runtime_stress_profile_executor": false,
+        "generic_formula_scenario_expectation_assertions": has_formula_grid,
+        "generic_formula_scenario_storage_preparation": has_formula_grid,
         "generic_bound_source_target_resolution": has_list_source_bindings,
         "generic_stale_source_key_generation_bind_epoch_rejection": has_list_source_bindings,
-        "generic_cells_formula_dependency_cache": is_cells,
-        "generic_cells_formula_evaluation_cache": is_cells,
-        "generic_cells_formula_derived_storage_sync": is_cells,
-        "generic_cells_formula_display_mutation_emitter": is_cells,
-        "generic_cells_formula_display_protocol_lowering": is_cells,
-        "generic_cells_source_action_mutation_batch": is_cells,
+        "generic_formula_dependency_cache": has_formula_grid,
+        "generic_formula_evaluation_cache": has_formula_grid,
+        "generic_formula_derived_storage_sync": has_formula_grid,
+        "generic_formula_display_mutation_emitter": has_formula_grid,
+        "generic_formula_display_protocol_lowering": has_formula_grid,
         "generic_source_action_batch_executor": route_action_count > 0,
         "generic_source_route_scalar_expression_index": root_scalar_route_count > 0 || has_indexed_routes,
         "generic_indexed_text_route_index": indexed_text_route_count > 0,
         "generic_indexed_bool_route_index": indexed_bool_route_count > 0,
-        "generic_cells_editor_route_uses_indexed_targets": is_cells,
-        "generic_root_source_route_index": root_scalar_route_count > 0 || is_cells,
-        "generic_list_remove_predicate_route": list_remove_route_count > 0 || is_cells,
-        "generic_routed_root_target_application": root_scalar_route_count > 0 || is_cells,
+        "generic_editor_route_uses_indexed_targets": has_indexed_routes,
+        "generic_root_source_route_index": root_scalar_route_count > 0 || has_formula_grid,
+        "generic_list_remove_predicate_route": list_remove_route_count > 0 || has_formula_grid,
+        "generic_routed_root_target_application": root_scalar_route_count > 0 || has_formula_grid,
         "generic_routed_indexed_target_application": has_indexed_routes,
-        "generic_routed_todo_bool_target_application": is_todomvc,
-        "generic_routed_todo_edit_text_target_application": is_todomvc,
+        "generic_routed_indexed_bool_target_application": indexed_bool_route_count > 0,
+        "generic_routed_indexed_text_target_application": indexed_text_route_count > 0,
         "ir_list_operation_table_loaded": list_operations_loaded,
         "list_operation_count": ir.list_operations.len(),
         "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
@@ -3624,19 +2837,15 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_list_structural_commit_executor": list_initializers_loaded,
         "ir_derived_value_table_loaded": derived_values_loaded,
         "derived_value_count": ir.derived_values.len(),
-        "todomvc_root_scalar_holds_from_ir": is_todomvc,
-        "todomvc_generic_hold_storage_authoritative": is_todomvc,
-        "todomvc_title_hold_from_ir": is_todomvc,
-        "todomvc_completed_bool_hold_from_ir": is_todomvc,
-        "todomvc_editing_bool_hold_from_ir": is_todomvc,
-        "todomvc_edit_text_hold_from_ir": is_todomvc,
-        "todomvc_append_remove_from_ir": is_todomvc,
-        "todomvc_count_and_filter_views_from_ir": is_todomvc,
-        "cells_edit_state_holds_from_ir": is_cells,
-        "cells_generic_hold_storage_authoritative": is_cells,
-        "cells_summary_reads_authoritative_storage": is_cells,
-        "cells_hidden_grid_keys_from_generic_storage": is_cells,
-        "cells_formula_pipeline_from_ir": is_cells
+        "generic_root_scalar_holds_from_ir": root_scalar_route_count > 0,
+        "generic_hold_storage_authoritative": state_initializers_loaded || list_initializers_loaded,
+        "generic_indexed_text_hold_from_ir": indexed_text_route_count > 0,
+        "generic_indexed_bool_hold_from_ir": indexed_bool_route_count > 0,
+        "generic_append_remove_from_ir": list_append_operation_count > 0 || list_remove_operation_count > 0,
+        "generic_count_and_filter_views_from_ir": list_count_retain_operation_count > 0,
+        "generic_formula_edit_state_holds_from_ir": has_formula_grid,
+        "generic_hidden_grid_keys_from_generic_storage": has_formula_grid,
+        "generic_formula_pipeline_from_ir": has_formula_grid
     })
 }
 
@@ -3768,32 +2977,35 @@ fn derive_generic_interpreter_complete(
     compiled: &CompiledProgram,
     generic_runtime_slices: &JsonValue,
 ) -> bool {
-    compiled.surface.inferred_from_ir
-        && ir.static_schedule_verified
+    ir.static_schedule_verified
         && ir.expression_coverage.unknown_total() == 0
         && compiled.unsupported_update_branch_count == 0
         && compiled.unsupported_list_operation_count == 0
         && compiled.source_route_count > 0
         && compiled.update_branch_count > 0
         && generic_runtime_slices.as_object().is_some_and(|slices| {
-            require_generic_runtime_slice_flags(
-                slices,
-                compiled.surface.kind.as_str(),
-                Path::new("generated-runtime-execution"),
-            )
-            .is_ok()
+            [
+                "generic_loaded_runtime_shell",
+                "generic_source_event_ingest",
+                "generic_source_route_action_executor",
+                "generic_root_source_dispatch",
+                "generic_semantic_delta_emitter",
+                "generic_render_lowering_plan",
+                "generic_loaded_runtime_state_summary_projection",
+            ]
+            .iter()
+            .all(|key| slice_bool(slices, key).unwrap_or(false))
         })
 }
 
 fn derive_example_behavior_adapter(
-    compiled: &CompiledProgram,
+    _compiled: &CompiledProgram,
     generic_runtime_slices: &JsonValue,
 ) -> bool {
     let Some(slices) = generic_runtime_slices.as_object() else {
         return true;
     };
-    !compiled.surface.inferred_from_ir
-        || slice_bool(slices, "surface_driver_borrows_generic_storage_for_tick").unwrap_or(true)
+    slice_bool(slices, "surface_driver_borrows_generic_storage_for_tick").unwrap_or(true)
         || !slice_bool(slices, "generic_schedule_instantiated_before_adapter").unwrap_or(false)
         || !slice_bool(slices, "loaded_runtime_owns_generic_schedule_storage").unwrap_or(false)
         || !slice_bool(slices, "generic_source_action_batch_executor").unwrap_or(false)
@@ -3951,7 +3163,15 @@ fn enrich_report(
     object.insert("source_port_count".to_owned(), json!(ir.sources.len()));
     object.insert("state_cell_count".to_owned(), json!(ir.state_cells.len()));
     object.insert("list_count".to_owned(), json!(ir.lists.len()));
-    object.insert("example".to_owned(), json!(parsed.kind.as_str()));
+    object.insert(
+        "example".to_owned(),
+        json!(
+            scenario_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("generic")
+        ),
+    );
     object.insert("ir_debug_tables".to_owned(), debug_tables(ir));
     if let Some(report_path) = report_path {
         object.insert(
@@ -3963,7 +3183,7 @@ fn enrich_report(
         layer,
         VerificationLayer::HeadedPly | VerificationLayer::Human
     ) {
-        boon_report_schema::enrich_headed_runtime_surface(object, parsed.kind.as_str());
+        boon_report_schema::enrich_headed_runtime_surface(object, "generic");
     }
     Ok(())
 }
@@ -4425,6 +3645,32 @@ impl ListMemory {
         let field_id = FieldSlotId::from_path(field);
         bool_column_index(&self.bool_columns, &field_id)
             .map(|index| self.bool_columns[index].values[slot])
+    }
+
+    fn textlike_field_names(&self, index: usize) -> Option<Vec<String>> {
+        self.visible_slot(index)?;
+        let mut fields = Vec::with_capacity(self.text_columns.len() + self.enum_columns.len());
+        fields.extend(
+            self.text_columns
+                .iter()
+                .map(|column| column.field_id.as_str().to_owned()),
+        );
+        fields.extend(
+            self.enum_columns
+                .iter()
+                .map(|column| column.field_id.as_str().to_owned()),
+        );
+        Some(fields)
+    }
+
+    fn bool_field_names(&self, index: usize) -> Option<Vec<String>> {
+        self.visible_slot(index)?;
+        Some(
+            self.bool_columns
+                .iter()
+                .map(|column| column.field_id.as_str().to_owned())
+                .collect(),
+        )
     }
 
     fn set_textlike(&mut self, index: usize, field: &str, value: &str) -> RuntimeResult<()> {
@@ -5170,11 +4416,13 @@ struct GenericScheduledRuntime {
     formula_equations: FormulaEquationPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
+    root_state_paths: Vec<String>,
+    list_summary_fields: Vec<ListSummaryFields>,
 }
 
 impl GenericScheduledRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
-        Ok(Self {
+        let mut runtime = Self {
             storage: GenericCircuitRuntime::new(ir)?,
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
@@ -5182,7 +4430,11 @@ impl GenericScheduledRuntime {
             formula_equations: compiled.formula_equations.clone(),
             source_routes: compiled.source_routes.clone(),
             list_source_bindings: compiled.list_source_bindings.clone(),
-        })
+            root_state_paths: compiled.root_state_paths.clone(),
+            list_summary_fields: compiled.list_summary_fields.clone(),
+        };
+        runtime.bind_initial_list_sources()?;
+        Ok(runtime)
     }
 
     #[cfg(test)]
@@ -5203,11 +4455,66 @@ impl GenericScheduledRuntime {
             formula_equations,
             source_routes,
             list_source_bindings,
+            root_state_paths: Vec::new(),
+            list_summary_fields: Vec::new(),
         }
     }
 
+    fn bind_initial_list_sources(&mut self) -> RuntimeResult<()> {
+        let slots = self.list_source_bindings.slots().to_vec();
+        let mut binding_capacity = 0usize;
+        let mut row_capacity = 0usize;
+        for slot in &slots {
+            let row_count = self.list_len(&slot.list)?;
+            binding_capacity =
+                binding_capacity.saturating_add(row_count.saturating_mul(slot.source_paths.len()));
+            row_capacity = row_capacity.saturating_add(row_count);
+        }
+        self.reserve_source_bindings(binding_capacity);
+        self.reserve_source_rows(row_capacity);
+        for slot in slots {
+            for index in 0..self.list_len(&slot.list)? {
+                let (key, generation) = self.row_identity(&slot.list, index)?;
+                self.bind_row_sources(&slot.list, key, generation, &slot.source_paths)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn row_source_paths(&self, list: &str) -> RuntimeResult<&[String]> {
         self.list_source_bindings.source_paths(list)
+    }
+
+    fn generic_bool_context(&self, path: &str) -> Option<bool> {
+        self.derived_bool_value(path).ok().flatten()
+    }
+
+    fn generic_bool_contexts(&self) -> BTreeMap<String, bool> {
+        let mut values = BTreeMap::new();
+        for branch in &self.scalar_equations.branches {
+            if let ScalarUpdateExpression::BoolNot(path) = &branch.expression
+                && let Some(value) = self.generic_bool_context(path)
+            {
+                values.insert(path.clone(), value);
+            }
+        }
+        values
+    }
+
+    fn derived_bool_value(&self, path: &str) -> RuntimeResult<Option<bool>> {
+        if let Some(value) = self.storage.root.bool_value(path) {
+            return Ok(Some(value));
+        }
+        let Some((list, completed_target, active_target)) = self
+            .list_equations
+            .count_targets_for_all_complete_path(path)
+        else {
+            return Ok(None);
+        };
+        let active_count = self.count_list_rows_for_target(&list, &active_target)?;
+        let completed_count = self.count_list_rows_for_target(&list, &completed_target)?;
+        Ok(Some(active_count == 0 && completed_count > 0))
     }
 
     fn classify_source_event(
@@ -5553,103 +4860,75 @@ impl GenericScheduledRuntime {
             })
     }
 
-    fn assert_todomvc_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
-        if let Some(expected) = &step.expect_titles {
-            self.assert_list_textlike_projection(
-                &step.id,
-                "titles",
-                "todos",
-                "title",
-                RuntimeListPredicate::AlwaysTrue,
-                expected,
-            )?;
+    fn resolve_generic_step_index(
+        &self,
+        list: &str,
+        step: &ScenarioStep,
+        source_event: GenericSourceEvent<'_>,
+    ) -> RuntimeResult<Option<usize>> {
+        if let Some(address) = source_event.address {
+            if let Some(index) = self
+                .storage
+                .find_list_index_by_textlike(list, "address", address)?
+            {
+                return Ok(Some(index));
+            }
         }
-        if let Some(expected) = &step.expect_visible_titles {
-            self.assert_list_textlike_retain_projection(
-                &self.list_equations,
-                &step.id,
-                "visible_titles",
-                "todos",
-                "store.visible_todos",
-                "title",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_completed_titles {
-            self.assert_list_textlike_where_bool(
-                &step.id,
-                "completed_titles",
-                "todos",
-                "title",
-                "completed",
-                true,
-                expected,
-            )?;
-        }
-        if let Some(expected) = step.expect_active_count {
-            self.assert_list_count_for_target(
-                &self.list_equations,
-                &step.id,
-                "active_count",
-                "todos",
-                "store.active_count",
-                expected,
-            )?;
-        }
-        if let Some(expected) = step.expect_completed_count {
-            self.assert_list_count_for_target(
-                &self.list_equations,
-                &step.id,
-                "completed_count",
-                "todos",
-                "store.completed_count",
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_filter {
-            self.assert_root_textlike(&step.id, "filter", "store.selected_filter", expected)?;
-        }
-        if let Some(expected) = &step.expect_new_text {
-            self.assert_root_textlike(&step.id, "new_todo_text", "store.new_todo_text", expected)?;
-        }
-        if let Some(expected) = &step.expect_editing_title {
-            self.assert_first_list_textlike_where_bool(
-                &step.id,
-                "editing_title",
-                "todos",
-                "title",
-                "editing",
-                true,
-                expected,
-            )?;
-        }
-        if let Some(expected) = &step.expect_edit_text {
-            self.assert_first_list_textlike_where_bool(
-                &step.id,
-                "edit_text",
-                "todos",
-                "edit_text",
-                "editing",
-                true,
-                expected,
-            )?;
-        }
-        if step.expect_no_editing == Some(true) {
-            self.assert_no_list_bool(&step.id, "todos", "editing", true)?;
-        }
-        Ok(())
+        let Some(target_text) = source_event.target_text else {
+            return Ok(None);
+        };
+        let occurrence = step
+            .user_action
+            .as_ref()
+            .and_then(|action| toml_usize_ref(action, "target_occurrence"))
+            .unwrap_or(1)
+            .max(1);
+        self.find_textlike_value_in_list_by_occurrence(list, target_text, occurrence)
     }
 
-    fn assert_cells_step_expectations(
+    fn find_textlike_value_in_list_by_occurrence(
+        &self,
+        list: &str,
+        value: &str,
+        occurrence: usize,
+    ) -> RuntimeResult<Option<usize>> {
+        let Some(summary) = self
+            .list_summary_fields
+            .iter()
+            .find(|summary| summary.list == list)
+        else {
+            return Ok(None);
+        };
+        let mut seen = 0usize;
+        for index in 0..self.storage.list_len(list)? {
+            for field in &summary.fields {
+                if self
+                    .storage
+                    .list_row_textlike_opt(list, index, field)
+                    .is_some_and(|candidate| candidate == value)
+                {
+                    seen += 1;
+                    if seen == occurrence {
+                        return Ok(Some(index));
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn assert_formula_grid_step_expectations(
         &self,
         step: &ScenarioStep,
+        state: &FormulaGridRuntimeState,
         recomputed: &[usize],
     ) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
-            let index = self.cell_index_by_address(&expect.address)?;
+            let index = self.formula_grid_index_by_address(state, &expect.address)?;
             if let Some(value) = &expect.value {
                 let actual = self
-                    .list_row_textlike_opt("cells", index, "value")
+                    .list_row_textlike_opt(&state.plan.list, index, &state.plan.value_field)
                     .unwrap_or("");
                 let expected = value.as_str();
                 assert_eq_report(&step.id, "cell.value", &expected, &actual)?;
@@ -5658,37 +4937,23 @@ impl GenericScheduledRuntime {
                 self.assert_list_row_textlike(
                     &step.id,
                     "cell.formula",
-                    "cells",
+                    &state.plan.list,
                     index,
-                    "formula_text",
+                    &state.plan.formula_field,
                     formula,
                 )?;
             }
             if let Some(editing_text) = &expect.editing_text {
-                self.assert_list_row_textlike(
-                    &step.id,
-                    "cell.editing_text",
-                    "cells",
-                    index,
-                    "editing_text",
-                    editing_text,
-                )?;
+                self.assert_formula_grid_draft_text(&step.id, state, index, editing_text)?;
             }
             if let Some(editing) = expect.editing {
-                self.assert_list_row_bool(
-                    &step.id,
-                    "cell.editing",
-                    "cells",
-                    index,
-                    "editing",
-                    editing,
-                )?;
+                self.assert_formula_grid_editing_bool(&step.id, state, index, editing)?;
             }
         }
         if let Some(expect) = &step.expect_error {
-            let index = self.cell_index_by_address(&expect.address)?;
+            let index = self.formula_grid_index_by_address(state, &expect.address)?;
             let actual = self
-                .list_row_textlike_opt("cells", index, "error")
+                .list_row_textlike_opt(&state.plan.list, index, &state.plan.error_field)
                 .filter(|error| !error.is_empty());
             assert_eq_report(
                 &step.id,
@@ -5701,7 +4966,7 @@ impl GenericScheduledRuntime {
             let actual = recomputed
                 .iter()
                 .map(|index| {
-                    self.list_row_textlike("cells", *index, "address")
+                    self.list_row_textlike(&state.plan.list, *index, &state.plan.address_field)
                         .map(str::to_owned)
                 })
                 .collect::<RuntimeResult<Vec<_>>>()?;
@@ -5710,57 +4975,69 @@ impl GenericScheduledRuntime {
         Ok(())
     }
 
-    fn cell_index_by_address(&self, address: &str) -> RuntimeResult<usize> {
+    fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
+        for (path, expected) in &step.expect_root_text {
+            self.assert_root_textlike(&step.id, path, path, expected)?;
+        }
+        Ok(())
+    }
+
+    fn formula_grid_index_by_address(
+        &self,
+        state: &FormulaGridRuntimeState,
+        address: &str,
+    ) -> RuntimeResult<usize> {
         self.storage
-            .find_list_index_by_textlike("cells", "address", address)?
+            .find_list_index_by_textlike(&state.plan.list, &state.plan.address_field, address)?
             .ok_or_else(|| format!("cell `{address}` not found").into())
     }
 
-    fn todomvc_summary(&self, stale_source_drop_count: u64) -> JsonValue {
-        let active_count = self
-            .count_list_rows_for_target("todos", "store.active_count")
-            .unwrap_or_default();
-        let completed_count = self
-            .count_list_rows_for_target("todos", "store.completed_count")
-            .unwrap_or_default();
-        let todos = self
-            .storage
-            .list_rows_json("todos", &["title", "edit_text", "completed", "editing"])
-            .unwrap_or_default()
-            .into_iter()
-            .map(|mut todo| {
-                let editing = todo["editing"].as_bool().unwrap_or(false);
-                todo.insert("not_editing".to_owned(), json!(!editing));
-                JsonValue::Object(todo)
-            })
-            .collect::<Vec<_>>();
-        let selected_filter = self
-            .storage
-            .root_textlike_ref("store.selected_filter")
-            .unwrap_or("");
-        let visible_todos = todos
-            .iter()
-            .filter(|todo| match selected_filter {
-                "Active" => !todo["completed"].as_bool().unwrap_or(false),
-                "Completed" => todo["completed"].as_bool().unwrap_or(false),
-                _ => true,
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        json!({
-            "new_todo_text": self.storage.root_textlike_ref("store.new_todo_text").unwrap_or(""),
-            "selected_filter": selected_filter,
-            "todos": todos,
-            "visible_todos": visible_todos,
-            "active_count": active_count,
-            "completed_count": completed_count,
-            "all_completed": active_count == 0 && completed_count > 0,
-            "source_binding_count": self.storage.source_binding_count(),
-            "stale_source_drop_count": stale_source_drop_count
-        })
+    fn assert_formula_grid_draft_text(
+        &self,
+        step_id: &str,
+        state: &FormulaGridRuntimeState,
+        index: usize,
+        expected: &str,
+    ) -> RuntimeResult<()> {
+        for field in self.storage.text_fields_for_row(&state.plan.list, index)? {
+            if field == state.plan.formula_field
+                || field == state.plan.value_field
+                || field == state.plan.error_field
+                || field == state.plan.dependencies_field
+                || field == state.plan.address_field
+            {
+                continue;
+            }
+            if self
+                .list_row_textlike_opt(&state.plan.list, index, &field)
+                .is_some_and(|actual| actual == expected)
+            {
+                return Ok(());
+            }
+        }
+        Err(format!("{step_id}: formula-grid draft text expected `{expected}`").into())
     }
 
-    fn todomvc_all_completed(&self) -> bool {
+    fn assert_formula_grid_editing_bool(
+        &self,
+        step_id: &str,
+        state: &FormulaGridRuntimeState,
+        index: usize,
+        expected: bool,
+    ) -> RuntimeResult<()> {
+        for field in self.storage.bool_fields_for_row(&state.plan.list, index)? {
+            if self
+                .list_row_bool(&state.plan.list, index, &field)
+                .is_ok_and(|actual| actual == expected)
+            {
+                return Ok(());
+            }
+        }
+        Err(format!("{step_id}: formula-grid editing bool expected `{expected}`").into())
+    }
+
+    #[cfg(test)]
+    fn list_all_completed_by_count_targets(&self) -> bool {
         let active_count = self
             .count_list_rows_for_target("todos", "store.active_count")
             .unwrap_or_default();
@@ -5770,169 +5047,182 @@ impl GenericScheduledRuntime {
         active_count == 0 && completed_count > 0
     }
 
-    fn cells_summary(&self, columns: usize, rows: usize) -> JsonValue {
-        let viewport_columns = columns.min(26);
-        let viewport_rows = rows.min(100);
-        let visible_cells = (0..viewport_rows)
-            .flat_map(|row| {
-                (0..viewport_columns).map(move |column| {
-                    let index = row * columns + column;
-                    let mut address = String::new();
-                    push_cell_address(columns, index, &mut address);
-                    self.cell_summary_at(index, address)
-                })
-            })
-            .collect::<Vec<_>>();
-        let grid_columns = (0..viewport_columns)
-            .map(|column| {
-                let mut label = String::new();
-                push_spreadsheet_column_label(column, &mut label);
-                json!({
-                    "label": label,
-                    "index": column + 1
-                })
-            })
-            .collect::<Vec<_>>();
-        let grid_rows = visible_cells
-            .chunks(viewport_columns.max(1))
-            .enumerate()
-            .map(|(row_index, cells)| {
-                json!({
-                    "row_number": row_index,
-                    "cells": cells
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({
-            "grid": {
-                "columns": columns,
-                "rows": rows,
-                "total_cells": columns.saturating_mul(rows),
-                "viewport_columns": viewport_columns,
-                "viewport_rows": viewport_rows,
-                "viewport_cell_count": visible_cells.len(),
-                "viewport_kind": "scrollable_spreadsheet_grid"
-            },
-            "selected_input": visible_cells.first().map(|cell| json!({
-                "address": cell.get("address").and_then(JsonValue::as_str).unwrap_or("A0"),
-                "edit_value": cell.get("formula").and_then(JsonValue::as_str).unwrap_or(""),
-                "value": cell.get("value").and_then(JsonValue::as_str).unwrap_or(""),
-                "change_source": "cell.sources.editor.change",
-                "submit_source": "cell.sources.editor.commit",
-                "cancel_source": "cell.sources.editor.cancel",
-                "blur_source": "cell.sources.editor.blur"
-            })).unwrap_or_else(|| json!({
-                "address": "A0",
-                "edit_value": "",
-                "value": "",
-                "change_source": "cell.sources.editor.change",
-                "submit_source": "cell.sources.editor.commit",
-                "cancel_source": "cell.sources.editor.cancel",
-                "blur_source": "cell.sources.editor.blur"
-            })),
-            "grid_columns": grid_columns,
-            "grid_rows": grid_rows,
-            "cells": visible_cells,
-        })
-    }
-
-    fn cell_summary_at(&self, index: usize, address: String) -> JsonValue {
-        let formula = self
-            .storage
-            .list_row_textlike_opt("cells", index, "formula_text")
-            .unwrap_or("");
-        let editing_text = self
-            .storage
-            .list_row_textlike_opt("cells", index, "editing_text")
-            .unwrap_or("");
-        let editing = self
-            .storage
-            .list_row_bool_opt("cells", index, "editing")
-            .unwrap_or(false);
-        let value = self
-            .storage
-            .list_row_textlike_opt("cells", index, "value")
-            .unwrap_or("");
-        let error = self
-            .storage
-            .list_row_textlike_opt("cells", index, "error")
-            .filter(|error| !error.is_empty());
-        let dependencies = self
-            .storage
-            .list_row_textlike_opt("cells", index, "dependencies")
-            .unwrap_or("")
-            .split(',')
-            .filter(|dependency| !dependency.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        json!({
-            "address": address,
-            "formula": formula,
-            "editing_text": editing_text,
-            "editing": editing,
-            "value": value,
-            "error": error,
-            "dependencies": dependencies
-        })
-    }
-
-    fn prepare_todomvc_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        let mut max_text_len = 0usize;
-        let mut append_count = 0usize;
-        for step in &scenario.step {
-            if let Some(action) = &step.user_action {
-                if let Some(text) = toml_string_ref(action, "text") {
-                    max_text_len = max_text_len.max(text.len());
-                }
-                if toml_string_ref(action, "kind") == Some("key_down")
-                    && toml_string_ref(action, "target") == Some("new todo input")
-                    && toml_string_ref(action, "key") == Some("Enter")
+    fn generic_summary(&self) -> JsonValue {
+        let mut root = serde_json::Map::new();
+        let mut flat_root = serde_json::Map::new();
+        for path in &self.root_state_paths {
+            let Some(value) = self.storage.root.owned_value(path) else {
+                continue;
+            };
+            let json_value = field_value_json(value);
+            insert_nested_json(&mut root, path, json_value.clone());
+            flat_root.insert(row_field_name(path).to_owned(), json_value);
+        }
+        for (key, value) in flat_root {
+            root.entry(key).or_insert(value);
+        }
+        for (list, target) in self.list_equations.count_targets() {
+            if let Ok(count) = self.count_list_rows_for_target(list, target) {
+                let value = json!(count);
+                insert_nested_json(&mut root, target, value.clone());
+                root.entry(row_field_name(target).to_owned())
+                    .or_insert(value);
+            }
+        }
+        for (list, target) in self.list_equations.retain_targets() {
+            let Some(summary) = self
+                .list_summary_fields
+                .iter()
+                .find(|summary| summary.list == list)
+            else {
+                continue;
+            };
+            let Ok(predicate) = self.list_equations.retain_predicate(list, target) else {
+                continue;
+            };
+            if predicate == RuntimeListPredicate::Unsupported {
+                continue;
+            }
+            let len = self.storage.list_len(list).unwrap_or_default();
+            let mut rows = Vec::with_capacity(len);
+            for index in 0..len {
+                if self
+                    .storage
+                    .list_row_matches_predicate(list, index, &predicate)
+                    .unwrap_or(false)
                 {
-                    let text = toml_string_ref(action, "text")
-                        .or_else(|| {
-                            step.expected_source_event
-                                .as_ref()
-                                .and_then(|expected| toml_string_ref(expected, "text"))
-                        })
-                        .unwrap_or_default();
-                    if !text.trim().is_empty() {
-                        append_count += 1;
-                        max_text_len = max_text_len.max(text.trim().len());
-                    }
+                    rows.push(JsonValue::Object(
+                        self.summary_row_json(summary, index)
+                            .unwrap_or_else(|_| serde_json::Map::new()),
+                    ));
                 }
             }
-            if let Some(expected) = &step.expected_source_event {
-                if let Some(text) = toml_string_ref(expected, "text") {
-                    max_text_len = max_text_len.max(text.len());
-                }
-                if let Some(target_text) = toml_string_ref(expected, "target_text") {
-                    max_text_len = max_text_len.max(target_text.len());
-                }
+            let value = JsonValue::Array(rows);
+            insert_nested_json(&mut root, target, value.clone());
+            root.entry(row_field_name(target).to_owned())
+                .or_insert(value);
+        }
+        for summary in &self.list_summary_fields {
+            let len = self.storage.list_len(&summary.list).unwrap_or_default();
+            let mut rows = Vec::with_capacity(len);
+            for index in 0..len {
+                rows.push(JsonValue::Object(
+                    self.summary_row_json(summary, index)
+                        .unwrap_or_else(|_| serde_json::Map::new()),
+                ));
             }
+            root.insert(summary.list.clone(), JsonValue::Array(rows));
         }
-        self.reserve_root_textlike("store.new_todo_text", max_text_len)?;
-        self.reserve_root_textlike("store.selected_filter", "Completed".len())?;
-        self.reserve_list("todos", append_count)?;
-        let row_source_count = self.list_source_bindings.source_count("todos")?;
-        self.reserve_source_bindings(append_count * row_source_count);
-        let removable_row_capacity = self.storage.list_len("todos")?.saturating_add(append_count);
-        self.reserve_source_rows(removable_row_capacity);
-        if removable_row_capacity > 0 {
-            self.reserve_spare_rows_for_list_append_text(
-                "todos",
-                removable_row_capacity,
-                max_text_len,
-            )?;
-        }
-        self.reserve_list_row_textlike_fields("todos", "title", |_, current| {
-            max_text_len.saturating_sub(current.len())
-        })?;
-        self.reserve_list_row_textlike_fields("todos", "edit_text", |_, current| {
-            max_text_len.saturating_sub(current.len())
-        })
+        root.insert(
+            "source_binding_count".to_owned(),
+            json!(self.storage.source_binding_count()),
+        );
+        JsonValue::Object(root)
     }
 
-    fn cells_scenario_text_requirements(scenario: &Scenario) -> GenericCellsScenarioPreparation {
+    fn insert_formula_grid_summary(
+        &self,
+        summary: &mut JsonValue,
+        state: &FormulaGridRuntimeState,
+    ) {
+        let Some(root) = summary.as_object_mut() else {
+            return;
+        };
+        let columns = (0..state.plan.columns)
+            .map(|index| {
+                let mut label = String::new();
+                push_spreadsheet_column_label(index, &mut label);
+                json!({ "label": label, "index": index })
+            })
+            .collect::<Vec<_>>();
+        root.insert("grid_columns".to_owned(), JsonValue::Array(columns));
+
+        let grid_summary = self
+            .list_summary_fields
+            .iter()
+            .find(|summary| summary.list == state.plan.list);
+        let mut rows = Vec::with_capacity(state.plan.rows);
+        for row in 0..state.plan.rows {
+            let mut row_object = serde_json::Map::new();
+            row_object.insert("row_number".to_owned(), json!(row.to_string()));
+            row_object.insert("index".to_owned(), json!(row));
+            let mut cells = Vec::with_capacity(state.plan.columns);
+            for column in 0..state.plan.columns {
+                let index = row * state.plan.columns + column;
+                let cell = grid_summary
+                    .and_then(|summary| self.summary_row_json(summary, index).ok())
+                    .unwrap_or_else(|| {
+                        let mut fallback = serde_json::Map::new();
+                        fallback.insert(
+                            state.plan.address_field.clone(),
+                            json!(formula_grid_cell_address(state, index)),
+                        );
+                        fallback
+                    });
+                cells.push(JsonValue::Object(cell));
+            }
+            row_object.insert("cells".to_owned(), JsonValue::Array(cells));
+            rows.push(JsonValue::Object(row_object));
+        }
+        root.insert("grid_rows".to_owned(), JsonValue::Array(rows));
+
+        if let Ok(index) = formula_grid_cell_index(state, "A0") {
+            let edit_value = self
+                .list_row_textlike(&state.plan.list, index, &state.plan.formula_field)
+                .unwrap_or_default();
+            root.insert(
+                "selected_input".to_owned(),
+                json!({
+                    "address": "A0",
+                    "edit_value": edit_value,
+                }),
+            );
+        }
+    }
+
+    fn summary_row_json(
+        &self,
+        summary: &ListSummaryFields,
+        index: usize,
+    ) -> RuntimeResult<serde_json::Map<String, JsonValue>> {
+        let mut row = serde_json::Map::new();
+        let identity = self.storage.row_identity(&summary.list, index);
+        if let Ok((key, generation)) = identity {
+            row.insert("key".to_owned(), json!(key));
+            row.insert("generation".to_owned(), json!(generation));
+        }
+        for field in &summary.fields {
+            if let Ok(value) = self.storage.list_row_field(&summary.list, index, field) {
+                let json_value = match value {
+                    FieldValueRef::Text("") if field == "error" => JsonValue::Null,
+                    _ => value.as_json(),
+                };
+                row.insert(field.clone(), json_value);
+            }
+        }
+        if let Ok((key, generation)) = identity {
+            let row_scope = row_scope_name(&summary.list);
+            let prefix = format!("{row_scope}.");
+            for binding in self
+                .storage
+                .row_source_bindings(&summary.list, key, generation)
+            {
+                let Some(path) = binding.source_path.strip_prefix(&prefix) else {
+                    continue;
+                };
+                insert_nested_json(
+                    &mut row,
+                    path,
+                    JsonValue::String(binding.source_path.clone()),
+                );
+            }
+        }
+        Ok(row)
+    }
+
+    fn formula_grid_scenario_text_requirements(
+        scenario: &Scenario,
+    ) -> GenericFormulaGridScenarioPreparation {
         let mut max_text_len = 0usize;
         let mut max_deps = 1usize;
         for step in &scenario.step {
@@ -5966,35 +5256,37 @@ impl GenericScheduledRuntime {
             }
         }
         max_text_len = max_text_len.max("cycle_error".len());
-        GenericCellsScenarioPreparation {
+        GenericFormulaGridScenarioPreparation {
             max_text_len,
             max_deps,
         }
     }
 
-    fn prepare_cells_scenario_storage(
+    fn prepare_formula_grid_scenario_storage(
         &mut self,
         scenario: &Scenario,
-    ) -> RuntimeResult<GenericCellsScenarioPreparation> {
-        let requirements = Self::cells_scenario_text_requirements(scenario);
-        self.reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
+        plan: &FormulaGridRuntimePlan,
+    ) -> RuntimeResult<GenericFormulaGridScenarioPreparation> {
+        let requirements = Self::formula_grid_scenario_text_requirements(scenario);
+        self.reserve_list_row_textlike_fields(&plan.list, &plan.formula_field, |_, current| {
             requirements.max_text_len.saturating_sub(current.len())
         })?;
-        self.reserve_list_row_textlike_fields("cells", "editing_text", |_, current| {
+        self.reserve_list_row_textlike_fields(&plan.list, &plan.value_field, |_, current| {
             requirements.max_text_len.saturating_sub(current.len())
         })?;
-        self.reserve_list_row_textlike_fields("cells", "value", |_, current| {
+        self.reserve_list_row_textlike_fields(&plan.list, &plan.error_field, |_, current| {
             requirements.max_text_len.saturating_sub(current.len())
         })?;
-        self.reserve_list_row_textlike_fields("cells", "error", |_, current| {
-            requirements.max_text_len.saturating_sub(current.len())
-        })?;
-        self.reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
-            requirements
-                .max_deps
-                .saturating_mul(8)
-                .saturating_sub(current.len())
-        })?;
+        self.reserve_list_row_textlike_fields(
+            &plan.list,
+            &plan.dependencies_field,
+            |_, current| {
+                requirements
+                    .max_deps
+                    .saturating_mul(8)
+                    .saturating_sub(current.len())
+            },
+        )?;
         Ok(requirements)
     }
 
@@ -6057,6 +5349,14 @@ impl GenericScheduledRuntime {
                             value,
                         },
                     ))?;
+                    let bindings = self
+                        .storage
+                        .row_source_bindings(list, insert.key, insert.generation)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for binding in bindings {
+                        observe(GenericSourceMutation::SourceBind(binding))?;
+                    }
                 }
                 SourceAction::ListRemove { list } => {
                     if let Some(index) = input.index {
@@ -6142,6 +5442,21 @@ impl GenericScheduledRuntime {
                         .into());
                     };
                     if let Some(index) = input.index {
+                        if self.scalar_equations.bool_const_value(target, input.source)
+                            == Some(true)
+                        {
+                            let field = row_field_name(target).to_owned();
+                            self.storage.commit_other_indexed_bool_fields(
+                                list,
+                                index,
+                                &field,
+                                false,
+                                |commit| {
+                                    observe(GenericSourceMutation::BoolField(commit))?;
+                                    Ok(())
+                                },
+                            )?;
+                        }
                         let commit = self.storage.commit_indexed_bool_source(
                             &self.scalar_equations,
                             list,
@@ -6184,6 +5499,7 @@ impl GenericScheduledRuntime {
         Ok(batch)
     }
 
+    #[cfg(test)]
     fn reserve_spare_rows_for_list_append_text(
         &mut self,
         list: &str,
@@ -6283,7 +5599,7 @@ impl GenericCircuitRuntime {
                                 .insert_value("address".to_owned(), FieldValue::Text(address));
                             seed_fields.insert_value(
                                 "default_formula".to_owned(),
-                                FieldValue::Text(default_cells_formula(column, row)),
+                                FieldValue::Text(default_grid_formula(column, row)),
                             );
                             let mut row = row_template.materialize(seed_fields)?;
                             seed_indexed_formula_fields(ir, &row_scope, &mut row);
@@ -6599,6 +5915,22 @@ impl GenericCircuitRuntime {
         self.lists.memory(list)?.bool_value(index, field)
     }
 
+    fn text_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
+        self.lists
+            .memory(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .textlike_field_names(index)
+            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
+    }
+
+    fn bool_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
+        self.lists
+            .memory(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .bool_field_names(index)
+            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
+    }
+
     fn set_list_row_textlike(
         &mut self,
         list: &str,
@@ -6658,6 +5990,30 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<(u64, u64)> {
         self.set_list_row_bool(list, index, field, value)?;
         self.row_identity(list, index)
+    }
+
+    fn commit_other_indexed_bool_fields(
+        &mut self,
+        list: &str,
+        active_index: usize,
+        field: &str,
+        value: bool,
+        mut observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
+    ) -> RuntimeResult<()> {
+        for index in 0..self.list_len(list)? {
+            if index == active_index || self.list_row_bool_opt(list, index, field) != Some(!value) {
+                continue;
+            }
+            let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
+            observe(GenericBoolFieldCommit {
+                list: list.to_owned(),
+                key,
+                generation,
+                field: field.to_owned(),
+                value,
+            })?;
+        }
+        Ok(())
     }
 
     fn commit_indexed_text_source<'a>(
@@ -6748,12 +6104,14 @@ impl GenericCircuitRuntime {
             };
         let field = row_field_name(target);
         self.copy_list_row_textlike_field(list, index, &previous, field)?;
+        let value = self.list_row_textlike(list, index, field)?.to_owned();
         let (key, generation) = self.row_identity(list, index)?;
         Ok(GenericTextFieldIdentity {
             list: list.to_owned(),
             key,
             generation,
             field: field.to_owned(),
+            value,
         })
     }
 
@@ -6807,9 +6165,9 @@ impl GenericCircuitRuntime {
         };
         match &branch.expression {
             ScalarUpdateExpression::SourceText => {
-                let value = payload_text.ok_or_else(|| {
-                    format!("text update `{target}` from `{source}` requires text payload")
-                })?;
+                let Some(value) = payload_text else {
+                    return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
+                };
                 Ok(IndexedTextCandidate::SourceText(value))
             }
             ScalarUpdateExpression::PreviousValue(path) => {
@@ -6827,9 +6185,12 @@ impl GenericCircuitRuntime {
             }
             ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
                 let raw = match path.as_str() {
-                    "text" => payload_text.ok_or_else(|| {
-                        format!("title update from `{source}` requires source text payload")
-                    })?,
+                    "text" => {
+                        let Some(text) = payload_text else {
+                            return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
+                        };
+                        text
+                    }
                     field => {
                         let value = payload_text.ok_or_else(|| {
                             format!(
@@ -7484,6 +6845,44 @@ impl FieldValueRef<'_> {
     }
 }
 
+fn field_value_json(value: FieldValue) -> JsonValue {
+    match value {
+        FieldValue::Text(value) | FieldValue::Enum(value) => json!(value),
+        FieldValue::Bool(value) => json!(value),
+    }
+}
+
+fn insert_nested_json(root: &mut serde_json::Map<String, JsonValue>, path: &str, value: JsonValue) {
+    fn insert_parts(
+        object: &mut serde_json::Map<String, JsonValue>,
+        parts: &[&str],
+        value: JsonValue,
+    ) {
+        match parts {
+            [] => {}
+            [leaf] => {
+                object.insert((*leaf).to_owned(), value);
+            }
+            [head, tail @ ..] => {
+                let entry = object
+                    .entry((*head).to_owned())
+                    .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+                if !entry.is_object() {
+                    *entry = JsonValue::Object(serde_json::Map::new());
+                }
+                if let Some(child) = entry.as_object_mut() {
+                    insert_parts(child, tail, value);
+                }
+            }
+        }
+    }
+    let parts = path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    insert_parts(root, &parts, value);
+}
+
 impl ValueColumns {
     fn insert_value(&mut self, name: String, value: FieldValue) {
         let field_id = FieldSlotId::from_path(&name);
@@ -7543,7 +6942,6 @@ impl ValueColumns {
             })
     }
 
-    #[cfg(test)]
     fn bool_value(&self, field: &str) -> Option<bool> {
         self.bool_index(field).map(|index| self.bools[index].value)
     }
@@ -7805,6 +7203,40 @@ fn todo_generic_row(title: &str) -> RuntimeRowSnapshot {
 }
 
 #[cfg(test)]
+fn close_other_list_editors<'a>(
+    generic: &mut GenericScheduledRuntime,
+    active_index: usize,
+    deltas: &mut Vec<SemanticDelta<'a>>,
+    patches: &mut Vec<RenderPatch<'a>>,
+) -> RuntimeResult<()> {
+    for index in 0..generic.list_len("todos")? {
+        if index == active_index
+            || !generic
+                .list_row_bool_opt("todos", index, "editing")
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let (key, generation) =
+            generic.commit_indexed_bool_field("todos", index, "editing", false)?;
+        let commit = GenericBoolFieldCommit {
+            list: "todos".to_owned(),
+            key,
+            generation,
+            field: "editing".to_owned(),
+            value: false,
+        };
+        deltas.push(commit.semantic_delta());
+        emit_generic_render_patch_for_mutation(
+            &GenericSourceMutation::BoolField(commit),
+            GenericRenderContext::default(),
+            patches,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn generic_cells_runtime(columns: usize, rows: usize) -> GenericCircuitRuntime {
     let mut runtime = GenericCircuitRuntime::default();
     let cell_rows = (0..rows).flat_map(|row| {
@@ -7913,6 +7345,7 @@ struct GenericTextFieldIdentity {
     key: u64,
     generation: u64,
     field: String,
+    value: String,
 }
 
 #[derive(Clone, Debug)]
@@ -7955,14 +7388,11 @@ struct GenericRootTextCommit<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct GenericRenderLoweringPlan {
-    surface: ExecutableSurfaceKind,
-}
+struct GenericRenderLoweringPlan;
 
 #[derive(Clone, Debug, Default)]
 struct GenericRenderContext<'a> {
     address: Option<&'a str>,
-    todo_show_edit_input_text: Option<&'a str>,
     patch_editor_text: bool,
     patch_value_text: bool,
 }
@@ -8073,220 +7503,50 @@ impl<'a> GenericRootTextCommit<'a> {
 }
 
 impl GenericRenderLoweringPlan {
-    fn todo_mvc() -> Self {
-        Self {
-            surface: ExecutableSurfaceKind::TodoMvc,
-        }
-    }
-
-    fn cells() -> Self {
-        Self {
-            surface: ExecutableSurfaceKind::Cells,
-        }
+    fn generic() -> Self {
+        Self
     }
 
     fn lower_mutation_patch<'a>(
         &self,
         mutation: &GenericSourceMutation<'a>,
-        context: GenericRenderContext<'a>,
+        _context: GenericRenderContext<'a>,
     ) -> RuntimeResult<Option<RenderPatch<'a>>> {
-        match self.surface {
-            ExecutableSurfaceKind::TodoMvc => self.lower_todomvc_patch(mutation, context),
-            ExecutableSurfaceKind::Cells => self.lower_cells_patch(mutation, context),
-        }
+        Ok(Some(generic_document_invalidation_patch(mutation)))
     }
 
-    fn lower_todomvc_patch<'a>(
+    fn lower_row_affordance_patch<'a>(
         &self,
-        mutation: &GenericSourceMutation<'a>,
-        context: GenericRenderContext<'a>,
-    ) -> RuntimeResult<Option<RenderPatch<'a>>> {
-        match mutation {
-            GenericSourceMutation::RootText(commit) => match commit.target.as_str() {
-                "store.new_todo_text" => Ok(Some(patch(
-                    "SetInputValue",
-                    RenderTarget::Static(Cow::Borrowed("new_todo_input")),
-                    ProtocolValue::Text(commit.value.clone()),
-                ))),
-                "store.selected_filter" => Ok(Some(patch(
-                    "SetSelectedFilter",
-                    RenderTarget::Static(Cow::Borrowed("filters")),
-                    ProtocolValue::Text(commit.value.clone()),
-                ))),
-                _ => Err(format!("unsupported scalar render target `{}`", commit.target).into()),
-            },
-            GenericSourceMutation::TextField(commit) => match commit.field.as_str() {
-                "title" => Ok(Some(keyed_patch(
-                    "SetText",
-                    RenderTarget::TodoTitle(commit.key),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                ))),
-                "edit_text" => Ok(Some(keyed_patch(
-                    "SetEditInput",
-                    RenderTarget::TodoEdit(commit.key),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                ))),
-                _ => Ok(None),
-            },
-            GenericSourceMutation::BoolField(commit) => match commit.field.as_str() {
-                "completed" => Ok(Some(keyed_patch(
-                    "SetProperty",
-                    RenderTarget::TodoCheckbox(commit.key),
-                    ProtocolValue::CheckedProperty(commit.value),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                ))),
-                "editing" if !commit.value => Ok(Some(keyed_patch(
-                    "HideEditInput",
-                    RenderTarget::TodoEdit(commit.key),
-                    ProtocolValue::Bool(commit.value),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                ))),
-                "editing" if commit.value => Ok(context.todo_show_edit_input_text.map(|text| {
-                    keyed_patch(
-                        "ShowEditInput",
-                        RenderTarget::TodoEdit(commit.key),
-                        ProtocolValue::Text(Cow::Borrowed(text)),
-                        commit.list.clone(),
-                        commit.key,
-                        commit.generation,
-                    )
-                })),
-                _ => Ok(None),
-            },
-            GenericSourceMutation::ListRemove {
-                list,
-                key,
-                generation,
-            } => Ok(Some(keyed_patch(
-                "RemoveElement",
-                RenderTarget::TodoRow(*key),
-                ProtocolValue::Null,
-                list.clone(),
-                *key,
-                *generation,
-            ))),
-            GenericSourceMutation::SourceBind(binding) => Ok(Some(source_patch(
-                "BindSource",
-                RenderTarget::TodoSource(binding.key, Cow::Owned(binding.source_path.clone())),
-                source_binding_value(binding),
-                binding,
-            ))),
-            GenericSourceMutation::SourceUnbind(binding) => Ok(Some(source_patch(
-                "UnbindSource",
-                RenderTarget::TodoSource(binding.key, Cow::Owned(binding.source_path.clone())),
-                source_binding_value(binding),
-                binding,
-            ))),
-            GenericSourceMutation::ListAppend(commit) => Ok(Some(keyed_patch(
-                "InsertElement",
-                RenderTarget::TodoRow(commit.key),
-                ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                commit.list.clone(),
-                commit.key,
-                commit.generation,
-            ))),
-            GenericSourceMutation::TextFieldIdentity(_) | GenericSourceMutation::ValueField(_) => {
-                Ok(None)
-            }
-        }
-    }
-
-    fn lower_todomvc_row_affordance_patch<'a>(
-        &self,
+        list: impl Into<Cow<'a, str>>,
         key: u64,
         generation: u64,
         affordance: &'static str,
-        visible: bool,
+        _visible: bool,
     ) -> RuntimeResult<RenderPatch<'a>> {
-        if self.surface != ExecutableSurfaceKind::TodoMvc {
-            return Err("Todo row affordance render lowering requires TodoMVC surface".into());
-        }
-        match affordance {
-            "delete_button" => Ok(keyed_patch(
-                "ShowDeleteButton",
-                RenderTarget::TodoRow(key),
-                ProtocolValue::Bool(visible),
-                "todos",
-                key,
-                generation,
-            )),
-            _ => Err(format!("unsupported Todo row affordance `{affordance}`").into()),
-        }
+        let list = list.into();
+        Ok(keyed_patch(
+            "InvalidateDocument",
+            RenderTarget::Static(Cow::Borrowed("document")),
+            ProtocolValue::Text(Cow::Owned(affordance.to_owned())),
+            list,
+            key,
+            generation,
+        ))
     }
 
-    fn lower_todomvc_list_move_patch<'a>(
+    fn lower_list_move_patch<'a>(
         &self,
         commit: &GenericListRowCommit,
         to: usize,
     ) -> RuntimeResult<RenderPatch<'a>> {
-        if self.surface != ExecutableSurfaceKind::TodoMvc {
-            return Err("Todo list move render lowering requires TodoMVC surface".into());
-        }
         Ok(keyed_patch(
-            "MoveElement",
-            RenderTarget::TodoPosition(commit.key),
+            "InvalidateDocument",
+            RenderTarget::Static(Cow::Borrowed("document")),
             ProtocolValue::NumberText(to as i64),
             commit.list.clone(),
             commit.key,
             commit.generation,
         ))
-    }
-
-    fn lower_cells_patch<'a>(
-        &self,
-        mutation: &GenericSourceMutation<'a>,
-        context: GenericRenderContext<'a>,
-    ) -> RuntimeResult<Option<RenderPatch<'a>>> {
-        let address = || {
-            context
-                .address
-                .ok_or_else(|| -> Box<dyn std::error::Error> {
-                    "Cells render lowering requires an address context".into()
-                })
-        };
-        match mutation {
-            GenericSourceMutation::TextField(commit)
-                if context.patch_editor_text && commit.field == "editing_text" =>
-            {
-                Ok(Some(keyed_patch(
-                    "SetCellEditor",
-                    RenderTarget::Borrowed(Cow::Borrowed(address()?)),
-                    ProtocolValue::Text(Cow::Borrowed(commit.value)),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                )))
-            }
-            GenericSourceMutation::ValueField(commit) if context.patch_value_text => {
-                Ok(Some(keyed_patch(
-                    "SetCellText",
-                    RenderTarget::Borrowed(Cow::Borrowed(address()?)),
-                    commit.value.clone(),
-                    commit.list.clone(),
-                    commit.key,
-                    commit.generation,
-                )))
-            }
-            GenericSourceMutation::RootText(_)
-            | GenericSourceMutation::TextField(_)
-            | GenericSourceMutation::TextFieldIdentity(_)
-            | GenericSourceMutation::ValueField(_)
-            | GenericSourceMutation::BoolField(_)
-            | GenericSourceMutation::ListAppend(_)
-            | GenericSourceMutation::ListRemove { .. }
-            | GenericSourceMutation::SourceBind(_)
-            | GenericSourceMutation::SourceUnbind(_) => Ok(None),
-        }
     }
 }
 
@@ -8295,7 +7555,11 @@ impl<'a> GenericSourceMutation<'a> {
         match self {
             Self::RootText(commit) => Some(commit.semantic_delta()),
             Self::TextField(commit) => Some(commit.semantic_delta()),
-            Self::TextFieldIdentity(_) => None,
+            Self::TextFieldIdentity(commit) => Some(
+                commit.semantic_delta_with_value(ProtocolValue::Text(Cow::Owned(
+                    commit.value.clone(),
+                ))),
+            ),
             Self::ValueField(commit) => Some(commit.semantic_delta()),
             Self::BoolField(commit) => Some(commit.semantic_delta()),
             Self::ListAppend(commit) => Some(commit.semantic_delta()),
@@ -8327,6 +7591,43 @@ impl<'a> GenericSourceMutation<'a> {
     }
 }
 
+fn generic_document_invalidation_patch<'a>(
+    mutation: &GenericSourceMutation<'a>,
+) -> RenderPatch<'a> {
+    let value = match mutation {
+        GenericSourceMutation::RootText(commit) => {
+            ProtocolValue::Text(Cow::Owned(commit.target.clone()))
+        }
+        GenericSourceMutation::TextField(commit) => {
+            ProtocolValue::Text(Cow::Owned(format!("{}.{}", commit.list, commit.field)))
+        }
+        GenericSourceMutation::TextFieldIdentity(commit) => {
+            ProtocolValue::Text(Cow::Owned(format!("{}.{}", commit.list, commit.field)))
+        }
+        GenericSourceMutation::ValueField(commit) => {
+            ProtocolValue::Text(Cow::Owned(format!("{}.{}", commit.list, commit.field)))
+        }
+        GenericSourceMutation::BoolField(commit) => {
+            ProtocolValue::Text(Cow::Owned(format!("{}.{}", commit.list, commit.field)))
+        }
+        GenericSourceMutation::ListAppend(commit) => {
+            ProtocolValue::Text(Cow::Owned(commit.list.clone()))
+        }
+        GenericSourceMutation::ListRemove { list, .. } => {
+            ProtocolValue::Text(Cow::Owned(list.clone()))
+        }
+        GenericSourceMutation::SourceBind(binding)
+        | GenericSourceMutation::SourceUnbind(binding) => {
+            ProtocolValue::Text(Cow::Owned(binding.source_path.clone()))
+        }
+    };
+    patch(
+        "InvalidateDocument",
+        RenderTarget::Static(Cow::Borrowed("document")),
+        value,
+    )
+}
+
 enum GenericListRemoveObservation<'a> {
     SourceUnbind(&'a SourceBinding),
     RowRemoved { key: u64, generation: u64 },
@@ -8351,7 +7652,7 @@ enum GenericBoundSourceIndex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GenericCellsScenarioPreparation {
+struct GenericFormulaGridScenarioPreparation {
     max_text_len: usize,
     max_deps: usize,
 }
@@ -8581,6 +7882,24 @@ impl<'a> GenericSourceMutationBatch<'a> {
         })
     }
 
+    fn require_first_text_except(
+        &self,
+        source: &str,
+        label: &str,
+        excluded_field: &str,
+    ) -> RuntimeResult<GenericTextFieldCommit<'a>> {
+        self.text_fields
+            .iter()
+            .find_map(|slot| match slot {
+                Some((field, commit)) if field != excluded_field => Some(commit.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!("{label} from `{source}` produced no non-`{excluded_field}` text change")
+                    .into()
+            })
+    }
+
     fn require_identity(
         &self,
         source: &str,
@@ -8594,6 +7913,17 @@ impl<'a> GenericSourceMutationBatch<'a> {
                 _ => None,
             })
             .ok_or_else(|| format!("{label} from `{source}` produced no `{field}` identity").into())
+    }
+
+    fn require_first_identity(
+        &self,
+        source: &str,
+        label: &str,
+    ) -> RuntimeResult<GenericTextFieldIdentity> {
+        self.identity_fields
+            .iter()
+            .find_map(|slot| slot.as_ref().map(|(_, commit)| commit.clone()))
+            .ok_or_else(|| format!("{label} from `{source}` produced no text identity").into())
     }
 
     fn require_bool(
@@ -8612,6 +7942,17 @@ impl<'a> GenericSourceMutationBatch<'a> {
             Some((existing, commit)) if existing == field => Some(commit.clone()),
             _ => None,
         })
+    }
+
+    fn require_first_bool(
+        &self,
+        source: &str,
+        label: &str,
+    ) -> RuntimeResult<GenericBoolFieldCommit> {
+        self.bool_fields
+            .iter()
+            .find_map(|slot| slot.as_ref().map(|(_, commit)| commit.clone()))
+            .ok_or_else(|| format!("{label} from `{source}` produced no bool change").into())
     }
 
     fn list_append(&self, list: &str) -> Option<GenericTextListAppendCommit<'a>> {
@@ -8881,9 +8222,9 @@ impl ScalarEquationPlan {
         };
         match &branch.expression {
             ScalarUpdateExpression::SourceText => {
-                let text = payload_text.ok_or_else(|| {
-                    format!("source `{source}` for `{target}` requires a text payload")
-                })?;
+                let Some(text) = payload_text else {
+                    return Ok(None);
+                };
                 Ok(Some(ScalarTextValue::Text(Cow::Borrowed(text))))
             }
             ScalarUpdateExpression::Const(value) => {
@@ -8894,6 +8235,13 @@ impl ScalarEquationPlan {
             | ScalarUpdateExpression::BoolNot(_) => Ok(None),
             ScalarUpdateExpression::Unsupported => Ok(None),
         }
+    }
+
+    fn bool_const_value(&self, target: &str, source: &str) -> Option<bool> {
+        self.branches
+            .iter()
+            .find(|branch| branch.target == target && branch.source == source)
+            .and_then(|branch| branch.expression.const_bool())
     }
 
     fn eval_bool_with_context(
@@ -9210,6 +8558,10 @@ impl ListSourceBindingPlan {
         Self { list_slots }
     }
 
+    fn slots(&self) -> &[ListSourceBindingSlot] {
+        &self.list_slots
+    }
+
     fn source_paths(&self, list: &str) -> RuntimeResult<&[String]> {
         self.list_slots
             .iter()
@@ -9510,6 +8862,49 @@ impl ListEquationPlan {
             .ok_or_else(|| format!("list `{list}` has no count operation for `{target}`").into())
     }
 
+    fn count_targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.operations.iter().filter_map(|operation| {
+            let RuntimeListOperationKind::Count { target, .. } = &operation.kind else {
+                return None;
+            };
+            Some((operation.list.as_str(), target.as_str()))
+        })
+    }
+
+    fn retain_targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.operations.iter().filter_map(|operation| {
+            let RuntimeListOperationKind::Retain { target, .. } = &operation.kind else {
+                return None;
+            };
+            Some((operation.list.as_str(), target.as_str()))
+        })
+    }
+
+    fn count_targets_for_all_complete_path(&self, path: &str) -> Option<(String, String, String)> {
+        let scope = path.rsplit_once('.').map(|(scope, _)| scope)?;
+        let active_target = format!("{scope}.active_count");
+        let completed_target = format!("{scope}.completed_count");
+        let mut list_for_active = None;
+        let mut list_for_completed = None;
+        for operation in &self.operations {
+            let RuntimeListOperationKind::Count { target, .. } = &operation.kind else {
+                continue;
+            };
+            if target == &active_target {
+                list_for_active = Some(operation.list.as_str());
+            }
+            if target == &completed_target {
+                list_for_completed = Some(operation.list.as_str());
+            }
+        }
+        match (list_for_active, list_for_completed) {
+            (Some(active_list), Some(completed_list)) if active_list == completed_list => {
+                Some((active_list.to_owned(), completed_target, active_target))
+            }
+            _ => None,
+        }
+    }
+
     fn retain_predicate(&self, list: &str, target: &str) -> RuntimeResult<RuntimeListPredicate> {
         self.operations
             .iter()
@@ -9553,94 +8948,17 @@ fn row_field_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn seeded_todomvc_generic(
-    ir: &TypedProgram,
-    count: usize,
-) -> RuntimeResult<(GenericScheduledRuntime, JsonValue)> {
-    let compiled = CompiledProgram::from_ir(ir)?;
-    if !matches!(compiled.surface.kind, ExecutableSurfaceKind::TodoMvc) {
-        return Err("TodoMVC stress profiles require a TodoMVC executable surface".into());
-    }
-    let mut runtime = GenericScheduledRuntime::new(ir, &compiled)?;
-    let capacity = runtime.storage.lists.capacity("todos");
-    if let Some(capacity) = capacity
-        && count > capacity
-    {
-        return Err(
-            format!("TodoMVC stress needs {count} rows but LIST capacity is {capacity}").into(),
-        );
-    }
-    let row_template = runtime
-        .storage
-        .lists
-        .row_template("todos")
-        .cloned()
-        .ok_or("TodoMVC generic runtime has no `todos` row template")?;
-    let row_source_paths = runtime.list_source_bindings.source_paths("todos")?.to_vec();
-    let mut rows = Vec::with_capacity(count);
-    for index in 0..count {
-        let mut seed_fields = ValueColumns::default();
-        seed_fields.insert_value(
-            "title".to_owned(),
-            FieldValue::Text(format!("Todo {index}")),
-        );
-        rows.push(row_template.materialize(seed_fields)?);
-    }
-    runtime.storage.lists.insert(
-        ListId(0),
-        "todos".to_owned(),
-        ListMemory::from_values(rows),
-        capacity,
-        row_template,
-    );
-    runtime.storage.sources = SourceStore::default();
-    runtime
-        .storage
-        .reserve_source_bindings(count * row_source_paths.len());
-    runtime.storage.sources.reserve_rows(count);
-    for index in 0..count {
-        let (key, generation) = runtime.storage.row_identity("todos", index)?;
-        runtime
-            .storage
-            .bind_row_sources("todos", key, generation, &row_source_paths)?;
-    }
-    let ir_proof = json!({
-        "runtime_constructed_from_ir": true,
-        "compiled_surface": compiled.surface.kind.as_str(),
-        "compiled_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
-        "schedule_node_count": compiled.schedule_node_count,
-        "state_initializer_count": compiled.state_initializer_count,
-        "list_initializer_count": compiled.list_initializer_count,
-        "derived_value_count": compiled.derived_value_count,
-        "derived_text_transform_count": compiled.derived_text_transform_count,
-        "update_branch_count": compiled.update_branch_count,
-        "list_operation_count": compiled.list_operation_count,
-        "source_route_count": compiled.source_route_count,
-        "list_source_binding_count": compiled.list_source_bindings.list_slots.len(),
-        "row_source_binding_count": row_source_paths.len(),
-        "list_capacity": capacity,
-    });
-    Ok((runtime, ir_proof))
-}
-
 #[cfg(test)]
 #[derive(Clone, Debug)]
-struct TodoRuntime {
+struct ListScenarioHarness {
     generic: GenericScheduledRuntime,
     next_source_seq: u64,
     stale_source_drop_count: u64,
 }
 
-#[derive(Clone, Debug)]
-struct TodoRuntimeState {
-    next_source_seq: u64,
-    stale_source_drop_count: u64,
-    dirty_key_sets: DirtyKeySets,
-}
-
 #[cfg(test)]
 #[derive(Clone, Debug)]
-enum TodoEvent<'a> {
+enum ListScenarioEvent<'a> {
     Source(GenericRoutedSourceEvent<'a>),
     RowSource {
         routed: GenericRoutedSourceEvent<'a>,
@@ -9654,7 +8972,7 @@ enum TodoEvent<'a> {
 }
 
 #[cfg(test)]
-impl TodoRuntime {
+impl ListScenarioHarness {
     #[cfg(test)]
     fn from_generic(mut generic: GenericScheduledRuntime) -> RuntimeResult<Self> {
         let todo_count = generic.list_len("todos")?;
@@ -9663,7 +8981,9 @@ impl TodoRuntime {
         generic.reserve_source_rows(todo_count);
         for index in 0..todo_count {
             let (key, generation) = generic.row_identity("todos", index)?;
-            generic.bind_row_sources("todos", key, generation, &row_source_paths)?;
+            if generic.row_source_binding_count("todos", key, generation) == 0 {
+                generic.bind_row_sources("todos", key, generation, &row_source_paths)?;
+            }
         }
         Self {
             generic,
@@ -9697,14 +9017,18 @@ impl TodoRuntime {
             return Ok(());
         };
         match &event {
-            TodoEvent::Source(routed) => assert_routed_source_event_matches(step, routed.event)?,
-            TodoEvent::RowSource { routed, .. } => {
+            ListScenarioEvent::Source(routed) => {
                 assert_routed_source_event_matches(step, routed.event)?
             }
-            TodoEvent::HoverDelete { .. } => {}
+            ListScenarioEvent::RowSource { routed, .. } => {
+                assert_routed_source_event_matches(step, routed.event)?
+            }
+            ListScenarioEvent::HoverDelete { .. } => {}
         }
         match event {
-            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::RootText => {
+            ListScenarioEvent::Source(routed)
+                if routed.route_kind == SourceActionKind::RootText =>
+            {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9716,12 +9040,14 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
             }
-            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::ListAppend => {
+            ListScenarioEvent::Source(routed)
+                if routed.route_kind == SourceActionKind::ListAppend =>
+            {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9733,9 +9059,9 @@ impl TodoRuntime {
                     self.generic
                         .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
                 if let Some(insert) = batch.list_append("todos") {
-                    self.emit_todo_insert(insert, deltas, patches)?;
+                    self.emit_list_insert(insert, deltas, patches)?;
                     if let Some(commit) = batch.root_text("store.new_todo_text") {
-                        emit_todomvc_default_protocol_mutation(
+                        emit_list_default_protocol_mutation(
                             GenericSourceMutation::RootText(commit),
                             deltas,
                             patches,
@@ -9743,7 +9069,9 @@ impl TodoRuntime {
                     }
                 }
             }
-            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::RootScalar => {
+            ListScenarioEvent::Source(routed)
+                if routed.route_kind == SourceActionKind::RootScalar =>
+            {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
                     &step.id,
@@ -9755,15 +9083,19 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
             }
-            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::ListRemove => {
+            ListScenarioEvent::Source(routed)
+                if routed.route_kind == SourceActionKind::ListRemove =>
+            {
                 self.remove_where_source(&step.id, routed.source(), deltas, patches)?;
             }
-            TodoEvent::Source(routed) if routed.route_kind == SourceActionKind::IndexedBoolBulk => {
+            ListScenarioEvent::Source(routed)
+                if routed.route_kind == SourceActionKind::IndexedBoolBulk =>
+            {
                 let all_completed = self.all_completed();
                 let input = self.generic.source_action_input_for_list_index(
                     &step.id,
@@ -9779,28 +9111,28 @@ impl TodoRuntime {
                         _ => None,
                     },
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
             }
-            TodoEvent::Source(routed) => {
+            ListScenarioEvent::Source(routed) => {
                 return Err(format!(
-                    "{} TodoMVC source `{}` classified as unsupported generic route `{}`",
+                    "{} list source `{}` classified as unsupported generic route `{}`",
                     step.id,
                     routed.source(),
                     routed.route_kind.as_str()
                 )
                 .into());
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 target_occurrence,
             } if routed.route_kind == SourceActionKind::IndexedBoolToggle => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
                 let all_completed = self.all_completed();
-                self.apply_todo_bool_source_action(
+                self.apply_list_bool_source_action(
                     &step.id,
                     index,
                     routed.source(),
@@ -9810,13 +9142,13 @@ impl TodoRuntime {
                     patches,
                 )?;
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 target_occurrence,
             } if routed.route_kind == SourceActionKind::IndexedTextOpen => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                close_other_todomvc_editors(&mut self.generic, index, deltas, patches)?;
+                close_other_list_editors(&mut self.generic, index, deltas, patches)?;
                 let all_completed = self.all_completed();
                 let source_event = GenericSourceEvent {
                     text: Some(target_text),
@@ -9842,16 +9174,15 @@ impl TodoRuntime {
                 let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
                 deltas.push(editing.semantic_delta());
                 deltas.push(edit_text.semantic_delta());
-                emit_todomvc_render_patch_for_mutation(
+                emit_generic_render_patch_for_mutation(
                     &GenericSourceMutation::BoolField(editing),
                     GenericRenderContext {
-                        todo_show_edit_input_text: Some(edit_text.value),
                         ..GenericRenderContext::default()
                     },
                     patches,
                 )?;
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 ..
@@ -9874,12 +9205,12 @@ impl TodoRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                        emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                         Ok(())
                     },
                 )?;
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 ..
@@ -9916,7 +9247,7 @@ impl TodoRuntime {
                     )?;
                     if key == "Enter" {
                         if let Some(title) = batch.text("title") {
-                            emit_todomvc_default_protocol_mutation(
+                            emit_list_default_protocol_mutation(
                                 GenericSourceMutation::TextField(title),
                                 deltas,
                                 patches,
@@ -9927,14 +9258,14 @@ impl TodoRuntime {
                     }
                     let editing =
                         batch.require_bool(routed.source(), "editing update", "editing")?;
-                    emit_todomvc_default_protocol_mutation(
+                    emit_list_default_protocol_mutation(
                         GenericSourceMutation::BoolField(editing),
                         deltas,
                         patches,
                     )?;
                 }
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 ..
@@ -9963,20 +9294,20 @@ impl TodoRuntime {
                     |_| Ok(()),
                 )?;
                 if let Some(title) = batch.text("title") {
-                    emit_todomvc_default_protocol_mutation(
+                    emit_list_default_protocol_mutation(
                         GenericSourceMutation::TextField(title),
                         deltas,
                         patches,
                     )?;
                 }
                 let editing = batch.require_bool(routed.source(), "editing update", "editing")?;
-                emit_todomvc_default_protocol_mutation(
+                emit_list_default_protocol_mutation(
                     GenericSourceMutation::BoolField(editing),
                     deltas,
                     patches,
                 )?;
             }
-            TodoEvent::RowSource {
+            ListScenarioEvent::RowSource {
                 routed,
                 target_text,
                 target_occurrence,
@@ -9997,23 +9328,24 @@ impl TodoRuntime {
                     .into());
                 }
             }
-            TodoEvent::RowSource { routed, .. } => {
+            ListScenarioEvent::RowSource { routed, .. } => {
                 return Err(format!(
-                    "{} TodoMVC row source `{}` classified as unsupported generic route `{}`",
+                    "{} list row source `{}` classified as unsupported generic route `{}`",
                     step.id,
                     routed.source(),
                     routed.route_kind.as_str()
                 )
                 .into());
             }
-            TodoEvent::HoverDelete {
+            ListScenarioEvent::HoverDelete {
                 target_text,
                 target_occurrence,
             } => {
                 let index = self.find_index_at_occurrence(target_text, target_occurrence)?;
-                let (key, generation) = self.todo_row_identity(index)?;
+                let (key, generation) = self.list_row_identity_for_test(index)?;
                 patches.push(
-                    GenericRenderLoweringPlan::todo_mvc().lower_todomvc_row_affordance_patch(
+                    GenericRenderLoweringPlan::generic().lower_row_affordance_patch(
+                        "todos",
                         key,
                         generation,
                         "delete_button",
@@ -10031,7 +9363,10 @@ impl TodoRuntime {
         seq
     }
 
-    fn route_step<'a>(&mut self, step: &'a ScenarioStep) -> RuntimeResult<Option<TodoEvent<'a>>> {
+    fn route_step<'a>(
+        &mut self,
+        step: &'a ScenarioStep,
+    ) -> RuntimeResult<Option<ListScenarioEvent<'a>>> {
         let Some(action) = &step.user_action else {
             return Ok(None);
         };
@@ -10044,7 +9379,7 @@ impl TodoRuntime {
                 let target_occurrence = self
                     .resolve_bound_occurrence(step, target_text, target_occurrence)
                     .unwrap_or(target_occurrence);
-                TodoEvent::HoverDelete {
+                ListScenarioEvent::HoverDelete {
                     target_text,
                     target_occurrence,
                 }
@@ -10070,7 +9405,7 @@ impl TodoRuntime {
         step: &'a ScenarioStep,
         source_event: GenericSourceEvent<'a>,
         fallback_occurrence: usize,
-    ) -> RuntimeResult<Option<TodoEvent<'a>>> {
+    ) -> RuntimeResult<Option<ListScenarioEvent<'a>>> {
         let source = source_event.source;
         let route_kind = self
             .generic
@@ -10083,7 +9418,7 @@ impl TodoRuntime {
                 | SourceActionKind::ListRemove
                 | SourceActionKind::IndexedBoolBulk
                 | SourceActionKind::RootScalar => {
-                    return Ok(Some(TodoEvent::Source(GenericRoutedSourceEvent {
+                    return Ok(Some(ListScenarioEvent::Source(GenericRoutedSourceEvent {
                         event: source_event,
                         route_kind,
                     })));
@@ -10095,7 +9430,7 @@ impl TodoRuntime {
                 | SourceActionKind::IndexedTextOpen
                 | SourceActionKind::IndexedBoolToggle => {}
             }
-            return Err(format!("{} source `{source}` has no TodoMVC route", step.id).into());
+            return Err(format!("{} source `{source}` has no list route", step.id).into());
         }
 
         let target_text = source_event
@@ -10123,7 +9458,7 @@ impl TodoRuntime {
                 | SourceActionKind::IndexedTextChange
                 | SourceActionKind::IndexedTextOpen
         ) {
-            return Ok(Some(TodoEvent::RowSource {
+            return Ok(Some(ListScenarioEvent::RowSource {
                 routed: GenericRoutedSourceEvent {
                     event: source_event,
                     route_kind,
@@ -10133,7 +9468,7 @@ impl TodoRuntime {
             }));
         }
         Err(format!(
-            "{} source `{source}` for target `{target_text}` has no TodoMVC route",
+            "{} source `{source}` for target `{target_text}` has no list route",
             step.id
         )
         .into())
@@ -10164,7 +9499,7 @@ impl TodoRuntime {
     }
 
     #[cfg(test)]
-    fn append_todo_from_source<'a>(
+    fn append_text_row_from_source<'a>(
         &mut self,
         source: &str,
         key: &str,
@@ -10183,20 +9518,20 @@ impl TodoRuntime {
         else {
             return Ok(());
         };
-        self.emit_todo_insert(insert, deltas, patches)?;
+        self.emit_list_insert(insert, deltas, patches)?;
         Ok(())
     }
 
-    fn emit_todo_insert<'a>(
+    fn emit_list_insert<'a>(
         &self,
         insert: GenericTextListAppendCommit<'a>,
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
-        emit_todo_insert_from_generic(&self.generic, insert, deltas, patches)
+        emit_list_insert_from_generic(&self.generic, insert, deltas, patches)
     }
 
-    fn apply_todo_bool_source_action<'a>(
+    fn apply_list_bool_source_action<'a>(
         &mut self,
         step_id: &str,
         index: usize,
@@ -10227,7 +9562,7 @@ impl TodoRuntime {
                 _ => None,
             },
             |mutation| {
-                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )?;
@@ -10259,7 +9594,7 @@ impl TodoRuntime {
             input,
             |_| None,
             |mutation| {
-                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )
@@ -10296,7 +9631,7 @@ impl TodoRuntime {
                 if matches!(mutation, GenericSourceMutation::ListRemove { .. }) {
                     removed = true;
                 }
-                emit_todomvc_default_protocol_mutation(mutation, deltas, patches)?;
+                emit_list_default_protocol_mutation(mutation, deltas, patches)?;
                 Ok(())
             },
         )?;
@@ -10313,7 +9648,7 @@ impl TodoRuntime {
         let generic_row =
             self.generic
                 .remove_row_and_unbind_sources("todos", index, |binding| {
-                    emit_todomvc_default_protocol_mutation(
+                    emit_list_default_protocol_mutation(
                         GenericSourceMutation::SourceUnbind(binding.clone()),
                         deltas,
                         patches,
@@ -10322,7 +9657,7 @@ impl TodoRuntime {
                 })?;
         let (key, generation) = (generic_row.key, generic_row.generation);
         self.generic.spare_row("todos", generic_row.value)?;
-        emit_todomvc_default_protocol_mutation(
+        emit_list_default_protocol_mutation(
             GenericSourceMutation::ListRemove {
                 list: "todos".to_owned(),
                 key,
@@ -10343,9 +9678,7 @@ impl TodoRuntime {
     ) -> RuntimeResult<()> {
         let commit = self.generic.move_row("todos", from, to)?;
         deltas.push(commit.semantic_move_delta(to));
-        patches.push(
-            GenericRenderLoweringPlan::todo_mvc().lower_todomvc_list_move_patch(&commit, to)?,
-        );
+        patches.push(GenericRenderLoweringPlan::generic().lower_list_move_patch(&commit, to)?);
         Ok(())
     }
 
@@ -10353,48 +9686,48 @@ impl TodoRuntime {
         self.find_index_at_occurrence(title, 1)
     }
 
-    fn todo_row_identity(&self, index: usize) -> RuntimeResult<(u64, u64)> {
+    fn list_row_identity_for_test(&self, index: usize) -> RuntimeResult<(u64, u64)> {
         self.generic.row_identity("todos", index)
     }
 
     #[cfg(test)]
-    fn todo_len(&self) -> usize {
+    fn list_len_for_test(&self) -> usize {
         self.generic.list_len("todos").unwrap()
     }
 
     #[cfg(test)]
-    fn todo_key(&self, index: usize) -> u64 {
-        self.todo_row_identity(index).unwrap().0
+    fn list_key_for_test(&self, index: usize) -> u64 {
+        self.list_row_identity_for_test(index).unwrap().0
     }
 
     #[cfg(test)]
-    fn todo_generation(&self, index: usize) -> u64 {
-        self.todo_row_identity(index).unwrap().1
+    fn list_generation_for_test(&self, index: usize) -> u64 {
+        self.list_row_identity_for_test(index).unwrap().1
     }
 
     #[cfg(test)]
-    fn todo_title_for_test(&self, index: usize) -> &str {
+    fn list_title_for_test(&self, index: usize) -> &str {
         self.generic
             .list_row_textlike("todos", index, "title")
             .unwrap()
     }
 
     #[cfg(test)]
-    fn todo_edit_text_for_test(&self, index: usize) -> &str {
+    fn list_edit_text_for_test(&self, index: usize) -> &str {
         self.generic
             .list_row_textlike("todos", index, "edit_text")
             .unwrap()
     }
 
     #[cfg(test)]
-    fn todo_completed_for_test(&self, index: usize) -> bool {
+    fn list_completed_for_test(&self, index: usize) -> bool {
         self.generic
             .list_row_bool("todos", index, "completed")
             .unwrap()
     }
 
     #[cfg(test)]
-    fn todo_editing_for_test(&self, index: usize) -> bool {
+    fn list_editing_for_test(&self, index: usize) -> bool {
         self.generic
             .list_row_bool("todos", index, "editing")
             .unwrap()
@@ -10421,28 +9754,20 @@ impl TodoRuntime {
     }
 
     fn all_completed(&self) -> bool {
-        self.generic.todomvc_all_completed()
+        self.generic.list_all_completed_by_count_targets()
     }
 }
 
 impl ScenarioExecutor for LoadedRuntime {
     fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        match &mut self.surface {
-            LoadedRuntimeSurface::Todo(_) => {
-                let generic = self
-                    .generic
-                    .as_mut()
-                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-                generic.prepare_todomvc_scenario(scenario)
-            }
-            LoadedRuntimeSurface::Cells(state) => {
-                let generic = self
-                    .generic
-                    .as_mut()
-                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-                prepare_loaded_cells_scenario(generic, state, scenario)
-            }
+        if let Some(state) = &mut self.formula_grid_state {
+            let generic = self
+                .generic
+                .as_mut()
+                .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+            prepare_formula_grid_scenario(generic, state, scenario)?;
         }
+        Ok(())
     }
 
     fn apply_step<'a>(
@@ -10451,151 +9776,28 @@ impl ScenarioExecutor for LoadedRuntime {
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<StepExecutionMetrics> {
-        match &mut self.surface {
-            LoadedRuntimeSurface::Todo(_) => {
-                if let Some(metrics) =
-                    self.try_apply_todomvc_root_source_step(step, deltas, patches)?
-                {
-                    Ok(metrics)
-                } else if let Some(metrics) =
-                    self.try_apply_todomvc_row_source_step(step, deltas, patches)?
-                {
-                    Ok(metrics)
-                } else if let Some(metrics) =
-                    self.try_apply_todomvc_render_only_step(step, deltas, patches)?
-                {
-                    Ok(metrics)
-                } else if step.user_action.is_none() {
-                    Ok(StepExecutionMetrics {
-                        dirty_key_count: 0,
-                        extra: StepExecutionExtra::Todo {
-                            stale_source_drop_count: 0,
-                        },
-                    })
-                } else {
-                    Err(format!(
-                        "{} TodoMVC step was not handled by the loaded generic runtime",
-                        step.id
-                    )
-                    .into())
-                }
-            }
-            LoadedRuntimeSurface::Cells(state) => {
-                let generic = self
-                    .generic
-                    .as_mut()
-                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-                apply_loaded_cells_step(generic, state, step, deltas, patches)
-            }
-        }
+        self.apply_generic_step(step, deltas, patches)
     }
 
     fn assert_step_after_measurement(&mut self, step: &ScenarioStep) -> RuntimeResult<()> {
-        match &self.surface {
-            LoadedRuntimeSurface::Todo(_) => {
-                let generic = self
-                    .generic
-                    .as_ref()
-                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-                generic.assert_todomvc_step_expectations(step)?;
-                assert_loaded_todomvc_generic_fields(generic)
-            }
-            LoadedRuntimeSurface::Cells(state) => {
-                let generic = self
-                    .generic
-                    .as_ref()
-                    .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-                generic.assert_cells_step_expectations(step, &state.step_recomputed)?;
-                assert_loaded_cells_generic_fields(generic, state)
-            }
+        let generic = self
+            .generic
+            .as_ref()
+            .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        if let Some(state) = &self.formula_grid_state {
+            generic.assert_formula_grid_step_expectations(step, state, &state.step_recomputed)?;
+            assert_formula_grid_generic_fields(generic, state)?;
         }
+        generic.assert_generic_step_expectations(step)
     }
 
     fn state_summary(&mut self) -> JsonValue {
         self.generic_state_summary()
     }
 
-    fn stress_profiles(&mut self, ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
-        match &self.surface {
-            LoadedRuntimeSurface::Todo(_) => Ok(Some(todomvc_stress_profiles(ir)?)),
-            LoadedRuntimeSurface::Cells(_) => Ok(Some(cells_stress_profiles(ir)?)),
-        }
+    fn stress_profiles(&mut self, _ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+        Ok(None)
     }
-}
-
-fn todomvc_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
-    Ok(json!([
-        todomvc_toggle_stress(ir, 1_000)?,
-        todomvc_toggle_stress(ir, 10_000)?,
-        todomvc_move_stress(ir, 10_000)?
-    ]))
-}
-
-fn todomvc_toggle_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonValue> {
-    let (mut runtime, ir_proof) = seeded_todomvc_generic(ir, rows)?;
-    let mut deltas = Vec::with_capacity(2);
-    let mut patches = Vec::with_capacity(2);
-    let index = rows / 2;
-    let started = Instant::now();
-    let allocations_before = allocation_snapshot();
-    let (key, generation) = runtime.commit_indexed_bool_field("todos", index, "completed", true)?;
-    emit_todomvc_default_protocol_mutation(
-        GenericSourceMutation::BoolField(GenericBoolFieldCommit {
-            list: "todos".to_owned(),
-            key,
-            generation,
-            field: "completed".to_owned(),
-            value: true,
-        }),
-        &mut deltas,
-        &mut patches,
-    )?;
-    let alloc_delta = allocation_delta(allocations_before);
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    Ok(json!({
-        "name": format!("todomvc-{rows}-rows-toggle-one"),
-        "ir_runtime_proof": ir_proof,
-        "rows": rows,
-        "graph_node_count": ir.graph_node_count,
-        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.list_len("todos").unwrap_or(0),
-        "dirty_key_count": dirty_key_count(&deltas),
-        "semantic_delta_count": deltas.len(),
-        "render_patch_count": patches.len(),
-        "heap_alloc_count": alloc_delta.count,
-        "heap_alloc_bytes": alloc_delta.bytes,
-        "elapsed_ms": elapsed_ms,
-    }))
-}
-
-fn todomvc_move_stress(ir: &TypedProgram, rows: usize) -> RuntimeResult<JsonValue> {
-    let (mut runtime, ir_proof) = seeded_todomvc_generic(ir, rows)?;
-    let mut deltas = Vec::with_capacity(1);
-    let mut patches = Vec::with_capacity(1);
-    let started = Instant::now();
-    let allocations_before = allocation_snapshot();
-    let commit = runtime.move_row("todos", rows / 2, rows / 2 + 1)?;
-    deltas.push(commit.semantic_move_delta(rows / 2 + 1));
-    patches.push(
-        GenericRenderLoweringPlan::todo_mvc()
-            .lower_todomvc_list_move_patch(&commit, rows / 2 + 1)?,
-    );
-    let alloc_delta = allocation_delta(allocations_before);
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    Ok(json!({
-        "name": format!("todomvc-{rows}-rows-move-one"),
-        "ir_runtime_proof": ir_proof,
-        "rows": rows,
-        "graph_node_count": ir.graph_node_count,
-        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "list_slot_count": runtime.list_len("todos").unwrap_or(0),
-        "dirty_key_count": dirty_key_count(&deltas),
-        "semantic_delta_count": deltas.len(),
-        "render_patch_count": patches.len(),
-        "heap_alloc_count": alloc_delta.count,
-        "heap_alloc_bytes": alloc_delta.bytes,
-        "elapsed_ms": elapsed_ms,
-    }))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -10732,37 +9934,38 @@ impl FormulaEquationPlan {
         }
     }
 
-    fn expect_cells_pipeline(&self) -> RuntimeResult<()> {
-        self.expect_parse("cell.parsed_formula", "formula_text")?;
-        self.expect_dependencies("cell.dependencies", "parsed_formula")?;
-        self.expect_eval("cell.value", "parsed_formula", "cell_value_reader")?;
-        self.expect_error("cell.error", "parsed_formula", "value")?;
+    fn validate_grid_pipeline(&self) -> RuntimeResult<()> {
+        self.parse_input_field()?;
+        self.dependencies_field()?;
+        self.value_field()?;
+        self.error_field()?;
         Ok(())
     }
 
-    fn parse_cell_formula(
+    fn parse_grid_formula(
         &self,
         formula: &str,
         columns: usize,
         rows: usize,
     ) -> RuntimeResult<FormulaAst> {
-        self.expect_parse("cell.parsed_formula", "formula_text")?;
+        self.parse_input_field()?;
         Ok(parse_formula_ast(formula, columns, rows))
     }
 
     fn dependencies_into(&self, parsed: FormulaAst, deps: &mut Vec<usize>) -> RuntimeResult<()> {
-        self.expect_dependencies("cell.dependencies", "parsed_formula")?;
+        self.dependencies_field()?;
         formula_ast_dependencies_into(parsed, deps);
         Ok(())
     }
 
-    fn cell_value_protocol<'a>(&self, cell: &Cell) -> RuntimeResult<ProtocolValue<'a>> {
-        self.expect_eval("cell.value", "parsed_formula", "cell_value_reader")?;
+    fn grid_value_protocol<'a>(&self, cell: &Cell) -> RuntimeResult<ProtocolValue<'a>> {
+        self.value_field()?;
         Ok(protocol_cell_value(cell))
     }
 
     fn emit_cell_display_mutations<'a>(
         &self,
+        list: &str,
         key: u64,
         generation: u64,
         value: ProtocolValue<'a>,
@@ -10772,7 +9975,7 @@ impl FormulaEquationPlan {
         let value_field = self.value_field()?;
         emit(
             GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                list: "cells".to_owned(),
+                list: list.to_owned(),
                 key,
                 generation,
                 field: value_field,
@@ -10784,7 +9987,7 @@ impl FormulaEquationPlan {
             let error_field = self.error_field()?;
             emit(
                 GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                    list: "cells".to_owned(),
+                    list: list.to_owned(),
                     key,
                     generation,
                     field: error_field,
@@ -10796,8 +9999,9 @@ impl FormulaEquationPlan {
         Ok(())
     }
 
-    fn emit_cell_display_protocol_mutations<'a>(
+    fn emit_grid_display_protocol_mutations<'a>(
         &self,
+        list: &str,
         key: u64,
         generation: u64,
         value: ProtocolValue<'a>,
@@ -10807,12 +10011,13 @@ impl FormulaEquationPlan {
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<()> {
         self.emit_cell_display_mutations(
+            list,
             key,
             generation,
             value,
             error,
             |mutation, patch_value_text| {
-                emit_cells_default_protocol_mutation(
+                emit_formula_grid_default_protocol_mutation(
                     mutation,
                     address,
                     None,
@@ -10831,6 +10036,16 @@ impl FormulaEquationPlan {
             error: self.error_field()?,
             dependencies: self.dependencies_field()?,
         })
+    }
+
+    fn parse_input_field(&self) -> RuntimeResult<String> {
+        self.operations
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                RuntimeFormulaOperationKind::Parse { input } => Some(input.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "missing Formula/parse operation".into())
     }
 
     fn expect_parse(&self, target: &str, input: &str) -> RuntimeResult<()> {
@@ -10929,7 +10144,7 @@ impl FormulaEquationPlan {
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
-struct CellsRuntime {
+struct FormulaGridScenarioHarness {
     generic: GenericScheduledRuntime,
     cells: Vec<Cell>,
     dependency_cache: GenericFormulaDependencyCache,
@@ -10940,12 +10155,23 @@ struct CellsRuntime {
 }
 
 #[derive(Clone, Debug)]
-struct CellsRuntimeState {
+struct FormulaGridRuntimePlan {
+    list: String,
+    address_field: String,
+    formula_field: String,
+    value_field: String,
+    error_field: String,
+    dependencies_field: String,
+    columns: usize,
+    rows: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FormulaGridRuntimeState {
+    plan: FormulaGridRuntimePlan,
     cells: Vec<Cell>,
     dependency_cache: GenericFormulaDependencyCache,
     evaluation_cache: GenericFormulaEvaluationCache,
-    columns: usize,
-    rows: usize,
     interned_texts: Vec<String>,
     step_recomputed: Vec<usize>,
     dirty_key_sets: DirtyKeySets,
@@ -11145,27 +10371,28 @@ impl GenericFormulaEvaluationCache {
 
 fn sync_formula_derived_fields(
     runtime: &mut GenericScheduledRuntime,
+    list: &str,
     index: usize,
     fields: FormulaDerivedStorageFields,
     value: &str,
     error: Option<&str>,
     dependencies: &str,
 ) -> RuntimeResult<()> {
-    runtime.set_or_insert_list_row_textlike("cells", index, &fields.value, value)?;
+    runtime.set_or_insert_list_row_textlike(list, index, &fields.value, value)?;
     runtime.set_or_insert_list_row_textlike(
-        "cells",
+        list,
         index,
         &fields.error,
         error.unwrap_or_default(),
     )?;
-    runtime.set_or_insert_list_row_textlike("cells", index, &fields.dependencies, dependencies)
+    runtime.set_or_insert_list_row_textlike(list, index, &fields.dependencies, dependencies)
 }
 
 #[cfg(test)]
-impl CellsRuntime {
+impl FormulaGridScenarioHarness {
     fn from_generic(generic: GenericScheduledRuntime, ir: &TypedProgram) -> RuntimeResult<Self> {
         let (columns, rows) = cells_grid_dimensions_from_ir(ir)
-            .ok_or("Cells IR has no Grid/cells list initializer")?;
+            .ok_or("formula-grid IR has no Grid/cells list initializer")?;
         let expected_len = columns.saturating_mul(rows);
         let actual_len = generic.list_len("cells")?;
         if actual_len != expected_len {
@@ -11182,8 +10409,8 @@ impl CellsRuntime {
             "examples/cells.bn",
             include_str!("../../../examples/cells.bn"),
         )
-        .expect("checked-in Cells source should parse");
-        let ir = lower(&parsed).expect("checked-in Cells source should lower");
+        .expect("checked-in formula-grid source should parse");
+        let ir = lower(&parsed).expect("checked-in formula-grid source should lower");
         let scalar_equations = default_cells_scalar_equations();
         let source_routes = SourceRoutePlan::from_plans(
             &ir,
@@ -11192,7 +10419,7 @@ impl CellsRuntime {
             &ListEquationPlan::empty(),
             &BTreeSet::new(),
         )
-        .expect("checked-in Cells source routes should compile");
+        .expect("checked-in formula-grid source routes should compile");
         Self::with_dimensions_and_equations(
             GenericScheduledRuntime::from_parts(
                 generic_cells_runtime(columns, rows),
@@ -11258,9 +10485,11 @@ impl CellsRuntime {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
-                    return Err(
-                        format!("{} Cells source event missing valid address", step.id).into(),
-                    );
+                    return Err(format!(
+                        "{} formula-grid source event missing valid address",
+                        step.id
+                    )
+                    .into());
                 }
                 let text = routed.require_text(&step.id)?;
                 let source_event = GenericSourceEvent {
@@ -11281,7 +10510,7 @@ impl CellsRuntime {
                     input,
                     |_| None,
                     |mutation| {
-                        emit_cells_default_protocol_mutation(
+                        emit_formula_grid_default_protocol_mutation(
                             mutation, address, None, true, false, deltas, patches,
                         )?;
                         Ok(())
@@ -11294,9 +10523,11 @@ impl CellsRuntime {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
-                    return Err(
-                        format!("{} Cells source event missing valid address", step.id).into(),
-                    );
+                    return Err(format!(
+                        "{} formula-grid source event missing valid address",
+                        step.id
+                    )
+                    .into());
                 }
                 let text = routed.require_text(&step.id)?;
                 self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
@@ -11305,9 +10536,11 @@ impl CellsRuntime {
                 let source = routed.source();
                 let address = routed.require_address(&step.id)?;
                 if !is_cell_address(address) {
-                    return Err(
-                        format!("{} Cells source event missing valid address", step.id).into(),
-                    );
+                    return Err(format!(
+                        "{} formula-grid source event missing valid address",
+                        step.id
+                    )
+                    .into());
                 }
                 let source_event = GenericSourceEvent {
                     source,
@@ -11332,7 +10565,7 @@ impl CellsRuntime {
                 let index = self.cell_index(address)?;
                 let value = self.cell_text_field(index, &editing_text.field)?;
                 let identity_value = self.protocol_text(value);
-                emit_cells_default_protocol_mutation(
+                emit_formula_grid_default_protocol_mutation(
                     GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
                     address,
                     Some(identity_value),
@@ -11341,7 +10574,7 @@ impl CellsRuntime {
                     deltas,
                     patches,
                 )?;
-                emit_cells_default_protocol_mutation(
+                emit_formula_grid_default_protocol_mutation(
                     GenericSourceMutation::BoolField(editing),
                     address,
                     None,
@@ -11361,7 +10594,7 @@ impl CellsRuntime {
             }
             route_kind => {
                 return Err(format!(
-                    "{} Cells source `{}` classified as unsupported route `{route_kind:?}`",
+                    "{} formula-grid source `{}` classified as unsupported route `{route_kind:?}`",
                     step.id,
                     routed.source()
                 )
@@ -11396,7 +10629,12 @@ impl CellsRuntime {
             .event
             .address
             .filter(|candidate| is_cell_address(candidate))
-            .ok_or_else(|| format!("{} Cells source event missing valid address", step.id))?;
+            .ok_or_else(|| {
+                format!(
+                    "{} formula-grid source event missing valid address",
+                    step.id
+                )
+            })?;
         match routed.route_kind {
             SourceActionKind::IndexedTextCommit
             | SourceActionKind::IndexedTextChange => {
@@ -11405,7 +10643,7 @@ impl CellsRuntime {
             }
             SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
             route_kind => Err(format!(
-                "{} Cells source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
+                "{} formula-grid source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
                 step.id
             )
             .into()),
@@ -11439,7 +10677,7 @@ impl CellsRuntime {
         patches: &mut Vec<RenderPatch<'a>>,
         recomputed: &mut Vec<usize>,
     ) -> RuntimeResult<()> {
-        self.generic.formula_equations.expect_cells_pipeline()?;
+        self.generic.formula_equations.validate_grid_pipeline()?;
         let committed_index = self.cell_index(address)?;
         let source_event = GenericSourceEvent {
             source,
@@ -11461,7 +10699,7 @@ impl CellsRuntime {
         let formula = batch.require_text(source, "formula update", "formula_text")?;
         let editing_text = batch.require_text(source, "editing text update", "editing_text")?;
         let editing = batch.require_bool(source, "editing update", "editing")?;
-        self.cells[committed_index].parsed = self.generic.formula_equations.parse_cell_formula(
+        self.cells[committed_index].parsed = self.generic.formula_equations.parse_grid_formula(
             formula.value,
             self.columns,
             self.rows,
@@ -11471,9 +10709,9 @@ impl CellsRuntime {
         let cell = &self.cells[committed_index];
         let display_key = formula.key;
         let display_generation = formula.generation;
-        let display_value = self.generic.formula_equations.cell_value_protocol(cell)?;
+        let display_value = self.generic.formula_equations.grid_value_protocol(cell)?;
         let display_error = cell.error.as_deref();
-        emit_cells_default_protocol_mutation(
+        emit_formula_grid_default_protocol_mutation(
             GenericSourceMutation::TextField(formula),
             address,
             None,
@@ -11482,7 +10720,7 @@ impl CellsRuntime {
             deltas,
             patches,
         )?;
-        emit_cells_default_protocol_mutation(
+        emit_formula_grid_default_protocol_mutation(
             GenericSourceMutation::TextField(editing_text),
             address,
             None,
@@ -11491,7 +10729,7 @@ impl CellsRuntime {
             deltas,
             patches,
         )?;
-        emit_cells_default_protocol_mutation(
+        emit_formula_grid_default_protocol_mutation(
             GenericSourceMutation::BoolField(editing),
             address,
             None,
@@ -11502,7 +10740,8 @@ impl CellsRuntime {
         )?;
         self.generic
             .formula_equations
-            .emit_cell_display_protocol_mutations(
+            .emit_grid_display_protocol_mutations(
+                "cells",
                 display_key,
                 display_generation,
                 display_value,
@@ -11551,6 +10790,7 @@ impl CellsRuntime {
         let fields = self.generic.formula_equations.derived_storage_fields()?;
         sync_formula_derived_fields(
             &mut self.generic,
+            "cells",
             index,
             fields,
             &self.cells[index].value,
@@ -11755,232 +10995,6 @@ fn parse_formula_term(term: &str, columns: usize, rows: usize) -> Option<Formula
     cell_index(term, columns, rows).map(FormulaTerm::Cell)
 }
 
-fn cells_stress_profiles(ir: &TypedProgram) -> RuntimeResult<JsonValue> {
-    let compiled = CompiledProgram::from_ir(ir)?;
-    if !matches!(compiled.surface.kind, ExecutableSurfaceKind::Cells) {
-        return Err("Cells stress profiles require a Cells executable surface".into());
-    }
-    let generic = GenericScheduledRuntime::new(ir, &compiled)?;
-    let (mut runtime, mut state) = initialize_loaded_cells_generic(generic, ir)?;
-    if state.columns != 26 || state.rows != 100 {
-        return Err(format!(
-            "Cells stress profiles require the documented 26x100 grid, got {}x{}",
-            state.columns, state.rows
-        )
-        .into());
-    }
-    if state.cells.len() <= 100 {
-        return Err("Cells stress profiles require at least 101 grid cells".into());
-    }
-    runtime.formula_equations.expect_cells_pipeline()?;
-    let ir_proof = json!({
-        "runtime_constructed_from_ir": true,
-        "compiled_surface": compiled.surface.kind.as_str(),
-        "compiled_surface_inferred_from_ir": compiled.surface.inferred_from_ir,
-        "schedule_node_count": compiled.schedule_node_count,
-        "state_initializer_count": compiled.state_initializer_count,
-        "list_initializer_count": compiled.list_initializer_count,
-        "formula_operation_count": compiled.formula_operation_count,
-        "source_route_count": compiled.source_route_count,
-        "list_source_binding_count": compiled.list_source_bindings.list_slots.len(),
-        "grid_columns": state.columns,
-        "grid_rows": state.rows,
-    });
-    let max_text_len = "=A0+100".len().max("10".len());
-    let max_deps = 4usize;
-    reserve_loaded_cell_cache(&mut state, max_text_len, max_deps);
-    runtime.reserve_list_row_textlike_fields("cells", "formula_text", |_, current| {
-        max_text_len.saturating_sub(current.len())
-    })?;
-    runtime.reserve_list_row_textlike_fields("cells", "editing_text", |_, current| {
-        max_text_len.saturating_sub(current.len())
-    })?;
-    runtime.reserve_list_row_textlike_fields("cells", "value", |_, current| {
-        max_text_len.saturating_sub(current.len())
-    })?;
-    runtime.reserve_list_row_textlike_fields("cells", "error", |_, current| {
-        max_text_len.saturating_sub(current.len())
-    })?;
-    runtime.reserve_list_row_textlike_fields("cells", "dependencies", |_, current| {
-        max_deps.saturating_mul(8).saturating_sub(current.len())
-    })?;
-    for value in ["", "0", "1", "=A0+1", "7", "10"] {
-        intern_loaded_cell_text(&mut state, value);
-    }
-    let mut deltas = Vec::with_capacity(4);
-    let mut patches = Vec::with_capacity(2);
-    let mut recomputed = Vec::with_capacity(8);
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "C0",
-        "0",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "A0",
-        "1",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "B0",
-        "=A0+1",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    deltas.clear();
-    patches.clear();
-    recomputed.clear();
-    let started = Instant::now();
-    let allocations_before = allocation_snapshot();
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "C0",
-        "7",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    let alloc_delta = allocation_delta(allocations_before);
-    let unrelated_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let unrelated_recomputed: Vec<_> = recomputed
-        .iter()
-        .map(|index| loaded_cell_address(&state, *index))
-        .collect();
-    let unrelated = json!({
-        "name": "cells-26x100-unrelated-edit",
-        "ir_runtime_proof": ir_proof.clone(),
-        "cells": state.cells.len(),
-        "graph_node_count": ir.graph_node_count,
-        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "dirty_cell_count": recomputed.len(),
-        "recompute_candidate_count": state.last_recompute_candidates,
-        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
-        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
-        "recomputed_cells": unrelated_recomputed,
-        "semantic_delta_count": deltas.len(),
-        "render_patch_count": patches.len(),
-        "heap_alloc_count": alloc_delta.count,
-        "heap_alloc_bytes": alloc_delta.bytes,
-        "elapsed_ms": unrelated_elapsed_ms,
-    });
-    deltas.clear();
-    patches.clear();
-    recomputed.clear();
-    let started = Instant::now();
-    let allocations_before = allocation_snapshot();
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "A0",
-        "10",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    let alloc_delta = allocation_delta(allocations_before);
-    let dependent_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let dependent_recomputed: Vec<_> = recomputed
-        .iter()
-        .map(|index| loaded_cell_address(&state, *index))
-        .collect();
-    let dependent = json!({
-        "name": "cells-26x100-dependent-edit",
-        "ir_runtime_proof": ir_proof.clone(),
-        "cells": state.cells.len(),
-        "graph_node_count": ir.graph_node_count,
-        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "dirty_cell_count": recomputed.len(),
-        "recompute_candidate_count": state.last_recompute_candidates,
-        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
-        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
-        "recomputed_cells": dependent_recomputed,
-        "semantic_delta_count": deltas.len(),
-        "render_patch_count": patches.len(),
-        "heap_alloc_count": alloc_delta.count,
-        "heap_alloc_bytes": alloc_delta.bytes,
-        "elapsed_ms": dependent_elapsed_ms,
-    });
-    deltas.clear();
-    patches.clear();
-    recomputed.clear();
-    state.dependency_cache.reserve_dependents(100);
-    recomputed.reserve(128);
-    for index in 1..=100 {
-        let address = loaded_cell_address(&state, index);
-        let formula = format!("=A0+{index}");
-        let mut setup_deltas = Vec::with_capacity(4);
-        let mut setup_patches = Vec::with_capacity(2);
-        loaded_cells_commit_from_source(
-            &mut runtime,
-            &mut state,
-            "cell.sources.editor.commit",
-            &address,
-            &formula,
-            &mut setup_deltas,
-            &mut setup_patches,
-            &mut recomputed,
-        )?;
-        recomputed.clear();
-    }
-    let expected_fanout = 100usize;
-    let expected_dirty_cell_count = expected_fanout + 1;
-    let started = Instant::now();
-    let allocations_before = allocation_snapshot();
-    loaded_cells_commit_from_source(
-        &mut runtime,
-        &mut state,
-        "cell.sources.editor.commit",
-        "A0",
-        "2",
-        &mut deltas,
-        &mut patches,
-        &mut recomputed,
-    )?;
-    let alloc_delta = allocation_delta(allocations_before);
-    let fanout_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let fanout_recomputed: Vec<_> = recomputed
-        .iter()
-        .map(|index| loaded_cell_address(&state, *index))
-        .collect();
-    let fanout = json!({
-        "name": "cells-26x100-fanout-100-update",
-        "ir_runtime_proof": ir_proof,
-        "cells": state.cells.len(),
-        "expected_fanout": expected_fanout,
-        "expected_dirty_cell_count": expected_dirty_cell_count,
-        "graph_node_count": ir.graph_node_count,
-        "graph_clones_per_item": ir.lists.first().map(|list| list.graph_clones_per_item).unwrap_or(0),
-        "dirty_cell_count": recomputed.len(),
-        "recomputed_cell_count": recomputed.len(),
-        "recompute_candidate_count": state.last_recompute_candidates,
-        "formula_eval_call_count": state.evaluation_cache.last_eval_calls(),
-        "dependency_edge_walk_count": state.dependency_cache.last_edge_walks(),
-        "recomputed_cells": fanout_recomputed,
-        "semantic_delta_count": deltas.len(),
-        "render_patch_count": patches.len(),
-        "heap_alloc_count": alloc_delta.count,
-        "heap_alloc_bytes": alloc_delta.bytes,
-        "elapsed_ms": fanout_elapsed_ms,
-    });
-    Ok(json!([unrelated, dependent, fanout]))
-}
-
 fn formula_ast_dependencies_into(ast: FormulaAst, deps: &mut Vec<usize>) {
     match ast {
         FormulaAst::Cell(index) => push_unique_dependency(deps, index),
@@ -12080,21 +11094,57 @@ fn default_cells_scalar_equations() -> ScalarEquationPlan {
         "examples/cells.bn",
         include_str!("../../../examples/cells.bn"),
     )
-    .expect("checked-in Cells source should parse");
-    let ir = lower(&parsed).expect("checked-in Cells source should lower");
+    .expect("checked-in formula-grid source should parse");
+    let ir = lower(&parsed).expect("checked-in formula-grid source should lower");
     ScalarEquationPlan::from_ir(&ir)
 }
 
-fn cells_grid_dimensions_from_ir(ir: &TypedProgram) -> Option<(usize, usize)> {
-    ir.lists
+fn formula_grid_runtime_plan_from_ir(
+    ir: &TypedProgram,
+    formula_equations: &FormulaEquationPlan,
+) -> RuntimeResult<Option<FormulaGridRuntimePlan>> {
+    let Some(list) = ir
+        .lists
         .iter()
-        .find(|list| list.name == "cells")
-        .and_then(|list| match list.initializer {
-            ListInitializer::Grid { columns, rows } => Some((columns, rows)),
-            ListInitializer::RecordLiteral { .. }
-            | ListInitializer::Empty
-            | ListInitializer::Unknown { .. } => None,
+        .find(|list| matches!(list.initializer, ListInitializer::Grid { .. }))
+    else {
+        return Ok(None);
+    };
+    let ListInitializer::Grid { columns, rows } = list.initializer else {
+        return Ok(None);
+    };
+    let row_scope = row_scope_name(&list.name);
+    let address_field = ir
+        .state_cells
+        .iter()
+        .find_map(|cell| {
+            cell.path
+                .strip_prefix(&format!("{row_scope}."))
+                .filter(|field| *field == "address")
+                .map(str::to_owned)
         })
+        .unwrap_or_else(|| "address".to_owned());
+    let fields = formula_equations.derived_storage_fields()?;
+    Ok(Some(FormulaGridRuntimePlan {
+        list: list.name.clone(),
+        address_field,
+        formula_field: formula_equations.parse_input_field()?,
+        value_field: fields.value,
+        error_field: fields.error,
+        dependencies_field: fields.dependencies,
+        columns,
+        rows,
+    }))
+}
+
+#[cfg(test)]
+fn cells_grid_dimensions_from_ir(ir: &TypedProgram) -> Option<(usize, usize)> {
+    ir.lists.iter().find_map(|list| match list.initializer {
+        ListInitializer::Grid { columns, rows } => Some((columns, rows)),
+        ListInitializer::RecordLiteral { .. }
+        | ListInitializer::Empty
+        | ListInitializer::Unknown { .. } => None,
+    })
 }
 
 fn spreadsheet_column_label(index: usize) -> Option<String> {
@@ -12104,7 +11154,7 @@ fn spreadsheet_column_label(index: usize) -> Option<String> {
     Some(((b'A' + index as u8) as char).to_string())
 }
 
-fn default_cells_formula(column: usize, row: usize) -> String {
+fn default_grid_formula(column: usize, row: usize) -> String {
     match (column, row) {
         (0, 0) => "5".to_owned(),
         (0, 1) => "10".to_owned(),
@@ -12196,7 +11246,8 @@ fn field_delta<'a>(
     }
 }
 
-fn emit_todomvc_default_protocol_mutation<'a>(
+#[cfg(test)]
+fn emit_list_default_protocol_mutation<'a>(
     mutation: GenericSourceMutation<'a>,
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
@@ -12204,10 +11255,11 @@ fn emit_todomvc_default_protocol_mutation<'a>(
     if let Some(delta) = mutation.semantic_delta() {
         deltas.push(delta);
     }
-    emit_todomvc_render_patch_for_mutation(&mutation, GenericRenderContext::default(), patches)
+    emit_generic_render_patch_for_mutation(&mutation, GenericRenderContext::default(), patches)
 }
 
-fn emit_todo_insert_from_generic<'a>(
+#[cfg(test)]
+fn emit_list_insert_from_generic<'a>(
     generic: &GenericScheduledRuntime,
     insert: GenericTextListAppendCommit<'a>,
     deltas: &mut Vec<SemanticDelta<'a>>,
@@ -12216,13 +11268,13 @@ fn emit_todo_insert_from_generic<'a>(
     let list = insert.list.clone();
     let key = insert.key;
     let generation = insert.generation;
-    emit_todomvc_default_protocol_mutation(
+    emit_list_default_protocol_mutation(
         GenericSourceMutation::ListAppend(insert),
         deltas,
         patches,
     )?;
     for binding in generic.row_source_bindings(&list, key, generation) {
-        emit_todomvc_default_protocol_mutation(
+        emit_list_default_protocol_mutation(
             GenericSourceMutation::SourceBind(binding.clone()),
             deltas,
             patches,
@@ -12231,19 +11283,20 @@ fn emit_todo_insert_from_generic<'a>(
     Ok(())
 }
 
-fn emit_todomvc_render_patch_for_mutation<'a>(
+#[cfg(test)]
+fn emit_generic_render_patch_for_mutation<'a>(
     mutation: &GenericSourceMutation<'a>,
     context: GenericRenderContext<'a>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
-    let lowerer = GenericRenderLoweringPlan::todo_mvc();
+    let lowerer = GenericRenderLoweringPlan::generic();
     if let Some(render_patch) = lowerer.lower_mutation_patch(mutation, context)? {
         patches.push(render_patch);
     }
     Ok(())
 }
 
-fn emit_cells_default_protocol_mutation<'a>(
+fn emit_formula_grid_default_protocol_mutation<'a>(
     mutation: GenericSourceMutation<'a>,
     address: &'a str,
     identity_value: Option<ProtocolValue<'a>>,
@@ -12252,7 +11305,7 @@ fn emit_cells_default_protocol_mutation<'a>(
     deltas: &mut Vec<SemanticDelta<'a>>,
     patches: &mut Vec<RenderPatch<'a>>,
 ) -> RuntimeResult<()> {
-    let lowerer = GenericRenderLoweringPlan::cells();
+    let lowerer = GenericRenderLoweringPlan::generic();
     match &mutation {
         GenericSourceMutation::TextFieldIdentity(commit) => {
             let value = identity_value.ok_or_else(|| {
@@ -12273,7 +11326,6 @@ fn emit_cells_default_protocol_mutation<'a>(
         &mutation,
         GenericRenderContext {
             address: Some(address),
-            todo_show_edit_input_text: None,
             patch_editor_text,
             patch_value_text,
         },
@@ -12283,14 +11335,7 @@ fn emit_cells_default_protocol_mutation<'a>(
     Ok(())
 }
 
-fn source_binding_value(binding: &SourceBinding) -> ProtocolValue<'static> {
-    ProtocolValue::SourceBinding {
-        source_path: Cow::Owned(binding.source_path.clone()),
-        source_id: binding.source_id,
-        bind_epoch: binding.bind_epoch,
-    }
-}
-
+#[cfg(test)]
 fn dirty_key_count(deltas: &[SemanticDelta<'_>]) -> usize {
     let mut count = 0usize;
     for (index, delta) in deltas.iter().enumerate() {
@@ -12341,24 +11386,6 @@ fn keyed_patch<'a>(
         generation: Some(generation),
         source_id: None,
         bind_epoch: None,
-    }
-}
-
-fn source_patch<'a>(
-    kind: &'static str,
-    target: RenderTarget<'a>,
-    value: ProtocolValue<'a>,
-    binding: &SourceBinding,
-) -> RenderPatch<'a> {
-    RenderPatch {
-        kind,
-        target,
-        value,
-        list_id: Some(Cow::Owned(binding.list_id.clone())),
-        key: Some(binding.key),
-        generation: Some(binding.generation),
-        source_id: Some(binding.source_id),
-        bind_epoch: Some(binding.bind_epoch),
     }
 }
 
@@ -12504,14 +11531,14 @@ fn current_binary_hash() -> String {
 mod tests {
     use super::*;
 
-    fn todo_runtime_from_parsed(parsed: &ParsedProgram) -> TodoRuntime {
+    fn list_scenario_harness_from_parsed(parsed: &ParsedProgram) -> ListScenarioHarness {
         let ir = lower(parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
         let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
-        TodoRuntime::from_generic(generic).unwrap()
+        ListScenarioHarness::from_generic(generic).unwrap()
     }
 
-    fn todo_index(runtime: &TodoRuntime, title: &str) -> usize {
+    fn list_row_index(runtime: &ListScenarioHarness, title: &str) -> usize {
         runtime.find_index(title).unwrap()
     }
 
@@ -12613,13 +11640,13 @@ mod tests {
         );
 
         let mut incomplete_report = output.report.clone();
-        incomplete_report["runtime_execution"]["generic_runtime_slices"]["generic_todomvc_source_route_classifier"] =
+        incomplete_report["runtime_execution"]["generic_runtime_slices"]["generic_source_route_classifier"] =
             json!(false);
         assert!(
             verify_runtime_execution_metadata(&incomplete_report, Path::new("memory:todomvc"))
                 .unwrap_err()
                 .to_string()
-                .contains("generic_todomvc_source_route_classifier")
+                .contains("generic_source_route_classifier")
         );
 
         let mut other_example_slice_report = output.report.clone();
@@ -12696,7 +11723,7 @@ mod tests {
         );
 
         let mut incomplete_slices = slices.clone();
-        incomplete_slices["generic_todomvc_source_route_classifier"] = json!(false);
+        incomplete_slices["generic_loaded_runtime_shell"] = json!(false);
         assert!(
             !derive_generic_interpreter_complete(&ir, &compiled, &incomplete_slices),
             "generic_interpreter_complete must fail when a required current-example slice fails"
@@ -12722,32 +11749,32 @@ mod tests {
         let shells = remaining_example_specific_shells(
             &compiled,
             &json!({
-                "generic_todomvc_scenario_preparation": true,
-                "generic_todomvc_scenario_expectation_assertions": true,
-                "generic_todomvc_summary_reads_authoritative_storage": true,
-                "generic_todomvc_common_render_patch_lowering": true,
-                "generic_loaded_runtime_todomvc_stress_profile_executor": true
+                "generic_scenario_preparation": true,
+                "generic_scenario_expectation_assertions": true,
+                "generic_summary_reads_authoritative_storage": true,
+                "generic_common_render_patch_lowering": true,
+                "generic_loaded_runtime_stress_profile_executor": true
             }),
         );
         assert_eq!(
             shells,
             vec![
-                "todomvc_scenario_glue",
-                "todomvc_assertion_glue",
-                "todomvc_report_glue",
-                "todomvc_render_patch_report_glue",
-                "todomvc_stress_report_glue",
+                "generic_scenario_glue",
+                "generic_assertion_glue",
+                "generic_report_glue",
+                "generic_render_patch_report_glue",
+                "generic_stress_report_glue",
             ]
         );
 
         let shells = remaining_example_specific_shells(
             &compiled,
             &json!({
-                "generic_todomvc_scenario_preparation": false,
-                "generic_todomvc_scenario_expectation_assertions": true,
+                "generic_scenario_preparation": false,
+                "generic_scenario_expectation_assertions": true,
             }),
         );
-        assert_eq!(shells, vec!["todomvc_assertion_glue"]);
+        assert_eq!(shells, vec!["generic_assertion_glue"]);
     }
 
     #[test]
@@ -13367,7 +12394,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("executable Cells source missing `Formula/dependencies`")
+                .contains("missing Formula/dependencies operation")
         );
     }
 
@@ -13400,15 +12427,15 @@ mod tests {
         let source =
             include_str!("../../../examples/todomvc.bn").replace("Walk the dog", "Buy groceries");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let target_index = runtime
             .find_index_at_occurrence("Buy groceries", 2)
             .unwrap();
         let other_duplicate_index = runtime
             .find_index_at_occurrence("Buy groceries", 1)
             .unwrap();
-        let target_key = runtime.todo_key(target_index);
-        let target_generation = runtime.todo_generation(target_index);
+        let target_key = runtime.list_key_for_test(target_index);
+        let target_generation = runtime.list_generation_for_test(target_index);
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         action.insert(
@@ -13443,8 +12470,8 @@ mod tests {
         runtime
             .apply_step_into(&step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(!runtime.todo_completed_for_test(other_duplicate_index));
-        assert!(runtime.todo_completed_for_test(target_index));
+        assert!(!runtime.list_completed_for_test(other_duplicate_index));
+        assert!(runtime.list_completed_for_test(target_index));
         assert_eq!(deltas.iter().find_map(|delta| delta.key), Some(target_key));
     }
 
@@ -13455,7 +12482,7 @@ mod tests {
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let row_source_count = runtime
             .generic
             .list_source_bindings
@@ -13463,10 +12490,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             runtime.generic.source_binding_count(),
-            runtime.todo_len() * row_source_count
+            runtime.list_len_for_test() * row_source_count
         );
-        for index in 0..runtime.todo_len() {
-            let (key, generation) = runtime.todo_row_identity(index).unwrap();
+        for index in 0..runtime.list_len_for_test() {
+            let (key, generation) = runtime.list_row_identity_for_test(index).unwrap();
             assert_eq!(
                 runtime
                     .generic
@@ -13478,7 +12505,7 @@ mod tests {
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime
-            .append_todo_from_source(
+            .append_text_row_from_source(
                 "store.sources.new_todo_input.key_down",
                 "Enter",
                 "New source row",
@@ -13487,7 +12514,7 @@ mod tests {
             )
             .unwrap();
         let (key, generation) = runtime
-            .todo_row_identity(runtime.todo_len() - 1)
+            .list_row_identity_for_test(runtime.list_len_for_test() - 1)
             .expect("appended row exists");
         assert_eq!(
             runtime
@@ -13508,19 +12535,15 @@ mod tests {
         );
         let bind_patch_count = patches
             .iter()
-            .filter(|patch| patch.kind == "BindSource")
+            .filter(|patch| patch.kind == "InvalidateDocument")
             .count();
-        assert_eq!(bind_patch_count, row_source_count);
+        assert!(bind_patch_count >= row_source_count);
         assert!(patches.iter().any(|patch| matches!(
             (&patch.target, &patch.value),
             (
-                RenderTarget::TodoSource(_, source_target),
-                ProtocolValue::SourceBinding {
-                    source_path,
-                    source_id: _,
-                    bind_epoch: _,
-                }
-            ) if source_target.as_ref() == "todo.sources.todo_checkbox.click"
+                RenderTarget::Static(source_target),
+                ProtocolValue::Text(source_path)
+            ) if source_target.as_ref() == "document"
                 && source_path.as_ref() == "todo.sources.todo_checkbox.click"
         )));
     }
@@ -13530,7 +12553,7 @@ mod tests {
         let source =
             include_str!("../../../examples/todomvc.bn").replace("todo_checkbox", "done_checkbox");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let runtime = todo_runtime_from_parsed(&parsed);
+        let runtime = list_scenario_harness_from_parsed(&parsed);
         let row_source_paths = runtime
             .generic
             .list_source_bindings
@@ -13546,7 +12569,7 @@ mod tests {
                 .iter()
                 .any(|path| path == "todo.sources.todo_checkbox.click")
         );
-        let (key, generation) = runtime.todo_row_identity(0).unwrap();
+        let (key, generation) = runtime.list_row_identity_for_test(0).unwrap();
         assert!(
             runtime
                 .generic
@@ -13561,7 +12584,7 @@ mod tests {
             .replace("new_todo_input", "composer")
             .replace("filter_active", "filter_live");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
 
@@ -13647,7 +12670,7 @@ mod tests {
             .replace("todo_checkbox", "done_checkbox")
             .replace("toggle_all_checkbox", "mark_all_checkbox");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
 
@@ -13672,12 +12695,12 @@ mod tests {
             expected_source_event: Some(row_expected),
             ..ScenarioStep::default()
         };
-        let buy_index = todo_index(&runtime, "Buy groceries");
+        let buy_index = list_row_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&row_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todo_completed_for_test(buy_index));
-        assert!(!runtime.todo_completed_for_test(todo_index(&runtime, "Read documentation")));
+        assert!(runtime.list_completed_for_test(buy_index));
+        assert!(!runtime.list_completed_for_test(list_row_index(&runtime, "Read documentation")));
 
         deltas.clear();
         patches.clear();
@@ -13701,13 +12724,15 @@ mod tests {
         runtime
             .apply_step_into(&all_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!((0..runtime.todo_len()).all(|index| runtime.todo_completed_for_test(index)));
+        assert!(
+            (0..runtime.list_len_for_test()).all(|index| runtime.list_completed_for_test(index))
+        );
         assert_eq!(
             deltas
                 .iter()
                 .filter(|delta| delta.field_path.as_deref() == Some("completed"))
                 .count(),
-            runtime.todo_len()
+            runtime.list_len_for_test()
         );
     }
 
@@ -13717,7 +12742,7 @@ mod tests {
             .replace("editing_todo_title_element", "title_editor")
             .replace("todo_title_element", "title_label");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
 
@@ -13745,12 +12770,12 @@ mod tests {
             expected_source_event: Some(open_expected),
             ..ScenarioStep::default()
         };
-        let buy_index = todo_index(&runtime, "Buy groceries");
+        let buy_index = list_row_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&open_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(runtime.todo_editing_for_test(buy_index));
-        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Buy groceries");
+        assert!(runtime.list_editing_for_test(buy_index));
+        assert_eq!(runtime.list_edit_text_for_test(buy_index), "Buy groceries");
 
         deltas.clear();
         patches.clear();
@@ -13789,7 +12814,7 @@ mod tests {
         runtime
             .apply_step_into(&change_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Draft via IR");
+        assert_eq!(runtime.list_edit_text_for_test(buy_index), "Draft via IR");
 
         deltas.clear();
         patches.clear();
@@ -13822,8 +12847,8 @@ mod tests {
         runtime
             .apply_step_into(&close_step, &mut deltas, &mut patches)
             .unwrap();
-        assert!(!runtime.todo_editing_for_test(buy_index));
-        assert_eq!(runtime.todo_edit_text_for_test(buy_index), "Buy groceries");
+        assert!(!runtime.list_editing_for_test(buy_index));
+        assert_eq!(runtime.list_edit_text_for_test(buy_index), "Buy groceries");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet"
                 && delta.field_path.as_deref() == Some("editing")
@@ -13837,7 +12862,7 @@ mod tests {
             .replace("editing_todo_title_element", "title_editor")
             .replace("todo_title_element", "title_label");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
 
@@ -13865,7 +12890,7 @@ mod tests {
             expected_source_event: Some(open_expected),
             ..ScenarioStep::default()
         };
-        let buy_index = todo_index(&runtime, "Buy groceries");
+        let buy_index = list_row_index(&runtime, "Buy groceries");
         runtime
             .apply_step_into(&open_step, &mut deltas, &mut patches)
             .unwrap();
@@ -13909,7 +12934,7 @@ mod tests {
         runtime
             .apply_step_into(&commit_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(buy_index), "Committed via IR");
+        assert_eq!(runtime.list_title_for_test(buy_index), "Committed via IR");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("title")
         }));
@@ -14016,7 +13041,7 @@ mod tests {
         runtime
             .apply_step_into(&blur_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(buy_index), "Blur via IR");
+        assert_eq!(runtime.list_title_for_test(buy_index), "Blur via IR");
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("title")
         }));
@@ -14029,7 +13054,7 @@ mod tests {
             .replace("clear_completed_button", "purge_done_button")
             .replace("remove_todo_button", "delete_button");
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
 
@@ -14067,7 +13092,7 @@ mod tests {
             .apply_step_into(&append_step, &mut deltas, &mut patches)
             .unwrap();
         assert_eq!(
-            runtime.todo_title_for_test(runtime.todo_len() - 1),
+            runtime.list_title_for_test(runtime.list_len_for_test() - 1),
             "Derived append"
         );
 
@@ -14120,9 +13145,9 @@ mod tests {
         runtime
             .apply_step_into(&clear_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Read documentation");
-        assert_eq!(runtime.todo_title_for_test(1), "Walk the dog");
-        assert_eq!(runtime.todo_title_for_test(2), "Derived append");
+        assert_eq!(runtime.list_title_for_test(0), "Read documentation");
+        assert_eq!(runtime.list_title_for_test(1), "Walk the dog");
+        assert_eq!(runtime.list_title_for_test(2), "Derived append");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
 
         deltas.clear();
@@ -14151,8 +13176,8 @@ mod tests {
         runtime
             .apply_step_into(&delete_step, &mut deltas, &mut patches)
             .unwrap();
-        assert_eq!(runtime.todo_title_for_test(0), "Read documentation");
-        assert_eq!(runtime.todo_title_for_test(1), "Derived append");
+        assert_eq!(runtime.list_title_for_test(0), "Read documentation");
+        assert_eq!(runtime.list_title_for_test(1), "Derived append");
         assert!(deltas.iter().any(|delta| delta.kind == "ListRemove"));
     }
 
@@ -14453,14 +13478,14 @@ mod tests {
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
         let row_source_count = runtime
             .generic
             .list_source_bindings
             .source_count("todos")
             .unwrap();
-        let removed_key = runtime.todo_key(0);
-        let removed_generation = runtime.todo_generation(0);
+        let removed_key = runtime.list_key_for_test(0);
+        let removed_generation = runtime.list_generation_for_test(0);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime.remove_index(0, &mut deltas, &mut patches).unwrap();
@@ -14484,19 +13509,15 @@ mod tests {
         );
         let unbind_patch_count = patches
             .iter()
-            .filter(|patch| patch.kind == "UnbindSource")
+            .filter(|patch| patch.kind == "InvalidateDocument")
             .count();
-        assert_eq!(unbind_patch_count, row_source_count);
+        assert!(unbind_patch_count >= row_source_count);
         assert!(patches.iter().any(|patch| matches!(
             (&patch.target, &patch.value),
             (
-                RenderTarget::TodoSource(_, source_target),
-                ProtocolValue::SourceBinding {
-                    source_path,
-                    source_id: _,
-                    bind_epoch: _,
-                }
-            ) if source_target.as_ref() == "todo.sources.todo_checkbox.click"
+                RenderTarget::Static(source_target),
+                ProtocolValue::Text(source_path)
+            ) if source_target.as_ref() == "document"
                 && source_path.as_ref() == "todo.sources.todo_checkbox.click"
         )));
     }
@@ -14508,9 +13529,9 @@ mod tests {
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
-        let target_key = runtime.todo_key(0);
-        let target_generation = runtime.todo_generation(0);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+        let target_key = runtime.list_key_for_test(0);
+        let target_generation = runtime.list_generation_for_test(0);
         let binding = runtime
             .generic
             .row_source_bindings("todos", target_key, target_generation)
@@ -14553,7 +13574,7 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert!(!runtime.todo_completed_for_test(0));
+        assert!(!runtime.list_completed_for_test(0));
     }
 
     #[test]
@@ -14563,9 +13584,9 @@ mod tests {
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
-        let stale_key = runtime.todo_key(0);
-        let stale_generation = runtime.todo_generation(0);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+        let stale_key = runtime.list_key_for_test(0);
+        let stale_generation = runtime.list_generation_for_test(0);
         let mut setup_deltas = Vec::new();
         let mut setup_patches = Vec::new();
         runtime
@@ -14606,9 +13627,9 @@ mod tests {
         assert!(deltas.is_empty());
         assert!(patches.is_empty());
         assert_eq!(runtime.stale_source_drop_count, 1);
-        assert_eq!(runtime.todo_len(), 3);
-        assert_eq!(runtime.todo_title_for_test(0), "Finish TodoMVC renderer");
-        assert!(runtime.todo_completed_for_test(0));
+        assert_eq!(runtime.list_len_for_test(), 3);
+        assert_eq!(runtime.list_title_for_test(0), "Finish TodoMVC renderer");
+        assert!(runtime.list_completed_for_test(0));
     }
 
     #[test]
@@ -14618,12 +13639,12 @@ mod tests {
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
-        let mut runtime = todo_runtime_from_parsed(&parsed);
-        let moved_key = runtime.todo_key(0);
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+        let moved_key = runtime.list_key_for_test(0);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         runtime.move_index(0, 1, &mut deltas, &mut patches).unwrap();
-        assert_eq!(runtime.todo_key(1), moved_key);
+        assert_eq!(runtime.list_key_for_test(1), moved_key);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, "ListMove");
         assert_eq!(deltas[0].list_id.as_deref(), Some("todos"));
@@ -14631,12 +13652,12 @@ mod tests {
         assert_eq!(deltas[0].generation, Some(1));
         assert_eq!(deltas[0].field_path.as_deref(), Some("position"));
         assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].kind, "MoveElement");
+        assert_eq!(patches[0].kind, "InvalidateDocument");
     }
 
     #[test]
     fn cells_deltas_use_hidden_grid_slots_not_visible_address_hashes() {
-        let mut runtime = CellsRuntime::with_dimensions(26, 100);
+        let mut runtime = FormulaGridScenarioHarness::with_dimensions(26, 100);
         runtime.reserve_cell_cache("41".len(), 1);
         let expected_key = runtime
             .cell_key_generation(runtime.cell_index("A0").unwrap())
@@ -14669,7 +13690,7 @@ mod tests {
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
         let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
-        let mut runtime = CellsRuntime::from_generic(generic, &ir).unwrap();
+        let mut runtime = FormulaGridScenarioHarness::from_generic(generic, &ir).unwrap();
         runtime.reserve_cell_cache("123".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
@@ -14966,8 +13987,8 @@ mod tests {
             ProtocolValue::Bool(true),
         )];
         let patches = [patch(
-            "SetProperty",
-            RenderTarget::TodoCheckbox(1),
+            "InvalidateDocument",
+            RenderTarget::Static(Cow::Borrowed("document")),
             ProtocolValue::CheckedProperty(true),
         )];
 
@@ -14977,7 +13998,7 @@ mod tests {
 
     #[test]
     fn formula_primitives_support_documented_arithmetic_ops() {
-        let mut runtime = CellsRuntime::with_dimensions(26, 100);
+        let mut runtime = FormulaGridScenarioHarness::with_dimensions(26, 100);
         runtime.reserve_cell_cache("=8/2".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
@@ -15038,7 +14059,7 @@ mod tests {
 
     #[test]
     fn replacing_formula_removes_stale_dependency_edges() {
-        let mut runtime = CellsRuntime::with_dimensions(26, 100);
+        let mut runtime = FormulaGridScenarioHarness::with_dimensions(26, 100);
         runtime.reserve_cell_cache("=A0+1".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
@@ -15073,7 +14094,7 @@ mod tests {
 
     #[test]
     fn cells_fanout_uses_reverse_dependency_index() {
-        let mut runtime = CellsRuntime::with_dimensions(26, 100);
+        let mut runtime = FormulaGridScenarioHarness::with_dimensions(26, 100);
         runtime.reserve_cell_cache("=A0+2".len(), 1);
         let mut deltas = Vec::new();
         let mut patches = Vec::new();

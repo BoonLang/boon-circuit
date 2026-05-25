@@ -74,10 +74,10 @@ pub mod native_gpu_rect {
                     }],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 16u64,
+                    array_stride: 4u64,
                     step_mode: color,
                     attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
+                        format: wgpu::VertexFormat::Unorm8x4,
                         offset: 0,
                         shader_location: 1,
                     }],

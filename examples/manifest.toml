@@ -22,16 +22,19 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
-  "focus-cell",
-  "type-scalar-value",
-  "commit-value-enter",
-  "edit-formula-bar",
-  "commit-formula-enter",
-  "recompute-dependents",
-  "invalid-formula-error",
+  "edit-a0-literal",
+  "commit-a0-literal",
+  "edit-a0-cancel-draft",
+  "cancel-a0-draft",
+  "commit-b0-formula",
+  "change-a0-updates-b0",
   "cycle-error",
-  "cancel-edit-escape",
-  "blur-commit-or-cancel",
+  "replace-b0-formula-removes-stale-cycle-edge",
+  "change-a0-after-edge-replacement-does-not-recompute-b0",
+  "commit-c0-fanout-formula",
+  "commit-d0-fanout-formula",
+  "commit-j0-visible-grid-edge",
+  "change-a0-fanout-recomputes-dependents-only",
 ]
 scroll_focus_scenarios = [
   "vertical-wheel-scroll",
@@ -76,19 +79,31 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
-  "focus-new-todo-input",
-  "type-new-todo",
-  "enter-adds-todo",
-  "reject-empty-add",
-  "toggle-single-row",
-  "toggle-all-rows",
-  "switch-all-active-completed",
-  "double-click-edit-row",
-  "enter-commits-edit",
-  "escape-cancels-edit",
-  "blur-commits-edit",
+  "add-test-todo-type",
+  "add-test-todo-submit",
+  "reject-empty-todo",
+  "toggle-all-complete",
+  "toggle-all-active",
+  "toggle-buy-groceries",
+  "filter-active",
+  "toggle-dynamic-test-todo-under-active-filter",
+  "filter-completed",
+  "filter-all",
+  "edit-test-todo",
+  "edit-test-todo-change",
+  "edit-test-todo-commit",
+  "edit-test-todo-cancel-open",
+  "edit-test-todo-cancel-change",
+  "edit-test-todo-cancel-escape",
+  "edit-test-todo-blur-open",
+  "edit-test-todo-blur-change",
+  "edit-test-todo-blur-commit",
   "clear-completed",
-  "delete-row",
+  "delete-clean-room",
+  "add-after-clear-type",
+  "add-after-clear-submit",
+  "toggle-all-single-after-clear",
+  "clear-all-rows",
 ]
 scroll_focus_scenarios = []
 visual_artifacts = [
@@ -101,4 +116,38 @@ performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",
   "preview-interaction-p99-frame-ms <= 25.0",
   "dev-editor-scroll-p95-frame-ms <= 16.7",
+]
+
+[[example]]
+id = "counter"
+label = "Counter"
+source = "examples/counter.bn"
+scenario = "examples/counter.scn"
+budget = "examples/counter.budget.toml"
+category = "basic"
+order = 30
+default_tab_order = 30
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = false
+initial_visible_assertions = [
+  "counter-title-visible",
+  "counter-value-visible",
+  "counter-controls-visible",
+  "dev-window-editor-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "press-increment",
+  "press-decrement",
+  "press-reset",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "preview-app-owned-framebuffer-before-after",
+  "dev-app-owned-framebuffer",
+]
+performance_thresholds = [
+  "preview-interaction-p95-frame-ms <= 16.7",
+  "preview-interaction-p99-frame-ms <= 25.0",
 ]

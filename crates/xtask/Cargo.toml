@@ -17,4 +17,5 @@ boon_native_app_window.workspace = true
 boon_native_gpu.workspace = true
 image.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 wgsl_bindgen.workspace = true

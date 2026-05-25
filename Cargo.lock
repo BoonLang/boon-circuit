@@ -3637,6 +3637,7 @@ dependencies = [
  "boon_runtime",
  "image",
  "serde_json",
+ "toml",
  "wgsl_bindgen",
 ]
 

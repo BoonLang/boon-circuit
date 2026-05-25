@@ -92,8 +92,8 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(|window| window[1].clone())
         .unwrap_or_else(|| "software_bounded".to_owned());
     let hardware_profile = HardwareProfile::for_name(&profile)?;
-    let (parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
-    hardware_profile.validate_program(parsed.kind)?;
+    let (_parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
+    hardware_profile.validate_program(&ir)?;
     let source_hash =
         boon_runtime::sha256_file(Path::new(source)).unwrap_or_else(|_| "missing".to_owned());
     let command_argv = std::env::args().collect::<Vec<_>>();
@@ -123,7 +123,7 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "runtime_profile": runtime_profile,
         "runtime_profile_detail": hardware_profile.runtime_profile_detail(runtime_profile),
         "capacities": capacities,
-        "program_kind": parsed.kind.as_str(),
+        "program_kind": "generic",
         "graph_node_count": ir.graph_node_count,
         "per_step_pass_fail": [
             {"id": "same-boon-source", "pass": true},
@@ -275,10 +275,10 @@ impl HardwareProfile {
 
     fn validate_program(
         &self,
-        kind: boon_parser::ProgramKind,
+        ir: &boon_ir::TypedProgram,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.name == "fpga_todomvc" && kind != boon_parser::ProgramKind::TodoMvc {
-            return Err("profile `fpga_todomvc` only supports TodoMVC in this phase".into());
+        if self.name == "fpga_todomvc" && !ir.lists.iter().any(|list| list.name == "todos") {
+            return Err("profile `fpga_todomvc` requires a manifest/source with a `todos` list in this phase".into());
         }
         Ok(())
     }
@@ -415,9 +415,10 @@ fn default_scenario(source: &str) -> Result<String, Box<dyn std::error::Error>> 
     {
         return Ok(entry.scenario);
     }
-    let source_text = std::fs::read_to_string(source)?;
-    let parsed = boon_parser::parse_source(source.to_owned(), source_text)?;
-    Ok(boon_runtime::example_manifest_entry(parsed.kind.as_str())?.scenario)
+    Err(format!(
+        "no default scenario for `{source}`; add it to examples/manifest.toml or pass --scenario"
+    )
+    .into())
 }
 
 fn default_cli_report(source: &str, scenario: &str) -> Option<PathBuf> {

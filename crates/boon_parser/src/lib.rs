@@ -4,16 +4,12 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProgramKind {
-    TodoMvc,
-    Cells,
     Generic,
 }
 
 impl ProgramKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::TodoMvc => "todomvc",
-            Self::Cells => "cells",
             Self::Generic => "generic",
         }
     }
@@ -316,8 +312,8 @@ pub fn parse_source(
     validate_required_constructs(&path, &ast)?;
     validate_list_capacities(&path, &ast)?;
     validate_no_reducer_style_update(&path, &ast)?;
-    let kind = detect_program_kind(&path, &ast)?;
-    validate_no_hidden_identity_leak(&path, &ast, kind)?;
+    let kind = detect_program_kind();
+    validate_no_hidden_identity_leak(&path, &ast)?;
     let row_scope_functions = collect_row_scope_functions(&ast);
     let structure = derive_program_tables(&ast, &row_scope_functions);
     Ok(ParsedProgram {
@@ -1201,21 +1197,8 @@ fn is_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, ParseError> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    if ast_has_lexeme(ast, "Grid/cells") {
-        return Ok(ProgramKind::Cells);
-    }
-    if normalized_path.ends_with("examples/todomvc.bn") || normalized_path.contains("todomvc") {
-        return Ok(ProgramKind::TodoMvc);
-    }
-    if normalized_path.ends_with("examples/cells.bn") || normalized_path.contains("cells") {
-        return Ok(ProgramKind::Cells);
-    }
-    if ast_has_lexeme(ast, "new_todo") || ast_has_lexeme(ast, "todos") {
-        return Ok(ProgramKind::TodoMvc);
-    }
-    Ok(ProgramKind::Generic)
+fn detect_program_kind() -> ProgramKind {
+    ProgramKind::Generic
 }
 
 fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
@@ -1433,11 +1416,7 @@ fn reducer_update_signature(item: &ParserItem) -> bool {
         && item.has_lexeme("event")
 }
 
-fn validate_no_hidden_identity_leak(
-    path: &str,
-    ast: &AstProgram,
-    kind: ProgramKind,
-) -> Result<(), ParseError> {
+fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     let forbidden = [
         "runtime_key",
         "item_key",
@@ -1457,26 +1436,21 @@ fn validate_no_hidden_identity_leak(
             });
         }
     }
-    if matches!(kind, ProgramKind::TodoMvc) {
-        for item in ast.semantic_parser_items() {
-            if item.field.as_deref() == Some("id") {
-                return Err(ParseError {
-                    path: path.to_owned(),
-                    message: format!(
-                        "TodoMVC must not expose app-visible `id` at line {}",
-                        item.line
-                    ),
-                });
-            }
-            if item.field.as_deref() == Some("alive") {
-                return Err(ParseError {
-                    path: path.to_owned(),
-                    message: format!(
-                        "TodoMVC must use list removal, not app-visible `alive`, at line {}",
-                        item.line
-                    ),
-                });
-            }
+    for item in ast.semantic_parser_items() {
+        if item.field.as_deref() == Some("id") {
+            return Err(ParseError {
+                path: path.to_owned(),
+                message: format!("Boon source exposes app-visible `id` at line {}", item.line),
+            });
+        }
+        if item.field.as_deref() == Some("alive") {
+            return Err(ParseError {
+                path: path.to_owned(),
+                message: format!(
+                    "Boon source exposes app-visible liveness field `alive` at line {}",
+                    item.line
+                ),
+            });
         }
     }
     Ok(())
@@ -1800,7 +1774,7 @@ mod tests {
     fn parses_todomvc_marker_and_constructs() {
         let source = include_str!("../../../examples/todomvc.bn");
         let program = parse_source("examples/todomvc.bn", source).unwrap();
-        assert_eq!(program.kind, ProgramKind::TodoMvc);
+        assert_eq!(program.kind, ProgramKind::Generic);
         assert!(
             program
                 .expressions
@@ -2091,7 +2065,7 @@ FUNCTION make_entry(seed) {
     fn parses_cells_marker_and_constructs() {
         let source = include_str!("../../../examples/cells.bn");
         let program = parse_source("examples/cells.bn", source).unwrap();
-        assert_eq!(program.kind, ProgramKind::Cells);
+        assert_eq!(program.kind, ProgramKind::Generic);
         assert!(
             program
                 .expressions
@@ -2145,7 +2119,7 @@ HOLD
 LATEST
 "#;
         let program = parse_source("examples/todomvc-looking-path.bn", source).unwrap();
-        assert_eq!(program.kind, ProgramKind::Cells);
+        assert_eq!(program.kind, ProgramKind::Generic);
 
         let missing = r#"
 -- label: "EXAMPLE Cells"
@@ -2339,7 +2313,7 @@ document:
     }
 
     #[test]
-    fn rejects_app_visible_todomvc_id_field() {
+    fn rejects_app_visible_identity_field() {
         let source = "LIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
         let err = parse_source("examples/todomvc.bn", source).unwrap_err();
         assert!(err.message.contains("app-visible `id`"));

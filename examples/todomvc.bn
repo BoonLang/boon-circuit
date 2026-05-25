@@ -173,7 +173,11 @@ FUNCTION new_todo(seed, store) {
 }
 
 document: Document/new(
-    root: Element/stripe(
+    root: todo_app()
+)
+
+FUNCTION todo_app() {
+    Element/stripe(
         element: []
         direction: Column
         gap: 0
@@ -185,231 +189,256 @@ document: Document/new(
             font: [size: 14, color: Oklch[lightness:0.17]]
         ]
         items: LIST {
-            Element/container(
-                element: [tag: Header]
+            todo_header()
+            todo_panel()
+            todo_info()
+        }
+    )
+}
+
+FUNCTION todo_header() {
+    Element/container(
+        element: [tag: Header]
+        style: [
+            width: 550
+            height: 118
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 100, color: Oklch[lightness:0.54,chroma:0.156,hue:21.2]]
+        ]
+        child: TEXT { todos }
+    )
+}
+
+FUNCTION todo_panel() {
+    Element/stripe(
+        element: [tag: Section]
+        direction: Column
+        gap: 0
+        style: [
+            width: 550
+            align: [row: Center]
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+        ]
+        items: LIST {
+            todo_new_entry()
+            todo_list()
+            todo_footer()
+        }
+    )
+}
+
+FUNCTION todo_new_entry() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 9
+        style: [
+            width: Fill
+            height: 66
+            padding: 8
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+        ]
+        items: LIST {
+            Element/button(
+                element: [event: [click: store.sources.toggle_all_checkbox.click]]
                 style: [
-                    width: 550
-                    height: 118
-                    align: [row: Center]
-                    background: [color: Oklch[lightness:0.97]]
-                    font: [size: 80, color: Oklch[lightness:0.54,chroma:0.156,hue:21.2]]
-                ]
-                child: TEXT { todos }
-            )
-            Element/stripe(
-                element: [tag: Section]
-                direction: Column
-                gap: 0
-                style: [
-                    width: 550
-                    align: [row: Center]
+                    width: 36
+                    height: 50
                     background: [color: Oklch[lightness:1]]
-                    border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+                    font: [size: 28, color: Oklch[lightness:0.56]]
                 ]
-                items: LIST {
-                    Element/stripe(
-                        element: []
-                        direction: Row
-                        gap: 9
-                        style: [
-                            width: Fill
-                            height: 66
-                            padding: 8
-                            background: [color: Oklch[lightness:1]]
-                            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
-                        ]
-                        items: LIST {
-                            Element/button(
-                                element: [
-                                    event: [
-                                        click: store.sources.toggle_all_checkbox.click
-                                    ]
-                                ]
-                                style: [
-                                    width: 36
-                                    height: 50
-                                    background: [color: Oklch[lightness:1]]
-                                    font: [size: 28, color: Oklch[lightness:0.56]]
-                                ]
-                                label: TEXT { ⌄ }
-                            )
-                            Element/text_input(
-                                element: [
-                                    event: [
-                                        change: store.sources.new_todo_input.change
-                                        key_down: store.sources.new_todo_input.key_down
-                                    ]
-                                ]
-                                style: [
-                                    width: 480
-                                    height: 56
-                                    background: [color: Oklch[lightness:1]]
-                                    font: [size: 24, color: Oklch[lightness:0.42]]
-                                ]
-                                label: TEXT { What needs to be done? }
-                                text: new_todo_text
-                                placeholder: [text: TEXT { What needs to be done? }]
-                                focus: True
-                            )
-                        }
-                    )
-                    Element/stripe(
-                        element: [tag: TodoList]
-                        direction: Column
-                        gap: 0
-                        style: [
-                            width: Fill
-                            height: 354
-                            background: [color: Oklch[lightness:1]]
-                            scroll: True
-                            scrollbars: True
-                        ]
-                        items: LIST {
-                            Element/repeat(
-                                element: []
-                                list: visible_todos
-                                item: todo
-                                child: Element/stripe(
-                                    element: []
-                                    direction: Row
-                                    gap: 11
-                                    style: [
-                                        width: Fill
-                                        height: 59
-                                        padding: 6
-                                        background: [color: Oklch[lightness:1]]
-                                        border: [color: Oklch[lightness:0.93]]
-                                    ]
-                                    items: LIST {
-                                        Element/checkbox(
-                                            element: [
-                                                event: [
-                                                    click: todo.sources.todo_checkbox.click
-                                                ]
-                                            ]
-                                            style: [size: 28]
-                                            label: Text/empty()
-                                            checked: todo.completed
-                                            target: todo.title
-                                        )
-                                        Element/button(
-                                            element: [
-                                                event: [
-                                                    double_click: todo.sources.todo_title_element.double_click
-                                                ]
-                                            ]
-                                            style: [
-                                                width: 430
-                                                height: 42
-                                                background: [color: Oklch[lightness:1]]
-                                                font: [size: 24, color: Oklch[lightness:0.42]]
-                                            ]
-                                            label: todo.title
-                                            visible: todo.not_editing
-                                            target: todo.title
-                                        )
-                                        Element/text_input(
-                                            element: [
-                                                event: [
-                                                    change: todo.sources.editing_todo_title_element.change
-                                                    key_down: todo.sources.editing_todo_title_element.key_down
-                                                    blur: todo.sources.editing_todo_title_element.blur
-                                                ]
-                                            ]
-                                            style: [
-                                                width: 430
-                                                height: 43
-                                                background: [color: Oklch[lightness:1]]
-                                                border: [color: Oklch[lightness:0.67]]
-                                                font: [size: 24, color: Oklch[lightness:0.42]]
-                                            ]
-                                            label: TEXT { Edit todo }
-                                            text: todo.edit_text
-                                            placeholder: [text: todo.title]
-                                            visible: todo.editing
-                                            target: todo.title
-                                            focus: True
-                                        )
-                                        Element/button(
-                                            element: [
-                                                event: [
-                                                    press: todo.sources.remove_todo_button.press
-                                                ]
-                                            ]
-                                            style: [
-                                                width: 32
-                                                height: 32
-                                                background: [color: Oklch[lightness:1]]
-                                                font: [size: 24, color: Oklch[lightness:0.73,chroma:0.06,hue:18.6]]
-                                            ]
-                                            label: TEXT { × }
-                                            target: todo.title
-                                        )
-                                    }
-                                )
-                            )
-                        }
-                    )
-                    Element/stripe(
-                        element: [tag: Footer]
-                        direction: Row
-                        gap: 9
-                        style: [
-                            width: Fill
-                            height: 41
-                            padding: 9
-                            background: [color: Oklch[lightness:1]]
-                            border: [color: Oklch[lightness:0.93]]
-                        ]
-                        items: LIST {
-                            Element/label(
-                                element: []
-                                style: [width: 130, height: 24, font: [size: 14, color: Oklch[lightness:0.17]]]
-                                label: TEXT { {active_count} items left }
-                            )
-                            Element/button(
-                                element: [event: [press: store.sources.filter_all.press]]
-                                style: [width: 43, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
-                                label: TEXT { All }
-                                selected: selected_filter == All
-                            )
-                            Element/button(
-                                element: [event: [press: store.sources.filter_active.press]]
-                                style: [width: 65, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
-                                label: TEXT { Active }
-                                selected: selected_filter == Active
-                            )
-                            Element/button(
-                                element: [event: [press: store.sources.filter_completed.press]]
-                                style: [width: 95, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
-                                label: TEXT { Completed }
-                                selected: selected_filter == Completed
-                            )
-                            Element/button(
-                                element: [event: [press: store.sources.clear_completed_button.press]]
-                                style: [width: 130, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
-                                label: TEXT { Clear completed }
-                                visible: has_completed
-                            )
-                        }
-                    )
-                }
+                label: TEXT { ⌄ }
             )
+            Element/text_input(
+                element: [
+                    event: [
+                        change: store.sources.new_todo_input.change
+                        key_down: store.sources.new_todo_input.key_down
+                    ]
+                ]
+                style: [
+                    width: 480
+                    height: 56
+                    background: [color: Oklch[lightness:1]]
+                    font: [size: 24, color: Oklch[lightness:0.42]]
+                ]
+                label: TEXT { What needs to be done? }
+                text: new_todo_text
+                placeholder: [text: TEXT { What needs to be done? }]
+                focus: True
+            )
+        }
+    )
+}
+
+FUNCTION todo_list() {
+    Element/stripe(
+        element: [tag: TodoList]
+        direction: Column
+        gap: 0
+        style: [
+            width: Fill
+            height: 354
+            background: [color: Oklch[lightness:1]]
+            scroll: True
+            scrollbars: True
+        ]
+        items: LIST {
+            Element/repeat(
+                element: []
+                list: visible_todos
+                item: todo
+                child: todo_row(todo: todo)
+            )
+        }
+    )
+}
+
+FUNCTION todo_row(todo) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 11
+        style: [
+            width: Fill
+            height: 59
+            padding: 6
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.93]]
+        ]
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: todo.sources.todo_checkbox.click]]
+                style: [size: 28]
+                label: Text/empty()
+                checked: todo.completed
+                target: todo.title
+            )
+            Element/button(
+                element: [event: [double_click: todo.sources.todo_title_element.double_click]]
+                style: [
+                    width: 430
+                    height: 42
+                    background: [color: Oklch[lightness:1]]
+                    font: [size: 24, color: Oklch[lightness:0.42]]
+                ]
+                label: todo.title
+                visible: todo.not_editing
+                target: todo.title
+            )
+            Element/text_input(
+                element: [
+                    event: [
+                        change: todo.sources.editing_todo_title_element.change
+                        key_down: todo.sources.editing_todo_title_element.key_down
+                        blur: todo.sources.editing_todo_title_element.blur
+                    ]
+                ]
+                style: [
+                    width: 430
+                    height: 43
+                    background: [color: Oklch[lightness:1]]
+                    border: [color: Oklch[lightness:0.67]]
+                    font: [size: 24, color: Oklch[lightness:0.42]]
+                ]
+                label: TEXT { Edit todo }
+                text: todo.edit_text
+                placeholder: [text: todo.title]
+                visible: todo.editing
+                target: todo.title
+                focus: True
+            )
+            Element/button(
+                element: [event: [press: todo.sources.remove_todo_button.press]]
+                style: [
+                    width: 32
+                    height: 32
+                    background: [color: Oklch[lightness:1]]
+                    font: [size: 24, color: Oklch[lightness:0.73,chroma:0.06,hue:18.6]]
+                ]
+                label: TEXT { × }
+                target: todo.title
+            )
+        }
+    )
+}
+
+FUNCTION todo_footer() {
+    Element/stripe(
+        element: [tag: Footer]
+        direction: Row
+        gap: 9
+        style: [
+            width: Fill
+            height: 41
+            padding: 9
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.93]]
+        ]
+        items: LIST {
             Element/label(
                 element: []
-                style: [width: 550, height: 30, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                style: [width: 130, height: 24, font: [size: 14, color: Oklch[lightness:0.17]]]
+                label: TEXT { {active_count} items left }
+            )
+            Element/button(
+                element: [event: [press: store.sources.filter_all.press]]
+                style: [width: 43, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                label: TEXT { All }
+                selected: selected_filter == All
+            )
+            Element/button(
+                element: [event: [press: store.sources.filter_active.press]]
+                style: [width: 65, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                label: TEXT { Active }
+                selected: selected_filter == Active
+            )
+            Element/button(
+                element: [event: [press: store.sources.filter_completed.press]]
+                style: [width: 95, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                label: TEXT { Completed }
+                selected: selected_filter == Completed
+            )
+            Element/button(
+                element: [event: [press: store.sources.clear_completed_button.press]]
+                style: [width: 130, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                label: TEXT { Clear completed }
+                visible: has_completed
+            )
+        }
+    )
+}
+
+FUNCTION todo_info() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            width: 550
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 12, color: Oklch[lightness:0.42]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [width: Fill, height: 30, align: [row: Center]]
                 label: TEXT { Double-click to edit a todo }
             )
             Element/label(
                 element: []
-                style: [width: 550, height: 23, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                style: [width: Fill, height: 23, align: [row: Center]]
                 label: TEXT { Created by Martin Kavík }
             )
             Element/label(
                 element: []
-                style: [width: 550, height: 23, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                style: [width: Fill, height: 23, align: [row: Center]]
                 label: TEXT { Part of TodoMVC }
             )
         }
     )
-)
+}

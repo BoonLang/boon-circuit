@@ -23,7 +23,7 @@ user_action = { kind = "type_text", target = "A0 editor", text = "41" }
 expected_source_event = { source = "cell.sources.editor.change", address = "A0", text = "41" }
 expect_cell = { address = "A0", editing_text = "41", editing = true }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
-expect_render_delta_contains = ["SetCellEditor"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "commit-a0-literal"
@@ -31,7 +31,7 @@ user_action = { kind = "key_down", target = "A0 editor", key = "Enter" }
 expected_source_event = { source = "cell.sources.editor.commit", address = "A0", text = "41" }
 expect_cell = { address = "A0", value = "41", formula = "41", editing = false }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "edit-a0-cancel-draft"
@@ -39,7 +39,7 @@ user_action = { kind = "type_text", target = "A0 editor", text = "123" }
 expected_source_event = { source = "cell.sources.editor.change", address = "A0", text = "123" }
 expect_cell = { address = "A0", value = "41", formula = "41", editing_text = "123", editing = true }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
-expect_render_delta_contains = ["SetCellEditor"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "cancel-a0-draft"
@@ -47,7 +47,7 @@ user_action = { kind = "key_down", target = "A0 editor", key = "Escape" }
 expected_source_event = { source = "cell.sources.editor.cancel", address = "A0" }
 expect_cell = { address = "A0", value = "41", formula = "41", editing_text = "41", editing = false }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "commit-b0-formula"
@@ -56,7 +56,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "B0",
 expect_cell = { address = "B0", value = "42", formula = "=A0+1" }
 expect_recomputed = ["B0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "change-a0-updates-b0"
@@ -65,7 +65,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "A0",
 expect_cell = { address = "B0", value = "100" }
 expect_recomputed = ["A0", "B0", "C0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "cycle-error"
@@ -73,7 +73,7 @@ user_action = { kind = "key_down", target = "A0 editor", key = "Enter", text = "
 expected_source_event = { source = "cell.sources.editor.commit", address = "A0", text = "=B0+1" }
 expect_error = { address = "A0", error = "cycle_error" }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value", "FieldSet:error"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "replace-b0-formula-removes-stale-cycle-edge"
@@ -82,7 +82,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "B0",
 expect_cell = { address = "B0", value = "5", formula = "5", editing = false }
 expect_recomputed = ["A0", "B0", "C0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "a0-recomputes-after-cycle-break"
@@ -95,7 +95,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "A0",
 expect_cell = { address = "A0", value = "10", formula = "10", editing = false }
 expect_recomputed = ["A0", "C0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "commit-c0-fanout-formula"
@@ -104,7 +104,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "C0",
 expect_cell = { address = "C0", value = "11", formula = "=A0+1", editing = false }
 expect_recomputed = ["C0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "commit-d0-fanout-formula"
@@ -113,7 +113,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "D0",
 expect_cell = { address = "D0", value = "12", formula = "=A0+2", editing = false }
 expect_recomputed = ["D0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "commit-j0-visible-grid-edge"
@@ -122,7 +122,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "J0",
 expect_cell = { address = "J0", value = "7", formula = "7", editing = false }
 expect_recomputed = ["J0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "change-a0-fanout-recomputes-dependents-only"
@@ -131,7 +131,7 @@ expected_source_event = { source = "cell.sources.editor.commit", address = "A0",
 expect_cell = { address = "C0", value = "21" }
 expect_recomputed = ["A0", "C0", "D0"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["SetCellText"]
+expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
 id = "d0-updated-by-fanout"

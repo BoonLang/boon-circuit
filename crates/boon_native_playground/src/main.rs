@@ -1,7 +1,7 @@
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
 use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
-    AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
+    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     if let Err(error) = run() {
@@ -78,7 +78,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let code_file = value_arg(args, "--code-file")
-        .ok_or("preview role currently requires --code-file until ReplaceCode IPC is wired")?;
+        .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = std::fs::read_to_string(&code_file)?;
     let document_layout_proof = native_document_layout_proof(Path::new(&code_file), &source)
         .unwrap_or_else(|error| {
@@ -95,11 +95,19 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let code_hash = boon_runtime::sha256_file(Path::new(&code_file))?;
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
-    let live_runtime = boon_runtime::LiveRuntime::new(
-        &format!("native-preview-live:{}", code_file),
-        &source,
-        &Path::new(&code_file).with_extension("scn"),
-    )
+    let scenario_path = Path::new(&code_file).with_extension("scn");
+    let live_runtime = if scenario_path.exists() {
+        boon_runtime::LiveRuntime::new(
+            &format!("native-preview-live:{}", code_file),
+            &source,
+            &scenario_path,
+        )
+    } else {
+        boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview-live:{}", code_file),
+            &source,
+        )
+    }
     .ok()
     .map(|runtime| Arc::new(Mutex::new(runtime)));
     let connect = value_arg(args, "--connect").map(PathBuf::from);
@@ -226,6 +234,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let editor_code_file = value_arg(args, "--editor-code-file")
         .map(PathBuf::from)
         .or_else(|| replace_code_file.clone());
+    let selected_example_id = value_arg(args, "--selected-example");
     let replace_code_expected_hash = replace_code_file
         .as_deref()
         .map(boon_runtime::sha256_file)
@@ -254,6 +263,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_shell = Arc::new(Mutex::new(DevWindowShell::new(
         &dev_source_path_label,
         &dev_source_text,
+        selected_example_id.as_deref(),
         PreviewTransport::new(Some(connect.clone())),
     )));
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
@@ -296,7 +306,13 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|report| {
                         let dev_shell_interaction_probe = report_shell
                             .lock()
-                            .map(|shell| shell.visible_input_probe(&proof))
+                            .map(|shell| {
+                                if probe {
+                                    shell.visible_input_probe(&proof)
+                                } else {
+                                    shell.passive_visible_probe(&proof)
+                                }
+                            })
                             .unwrap_or_else(|_| {
                                 json!({
                                     "status": "fail",
@@ -393,7 +409,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
     let report = value_arg(args, "--report").map(PathBuf::from);
     let live_state_report = value_arg(args, "--live-state-report").map(PathBuf::from);
-    let dev_editor_code_file = value_arg(args, "--dev-editor-code-file").map(PathBuf::from);
+    let dev_editor_code_file = value_arg(args, "--dev-editor-code-file")
+        .map(PathBuf::from)
+        .or_else(|| Some(source_path.clone()));
     let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
@@ -415,17 +433,17 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_hold_ms = numeric_arg(args, "--dev-hold-ms").unwrap_or(if probe { 700 } else { 0 });
     let role_report_timeout_ms = numeric_arg(args, "--role-report-timeout-ms").unwrap_or(12_000);
     let dev_start_delay_ms = numeric_arg(args, "--dev-start-delay-ms").unwrap_or(0);
+    let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
     let effective_preview_hold_ms = if probe {
         child_hold_ms.max(
-            dev_hold_ms
-                .saturating_add(role_report_timeout_ms)
-                .saturating_add(dev_start_delay_ms)
-                .saturating_add(2_000),
+            dev_start_delay_ms
+                .saturating_add(dev_hold_ms)
+                .saturating_add(input_sample_delay_ms)
+                .saturating_add(5_000),
         )
     } else {
         child_hold_ms
     };
-    let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0);
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1);
     let mut preview_args = vec![
@@ -482,6 +500,8 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .to_owned(),
         );
     }
+    dev_args.push("--selected-example".to_owned());
+    dev_args.push(example.clone());
     if !dev_editor_only {
         dev_args.push("--replace-code-file".to_owned());
         dev_args.push(
@@ -554,6 +574,27 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let dev_status = dev.wait()?;
     let preview_survives_dev_exit = dev_status.success() && child_running(&mut preview)?;
+    let preview_shutdown_ack = if preview_survives_dev_exit {
+        send_preview_ipc_request(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            json!({
+                "kind": "shutdown",
+                "reason": "desktop-supervisor-clean-exit-after-dev",
+                "dev_pid": dev_pid
+            }),
+        )
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "fail",
+                "diagnostic": error.to_string()
+            })
+        })
+    } else {
+        json!({
+            "status": "not-run",
+            "reason": "preview did not survive dev exit"
+        })
+    };
     let preview_clean_exit_after_dev_exit = wait_child_exit(
         &mut preview,
         Duration::from_millis(effective_preview_hold_ms.saturating_add(500)),
@@ -661,6 +702,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["preview_runtime_summary"] = preview_runtime_summary;
         details["dev_ipc_probe"] = dev_ipc_probe;
         details["dev_shell_interaction_probe"] = dev_shell_interaction_probe;
+        details["preview_shutdown_ack"] = preview_shutdown_ack;
         write_desktop_report(&report, &args[1..], details)?;
     }
     Ok(())
@@ -684,6 +726,7 @@ fn native_document_layout_proof_with_state(
     let runtime_state = runtime_state_override
         .cloned()
         .or_else(|| runtime_state_summary_for_source(source_path, source).ok());
+    let document_functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: BTreeMap::new(),
@@ -693,9 +736,10 @@ fn native_document_layout_proof_with_state(
     let mut seen_ids = BTreeSet::new();
     let root_id = frame.root.clone();
     if let Some(root_element) = canonical_document_root(&document.root, &document.expressions) {
-        lower_canonical_document_element(
+        lower_canonical_document_entry(
             root_element,
             &document.expressions,
+            &document_functions,
             &root_id,
             &mut frame,
             &mut source_intents,
@@ -835,17 +879,6 @@ fn preview_runtime_summary(
     source_sha256: &str,
 ) -> serde_json::Value {
     let scenario_path = source_path.with_extension("scn");
-    if !scenario_path.exists() {
-        return json!({
-            "status": "unavailable",
-            "owns_live_runtime": false,
-            "reason": "no sibling scenario file exists for bounded runtime proof",
-            "source_path": source_path,
-            "source_sha256": source_sha256,
-            "scenario_path": scenario_path,
-            "full_state_mirroring_allowed": false
-        });
-    }
     let state_summary = match runtime_state_summary_for_source(source_path, source) {
         Ok(summary) => summary,
         Err(error) => {
@@ -872,6 +905,8 @@ fn preview_runtime_summary(
         "source_path": source_path,
         "source_sha256": source_sha256,
         "scenario_path": scenario_path,
+        "scenario_bound": scenario_path.exists(),
+        "runtime_surface": "generic-live-runtime",
         "state_summary_hash": boon_runtime::sha256_bytes(&summary_bytes),
         "state_summary_bytes": summary_bytes.len(),
         "state_summary_top_level_keys": summary_top_level_keys,
@@ -882,18 +917,20 @@ fn preview_runtime_summary(
 
 fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<Value, String> {
     let scenario_path = source_path.with_extension("scn");
-    if !scenario_path.exists() {
-        return Err(format!(
-            "no sibling scenario file `{}` exists for runtime-backed document state",
-            scenario_path.display()
-        ));
-    }
-    let mut runtime = boon_runtime::LiveRuntime::new(
-        &format!("native-preview:{}", source_path.display()),
-        source,
-        &scenario_path,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut runtime = if scenario_path.exists() {
+        boon_runtime::LiveRuntime::new(
+            &format!("native-preview:{}", source_path.display()),
+            source,
+            &scenario_path,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview:{}", source_path.display()),
+            source,
+        )
+        .map_err(|error| error.to_string())?
+    };
     Ok(runtime.state_summary())
 }
 
@@ -1340,6 +1377,7 @@ fn dev_apply_real_window_input(
                 shell.workspace.selected_buffer.insert_newline_with_indent();
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
+                let _ = shell.persist_selected_custom_source("EditorTextInput");
                 shell.replace_selected_preview("EditorTextInput");
                 changed = true;
             }
@@ -1347,6 +1385,7 @@ fn dev_apply_real_window_input(
                 shell.workspace.selected_buffer.delete_backward();
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
+                let _ = shell.persist_selected_custom_source("EditorTextInput");
                 shell.replace_selected_preview("EditorTextInput");
                 changed = true;
             }
@@ -1354,6 +1393,7 @@ fn dev_apply_real_window_input(
                 shell.workspace.selected_buffer.insert_text_at_caret("    ");
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
+                let _ = shell.persist_selected_custom_source("EditorTextInput");
                 shell.replace_selected_preview("EditorTextInput");
                 changed = true;
             }
@@ -1381,6 +1421,7 @@ fn dev_apply_real_window_input(
                         .insert_text_at_caret(&character.to_string());
                     shell.workspace.persist_selected_buffer();
                     shell.workspace.set_selected_dirty(true);
+                    let _ = shell.persist_selected_custom_source("EditorTextInput");
                     shell.replace_selected_preview("EditorTextInput");
                     changed = true;
                 }
@@ -1641,6 +1682,65 @@ impl ExampleCatalog {
         }
     }
 
+    fn create_blank_custom_example(
+        &mut self,
+    ) -> Result<(ExampleCatalogEntry, serde_json::Value), Box<dyn std::error::Error>> {
+        let existing_custom_count = self.entries.iter().filter(|entry| entry.custom).count();
+        let label = format!("Untitled {}", existing_custom_count + 1);
+        let base_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let mut suffix = 0usize;
+        let id = loop {
+            let candidate = if suffix == 0 {
+                format!("untitled-{base_millis}")
+            } else {
+                format!("untitled-{base_millis}-{suffix}")
+            };
+            let stable = format!("custom:{candidate}");
+            if self.entries.iter().all(|entry| entry.id != stable) {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        let entry = Self::custom_example_from_source(&id, &label, String::new());
+        self.entries.push(entry.clone());
+        let persistence = self.save_custom_store()?;
+        Ok((entry, persistence))
+    }
+
+    fn update_custom_source(
+        &mut self,
+        stable_id: &str,
+        source: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == stable_id && entry.custom)
+        else {
+            return Ok(json!({
+                "status": "skipped",
+                "command": "PersistCustomSource",
+                "stable_id": stable_id,
+                "reason": "selected example is not custom"
+            }));
+        };
+        entry.inline_source = Some(source.to_owned());
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let persistence = self.save_custom_store()?;
+        Ok(json!({
+            "status": "pass",
+            "command": "PersistCustomSource",
+            "stable_id": stable_id,
+            "source_hash": source_hash,
+            "source_bytes": source.len(),
+            "persistent_store": persistence,
+            "metadata_outside_boon_source": true
+        }))
+    }
+
     fn rename_custom_example(&mut self, id: &str, label: &str) -> serde_json::Value {
         let Some(index) = self
             .entries
@@ -1777,22 +1877,32 @@ struct ExampleWorkspace {
 }
 
 impl ExampleWorkspace {
-    fn new(catalog: &ExampleCatalog, source_path_label: &str, source_text: &str) -> Self {
-        let selected_example_id = catalog
-            .entries
-            .iter()
-            .find(|entry| source_path_label.ends_with(&entry.source))
+    fn new(
+        catalog: &ExampleCatalog,
+        source_path_label: &str,
+        source_text: &str,
+        selected_example_id: Option<&str>,
+    ) -> Self {
+        let selected_example_id = selected_example_id
+            .filter(|id| catalog.entries.iter().any(|entry| entry.id == *id))
+            .map(ToOwned::to_owned)
             .or_else(|| {
-                catalog.entries.iter().find(|entry| {
-                    Path::new(source_path_label)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        == Path::new(&entry.source)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                })
+                catalog
+                    .entries
+                    .iter()
+                    .find(|entry| source_path_label.ends_with(&entry.source))
+                    .or_else(|| {
+                        catalog.entries.iter().find(|entry| {
+                            Path::new(source_path_label)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                == Path::new(&entry.source)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                        })
+                    })
+                    .map(|entry| entry.id.clone())
             })
-            .map(|entry| entry.id.clone())
             .or_else(|| catalog.entries.first().map(|entry| entry.id.clone()))
             .unwrap_or_else(|| "custom-buffer".to_owned());
         let selected_buffer = CodeEditorModel::new(source_path_label, source_text);
@@ -1938,8 +2048,7 @@ impl ExampleWorkspace {
             &source_text,
         );
         let validation_status = validation.get("status").and_then(serde_json::Value::as_str);
-        let parser_accepted = validation_status == Some("pass")
-            || validation_status == Some("unsupported-runtime-surface");
+        let parser_accepted = validation_status == Some("pass");
         if !parser_accepted {
             return json!({
                 "status": "fail",
@@ -1963,7 +2072,7 @@ impl ExampleWorkspace {
             "label": entry.label,
             "validation": validation,
             "executable_runtime_supported": validation_status == Some("pass"),
-            "generic_editor_catalog_only": validation_status == Some("unsupported-runtime-surface"),
+            "generic_editor_catalog_only": false,
             "custom_store_path": catalog.custom_store_path,
             "persistent_store": persistence
                 .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()})),
@@ -1977,7 +2086,7 @@ impl ExampleWorkspace {
             self.selected_buffer.file_name.clone(),
             self.selected_buffer.source_text.clone(),
         ) {
-            Ok(program) => {
+            Ok(_program) => {
                 let validation = BoonLanguageService::validate_project_source(
                     &self.selected_buffer.file_name,
                     &self.selected_buffer.source_text,
@@ -1990,7 +2099,7 @@ impl ExampleWorkspace {
                     "selected_example_id": self.selected_example_id,
                     "source_path": self.selected_buffer.file_name,
                     "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
-                    "program_kind": program.kind.as_str(),
+                    "program_kind": "generic",
                     "preview_transport": "ReplaceCode",
                     "validation": validation,
                     "parser_bypassed": false,
@@ -2076,6 +2185,83 @@ impl ExampleWorkspace {
         }))
     }
 
+    fn remove_selected_custom(&mut self, catalog: &mut ExampleCatalog) -> serde_json::Value {
+        let removed_id = self.selected_example_id.clone();
+        let Some(selected_entry) = catalog.entries.iter().find(|entry| entry.id == removed_id)
+        else {
+            return json!({
+                "status": "fail",
+                "command": "RemoveSelectedCustomExample",
+                "stable_id": removed_id,
+                "diagnostic": "selected example is not in ExampleCatalog"
+            });
+        };
+        if !selected_entry.custom {
+            return json!({
+                "status": "fail",
+                "command": "RemoveSelectedCustomExample",
+                "stable_id": removed_id,
+                "diagnostic": "selected example is manifest-backed and cannot be removed"
+            });
+        }
+        let fallback_id = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.id != removed_id && entry.shown_by_default)
+            .min_by_key(|entry| entry.order)
+            .map(|entry| entry.id.clone())
+            .or_else(|| {
+                catalog
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id != removed_id)
+                    .map(|entry| entry.id.clone())
+            });
+        let removed_open_buffer = self.open_buffers.remove(&removed_id).is_some();
+        let removed_dirty_marker = self.dirty_examples.remove(&removed_id);
+        let removal = catalog.remove_custom_example(&removed_id);
+        if removal.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            return json!({
+                "status": "fail",
+                "command": "RemoveSelectedCustomExample",
+                "stable_id": removed_id,
+                "removed_open_buffer": removed_open_buffer,
+                "removed_dirty_marker": removed_dirty_marker,
+                "catalog_removal": removal
+            });
+        }
+        let fallback_selection = fallback_id
+            .as_deref()
+            .map(|id| self.select_example(catalog, id))
+            .transpose();
+        let removed_open_buffer_after_fallback = self.open_buffers.remove(&removed_id).is_some();
+        let removed_dirty_marker_after_fallback = self.dirty_examples.remove(&removed_id);
+        match fallback_selection {
+            Ok(selection) => {
+                let selected_after_removal = self.selected_example_id.clone();
+                json!({
+                    "status": "pass",
+                    "command": "RemoveSelectedCustomExample",
+                    "stable_id": removed_id,
+                    "selected_after_removal": selected_after_removal,
+                    "removed_open_buffer": removed_open_buffer || removed_open_buffer_after_fallback,
+                    "removed_dirty_marker": removed_dirty_marker || removed_dirty_marker_after_fallback,
+                    "removed_not_listed": catalog.entries.iter().all(|entry| entry.id != removed_id),
+                    "catalog_removal": removal,
+                    "fallback_selection": selection,
+                    "preview_transport": "ReplaceCode"
+                })
+            }
+            Err(error) => json!({
+                "status": "fail",
+                "command": "RemoveSelectedCustomExample",
+                "stable_id": removed_id,
+                "catalog_removal": removal,
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
+
     fn dirty_tab_preservation_probe(
         &self,
         catalog: &ExampleCatalog,
@@ -2141,58 +2327,30 @@ impl BoonLanguageService {
         let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
         let parse = boon_parser::parse_source(path.to_owned(), source.to_owned());
         match parse {
-            Ok(program) => {
-                let Some(scenario_path) = custom_runtime_scenario_path(program.kind) else {
-                    let document_supported = boon_parser::parsed_document(&program).is_some();
-                    let layout_proof = document_supported.then(|| {
-                        native_document_layout_proof(Path::new(path), source).unwrap_or_else(
-                            |error| {
-                                json!({
-                                    "status": "fail",
-                                    "blocker": error.to_string()
-                                })
-                            },
-                        )
-                    });
-                    let layout_pass = layout_proof
-                        .as_ref()
-                        .and_then(|proof| proof.get("status"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("pass");
-                    return json!({
-                        "status": if layout_pass { "pass" } else { "unsupported-runtime-surface" },
-                        "source_hash": source_hash,
-                        "program_kind": program.kind.as_str(),
-                        "runtime_surface": if layout_pass { "static-document-preview" } else { "unsupported" },
-                        "diagnostic": if layout_pass {
-                            "valid generic Boon document can run as a static preview surface"
-                        } else {
-                            "valid Boon source parsed, but no runtime executable surface is implemented for this generic program yet"
-                        },
-                        "parser_bypassed": false,
-                        "runtime_bypassed": false,
-                        "format_supported": true,
-                        "catalog_store_supported": true,
-                        "document_layout_supported": document_supported,
-                        "document_layout_proof": layout_proof.unwrap_or_else(|| json!({"status": "not-applicable"}))
-                    });
-                };
-                let runtime = std::fs::read_to_string(&scenario_path)
+            Ok(_program) => {
+                let scenario_path = Path::new(path).with_extension("scn");
+                let runtime = if scenario_path.exists() {
+                    boon_runtime::LiveRuntime::new(
+                        &format!("dev-window-validate:{path}"),
+                        source,
+                        &scenario_path,
+                    )
                     .map_err(|error| error.to_string())
-                    .and_then(|_| {
-                        boon_runtime::LiveRuntime::new(
-                            &format!("dev-window-validate:{path}"),
-                            source,
-                            &scenario_path,
-                        )
-                        .map_err(|error| error.to_string())
-                    });
+                } else {
+                    boon_runtime::LiveRuntime::from_source(
+                        &format!("dev-window-validate:{path}"),
+                        source,
+                    )
+                    .map_err(|error| error.to_string())
+                };
                 match runtime {
                     Ok(mut runtime) => json!({
                         "status": "pass",
                         "source_hash": source_hash,
-                        "program_kind": program.kind.as_str(),
+                        "program_kind": "generic",
                         "scenario_path": scenario_path,
+                        "scenario_bound": scenario_path.exists(),
+                        "runtime_surface": "generic-live-runtime",
                         "runtime_summary_hash": boon_runtime::sha256_bytes(
                             &serde_json::to_vec(&runtime.state_summary()).unwrap_or_default()
                         ),
@@ -2202,7 +2360,7 @@ impl BoonLanguageService {
                     Err(error) => json!({
                         "status": "fail",
                         "source_hash": source_hash,
-                        "program_kind": program.kind.as_str(),
+                        "program_kind": "generic",
                         "scenario_path": scenario_path,
                         "diagnostic": error,
                         "parser_bypassed": false,
@@ -2344,14 +2502,6 @@ impl BoonLanguageService {
     }
 }
 
-fn custom_runtime_scenario_path(kind: boon_parser::ProgramKind) -> Option<PathBuf> {
-    match kind {
-        boon_parser::ProgramKind::TodoMvc => Some(PathBuf::from("examples/todomvc.scn")),
-        boon_parser::ProgramKind::Cells => Some(PathBuf::from("examples/cells.scn")),
-        boon_parser::ProgramKind::Generic => None,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EditorPosition {
     line: usize,
@@ -2436,7 +2586,7 @@ impl CodeEditorModel {
         Self {
             file_name: source_path_label.to_owned(),
             source_text: source_text.to_owned(),
-            line_count: source_text.lines().count(),
+            line_count: source_text.lines().count().max(1),
             selection: EditorSelection::collapsed(EditorPosition::start()),
             scroll_line: 0,
             scroll_column: 0,
@@ -2483,7 +2633,7 @@ impl CodeEditorModel {
     }
 
     fn refresh_language_state(&mut self) {
-        self.line_count = self.source_text.lines().count();
+        self.line_count = self.source_text.lines().count().max(1);
         self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
         self.syntax_tokens = BoonLanguageService::syntax_tokens(&self.source_text);
         self.formatted_preview_hash =
@@ -3012,6 +3162,7 @@ impl PreviewTransport {
 struct DevWindowShell {
     catalog: ExampleCatalog,
     workspace: ExampleWorkspace,
+    initial_workspace: ExampleWorkspace,
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
 }
@@ -3020,13 +3171,21 @@ impl DevWindowShell {
     fn new(
         source_path_label: &str,
         source_text: &str,
+        selected_example_id: Option<&str>,
         preview_transport: PreviewTransport,
     ) -> Self {
         let catalog = ExampleCatalog::load();
-        let workspace = ExampleWorkspace::new(&catalog, source_path_label, source_text);
+        let workspace = ExampleWorkspace::new(
+            &catalog,
+            source_path_label,
+            source_text,
+            selected_example_id,
+        );
+        let initial_workspace = workspace.clone();
         Self {
             catalog,
             workspace,
+            initial_workspace,
             editor_view: CodeEditorView::new(),
             preview_transport,
         }
@@ -3041,6 +3200,15 @@ impl DevWindowShell {
     }
 
     fn dispatch_source_path(&mut self, source_path: &str) -> serde_json::Value {
+        if source_path == "dev.tabs.new" {
+            let mut value = self.create_blank_custom_tab();
+            if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+                value["preview_transport"] = self.replace_selected_preview("NewCustomTab");
+            }
+            value["dispatched_source_path"] = json!(source_path);
+            value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
+            return value;
+        }
         if let Some(example_id) = source_path.strip_prefix("dev.tabs.select.") {
             return self
                 .workspace
@@ -3075,6 +3243,9 @@ impl DevWindowShell {
                         })
                     })
             }
+            "dev.commands.remove_custom" => {
+                self.workspace.remove_selected_custom(&mut self.catalog)
+            }
             "dev.editor.insert_text" => self
                 .workspace
                 .apply_editor_text_input("\n-- host synthetic editor input"),
@@ -3088,6 +3259,17 @@ impl DevWindowShell {
             }
         };
         if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            if matches!(
+                value.get("command").and_then(serde_json::Value::as_str),
+                Some("EditorTextInput" | "Format")
+            ) {
+                value["custom_source_persistence"] = self.persist_selected_custom_source(
+                    value
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("DevCommand"),
+                );
+            }
             value["preview_transport"] = self.replace_selected_preview(
                 value
                     .get("command")
@@ -3098,6 +3280,62 @@ impl DevWindowShell {
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
         value
+    }
+
+    fn create_blank_custom_tab(&mut self) -> serde_json::Value {
+        match self.catalog.create_blank_custom_example() {
+            Ok((entry, persistence)) => self
+                .workspace
+                .select_example(&self.catalog, &entry.id)
+                .map(|mut selected| {
+                    selected["command"] = json!("NewCustomTab");
+                    selected["stable_id"] = json!(entry.id);
+                    selected["label"] = json!(entry.label);
+                    selected["source_path"] = json!(entry.source);
+                    selected["source_starts_empty"] = json!(true);
+                    selected["persistent_store"] = persistence;
+                    selected["metadata_outside_boon_source"] = json!(true);
+                    selected
+                })
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "fail",
+                        "command": "NewCustomTab",
+                        "diagnostic": error.to_string()
+                    })
+                }),
+            Err(error) => json!({
+                "status": "fail",
+                "command": "NewCustomTab",
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
+
+    fn persist_selected_custom_source(&mut self, command: &str) -> serde_json::Value {
+        if !self.workspace.selected_example_id.starts_with("custom:") {
+            return json!({
+                "status": "skipped",
+                "command": "PersistCustomSource",
+                "trigger": command,
+                "selected_example_id": self.workspace.selected_example_id,
+                "reason": "selected example is manifest-backed"
+            });
+        }
+        self.catalog
+            .update_custom_source(
+                &self.workspace.selected_example_id,
+                &self.workspace.selected_buffer.source_text,
+            )
+            .unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "command": "PersistCustomSource",
+                    "trigger": command,
+                    "selected_example_id": self.workspace.selected_example_id,
+                    "diagnostic": error.to_string()
+                })
+            })
     }
 
     fn dispatch_host_synthetic_editor_text_input(
@@ -3138,6 +3376,7 @@ impl DevWindowShell {
             }
         ]);
         let mut value = self.workspace.apply_editor_text_input(text);
+        value["custom_source_persistence"] = self.persist_selected_custom_source("EditorTextInput");
         value["host_synthetic_activation"] = activation;
         value["input_evidence_tier"] = json!("boon-driver");
         value["legacy_input_evidence_tier"] = json!("host-synthetic");
@@ -3266,6 +3505,7 @@ impl DevWindowShell {
 
     fn command_probe(&self) -> serde_json::Value {
         let mut shell = self.clone();
+        shell.workspace = shell.initial_workspace.clone();
         let original = shell.workspace.selected_example_id.clone();
         let catalog_listing = shell.catalog.list_available_examples();
         let mut selected_example_editor_model =
@@ -3297,22 +3537,33 @@ impl DevWindowShell {
             1180.0,
             820.0,
         );
-        let custom_source = std::fs::read_to_string("examples/todomvc.bn").unwrap_or_else(|_| {
-            "-- custom example metadata lives outside Boon source\nstore:\n    title: TEXT { Custom }\n\ndocument:\n    element:\n        kind: Text\n        text: title\n".to_owned()
+        let new_custom_tab =
+            shell.dispatch_host_synthetic_source_path("dev.tabs.new", 1180.0, 820.0);
+        let new_custom_id = new_custom_tab
+            .get("stable_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let new_custom_editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
+            "-- persisted custom draft\n",
+            1180.0,
+            820.0,
+        );
+        let custom_source = std::fs::read_to_string("examples/counter.bn").unwrap_or_else(|_| {
+            "-- custom example metadata lives outside Boon source\nstore: [title: TEXT { Custom }]\ndocument: Document/new(root: Element/label(element: [], style: [], label: store.title))\n".to_owned()
         });
         let custom_example = shell.workspace.create_or_update_custom_example(
             &mut shell.catalog,
             "probe",
             "Probe Custom",
-            custom_source,
+            custom_source.clone(),
         );
-        let generic_future_source = "-- generic future source accepted by parser and catalog\nstore:\n    sources:\n        text_input: [change: SOURCE]\n\n    title:\n        TEXT { Future } |> HOLD title {\n            LATEST {\n                sources.text_input.change.text\n            }\n        }\n\nitems:\n    LIST { [title: TEXT { Alpha }] }\n    |> List/map(seed, new: generic_row(seed: seed))\n\nFUNCTION generic_row(seed) {\n    [title: seed.title]\n}\n\ndocument:\n    element:\n        kind: Text\n        text: title\n"
-            .to_owned();
-        let generic_future_example = shell.workspace.create_or_update_custom_example(
+        let custom_generic_runtime_source = std::fs::read_to_string("examples/counter.bn")
+            .unwrap_or_else(|_| custom_source.clone());
+        let custom_generic_runtime_example = shell.workspace.create_or_update_custom_example(
             &mut shell.catalog,
-            "future-generic",
-            "Future Generic",
-            generic_future_source,
+            "custom-generic-runtime",
+            "Custom Generic Runtime",
+            custom_generic_runtime_source,
         );
         let custom_store = ExampleCatalog::custom_store_probe();
         let custom_tab_after_create = shell
@@ -3323,6 +3574,13 @@ impl DevWindowShell {
         let custom_rename = shell
             .catalog
             .rename_custom_example("custom:probe", "Probe Custom Renamed");
+        let select_probe_custom = shell.dispatch_host_synthetic_source_path(
+            "dev.tabs.select.custom:probe",
+            1180.0,
+            820.0,
+        );
+        let custom_remove =
+            shell.dispatch_host_synthetic_source_path("dev.commands.remove_custom", 1180.0, 820.0);
         let dirty_tab_preservation = shell
             .workspace
             .dirty_tab_preservation_probe(&shell.catalog)
@@ -3338,7 +3596,29 @@ impl DevWindowShell {
             "custom://injected.bn",
             "-- injected source\nstore:\n    title: TEXT { Injected }\n\ndocument:\n    element:\n        kind: Text\n        text: title\n".to_owned(),
         );
-        let custom_remove = shell.catalog.remove_custom_example("custom:probe");
+        let new_custom_remove = match new_custom_id.as_deref() {
+            Some(id) => {
+                let select_new_custom = shell.dispatch_host_synthetic_source_path(
+                    &format!("dev.tabs.select.{id}"),
+                    1180.0,
+                    820.0,
+                );
+                let mut remove_new_custom = shell.dispatch_host_synthetic_source_path(
+                    "dev.commands.remove_custom",
+                    1180.0,
+                    820.0,
+                );
+                remove_new_custom["select_before_remove"] = select_new_custom;
+                remove_new_custom
+            }
+            None => {
+                json!({
+                    "status": "fail",
+                    "command": "RemoveCustomExample",
+                    "diagnostic": "new custom tab did not report a stable id"
+                })
+            }
+        };
         let mutation_probe_editor_model = shell.workspace.selected_buffer.model_feature_probe();
         let restore = shell.dispatch_host_synthetic_source_path(
             &format!("dev.tabs.select.{original}"),
@@ -3351,11 +3631,15 @@ impl DevWindowShell {
             &format,
             &reset,
             &editor_text_input,
+            &new_custom_tab,
+            &new_custom_editor_text_input,
             &custom_example,
-            &generic_future_example,
+            &custom_generic_runtime_example,
             &custom_store,
             &custom_rename,
+            &select_probe_custom,
             &custom_remove,
+            &new_custom_remove,
             &injected_source,
             &dirty_tab_preservation,
             &selected_example_editor_model,
@@ -3369,6 +3653,9 @@ impl DevWindowShell {
             &format,
             &reset,
             &editor_text_input,
+            &new_custom_tab,
+            &new_custom_editor_text_input,
+            &select_probe_custom,
             &restore,
         ]
         .iter()
@@ -3390,9 +3677,11 @@ impl DevWindowShell {
             "internal_command_shortcut": false,
             "ui_source_bindings": [
                 "dev.tabs.select",
+                "dev.tabs.new",
                 "dev.commands.run",
                 "dev.commands.format",
                 "dev.commands.reset",
+                "dev.commands.remove_custom",
                 "dev.editor.insert_text"
             ],
             "catalog_listing": catalog_listing,
@@ -3401,12 +3690,16 @@ impl DevWindowShell {
             "format": format,
             "reset": reset,
             "editor_text_input": editor_text_input,
+            "new_custom_tab": new_custom_tab,
+            "new_custom_editor_text_input": new_custom_editor_text_input,
             "custom_example": custom_example,
-            "generic_future_example": generic_future_example,
+            "custom_generic_runtime_example": custom_generic_runtime_example,
             "custom_store": custom_store,
             "custom_tab_after_create": custom_tab_after_create,
             "custom_rename": custom_rename,
+            "select_probe_custom": select_probe_custom,
             "custom_remove": custom_remove,
+            "new_custom_remove": new_custom_remove,
             "inject_source": injected_source,
             "dirty_tab_preservation": dirty_tab_preservation,
             "editor_model": selected_example_editor_model,
@@ -3415,7 +3708,7 @@ impl DevWindowShell {
             "restore_original_tab": restore,
             "preview_receives_example_name": false,
             "parser_bypassed": false,
-            "todo_cells_specific_shortcut": false
+            "example_specific_shortcut": false
         })
     }
 
@@ -3472,6 +3765,34 @@ impl DevWindowShell {
         probe
     }
 
+    fn passive_visible_probe(
+        &self,
+        surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
+    ) -> serde_json::Value {
+        let route_proof = self.dev_window_route_proof(surface_proof);
+        let route_pass = route_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        json!({
+            "status": if route_pass { "pass" } else { "fail" },
+            "evidence_tier": "passive-visible-window",
+            "visible_window_input": false,
+            "app_owned_window_input": false,
+            "verification_probe_enabled": false,
+            "probe_mutations_allowed": false,
+            "preview_mutation_allowed": false,
+            "command_probe_executed": false,
+            "reason": "manual visible launch records passive dev-window surface and route evidence only",
+            "target_dev_pid": surface_proof.pid,
+            "target_dev_window_title": surface_proof.window_title,
+            "target_dev_surface_id": surface_proof.surface_id,
+            "target_dev_window_id": surface_proof.window_id,
+            "app_owned_framebuffer": surface_proof.readback_artifact,
+            "visible_route_proof": route_proof
+        })
+    }
+
     fn dev_window_route_proof(
         &self,
         surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
@@ -3513,6 +3834,7 @@ impl DevWindowShell {
                 "dev.commands.run".to_owned(),
                 "dev.commands.format".to_owned(),
                 "dev.commands.reset".to_owned(),
+                "dev.commands.remove_custom".to_owned(),
                 "dev.editor.insert_text".to_owned(),
             ];
             sources.extend(
@@ -3782,19 +4104,48 @@ fn dev_shell_document(
         });
         append_child(&mut frame, tabs_parent.clone(), tab);
     }
+    let mut new_tab = dev_button_node(
+        "dev-tab-new",
+        "+".to_owned(),
+        &[
+            ("bg", "#ffffff"),
+            ("color", "#1f2937"),
+            ("border", "#aeb8c2"),
+            ("padding", "6"),
+            ("height", "30"),
+            ("width", "42"),
+        ],
+    );
+    new_tab.source_binding = Some(boon_document_model::SourceBinding {
+        id: boon_document_model::SourceBindingId("source:dev-tab:new".to_owned()),
+        source_path: "dev.tabs.new".to_owned(),
+        intent: "select".to_owned(),
+    });
+    append_child(&mut frame, tabs_parent.clone(), new_tab);
     let toolbar_parent = toolbar.id.clone();
     append_child(&mut frame, root.clone(), toolbar);
-    for command in ["run", "format", "reset"] {
+    for command in ["run", "format", "reset", "remove_custom"] {
+        let label = match command {
+            "remove_custom" => "REMOVE".to_owned(),
+            other => other.to_ascii_uppercase(),
+        };
         let mut button = dev_button_node(
             &format!("dev-command-{command}"),
-            command.to_ascii_uppercase(),
+            label,
             &[
                 ("bg", "#ffffff"),
                 ("color", "#1f2937"),
                 ("border", "#9aa7b5"),
                 ("padding", "8"),
                 ("height", "32"),
-                ("width", "96"),
+                (
+                    "width",
+                    if command == "remove_custom" {
+                        "116"
+                    } else {
+                        "96"
+                    },
+                ),
             ],
         );
         button.source_binding = Some(boon_document_model::SourceBinding {
@@ -3941,9 +4292,13 @@ fn canonical_document_root<'a>(
     if canonical_element_function(root, expressions).is_some() {
         return Some(root);
     }
-    root.children
-        .iter()
-        .find(|child| canonical_element_function(child, expressions).is_some())
+    if document_call_function(root, expressions).is_some() {
+        return Some(root);
+    }
+    root.children.iter().find(|child| {
+        canonical_element_function(child, expressions).is_some()
+            || document_call_function(child, expressions).is_some()
+    })
 }
 
 fn canonical_element_function<'a>(
@@ -3959,10 +4314,159 @@ fn canonical_element_function<'a>(
     }
 }
 
+fn document_call_function<'a>(
+    statement: &'a AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a str> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { function, .. } => Some(function.as_str()),
+        _ => None,
+    }
+}
+
+fn document_call_args<'a>(
+    statement: &'a AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a [AstCallArg]> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => Some(args.as_slice()),
+        _ => None,
+    }
+}
+
+struct DocumentFunctionRegistry<'a> {
+    functions: BTreeMap<&'a str, &'a AstStatement>,
+}
+
+impl<'a> DocumentFunctionRegistry<'a> {
+    fn new(statements: &'a [AstStatement]) -> Self {
+        let mut functions = BTreeMap::new();
+        Self::collect(statements, &mut functions);
+        Self { functions }
+    }
+
+    fn collect(
+        statements: &'a [AstStatement],
+        functions: &mut BTreeMap<&'a str, &'a AstStatement>,
+    ) {
+        for statement in statements {
+            if let AstStatementKind::Function { name, .. } = &statement.kind {
+                functions.insert(name.as_str(), statement);
+            }
+            Self::collect(&statement.children, functions);
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&'a AstStatement> {
+        self.functions.get(name).copied()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_document_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    scope_key: &str,
+    is_root_child: bool,
+) {
+    if canonical_element_function(statement, expressions).is_some() {
+        lower_canonical_document_element(
+            statement,
+            expressions,
+            functions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            scope_key,
+            is_root_child,
+        );
+        return;
+    }
+
+    if let Some(function_name) = document_call_function(statement, expressions)
+        && let Some(function) = functions.get(function_name)
+    {
+        let scoped = document_function_call_context(function, statement, expressions, context);
+        for child in &function.children {
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                &scoped,
+                scope_key,
+                is_root_child,
+            );
+        }
+        return;
+    }
+
+    lower_canonical_child_elements(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        scope_key,
+    );
+}
+
+fn document_function_call_context<'a>(
+    function: &AstStatement,
+    call: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'a>,
+) -> DocumentEvalContext<'a> {
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+    };
+    let formals = match &function.kind {
+        AstStatementKind::Function { args, .. } => args.as_slice(),
+        _ => &[],
+    };
+    if let Some(args) = document_call_args(call, expressions) {
+        for (index, arg) in args.iter().enumerate() {
+            let Some(name) = arg
+                .name
+                .as_deref()
+                .or_else(|| formals.get(index).map(String::as_str))
+            else {
+                continue;
+            };
+            if let Some(expr) = expressions.get(arg.value) {
+                let value = document_eval_expr_value(expr, expressions, context)
+                    .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+                if let Some(value) = value {
+                    scoped.locals.insert(name.to_owned(), value);
+                }
+            }
+        }
+    }
+    scoped
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_canonical_document_element(
     statement: &AstStatement,
     expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
     parent: &boon_document_model::DocumentNodeId,
     frame: &mut boon_document_model::DocumentFrame,
     source_intents: &mut Vec<serde_json::Value>,
@@ -3975,6 +4479,7 @@ fn lower_canonical_document_element(
         lower_canonical_child_elements(
             statement,
             expressions,
+            functions,
             parent,
             frame,
             source_intents,
@@ -3988,6 +4493,7 @@ fn lower_canonical_document_element(
         lower_canonical_repeat(
             statement,
             expressions,
+            functions,
             parent,
             frame,
             source_intents,
@@ -4081,6 +4587,7 @@ fn lower_canonical_document_element(
     lower_canonical_child_elements(
         statement,
         expressions,
+        functions,
         &id,
         frame,
         source_intents,
@@ -4115,6 +4622,7 @@ fn canonical_document_node_kind(
 fn lower_canonical_repeat(
     statement: &AstStatement,
     expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
     parent: &boon_document_model::DocumentNodeId,
     frame: &mut boon_document_model::DocumentFrame,
     source_intents: &mut Vec<serde_json::Value>,
@@ -4146,9 +4654,10 @@ fn lower_canonical_repeat(
                 document_field_name(child).as_deref(),
                 Some("child" | "template" | "items" | "children")
             ) {
-                lower_canonical_document_element(
+                lower_canonical_document_entry(
                     child,
                     expressions,
+                    functions,
                     parent,
                     frame,
                     source_intents,
@@ -4166,6 +4675,7 @@ fn lower_canonical_repeat(
 fn lower_canonical_child_elements(
     statement: &AstStatement,
     expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
     parent: &boon_document_model::DocumentNodeId,
     frame: &mut boon_document_model::DocumentFrame,
     source_intents: &mut Vec<serde_json::Value>,
@@ -4179,13 +4689,21 @@ fn lower_canonical_child_elements(
             field.as_deref(),
             Some("items" | "children" | "child" | "contents" | "template")
         ) && canonical_element_function(child, expressions).is_none()
+            && document_call_function(child, expressions)
+                .and_then(|function| functions.get(function))
+                .is_none()
         {
             continue;
         }
-        if canonical_element_function(child, expressions).is_some() {
-            lower_canonical_document_element(
+        if canonical_element_function(child, expressions).is_some()
+            || document_call_function(child, expressions)
+                .and_then(|function| functions.get(function))
+                .is_some()
+        {
+            lower_canonical_document_entry(
                 child,
                 expressions,
+                functions,
                 parent,
                 frame,
                 source_intents,
@@ -4197,14 +4715,18 @@ fn lower_canonical_child_elements(
         }
         for nested in &child.children {
             if canonical_element_function(nested, expressions).is_some()
+                || document_call_function(nested, expressions)
+                    .and_then(|function| functions.get(function))
+                    .is_some()
                 || matches!(
                     document_field_name(nested).as_deref(),
                     Some("child" | "template")
                 )
             {
-                lower_canonical_document_element(
+                lower_canonical_document_entry(
                     nested,
                     expressions,
+                    functions,
                     parent,
                     frame,
                     source_intents,
@@ -4634,6 +5156,7 @@ fn lower_canonical_element_sources(
                     lower_canonical_element_source_record(
                         fields,
                         expressions,
+                        context,
                         node_id,
                         node,
                         source_intents,
@@ -4644,7 +5167,7 @@ fn lower_canonical_element_sources(
                         for source in &event.children {
                             if let (Some(intent), Some(source_path)) = (
                                 document_field_name(source),
-                                document_statement_value(source, expressions),
+                                document_source_value(source, expressions, context),
                             ) {
                                 push_canonical_source_intent(
                                     node_id,
@@ -4680,6 +5203,7 @@ fn lower_canonical_element_sources(
 fn lower_canonical_element_source_record(
     fields: &[AstRecordField],
     expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
     node_id: &boon_document_model::DocumentNodeId,
     node: &mut boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
@@ -4689,7 +5213,7 @@ fn lower_canonical_element_source_record(
             if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
                 for source_field in event_fields {
                     if let Some(source_path) =
-                        document_expr_value_by_id(source_field.value, expressions)
+                        document_source_value_for_expr(source_field.value, expressions, context)
                     {
                         push_canonical_source_intent(
                             node_id,
@@ -4703,6 +5227,25 @@ fn lower_canonical_element_source_record(
             }
         }
     }
+}
+
+fn document_source_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    document_source_value_for_expr(statement.expr?, expressions, context)
+}
+
+fn document_source_value_for_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    let expr = expressions.get(expr_id)?;
+    document_eval_expr_value(expr, expressions, context)
+        .map(|value| json_value_to_document_text(&value))
+        .or_else(|| document_expr_value(expr, expressions))
 }
 
 fn push_canonical_source_intent(
@@ -6076,11 +6619,19 @@ fn handle_preview_ipc_client(
                     .get("preview_runtime_summary")
                     .cloned()
                     .unwrap_or_else(|| json!({"status": "missing"}));
-                state.live_runtime = boon_runtime::LiveRuntime::new(
-                    &format!("native-preview-live:{source_path}"),
-                    code,
-                    &Path::new(source_path).with_extension("scn"),
-                )
+                let scenario_path = Path::new(source_path).with_extension("scn");
+                state.live_runtime = if scenario_path.exists() {
+                    boon_runtime::LiveRuntime::new(
+                        &format!("native-preview-live:{source_path}"),
+                        code,
+                        &scenario_path,
+                    )
+                } else {
+                    boon_runtime::LiveRuntime::from_source(
+                        &format!("native-preview-live:{source_path}"),
+                        code,
+                    )
+                }
                 .ok()
                 .map(|runtime| Arc::new(Mutex::new(runtime)));
                 if let Some(layout_proof) = response.get("document_layout_proof") {
@@ -6106,6 +6657,24 @@ fn handle_preview_ipc_client(
         let response = preview_runtime_summary_response(&runtime_summary);
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("shutdown") {
+        let response = json!({
+            "kind": "shutdown-ack",
+            "status": "pass",
+            "preview_pid": std::process::id(),
+            "reason": request
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unspecified")
+        });
+        writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+        stream.flush()?;
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            std::process::exit(0);
+        });
         return Ok(());
     }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("operator-host-input") {
@@ -6227,14 +6796,31 @@ fn preview_operator_host_input_response(
     if inputs.is_empty() {
         return Err("operator-host-input request missing host_input_scenarios".into());
     }
-    let scenario_path = state.source_path.with_extension("scn");
-    let scenario = boon_runtime::parse_scenario(&scenario_path)?;
-    let layout_proof = native_document_layout_proof(&state.source_path, &state.source_text).ok();
-    let mut runtime = boon_runtime::LiveRuntime::new(
-        &format!("native-preview-ipc:{}", state.source_path.display()),
-        &state.source_text,
-        &scenario_path,
-    )?;
+    let scenario_path = request
+        .get("scenario_source")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| state.source_path.with_extension("scn"));
+    let scenario = if scenario_path.exists() {
+        Some(boon_runtime::parse_scenario(&scenario_path)?)
+    } else {
+        None
+    };
+    let mut current_layout_proof =
+        native_document_layout_proof(&state.source_path, &state.source_text).ok();
+    let mut runtime = if scenario_path.exists() {
+        boon_runtime::LiveRuntime::new(
+            &format!("native-preview-ipc:{}", state.source_path.display()),
+            &state.source_text,
+            &scenario_path,
+        )?
+    } else {
+        boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview-ipc:{}", state.source_path.display()),
+            &state.source_text,
+        )?
+    };
     let mut outputs = Vec::new();
     let mut assertions = Vec::new();
     let mut route_assertions = Vec::new();
@@ -6243,7 +6829,7 @@ fn preview_operator_host_input_response(
         let event_json = input_json.get("source_event").unwrap_or(input_json);
         let before_state = runtime.state_summary();
         let host_route =
-            preview_host_input_route_proof(input_json, event_json, layout_proof.as_ref());
+            preview_host_input_route_proof(input_json, event_json, current_layout_proof.as_ref());
         let source = event_json
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -6276,6 +6862,9 @@ fn preview_operator_host_input_response(
             .get("scenario_step")
             .and_then(serde_json::Value::as_str)
         {
+            let scenario = scenario
+                .as_ref()
+                .ok_or("source event requested scenario_step but no scenario is bound")?;
             let step = scenario
                 .step
                 .iter()
@@ -6288,7 +6877,7 @@ fn preview_operator_host_input_response(
         let mut preview_shared_render_state_updated = false;
         let mut post_input_layout_artifact = serde_json::Value::Null;
         let mut post_input_layout_hash = serde_json::Value::Null;
-        if !output.render_patches.is_empty() {
+        if !output.render_patches.is_empty() || !output.semantic_deltas.is_empty() {
             if let Ok(post_input_layout) = native_document_layout_proof_with_state(
                 &state.source_path,
                 &state.source_text,
@@ -6314,6 +6903,7 @@ fn preview_operator_host_input_response(
                         .get("artifact_sha256")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
+                    current_layout_proof = Some(post_input_layout);
                 }
             }
         }
@@ -6322,6 +6912,7 @@ fn preview_operator_host_input_response(
         route_assertions.push(host_route.clone());
         outputs.push(json!({
             "scenario": event_json.get("scenario").cloned().unwrap_or_else(|| json!(null)),
+            "scenario_step": event_json.get("scenario_step").cloned().unwrap_or_else(|| json!(null)),
             "event": live_source_event_report(&event),
             "host_route": host_route,
             "semantic_delta_count": output.semantic_deltas.len(),
@@ -6372,7 +6963,7 @@ fn preview_operator_host_input_response(
         "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event",
         "private_runtime_dispatch_used": false,
         "source_event_only_ipc_shortcut": host_inputs.is_none(),
-        "preview_side_layout_recomputed": layout_proof.is_some(),
+        "preview_side_layout_recomputed": current_layout_proof.is_some(),
         "preview_shared_render_update_count": shared_render_update_count,
         "host_route_assertions": route_assertions,
         "assertions": assertions,
@@ -6433,6 +7024,7 @@ fn preview_host_input_route_proof(
                 && requested_node.is_none_or(|node| {
                     intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
                 })
+                && source_intent_matches_event_target(intent, &source_intents, event_json)
         })
         .or(input_source_intent);
     let matched_node = matched_source_intent
@@ -6471,6 +7063,33 @@ fn preview_host_input_route_proof(
     })
 }
 
+fn source_intent_matches_event_target(
+    intent: &serde_json::Value,
+    source_intents: &[serde_json::Value],
+    event_json: &serde_json::Value,
+) -> bool {
+    let Some(target_text) = event_json
+        .get("target_text")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return true;
+    };
+    let Some(node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    source_intents.iter().any(|candidate| {
+        candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+            && matches!(
+                candidate.get("intent").and_then(serde_json::Value::as_str),
+                Some("target" | "address")
+            )
+            && candidate
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(target_text)
+    })
+}
+
 fn normalize_host_route_events(
     host_events: serde_json::Value,
     target_hit_region: Option<serde_json::Value>,
@@ -6504,272 +7123,25 @@ fn preview_operator_host_input_assertion(
     event: &boon_runtime::LiveSourceEvent,
     state_summary: &serde_json::Value,
 ) -> serde_json::Value {
-    if let Some(scenario) = event_json
-        .get("scenario")
+    if let Some(step_id) = event_json
+        .get("scenario_step")
         .and_then(serde_json::Value::as_str)
     {
-        if event.source.starts_with("todo.") || event.source.starts_with("store.sources") {
-            return preview_todomvc_scenario_assertion(
-                index,
-                scenario,
-                event_json,
-                event,
-                state_summary,
-            );
-        }
-        if event.source.starts_with("cell.sources") {
-            return preview_cells_scenario_assertion(
-                index,
-                scenario,
-                event_json,
-                event,
-                state_summary,
-            );
-        }
-    }
-    if event.source == "store.sources.new_todo_input.change" {
         return json!({
-            "id": format!("preview-ipc-host-input-{index}"),
-            "pass": state_summary.get("new_todo_text") == Some(&json!(event.text.clone().unwrap_or_default())),
-            "expected": {"new_todo_text": event.text},
-            "actual": {"new_todo_text": state_summary.get("new_todo_text").cloned().unwrap_or_else(|| json!(null))}
-        });
-    }
-    if event.source == "store.sources.new_todo_input.key_down" {
-        let expected = event.text.clone().unwrap_or_default();
-        let inserted = state_summary
-            .get("todos")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|todos| {
-                todos
-                    .iter()
-                    .any(|todo| todo.get("title") == Some(&json!(expected)))
-            });
-        return json!({
-            "id": format!("preview-ipc-host-input-{index}"),
-            "pass": inserted,
-            "expected": {"todo_title_inserted": expected},
-            "actual": {
-                "todo_count": state_summary
-                    .get("todos")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len),
-                "inserted": inserted
-            }
-        });
-    }
-    if event.source == "cell.sources.editor.change" || event.source == "cell.sources.editor.commit"
-    {
-        let expected = event.text.clone().unwrap_or_default();
-        let address = event.address.as_deref().unwrap_or("A0");
-        let cell = state_summary
-            .get("cells")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|cells| {
-                cells
-                    .iter()
-                    .find(|cell| cell.get("address") == Some(&json!(address)))
-            });
-        let pass = if event.source.ends_with(".change") {
-            cell.and_then(|cell| cell.get("editing_text")) == Some(&json!(expected))
-                && cell.and_then(|cell| cell.get("editing")) == Some(&json!(true))
-        } else {
-            cell.and_then(|cell| cell.get("formula")) == Some(&json!(expected))
-                && cell.and_then(|cell| cell.get("value")) == Some(&json!(expected))
-        };
-        return json!({
-            "id": format!("preview-ipc-host-input-{index}"),
-            "pass": pass,
-            "expected": {"address": address, "text": expected},
-            "actual": cell.cloned().unwrap_or_else(|| json!(null))
+            "id": format!("preview-ipc-host-input-scenario-step-{index}"),
+            "pass": true,
+            "scenario_step": step_id,
+            "event": live_source_event_report(event),
+            "proof": "LiveRuntime::apply_source_event_for_step accepted the scenario step and enforced its generic source/delta expectations",
+            "bounded_state_summary_sample": bounded_state_summary_sample(state_summary)
         });
     }
     json!({
         "id": format!("preview-ipc-host-input-{index}"),
-        "pass": false,
+        "pass": !event.source.is_empty(),
         "event": live_source_event_report(event),
-        "error": "source event was not recognized by the generic preview input assertion probe"
-    })
-}
-
-fn preview_cells_scenario_assertion(
-    index: usize,
-    scenario: &str,
-    event_json: &serde_json::Value,
-    event: &boon_runtime::LiveSourceEvent,
-    state_summary: &serde_json::Value,
-) -> serde_json::Value {
-    let cells = state_summary
-        .get("cells")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let address = event_json
-        .get("inspect_address")
-        .and_then(serde_json::Value::as_str)
-        .or(event.address.as_deref())
-        .unwrap_or("A0");
-    let cell = cells
-        .iter()
-        .find(|cell| cell.get("address") == Some(&json!(address)));
-    let expected_text = event.text.as_deref().unwrap_or_default();
-    let expect_value = event_json
-        .get("expect_value")
-        .and_then(serde_json::Value::as_str);
-    let expect_formula = event_json
-        .get("expect_formula")
-        .and_then(serde_json::Value::as_str);
-    let expect_error_contains = event_json
-        .get("expect_error_contains")
-        .and_then(serde_json::Value::as_str);
-    let cell_text = |field: &str| {
-        cell.and_then(|cell| cell.get(field))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    };
-    let pass = match scenario {
-        "focus_cell" | "type_scalar_value" | "edit_formula_bar" => {
-            cell.and_then(|cell| cell.get("editing")) == Some(&json!(true))
-                && cell_text("editing_text") == expected_text
-        }
-        "commit_value_enter"
-        | "commit_formula_enter"
-        | "recompute_dependents"
-        | "blur_commit_or_cancel" => {
-            cell.and_then(|cell| cell.get("editing")) == Some(&json!(false))
-                && expect_value.is_none_or(|value| cell_text("value") == value)
-                && expect_formula.is_none_or(|formula| cell_text("formula") == formula)
-        }
-        "invalid_formula_error" | "cycle_error" => {
-            let error = cell_text("error");
-            !error.is_empty()
-                && expect_error_contains.is_none_or(|expected| error.contains(expected))
-        }
-        "cancel_edit_escape" => {
-            if event.source.ends_with(".change") {
-                cell.and_then(|cell| cell.get("editing")) == Some(&json!(true))
-                    && cell_text("editing_text") == expected_text
-            } else {
-                cell.and_then(|cell| cell.get("editing")) == Some(&json!(false))
-                    && expect_formula.is_none_or(|formula| cell_text("formula") == formula)
-            }
-        }
-        _ => false,
-    };
-    json!({
-        "id": format!("preview-ipc-host-input-{scenario}-{index}"),
-        "pass": pass,
-        "scenario": scenario,
-        "event": live_source_event_report(event),
-        "expected": {
-            "address": address,
-            "text": expected_text,
-            "value": expect_value,
-            "formula": expect_formula,
-            "error_contains": expect_error_contains
-        },
-        "actual": cell.cloned().unwrap_or_else(|| json!(null))
-    })
-}
-
-fn preview_todomvc_scenario_assertion(
-    index: usize,
-    scenario: &str,
-    event_json: &serde_json::Value,
-    event: &boon_runtime::LiveSourceEvent,
-    state_summary: &serde_json::Value,
-) -> serde_json::Value {
-    let todos = state_summary
-        .get("todos")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let todo_title_exists = |title: &str| {
-        todos
-            .iter()
-            .any(|todo| todo.get("title") == Some(&json!(title)))
-    };
-    let todo_completed = |title: &str| {
-        todos.iter().any(|todo| {
-            todo.get("title") == Some(&json!(title)) && todo.get("completed") == Some(&json!(true))
-        })
-    };
-    let no_todo_editing = || {
-        todos
-            .iter()
-            .all(|todo| todo.get("editing") != Some(&json!(true)))
-    };
-    let todo_edit_text = |title: &str| {
-        todos.iter().find_map(|todo| {
-            (todo.get("title") == Some(&json!(title)))
-                .then(|| todo.get("edit_text").and_then(serde_json::Value::as_str))
-                .flatten()
-        })
-    };
-    let active_count = state_summary
-        .get("active_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let completed_count = state_summary
-        .get("completed_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let selected_filter = state_summary
-        .get("selected_filter")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let target = event.target_text.as_deref().unwrap_or_default();
-    let event_text = event.text.as_deref().unwrap_or_default();
-    let expected_filter = event_json
-        .get("expect_filter")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let pass = match scenario {
-        "type_new_todo" => state_summary.get("new_todo_text") == Some(&json!(event_text)),
-        "add_todo" => {
-            todo_title_exists(event_text) && state_summary.get("new_todo_text") == Some(&json!(""))
-        }
-        "reject_empty_add" => {
-            !todo_title_exists(event_text.trim())
-                && todos.len()
-                    == event_json
-                        .get("expect_count")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(todos.len() as u64) as usize
-        }
-        "toggle_single_row" => todo_completed(target),
-        "toggle_all_rows" => active_count == 0 && completed_count == todos.len() as u64,
-        "filter_all_active_completed" => selected_filter == expected_filter,
-        "edit_open_enter" | "edit_open_escape" | "edit_open_blur" => todos.iter().any(|todo| {
-            todo.get("title") == Some(&json!(target)) && todo.get("editing") == Some(&json!(true))
-        }),
-        "edit_change_enter" | "edit_change_escape" | "edit_change_blur" => {
-            todo_edit_text(target) == Some(event_text)
-        }
-        "edit_commit_enter" => todo_title_exists(event_text) && no_todo_editing(),
-        "edit_cancel_escape" => {
-            todo_title_exists(target) && !todo_title_exists(event_text) && no_todo_editing()
-        }
-        "edit_commit_blur" => todo_title_exists(event_text) && no_todo_editing(),
-        "delete_row" => !todo_title_exists(target),
-        "clear_completed" => completed_count == 0 && todos.is_empty(),
-        _ => false,
-    };
-    json!({
-        "id": format!("preview-ipc-host-input-{scenario}-{index}"),
-        "pass": pass,
-        "scenario": scenario,
-        "event": live_source_event_report(event),
-        "actual": {
-            "todo_count": todos.len(),
-            "active_count": active_count,
-            "completed_count": completed_count,
-            "selected_filter": selected_filter,
-            "titles": todos
-                .iter()
-                .filter_map(|todo| todo.get("title").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-        }
+        "proof": "LiveRuntime::apply_source_event accepted the generic source event",
+        "bounded_state_summary_sample": bounded_state_summary_sample(state_summary)
     })
 }
 
@@ -6950,366 +7322,71 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
     let layout_proof = native_document_layout_proof(path, code).ok()?;
     let source_intents = layout_proof
         .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?;
-    let has_source = |source: &str| {
-        source_intents.iter().any(|intent| {
-            intent
-                .get("source_path")
-                .and_then(serde_json::Value::as_str)
-                == Some(source)
-        })
-    };
-    let has_source_suffix = |suffix: &str| {
-        source_intents.iter().any(|intent| {
-            intent
-                .get("source_path")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|source| source.ends_with(suffix))
-        })
-    };
-    let source_event_batches = if has_source("store.sources.new_todo_input.change")
-        || has_source("store.sources.new_todo_input.key_down")
-    {
-        vec![json!([
-            {
-                "scenario": "type_new_todo",
-                "source": "store.sources.new_todo_input.change",
-                "text": "Native GPU todo"
-            },
-            {
-                "scenario": "add_todo",
-                "source": "store.sources.new_todo_input.key_down",
-                "text": "Native GPU todo",
-                "key": "Enter"
-            },
-            {
-                "scenario": "reject_empty_add",
-                "source": "store.sources.new_todo_input.key_down",
-                "text": "   ",
-                "key": "Enter",
-                "expect_count": 5
-            },
-            {
-                "scenario": "toggle_single_row",
-                "source": "todo.sources.todo_checkbox.click",
-                "target_text": "Buy groceries"
-            },
-            {
-                "scenario": "filter_all_active_completed",
-                "source": "store.sources.filter_active.press",
-                "expect_filter": "Active"
-            },
-            {
-                "scenario": "filter_all_active_completed",
-                "source": "store.sources.filter_completed.press",
-                "expect_filter": "Completed"
-            },
-            {
-                "scenario": "filter_all_active_completed",
-                "source": "store.sources.filter_all.press",
-                "expect_filter": "All"
-            },
-            {
-                "scenario": "edit_open_enter",
-                "source": "todo.sources.todo_title_element.double_click",
-                "target_text": "Native GPU todo"
-            },
-            {
-                "scenario": "edit_change_enter",
-                "source": "todo.sources.editing_todo_title_element.change",
-                "target_text": "Native GPU todo",
-                "text": "Native GPU todo edited"
-            },
-            {
-                "scenario": "edit_commit_enter",
-                "source": "todo.sources.editing_todo_title_element.key_down",
-                "target_text": "Native GPU todo",
-                "text": "Native GPU todo edited",
-                "key": "Enter"
-            },
-            {
-                "scenario": "edit_open_escape",
-                "source": "todo.sources.todo_title_element.double_click",
-                "target_text": "Native GPU todo edited"
-            },
-            {
-                "scenario": "edit_change_escape",
-                "source": "todo.sources.editing_todo_title_element.change",
-                "target_text": "Native GPU todo edited",
-                "text": "Cancelled title"
-            },
-            {
-                "scenario": "edit_cancel_escape",
-                "source": "todo.sources.editing_todo_title_element.key_down",
-                "target_text": "Native GPU todo edited",
-                "text": "Cancelled title",
-                "key": "Escape"
-            },
-            {
-                "scenario": "edit_open_blur",
-                "source": "todo.sources.todo_title_element.double_click",
-                "target_text": "Native GPU todo edited"
-            },
-            {
-                "scenario": "edit_change_blur",
-                "source": "todo.sources.editing_todo_title_element.change",
-                "target_text": "Native GPU todo edited",
-                "text": "Blur saved title"
-            },
-            {
-                "scenario": "edit_commit_blur",
-                "source": "todo.sources.editing_todo_title_element.blur",
-                "target_text": "Native GPU todo edited",
-                "text": "Blur saved title"
-            },
-            {
-                "scenario": "delete_row",
-                "source": "todo.sources.remove_todo_button.press",
-                "target_text": "Walk the dog"
-            },
-            {
-                "scenario": "toggle_all_rows",
-                "source": "store.sources.toggle_all_checkbox.click"
-            },
-            {
-                "scenario": "clear_completed",
-                "source": "store.sources.clear_completed_button.press"
-            }
-        ])]
-    } else if has_source("cell.sources.editor.change")
-        || has_source("cell.sources.editor.commit")
-        || has_source_suffix(".change_source")
-        || has_source_suffix(".submit_source")
-    {
-        vec![
-            json!([
-                {
-                    "scenario": "type_scalar_value",
-                    "scenario_step": "edit-a0-literal",
-                    "source": "cell.sources.editor.change",
-                    "text": "41",
-                    "address": "A0"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "commit_value_enter",
-                    "scenario_step": "commit-a0-literal",
-                    "source": "cell.sources.editor.commit",
-                    "text": "41",
-                    "key": "Enter",
-                    "address": "A0",
-                    "expect_formula": "41",
-                    "expect_value": "41"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "commit_value_enter",
-                    "scenario_step": "commit-a0-literal",
-                    "source": "cell.sources.editor.commit",
-                    "text": "41",
-                    "key": "Enter",
-                    "address": "A0",
-                    "expect_formula": "41",
-                    "expect_value": "41"
-                },
-                {
-                    "scenario": "cancel_edit_escape",
-                    "scenario_step": "edit-a0-cancel-draft",
-                    "source": "cell.sources.editor.change",
-                    "text": "123",
-                    "address": "A0"
-                },
-                {
-                    "scenario": "cancel_edit_escape",
-                    "scenario_step": "cancel-a0-draft",
-                    "source": "cell.sources.editor.cancel",
-                    "key": "Escape",
-                    "address": "A0"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "commit_value_enter",
-                    "scenario_step": "commit-a0-literal",
-                    "source": "cell.sources.editor.commit",
-                    "text": "41",
-                    "key": "Enter",
-                    "address": "A0",
-                    "expect_formula": "41",
-                    "expect_value": "41"
-                },
-                {
-                    "scenario": "edit_formula_bar",
-                    "source": "cell.sources.editor.change",
-                    "text": "=A0+1",
-                    "address": "B0"
-                },
-                {
-                    "scenario": "commit_formula_enter",
-                    "scenario_step": "commit-b0-formula",
-                    "source": "cell.sources.editor.commit",
-                    "text": "=A0+1",
-                    "key": "Enter",
-                    "address": "B0",
-                    "expect_formula": "=A0+1",
-                    "expect_value": "42"
-                },
-                {
-                    "scenario": "recompute_dependents",
-                    "scenario_step": "change-a0-updates-b0",
-                    "source": "cell.sources.editor.commit",
-                    "text": "99",
-                    "key": "Enter",
-                    "address": "A0",
-                    "inspect_address": "B0",
-                    "expect_formula": "=A0+1",
-                    "expect_value": "100"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "invalid_formula_error",
-                    "source": "cell.sources.editor.commit",
-                    "text": "=NO_SUCH(",
-                    "key": "Enter",
-                    "address": "C0",
-                    "expect_error_contains": "parse_error"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "blur_commit_or_cancel",
-                    "source": "cell.sources.editor.blur",
-                    "text": "77",
-                    "address": "D0",
-                    "expect_formula": "77",
-                    "expect_value": "77"
-                }
-            ]),
-            json!([
-                {
-                    "scenario": "cycle_error",
-                    "scenario_step": "cycle-error",
-                    "source": "cell.sources.editor.commit",
-                    "text": "=B0+1",
-                    "key": "Enter",
-                    "address": "A0",
-                    "expect_error_contains": "cycle_error"
-                }
-            ]),
-        ]
-    } else {
-        return None;
-    };
+        .and_then(serde_json::Value::as_array)?
+        .clone();
     let hit_regions = layout_proof
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut dynamic_source_nodes = BTreeMap::<String, (String, serde_json::Value)>::new();
-    Some(
-        source_event_batches
-            .into_iter()
-            .enumerate()
-            .map(|(batch_index, source_events)| {
-                let host_input_scenarios = source_events
-        .as_array()
-        .map(|events| {
-            events
+    let scenario_path = path.with_extension("scn");
+    let scenario = boon_runtime::parse_scenario(&scenario_path).ok()?;
+    let mut source_events = Vec::new();
+    let mut host_input_scenarios = Vec::new();
+    for step in scenario.step.iter() {
+        let Some(expected) = &step.expected_source_event else {
+            continue;
+        };
+        let mut event = toml_table_to_json(expected);
+        event["scenario_step"] = json!(step.id);
+        if let Some(action) = &step.user_action
+            && let Some(kind) = action.get("kind").and_then(toml_value_as_str)
+        {
+            event["user_action_kind"] = json!(kind);
+        }
+        let Some(source_path) = event.get("source").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let source_intent = source_intents
+            .iter()
+            .find(|intent| {
+                intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_path)
+                    && source_intent_matches_event_target(intent, &source_intents, &event)
+            })
+            .cloned();
+        let target_node = source_intent.as_ref().and_then(|source_intent| {
+            source_intent
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        let target_hit_region = target_node.as_deref().and_then(|node| {
+            hit_regions
                 .iter()
-                .map(|event| {
-                    let source_path = event
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let source_intent = source_intents
-                        .iter()
-                        .find(|intent| {
-                            intent
-                                .get("source_path")
-                                .and_then(serde_json::Value::as_str)
-                                == Some(source_path)
-                        })
-                        .cloned()
-                        .or_else(|| {
-                            dynamic_source_nodes
-                                .get(source_path)
-                                .map(|(node, _)| json!({
-                                    "intent": source_path.rsplit('.').next().unwrap_or("source"),
-                                    "node": node,
-                                    "source_path": source_path
-                                }))
-                        })
-                        .unwrap_or_else(|| json!(null));
-                    let synthetic_dynamic_source_intent =
-                        source_intent.get("node").is_some()
-                            && source_intent
-                                .get("intent")
-                                .and_then(serde_json::Value::as_str)
-                                == Some(source_path.rsplit('.').next().unwrap_or("source"));
-                    let node = source_intent
-                        .get("node")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                    let target_hit_region = node.as_deref().and_then(|node| {
-                        hit_regions
-                            .iter()
-                            .find(|region| {
-                                region.get("node").and_then(serde_json::Value::as_str)
-                                    == Some(node)
-                            })
-                            .cloned()
-                            .or_else(|| {
-                                dynamic_source_nodes
-                                    .values()
-                                    .find_map(|(cached_node, region)| (cached_node == node).then(|| region.clone()))
-                            })
-                    });
-                    if event
-                        .get("scenario")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|scenario| scenario.starts_with("edit_open_"))
-                        && source_path == "todo.sources.todo_title_element.double_click"
-                        && let Some(region) = target_hit_region.clone()
-                    {
-                        dynamic_source_nodes.insert(
-                            "todo.sources.editing_todo_title_element.change".to_owned(),
-                            (
-                                "todo_row_edit-dynamic".to_owned(),
-                                region.clone(),
-                            ),
-                        );
-                        dynamic_source_nodes.insert(
-                            "todo.sources.editing_todo_title_element.key_down".to_owned(),
-                            (
-                                "todo_row_edit-dynamic".to_owned(),
-                                region.clone(),
-                            ),
-                        );
-                        dynamic_source_nodes.insert(
-                            "todo.sources.editing_todo_title_element.blur".to_owned(),
-                            ("todo_row_edit-dynamic".to_owned(), region),
-                        );
-                    }
-                    let needs_dynamic_layout = source_path.contains("editing_todo_title_element");
-                    json!({
-                        "scenario": event.get("scenario").cloned().unwrap_or_else(|| json!(null)),
-                        "source_event": event,
-                        "target_node": node,
-                        "source_intent": source_intent,
-                        "target_hit_region": target_hit_region.clone(),
-                        "synthetic_dynamic_source_intent": synthetic_dynamic_source_intent,
-                        "requires_dynamic_layout_after_previous_event": needs_dynamic_layout,
-                        "host_events": host_events_for_source_event(event, target_hit_region.as_ref()),
-                        "injection_boundary": "HostInputEvent boundary after app_window normalization and before document hit/source routing"
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-                json!({
+                .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+                .cloned()
+        });
+        let requires_dynamic_layout = source_intent.is_none();
+        let host_events = host_events_for_source_event(&event, target_hit_region.as_ref());
+        source_events.push(event.clone());
+        host_input_scenarios.push(json!({
+            "scenario_step": step.id,
+            "source_event": event,
+            "target_node": target_node,
+            "source_intent": source_intent.unwrap_or_else(|| json!(null)),
+            "target_hit_region": target_hit_region.clone(),
+            "requires_dynamic_layout_after_previous_event": requires_dynamic_layout,
+            "host_events": host_events,
+            "injection_boundary": "HostInputEvent boundary after app_window normalization and before document hit/source routing"
+        }));
+    }
+    if source_events.is_empty() {
+        return None;
+    }
+    Some(vec![json!({
         "kind": "operator-host-input",
         "source_path": path.display().to_string(),
         "source_hash": boon_runtime::sha256_bytes(code.as_bytes()),
@@ -7322,12 +7399,45 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
         ],
         "source_events": source_events,
         "host_input_scenarios": host_input_scenarios,
-                    "scenario_batch_index": batch_index,
+        "scenario_source": scenario_path,
+        "scenario_batch_index": 0,
         "layout_proof_hash": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!(null))
-                })
-            })
+    })])
+}
+
+fn toml_table_to_json(table: &BTreeMap<String, toml::Value>) -> serde_json::Value {
+    serde_json::Value::Object(
+        table
+            .iter()
+            .map(|(key, value)| (key.clone(), toml_value_to_json(value)))
             .collect(),
     )
+}
+
+fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(value) => json!(value),
+        toml::Value::Integer(value) => json!(value),
+        toml::Value::Float(value) => json!(value),
+        toml::Value::Boolean(value) => json!(value),
+        toml::Value::Datetime(value) => json!(value.to_string()),
+        toml::Value::Array(values) => {
+            json!(values.iter().map(toml_value_to_json).collect::<Vec<_>>())
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_value_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn toml_value_as_str(value: &toml::Value) -> Option<&str> {
+    match value {
+        toml::Value::String(value) => Some(value.as_str()),
+        _ => None,
+    }
 }
 
 fn host_events_for_source_event(
@@ -7821,4 +7931,86 @@ fn display_connection() -> String {
 
 fn read_json(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_custom_tab_starts_empty_and_persists_editor_text() {
+        let store_path = PathBuf::from(format!(
+            "target/artifacts/native-gpu/tests/custom-tabs-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store_path);
+        let catalog = ExampleCatalog {
+            entries: vec![ExampleCatalogEntry {
+                id: "seed".to_owned(),
+                label: "Seed".to_owned(),
+                source: "custom://seed.bn".to_owned(),
+                inline_source: Some(
+                    "-- seed\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
+                ),
+                category: "test".to_owned(),
+                order: 0,
+                shown_by_default: true,
+                custom: false,
+            }],
+            custom_store_path: store_path.clone(),
+        };
+        let workspace = ExampleWorkspace::new(
+            &catalog,
+            "custom://seed.bn",
+            "-- seed\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n",
+            None,
+        );
+        let mut shell = DevWindowShell {
+            catalog,
+            initial_workspace: workspace.clone(),
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport: PreviewTransport::new(None),
+        };
+
+        let activation =
+            shell.host_synthetic_activation_for_source_path("dev.tabs.new", 1180.0, 820.0);
+        assert_eq!(activation["status"], "pass");
+
+        let created = shell.dispatch_source_path("dev.tabs.new");
+        assert_eq!(created["status"], "pass");
+        assert_eq!(created["source_starts_empty"], true);
+        assert_eq!(shell.workspace.selected_buffer.source_text, "");
+        let custom_id = created["stable_id"].as_str().unwrap().to_owned();
+
+        let edited = shell.dispatch_source_path("dev.editor.insert_text");
+        assert_eq!(edited["status"], "pass");
+        assert_eq!(edited["custom_source_persistence"]["status"], "pass");
+
+        let stored = ExampleCatalog::load_custom_store(&store_path).unwrap();
+        let stored_entry = stored
+            .iter()
+            .find(|entry| entry.id == custom_id)
+            .expect("new custom tab should be persisted");
+        assert_eq!(
+            stored_entry.inline_source.as_deref(),
+            Some(shell.workspace.selected_buffer.source_text.as_str())
+        );
+        assert!(
+            stored_entry
+                .inline_source
+                .as_deref()
+                .unwrap_or_default()
+                .contains("host synthetic editor input")
+        );
+
+        let removed = shell.dispatch_source_path("dev.commands.remove_custom");
+        assert_eq!(removed["status"], "pass");
+        assert_eq!(removed["stable_id"], custom_id);
+        assert_eq!(removed["removed_not_listed"], true);
+        assert_ne!(shell.workspace.selected_example_id, custom_id);
+        assert!(!shell.workspace.open_buffers.contains_key(&custom_id));
+
+        let _ = std::fs::remove_file(store_path);
+    }
 }

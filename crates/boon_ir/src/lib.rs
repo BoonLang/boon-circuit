@@ -3,7 +3,7 @@ use boon_parser::{
     ParserItem as AstItem, ProgramKind,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -928,15 +928,46 @@ fn view_bindings(
         .collect::<Vec<_>>();
     let mut bindings = Vec::new();
     if let Some(document) = boon_parser::parsed_document(program) {
+        let document_functions = DocumentViewFunctionRegistry::new(&program.ast.statements);
         collect_document_view_bindings(
             &document.root.children,
             &document.expressions,
+            &document_functions,
             row_scopes,
             &source_paths,
             &mut bindings,
+            &mut Vec::new(),
         );
     }
     bindings
+}
+
+struct DocumentViewFunctionRegistry<'a> {
+    functions: BTreeMap<&'a str, &'a AstStatement>,
+}
+
+impl<'a> DocumentViewFunctionRegistry<'a> {
+    fn new(statements: &'a [AstStatement]) -> Self {
+        let mut functions = BTreeMap::new();
+        Self::collect(statements, &mut functions);
+        Self { functions }
+    }
+
+    fn collect(
+        statements: &'a [AstStatement],
+        functions: &mut BTreeMap<&'a str, &'a AstStatement>,
+    ) {
+        for statement in statements {
+            if let AstStatementKind::Function { name, .. } = &statement.kind {
+                functions.insert(name.as_str(), statement);
+            }
+            Self::collect(&statement.children, functions);
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&'a AstStatement> {
+        self.functions.get(name).copied()
+    }
 }
 
 fn view_data_path(value: &str) -> Option<String> {
@@ -982,9 +1013,11 @@ fn attr_can_bind_data(attr: &str) -> bool {
 fn collect_document_view_bindings(
     statements: &[AstStatement],
     expressions: &[AstExpr],
+    functions: &DocumentViewFunctionRegistry<'_>,
     row_scopes: &[RowScope],
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
+    function_stack: &mut Vec<String>,
 ) {
     for statement in statements {
         if let Some(function) = document_statement_call(statement, expressions)
@@ -998,6 +1031,21 @@ fn collect_document_view_bindings(
                 source_paths,
                 bindings,
             );
+        } else if let Some(function) = document_statement_call(statement, expressions)
+            && let Some(function_statement) = functions.get(function)
+            && !function_stack.iter().any(|active| active == function)
+        {
+            function_stack.push(function.to_owned());
+            collect_document_view_bindings(
+                &function_statement.children,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                bindings,
+                function_stack,
+            );
+            function_stack.pop();
         } else if document_statement_field(statement).as_deref() == Some("element")
             && let Some(kind) = document_child_value(statement, "kind", expressions)
         {
@@ -1013,9 +1061,11 @@ fn collect_document_view_bindings(
         collect_document_view_bindings(
             &statement.children,
             expressions,
+            functions,
             row_scopes,
             source_paths,
             bindings,
+            function_stack,
         );
     }
 }
@@ -2298,7 +2348,11 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: "list body not found".to_owned(),
         };
     };
-    if items.iter().any(|item| item_has_symbol(item, "Grid/cells")) {
+    let grid_constructor = format!("Grid/{list_name}");
+    if items
+        .iter()
+        .any(|item| item_has_symbol(item, &grid_constructor))
+    {
         return ListInitializer::Grid {
             columns: extract_usize_arg_from_items(&items, "columns").unwrap_or(26),
             rows: extract_usize_arg_from_items(&items, "rows").unwrap_or(100),
@@ -2872,6 +2926,9 @@ fn update_expression_for_source(
     if let Some(expression) = text_trim_or_previous_update(program, target, &branch) {
         return expression;
     }
+    if let Some(value) = branch.then_negative_number_value() {
+        return UpdateExpression::Const { value };
+    }
     if let Some(value) = branch.then_simple_value() {
         return if value_starts_lowercase_identifier(&value) {
             UpdateExpression::PreviousValue { path: value }
@@ -3075,6 +3132,18 @@ impl RoutedBranch {
                 .find_map(|candidate| {
                     ast_simple_update_value_in_exprs(&self.ast_exprs, candidate.id)
                 })
+        })
+    }
+
+    fn then_negative_number_value(&self) -> Option<String> {
+        self.items.iter().find_map(|item| {
+            if !item_has_symbol(item, "THEN") {
+                return None;
+            }
+            item.symbols.windows(2).find_map(|window| {
+                (window[0] == "-" && window[1].parse::<i64>().is_ok())
+                    .then(|| format!("-{}", window[1]))
+            })
         })
     }
 
@@ -3575,7 +3644,7 @@ mod tests {
         )
         .unwrap();
         let ir = lower(&parsed).unwrap();
-        assert_eq!(ir.kind, ProgramKind::TodoMvc);
+        assert_eq!(ir.kind, ProgramKind::Generic);
         assert!(
             ir.nodes
                 .iter()
@@ -4074,7 +4143,7 @@ FUNCTION new_todo(seed) {
         )
         .unwrap();
         let ir = lower(&parsed).unwrap();
-        assert_eq!(ir.kind, ProgramKind::Cells);
+        assert_eq!(ir.kind, ProgramKind::Generic);
         assert_eq!(
             ir.lists[0].initializer,
             ListInitializer::Grid {

@@ -284,16 +284,14 @@ fn encode_layout_to_surface_with_pipeline(
     });
     let color_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("boon-native-gpu-visible-color-buffer"),
-        size: (colors.len() * std::mem::size_of::<f32>()) as u64,
+        size: colors.len() as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     request
         .queue
         .write_buffer(&position_buffer, 0, &f32_slice_bytes(&positions));
-    request
-        .queue
-        .write_buffer(&color_buffer, 0, &f32_slice_bytes(&colors));
+    request.queue.write_buffer(&color_buffer, 0, &colors);
     {
         let mut pass = request
             .encoder
@@ -340,7 +338,7 @@ fn encode_layout_to_surface_with_pipeline(
     Ok(FrameMetrics {
         frame_seq,
         draw_calls: 1 + u32::from(rendered_text_runs > 0),
-        upload_bytes: ((positions.len() + colors.len()) * std::mem::size_of::<f32>()) as u64,
+        upload_bytes: ((positions.len() * std::mem::size_of::<f32>()) + colors.len()) as u64,
         visible_display_item_count: rect_metrics.visible_display_item_count,
         rendered_rect_count: rect_metrics.rendered_rect_count,
         rect_cap_hit: rect_metrics.cap_hit,
@@ -720,7 +718,7 @@ impl GlyphonTextState {
             &mut self.font_system,
             &run.text,
             &Attrs::new().family(Family::Name(&run.font_family)),
-            Shaping::Basic,
+            Shaping::Advanced,
             None,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -820,6 +818,9 @@ fn rect_intersects(rect: Rect, viewport: Rect) -> bool {
 }
 
 fn text_align(style: &StyleMap) -> TextAlign {
+    if style_bool(style, "center") == Some(true) {
+        return TextAlign::Center;
+    }
     match style_text(style, "align") {
         Some("center") => TextAlign::Center,
         Some("right") => TextAlign::Right,
@@ -870,7 +871,7 @@ fn rect_vertices(
     frame: &LayoutFrame,
     width: f32,
     height: f32,
-) -> (Vec<f32>, Vec<f32>, RectVertexMetrics) {
+) -> (Vec<f32>, Vec<u8>, RectVertexMetrics) {
     let mut positions = Vec::new();
     let mut colors = Vec::new();
     let mut metrics = RectVertexMetrics {
@@ -1015,7 +1016,7 @@ fn rect_vertices(
             -0.9, 0.9, -0.7, 0.9, -0.7, 0.7, -0.9, 0.9, -0.7, 0.7, -0.9, 0.7,
         ]);
         for _ in 0..6 {
-            colors.extend_from_slice(&[0.2, 0.6, 0.9, 1.0]);
+            colors.extend_from_slice(&rgba8_from_f32([0.2, 0.6, 0.9, 1.0]));
         }
     }
     (positions, colors, metrics)
@@ -1023,7 +1024,7 @@ fn rect_vertices(
 
 fn push_rect(
     positions: &mut Vec<f32>,
-    colors: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
     rect: Rect,
     width: f32,
     height: f32,
@@ -1038,6 +1039,7 @@ fn push_rect(
     let y0 = (1.0 - (rect.y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
     let y1 = (1.0 - ((rect.y + rect.height) / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
     positions.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
+    let color = rgba8_from_f32(color);
     for _ in 0..6 {
         colors.extend_from_slice(&color);
     }
@@ -1045,7 +1047,7 @@ fn push_rect(
 
 fn push_border(
     positions: &mut Vec<f32>,
-    colors: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
     rect: Rect,
     width: f32,
     height: f32,
@@ -1080,6 +1082,10 @@ fn push_border(
     ] {
         push_rect(positions, colors, edge, width, height, color);
     }
+}
+
+fn rgba8_from_f32(color: [f32; 4]) -> [u8; 4] {
+    color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {

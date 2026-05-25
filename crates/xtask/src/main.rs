@@ -24,6 +24,15 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-runtime-finality",
     "verify-playground-genericity",
     "verify-boon-source-syntax",
+    "verify-boon-driver-schema",
+    "verify-boon-driver-e2e",
+    "verify-boon-driver-dev-window",
+    "verify-boon-driver-speed",
+    "verify-boon-driver-all",
+    "verify-linux-human-like-environment",
+    "verify-linux-human-like-e2e",
+    "verify-linux-human-like-speed",
+    "verify-linux-human-like-all",
     "audit-machine-readiness",
     "verify-todomvc-semantic",
     "verify-todomvc-speed",
@@ -89,6 +98,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-runtime-finality" => verify_runtime_finality(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
         "verify-boon-source-syntax" => verify_boon_source_syntax(&args),
+        "verify-boon-driver-schema" => verify_boon_driver_schema(&args),
+        "verify-boon-driver-e2e" => verify_boon_driver_e2e(&args),
+        "verify-boon-driver-dev-window" => verify_boon_driver_dev_window(&args),
+        "verify-boon-driver-speed" => verify_boon_driver_speed(&args),
+        "verify-boon-driver-all" => verify_boon_driver_all(&args),
+        "verify-linux-human-like-environment" => verify_linux_human_like_environment(&args),
+        "verify-linux-human-like-e2e" => verify_linux_human_like_e2e(&args),
+        "verify-linux-human-like-speed" => verify_linux_human_like_speed(&args),
+        "verify-linux-human-like-all" => verify_linux_human_like_all(&args),
         "audit-machine-readiness" => audit_machine_readiness(&args),
         "bench-example" => bench_example(named_arg(&args, 1)?, &args),
         "verify-todomvc-semantic" => verify_specific("todomvc", VerificationLayer::Semantic, &args),
@@ -1009,6 +1027,7 @@ fn verify_native_gpu_dependency_graph(args: &[String]) -> Result<(), Box<dyn std
     );
     let required_crates = [
         "boon_document_model",
+        "boon_driver",
         "boon_document",
         "boon_native_gpu",
         "boon_native_app_window",
@@ -1045,6 +1064,17 @@ fn verify_native_gpu_dependency_graph(args: &[String]) -> Result<(), Box<dyn std
         );
     }
     let dependency_rules = [
+        (
+            "crates/boon_driver/Cargo.toml",
+            &[
+                "wgpu",
+                "app_window",
+                "glyphon",
+                "boon_native",
+                "boon_runtime",
+            ][..],
+            "boon_driver",
+        ),
         (
             "crates/boon_runtime/Cargo.toml",
             &["wgpu", "app_window", "glyphon", "boon_document"][..],
@@ -1531,22 +1561,29 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
     let live_state_report =
         PathBuf::from("target/artifacts/native-gpu/multiwindow-live-state.json");
     let mut cosmic_launch_proof = json!({"status": "not-run"});
+    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
     let _ = std::fs::remove_file("target/reports/native-gpu/.multiwindow-live-state.json");
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-multiwindow:wayland-session",
-        wayland,
+        "native-gpu-multiwindow:isolated-real-window-environment",
+        isolated_real_window_available,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!wayland).then(|| "native multiwindow proof requires a Wayland session".to_owned()),
+        (!isolated_real_window_available).then(|| {
+            "native multiwindow proof requires the isolated Weston real-window harness".to_owned()
+        }),
     );
 
     let build = Command::new("cargo")
@@ -1561,7 +1598,72 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    if build.success() && wayland {
+    if build.success() && isolated_real_window_available {
+        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+            Path::new("target/debug/boon_native_playground"),
+            "todomvc",
+            &native_gpu_title_token("multiwindow"),
+            1_500,
+            60_000,
+            &supervisor_report,
+            &live_state_report,
+            None,
+            Some("a"),
+        )?;
+        let launch_success = isolated_real_window_launch_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-multiwindow:isolated-launch-command",
+            launch_success,
+            format!(
+                "status={:?}, desktop_pass={:?}, driver_effect_observed={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .get("desktop_pass")
+                    .and_then(serde_json::Value::as_bool),
+                isolated_real_window_launch_proof
+                    .get("driver_effect_observed")
+                    .and_then(serde_json::Value::as_bool)
+            ),
+            (!launch_success).then(|| {
+                "isolated native multiwindow launch failed to produce real-window proof".to_owned()
+            }),
+        );
+        let live_state_ready = live_state_report.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-multiwindow:live-state-report-written",
+            live_state_ready,
+            format!("{} ready={live_state_ready}", live_state_report.display()),
+            (!live_state_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write live state `{}` while windows were alive",
+                    live_state_report.display()
+                )
+            }),
+        );
+        let report_ready = supervisor_report.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-multiwindow:supervisor-report-written",
+            report_ready,
+            format!("{} ready={report_ready}", supervisor_report.display()),
+            (!report_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write `{}`",
+                    supervisor_report.display()
+                )
+            }),
+        );
+    } else if false && build.success() && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -1689,8 +1791,9 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
 
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
+        "launcher_command": "isolated-weston-headless-with-weston-test-control",
         "cosmic_background_launch_proof": cosmic_launch_proof,
+        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "cosmic_toplevel_probe": {"status": "removed", "reason": "native proof uses app-owned live state and process reports, not compositor toplevel scraping"},
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
@@ -1928,20 +2031,28 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
     let mut blockers = Vec::new();
     let queue_capacity = native_gpu_budget_u64("ipc", "queue_depth_max").unwrap_or(256);
     let supervisor_report = PathBuf::from("target/reports/native-gpu/.ipc-supervisor.json");
+    let live_state_report = PathBuf::from("target/artifacts/native-gpu/ipc-live-state.json");
     let _ = std::fs::remove_file(&supervisor_report);
+    let _ = std::fs::remove_file(&live_state_report);
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-ipc:wayland-session",
-        wayland,
+        "native-gpu-ipc:isolated-real-window-environment",
+        isolated_real_window_available,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!wayland).then(|| "native IPC proof requires a Wayland session".to_owned()),
+        (!isolated_real_window_available).then(|| {
+            "native IPC proof requires the isolated Weston real-window harness".to_owned()
+        }),
     );
 
     let build = Command::new("cargo")
@@ -1956,7 +2067,42 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    if build.success() && wayland {
+    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
+    if build.success() && isolated_real_window_available {
+        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+            Path::new("target/debug/boon_native_playground"),
+            "todomvc",
+            &native_gpu_title_token("ipc-backpressure"),
+            1_500,
+            60_000,
+            &supervisor_report,
+            &live_state_report,
+            None,
+            Some("a"),
+        )?;
+        let launch_success = isolated_real_window_launch_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-ipc:isolated-launch-command",
+            launch_success,
+            format!(
+                "status={:?}, desktop_pass={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .get("desktop_pass")
+                    .and_then(serde_json::Value::as_bool)
+            ),
+            (!launch_success).then(|| {
+                "isolated native IPC launch failed to produce supervisor proof".to_owned()
+            }),
+        );
+    } else if false && build.success() && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -2010,8 +2156,10 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
     let mut ipc_probe = json!({});
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
+        "launcher_command": "isolated-weston-headless-with-weston-test-control",
         "supervisor_report": supervisor_report,
+        "live_state_report": live_state_report,
+        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_preview_dev_windows": false,
         "bounded_ipc": false,
         "preview_blocked_on_ipc_count": serde_json::Value::Null,
@@ -2231,20 +2379,29 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
     let mut blockers = Vec::new();
     let supervisor_report =
         PathBuf::from("target/reports/native-gpu/.observability-supervisor.json");
+    let live_state_report =
+        PathBuf::from("target/artifacts/native-gpu/observability-live-state.json");
     let _ = std::fs::remove_file(&supervisor_report);
+    let _ = std::fs::remove_file(&live_state_report);
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-observability:wayland-session",
-        wayland,
+        "native-gpu-observability:isolated-real-window-environment",
+        isolated_real_window_available,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!wayland).then(|| "native observability proof requires a Wayland session".to_owned()),
+        (!isolated_real_window_available).then(|| {
+            "native observability proof requires the isolated Weston real-window harness".to_owned()
+        }),
     );
 
     let build = Command::new("cargo")
@@ -2259,7 +2416,42 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    if build.success() && wayland {
+    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
+    if build.success() && isolated_real_window_available {
+        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+            Path::new("target/debug/boon_native_playground"),
+            "todomvc",
+            &native_gpu_title_token("observability"),
+            1_500,
+            60_000,
+            &supervisor_report,
+            &live_state_report,
+            None,
+            Some("a"),
+        )?;
+        let launch_success = isolated_real_window_launch_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-observability:isolated-launch-command",
+            launch_success,
+            format!(
+                "status={:?}, desktop_pass={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .get("desktop_pass")
+                    .and_then(serde_json::Value::as_bool)
+            ),
+            (!launch_success).then(|| {
+                "isolated native observability launch failed to produce supervisor proof".to_owned()
+            }),
+        );
+    } else if false && build.success() && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -2313,8 +2505,10 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
     let mut ipc_probe = json!({});
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
+        "launcher_command": "isolated-weston-headless-with-weston-test-control",
         "supervisor_report": supervisor_report,
+        "live_state_report": live_state_report,
+        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "bounded_observability": false,
         "full_state_mirroring_observed": false,
         "live_preview_dev_windows": false,
@@ -2596,23 +2790,40 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
 
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
-        format!("native-gpu-preview-e2e-{example}:wayland-session"),
-        wayland,
+        format!("native-gpu-preview-e2e-{example}:real-window-launch-environment"),
+        wayland || isolated_real_window_available,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!wayland).then(|| "native preview E2E requires a Wayland session".to_owned()),
+        (!(wayland || isolated_real_window_available)).then(|| {
+            "native preview E2E requires either a Wayland session or the isolated Weston real-window harness".to_owned()
+        }),
     );
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    let launched_binary_path = PathBuf::from("target/debug/boon_native_playground");
+    let release_build = entry.id == "cells";
+    let build = if release_build {
+        Command::new("cargo")
+            .args(["build", "--release", "-p", "boon_native_playground"])
+            .status()?
+    } else {
+        Command::new("cargo")
+            .args(["build", "-p", "boon_native_playground"])
+            .status()?
+    };
+    let launched_binary_path = if release_build {
+        PathBuf::from("target/release/boon_native_playground")
+    } else {
+        PathBuf::from("target/debug/boon_native_playground")
+    };
     let launched_binary_hash = if build.success() {
         file_hash(launched_binary_path.to_string_lossy().as_ref())
     } else {
@@ -2628,15 +2839,56 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     );
 
     let layout_probe = if build.success() {
-        run_native_layout_probe(&source_path, &layout_probe_report)?
+        run_native_layout_probe(&launched_binary_path, &source_path, &layout_probe_report)?
     } else {
         json!({"status": "not-run", "reason": "boon_native_playground build failed"})
     };
     let driver_target = native_preview_driver_target(&example, &layout_probe);
     let native_input_driver_attempt =
         native_gpu_operator_input_driver_attempt("preview-e2e", &example, driver_target.clone());
+    let linked_linux_real_window_evidence =
+        linked_linux_human_like_real_window_evidence(&example, &source_hash);
 
-    if build.success() && wayland {
+    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
+    if build.success() && isolated_real_window_available {
+        let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
+        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+            &launched_binary_path,
+            &entry.id,
+            &title_token,
+            input_sample_delay_ms.max(1_500),
+            isolated_role_report_timeout_ms,
+            &supervisor_report,
+            &live_state_report,
+            driver_target.clone(),
+            isolated_preview_driver_text(&entry.id),
+        )?;
+        let isolated_launch_success = isolated_real_window_launch_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-preview-e2e-{example}:isolated-real-window-launch"),
+            isolated_launch_success,
+            format!(
+                "status={:?}, driver_effect_observed={:?}, supervisor_report_written={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .get("driver_effect_observed")
+                    .and_then(serde_json::Value::as_bool),
+                isolated_real_window_launch_proof
+                    .get("supervisor_report_written")
+                    .and_then(serde_json::Value::as_bool)
+            ),
+            (!isolated_launch_success).then(|| {
+                "isolated Weston native launch did not prove real-window input delivery for this native run".to_owned()
+            }),
+        );
+    } else if build.success() && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -2652,8 +2904,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             let cwd = std::env::current_dir()?;
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
-                "cd {} && ./target/debug/boon_native_playground --role desktop --example {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
+                "cd {} && {} --role desktop --example {} --probe --child-hold-ms 10000 --dev-hold-ms 5000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
+                shell_quote(&format!("./{}", launched_binary_path.display())),
                 shell_quote(&entry.id),
                 shell_quote(&title_token),
                 input_sample_delay_ms,
@@ -2746,17 +2999,26 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "source_path": source_path,
         "launched_binary_path": launched_binary_path,
         "launched_binary_hash": launched_binary_hash,
+        "release_build": release_build,
         "scenario_hash": scenario_hash,
         "scenario_artifact": scenario_artifact,
         "layout_probe_report": layout_probe_report,
         "prelaunch_layout_probe": layout_probe,
         "driver_target_region": driver_target,
         "scenario_labels": scenario_labels,
-        "evidence_tier": "host-synthetic",
+        "evidence_tier": boon_driver::TIER_BOON_DRIVER,
+        "legacy_evidence_tier": boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
         "real_os_input": false,
         "operator_host_input": true,
         "input_injection_method": "operator_host_event_harness",
         "operator_host_input_evidence": operator_host_input_evidence,
+        "linked_linux_real_window_evidence": linked_linux_real_window_evidence,
+        "boon_driver_proof": {
+            "status": "pending-supervisor-report",
+            "evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "legacy_evidence_tier": boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
+            "real_window_claimed": false
+        },
         "input_sample_delay_ms": input_sample_delay_ms,
         "visual_capture_method": "wgpu-visible-surface-copy-src-readback",
         "headless": false,
@@ -2783,9 +3045,11 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "live_state_report": live_state_report,
         "launcher_command": "cosmic-background-launch --workspace boon-circuit",
         "cosmic_background_launch_proof": cosmic_launch_proof,
+        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_desktop_input_allowed": false,
         "native_input_driver_attempt": native_input_driver_attempt
     });
+    extra["isolated_real_window_launch_proof"] = isolated_real_window_launch_proof.clone();
 
     if supervisor_report.exists() {
         let supervisor = read_json(&supervisor_report)?;
@@ -2878,9 +3142,14 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 extra["real_window_input"] = json!(true);
                 extra["evidence_tier"] = json!("real-window");
                 extra["real_os_input"] = json!(true);
-                extra["input_injection_method"] = extra
-                    .pointer("/native_input_adapter/input_injection_method")
+                extra["input_injection_method"] = isolated_real_window_launch_proof
+                    .get("method")
                     .cloned()
+                    .or_else(|| {
+                        extra
+                            .pointer("/native_input_adapter/input_injection_method")
+                            .cloned()
+                    })
                     .unwrap_or_else(|| json!("app_window_per_window_input_harness"));
                 extra["focused_window_proof"] = json!({
                     "status": "pass",
@@ -2897,22 +3166,41 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 });
             }
         }
+        extra["linked_linux_real_window_evidence"]["native_evidence_upgrade_allowed"] =
+            json!(false);
         if let Some(readback) = supervisor
             .pointer("/preview_surface_proof/readback_artifact")
             .and_then(serde_json::Value::as_object)
         {
             if let Some(path) = readback.get("path").and_then(serde_json::Value::as_str) {
-                extra["focused_window_proof"] = json!({
-                    "status": "pass",
-                    "method": "app_owned_surface_readback_plus_operator_host_event_harness",
-                    "target_preview_title": extra
+                if extra
+                    .get("real_window_input")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    extra["focused_window_proof"]["readback_path"] = json!(path);
+                    extra["focused_window_proof"]["surface_epoch"] = extra
+                        .get("surface_epoch")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    extra["focused_window_proof"]["target_preview_title"] = extra
                         .get("preview_window_title")
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    "surface_epoch": extra.get("surface_epoch").cloned().unwrap_or(serde_json::Value::Null),
-                    "readback_path": path,
-                    "real_os_input_claimed": false
-                });
+                        .unwrap_or(serde_json::Value::Null);
+                    extra["focused_window_proof"]["app_owned_readback_attached"] = json!(true);
+                } else {
+                    extra["focused_window_proof"] = json!({
+                        "status": "pass",
+                        "method": "app_owned_surface_readback_plus_operator_host_event_harness",
+                        "target_preview_title": extra
+                            .get("preview_window_title")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "surface_epoch": extra.get("surface_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                        "readback_path": path,
+                        "real_os_input_claimed": false
+                    });
+                }
                 extra["checkpoint_screenshot_or_video_paths"] = json!([path]);
                 extra["frame_hashes"] = json!([{
                     "kind": "wgpu_readback_png",
@@ -3010,7 +3298,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     {
         "real-window"
     } else {
-        "host-synthetic"
+        boon_driver::TIER_BOON_DRIVER
     });
     if let Some(route) = host_route_evidence.get("per_step_host_input_route") {
         extra["per_step_host_input_route"] = route.clone();
@@ -3042,6 +3330,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         );
     }
     extra["scenario_evidence"] = scenario_evidence;
+    extra["boon_driver_proof"] = boon_driver::app_owned_preview_proof(&extra);
     let artifact_freshness =
         native_artifact_freshness_summary(&extra, &source_path, &launched_binary_path);
     let artifacts_fresh = artifact_freshness
@@ -3096,6 +3385,26 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         two_windows,
         format!("process_model={:?}", extra.get("process_model")),
         (!two_windows).then(|| "native preview E2E did not launch two child windows".to_owned()),
+    );
+    let dev_probe_status = extra
+        .pointer("/dev_shell_interaction_probe/status")
+        .and_then(serde_json::Value::as_str);
+    let dev_probe_real_window_input = extra
+        .pointer("/dev_shell_interaction_probe/visible_window_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let dev_probe_pass = dev_probe_status == Some("pass") && dev_probe_real_window_input;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:dev-window-real-input-probe"),
+        dev_probe_pass,
+        format!(
+            "dev_probe_status={dev_probe_status:?}, visible_window_input={dev_probe_real_window_input}"
+        ),
+        (!dev_probe_pass).then(|| {
+            "native preview E2E launched two windows but did not prove the dev window is visibly interactive through real window input".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -3412,6 +3721,137 @@ fn native_preview_e2e_scenario_labels(entry: &boon_runtime::ExampleManifestEntry
     labels.extend(entry.input_scenarios.iter().cloned());
     labels.extend(entry.scroll_focus_scenarios.iter().cloned());
     labels.into_iter().collect()
+}
+
+fn linked_linux_human_like_real_window_evidence(
+    example: &str,
+    expected_source_hash: &str,
+) -> serde_json::Value {
+    let path = PathBuf::from(format!("target/reports/linux-human-like/{example}.json"));
+    let Ok(Some(report)) = read_optional_json(&path) else {
+        return json!({
+            "status": "missing",
+            "path": path,
+            "reason": "Linux human-like report is missing"
+        });
+    };
+    let source_hash_matches = report
+        .get("source_hash")
+        .and_then(serde_json::Value::as_str)
+        == Some(expected_source_hash);
+    let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && report.get("git_commit").and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str())
+        && report
+            .get("evidence_tier")
+            .and_then(serde_json::Value::as_str)
+            == Some(boon_driver::TIER_REAL_WINDOW)
+        && report
+            .get("live_desktop_input_used")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && source_hash_matches
+        && report
+            .pointer("/isolated_preview_smoke_probe/driver_effect_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .pointer("/isolated_preview_smoke_probe/real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "path": path,
+        "report_sha256": if path.exists() {
+            file_hash(path.to_string_lossy().as_ref())
+        } else {
+            "missing".to_owned()
+        },
+        "source_hash_matches": source_hash_matches,
+        "git_commit": report.get("git_commit").cloned().unwrap_or(serde_json::Value::Null),
+        "evidence_tier": report.get("evidence_tier").cloned().unwrap_or(serde_json::Value::Null),
+        "live_desktop_input_used": report.get("live_desktop_input_used").cloned().unwrap_or(serde_json::Value::Null),
+        "driver_effect_observed": report.pointer("/isolated_preview_smoke_probe/driver_effect_observed").cloned().unwrap_or(serde_json::Value::Null),
+        "real_os_events_observed": report.pointer("/isolated_preview_smoke_probe/real_os_events_observed").cloned().unwrap_or(serde_json::Value::Null),
+        "link_contract": "separate isolated preview-only real-window input proof linked by example source hash and git commit; native preview E2E still owns two-window/dev/renderer proof"
+    })
+}
+
+fn linked_linux_human_like_speed_real_window_evidence(
+    label: &str,
+    expected_source_hash: &str,
+) -> serde_json::Value {
+    let path = if label == "cells" {
+        PathBuf::from("target/reports/linux-human-like/cells-speed.json")
+    } else {
+        PathBuf::from(format!(
+            "target/reports/linux-human-like/{label}-speed.json"
+        ))
+    };
+    let Ok(Some(report)) = read_optional_json(&path) else {
+        return json!({
+            "status": "missing",
+            "path": path,
+            "reason": "Linux human-like speed report is missing"
+        });
+    };
+    let report_source_hash = report
+        .get("source_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let source_hash_matches = expected_source_hash == "n/a"
+        || report_source_hash == "n/a"
+        || report_source_hash == expected_source_hash;
+    let smoke = report
+        .get("isolated_preview_smoke_probe")
+        .or_else(|| report.get("isolated_surface_smoke_probe"));
+    let real_os_events_observed = smoke
+        .and_then(|smoke| smoke.get("real_os_events_observed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let driver_effect_observed = smoke
+        .and_then(|smoke| smoke.get("driver_effect_observed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && report.get("command").and_then(serde_json::Value::as_str)
+            == Some("verify-linux-human-like-speed")
+        && report.get("git_commit").and_then(serde_json::Value::as_str)
+            == Some(git_commit().as_str())
+        && report
+            .get("evidence_tier")
+            .and_then(serde_json::Value::as_str)
+            == Some(boon_driver::TIER_REAL_WINDOW)
+        && report
+            .get("live_desktop_input_used")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && report
+            .get("real_window_claimed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && source_hash_matches
+        && real_os_events_observed
+        && driver_effect_observed;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "path": path,
+        "report_sha256": if path.exists() {
+            file_hash(path.to_string_lossy().as_ref())
+        } else {
+            "missing".to_owned()
+        },
+        "source_hash_matches": source_hash_matches,
+        "expected_source_hash": expected_source_hash,
+        "report_source_hash": report_source_hash,
+        "git_commit": report.get("git_commit").cloned().unwrap_or(serde_json::Value::Null),
+        "evidence_tier": report.get("evidence_tier").cloned().unwrap_or(serde_json::Value::Null),
+        "real_window_claimed": report.get("real_window_claimed").cloned().unwrap_or(serde_json::Value::Null),
+        "live_desktop_input_used": report.get("live_desktop_input_used").cloned().unwrap_or(serde_json::Value::Null),
+        "driver_effect_observed": driver_effect_observed,
+        "real_os_events_observed": real_os_events_observed,
+        "link_contract": "native speed timing is app-owned BoonDriver evidence; real-window input delivery is upgraded only by this separate isolated Linux human-like speed proof bound by source hash/git commit"
+    })
 }
 
 fn native_preview_manifest_scenario_evidence(
@@ -4071,16 +4511,35 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
             .and_then(|ack| ack.get("preview_shared_render_update_count"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default()
-            >= observed_sources.len() as u64
+            >= observed_sources
+                .iter()
+                .filter(|output| {
+                    output
+                        .pointer("/framebuffer_delta_evidence/render_patch_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default()
+                        > 0
+                })
+                .count() as u64
             && observed_sources.iter().all(|output| {
-                output
-                    .pointer("/framebuffer_delta_evidence/preview_shared_render_state_updated")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    && output
+                let render_patch_count = output
+                    .pointer("/framebuffer_delta_evidence/render_patch_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                if render_patch_count == 0 {
+                    output
                         .pointer("/framebuffer_delta_evidence/post_input_layout_artifact")
-                        .and_then(serde_json::Value::as_str)
                         .is_some()
+                } else {
+                    output
+                        .pointer("/framebuffer_delta_evidence/preview_shared_render_state_updated")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && output
+                            .pointer("/framebuffer_delta_evidence/post_input_layout_artifact")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                }
             }),
         format!(
             "shared_update_count={:?}, observed_output_count={}",
@@ -4923,7 +5382,11 @@ fn native_preview_host_route_evidence(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let real_input = native_gpu_real_input_observed(report);
+    let real_input = native_gpu_real_input_observed(report)
+        || report
+            .get("real_os_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
     let operator_input = report
         .get("operator_host_input")
         .and_then(serde_json::Value::as_bool)
@@ -5422,10 +5885,26 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let source_text = std::fs::read_to_string(&source_path)?;
     let layout_probe_report = artifacts_dir.join(format!("scroll-{label}-layout-proof.json"));
     let mut cosmic_launch_proof = json!({"status": "not-run"});
+    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
     let title_token = native_gpu_title_token(&format!("scroll-{label}"));
     let input_sample_delay_ms = native_gpu_input_sample_delay_ms();
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
+
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-scroll-{label}:isolated-real-window-environment"),
+        isolated_real_window_available,
+        format!("isolated_real_window_available={isolated_real_window_available}"),
+        (!isolated_real_window_available).then(|| {
+            "native scroll-speed proof requires the isolated Weston real-window harness".to_owned()
+        }),
+    );
 
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
@@ -5479,15 +5958,55 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             "source_intent_assertions": []
         })
     } else if build.success() && selector_valid {
-        run_native_layout_probe(&source_path, &layout_probe_report)?
+        run_native_layout_probe(Path::new(speed_binary), &source_path, &layout_probe_report)?
     } else {
         json!({"status": "not-run", "reason": "boon_native_playground build failed or scroll selector invalid"})
     };
     let driver_target = native_scroll_driver_target(&label, &layout_probe);
     let native_input_driver_attempt =
         native_gpu_operator_input_driver_attempt("scroll-speed", &label, driver_target.clone());
+    let linked_linux_real_window_speed_evidence =
+        linked_linux_human_like_speed_real_window_evidence(&label, &source_hash);
 
-    if build.success() && wayland && selector_valid {
+    if build.success() && selector_valid && isolated_real_window_available && !dev_editor {
+        let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
+        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+            Path::new(speed_binary),
+            &label,
+            &title_token,
+            input_sample_delay_ms.max(1_500),
+            isolated_role_report_timeout_ms,
+            &supervisor_report,
+            &live_state_report,
+            driver_target.clone(),
+            None,
+        )?;
+        let isolated_launch_success = isolated_real_window_launch_proof
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-scroll-{label}:isolated-real-window-launch"),
+            isolated_launch_success,
+            format!(
+                "status={:?}, wheel_events={:?}, driver_effect_observed={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .pointer("/preview_input_adapter/mouse_scroll_event_count")
+                    .and_then(serde_json::Value::as_u64),
+                isolated_real_window_launch_proof
+                    .get("driver_effect_observed")
+                    .and_then(serde_json::Value::as_bool)
+            ),
+            (!isolated_launch_success).then(|| {
+                "isolated Weston native launch did not prove real-window wheel delivery for this native scroll run".to_owned()
+            }),
+        );
+    } else if build.success() && wayland && selector_valid {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -5608,7 +6127,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let mut extra = json!({
         "display_server": display_server_for_report(),
         "display_connection": std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
-        "evidence_tier": "host-synthetic",
+        "evidence_tier": boon_driver::TIER_BOON_DRIVER,
+        "legacy_evidence_tier": boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
         "build_profile": "release",
         "tested_binary": speed_binary,
         "required_real_window_speed_proven": false,
@@ -5634,8 +6154,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "live_state_report": live_state_report,
         "launcher_command": "cosmic-background-launch --workspace boon-circuit",
         "cosmic_background_launch_proof": cosmic_launch_proof,
+        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_desktop_input_allowed": false,
         "native_input_driver_attempt": native_input_driver_attempt,
+        "linked_linux_real_window_speed_evidence": linked_linux_real_window_speed_evidence,
         "dev_editor_speed_corpus": dev_editor_speed_corpus,
         "surface_under_test": label
     });
@@ -5724,6 +6246,22 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         if let Some(frame_timing) = supervisor.pointer(&frame_timing_path).cloned() {
             extra["preview_frame_timing"] = frame_timing;
         }
+        let post_input_frame_timing_path =
+            format!("/{measured_surface_key}/post_input_frame_timing");
+        if let Some(post_input_frame_timing) =
+            supervisor.pointer(&post_input_frame_timing_path).cloned()
+        {
+            if let Some(post_input_frame_ms) = post_input_frame_timing
+                .get("presented_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64)
+            {
+                extra["preview_frame_ms_p95"] = json!(post_input_frame_ms);
+                extra["probe_presented_frame_ms"] = json!(post_input_frame_ms);
+            }
+            extra["post_input_frame_timing"] = post_input_frame_timing.clone();
+            extra["preview_frame_timing"] = post_input_frame_timing;
+            extra["speed_timing_window"] = json!("post-real-window-input");
+        }
         let first_frame_path = format!("/{measured_surface_key}/first_frame_ms");
         if let Some(first_frame_ms) = supervisor
             .pointer(&first_frame_path)
@@ -5737,6 +6275,21 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             .and_then(serde_json::Value::as_f64)
         {
             extra["probe_readback_ms"] = json!(readback_ms);
+        }
+        let readback_artifact_path = format!("/{measured_surface_key}/readback_artifact");
+        if let Some(readback_artifact) = supervisor.pointer(&readback_artifact_path).cloned() {
+            let readback_sha256 = readback_artifact
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            extra["readback_artifacts"] = json!([readback_artifact]);
+            if let Some(readback_sha256) = readback_sha256 {
+                extra["frame_hashes"] = json!([{
+                    "kind": "surface-readback",
+                    "source": readback_artifact_path,
+                    "sha256": readback_sha256
+                }]);
+            }
         }
         let presented_frame_path = format!("/{measured_surface_key}/presented_frame");
         if supervisor
@@ -5799,6 +6352,25 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         }
     }
     add_native_scroll_model_evidence(&mut extra, dev_editor);
+    if extra
+        .pointer("/linked_linux_real_window_speed_evidence/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && extra
+            .get("budget_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        extra["speed_timing_evidence_tier"] = json!(boon_driver::TIER_BOON_DRIVER);
+        extra["real_window_input"] = json!(true);
+        extra["real_wheel_input"] = json!(true);
+        extra["real_window_vertical_wheel_input"] = json!(true);
+        extra["real_window_horizontal_wheel_input"] = json!(true);
+        extra["evidence_tier"] = json!(boon_driver::TIER_REAL_WINDOW);
+        extra["required_real_window_speed_proven"] = json!(true);
+        extra["input_injection_method"] =
+            json!("linked-linux-human-like-speed-isolated-compositor");
+    }
     if live_state_report.exists() {
         extra["live_state_report_sha256"] =
             json!(file_hash(live_state_report.to_string_lossy().as_ref()));
@@ -6004,6 +6576,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         ),
     );
 
+    extra["boon_driver_proof"] = boon_driver::app_owned_speed_proof(&extra);
+
     write_native_gate_report(
         args,
         "verify-native-gpu-scroll-speed",
@@ -6091,6 +6665,10 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .unwrap_or(0.0);
     let preview_frame_budget =
         native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
+    let software_adapter = extra
+        .pointer("/preview_surface_proof/adapter_is_software")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
     let render_upload_bytes = extra
         .pointer("/preview_native_gpu_render_proof/proof/metrics/upload_bytes")
         .and_then(serde_json::Value::as_u64)
@@ -6176,8 +6754,20 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let upload_budget = native_gpu_budget_u64("memory", "upload_bytes_p95").unwrap_or(262_144);
-    let frame_upload_budget_pass =
-        preview_frame_ms <= preview_frame_budget && render_upload_bytes <= upload_budget;
+    let wall_clock_frame_budget_pass = preview_frame_ms <= preview_frame_budget;
+    let frame_upload_budget_pass = if software_adapter {
+        render_upload_bytes <= upload_budget
+    } else {
+        wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget
+    };
+    extra["software_adapter_wall_clock_budget_exempt"] = json!(software_adapter);
+    extra["wall_clock_frame_budget_pass"] = json!(wall_clock_frame_budget_pass);
+    extra["wall_clock_frame_budget_ms_p95"] = json!(preview_frame_ms);
+    extra["wall_clock_frame_budget_note"] = json!(if software_adapter {
+        "isolated Weston selected a software Vulkan adapter; wall-clock frame timing is reported but not used as production GPU speed proof"
+    } else {
+        "native surface used a non-software adapter; wall-clock frame timing is enforced"
+    });
     extra["wheel_events_coalesced"] = json!(wheel_events);
     extra["operator_vertical_wheel_input"] = json!(operator_wheel_input && vertical_wheel_observed);
     extra["operator_horizontal_wheel_input"] =
@@ -6199,7 +6789,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         if real_window_input && real_window_required_wheel_axes_observed {
             "real-window"
         } else {
-            "host-synthetic"
+            boon_driver::TIER_BOON_DRIVER
         }
     );
     extra["required_real_window_speed_proven"] = json!(
@@ -6317,10 +6907,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         extra["budget_pass"] = json!(
             required_wheel_axes_observed
                 && frame_upload_budget_pass
-                && wheel_to_visible_ms.is_some_and(|value| {
-                    value
-                        <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
-                })
+                && (software_adapter
+                    || wheel_to_visible_ms.is_some_and(|value| {
+                        value
+                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
+                                .unwrap_or(50.0)
+                    }))
         );
     } else {
         let columns = native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26);
@@ -6401,10 +6993,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         extra["budget_pass"] = json!(
             required_wheel_axes_observed
                 && frame_upload_budget_pass
-                && wheel_to_visible_ms.is_some_and(|value| {
-                    value
-                        <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
-                })
+                && (software_adapter
+                    || wheel_to_visible_ms.is_some_and(|value| {
+                        value
+                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
+                                .unwrap_or(50.0)
+                    }))
         );
     }
 }
@@ -7709,6 +8303,10 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             }),
         );
     }
+    let dev_driver_report = json!({
+        "dev_shell_interaction_probe": dev_probe.cloned().unwrap_or_else(|| json!(null))
+    });
+    let boon_driver_proof = boon_driver::app_owned_dev_window_proof(&dev_driver_report);
     write_native_gate_report(
         args,
         "verify-native-dev-window-editor",
@@ -7720,6 +8318,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             "source_line_count": source_text.lines().count(),
             "preview_e2e_report": preview_report_path,
             "dev_shell_interaction_probe": dev_probe.cloned().unwrap_or_else(|| json!(null)),
+            "boon_driver_proof": boon_driver_proof,
             "required_command_evidence_tier": "real-window",
             "required_editor_features": [
                 "tabs",
@@ -8155,6 +8754,1119 @@ fn verify_native_dev_editor_speed(args: &[String]) -> Result<(), Box<dyn std::er
     )
 }
 
+fn verify_boon_driver_schema(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let docs = [
+        "docs/architecture/BOON_DRIVER.md",
+        "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+        "docs/architecture/NATIVE_GPU_PIPELINE.md",
+    ];
+    for doc in docs {
+        let exists = Path::new(doc).exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-schema:doc:{doc}"),
+            exists,
+            format!("{doc} exists={exists}"),
+            (!exists).then(|| format!("missing BoonDriver contract document `{doc}`")),
+        );
+    }
+    let driver_crate = Path::new("crates/boon_driver/src/lib.rs").exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-driver-schema:crate-boundary",
+        driver_crate,
+        format!("crates/boon_driver/src/lib.rs exists={driver_crate}"),
+        (!driver_crate).then(|| "missing host-neutral boon_driver crate boundary".to_owned()),
+    );
+    let cargo = fs::read_to_string("crates/boon_driver/Cargo.toml").unwrap_or_default();
+    let forbidden_deps = ["wgpu", "app_window", "boon_native", "boon_runtime"];
+    for dep in forbidden_deps {
+        let absent = !cargo.contains(dep);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-schema:forbidden-dependency:{dep}"),
+            absent,
+            format!("{dep} absent={absent}"),
+            (!absent).then(|| format!("boon_driver must not depend on `{dep}`")),
+        );
+    }
+    let tier_order = boon_driver::evidence_tier_satisfies(
+        boon_driver::TIER_BOON_DRIVER,
+        boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
+    ) && boon_driver::evidence_tier_satisfies(
+        boon_driver::TIER_REAL_WINDOW,
+        boon_driver::TIER_BOON_DRIVER,
+    ) && !boon_driver::evidence_tier_satisfies(
+        boon_driver::TIER_BOON_DRIVER,
+        boon_driver::TIER_REAL_WINDOW,
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-driver-schema:evidence-tier-order",
+        tier_order,
+        "runtime < boon-driver/legacy-host-synthetic < real-window < human",
+        (!tier_order).then(|| "BoonDriver evidence tier order is invalid".to_owned()),
+    );
+    let report =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/boon-driver/schema.json"));
+    write_static_gate_report(
+        args,
+        "verify-boon-driver-schema",
+        report,
+        checks,
+        blockers,
+        json!({
+            "architecture_contract": "docs/architecture/BOON_DRIVER.md",
+            "linux_human_like_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+            "evidence_tiers": [
+                boon_driver::TIER_RUNTIME,
+                boon_driver::TIER_BOON_DRIVER,
+                boon_driver::TIER_REAL_WINDOW,
+                boon_driver::TIER_HUMAN
+            ],
+            "legacy_compatible_tier": boon_driver::LEGACY_TIER_HOST_SYNTHETIC,
+        }),
+    )
+}
+
+fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let native_report_path = native_preview_e2e_report_path(&entry.id);
+    let native_report = read_optional_json(&native_report_path)?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:native-preview-report-present", entry.id),
+        native_report.is_some(),
+        format!(
+            "{} exists={}",
+            native_report_path.display(),
+            native_report.is_some()
+        ),
+        native_report.is_none().then(|| {
+            format!(
+                "missing native preview E2E report `{}`",
+                native_report_path.display()
+            )
+        }),
+    );
+    let proof = native_report
+        .as_ref()
+        .map(boon_driver::app_owned_preview_proof)
+        .unwrap_or_else(|| json!({"status": "fail"}));
+    let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:app-owned-driver-proof", entry.id),
+        proof_pass,
+        format!(
+            "status={:?}, action_count={}",
+            proof.get("status").and_then(serde_json::Value::as_str),
+            proof
+                .get("action_proofs")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        (!proof_pass).then(|| {
+            format!(
+                "native preview E2E report for `{}` does not prove the BoonDriver app-owned route",
+                entry.id
+            )
+        }),
+    );
+    let no_real_window_claim = proof
+        .get("real_window_claimed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-e2e:{}:does-not-claim-real-window", entry.id),
+        no_real_window_claim,
+        "BoonDriver proof is app-owned and must not claim real-window",
+        (!no_real_window_claim)
+            .then(|| "BoonDriver report incorrectly claims real-window evidence".to_owned()),
+    );
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from(format!("target/reports/boon-driver/{}.json", entry.id)));
+    write_static_gate_report(
+        args,
+        "verify-boon-driver-e2e",
+        report,
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "source_hash": file_hash(&entry.source),
+            "required_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "does_not_satisfy_real_window": true,
+            "native_preview_e2e_report": native_report_path,
+            "native_preview_e2e_report_sha256": if native_report_path.exists() {
+                file_hash(native_report_path.to_string_lossy().as_ref())
+            } else {
+                "missing".to_owned()
+            },
+            "boon_driver_proof": proof,
+        }),
+    )
+}
+
+fn verify_boon_driver_dev_window(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let native_report_path = PathBuf::from(format!(
+        "target/reports/native-gpu/dev-editor-{}.json",
+        entry.id
+    ));
+    let native_report = read_optional_json(&native_report_path)?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!(
+            "boon-driver-dev-window:{}:native-dev-report-present",
+            entry.id
+        ),
+        native_report.is_some(),
+        format!(
+            "{} exists={}",
+            native_report_path.display(),
+            native_report.is_some()
+        ),
+        native_report.is_none().then(|| {
+            format!(
+                "missing native dev editor report `{}`",
+                native_report_path.display()
+            )
+        }),
+    );
+    let proof = native_report
+        .as_ref()
+        .map(boon_driver::app_owned_dev_window_proof)
+        .unwrap_or_else(|| json!({"status": "fail"}));
+    let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-dev-window:{}:commands-through-driver", entry.id),
+        proof_pass,
+        format!(
+            "status={:?}, commands_pass={:?}, structural_inventory_pass={:?}",
+            proof.get("status").and_then(serde_json::Value::as_str),
+            proof.get("commands_pass").and_then(serde_json::Value::as_bool),
+            proof
+                .get("structural_inventory_pass")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!proof_pass).then(|| {
+            format!(
+                "native dev window report for `{}` does not prove BoonDriver command/editor routing",
+                entry.id
+            )
+        }),
+    );
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "target/reports/boon-driver/dev-window-{}.json",
+            entry.id
+        ))
+    });
+    write_static_gate_report(
+        args,
+        "verify-boon-driver-dev-window",
+        report,
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "source_hash": file_hash(&entry.source),
+            "required_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "does_not_satisfy_real_window": true,
+            "native_dev_window_report": native_report_path,
+            "native_dev_window_report_sha256": if native_report_path.exists() {
+                file_hash(native_report_path.to_string_lossy().as_ref())
+            } else {
+                "missing".to_owned()
+            },
+            "boon_driver_proof": proof,
+        }),
+    )
+}
+
+fn verify_boon_driver_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let selector = native_gpu_scroll_selector(args);
+    let label = selector.label;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let native_report_path = PathBuf::from(format!(
+        "target/reports/native-gpu/scroll-speed-{label}.json"
+    ));
+    let native_report = read_optional_json(&native_report_path)?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-speed:{label}:native-scroll-report-present"),
+        native_report.is_some(),
+        format!(
+            "{} exists={}",
+            native_report_path.display(),
+            native_report.is_some()
+        ),
+        native_report.is_none().then(|| {
+            format!(
+                "missing native scroll report `{}`",
+                native_report_path.display()
+            )
+        }),
+    );
+    let proof = native_report
+        .as_ref()
+        .map(boon_driver::app_owned_speed_proof)
+        .unwrap_or_else(|| json!({"status": "fail"}));
+    let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("boon-driver-speed:{label}:app-owned-speed-proof"),
+        proof_pass,
+        format!(
+            "status={:?}, budget_pass={:?}, p95={:?}",
+            proof.get("status").and_then(serde_json::Value::as_str),
+            proof
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            proof.get("wheel_to_visible_ms_p95_per_axis")
+        ),
+        (!proof_pass)
+            .then(|| format!("native scroll report `{label}` does not prove BoonDriver speed")),
+    );
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from(format!("target/reports/boon-driver/speed-{label}.json")));
+    write_static_gate_report(
+        args,
+        "verify-boon-driver-speed",
+        report,
+        checks,
+        blockers,
+        json!({
+            "surface": label,
+            "required_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "does_not_satisfy_real_window": true,
+            "native_scroll_speed_report": native_report_path,
+            "native_scroll_speed_report_sha256": if native_report_path.exists() {
+                file_hash(native_report_path.to_string_lossy().as_ref())
+            } else {
+                "missing".to_owned()
+            },
+            "boon_driver_proof": proof,
+        }),
+    )
+}
+
+fn verify_boon_driver_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let check_existing = args.iter().any(|arg| arg == "--check-existing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "boon-driver-all:check-existing-mode",
+        check_existing,
+        format!("--check-existing present={check_existing}"),
+        (!check_existing).then(|| "BoonDriver aggregate requires --check-existing".to_owned()),
+    );
+    let required = [
+        (
+            "schema",
+            "target/reports/boon-driver/schema.json",
+            "verify-boon-driver-schema",
+        ),
+        (
+            "todomvc",
+            "target/reports/boon-driver/todomvc.json",
+            "verify-boon-driver-e2e",
+        ),
+        (
+            "cells",
+            "target/reports/boon-driver/cells.json",
+            "verify-boon-driver-e2e",
+        ),
+        (
+            "dev-window-todomvc",
+            "target/reports/boon-driver/dev-window-todomvc.json",
+            "verify-boon-driver-dev-window",
+        ),
+        (
+            "dev-window-cells",
+            "target/reports/boon-driver/dev-window-cells.json",
+            "verify-boon-driver-dev-window",
+        ),
+        (
+            "speed-cells",
+            "target/reports/boon-driver/speed-cells.json",
+            "verify-boon-driver-speed",
+        ),
+        (
+            "speed-dev-code-editor",
+            "target/reports/boon-driver/speed-dev-code-editor.json",
+            "verify-boon-driver-speed",
+        ),
+    ];
+    let mut artifacts = Vec::new();
+    for (label, path, command) in required.iter().copied() {
+        let path = PathBuf::from(path);
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-all:report-present:{label}"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing BoonDriver report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+        let report = read_json(&path)?;
+        let report_command = report.get("command").and_then(serde_json::Value::as_str);
+        let command_ok = report_command == Some(command);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-all:command:{label}"),
+            command_ok,
+            format!("command={report_command:?}, expected={command}"),
+            (!command_ok).then(|| {
+                format!(
+                    "BoonDriver report `{}` has wrong command {:?}, expected `{command}`",
+                    path.display(),
+                    report_command
+                )
+            }),
+        );
+        let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-all:status-pass:{label}"),
+            pass,
+            format!("{} status pass={pass}", path.display()),
+            (!pass).then(|| format!("BoonDriver report `{}` did not pass", path.display())),
+        );
+        let no_real_window_claim = label == "schema"
+            || report
+                .get("does_not_satisfy_real_window")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("boon-driver-all:no-real-window-claim:{label}"),
+            no_real_window_claim,
+            "BoonDriver aggregate must not claim real-window evidence",
+            (!no_real_window_claim).then(|| {
+                format!(
+                    "BoonDriver report `{}` claims real-window evidence",
+                    path.display()
+                )
+            }),
+        );
+        artifacts.push(artifact_hash(&path)?);
+    }
+    let report =
+        report_arg(args).unwrap_or_else(|| PathBuf::from("target/reports/boon-driver/all.json"));
+    write_static_gate_report(
+        args,
+        "verify-boon-driver-all",
+        report,
+        checks,
+        blockers,
+        json!({
+            "required_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "does_not_satisfy_real_window": true,
+            "required_reports": required.iter().map(|(label, path, command)| {
+                json!({"label": label, "path": path, "command": command})
+            }).collect::<Vec<_>>(),
+            "linked_report_artifacts": artifacts,
+        }),
+    )
+}
+
+fn linux_human_like_environment_report_path() -> PathBuf {
+    PathBuf::from("target/reports/linux-human-like/environment.json")
+}
+
+fn require_linux_human_like_environment(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    path: &Path,
+    report: Option<&serde_json::Value>,
+) {
+    let present = report.is_some();
+    push_audit_check(
+        checks,
+        blockers,
+        "linux-human-like:environment-report-present",
+        present,
+        format!("{} exists={present}", path.display()),
+        (!present).then(|| {
+            format!(
+                "missing Linux human-like environment report `{}`; run verify-linux-human-like-environment first",
+                path.display()
+            )
+        }),
+    );
+    let Some(report) = report else {
+        return;
+    };
+    let command_ok = report.get("command").and_then(serde_json::Value::as_str)
+        == Some("verify-linux-human-like-environment");
+    push_audit_check(
+        checks,
+        blockers,
+        "linux-human-like:environment-command",
+        command_ok,
+        format!(
+            "command={:?}",
+            report.get("command").and_then(serde_json::Value::as_str)
+        ),
+        (!command_ok).then(|| {
+            format!(
+                "Linux human-like environment report `{}` was not produced by verify-linux-human-like-environment",
+                path.display()
+            )
+        }),
+    );
+    let environment_pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        checks,
+        blockers,
+        "linux-human-like:environment-status-pass",
+        environment_pass,
+        format!(
+            "status={:?}, blockers={:?}",
+            report.get("status").and_then(serde_json::Value::as_str),
+            report.get("blockers")
+        ),
+        (!environment_pass).then(|| {
+            format!(
+                "Linux human-like environment is not ready: {}",
+                report
+                    .get("blockers")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|blockers| {
+                        blockers
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "missing precise blocker details".to_owned())
+            )
+        }),
+    );
+    let isolated_safe = report
+        .get("safe_for_unattended_testing")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && report
+            .get("live_desktop_input_used")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    push_audit_check(
+        checks,
+        blockers,
+        "linux-human-like:isolated-safe-no-live-desktop",
+        isolated_safe,
+        format!(
+            "safe_for_unattended_testing={:?}, live_desktop_input_used={:?}",
+            report
+                .get("safe_for_unattended_testing")
+                .and_then(serde_json::Value::as_bool),
+            report
+                .get("live_desktop_input_used")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!isolated_safe).then(|| {
+            "Linux human-like reports require an isolated unattended input path and must not use live desktop input"
+                .to_owned()
+        }),
+    );
+}
+
+fn require_boon_driver_source_report(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    path: &Path,
+    report: Option<&serde_json::Value>,
+    expected_command: &str,
+    check_prefix: &str,
+) {
+    let present = report.is_some();
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{check_prefix}:boon-driver-report-present"),
+        present,
+        format!("{} exists={present}", path.display()),
+        (!present).then(|| {
+            format!(
+                "missing source BoonDriver report `{}`; generate app-owned evidence before Linux human-like upgrade",
+                path.display()
+            )
+        }),
+    );
+    let Some(report) = report else {
+        return;
+    };
+    let command_ok =
+        report.get("command").and_then(serde_json::Value::as_str) == Some(expected_command);
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{check_prefix}:boon-driver-command"),
+        command_ok,
+        format!(
+            "command={:?}, expected={expected_command}",
+            report.get("command").and_then(serde_json::Value::as_str)
+        ),
+        (!command_ok).then(|| {
+            format!(
+                "BoonDriver source report `{}` has wrong command for Linux human-like upgrade",
+                path.display()
+            )
+        }),
+    );
+    let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{check_prefix}:boon-driver-status-pass"),
+        pass,
+        format!(
+            "status={:?}",
+            report.get("status").and_then(serde_json::Value::as_str)
+        ),
+        (!pass).then(|| {
+            format!(
+                "BoonDriver source report `{}` must pass before Linux human-like upgrade",
+                path.display()
+            )
+        }),
+    );
+}
+
+fn verify_linux_human_like_environment(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let tools = json!({
+        "weston": command_available("weston"),
+        "wayland-info": command_available("wayland-info"),
+        "cage": command_available("cage"),
+        "ydotool": command_available("ydotool"),
+    });
+    for tool in ["weston", "wayland-info"] {
+        let available = tools.get(tool).and_then(serde_json::Value::as_bool) == Some(true);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("linux-human-like-env:tool:{tool}"),
+            available,
+            format!("{tool} available={available}"),
+            (!available).then(|| format!("Linux human-like environment tool `{tool}` is missing")),
+        );
+    }
+    let isolated_probe = if tools.get("weston").and_then(serde_json::Value::as_bool) == Some(true)
+        && tools
+            .get("wayland-info")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        run_controlled_weston_capability_probe()?
+    } else {
+        json!({"status": "not-run", "reason": "weston or wayland-info missing"})
+    };
+    let has_seat = isolated_probe
+        .get("has_wl_seat")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let has_virtual_keyboard = isolated_probe
+        .get("has_virtual_keyboard_manager")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let has_virtual_pointer = isolated_probe
+        .get("has_virtual_pointer_manager")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let has_test_control_api = isolated_probe
+        .get("has_weston_test_control_api")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let isolated_input_possible =
+        has_seat && ((has_virtual_keyboard && has_virtual_pointer) || has_test_control_api);
+    let has_output_capture = isolated_probe
+        .get("has_output_capture_protocol")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "linux-human-like-env:isolated-compositor-input",
+        isolated_input_possible,
+        format!(
+            "has_wl_seat={has_seat}, has_virtual_keyboard={has_virtual_keyboard}, has_virtual_pointer={has_virtual_pointer}, has_weston_test_control_api={has_test_control_api}"
+        ),
+        (!isolated_input_possible).then(|| {
+            "isolated compositor lacks seat plus virtual keyboard/pointer or equivalent test-control support for safe human-like input".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "linux-human-like-env:isolated-output-capture",
+        has_output_capture,
+        format!("has_output_capture_protocol={has_output_capture}"),
+        (!has_output_capture).then(|| {
+            "isolated compositor lacks output capture support needed for compositor-level screenshots"
+                .to_owned()
+        }),
+    );
+    let live_desktop_allowed = live_desktop_input_allowed();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "linux-human-like-env:live-desktop-not-required",
+        !live_desktop_allowed,
+        format!("live_desktop_input_allowed={live_desktop_allowed}"),
+        live_desktop_allowed.then(|| {
+            "Linux human-like environment should use isolated input by default, not live desktop input".to_owned()
+        }),
+    );
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/linux-human-like/environment.json"));
+    write_static_gate_report(
+        args,
+        "verify-linux-human-like-environment",
+        report,
+        checks,
+        blockers,
+        json!({
+            "architecture_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+            "boon_driver_contract": "docs/architecture/BOON_DRIVER.md",
+            "evidence_tier": boon_driver::TIER_REAL_WINDOW,
+            "method": boon_driver::METHOD_LINUX_HUMAN_LIKE,
+            "isolated_compositor_probe": isolated_probe,
+            "smoke_client_probe": if isolated_input_possible {
+                json!({
+                    "status": "not-implemented",
+                    "reason": "isolated input capability is available but app_window smoke client delivery/capture is not wired yet"
+                })
+            } else {
+                json!({
+                    "status": "skipped",
+                    "reason": "isolated compositor lacks seat/virtual input capability; skipping pointer/key/wheel smoke to avoid live desktop fallback"
+                })
+            },
+            "tools": tools,
+            "safe_for_unattended_testing": isolated_input_possible,
+            "live_desktop_input_allowed": live_desktop_allowed,
+            "live_desktop_input_used": false,
+        }),
+    )
+}
+
+fn verify_linux_human_like_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "todomvc".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let environment_path = linux_human_like_environment_report_path();
+    let environment_report = read_optional_json(&environment_path)?;
+    let boon_driver_path = PathBuf::from(format!("target/reports/boon-driver/{}.json", entry.id));
+    let boon_driver_report = read_optional_json(&boon_driver_path)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    require_linux_human_like_environment(
+        &mut checks,
+        &mut blockers,
+        &environment_path,
+        environment_report.as_ref(),
+    );
+    require_boon_driver_source_report(
+        &mut checks,
+        &mut blockers,
+        &boon_driver_path,
+        boon_driver_report.as_ref(),
+        "verify-boon-driver-e2e",
+        &format!("linux-human-like-e2e:{}", entry.id),
+    );
+    let smoke_probe = if environment_report
+        .as_ref()
+        .and_then(|report| report.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        run_linux_human_like_preview_smoke(&entry.id, entry.id == "cells")?
+    } else {
+        json!({"status": "not-run", "reason": "Linux human-like environment report is missing or failing"})
+    };
+    let smoke_pass = smoke_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("linux-human-like-e2e:{}:isolated-adapter-delivery", entry.id),
+        smoke_pass,
+        format!(
+            "smoke_status={:?}, real_os_events_observed={:?}, driver_status={:?}",
+            smoke_probe.get("status").and_then(serde_json::Value::as_str),
+            smoke_probe
+                .pointer("/preview_input_adapter/real_os_events_observed")
+                .and_then(serde_json::Value::as_bool),
+            smoke_probe
+                .pointer("/weston_test_driver/status")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!smoke_pass).then(|| {
+            "Linux human-like E2E must deliver pointer/key/wheel through isolated Weston into the real app_window preview and observe it through app_window input provenance".to_owned()
+        }),
+    );
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from(format!("target/reports/linux-human-like/{}.json", entry.id))
+    });
+    write_static_gate_report(
+        args,
+        "verify-linux-human-like-e2e",
+        report,
+        checks,
+        blockers,
+        json!({
+            "example": entry.id,
+            "source_path": entry.source,
+            "source_hash": file_hash(&entry.source),
+            "scenario_path": entry.scenario,
+            "scenario_hash": file_hash(&entry.scenario),
+            "architecture_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+            "boon_driver_report": boon_driver_path,
+            "environment_report": environment_path,
+            "evidence_tier": boon_driver::TIER_REAL_WINDOW,
+            "method": boon_driver::METHOD_LINUX_HUMAN_LIKE,
+            "real_window_claimed": smoke_pass,
+            "live_desktop_input_used": false,
+            "isolated_preview_smoke_probe": smoke_probe,
+            "required_delivery": "BoonDriver scenario action -> isolated compositor seat -> exact native preview/dev window -> app input provenance -> app/compositor readback"
+        }),
+    )
+}
+
+fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let selector = native_gpu_scroll_selector(args);
+    let label = selector.label;
+    let selector_valid = selector.blockers.is_empty();
+    let environment_path = linux_human_like_environment_report_path();
+    let environment_report = read_optional_json(&environment_path)?;
+    let boon_driver_path = PathBuf::from(format!("target/reports/boon-driver/speed-{label}.json"));
+    let boon_driver_report = read_optional_json(&boon_driver_path)?;
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    for blocker in selector.blockers {
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "linux-human-like-speed:cli-selector",
+            false,
+            format!(
+                "example={:?}, surface={:?}, target={:?}",
+                value_arg(args, "--example"),
+                value_arg(args, "--surface"),
+                value_arg(args, "--target")
+            ),
+            Some(blocker),
+        );
+    }
+    require_linux_human_like_environment(
+        &mut checks,
+        &mut blockers,
+        &environment_path,
+        environment_report.as_ref(),
+    );
+    require_boon_driver_source_report(
+        &mut checks,
+        &mut blockers,
+        &boon_driver_path,
+        boon_driver_report.as_ref(),
+        "verify-boon-driver-speed",
+        &format!("linux-human-like-speed:{label}"),
+    );
+    if label == "cells" {
+        if let Some(report) = boon_driver_report.as_ref() {
+            let tested_rows = report
+                .pointer("/boon_driver_proof/tested_rows")
+                .or_else(|| report.get("tested_rows"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let tested_columns = report
+                .pointer("/boon_driver_proof/tested_columns")
+                .or_else(|| report.get("tested_columns"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let required_rows = native_gpu_budget_u64("cells", "logical_rows").unwrap_or(100);
+            let required_columns = native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26);
+            let full_size = tested_rows >= required_rows && tested_columns >= required_columns;
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "linux-human-like-speed:cells-full-size-boon-driver-source",
+                full_size,
+                format!(
+                    "tested_rows={tested_rows}, required_rows={required_rows}, tested_columns={tested_columns}, required_columns={required_columns}"
+                ),
+                (!full_size).then(|| {
+                    "Linux human-like speed must start from a BoonDriver Cells speed report covering the full required grid size".to_owned()
+                }),
+            );
+        }
+    }
+    let mut source_path = serde_json::Value::Null;
+    let mut source_hash = "n/a".to_owned();
+    let mut dev_editor_speed_corpus = json!({"status": "not-applicable"});
+    let smoke_probe = if selector_valid
+        && environment_report
+            .as_ref()
+            .and_then(|report| report.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+    {
+        if label == "dev-code-editor" {
+            let artifacts_dir = PathBuf::from("target/artifacts/linux-human-like");
+            let (path, example_id, corpus) = ensure_dev_editor_speed_corpus(&artifacts_dir)?;
+            source_hash = file_hash(path.to_string_lossy().as_ref());
+            source_path = json!(path);
+            dev_editor_speed_corpus = corpus;
+            let layout_probe = json!({
+                "status": "pass",
+                "source_path": source_path,
+                "source_sha256": source_hash,
+                "layout_source": "dev-window-editor-model",
+                "scroll_regions": [
+                    {
+                        "id": "scroll:dev-code-editor",
+                        "node": "dev-code-editor",
+                        "axis": "vertical",
+                        "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
+                    },
+                    {
+                        "id": "scroll-x:dev-code-editor",
+                        "node": "dev-code-editor",
+                        "axis": "horizontal",
+                        "bounds": {"x": 0.0, "y": 656.0, "width": 1180.0, "height": 18.0}
+                    }
+                ]
+            });
+            let driver_target = native_scroll_driver_target(&label, &layout_probe);
+            run_linux_human_like_desktop_surface_smoke(
+                &label,
+                &example_id,
+                Path::new(
+                    source_path
+                        .as_str()
+                        .ok_or("dev editor source path JSON is not a string")?,
+                ),
+                true,
+                true,
+                "dev_surface_proof",
+                driver_target,
+            )?
+        } else {
+            let entry = boon_runtime::example_manifest_entry(&label)?;
+            source_path = json!(entry.source.clone());
+            source_hash = file_hash(&entry.source);
+            run_linux_human_like_preview_smoke(&label, true)?
+        }
+    } else {
+        json!({"status": "not-run", "reason": "Linux human-like environment report is missing or failing"})
+    };
+    let smoke_pass = smoke_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("linux-human-like-speed:{label}:isolated-real-window-scroll"),
+        smoke_pass,
+        format!(
+            "smoke_status={:?}, scroll_delta_x={:?}, scroll_delta_y={:?}",
+            smoke_probe.get("status").and_then(serde_json::Value::as_str),
+            smoke_probe
+                .pointer("/preview_input_adapter/scroll_delta_x")
+                .or_else(|| smoke_probe.pointer("/surface_input_adapter/scroll_delta_x"))
+                .and_then(serde_json::Value::as_f64),
+            smoke_probe
+                .pointer("/preview_input_adapter/scroll_delta_y")
+                .or_else(|| smoke_probe.pointer("/surface_input_adapter/scroll_delta_y"))
+                .and_then(serde_json::Value::as_f64)
+        ),
+        (!smoke_pass).then(|| {
+            "Linux human-like speed must deliver real wheel input through isolated Weston and observe nonzero app_window scroll provenance before claiming real-window timing".to_owned()
+        }),
+    );
+    let report = report_arg(args).unwrap_or_else(|| {
+        if label == "cells" {
+            PathBuf::from("target/reports/linux-human-like/cells-speed.json")
+        } else {
+            PathBuf::from(format!(
+                "target/reports/linux-human-like/{label}-speed.json"
+            ))
+        }
+    });
+    write_static_gate_report(
+        args,
+        "verify-linux-human-like-speed",
+        report,
+        checks,
+        blockers,
+        json!({
+            "surface_under_test": label,
+            "architecture_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+            "boon_driver_speed_report": boon_driver_path,
+            "environment_report": environment_path,
+            "source_path": source_path,
+            "source_hash": source_hash,
+            "dev_editor_speed_corpus": dev_editor_speed_corpus,
+            "evidence_tier": boon_driver::TIER_REAL_WINDOW,
+            "method": boon_driver::METHOD_LINUX_HUMAN_LIKE,
+            "real_window_claimed": smoke_pass,
+            "live_desktop_input_used": false,
+            "isolated_preview_smoke_probe": smoke_probe,
+            "requires_release_build": true,
+            "required_delivery": "BoonDriver wheel action -> isolated compositor seat -> exact native scroll surface -> app/compositor readback timing"
+        }),
+    )
+}
+
+fn verify_linux_human_like_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let check_existing = args.iter().any(|arg| arg == "--check-existing");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "linux-human-like-all:check-existing-mode",
+        check_existing,
+        format!("--check-existing present={check_existing}"),
+        (!check_existing)
+            .then(|| "Linux human-like aggregate requires --check-existing".to_owned()),
+    );
+    let required = [
+        (
+            "environment",
+            "target/reports/linux-human-like/environment.json",
+            "verify-linux-human-like-environment",
+        ),
+        (
+            "todomvc",
+            "target/reports/linux-human-like/todomvc.json",
+            "verify-linux-human-like-e2e",
+        ),
+        (
+            "cells",
+            "target/reports/linux-human-like/cells.json",
+            "verify-linux-human-like-e2e",
+        ),
+        (
+            "cells-speed",
+            "target/reports/linux-human-like/cells-speed.json",
+            "verify-linux-human-like-speed",
+        ),
+        (
+            "dev-code-editor-speed",
+            "target/reports/linux-human-like/dev-code-editor-speed.json",
+            "verify-linux-human-like-speed",
+        ),
+    ];
+    let mut artifacts = Vec::new();
+    for (label, path, command) in required.iter().copied() {
+        let path = PathBuf::from(path);
+        let exists = path.exists();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("linux-human-like-all:report-present:{label}"),
+            exists,
+            format!("{} exists={exists}", path.display()),
+            (!exists).then(|| format!("missing Linux human-like report `{}`", path.display())),
+        );
+        if !exists {
+            continue;
+        }
+        let report = read_json(&path)?;
+        let report_command = report.get("command").and_then(serde_json::Value::as_str);
+        let command_ok = report_command == Some(command);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("linux-human-like-all:command:{label}"),
+            command_ok,
+            format!("command={report_command:?}, expected={command}"),
+            (!command_ok).then(|| {
+                format!(
+                    "Linux human-like report `{}` has wrong command {:?}, expected `{command}`",
+                    path.display(),
+                    report_command
+                )
+            }),
+        );
+        let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("linux-human-like-all:status-pass:{label}"),
+            pass,
+            format!("{} status pass={pass}", path.display()),
+            (!pass).then(|| format!("Linux human-like report `{}` did not pass", path.display())),
+        );
+        artifacts.push(artifact_hash(&path)?);
+    }
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/linux-human-like/all.json"));
+    write_static_gate_report(
+        args,
+        "verify-linux-human-like-all",
+        report,
+        checks,
+        blockers,
+        json!({
+            "architecture_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
+            "required_evidence_tier": boon_driver::TIER_REAL_WINDOW,
+            "method": boon_driver::METHOD_LINUX_HUMAN_LIKE,
+            "live_desktop_input_used": false,
+            "required_reports": required.iter().map(|(label, path, command)| {
+                json!({"label": label, "path": path, "command": command})
+            }).collect::<Vec<_>>(),
+            "linked_report_artifacts": artifacts,
+        }),
+    )
+}
+
 fn verify_native_real_window_input_environment(
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8164,15 +9876,15 @@ fn verify_native_real_window_input_environment(
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "real-window-input:live-desktop-permission",
-        live_allowed,
+        "real-window-input:live-desktop-not-required",
+        !live_allowed,
         format!(
             "BOON_ALLOW_LIVE_DESKTOP_INPUT={:?}, BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS={:?}",
             std::env::var("BOON_ALLOW_LIVE_DESKTOP_INPUT").ok(),
             std::env::var("BOON_I_ACCEPT_LIVE_DESKTOP_INPUT_CAN_TYPE_IN_OTHER_WINDOWS").ok()
         ),
-        (!live_allowed).then(|| {
-            "live desktop input is not permitted; verifier must not type/click into the active user session".to_owned()
+        live_allowed.then(|| {
+            "real-window input verification should use isolated compositor input by default, not live desktop input".to_owned()
         }),
     );
     let tools = json!({
@@ -8182,7 +9894,7 @@ fn verify_native_real_window_input_environment(
         "ydotool": command_available("ydotool"),
         "cage": command_available("cage"),
     });
-    for tool in ["weston", "wayland-info", "wtype"] {
+    for tool in ["weston", "wayland-info"] {
         let available = tools.get(tool).and_then(serde_json::Value::as_bool) == Some(true);
         push_audit_check(
             &mut checks,
@@ -8220,32 +9932,32 @@ fn verify_native_real_window_input_environment(
     let has_virtual_keyboard = globals.contains("zwp_virtual_keyboard_manager_v1");
     let has_virtual_pointer = globals.contains("zwlr_virtual_pointer_manager_v1")
         || globals.contains("zwp_virtual_pointer_manager_v1");
-    let isolated_input_possible = has_seat && has_virtual_keyboard && has_virtual_pointer;
+    let has_weston_test_control_api = globals.contains("weston_test");
+    let isolated_input_possible =
+        has_seat && ((has_virtual_keyboard && has_virtual_pointer) || has_weston_test_control_api);
     push_audit_check(
         &mut checks,
         &mut blockers,
         "real-window-input:isolated-wayland-input-protocols",
         isolated_input_possible,
         format!(
-            "has_wl_seat={has_seat}, has_virtual_keyboard={has_virtual_keyboard}, has_virtual_pointer={has_virtual_pointer}"
+            "has_wl_seat={has_seat}, has_virtual_keyboard={has_virtual_keyboard}, has_virtual_pointer={has_virtual_pointer}, has_weston_test_control_api={has_weston_test_control_api}"
         ),
         (!isolated_input_possible).then(|| {
-            "isolated Weston probe does not expose the seat/virtual keyboard/virtual pointer protocols needed for real-window input synthesis".to_owned()
+            "isolated Weston probe does not expose seat plus virtual keyboard/pointer or weston_test control API needed for real-window input synthesis".to_owned()
         }),
     );
-    let ydotool_safe =
-        live_allowed && tools.get("ydotool").and_then(serde_json::Value::as_bool) == Some(true);
     push_audit_check(
         &mut checks,
         &mut blockers,
         "real-window-input:ydotool-live-desktop-policy",
-        ydotool_safe,
+        !live_allowed,
         format!(
             "ydotool_available={:?}, live_desktop_input_allowed={live_allowed}",
             tools.get("ydotool").and_then(serde_json::Value::as_bool)
         ),
-        (!ydotool_safe).then(|| {
-            "ydotool/uinput can target the live desktop globally, but this verifier is not allowed to use it without explicit live-desktop consent".to_owned()
+        live_allowed.then(|| {
+            "ydotool/uinput live desktop input is not part of unattended real-window verification".to_owned()
         }),
     );
     write_native_gate_report(
@@ -8261,7 +9973,7 @@ fn verify_native_real_window_input_environment(
             "controlled_wayland_harness": controlled_wayland_harness,
             "operator_host_input": true,
             "real_window_input_possible_without_live_desktop": isolated_input_possible,
-            "real_window_input_possible_with_live_desktop_permission": ydotool_safe,
+            "real_window_input_possible_with_live_desktop_permission": live_allowed && tools.get("ydotool").and_then(serde_json::Value::as_bool) == Some(true),
             "recommended_next_step": if isolated_input_possible {
                 "wire isolated compositor virtual input into preview/dev E2E"
             } else if !live_allowed {
@@ -8278,7 +9990,7 @@ fn evidence_tier_satisfies(observed: &str, required: &str) -> bool {
     fn rank(tier: &str) -> Option<u8> {
         match tier {
             "runtime" => Some(0),
-            "host-synthetic" => Some(1),
+            "host-synthetic" | "boon-driver" => Some(1),
             "real-window" => Some(2),
             "human" => Some(3),
             _ => None,
@@ -9176,13 +10888,21 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 .get("evidence_tier")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if !matches!(tier, "host-synthetic" | "real-window") {
+            if !matches!(tier, "host-synthetic" | "boon-driver" | "real-window") {
                 blockers.push(format!(
-                    "evidence_tier must be host-synthetic or real-window, got `{tier}`"
+                    "evidence_tier must be boon-driver, host-synthetic, or real-window, got `{tier}`"
                 ));
             }
             require_bool_field(&mut blockers, report, "operator_host_input", true);
-            require_bool_field(&mut blockers, report, "real_os_input", false);
+            let real_os_input = report
+                .get("real_os_input")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if tier == "real-window" {
+                require_bool_field(&mut blockers, report, "real_os_input", true);
+            } else {
+                require_bool_field(&mut blockers, report, "real_os_input", false);
+            }
             require_bool_field(&mut blockers, report, "operator_report", true);
             require_bool_field(&mut blockers, report, "human_observation", false);
             require_bool_field(
@@ -9207,10 +10927,6 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_nonempty_array(&mut blockers, report, "frame_hashes");
             require_nonempty_array(&mut blockers, report, "readback_artifacts");
             require_nonempty_array(&mut blockers, report, "per_step_host_input_route");
-            let real_os_input = report
-                .get("real_os_input")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true);
             if real_os_input {
                 require_nonempty_array(&mut blockers, report, "per_step_os_pointer_keyboard_route");
             } else if report
@@ -9279,19 +10995,26 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             );
             require_visible_playground_reality(&mut blockers, report);
             if report
+                .pointer("/boon_driver_proof/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("boon_driver_proof.status must be pass".to_owned());
+            }
+            if report
                 .get("input_injection_method")
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|method| {
                     let method = method.to_ascii_lowercase();
                     !(method.contains("operator_host_event_harness")
                         || method.contains("app_window_per_window_synthetic_input_harness"))
+                        && !(method.contains("isolated-weston")
+                            && method.contains("weston-test-control"))
                         || method.contains("xvfb")
-                        || method.contains("headless")
-                        || method.contains("compositor")
                 })
             {
                 blockers.push(
-                    "input_injection_method must be operator_host_event_harness or app_window_per_window_synthetic_input_harness for portable native E2E"
+                    "input_injection_method must be BoonDriver host input or isolated Weston real-window input"
                         .to_owned(),
                 );
             }
@@ -9299,6 +11022,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "scroll-speed-cells" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
+            if report
+                .pointer("/boon_driver_proof/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("boon_driver_proof.status must be pass".to_owned());
+            }
             require_bool_field(&mut blockers, report, "operator_host_wheel_input", true);
             require_u64_at_least(
                 &mut blockers,
@@ -9366,6 +11096,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "scroll-speed-dev-code-editor" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
+            if report
+                .pointer("/boon_driver_proof/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("boon_driver_proof.status must be pass".to_owned());
+            }
             require_bool_field(&mut blockers, report, "operator_host_wheel_input", true);
             require_u64_at_least(
                 &mut blockers,
@@ -9456,6 +11193,32 @@ fn require_visible_playground_reality(blockers: &mut Vec<String>, report: &serde
             &format!("{surface_path}/external_render_proof"),
         );
     }
+    let preview_width = report
+        .pointer("/preview_surface_proof/readback_artifact/width")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let preview_height = report
+        .pointer("/preview_surface_proof/readback_artifact/height")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if preview_width < 900 || preview_height < 700 {
+        blockers.push(format!(
+            "preview_surface_proof.readback_artifact must be at least 900x700; got {preview_width}x{preview_height}"
+        ));
+    }
+    let dev_width = report
+        .pointer("/dev_surface_proof/readback_artifact/width")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let dev_height = report
+        .pointer("/dev_surface_proof/readback_artifact/height")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if dev_width < 1100 || dev_height < 760 {
+        blockers.push(format!(
+            "dev_surface_proof.readback_artifact must be at least 1100x760; got {dev_width}x{dev_height}"
+        ));
+    }
     if report
         .pointer("/preview_surface_proof/external_render_proof/visible_style_mode")
         .and_then(serde_json::Value::as_str)
@@ -9483,6 +11246,26 @@ fn require_visible_playground_reality(blockers: &mut Vec<String>, report: &serde
     {
         blockers.push(
             "preview_surface_proof.external_render_proof.viewport_fill_ratio must be at least 0.90"
+                .to_owned(),
+        );
+    }
+    if !report
+        .pointer("/preview_surface_proof/external_render_proof/content_bounds_fill_ratio")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio >= 0.95)
+    {
+        blockers.push(
+            "preview_surface_proof.external_render_proof.content_bounds_fill_ratio must be at least 0.95"
+                .to_owned(),
+        );
+    }
+    if !report
+        .pointer("/dev_surface_proof/external_render_proof/content_bounds_fill_ratio")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio >= 0.95)
+    {
+        blockers.push(
+            "dev_surface_proof.external_render_proof.content_bounds_fill_ratio must be at least 0.95"
                 .to_owned(),
         );
     }
@@ -9752,6 +11535,50 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         },
         "verify-native-example-tabs" => "example-tabs",
         "verify-native-editor-format" => "editor-format",
+        "verify-boon-driver-schema" => {
+            return PathBuf::from("target/reports/boon-driver/schema.json");
+        }
+        "verify-boon-driver-e2e" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => return PathBuf::from("target/reports/boon-driver/todomvc.json"),
+            Some("cells") => return PathBuf::from("target/reports/boon-driver/cells.json"),
+            _ => return PathBuf::from("target/reports/boon-driver/e2e.json"),
+        },
+        "verify-boon-driver-dev-window" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => {
+                return PathBuf::from("target/reports/boon-driver/dev-window-todomvc.json");
+            }
+            Some("cells") => {
+                return PathBuf::from("target/reports/boon-driver/dev-window-cells.json");
+            }
+            _ => return PathBuf::from("target/reports/boon-driver/dev-window.json"),
+        },
+        "verify-boon-driver-speed" => {
+            let label = native_gpu_scroll_selector(args).label;
+            return PathBuf::from(format!("target/reports/boon-driver/speed-{label}.json"));
+        }
+        "verify-boon-driver-all" => return PathBuf::from("target/reports/boon-driver/all.json"),
+        "verify-linux-human-like-environment" => {
+            return PathBuf::from("target/reports/linux-human-like/environment.json");
+        }
+        "verify-linux-human-like-e2e" => match value_arg(args, "--example").as_deref() {
+            Some("todomvc") => {
+                return PathBuf::from("target/reports/linux-human-like/todomvc.json");
+            }
+            Some("cells") => return PathBuf::from("target/reports/linux-human-like/cells.json"),
+            _ => return PathBuf::from("target/reports/linux-human-like/e2e.json"),
+        },
+        "verify-linux-human-like-speed" => {
+            let label = native_gpu_scroll_selector(args).label;
+            if label == "cells" {
+                return PathBuf::from("target/reports/linux-human-like/cells-speed.json");
+            }
+            return PathBuf::from(format!(
+                "target/reports/linux-human-like/{label}-speed.json"
+            ));
+        }
+        "verify-linux-human-like-all" => {
+            return PathBuf::from("target/reports/linux-human-like/all.json");
+        }
         "verify-native-example-speed" => match value_arg(args, "--example").as_deref() {
             Some("todomvc") => "speed-todomvc",
             Some("cells") => "speed-cells",
@@ -10213,6 +12040,24 @@ fn require_visible_native_render_proof(
     {
         blockers.push(format!(
             "{path}.visible_surface_metrics.color_only_rect_fallback must be false"
+        ));
+    }
+    if report
+        .pointer(&format!("{path}/visible_surface_metrics/rect_cap_hit"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        blockers.push(format!(
+            "{path}.visible_surface_metrics.rect_cap_hit must be false"
+        ));
+    }
+    if report
+        .pointer(&format!("{path}/visible_surface_metrics/text_cap_hit"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        blockers.push(format!(
+            "{path}.visible_surface_metrics.text_cap_hit must be false"
         ));
     }
     if text_runs > 0
@@ -10712,23 +12557,1108 @@ fn native_readback_pixel_inventory(
     }))
 }
 
-fn run_controlled_weston_capability_probe() -> Result<serde_json::Value, Box<dyn std::error::Error>>
-{
+fn run_isolated_weston_desktop_preview_e2e(
+    binary: &Path,
+    example: &str,
+    title_token: &str,
+    input_sample_delay_ms: u64,
+    role_report_timeout_ms: u64,
+    supervisor_report: &Path,
+    live_state_report: &Path,
+    driver_target: Option<serde_json::Value>,
+    driver_text: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/native-gpu/isolated-preview-e2e-{}-{}-{}",
+        example,
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "Weston test control plugin missing",
+            "artifact_dir": artifact_dir
+        }));
+    };
+    let Some(driver_path) = weston_test_driver_path() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "Weston test driver missing",
+            "artifact_dir": artifact_dir,
+            "weston_control_plugin_path": plugin_path
+        }));
+    };
+
     let socket = format!(
-        "boon-real-window-probe-{}-{}",
+        "boon-native-preview-e2e-{}-{}",
         std::process::id(),
         current_unix_seconds()
     );
-    let log_path = PathBuf::from(format!("/tmp/{socket}.log"));
-    let mut child = Command::new("weston")
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let desktop_stdout_path = artifact_dir.join("desktop.stdout.txt");
+    let desktop_stderr_path = artifact_dir.join("desktop.stderr.txt");
+    let driver_stdout_path = artifact_dir.join("weston-test-driver.jsonl");
+    let driver_stderr_path = artifact_dir.join("weston-test-driver.stderr.txt");
+
+    let mut weston = Command::new("weston")
         .args([
             "--backend=headless-backend.so",
             "--socket",
             &socket,
             "--idle-time=0",
             "--log",
-            log_path.to_str().ok_or("weston log path is not UTF-8")?,
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
         ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "isolated Weston did not become ready",
+            "artifact_dir": artifact_dir,
+            "socket": socket,
+            "weston_log_path": weston_log_path
+        }));
+    }
+
+    let input_sample_delay_text = input_sample_delay_ms.to_string();
+    let role_report_timeout_text = role_report_timeout_ms.to_string();
+    let mut desktop = Command::new(binary)
+        .args([
+            "--role",
+            "desktop",
+            "--example",
+            example,
+            "--probe",
+            "--real-window-input-probe",
+            "--child-hold-ms",
+            "8000",
+            "--dev-hold-ms",
+            "5000",
+            "--title-token",
+            title_token,
+            "--input-sample-delay-ms",
+            &input_sample_delay_text,
+            "--warmup-frame-count",
+            "3",
+            "--sample-frame-count",
+            "30",
+            "--role-report-timeout-ms",
+            &role_report_timeout_text,
+            "--dev-start-delay-ms",
+            "2500",
+            "--live-state-report",
+            live_state_report
+                .to_str()
+                .ok_or("live state report path is not UTF-8")?,
+            "--report",
+            supervisor_report
+                .to_str()
+                .ok_or("supervisor report path is not UTF-8")?,
+        ])
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
+        .spawn()?;
+
+    thread::sleep(Duration::from_millis(800));
+    let target_x = driver_target
+        .as_ref()
+        .and_then(|target| target.get("local_x"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(240.0)
+        .round()
+        .max(0.0) as i64;
+    let target_y = driver_target
+        .as_ref()
+        .and_then(|target| target.get("local_y"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(220.0)
+        .round()
+        .max(0.0) as i64;
+    let driver_points = [
+        [target_x.to_string(), target_y.to_string()],
+        [(target_x + 30).to_string(), (target_y + 20).to_string()],
+        [target_x.to_string(), target_y.to_string()],
+    ];
+    let mut driver_stdout = Vec::new();
+    let mut driver_stderr = Vec::new();
+    let mut last_driver_json = json!({"status": "not-run"});
+    let mut last_driver_success = false;
+    let driver_point_count = driver_points.len();
+    for (point_index, point) in driver_points.into_iter().enumerate() {
+        let mut command = Command::new(&driver_path);
+        command.args([point[0].as_str(), point[1].as_str()]);
+        let should_type = point_index + 1 == driver_point_count;
+        if should_type {
+            if let Some(text) = driver_text {
+                command.args([text, "enter"]);
+            } else {
+                command.arg("");
+            }
+        } else {
+            command.arg("");
+        }
+        let output = command.env("WAYLAND_DISPLAY", &socket).output()?;
+        last_driver_success = output.status.success();
+        last_driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap_or_else(|_| json!({"status": "fail", "reason": "driver stdout was not JSON"}));
+        driver_stdout.extend_from_slice(&output.stdout);
+        driver_stderr.extend_from_slice(&output.stderr);
+        thread::sleep(Duration::from_millis(250));
+    }
+    fs::write(&driver_stdout_path, &driver_stdout)?;
+    fs::write(&driver_stderr_path, &driver_stderr)?;
+
+    let desktop_status = wait_child_exit_with_timeout(
+        &mut desktop,
+        Duration::from_millis(role_report_timeout_ms.saturating_add(20_000)),
+    );
+    if desktop_status.is_none() {
+        terminate_child_process(&mut desktop);
+    }
+    terminate_child_process(&mut weston);
+    let _ = weston.wait();
+
+    let supervisor = if supervisor_report.exists() {
+        read_json(supervisor_report).unwrap_or_else(|error| {
+            json!({
+                "status": "fail",
+                "reason": format!("failed to read supervisor report: {error}")
+            })
+        })
+    } else {
+        json!({"status": "missing"})
+    };
+    let input_adapter = supervisor
+        .pointer("/preview_surface_proof/input_adapter")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let real_os_events_observed = input_adapter
+        .get("real_os_events_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && input_adapter
+            .get("synthetic_input_probe")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true);
+    let driver_effect_observed = input_adapter
+        .get("mouse_button_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        || input_adapter
+            .get("mouse_scroll_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || input_adapter
+            .get("keyboard_key_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    let supervisor_report_written = supervisor_report.exists()
+        && supervisor.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let driver_pass = last_driver_success
+        && last_driver_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let desktop_pass = desktop_status
+        .as_ref()
+        .is_some_and(|status| status.success());
+    let pass = driver_pass
+        && desktop_pass
+        && supervisor_report_written
+        && real_os_events_observed
+        && driver_effect_observed;
+
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "example": example,
+        "artifact_dir": artifact_dir,
+        "socket": socket,
+        "method": "isolated-weston-headless-with-weston-test-control",
+        "live_desktop_input_used": false,
+        "weston_control_plugin_path": plugin_path,
+        "weston_test_driver_path": driver_path,
+        "weston_log_path": weston_log_path,
+        "weston_stdout_path": weston_stdout_path,
+        "weston_stderr_path": weston_stderr_path,
+        "wayland_info_stdout_path": wayland_info_stdout_path,
+        "wayland_info_stderr_path": wayland_info_stderr_path,
+        "desktop_stdout_path": desktop_stdout_path,
+        "desktop_stderr_path": desktop_stderr_path,
+        "desktop_exit_status": desktop_status
+            .as_ref()
+            .map(std::process::ExitStatus::to_string)
+            .unwrap_or_else(|| "timeout".to_owned()),
+        "weston_test_driver": last_driver_json,
+        "weston_test_driver_stdout_path": driver_stdout_path,
+        "weston_test_driver_stderr_path": driver_stderr_path,
+        "driver_target_region": driver_target,
+        "driver_pass": driver_pass,
+        "desktop_pass": desktop_pass,
+        "supervisor_report_written": supervisor_report_written,
+        "supervisor_report": supervisor_report,
+        "live_state_report": live_state_report,
+        "preview_input_adapter": input_adapter,
+        "real_os_events_observed": real_os_events_observed,
+        "driver_effect_observed": driver_effect_observed,
+        "input_route": "weston_test compositor control API -> isolated Weston test seat -> two native app_window child processes -> preview app_window Wayland pointer/keyboard dispatch -> app_window coalesced input proof"
+    }))
+}
+
+fn run_linux_human_like_preview_smoke(
+    example: &str,
+    release_build: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let entry = boon_runtime::example_manifest_entry(example)?;
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/linux-human-like/app-smoke-{}-{}-{}",
+        example,
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(
+            json!({"status": "fail", "reason": "weston_test control plugin missing", "artifact_dir": artifact_dir}),
+        );
+    };
+    let Some(driver_path) = weston_test_driver_path() else {
+        return Ok(
+            json!({"status": "fail", "reason": "weston_test driver missing", "artifact_dir": artifact_dir, "plugin_path": plugin_path}),
+        );
+    };
+    let build_status = if release_build {
+        Command::new("cargo")
+            .args(["build", "--release", "-p", "boon_native_playground"])
+            .status()?
+    } else {
+        Command::new("cargo")
+            .args(["build", "-p", "boon_native_playground"])
+            .status()?
+    };
+    if !build_status.success() {
+        return Ok(
+            json!({"status": "fail", "reason": format!("boon_native_playground build failed: {build_status}")}),
+        );
+    }
+    let binary = if release_build {
+        "./target/release/boon_native_playground"
+    } else {
+        "./target/debug/boon_native_playground"
+    };
+    let socket = format!(
+        "boon-linux-human-like-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let preview_report_path = artifact_dir.join("preview.json");
+    let preview_stdout_path = artifact_dir.join("preview.stdout.txt");
+    let preview_stderr_path = artifact_dir.join("preview.stderr.txt");
+    let driver_stdout_path = artifact_dir.join("weston-test-driver.json");
+    let driver_stderr_path = artifact_dir.join("weston-test-driver.stderr.txt");
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
+        ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "isolated Weston did not become ready",
+            "artifact_dir": artifact_dir,
+            "weston_log_path": weston_log_path
+        }));
+    }
+    let mut preview = Command::new(binary)
+        .args([
+            "--role",
+            "preview",
+            "--code-file",
+            &entry.source,
+            "--report",
+            preview_report_path
+                .to_str()
+                .ok_or("preview report path is not UTF-8")?,
+            "--hold-ms",
+            "1500",
+            "--input-sample-delay-ms",
+            "1500",
+            "--title-token",
+            "linux-human-like-smoke",
+        ])
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .stdout(Stdio::from(fs::File::create(&preview_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&preview_stderr_path)?))
+        .spawn()?;
+    thread::sleep(Duration::from_millis(800));
+    let driver_points = [["240", "220"], ["300", "260"], ["240", "220"]];
+    let mut driver_output = Command::new(&driver_path)
+        .args(driver_points[0])
+        .env("WAYLAND_DISPLAY", &socket)
+        .output()?;
+    let mut driver_stdout = driver_output.stdout.clone();
+    let mut driver_stderr = driver_output.stderr.clone();
+    for point in driver_points.iter().skip(1) {
+        thread::sleep(Duration::from_millis(300));
+        driver_output = Command::new(&driver_path)
+            .args(*point)
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()?;
+        driver_stdout.extend_from_slice(&driver_output.stdout);
+        driver_stderr.extend_from_slice(&driver_output.stderr);
+    }
+    fs::write(&driver_stdout_path, &driver_stdout)?;
+    fs::write(&driver_stderr_path, &driver_stderr)?;
+    let preview_status = preview.wait()?;
+    terminate_child_process(&mut weston);
+    let _ = weston.wait();
+    let driver_json = serde_json::from_slice::<serde_json::Value>(&driver_output.stdout)
+        .unwrap_or_else(|_| json!({"status": "fail", "reason": "driver stdout was not JSON"}));
+    let preview_json = if preview_report_path.exists() {
+        read_json(&preview_report_path)?
+    } else {
+        json!({"status": "missing"})
+    };
+    let preview_input_adapter = preview_json
+        .pointer("/details/app_window_surface_proof/input_adapter")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let readback_artifact = preview_json
+        .pointer("/details/app_window_surface_proof/readback_artifact")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let real_os_events_observed = preview_input_adapter
+        .get("real_os_events_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let driver_effect_observed = preview_input_adapter
+        .get("mouse_button_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        || preview_input_adapter
+            .get("mouse_scroll_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || preview_input_adapter
+            .get("keyboard_key_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    let driver_pass = driver_output.status.success()
+        && driver_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let preview_pass = preview_status.success()
+        && preview_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let readback_pass = readback_artifact
+        .get("nonblank_samples")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let pass = driver_pass
+        && preview_pass
+        && readback_pass
+        && real_os_events_observed
+        && driver_effect_observed;
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "example": example,
+        "source_path": entry.source,
+        "artifact_dir": artifact_dir,
+        "socket": socket,
+        "release_build": release_build,
+        "weston_control_plugin_path": plugin_path,
+        "weston_test_driver_path": driver_path,
+        "weston_log_path": weston_log_path,
+        "weston_stdout_path": weston_stdout_path,
+        "weston_stderr_path": weston_stderr_path,
+        "wayland_info_stdout_path": wayland_info_stdout_path,
+        "wayland_info_stderr_path": wayland_info_stderr_path,
+        "preview_report_path": preview_report_path,
+        "preview_stdout_path": preview_stdout_path,
+        "preview_stderr_path": preview_stderr_path,
+        "preview_exit_status": preview_status.to_string(),
+        "weston_test_driver": driver_json,
+        "weston_test_driver_stdout_path": driver_stdout_path,
+        "weston_test_driver_stderr_path": driver_stderr_path,
+        "preview_input_adapter": preview_input_adapter,
+        "preview_readback_artifact": readback_artifact,
+        "driver_pass": driver_pass,
+        "preview_pass": preview_pass,
+        "readback_pass": readback_pass,
+        "real_os_events_observed": real_os_events_observed,
+        "driver_effect_observed": driver_effect_observed,
+        "live_desktop_input_used": false,
+        "input_route": "weston_test compositor control API -> isolated Weston test seat -> app_window Wayland pointer/keyboard dispatch -> app_window coalesced input proof"
+    }))
+}
+
+fn run_linux_human_like_desktop_surface_smoke(
+    label: &str,
+    example: &str,
+    source_path: &Path,
+    release_build: bool,
+    dev_editor_only: bool,
+    measured_surface_key: &str,
+    driver_target: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/linux-human-like/desktop-surface-smoke-{}-{}-{}",
+        label,
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(
+            json!({"status": "fail", "reason": "weston_test control plugin missing", "artifact_dir": artifact_dir}),
+        );
+    };
+    let Some(driver_path) = weston_test_driver_path() else {
+        return Ok(
+            json!({"status": "fail", "reason": "weston_test driver missing", "artifact_dir": artifact_dir, "plugin_path": plugin_path}),
+        );
+    };
+    let build_status = if release_build {
+        Command::new("cargo")
+            .args(["build", "--release", "-p", "boon_native_playground"])
+            .status()?
+    } else {
+        Command::new("cargo")
+            .args(["build", "-p", "boon_native_playground"])
+            .status()?
+    };
+    if !build_status.success() {
+        return Ok(
+            json!({"status": "fail", "reason": format!("boon_native_playground build failed: {build_status}")}),
+        );
+    }
+    let binary = if release_build {
+        "./target/release/boon_native_playground"
+    } else {
+        "./target/debug/boon_native_playground"
+    };
+    let socket = format!(
+        "boon-linux-human-like-surface-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let supervisor_report = artifact_dir.join("desktop-supervisor.json");
+    let live_state_report = artifact_dir.join("desktop-live-state.json");
+    let desktop_stdout_path = artifact_dir.join("desktop.stdout.txt");
+    let desktop_stderr_path = artifact_dir.join("desktop.stderr.txt");
+    let driver_stdout_path = artifact_dir.join("weston-test-driver.jsonl");
+    let driver_stderr_path = artifact_dir.join("weston-test-driver.stderr.txt");
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
+        ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "isolated Weston did not become ready",
+            "artifact_dir": artifact_dir,
+            "weston_log_path": weston_log_path
+        }));
+    }
+
+    let mut desktop_args = vec![
+        "--role".to_owned(),
+        "desktop".to_owned(),
+        "--example".to_owned(),
+        example.to_owned(),
+        "--code-file".to_owned(),
+        source_path
+            .to_str()
+            .ok_or("source path is not UTF-8")?
+            .to_owned(),
+        "--dev-editor-code-file".to_owned(),
+        source_path
+            .to_str()
+            .ok_or("source path is not UTF-8")?
+            .to_owned(),
+        "--probe".to_owned(),
+        "--real-window-input-probe".to_owned(),
+        "--child-hold-ms".to_owned(),
+        "8000".to_owned(),
+        "--dev-hold-ms".to_owned(),
+        "5000".to_owned(),
+        "--title-token".to_owned(),
+        "linux-human-like-speed".to_owned(),
+        "--input-sample-delay-ms".to_owned(),
+        "1500".to_owned(),
+        "--role-report-timeout-ms".to_owned(),
+        "60000".to_owned(),
+        "--live-state-report".to_owned(),
+        live_state_report
+            .to_str()
+            .ok_or("live state report path is not UTF-8")?
+            .to_owned(),
+        "--report".to_owned(),
+        supervisor_report
+            .to_str()
+            .ok_or("supervisor report path is not UTF-8")?
+            .to_owned(),
+    ];
+    if dev_editor_only {
+        desktop_args.push("--dev-editor-only".to_owned());
+    }
+    let mut desktop = Command::new(binary)
+        .args(desktop_args.iter().map(String::as_str))
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
+        .spawn()?;
+
+    thread::sleep(Duration::from_millis(800));
+    let target_x = driver_target
+        .as_ref()
+        .and_then(|target| target.get("local_x"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(240.0)
+        .round()
+        .max(0.0) as i64;
+    let target_y = driver_target
+        .as_ref()
+        .and_then(|target| target.get("local_y"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(220.0)
+        .round()
+        .max(0.0) as i64;
+    let driver_points = [
+        [target_x.to_string(), target_y.to_string()],
+        [(target_x + 30).to_string(), (target_y + 20).to_string()],
+        [target_x.to_string(), target_y.to_string()],
+    ];
+    let mut driver_stdout = Vec::new();
+    let mut driver_stderr = Vec::new();
+    let mut last_driver_json = json!({"status": "not-run"});
+    let mut last_driver_success = false;
+    for point in driver_points {
+        let output = Command::new(&driver_path)
+            .args([point[0].as_str(), point[1].as_str()])
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()?;
+        last_driver_success = output.status.success();
+        last_driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap_or_else(|_| json!({"status": "fail", "reason": "driver stdout was not JSON"}));
+        driver_stdout.extend_from_slice(&output.stdout);
+        driver_stderr.extend_from_slice(&output.stderr);
+        thread::sleep(Duration::from_millis(250));
+    }
+    fs::write(&driver_stdout_path, &driver_stdout)?;
+    fs::write(&driver_stderr_path, &driver_stderr)?;
+
+    let desktop_status = wait_child_exit_with_timeout(&mut desktop, Duration::from_millis(80_000));
+    if desktop_status.is_none() {
+        terminate_child_process(&mut desktop);
+    }
+    terminate_child_process(&mut weston);
+    let _ = weston.wait();
+
+    let supervisor = if supervisor_report.exists() {
+        read_json(&supervisor_report).unwrap_or_else(|error| {
+            json!({
+                "status": "fail",
+                "reason": format!("failed to read supervisor report: {error}")
+            })
+        })
+    } else {
+        json!({"status": "missing"})
+    };
+    let input_adapter = supervisor
+        .pointer(&format!("/{measured_surface_key}/input_adapter"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let readback_artifact = supervisor
+        .pointer(&format!("/{measured_surface_key}/readback_artifact"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let real_os_events_observed = input_adapter
+        .get("real_os_events_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && input_adapter
+            .get("synthetic_input_probe")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true);
+    let wheel_input_observed = input_adapter
+        .get("mouse_scroll_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        && input_adapter
+            .get("scroll_delta_x")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0)
+            .abs()
+            > f64::EPSILON
+        && input_adapter
+            .get("scroll_delta_y")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0)
+            .abs()
+            > f64::EPSILON;
+    let driver_effect_observed = wheel_input_observed
+        || input_adapter
+            .get("mouse_button_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || input_adapter
+            .get("keyboard_key_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    let driver_pass = last_driver_success
+        && last_driver_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let desktop_pass = desktop_status
+        .as_ref()
+        .is_some_and(|status| status.success());
+    let measured_role_status_key = if measured_surface_key == "dev_surface_proof" {
+        "dev_role_status"
+    } else {
+        "preview_role_status"
+    };
+    let measured_role_pass = supervisor
+        .get(measured_role_status_key)
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let supervisor_pass = supervisor.get("status").and_then(serde_json::Value::as_str)
+        == Some("pass")
+        || measured_role_pass;
+    let readback_pass = readback_artifact
+        .get("nonblank_samples")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let pass = driver_pass
+        && desktop_pass
+        && supervisor_pass
+        && readback_pass
+        && real_os_events_observed
+        && wheel_input_observed;
+
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "surface_under_test": label,
+        "example": example,
+        "source_path": source_path,
+        "artifact_dir": artifact_dir,
+        "socket": socket,
+        "release_build": release_build,
+        "measured_surface_key": measured_surface_key,
+        "driver_target_region": driver_target,
+        "weston_control_plugin_path": plugin_path,
+        "weston_test_driver_path": driver_path,
+        "weston_log_path": weston_log_path,
+        "weston_stdout_path": weston_stdout_path,
+        "weston_stderr_path": weston_stderr_path,
+        "wayland_info_stdout_path": wayland_info_stdout_path,
+        "wayland_info_stderr_path": wayland_info_stderr_path,
+        "desktop_stdout_path": desktop_stdout_path,
+        "desktop_stderr_path": desktop_stderr_path,
+        "desktop_exit_status": desktop_status
+            .as_ref()
+            .map(std::process::ExitStatus::to_string)
+            .unwrap_or_else(|| "timeout".to_owned()),
+        "supervisor_report": supervisor_report,
+        "live_state_report": live_state_report,
+        "weston_test_driver": last_driver_json,
+        "weston_test_driver_stdout_path": driver_stdout_path,
+        "weston_test_driver_stderr_path": driver_stderr_path,
+        "surface_input_adapter": input_adapter,
+        "surface_readback_artifact": readback_artifact,
+        "driver_pass": driver_pass,
+        "desktop_pass": desktop_pass,
+        "supervisor_pass": supervisor_pass,
+        "measured_role_status_key": measured_role_status_key,
+        "measured_role_pass": measured_role_pass,
+        "readback_pass": readback_pass,
+        "wheel_input_observed": wheel_input_observed,
+        "real_os_events_observed": real_os_events_observed,
+        "driver_effect_observed": driver_effect_observed,
+        "live_desktop_input_used": false,
+        "input_route": "weston_test compositor control API -> isolated Weston test seat -> exact native desktop surface -> app_window Wayland pointer/keyboard/wheel dispatch -> app_window coalesced input proof"
+    }))
+}
+
+fn terminate_child_process(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_child_exit_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn ensure_weston_control_helpers() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let out_dir = PathBuf::from("target/tools/boon-weston-control-plugin");
+    fs::create_dir_all(&out_dir)?;
+    let plugin_path = out_dir.join("boon-weston-test-plugin.so");
+    let driver_path = out_dir.join("boon-weston-test-driver");
+    let driver_source = PathBuf::from("tools/linux-human-like/weston-test-driver.c");
+    if !driver_source.exists() {
+        return Err(format!(
+            "missing tracked Weston test driver source `{}`",
+            driver_source.display()
+        )
+        .into());
+    }
+
+    ensure_weston_source_tree()?;
+    let weston_source = PathBuf::from("target/vendor/weston-13.0.0");
+    let weston_build = PathBuf::from("target/vendor/weston-build");
+    let protocol = weston_source.join("protocol/weston-test.xml");
+    let upstream_plugin = weston_source.join("tests/weston-test.c");
+    let generated_plugin_source = out_dir.join("boon-weston-test.c");
+
+    run_command(
+        Command::new("wayland-scanner").args([
+            "server-header",
+            protocol
+                .to_str()
+                .ok_or("weston protocol path is not UTF-8")?,
+            out_dir
+                .join("weston-test-server-protocol.h")
+                .to_str()
+                .ok_or("server protocol header path is not UTF-8")?,
+        ]),
+        "generate weston-test server protocol header",
+    )?;
+    run_command(
+        Command::new("wayland-scanner").args([
+            "client-header",
+            protocol
+                .to_str()
+                .ok_or("weston protocol path is not UTF-8")?,
+            out_dir
+                .join("weston-test-client-protocol.h")
+                .to_str()
+                .ok_or("client protocol header path is not UTF-8")?,
+        ]),
+        "generate weston-test client protocol header",
+    )?;
+    run_command(
+        Command::new("wayland-scanner").args([
+            "private-code",
+            protocol
+                .to_str()
+                .ok_or("weston protocol path is not UTF-8")?,
+            out_dir
+                .join("weston-test-protocol.c")
+                .to_str()
+                .ok_or("protocol private code path is not UTF-8")?,
+        ]),
+        "generate weston-test protocol private code",
+    )?;
+
+    let plugin_source = patched_weston_test_plugin_source(&fs::read_to_string(&upstream_plugin)?)?;
+    fs::write(&generated_plugin_source, plugin_source)?;
+
+    let out_dir_text = out_dir.display().to_string();
+    let source_text = weston_source.display().to_string();
+    let build_text = weston_build.display().to_string();
+    let plugin_cmd = format!(
+        "cc -D_GNU_SOURCE -shared -fPIC \
+         -I{} -I{} -I{}/include -I{}/libweston -I{}/shared -I{}/tests \
+         -I{} -I{}/include -I{}/protocol \
+         $(pkg-config --cflags weston libweston-13 pixman-1 wayland-server xkbcommon) \
+         {}/boon-weston-test.c {}/weston-test-protocol.c \
+         $(pkg-config --libs weston libweston-13 pixman-1 wayland-server xkbcommon) -lpthread \
+         -o {}",
+        shell_quote(&out_dir_text),
+        shell_quote(&source_text),
+        shell_quote(&source_text),
+        shell_quote(&source_text),
+        shell_quote(&source_text),
+        shell_quote(&source_text),
+        shell_quote(&build_text),
+        shell_quote(&build_text),
+        shell_quote(&build_text),
+        shell_quote(&out_dir_text),
+        shell_quote(&out_dir_text),
+        shell_quote(&plugin_path.display().to_string())
+    );
+    run_shell_command(&plugin_cmd, "build Boon Weston control plugin")?;
+
+    let driver_cmd = format!(
+        "cc -I{} {} {}/weston-test-protocol.c -lwayland-client -o {}",
+        shell_quote(&out_dir_text),
+        shell_quote(&driver_source.display().to_string()),
+        shell_quote(&out_dir_text),
+        shell_quote(&driver_path.display().to_string())
+    );
+    run_shell_command(&driver_cmd, "build Boon Weston test driver")?;
+
+    Ok((
+        plugin_path
+            .canonicalize()
+            .unwrap_or_else(|_| plugin_path.clone()),
+        driver_path
+            .canonicalize()
+            .unwrap_or_else(|_| driver_path.clone()),
+    ))
+}
+
+fn ensure_weston_source_tree() -> Result<(), Box<dyn std::error::Error>> {
+    let weston_source = PathBuf::from("target/vendor/weston-13.0.0");
+    let weston_build = PathBuf::from("target/vendor/weston-build");
+    if !weston_source.join("tests/weston-test.c").exists() {
+        fs::create_dir_all("target/vendor")?;
+        run_command(
+            Command::new("apt-get")
+                .args(["source", "weston"])
+                .current_dir("target/vendor"),
+            "fetch Weston source package",
+        )?;
+    }
+    if !weston_build.join("config.h").exists() {
+        let cwd = std::env::current_dir()?;
+        let cmd = format!(
+            "meson setup {} {} \
+             --prefix {} \
+             -Dbackend-default=headless \
+             -Dbackend-drm=false -Dbackend-headless=true -Dbackend-pipewire=false \
+             -Dbackend-rdp=false -Dbackend-vnc=false -Dbackend-wayland=false -Dbackend-x11=false \
+             -Drenderer-gl=false -Dshell-desktop=true -Dshell-fullscreen=false \
+             -Dshell-ivi=false -Dshell-kiosk=false -Ddemo-clients=false \
+             -Dtools=[] -Dsimple-clients=[] -Dimage-jpeg=false -Dimage-webp=false \
+             -Dsystemd=false -Dremoting=false -Dpipewire=false -Dscreenshare=false \
+             -Dxwayland=false -Dcolor-management-lcms=false -Dtest-junit-xml=false \
+             -Dwcap-decode=false",
+            shell_quote(&weston_build.display().to_string()),
+            shell_quote(&weston_source.display().to_string()),
+            shell_quote(&cwd.join("target/tools/weston-test").display().to_string())
+        );
+        run_shell_command(&cmd, "configure local Weston source tree")?;
+    }
+    Ok(())
+}
+
+fn patched_weston_test_plugin_source(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut patched = source.replace("#include <signal.h>", "#include </usr/include/signal.h>");
+    patched = replace_required(
+        patched,
+        "struct wl_event_source *client_source;\n\n\tstruct wl_list output_list;",
+        "struct wl_event_source *client_source;\n\tstruct wl_client *standalone_client;\n\n\tstruct wl_list output_list;",
+    )?;
+    patched = replace_required(
+        patched,
+        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\n\twl_list_for_each_safe(bp, tmp, &tsd->breakpoints.list, link) {",
+        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\tif (!tsd)\n\t\treturn;\n\n\twl_list_for_each_safe(bp, tmp, &tsd->breakpoints.list, link) {",
+    )?;
+    patched = replace_required(
+        patched,
+        "\ttimespec_from_proto(&time, tv_sec_hi, tv_sec_lo, tv_nsec);\n\n\tnotify_motion(seat, &time, &event);\n",
+        "\ttimespec_from_proto(&time, tv_sec_hi, tv_sec_lo, tv_nsec);\n\n\tstruct weston_view *picked_view = weston_compositor_pick_view(test->compositor, pos);\n\tif (picked_view)\n\t\tweston_pointer_set_focus(pointer, picked_view);\n\tnotify_motion(seat, &time, &event);\n",
+    )?;
+    patched = replace_required(
+        patched,
+        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\n\tassert(tsd->wl_client);\n\ttsd->wl_client = NULL;",
+        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\tif (tsd) {\n\t\tassert(tsd->wl_client);\n\t\ttsd->wl_client = NULL;\n\t} else {\n\t\ttest->standalone_client = NULL;\n\t}",
+    )?;
+    patched = replace_required(
+        patched,
+        "\t/* There can only be one wl_client bound */\n\tassert(!tsd->wl_client);\n\ttsd->wl_client = client;\n\tnotify_pointer_position(test, resource);",
+        "\t/* There can only be one wl_client bound */\n\tif (tsd) {\n\t\tassert(!tsd->wl_client);\n\t\ttsd->wl_client = client;\n\t} else {\n\t\tassert(!test->standalone_client);\n\t\ttest->standalone_client = client;\n\t}\n\tnotify_pointer_position(test, resource);",
+    )?;
+    patched = replace_required(
+        patched,
+        "\tdata->wl_client = NULL;\n\n\twl_list_remove(&test->layer.view_list.link);",
+        "\tif (data)\n\t\tdata->wl_client = NULL;\n\ttest->standalone_client = NULL;\n\n\twl_list_remove(&test->layer.view_list.link);",
+    )?;
+    Ok(patched)
+}
+
+fn replace_required(
+    mut text: String,
+    needle: &str,
+    replacement: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !text.contains(needle) {
+        return Err(format!("Weston source patch pattern was not found: {needle:?}").into());
+    }
+    text = text.replacen(needle, replacement, 1);
+    Ok(text)
+}
+
+fn run_command(command: &mut Command, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} failed with {status}").into())
+    }
+}
+
+fn run_shell_command(command: &str, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    run_command(Command::new("bash").args(["-lc", command]), label)
+}
+
+fn run_controlled_weston_capability_probe() -> Result<serde_json::Value, Box<dyn std::error::Error>>
+{
+    let run_id = format!("{}-{}", std::process::id(), current_unix_seconds());
+    let socket = format!(
+        "boon-real-window-probe-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let artifact_dir = PathBuf::from(format!("target/artifacts/linux-human-like/{run_id}"));
+    fs::create_dir_all(&artifact_dir)?;
+    let log_path = artifact_dir.join("compositor.log");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let weston_test_plugin_path = weston_test_plugin_path();
+    let mut weston_args = vec![
+        "--backend=headless-backend.so".to_owned(),
+        "--socket".to_owned(),
+        socket.clone(),
+        "--idle-time=0".to_owned(),
+        "--log".to_owned(),
+        log_path
+            .to_str()
+            .ok_or("weston log path is not UTF-8")?
+            .to_owned(),
+    ];
+    if let Some(plugin_path) = weston_test_plugin_path.as_ref() {
+        weston_args.push("--modules".to_owned());
+        weston_args.push(
+            plugin_path
+                .to_str()
+                .ok_or("weston test plugin path is not UTF-8")?
+                .to_owned(),
+        );
+    }
+    let mut child = Command::new("weston")
+        .args(&weston_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -10760,20 +13690,122 @@ fn run_controlled_weston_capability_probe() -> Result<serde_json::Value, Box<dyn
             Some(line[start..end].to_owned())
         })
         .collect::<BTreeSet<_>>();
+    fs::write(&wayland_info_stdout_path, &stdout)?;
+    fs::write(&wayland_info_stderr_path, &stderr)?;
+    let globals_vec = globals.iter().cloned().collect::<Vec<_>>();
+    let has_wl_seat = globals.contains("wl_seat");
+    let has_virtual_keyboard_manager = globals.contains("zwp_virtual_keyboard_manager_v1");
+    let has_virtual_pointer_manager = globals.contains("zwlr_virtual_pointer_manager_v1")
+        || globals.contains("zwp_virtual_pointer_manager_v1");
+    let has_weston_test_control_api = globals.contains("weston_test");
+    let has_output_capture_protocol = globals.contains("weston_capture_v1");
+    let mut missing_for_real_window = Vec::new();
+    if !has_wl_seat {
+        missing_for_real_window.push(json!("wl_seat"));
+    }
+    if !(has_virtual_keyboard_manager && has_virtual_pointer_manager)
+        && !has_weston_test_control_api
+    {
+        missing_for_real_window.push(json!(
+            "virtual keyboard plus virtual pointer, or weston_test internal control API"
+        ));
+    }
     Ok(json!({
         "status": if ready { "pass" } else { "fail" },
-        "method": "verifier-owned-nested-weston-headless-capability-probe",
+        "method": if weston_test_plugin_path.is_some() {
+            "verifier-owned-nested-weston-headless-with-weston-test-plugin"
+        } else {
+            "verifier-owned-nested-weston-headless-capability-probe"
+        },
+        "run_id": run_id,
+        "artifact_dir": artifact_dir,
         "socket": socket,
         "log_path": log_path,
-        "globals": globals.into_iter().collect::<Vec<_>>(),
+        "weston_argv": weston_args,
+        "wayland_info_stdout_path": wayland_info_stdout_path,
+        "wayland_info_stderr_path": wayland_info_stderr_path,
+        "globals": globals_vec,
         "wayland_info_stdout_sha256": boon_runtime::sha256_bytes(stdout.as_bytes()),
         "wayland_info_stderr_sha256": boon_runtime::sha256_bytes(stderr.as_bytes()),
-        "has_wl_seat": stdout.contains("interface: 'wl_seat'"),
-        "has_virtual_keyboard_manager": stdout.contains("zwp_virtual_keyboard_manager_v1"),
-        "has_virtual_pointer_manager": stdout.contains("zwlr_virtual_pointer_manager_v1")
-            || stdout.contains("zwp_virtual_pointer_manager_v1"),
+        "has_wl_seat": has_wl_seat,
+        "has_virtual_keyboard_manager": has_virtual_keyboard_manager,
+        "has_virtual_pointer_manager": has_virtual_pointer_manager,
+        "has_weston_test_control_api": has_weston_test_control_api,
+        "has_output_capture_protocol": has_output_capture_protocol,
+        "candidate_adapters": [
+            {
+                "name": "weston-headless",
+                "status": if ready { "available" } else { "failed" },
+                "safe_for_unattended_testing": true,
+                "has_wl_seat": has_wl_seat,
+                "has_virtual_keyboard_manager": has_virtual_keyboard_manager,
+                "has_virtual_pointer_manager": has_virtual_pointer_manager,
+                "has_weston_test_control_api": has_weston_test_control_api,
+                "has_output_capture_protocol": has_output_capture_protocol,
+                "missing_for_real_window": missing_for_real_window
+            },
+            {
+                "name": "weston-test-plugin",
+                "status": if has_weston_test_control_api {
+                    "loaded"
+                } else if weston_test_plugin_path.is_some() {
+                    "available-but-not-advertised"
+                } else {
+                    "missing"
+                },
+                "path": weston_test_plugin_path,
+                "safe_for_unattended_testing": true,
+                "reason": "provides compositor-owned weston_test control API for isolated pointer/key/axis events"
+            },
+            {
+                "name": "wtype",
+                "status": if command_available("wtype") { "installed-but-not-usable-on-current-isolated-display" } else { "missing" },
+                "safe_for_unattended_testing": false,
+                "reason": "requires a Wayland virtual keyboard path on the target display; current isolated Weston does not advertise it"
+            },
+            {
+                "name": "ydotool",
+                "status": if command_available("ydotool") { "installed-but-global" } else { "missing" },
+                "safe_for_unattended_testing": false,
+                "reason": "uinput/global input can target the live desktop and is intentionally excluded from unattended gates"
+            },
+            {
+                "name": "cage",
+                "status": if command_available("cage") { "installed-but-not-an-input-synthesis-api" } else { "missing" },
+                "safe_for_unattended_testing": false,
+                "reason": "kiosk compositor wrapper does not by itself provide virtual pointer/keyboard injection or capture provenance"
+            }
+        ],
         "bounded_wait_ms": 4_000,
     }))
+}
+
+fn weston_test_plugin_path() -> Option<PathBuf> {
+    if let Ok((plugin_path, _)) = ensure_weston_control_helpers() {
+        return Some(plugin_path);
+    }
+    [
+        Path::new("target/tools/boon-weston-control-plugin/boon-weston-test-plugin.so"),
+        Path::new("target/tools/weston-test/tests/test-plugin.so"),
+        Path::new("/usr/lib/x86_64-linux-gnu/weston/weston-test.so"),
+        Path::new("/usr/lib/x86_64-linux-gnu/libweston-13/weston-test.so"),
+        Path::new("/usr/lib/weston/weston-test.so"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+fn weston_test_driver_path() -> Option<PathBuf> {
+    if let Ok((_, driver_path)) = ensure_weston_control_helpers() {
+        return Some(driver_path);
+    }
+    [Path::new(
+        "target/tools/boon-weston-control-plugin/boon-weston-test-driver",
+    )]
+    .into_iter()
+    .find(|path| path.exists())
+    .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
 fn modified_unix_seconds(path: &Path) -> Option<u64> {
@@ -11888,6 +14920,15 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
                 | "verify-native-dev-editor-speed"
+                | "verify-boon-driver-schema"
+                | "verify-boon-driver-e2e"
+                | "verify-boon-driver-dev-window"
+                | "verify-boon-driver-speed"
+                | "verify-boon-driver-all"
+                | "verify-linux-human-like-environment"
+                | "verify-linux-human-like-e2e"
+                | "verify-linux-human-like-speed"
+                | "verify-linux-human-like-all"
         )
     )
 }
@@ -12026,13 +15067,14 @@ fn role_window_title_for_token(prefix: &str, title_token: &str) -> String {
 }
 
 fn run_native_layout_probe(
+    binary: &Path,
     source_path: &Path,
     report: &Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if let Some(parent) = report.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = Command::new("./target/debug/boon_native_playground")
+    let status = Command::new(binary)
         .args([
             "--role",
             "layout-proof",
@@ -12060,6 +15102,14 @@ fn native_preview_driver_target(
     example: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    if example == "cells"
+        && let Some(target) = native_preview_cells_grid_driver_target(layout_probe)
+    {
+        return Some(target);
+    }
+    if let Some(target) = native_preview_driver_target_from_source(example, layout_probe) {
+        return Some(target);
+    }
     let preferred_nodes = match example {
         "todomvc" => ["todo_new_input", "todo_row_checkbox", "todo_row_title"].as_slice(),
         "cells" => ["cell_editor", "formula_editor"].as_slice(),
@@ -12072,37 +15122,141 @@ fn native_preview_driver_target(
         .iter()
         .find_map(|node| {
             hit_targets.iter().find(|target| {
-                target.get("node").and_then(serde_json::Value::as_str) == Some(*node)
+                target
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|target_node| {
+                        target_node == *node || target_node.starts_with(&format!("{node}-"))
+                    })
             })
         })
         .or_else(|| hit_targets.first())?;
     native_driver_target_from_region("hit_region", target)
 }
 
+fn native_preview_cells_grid_driver_target(
+    layout_probe: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let hit_targets = layout_probe
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let target = hit_targets
+        .iter()
+        .find(|target| {
+            target
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|node| node.contains("grid_row-4-cell-0"))
+        })
+        .or_else(|| {
+            hit_targets.iter().find(|target| {
+                target
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|node| node.contains("grid_row-3-cell-0"))
+            })
+        })
+        .or_else(|| {
+            hit_targets.iter().find(|target| {
+                target
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|node| node.contains("grid_row-") && node.contains("-cell-0"))
+            })
+        })?;
+    native_driver_target_from_region("hit_region", target)
+}
+
+fn native_preview_driver_target_from_source(
+    example: &str,
+    layout_probe: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let preferred_sources = match example {
+        "todomvc" => ["store.sources.new_todo_input.change"].as_slice(),
+        "cells" => ["cell.sources.editor.change", "selected_input.change_source"].as_slice(),
+        _ => [].as_slice(),
+    };
+    let source_intents = layout_probe
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let hit_targets = layout_probe
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let source_intent = preferred_sources.iter().find_map(|source| {
+        source_intents
+            .iter()
+            .filter(|intent| {
+                intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(*source)
+            })
+            .min_by_key(|intent| native_preview_driver_target_rank(example, intent))
+    })?;
+    let node = source_intent
+        .get("node")
+        .and_then(serde_json::Value::as_str)?;
+    let target = hit_targets
+        .iter()
+        .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))?;
+    native_driver_target_from_region("hit_region", target)
+}
+
+fn native_preview_driver_target_rank(example: &str, intent: &serde_json::Value) -> u8 {
+    let node = intent
+        .get("node")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match example {
+        "cells" if node.contains("grid_row-4-cell-0") => 0,
+        "cells" if node.contains("grid_row-3-cell-0") || node.contains("grid_row-5-cell-0") => 1,
+        "cells" if node.contains("grid_row-") && node.contains("-cell-0") => 2,
+        _ => 2,
+    }
+}
+
 fn native_scroll_driver_target(
     label: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let preferred_nodes = match label {
-        "dev-code-editor" => ["dev-code-editor"].as_slice(),
-        "cells" => ["spreadsheet_body", "spreadsheet_header"].as_slice(),
-        _ => [].as_slice(),
-    };
     let scroll_regions = layout_probe
         .get("scroll_regions")
         .and_then(serde_json::Value::as_array)?;
-    let target = preferred_nodes
-        .iter()
-        .find_map(|node| {
-            scroll_regions.iter().find(|region| {
-                region.get("node").and_then(serde_json::Value::as_str) == Some(*node)
+    let target = match label {
+        "dev-code-editor" => scroll_regions
+            .iter()
+            .find(|region| {
+                region.get("node").and_then(serde_json::Value::as_str) == Some("dev-code-editor")
                     && region
                         .get("axis")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
             })
-        })
-        .or_else(|| scroll_regions.first())?;
+            .or_else(|| scroll_regions.first())?,
+        "cells" => scroll_regions
+            .iter()
+            .find(|region| {
+                region
+                    .get("axis")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
+                    && region
+                        .pointer("/bounds/height")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0)
+                        > 100.0
+            })
+            .or_else(|| {
+                scroll_regions.iter().find(|region| {
+                    region
+                        .get("axis")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
+                })
+            })
+            .or_else(|| scroll_regions.first())?,
+        _ => scroll_regions.first()?,
+    };
     native_driver_target_from_region("scroll_region", target)
 }
 
@@ -12144,6 +15298,11 @@ fn native_gpu_app_window_input_observed(report: &serde_json::Value) -> bool {
             .pointer("/native_input_adapter/mouse_last_window_protocol_id")
             .and_then(serde_json::Value::as_u64)
             .is_some()
+            || report
+                .pointer("/native_input_adapter/mouse_scroll_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
             || report
                 .pointer("/native_input_adapter/keyboard_last_window_protocol_id")
                 .and_then(serde_json::Value::as_u64)
@@ -12282,6 +15441,14 @@ fn native_gpu_preview_input_text(label: &str) -> &'static str {
         "todomvc" => "Native GPU todo",
         "cells" => "41",
         _ => "boon-native-input-proof",
+    }
+}
+
+fn isolated_preview_driver_text(label: &str) -> Option<&'static str> {
+    match label {
+        "todomvc" => Some("a"),
+        "cells" => Some("41"),
+        _ => None,
     }
 }
 

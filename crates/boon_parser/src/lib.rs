@@ -432,7 +432,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let lines = parser_lines(&tokens);
     let items = parser_items(&lines);
     let mut expressions = Vec::new();
-    let statements = ast_statement_tree(&items, &mut expressions);
+    let statements = ast_statement_tree(&items, &mut expressions, source);
     Ok(AstProgram {
         tokens,
         lines,
@@ -617,7 +617,8 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         hold: ast_hold_name(&symbols).map(ToOwned::to_owned),
         list_capacity: ast_list_capacity(&symbols),
         opens_scope: ast_opens_scope(&symbols),
-        closes_scope: symbols.len() == 1 && symbols.first().map(String::as_str) == Some("}"),
+        closes_scope: symbols.len() == 1
+            && matches!(symbols.first().map(String::as_str), Some("}" | "]" | ")")),
         operators,
         symbols,
         field,
@@ -628,10 +629,14 @@ fn parser_item(line: &ParserLine) -> ParserItem {
     }
 }
 
-fn ast_statement_tree(items: &[ParserItem], expressions: &mut Vec<AstExpr>) -> Vec<AstStatement> {
+fn ast_statement_tree(
+    items: &[ParserItem],
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Vec<AstStatement> {
     let mut index = 0usize;
     let mut next_id = 0usize;
-    ast_statement_block(items, &mut index, 0, expressions, &mut next_id)
+    ast_statement_block(items, &mut index, 0, expressions, &mut next_id, source)
 }
 
 fn ast_statement_block(
@@ -640,6 +645,7 @@ fn ast_statement_block(
     min_indent: usize,
     expressions: &mut Vec<AstExpr>,
     next_id: &mut usize,
+    source: &str,
 ) -> Vec<AstStatement> {
     let mut statements = Vec::new();
     while let Some(item) = items.get(*index) {
@@ -651,19 +657,24 @@ fn ast_statement_block(
             continue;
         }
         let indent = item.indent;
-        let mut statement = ast_statement(item, expressions, *next_id);
+        let mut statement = ast_statement(item, expressions, *next_id, source);
         *next_id += 1;
         *index += 1;
         if item.opens_scope || items.get(*index).is_some_and(|next| next.indent > indent) {
             statement.children =
-                ast_statement_block(items, index, indent + 1, expressions, next_id);
+                ast_statement_block(items, index, indent + 1, expressions, next_id, source);
         }
         statements.push(statement);
     }
     statements
 }
 
-fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -> AstStatement {
+fn ast_statement(
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    id: usize,
+    source: &str,
+) -> AstStatement {
     let kind = if let Some(function) = item.function.clone() {
         AstStatementKind::Function {
             name: function,
@@ -686,7 +697,8 @@ fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -
         }
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
-    } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "]")) {
+    } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
+    {
         AstStatementKind::Block
     } else {
         AstStatementKind::Expression
@@ -698,7 +710,7 @@ fn ast_statement(item: &ParserItem, expressions: &mut Vec<AstExpr>, id: usize) -
         None
     } else {
         let expr_tokens = statement_expression_tokens(item);
-        (!expr_tokens.is_empty()).then(|| parse_ast_expr(&expr_tokens, item, expressions))
+        (!expr_tokens.is_empty()).then(|| parse_ast_expr(&expr_tokens, item, expressions, source))
     };
     AstStatement {
         id,
@@ -726,8 +738,13 @@ fn statement_expression_tokens(item: &ParserItem) -> Vec<String> {
     item.symbols.clone()
 }
 
-fn parse_ast_expr(tokens: &[String], item: &ParserItem, expressions: &mut Vec<AstExpr>) -> usize {
-    let kind = ast_expr_kind(tokens, item, expressions);
+fn parse_ast_expr(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> usize {
+    let kind = ast_expr_kind(tokens, item, expressions, source);
     push_ast_expr(item, expressions, kind)
 }
 
@@ -747,6 +764,7 @@ fn ast_expr_kind(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> AstExprKind {
     if tokens.is_empty() {
         return AstExprKind::Delimiter;
@@ -772,8 +790,11 @@ fn ast_expr_kind(
     if let Some(value) = string_literal_value(tokens) {
         return AstExprKind::StringLiteral(value);
     }
-    if let Some(text) = text_literal_value(tokens) {
+    if let Some(text) = text_literal_value(tokens, item, source) {
         return AstExprKind::TextLiteral(text);
+    }
+    if tokens == ["Text/empty", "(", ")"] {
+        return AstExprKind::TextLiteral(String::new());
     }
     if tokens == ["Text/empty"] {
         return AstExprKind::TextLiteral(String::new());
@@ -789,11 +810,11 @@ fn ast_expr_kind(
     if tokens.first().map(String::as_str) == Some("[")
         && tokens.last().map(String::as_str) == Some("]")
     {
-        return AstExprKind::Record(ast_record_fields(tokens, item, expressions));
+        return AstExprKind::Record(ast_record_fields(tokens, item, expressions, source));
     }
     if let Some((left, op, right)) = split_infix(tokens) {
-        let left = parse_ast_expr(left, item, expressions);
-        let right = parse_ast_expr(right, item, expressions);
+        let left = parse_ast_expr(left, item, expressions, source);
+        let right = parse_ast_expr(right, item, expressions, source);
         return AstExprKind::Infix {
             left,
             op: op.to_owned(),
@@ -804,11 +825,11 @@ fn ast_expr_kind(
         return AstExprKind::MatchArm {
             pattern: tokens[..arrow].to_vec(),
             output: (!tokens[arrow + 1..].is_empty())
-                .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions)),
+                .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
         };
     }
     if let Some(pipe) = find_top_level_pipe(tokens) {
-        let input = parse_ast_expr(&tokens[..pipe], item, expressions);
+        let input = parse_ast_expr(&tokens[..pipe], item, expressions, source);
         let op = tokens
             .get(pipe + 1)
             .cloned()
@@ -829,17 +850,20 @@ fn ast_expr_kind(
         if op == "THEN" {
             return AstExprKind::Then {
                 input,
-                output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions),
+                output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source),
             };
         }
         return AstExprKind::Pipe {
             input,
             op,
-            args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions),
+            args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source),
         };
     }
-    if let Some((function, args)) = ast_call(tokens, item, expressions) {
+    if let Some((function, args)) = ast_call(tokens, item, expressions, source) {
         return AstExprKind::Call { function, args };
+    }
+    if tokens.first().map(String::as_str) == Some("Oklch") {
+        return AstExprKind::StringLiteral(tokens.join(""));
     }
     if tokens.len() == 1 && is_name(&tokens[0]) {
         let token = tokens[0].clone();
@@ -859,6 +883,7 @@ fn ast_record_fields(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> Vec<AstRecordField> {
     split_top_level(&tokens[1..tokens.len() - 1], ",")
         .into_iter()
@@ -868,7 +893,7 @@ fn ast_record_fields(
             }
             Some(AstRecordField {
                 name: part[0].clone(),
-                value: parse_ast_expr(&part[2..], item, expressions),
+                value: parse_ast_expr(&part[2..], item, expressions, source),
             })
         })
         .collect()
@@ -878,6 +903,7 @@ fn ast_call(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> Option<(String, Vec<AstCallArg>)> {
     let open = tokens.iter().position(|token| token == "(")?;
     if open == 0 {
@@ -885,11 +911,16 @@ fn ast_call(
     }
     let function = tokens[..open].join("");
     let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
+    let arg_tokens = if close > open {
+        &tokens[open + 1..close]
+    } else {
+        &[]
+    };
     Some((
         function,
-        split_top_level(&tokens[open + 1..close], ",")
+        split_top_level(arg_tokens, ",")
             .into_iter()
-            .filter_map(|part| ast_call_arg(&part, item, expressions))
+            .filter_map(|part| ast_call_arg(&part, item, expressions, source))
             .collect(),
     ))
 }
@@ -898,14 +929,20 @@ fn ast_call_args_after_operator(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> Vec<AstCallArg> {
     let Some(open) = tokens.iter().position(|token| token == "(") else {
         return Vec::new();
     };
     let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
-    split_top_level(&tokens[open + 1..close], ",")
+    let arg_tokens = if close > open {
+        &tokens[open + 1..close]
+    } else {
+        &[]
+    };
+    split_top_level(arg_tokens, ",")
         .into_iter()
-        .filter_map(|part| ast_call_arg(&part, item, expressions))
+        .filter_map(|part| ast_call_arg(&part, item, expressions, source))
         .collect()
 }
 
@@ -913,16 +950,18 @@ fn ast_operator_block_expr(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> Option<usize> {
     let open = tokens.iter().position(|token| token == "{")?;
     let close = matching_close(tokens, open)?;
-    (close > open + 1).then(|| parse_ast_expr(&tokens[open + 1..close], item, expressions))
+    (close > open + 1).then(|| parse_ast_expr(&tokens[open + 1..close], item, expressions, source))
 }
 
 fn ast_call_arg(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
+    source: &str,
 ) -> Option<AstCallArg> {
     if tokens.is_empty() {
         return None;
@@ -930,12 +969,12 @@ fn ast_call_arg(
     if tokens.get(1).map(String::as_str) == Some(":") {
         return Some(AstCallArg {
             name: Some(tokens[0].clone()),
-            value: parse_ast_expr(&tokens[2..], item, expressions),
+            value: parse_ast_expr(&tokens[2..], item, expressions, source),
         });
     }
     Some(AstCallArg {
         name: None,
-        value: parse_ast_expr(tokens, item, expressions),
+        value: parse_ast_expr(tokens, item, expressions, source),
     })
 }
 
@@ -1042,11 +1081,24 @@ fn path_segments(tokens: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn text_literal_value(tokens: &[String]) -> Option<String> {
+fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Option<String> {
     if tokens.first().map(String::as_str) != Some("TEXT")
         || tokens.get(1).map(String::as_str) != Some("{")
     {
         return None;
+    }
+    if let Some(slice) = source.get(item.start..item.end)
+        && let Some(text_start) = slice.find("TEXT")
+        && let Some(open_offset) = slice[text_start..].find('{')
+    {
+        let after_open = text_start + open_offset + 1;
+        if let Some(close_offset) = slice[after_open..].rfind('}') {
+            return Some(
+                slice[after_open..after_open + close_offset]
+                    .trim()
+                    .to_owned(),
+            );
+        }
     }
     let close = tokens.iter().rposition(|token| token == "}")?;
     Some(tokens[2..close].join(" "))
@@ -1167,6 +1219,7 @@ fn detect_program_kind(path: &str, ast: &AstProgram) -> Result<ProgramKind, Pars
 }
 
 fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    let example_source = path.contains("/examples/") || path.starts_with("examples/");
     for token in &ast.tokens {
         if matches!(token.kind, AstTokenKind::String | AstTokenKind::Comment) {
             continue;
@@ -1187,13 +1240,74 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
                 "`#` comments are not supported in Boon source; use `--` comments",
             ));
         }
+        if token.lexeme == "LINK" {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`LINK` is not supported in boon-circuit examples; declare input ports with `SOURCE`",
+            ));
+        }
+        if example_source && matches!(token.lexeme.as_str(), "bg" | "fill" | "true" | "false") {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "Boon examples must use canonical names such as `background`, `Fill`, `True`, and `False`",
+            ));
+        }
+    }
+    for item in &ast.items {
+        for window in item.symbols.windows(2) {
+            if matches!(
+                window,
+                [pipe, op] if pipe == "|>" && matches!(op.as_str(), "LINK" | "SOURCE")
+            ) {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "`|> LINK` and `|> SOURCE` are not supported; wire `SOURCE` ports through explicit element event fields",
+                ));
+            }
+        }
+    }
+    if example_source {
+        if let Some(document) = document_statement(ast) {
+            let document_is_canonical = document.expr.is_some_and(|expr_id| {
+                ast.expressions.get(expr_id).is_some_and(|expr| {
+                    matches!(&expr.kind, AstExprKind::Call { function, .. } if function == "Document/new")
+                })
+            });
+            if !document_is_canonical || statement_has_field(document, "kind") {
+                return Err(error(
+                    path,
+                    document.line,
+                    document.indent + 1,
+                    "example documents must use `Document/new(root: Element/...)`, not legacy `document.children.element.kind` records",
+                ));
+            }
+        }
     }
     Ok(())
 }
 
+fn statement_has_field(statement: &AstStatement, needle: &str) -> bool {
+    matches!(&statement.kind, AstStatementKind::Field { name } if name == needle)
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_has_field(child, needle))
+}
+
 fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     let mut stack = Vec::new();
-    for token in ast.semantic_tokens() {
+    for token in ast.tokens.iter().filter(|token| {
+        !matches!(
+            token.kind,
+            AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
+        )
+    }) {
         match token.lexeme.as_str() {
             "[" | "{" | "(" => stack.push((token.lexeme.as_str(), token.line, token.column)),
             "]" if stack.pop().map(|(ch, _, _)| ch) != Some("[") => {
@@ -1474,6 +1588,9 @@ fn derive_structure_from_statements(
                 }
             }
             AstStatementKind::Field { name } => {
+                if name == "document" {
+                    continue;
+                }
                 if !statement.children.is_empty() {
                     scope.push(name.clone());
                     derive_structure_from_statements(
@@ -1550,6 +1667,9 @@ fn collect_row_scope_statements(
         }
         match &statement.kind {
             AstStatementKind::Field { name } => {
+                if name == "document" {
+                    continue;
+                }
                 if !statement.children.is_empty() {
                     scope.push(name.clone());
                     collect_row_scope_statements(&statement.children, ast, scope, functions);
@@ -2044,6 +2164,37 @@ LIST {}
         )
         .unwrap_err();
         assert!(err.message.contains("use `--` comments"));
+    }
+
+    #[test]
+    fn rejects_legacy_link_and_piped_source_wiring() {
+        let legacy_link = "LIST {}\nbutton: LINK\nSOURCE\nHOLD\nLATEST\nList/map";
+        let err = parse_source("examples/todomvc.bn", legacy_link).unwrap_err();
+        assert!(err.message.contains("`LINK` is not supported"));
+
+        let piped_source =
+            "LIST {}\nclick: SOURCE\nvalue: TEXT { x } |> SOURCE\nHOLD\nLATEST\nList/map";
+        let err = parse_source("examples/todomvc.bn", piped_source).unwrap_err();
+        assert!(err.message.contains("`|> LINK` and `|> SOURCE`"));
+    }
+
+    #[test]
+    fn rejects_legacy_example_document_shape() {
+        let source = r#"
+store:
+    sources: [click: SOURCE]
+value: Text/empty() |> HOLD value { LATEST {} }
+items: LIST {}
+items |> List/map(item, new: row(seed: item))
+FUNCTION row(seed) { [title: seed.title] }
+document:
+    children:
+        element:
+            kind: Text
+            text: TEXT { bad }
+"#;
+        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
+        assert!(err.message.contains("Document/new"));
     }
 
     #[test]

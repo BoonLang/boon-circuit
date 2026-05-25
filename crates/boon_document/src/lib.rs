@@ -223,6 +223,8 @@ impl LayoutBuilder<'_, '_> {
                 DocumentNodeKind::Button | DocumentNodeKind::GridCell
             ) && node.text.is_none()
         });
+        let auto_width = style_text(&node.style, "width")
+            .is_some_and(|value| value.eq_ignore_ascii_case("auto"));
         let explicit_width =
             style_dimension(&node.style, "width", available_width).or(control_size);
         let explicit_height = style_dimension(&node.style, "height", 0.0).or(control_size);
@@ -238,9 +240,13 @@ impl LayoutBuilder<'_, '_> {
                 width: 0.0,
                 height: 0.0,
             });
-        let mut width = explicit_width
-            .unwrap_or_else(|| measured.width.max(available_width))
-            .max(1.0);
+        let mut width = if auto_width {
+            (measured.width + style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9).max(1.0)
+        } else {
+            explicit_width
+                .unwrap_or_else(|| measured.width.max(available_width))
+                .max(1.0)
+        };
         let mut height = explicit_height.unwrap_or_else(|| measured.height.max(24.0));
         let centered = style_bool(&node.style, "center").unwrap_or(false);
         let node_x = if centered && width < available_width {
@@ -347,6 +353,13 @@ fn style_bool(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<bool> {
     }
 }
 
+fn style_text<'a>(style: &'a BTreeMap<String, StyleValue>, key: &str) -> Option<&'a str> {
+    match style.get(key)? {
+        StyleValue::Text(value) => Some(value.as_str()),
+        StyleValue::Bool(_) | StyleValue::Number(_) => None,
+    }
+}
+
 fn style_dimension(
     style: &BTreeMap<String, StyleValue>,
     key: &str,
@@ -354,7 +367,7 @@ fn style_dimension(
 ) -> Option<f32> {
     match style.get(key)? {
         StyleValue::Number(value) => Some(*value as f32),
-        StyleValue::Text(value) if value == "fill" => Some(fill_width),
+        StyleValue::Text(value) if value == "Fill" || value == "fill" => Some(fill_width),
         StyleValue::Text(value) => value.parse::<f32>().ok(),
         StyleValue::Bool(_) => None,
     }

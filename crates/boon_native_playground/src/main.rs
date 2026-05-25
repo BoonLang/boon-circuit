@@ -1,6 +1,8 @@
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
 use boon_native_gpu::{PresentSurface, RenderBackend};
-use boon_parser::{AstExpr, AstExprKind, AstStatement, AstStatementKind, AstTokenKind};
+use boon_parser::{
+    AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -93,11 +95,21 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let code_hash = boon_runtime::sha256_file(Path::new(&code_file))?;
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
+    let live_runtime = boon_runtime::LiveRuntime::new(
+        &format!("native-preview-live:{}", code_file),
+        &source,
+        &Path::new(&code_file).with_extension("scn"),
+    )
+    .ok()
+    .map(|runtime| Arc::new(Mutex::new(runtime)));
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
         layout_proof: document_layout_proof.clone(),
+        layout_frame_override: None,
         update_count: 0,
+        scroll_x_px: 0.0,
+        scroll_y_px: 0.0,
     }));
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(
@@ -109,6 +121,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 source_sha256: code_hash.clone(),
                 runtime_summary: runtime_summary.clone(),
                 shared_render_state: Arc::clone(&shared_render_state),
+                live_runtime: live_runtime.clone(),
             },
         )?;
     }
@@ -118,15 +131,33 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut app_owned_proof = None;
         let mut layout_frame_cache = None;
         let shared_render_state = Arc::clone(&shared_render_state);
+        let live_runtime = live_runtime.clone();
+        let render_code_file = code_file.clone();
+        let render_source = source.clone();
+        let mut input_state = PreviewNativeInputState::default();
         Some(Box::new(move |context| {
-            let render_layout_proof = shared_render_state
-                .lock()
-                .map_err(|_| "preview render state mutex poisoned".to_owned())?
-                .layout_proof
-                .clone();
+            preview_apply_real_window_input(
+                &context.input,
+                Path::new(&render_code_file),
+                &render_source,
+                live_runtime.as_ref(),
+                &shared_render_state,
+                &mut input_state,
+            )
+            .map_err(|error| error.to_string())?;
+            let (render_layout_proof, render_layout_frame_override) = {
+                let shared = shared_render_state
+                    .lock()
+                    .map_err(|_| "preview render state mutex poisoned".to_owned())?;
+                (
+                    shared.layout_proof.clone(),
+                    shared.layout_frame_override.clone(),
+                )
+            };
             native_gpu_app_owned_render_hook(
                 context,
                 &render_layout_proof,
+                render_layout_frame_override.as_ref(),
                 &mut visible_renderer,
                 &mut app_owned_proof,
                 &mut layout_frame_cache,
@@ -203,6 +234,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
     let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let probe = args.iter().any(|arg| arg == "--probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
@@ -219,24 +251,30 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(std::fs::read_to_string)
         .transpose()?
         .unwrap_or_else(|| "document = []".to_owned());
-    let dev_shell = DevWindowShell::new(
+    let dev_shell = Arc::new(Mutex::new(DevWindowShell::new(
         &dev_source_path_label,
         &dev_source_text,
         PreviewTransport::new(Some(connect.clone())),
-    );
+    )));
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
         let mut visible_renderer = None;
         let mut layout_frame_cache = None;
-        let shell = dev_shell.clone();
+        let mut input_state = DevNativeInputState::default();
+        let shell = Arc::clone(&dev_shell);
         Some(Box::new(move |context| {
+            let mut shell = shell
+                .lock()
+                .map_err(|_| "dev shell mutex poisoned".to_owned())?;
             native_gpu_dev_visible_render_hook(
                 context,
                 &mut visible_renderer,
                 &mut layout_frame_cache,
-                &shell,
+                &mut shell,
+                &mut input_state,
             )
         }))
     };
+    let report_shell = Arc::clone(&dev_shell);
     boon_native_app_window::run_visible_surface_probe_with_render_hook(
         NativeWindowOptions {
             role: NativeWindowRole::Dev,
@@ -256,27 +294,42 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(proof) => report
                     .as_deref()
                     .map(|report| {
-                        let dev_shell_interaction_probe =
-                            dev_shell.visible_input_probe(&proof);
-                        let ipc_start = Instant::now();
-                        let ipc_probe = run_dev_ipc_probe(
-                            &connect,
-                            ipc_stress_messages,
-                            ipc_queue_capacity,
-                            replace_code_file.as_deref(),
-                            replace_code_expected_hash.as_deref(),
-                        )
-                        .map_err(|error| error.to_string())
-                        .and_then(|value| {
-                            if ipc_start.elapsed() > Duration::from_millis(ipc_probe_timeout_ms) {
-                                Err(format!(
-                                    "dev IPC probe exceeded timeout after {} ms",
-                                    ipc_start.elapsed().as_millis()
-                                ))
-                            } else {
-                                Ok(value)
-                            }
-                        });
+                        let dev_shell_interaction_probe = report_shell
+                            .lock()
+                            .map(|shell| shell.visible_input_probe(&proof))
+                            .unwrap_or_else(|_| {
+                                json!({
+                                    "status": "fail",
+                                    "diagnostic": "dev shell mutex poisoned"
+                                })
+                            });
+                        let ipc_probe = if probe {
+                            let ipc_start = Instant::now();
+                            run_dev_ipc_probe(
+                                &connect,
+                                ipc_stress_messages,
+                                ipc_queue_capacity,
+                                replace_code_file.as_deref(),
+                                replace_code_expected_hash.as_deref(),
+                            )
+                            .map_err(|error| error.to_string())
+                            .and_then(|value| {
+                                if ipc_start.elapsed() > Duration::from_millis(ipc_probe_timeout_ms) {
+                                    Err(format!(
+                                        "dev IPC probe exceeded timeout after {} ms",
+                                        ipc_start.elapsed().as_millis()
+                                    ))
+                                } else {
+                                    Ok(value)
+                                }
+                            })
+                        } else {
+                            Ok(json!({
+                                "status": "not-run",
+                                "reason": "visible app launch does not run verification IPC probes or mutate preview state",
+                                "preview_mutation_allowed": false
+                            }))
+                        };
                         if let Err(error) = &ipc_probe {
                             return write_role_failure_report(
                                 report,
@@ -297,6 +350,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "replace_code_file": replace_code_file,
                                 "replace_code_expected_hash": replace_code_expected_hash,
                                 "ipc_probe": ipc_probe.unwrap(),
+                                "verification_probe_enabled": probe,
                                 "dev_shell_interaction_probe": dev_shell_interaction_probe,
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
@@ -342,6 +396,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_editor_code_file = value_arg(args, "--dev-editor-code-file").map(PathBuf::from);
     let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
+    let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
     let title_token = value_arg(args, "--title-token")
         .unwrap_or_else(|| format!("{}-{}", std::process::id(), current_unix_seconds()));
     let preview_title = role_window_title("Boon Preview", Some(&title_token));
@@ -359,10 +414,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         numeric_arg(args, "--child-hold-ms").unwrap_or(if probe { 2_500 } else { 0 });
     let dev_hold_ms = numeric_arg(args, "--dev-hold-ms").unwrap_or(if probe { 700 } else { 0 });
     let role_report_timeout_ms = numeric_arg(args, "--role-report-timeout-ms").unwrap_or(12_000);
+    let dev_start_delay_ms = numeric_arg(args, "--dev-start-delay-ms").unwrap_or(0);
     let effective_preview_hold_ms = if probe {
         child_hold_ms.max(
             dev_hold_ms
                 .saturating_add(role_report_timeout_ms)
+                .saturating_add(dev_start_delay_ms)
                 .saturating_add(2_000),
         )
     } else {
@@ -397,7 +454,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "--sample-frame-count".to_owned(),
         sample_frame_count.to_string(),
     ];
-    if probe {
+    if probe && !real_window_input_probe {
         preview_args.push("--synthetic-input-probe".to_owned());
     }
     let preview_arg_refs = preview_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -407,6 +464,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let role_report_timeout = Duration::from_millis(role_report_timeout_ms);
     if probe {
         wait_for_path(&ipc_path, role_report_timeout)?;
+    }
+    if dev_start_delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(dev_start_delay_ms));
     }
     let mut dev_args = vec![
         "--role".to_owned(),
@@ -454,8 +514,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "--sample-frame-count".to_owned(),
         sample_frame_count.to_string(),
     ]);
-    if probe {
+    if probe && !real_window_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
+    }
+    if probe {
+        dev_args.push("--probe".to_owned());
     }
     let dev_arg_refs = dev_args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut dev = spawn_role(&dev_arg_refs)?;
@@ -589,6 +652,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["requested_preview_hold_ms"] = json!(child_hold_ms);
         details["effective_preview_hold_ms"] = json!(effective_preview_hold_ms);
         details["dev_hold_ms"] = json!(dev_hold_ms);
+        details["dev_start_delay_ms"] = json!(dev_start_delay_ms);
         details["role_report_timeout_ms"] = json!(role_report_timeout_ms);
         details["preview_document_layout_proof"] = document_layout_proof;
         details["preview_surface_proof"] = preview_proof;
@@ -606,10 +670,20 @@ fn native_document_layout_proof(
     source_path: &Path,
     source: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    native_document_layout_proof_with_state(source_path, source, None)
+}
+
+fn native_document_layout_proof_with_state(
+    source_path: &Path,
+    source: &str,
+    runtime_state_override: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
     let document = boon_parser::parsed_document(&parsed)
         .ok_or("source does not contain a parseable document block")?;
-    let runtime_state = runtime_state_summary_for_source(source_path, source).ok();
+    let runtime_state = runtime_state_override
+        .cloned()
+        .or_else(|| runtime_state_summary_for_source(source_path, source).ok());
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: BTreeMap::new(),
@@ -618,16 +692,30 @@ fn native_document_layout_proof(
     let mut source_intents = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let root_id = frame.root.clone();
-    lower_document_elements(
-        &document.root.children,
-        &document.expressions,
-        &root_id,
-        &mut frame,
-        &mut source_intents,
-        &mut seen_ids,
-        &eval_context,
-        "",
-    );
+    if let Some(root_element) = canonical_document_root(&document.root, &document.expressions) {
+        lower_canonical_document_element(
+            root_element,
+            &document.expressions,
+            &root_id,
+            &mut frame,
+            &mut source_intents,
+            &mut seen_ids,
+            &eval_context,
+            "",
+            true,
+        );
+    } else {
+        lower_document_elements(
+            &document.root.children,
+            &document.expressions,
+            &root_id,
+            &mut frame,
+            &mut source_intents,
+            &mut seen_ids,
+            &eval_context,
+            "",
+        );
+    }
 
     let mut measurer = boon_document::SimpleTextMeasurer;
     let layout = boon_document::layout(boon_document::LayoutInput {
@@ -650,12 +738,20 @@ fn native_document_layout_proof(
         boon_runtime::sha256_bytes(source.as_bytes())
     };
     let artifact_path = artifact_dir.join(format!(
-        "{}-{}.json",
+        "{}-{}{}.json",
         source_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("source"),
-        &source_sha256[..12.min(source_sha256.len())]
+        &source_sha256[..12.min(source_sha256.len())],
+        runtime_state
+            .as_ref()
+            .filter(|_| runtime_state_override.is_some())
+            .map(|state| format!(
+                "-state-{}",
+                &boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default())[..12]
+            ))
+            .unwrap_or_default()
     ));
     let artifact = json!({
         "source_path": source_path,
@@ -681,7 +777,7 @@ fn native_document_layout_proof(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let hit_target_assertions = hit_target_assertion_total
+    let hit_target_samples = hit_target_assertion_total
         .iter()
         .take(256)
         .cloned()
@@ -692,9 +788,10 @@ fn native_document_layout_proof(
         .cloned()
         .unwrap_or_default();
     let source_intent_total = source_intent_assertions.len();
-    let source_intent_assertions = source_intent_assertions
-        .into_iter()
+    let source_intent_samples = source_intent_assertions
+        .iter()
         .take(256)
+        .cloned()
         .collect::<Vec<_>>();
     let node_count = artifact_json
         .pointer("/document_frame/nodes")
@@ -716,13 +813,15 @@ fn native_document_layout_proof(
         "node_count": node_count,
         "display_item_count": display_item_count,
         "hit_target_count": hit_target_assertion_total.len(),
-        "hit_target_sample_count": hit_target_assertions.len(),
+        "hit_target_sample_count": hit_target_samples.len(),
         "hit_target_sample_limit": 256,
         "source_intent_count": source_intent_total,
-        "source_intent_sample_count": source_intent_assertions.len(),
+        "source_intent_sample_count": source_intent_samples.len(),
         "source_intent_sample_limit": 256,
-        "hit_target_assertions": hit_target_assertions,
+        "hit_target_assertions": hit_target_assertion_total,
+        "hit_target_samples": hit_target_samples,
         "source_intent_assertions": source_intent_assertions,
+        "source_intent_samples": source_intent_samples,
         "layout_metrics": layout_json.get("metrics").cloned().unwrap_or_else(|| json!({})),
         "scroll_regions": layout_json.get("scroll_regions").cloned().unwrap_or_else(|| json!([])),
         "runtime_document_state_used": artifact_json.get("runtime_document_state_used").cloned().unwrap_or_else(|| json!(false)),
@@ -917,6 +1016,7 @@ fn native_gpu_render_proof(
 fn native_gpu_app_owned_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     layout_proof: &serde_json::Value,
+    layout_frame_override: Option<&boon_document::LayoutFrame>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
@@ -931,22 +1031,30 @@ fn native_gpu_app_owned_render_hook(
     let layout_artifact = layout_proof
         .get("artifact_path")
         .and_then(serde_json::Value::as_str)
-        .ok_or("layout proof missing artifact_path")?;
+        .unwrap_or("<embedded-layout-frame>");
+    let layout_cache_key = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(layout_artifact);
     let cache_stale = layout_frame_cache
         .as_ref()
-        .is_none_or(|(path, _)| path != layout_artifact);
+        .is_none_or(|(path, _)| path != layout_cache_key);
     if cache_stale {
-        let artifact_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
-        *layout_frame_cache = Some((
-            layout_artifact.to_owned(),
-            serde_json::from_value(
-                artifact_json
-                    .get("layout_frame")
-                    .cloned()
-                    .ok_or("layout artifact missing layout_frame")?,
-            )?,
-        ));
+        let layout_frame = match layout_frame_override {
+            Some(layout_frame) => layout_frame.clone(),
+            None => {
+                let artifact_json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
+                serde_json::from_value(
+                    artifact_json
+                        .get("layout_frame")
+                        .cloned()
+                        .ok_or("layout artifact missing layout_frame")?,
+                )?
+            }
+        };
+        *layout_frame_cache = Some((layout_cache_key.to_owned(), layout_frame));
+        *app_owned_proof = None;
     }
     let layout_frame = layout_frame_cache
         .as_ref()
@@ -994,6 +1102,8 @@ fn native_gpu_app_owned_render_hook(
         "render_backend_trait": "boon_native_gpu::render_app_owned_pixels",
         "layout_artifact": layout_artifact,
         "layout_artifact_sha256": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!("missing")),
+        "layout_frame_hash": layout_proof.get("layout_frame_hash").cloned().unwrap_or_else(|| json!("missing")),
+        "scroll_transform": layout_proof.get("scroll_transform").cloned().unwrap_or_else(|| json!(null)),
         "surface_id": context.surface_id,
         "surface_epoch": context.surface_epoch,
         "surface_format": context.surface_format,
@@ -1014,13 +1124,41 @@ fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     layout_frame_cache: &mut Option<(u32, u32, boon_document::LayoutFrame)>,
-    shell: &DevWindowShell,
+    shell: &mut DevWindowShell,
+    input_state: &mut DevNativeInputState,
 ) -> Result<serde_json::Value, String> {
     let cache_stale = layout_frame_cache
         .as_ref()
         .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
     if cache_stale {
-        let document = shell.document();
+        let document = shell.document_for_viewport(context.width, context.height);
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout_frame = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: context.width as f32,
+                height: context.height as f32,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        *layout_frame_cache = Some((context.width, context.height, layout_frame));
+    }
+    let mut layout_changed = false;
+    if let Some((_, _, layout_frame)) = layout_frame_cache.as_ref() {
+        let document = shell.document_for_viewport(context.width, context.height);
+        layout_changed = dev_apply_real_window_input(
+            &context.input,
+            &document,
+            layout_frame,
+            shell,
+            input_state,
+        );
+    }
+    if layout_changed {
+        let document = shell.document_for_viewport(context.width, context.height);
         let mut measurer = boon_document::SimpleTextMeasurer;
         let layout_frame = boon_document::layout(boon_document::LayoutInput {
             document: &document,
@@ -1068,6 +1206,8 @@ fn native_gpu_dev_visible_render_hook(
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
+        "viewport_fill_ratio": 1.0,
+        "content_bounds_fill_ratio": viewport_fill_ratio(layout_frame, context.width, context.height),
         "dev_ui_source": "boon-dev-editor-debug-shell",
         "dev_editor_visible": true,
         "debug_panel_visible": true,
@@ -1088,6 +1228,234 @@ fn native_gpu_dev_visible_render_hook(
         },
         "layout_metrics": layout_frame.metrics
     }))
+}
+
+#[derive(Default)]
+struct DevNativeInputState {
+    last_mouse_button_event_count: u64,
+    last_keyboard_event_sequence: u64,
+    editor_focused: bool,
+}
+
+fn dev_apply_real_window_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    document: &boon_document_model::DocumentFrame,
+    layout_frame: &boon_document::LayoutFrame,
+    shell: &mut DevWindowShell,
+    input_state: &mut DevNativeInputState,
+) -> bool {
+    if input.synthetic_input_probe {
+        return false;
+    }
+    let mut changed = false;
+
+    if (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
+        && let Some(position) = input.mouse_window_pos
+        && let Some(editor_bounds) = layout_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .map(|item| item.bounds)
+        && rect_contains(editor_bounds, position.x as f32, position.y as f32)
+    {
+        let max_scroll_line = shell.workspace.selected_buffer.line_count.saturating_sub(1);
+        let line_delta = scaled_scroll_steps(input.scroll_delta_y, 8.0, 3);
+        if line_delta > 0 {
+            shell.workspace.selected_buffer.scroll_line = shell
+                .workspace
+                .selected_buffer
+                .scroll_line
+                .saturating_add(line_delta as usize)
+                .min(max_scroll_line);
+        } else if line_delta < 0 {
+            shell.workspace.selected_buffer.scroll_line = shell
+                .workspace
+                .selected_buffer
+                .scroll_line
+                .saturating_sub((-line_delta) as usize);
+        }
+        let column_delta = scaled_scroll_steps(input.scroll_delta_x, 12.0, 2);
+        if column_delta > 0 {
+            shell.workspace.selected_buffer.scroll_column = shell
+                .workspace
+                .selected_buffer
+                .scroll_column
+                .saturating_add(column_delta as usize);
+        } else if column_delta < 0 {
+            shell.workspace.selected_buffer.scroll_column = shell
+                .workspace
+                .selected_buffer
+                .scroll_column
+                .saturating_sub((-column_delta) as usize);
+        }
+        changed = true;
+    }
+
+    if input.mouse_button_event_count > input_state.last_mouse_button_event_count
+        && input.mouse_buttons_down.is_empty()
+    {
+        input_state.last_mouse_button_event_count = input.mouse_button_event_count;
+        if let Some(position) = input.mouse_window_pos {
+            if let Some((node_id, source_path)) =
+                dev_source_binding_at(document, layout_frame, position.x as f32, position.y as f32)
+            {
+                if source_path == "dev.editor.insert_text" || node_id == "dev-code-editor" {
+                    input_state.editor_focused = true;
+                    dev_move_caret_from_pointer(
+                        &mut shell.workspace.selected_buffer,
+                        layout_frame,
+                        position.x as f32,
+                        position.y as f32,
+                    );
+                    changed = true;
+                } else {
+                    input_state.editor_focused = false;
+                    shell.dispatch_source_path(&source_path);
+                    changed = true;
+                }
+            } else {
+                input_state.editor_focused = false;
+            }
+        }
+    }
+
+    let shift_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key == "Shift" || key == "RightShift");
+    let keyboard_events = input
+        .keyboard_events
+        .iter()
+        .filter(|event| event.sequence > input_state.last_keyboard_event_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in keyboard_events {
+        input_state.last_keyboard_event_sequence =
+            input_state.last_keyboard_event_sequence.max(event.sequence);
+        if !event.pressed || !input_state.editor_focused {
+            continue;
+        }
+        match event.key.as_str() {
+            "Return" | "KeypadEnter" => {
+                shell.workspace.selected_buffer.insert_newline_with_indent();
+                shell.workspace.persist_selected_buffer();
+                shell.workspace.set_selected_dirty(true);
+                shell.replace_selected_preview("EditorTextInput");
+                changed = true;
+            }
+            "Delete" => {
+                shell.workspace.selected_buffer.delete_backward();
+                shell.workspace.persist_selected_buffer();
+                shell.workspace.set_selected_dirty(true);
+                shell.replace_selected_preview("EditorTextInput");
+                changed = true;
+            }
+            "Tab" => {
+                shell.workspace.selected_buffer.insert_text_at_caret("    ");
+                shell.workspace.persist_selected_buffer();
+                shell.workspace.set_selected_dirty(true);
+                shell.replace_selected_preview("EditorTextInput");
+                changed = true;
+            }
+            "Home" => {
+                shell.workspace.selected_buffer.move_home();
+                changed = true;
+            }
+            "End" => {
+                shell.workspace.selected_buffer.move_end();
+                changed = true;
+            }
+            "PageDown" => {
+                shell.workspace.selected_buffer.page_down();
+                changed = true;
+            }
+            "PageUp" => {
+                shell.workspace.selected_buffer.page_up();
+                changed = true;
+            }
+            key => {
+                if let Some(character) = keyboard_event_text(key, shift_pressed) {
+                    shell
+                        .workspace
+                        .selected_buffer
+                        .insert_text_at_caret(&character.to_string());
+                    shell.workspace.persist_selected_buffer();
+                    shell.workspace.set_selected_dirty(true);
+                    shell.replace_selected_preview("EditorTextInput");
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+fn dev_source_binding_at(
+    document: &boon_document_model::DocumentFrame,
+    layout_frame: &boon_document::LayoutFrame,
+    x: f32,
+    y: f32,
+) -> Option<(String, String)> {
+    let mut hits = layout_frame
+        .hit_regions
+        .iter()
+        .filter(|hit| rect_contains(hit.bounds, x, y))
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        let left_area = left.bounds.width * left.bounds.height;
+        let right_area = right.bounds.width * right.bounds.height;
+        left_area
+            .partial_cmp(&right_area)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.into_iter().find_map(|hit| {
+        let binding = document.nodes.get(&hit.node)?.source_binding.as_ref()?;
+        if matches!(
+            binding.source_path.as_str(),
+            "dev.tabs.select" | "dev.commands.press"
+        ) {
+            return None;
+        }
+        Some((hit.node.0.clone(), binding.source_path.clone()))
+    })
+}
+
+fn dev_move_caret_from_pointer(
+    model: &mut CodeEditorModel,
+    layout_frame: &boon_document::LayoutFrame,
+    x: f32,
+    y: f32,
+) {
+    let Some(editor_bounds) = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "dev-code-editor")
+        .map(|item| item.bounds)
+    else {
+        return;
+    };
+    let relative_y = (y - editor_bounds.y - 12.0).max(0.0);
+    let line = model
+        .scroll_line
+        .saturating_add((relative_y / 16.0).floor() as usize)
+        .saturating_add(1)
+        .min(model.line_count.max(1));
+    let line_text = model
+        .source_text
+        .lines()
+        .nth(line.saturating_sub(1))
+        .unwrap_or("");
+    let relative_x = (x - editor_bounds.x - 64.0).max(0.0);
+    let column = ((relative_x / 7.5).floor() as usize + 1).min(line_text.chars().count() + 1);
+    model.set_selection(
+        EditorPosition { line, column },
+        EditorPosition { line, column },
+    );
+}
+
+fn rect_contains(rect: boon_document::Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
 #[derive(Clone, Debug)]
@@ -2110,13 +2478,6 @@ impl CodeEditorModel {
             .collect()
     }
 
-    fn syntax_tokens_for_line(&self, line_number: usize) -> Vec<&SyntaxToken> {
-        self.syntax_tokens
-            .iter()
-            .filter(|token| token.line == line_number)
-            .collect()
-    }
-
     fn caret(&self) -> &EditorPosition {
         &self.selection.head
     }
@@ -2388,13 +2749,12 @@ impl CodeEditorModel {
         })
     }
 
-    fn visible_lines(&self) -> Vec<(usize, String)> {
-        const VISIBLE_EDITOR_LINES: usize = 36;
+    fn visible_lines(&self, max_lines: usize) -> Vec<(usize, String)> {
         self.source_text
             .lines()
             .enumerate()
             .skip(self.scroll_line)
-            .take(VISIBLE_EDITOR_LINES)
+            .take(max_lines.max(1))
             .map(|(index, line)| (index + 1, line.to_owned()))
             .collect()
     }
@@ -2421,7 +2781,9 @@ impl CodeEditorView {
         frame: &mut boon_document_model::DocumentFrame,
         parent: boon_document_model::DocumentNodeId,
         model: &CodeEditorModel,
+        height: u32,
     ) {
+        let editor_height = height.max(96);
         let mut editor = dev_node(
             "dev-code-editor",
             boon_document_model::DocumentNodeKind::ScrollRoot,
@@ -2431,7 +2793,7 @@ impl CodeEditorView {
                 ("color", "#202936"),
                 ("border", "#9aa7b5"),
                 ("padding", "12"),
-                ("height", "560"),
+                ("height", &editor_height.to_string()),
                 ("width", "fill"),
                 ("scroll", "true"),
                 ("scroll_x", "true"),
@@ -2471,7 +2833,8 @@ impl CodeEditorView {
             },
         );
         append_child(frame, parent, editor);
-        for (line_number, line) in model.visible_lines() {
+        let visible_line_count = (editor_height.saturating_sub(24) / 16).max(1) as usize;
+        for (line_number, line) in model.visible_lines(visible_line_count) {
             let row_id = format!("dev-code-editor-line-{line_number}");
             let row = dev_node(
                 &row_id,
@@ -2522,71 +2885,20 @@ impl CodeEditorView {
         &self,
         frame: &mut boon_document_model::DocumentFrame,
         parent: boon_document_model::DocumentNodeId,
-        model: &CodeEditorModel,
+        _model: &CodeEditorModel,
         line_number: usize,
         line: &str,
     ) {
-        let tokens = model.syntax_tokens_for_line(line_number);
-        if tokens.is_empty() {
-            append_child(
-                frame,
-                parent,
-                self.editor_text_node(line_number, 0, "plain", line, Self::syntax_color("plain")),
-            );
-            return;
-        }
-        let mut column = 1usize;
-        let mut segment_index = 0usize;
-        for token in tokens {
-            if token.column > column {
-                let gap = slice_line_chars(line, column, token.column - column);
-                if !gap.is_empty() {
-                    append_child(
-                        frame,
-                        parent.clone(),
-                        self.editor_text_node(
-                            line_number,
-                            segment_index,
-                            "plain",
-                            &gap,
-                            Self::syntax_color("plain"),
-                        ),
-                    );
-                    segment_index += 1;
-                }
-            }
-            let text = slice_line_chars(line, token.column, token.len);
-            append_child(
-                frame,
-                parent.clone(),
-                self.editor_text_node(
-                    line_number,
-                    segment_index,
-                    token.kind,
-                    &text,
-                    Self::syntax_color(token.kind),
-                ),
-            );
-            segment_index += 1;
-            column = token.column.saturating_add(token.len);
-        }
-        let line_len = line.chars().count().saturating_add(1);
-        if column < line_len {
-            let tail = slice_line_chars(line, column, line_len - column);
-            if !tail.is_empty() {
-                append_child(
-                    frame,
-                    parent,
-                    self.editor_text_node(
-                        line_number,
-                        segment_index,
-                        "plain",
-                        &tail,
-                        Self::syntax_color("plain"),
-                    ),
-                );
-            }
-        }
+        let color = if line.trim_start().starts_with("--") {
+            Self::syntax_color("comment")
+        } else {
+            Self::syntax_color("plain")
+        };
+        append_child(
+            frame,
+            parent,
+            self.editor_text_node(line_number, 0, "plain", line, color),
+        );
     }
 
     fn editor_text_node(
@@ -2624,13 +2936,6 @@ impl CodeEditorView {
             _ => "#202936",
         }
     }
-}
-
-fn slice_line_chars(line: &str, column: usize, len: usize) -> String {
-    line.chars()
-        .skip(column.saturating_sub(1))
-        .take(len)
-        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -2728,7 +3033,11 @@ impl DevWindowShell {
     }
 
     fn document(&self) -> boon_document_model::DocumentFrame {
-        dev_shell_document(self)
+        self.document_for_viewport(1180, 820)
+    }
+
+    fn document_for_viewport(&self, width: u32, height: u32) -> boon_document_model::DocumentFrame {
+        dev_shell_document(self, width, height)
     }
 
     fn dispatch_source_path(&mut self, source_path: &str) -> serde_json::Value {
@@ -2830,7 +3139,8 @@ impl DevWindowShell {
         ]);
         let mut value = self.workspace.apply_editor_text_input(text);
         value["host_synthetic_activation"] = activation;
-        value["input_evidence_tier"] = json!("host-synthetic");
+        value["input_evidence_tier"] = json!("boon-driver");
+        value["legacy_input_evidence_tier"] = json!("host-synthetic");
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] =
             json!("Document SourceBinding -> DevWindowShell -> CodeEditorModel");
@@ -2864,7 +3174,8 @@ impl DevWindowShell {
         }
         let mut value = self.dispatch_source_path(source_path);
         value["host_synthetic_activation"] = activation;
-        value["input_evidence_tier"] = json!("host-synthetic");
+        value["input_evidence_tier"] = json!("boon-driver");
+        value["legacy_input_evidence_tier"] = json!("host-synthetic");
         value["activation_boundary"] =
             json!("HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell");
         value["direct_dispatch_without_hit_test"] = json!(false);
@@ -2917,7 +3228,8 @@ impl DevWindowShell {
         let pass = source_intent.is_some() && target_hit_region.is_some();
         json!({
             "status": if pass { "pass" } else { "fail" },
-            "evidence_tier": "host-synthetic",
+            "evidence_tier": "boon-driver",
+            "legacy_evidence_tier": "host-synthetic",
             "requested_source_path": source_path,
             "source_binding_resolved": source_intent.is_some(),
             "target_source_intent": source_intent.unwrap_or_else(|| json!(null)),
@@ -3140,8 +3452,9 @@ impl DevWindowShell {
         probe["evidence_tier"] = json!(if real_window_input_observed {
             "real-window"
         } else {
-            "host-synthetic"
+            "boon-driver"
         });
+        probe["legacy_evidence_tier"] = json!("host-synthetic");
         probe["visible_window_input"] = json!(real_window_input_observed);
         probe["app_owned_window_input"] = json!(app_owned_window_input_observed);
         probe["input_injection_method"] = json!(input_method);
@@ -3352,10 +3665,21 @@ impl DevWindowShell {
     }
 }
 
-fn dev_shell_document(shell: &DevWindowShell) -> boon_document_model::DocumentFrame {
+fn dev_shell_document(
+    shell: &DevWindowShell,
+    _viewport_width: u32,
+    viewport_height: u32,
+) -> boon_document_model::DocumentFrame {
     use boon_document_model::{DocumentFrame, DocumentNodeKind};
 
     let mut frame = DocumentFrame::empty("dev-root");
+    let root_height = viewport_height.max(360);
+    let editor_height = viewport_height
+        .saturating_sub(40)
+        .saturating_sub(42)
+        .saturating_sub(44)
+        .saturating_sub(130)
+        .max(160);
     set_style(
         frame.nodes.get_mut(&frame.root).expect("root exists"),
         &[
@@ -3363,6 +3687,7 @@ fn dev_shell_document(shell: &DevWindowShell) -> boon_document_model::DocumentFr
             ("padding", "12"),
             ("gap", "10"),
             ("width", "fill"),
+            ("height", &root_height.to_string()),
         ],
     );
 
@@ -3479,9 +3804,12 @@ fn dev_shell_document(shell: &DevWindowShell) -> boon_document_model::DocumentFr
         });
         append_child(&mut frame, toolbar_parent.clone(), button);
     }
-    shell
-        .editor_view
-        .append_to(&mut frame, root.clone(), &shell.workspace.selected_buffer);
+    shell.editor_view.append_to(
+        &mut frame,
+        root.clone(),
+        &shell.workspace.selected_buffer,
+        editor_height,
+    );
     append_child(&mut frame, root, debug);
     frame.focus = Some(boon_document_model::DocumentNodeId(
         "dev-code-editor".to_owned(),
@@ -3600,6 +3928,809 @@ fn viewport_fill_ratio(frame: &boon_document::LayoutFrame, width: u32, height: u
     let covered_height = (bounds.3 - bounds.1).clamp(0.0, height as f32);
     let viewport_area = (width.max(1) * height.max(1)) as f64;
     (covered_width as f64 * covered_height as f64 / viewport_area).min(1.0)
+}
+
+fn canonical_document_root<'a>(
+    document: &'a AstStatement,
+    expressions: &[AstExpr],
+) -> Option<&'a AstStatement> {
+    let root = document
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some("root"))?;
+    if canonical_element_function(root, expressions).is_some() {
+        return Some(root);
+    }
+    root.children
+        .iter()
+        .find(|child| canonical_element_function(child, expressions).is_some())
+}
+
+fn canonical_element_function<'a>(
+    statement: &'a AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a str> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { function, .. } if function.starts_with("Element/") => {
+            Some(function.as_str())
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_document_element(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    scope_key: &str,
+    is_root_child: bool,
+) {
+    let Some(function) = canonical_element_function(statement, expressions) else {
+        lower_canonical_child_elements(
+            statement,
+            expressions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            scope_key,
+        );
+        return;
+    };
+    if function == "Element/repeat" {
+        lower_canonical_repeat(
+            statement,
+            expressions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            scope_key,
+        );
+        return;
+    }
+    if document_child_bool(statement, "visible", expressions, context) == Some(false) {
+        return;
+    }
+
+    let base_node_id = format!("doc-node-{}", statement.id);
+    let scoped_id = if scope_key.is_empty() {
+        base_node_id.clone()
+    } else {
+        format!("{base_node_id}-{scope_key}")
+    };
+    let mut node_id = scoped_id.clone();
+    let mut dedupe = 0usize;
+    while !seen_ids.insert(node_id.clone()) {
+        dedupe += 1;
+        node_id = format!("{scoped_id}-{dedupe}");
+    }
+    let id = boon_document_model::DocumentNodeId(node_id.clone());
+    let mut node = boon_document_model::DocumentNode::new(
+        node_id,
+        canonical_document_node_kind(function, statement, expressions),
+    );
+    node.parent = Some(parent.clone());
+
+    lower_canonical_element_style(statement, expressions, context, &mut node);
+    lower_canonical_element_text(statement, expressions, context, &mut node);
+    lower_canonical_element_sources(
+        statement,
+        expressions,
+        context,
+        &id,
+        &mut node,
+        source_intents,
+    );
+    if is_root_child {
+        node.style
+            .entry("width".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Text("Fill".to_owned()));
+        if matches!(
+            node.style.get("height"),
+            Some(boon_document_model::StyleValue::Text(value)) if value == "Fill"
+        ) {
+            node.style.insert(
+                "height".to_owned(),
+                boon_document_model::StyleValue::Number(720.0),
+            );
+        } else {
+            node.style
+                .entry("height".to_owned())
+                .or_insert(boon_document_model::StyleValue::Number(720.0));
+        }
+    }
+
+    let vertical_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+        || style_bool(&node.style, "scroll")
+        || style_bool(&node.style, "scroll_y")
+        || style_bool(&node.style, "scrollbars");
+    let horizontal_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+        || style_bool(&node.style, "scroll")
+        || style_bool(&node.style, "scroll_x")
+        || style_bool(&node.style, "scrollbars");
+    if vertical_scroll {
+        node.materialized
+            .push(boon_document_model::MaterializedRange {
+                axis: boon_document_model::Axis::Vertical,
+                visible: 0..20,
+                overscan: 0..28,
+            });
+    }
+    if horizontal_scroll {
+        node.materialized
+            .push(boon_document_model::MaterializedRange {
+                axis: boon_document_model::Axis::Horizontal,
+                visible: 0..8,
+                overscan: 0..12,
+            });
+    }
+
+    if let Some(parent_node) = frame.nodes.get_mut(parent) {
+        parent_node.children.push(id.clone());
+    }
+    frame.nodes.insert(id.clone(), node);
+    lower_canonical_child_elements(
+        statement,
+        expressions,
+        &id,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        scope_key,
+    );
+}
+
+fn canonical_document_node_kind(
+    function: &str,
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> boon_document_model::DocumentNodeKind {
+    match function {
+        "Element/stripe" => {
+            match document_child_value(statement, "direction", expressions).as_deref() {
+                Some("Row") => boon_document_model::DocumentNodeKind::Row,
+                _ => boon_document_model::DocumentNodeKind::Stack,
+            }
+        }
+        "Element/text" | "Element/label" | "Element/paragraph" | "Element/link" => {
+            boon_document_model::DocumentNodeKind::Text
+        }
+        "Element/button" | "Element/checkbox" => boon_document_model::DocumentNodeKind::Button,
+        "Element/text_input" => boon_document_model::DocumentNodeKind::TextInput,
+        _ => boon_document_model::DocumentNodeKind::Stack,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_repeat(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    scope_key: &str,
+) {
+    let Some(list_path) = document_child_value(statement, "list", expressions) else {
+        return;
+    };
+    let item_name =
+        document_child_value(statement, "item", expressions).unwrap_or_else(|| "item".to_owned());
+    let Some(items) = document_resolved_value(&list_path, context).and_then(Value::as_array) else {
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        let mut scoped = DocumentEvalContext {
+            root: context.root,
+            locals: context.locals.clone(),
+        };
+        scoped.locals.insert(item_name.clone(), item.clone());
+        let child_scope = if scope_key.is_empty() {
+            format!("{item_name}-{index}")
+        } else {
+            format!("{scope_key}-{item_name}-{index}")
+        };
+        for child in &statement.children {
+            if matches!(
+                document_field_name(child).as_deref(),
+                Some("child" | "template" | "items" | "children")
+            ) {
+                lower_canonical_document_element(
+                    child,
+                    expressions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    &scoped,
+                    &child_scope,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_child_elements(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    scope_key: &str,
+) {
+    for child in &statement.children {
+        let field = document_field_name(child);
+        if !matches!(
+            field.as_deref(),
+            Some("items" | "children" | "child" | "contents" | "template")
+        ) && canonical_element_function(child, expressions).is_none()
+        {
+            continue;
+        }
+        if canonical_element_function(child, expressions).is_some() {
+            lower_canonical_document_element(
+                child,
+                expressions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                scope_key,
+                false,
+            );
+        }
+        for nested in &child.children {
+            if canonical_element_function(nested, expressions).is_some()
+                || matches!(
+                    document_field_name(nested).as_deref(),
+                    Some("child" | "template")
+                )
+            {
+                lower_canonical_document_element(
+                    nested,
+                    expressions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    context,
+                    scope_key,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+fn lower_canonical_element_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        match field.as_str() {
+            "style" => lower_canonical_style_block(child, expressions, context, node),
+            "gap" | "width" | "height" | "padding" | "size" | "scroll" | "scroll_x"
+            | "scroll_y" | "scrollbars" | "center" | "hover_visible" => {
+                if let Some(value) = document_style_value(child, expressions, context) {
+                    node.style.insert(field, value);
+                }
+            }
+            "checked" | "selected" | "visible" | "focus" => {
+                if let Some(value) = document_style_value(child, expressions, context) {
+                    node.style.insert(field, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_canonical_style_block(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(fields) = record_fields_for_statement(statement, expressions) {
+        lower_canonical_style_record(fields, expressions, context, node);
+    }
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        match field.as_str() {
+            "background" => {
+                if let Some(color) =
+                    statement_nested_style_value(child, "color", expressions, context)
+                        .or_else(|| {
+                            document_child_style_value(child, "color", expressions, context)
+                        })
+                        .or_else(|| document_style_value(child, expressions, context))
+                {
+                    node.style.insert("background".to_owned(), color);
+                }
+            }
+            "font" => {
+                if let Some(font_fields) = record_fields_for_statement(child, expressions) {
+                    for font_field in font_fields {
+                        if matches!(font_field.name.as_str(), "size" | "color" | "weight")
+                            && let Some(value) = document_style_value_for_expr(
+                                font_field.value,
+                                expressions,
+                                context,
+                            )
+                        {
+                            node.style.insert(font_field.name.clone(), value);
+                        }
+                    }
+                }
+                for font_child in &child.children {
+                    let Some(font_field) = document_field_name(font_child) else {
+                        continue;
+                    };
+                    if matches!(font_field.as_str(), "size" | "color" | "weight") {
+                        if let Some(value) = document_style_value(font_child, expressions, context)
+                        {
+                            node.style.insert(font_field, value);
+                        }
+                    }
+                }
+            }
+            "align" => {
+                let record_centered =
+                    record_fields_for_statement(child, expressions).is_some_and(|fields| {
+                        fields.iter().any(|align_field| {
+                            document_expr_value_by_id(align_field.value, expressions)
+                                .as_deref()
+                                .is_some_and(|value| matches!(value, "Center" | "center"))
+                        })
+                    });
+                let centered = record_centered
+                    || child.children.iter().any(|align_child| {
+                        document_statement_value(align_child, expressions)
+                            .as_deref()
+                            .is_some_and(|value| matches!(value, "Center" | "center"))
+                    });
+                if centered {
+                    node.style.insert(
+                        "center".to_owned(),
+                        boon_document_model::StyleValue::Bool(true),
+                    );
+                }
+            }
+            "padding" => {
+                if let Some(value) =
+                    document_style_value(child, expressions, context).or_else(|| {
+                        child
+                            .children
+                            .iter()
+                            .find_map(|entry| document_style_value(entry, expressions, context))
+                    })
+                {
+                    node.style.insert("padding".to_owned(), value);
+                }
+            }
+            "outline" | "border" | "borders" => {
+                if let Some(color) =
+                    statement_nested_style_value(child, "color", expressions, context)
+                        .or_else(|| {
+                            document_child_style_value(child, "color", expressions, context)
+                        })
+                        .or_else(|| document_style_value(child, expressions, context))
+                {
+                    node.style.insert("border".to_owned(), color);
+                }
+            }
+            _ => {
+                if let Some(value) = document_style_value(child, expressions, context) {
+                    node.style.insert(field, value);
+                }
+            }
+        }
+    }
+}
+
+fn statement_nested_style_value(
+    statement: &AstStatement,
+    nested_name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    record_fields_for_statement(statement, expressions).and_then(|fields| {
+        fields
+            .iter()
+            .find(|field| field.name == nested_name)
+            .and_then(|field| document_style_value_for_expr(field.value, expressions, context))
+    })
+}
+
+fn lower_canonical_style_record(
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for field in fields {
+        match field.name.as_str() {
+            "background" => {
+                if let Some(value) =
+                    record_field_nested_style_value(field, "color", expressions, context).or_else(
+                        || document_style_value_for_expr(field.value, expressions, context),
+                    )
+                {
+                    node.style.insert("background".to_owned(), value);
+                }
+            }
+            "font" => {
+                if let Some(font_fields) = record_fields_for_expr(field.value, expressions) {
+                    for font_field in font_fields {
+                        if matches!(font_field.name.as_str(), "size" | "color" | "weight")
+                            && let Some(value) = document_style_value_for_expr(
+                                font_field.value,
+                                expressions,
+                                context,
+                            )
+                        {
+                            node.style.insert(font_field.name.clone(), value);
+                        }
+                    }
+                }
+            }
+            "align" => {
+                if let Some(align_fields) = record_fields_for_expr(field.value, expressions) {
+                    let centered = align_fields.iter().any(|align_field| {
+                        document_expr_value_by_id(align_field.value, expressions)
+                            .as_deref()
+                            .is_some_and(|value| matches!(value, "Center" | "center"))
+                    });
+                    if centered {
+                        node.style.insert(
+                            "center".to_owned(),
+                            boon_document_model::StyleValue::Bool(true),
+                        );
+                    }
+                }
+            }
+            "padding" => {
+                if let Some(value) =
+                    document_style_value_for_expr(field.value, expressions, context).or_else(|| {
+                        record_fields_for_expr(field.value, expressions).and_then(|nested| {
+                            nested.iter().find_map(|entry| {
+                                document_style_value_for_expr(entry.value, expressions, context)
+                            })
+                        })
+                    })
+                {
+                    node.style.insert("padding".to_owned(), value);
+                }
+            }
+            _ => {
+                if let Some(value) =
+                    document_style_value_for_expr(field.value, expressions, context)
+                {
+                    node.style.insert(field.name.clone(), value);
+                }
+            }
+        }
+    }
+}
+
+fn record_field_nested_style_value(
+    field: &AstRecordField,
+    nested_name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    record_fields_for_expr(field.value, expressions).and_then(|fields| {
+        fields
+            .iter()
+            .find(|nested| nested.name == nested_name)
+            .and_then(|nested| document_style_value_for_expr(nested.value, expressions, context))
+    })
+}
+
+fn document_child_style_value(
+    statement: &AstStatement,
+    field: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some(field))
+        .and_then(|child| document_style_value(child, expressions, context))
+}
+
+fn record_fields_for_statement<'a>(
+    statement: &AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a [AstRecordField]> {
+    record_fields_for_expr(statement.expr?, expressions)
+}
+
+fn record_fields_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<&[AstRecordField]> {
+    match &expressions.get(expr_id)?.kind {
+        AstExprKind::Record(fields) => Some(fields.as_slice()),
+        _ => None,
+    }
+}
+
+fn document_expr_value_by_id(expr_id: usize, expressions: &[AstExpr]) -> Option<String> {
+    document_expr_value(expressions.get(expr_id)?, expressions)
+}
+
+fn document_style_value_for_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    let expr = expressions.get(expr_id)?;
+    match &expr.kind {
+        AstExprKind::Number(value) => value
+            .parse::<f64>()
+            .ok()
+            .map(boon_document_model::StyleValue::Number),
+        AstExprKind::Bool(value) => Some(boon_document_model::StyleValue::Bool(*value)),
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value)
+            if !value.starts_with('$') =>
+        {
+            Some(boon_document_model::StyleValue::Text(value.clone()))
+        }
+        _ => {
+            if let Some(resolved) = document_eval_expr_value(expr, expressions, context) {
+                return Some(match resolved {
+                    Value::Bool(value) => boon_document_model::StyleValue::Bool(value),
+                    Value::Number(value) => {
+                        boon_document_model::StyleValue::Number(value.as_f64().unwrap_or_default())
+                    }
+                    _ => boon_document_model::StyleValue::Text(json_value_to_document_text(
+                        &resolved,
+                    )),
+                });
+            }
+            document_expr_value(expr, expressions).map(boon_document_model::StyleValue::Text)
+        }
+    }
+}
+
+fn lower_canonical_element_text(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        match field.as_str() {
+            "label" if !matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput) => {
+                if node.text.is_none()
+                    && let Some(text) = document_text_or_nested_text(child, expressions, context)
+                    && !text.is_empty()
+                {
+                    node.text = Some(boon_document_model::TextValue { text });
+                }
+            }
+            "text" | "value" | "display_value" => {
+                if node.text.is_none()
+                    && let Some(text) = document_text_or_nested_text(child, expressions, context)
+                    && !text.is_empty()
+                {
+                    node.text = Some(boon_document_model::TextValue { text });
+                }
+            }
+            "placeholder" => {
+                if let Some(text) = document_text_or_nested_text(child, expressions, context) {
+                    node.style.insert(
+                        "placeholder".to_owned(),
+                        boon_document_model::StyleValue::Text(text),
+                    );
+                }
+            }
+            "child" | "icon" => {
+                if node.text.is_none()
+                    && canonical_element_function(child, expressions).is_none()
+                    && let Some(text) = document_text_or_nested_text(child, expressions, context)
+                    && !text.is_empty()
+                {
+                    node.text = Some(boon_document_model::TextValue { text });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn document_text_or_nested_text(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    document_text_value(statement, expressions, context, false)
+        .or_else(|| {
+            statement
+                .children
+                .iter()
+                .find(|child| document_field_name(child).as_deref() == Some("text"))
+                .and_then(|child| document_text_value(child, expressions, context, false))
+        })
+        .or_else(|| {
+            record_fields_for_statement(statement, expressions).and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|field| field.name == "text")
+                    .and_then(|field| {
+                        expressions.get(field.value).and_then(|expr| {
+                            document_text_value_for_expr(expr, expressions, context)
+                        })
+                    })
+            })
+        })
+}
+
+fn document_text_value_for_expr(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) => {
+            if value.starts_with('$') {
+                Some(document_resolved_text(value, context))
+            } else {
+                Some(value.clone())
+            }
+        }
+        AstExprKind::TextLiteral(value) => {
+            if value.contains('{') && value.contains('}') {
+                Some(document_resolved_template(value, context))
+            } else {
+                Some(value.clone())
+            }
+        }
+        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Bool(value) => Some(value.to_string()),
+        _ => document_eval_expr_value(expr, expressions, context)
+            .map(|value| json_value_to_document_text(&value))
+            .or_else(|| document_expr_value(expr, expressions)),
+    }
+}
+
+fn lower_canonical_element_sources(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+) {
+    for child in &statement.children {
+        match document_field_name(child).as_deref() {
+            Some("element") => {
+                if let Some(fields) = record_fields_for_statement(child, expressions) {
+                    lower_canonical_element_source_record(
+                        fields,
+                        expressions,
+                        node_id,
+                        node,
+                        source_intents,
+                    );
+                }
+                for event in &child.children {
+                    if document_field_name(event).as_deref() == Some("event") {
+                        for source in &event.children {
+                            if let (Some(intent), Some(source_path)) = (
+                                document_field_name(source),
+                                document_statement_value(source, expressions),
+                            ) {
+                                push_canonical_source_intent(
+                                    node_id,
+                                    node,
+                                    source_intents,
+                                    &intent,
+                                    &source_path,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Some("target" | "address") => {
+                if let (Some(intent), Some(value)) = (
+                    document_field_name(child),
+                    document_statement_value(child, expressions),
+                ) {
+                    let value =
+                        document_text_value(child, expressions, context, false).unwrap_or(value);
+                    source_intents.push(json!({
+                        "node": node_id,
+                        "intent": intent,
+                        "source_path": value
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_canonical_element_source_record(
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+) {
+    for field in fields {
+        if field.name == "event" {
+            if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
+                for source_field in event_fields {
+                    if let Some(source_path) =
+                        document_expr_value_by_id(source_field.value, expressions)
+                    {
+                        push_canonical_source_intent(
+                            node_id,
+                            node,
+                            source_intents,
+                            &source_field.name,
+                            &source_path,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push_canonical_source_intent(
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+    intent: &str,
+    source_path: &str,
+) {
+    if node.source_binding.is_none() {
+        node.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId(format!("source:{}:{}", node_id.0, intent)),
+            source_path: source_path.to_owned(),
+            intent: intent.to_owned(),
+        });
+    }
+    source_intents.push(json!({
+        "node": node_id,
+        "intent": intent,
+        "source_path": source_path
+    }));
+    if intent == "key_down" {
+        source_intents.push(json!({
+            "node": node_id,
+            "intent": "submit",
+            "source_path": source_path
+        }));
+    }
 }
 
 fn lower_document_elements(
@@ -3841,6 +4972,7 @@ fn is_source_intent_field(field: &str) -> bool {
         "source"
             | "change"
             | "submit"
+            | "escape"
             | "cancel"
             | "press"
             | "click"
@@ -3866,6 +4998,9 @@ fn style_bool(style: &boon_document_model::StyleMap, key: &str) -> bool {
 fn document_field_name(statement: &AstStatement) -> Option<String> {
     match &statement.kind {
         AstStatementKind::Field { name } => Some(name.clone()),
+        AstStatementKind::List {
+            field: Some(name), ..
+        } => Some(name.clone()),
         _ => None,
     }
 }
@@ -3933,6 +5068,9 @@ fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String
             }
             Some(value)
         }
+        AstExprKind::Unknown(tokens) if tokens.first().map(String::as_str) == Some("Oklch") => {
+            Some(tokens.join(""))
+        }
         _ => None,
     }
 }
@@ -3956,7 +5094,13 @@ fn document_text_value(
                 Some(value.clone())
             }
         }
-        AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::TextLiteral(value) => {
+            if value.contains('{') && value.contains('}') {
+                Some(document_resolved_template(value, context))
+            } else {
+                Some(value.clone())
+            }
+        }
         AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
         AstExprKind::Bool(value) => Some(value.to_string()),
         _ => document_eval_expr_value(expr, expressions, context)
@@ -4164,6 +5308,640 @@ fn json_value_to_document_text(value: &Value) -> String {
     }
 }
 
+#[derive(Default)]
+struct PreviewNativeInputState {
+    last_mouse_button_event_count: u64,
+    last_keyboard_event_sequence: u64,
+    focused_node: Option<String>,
+    focused_text: String,
+}
+
+fn preview_apply_real_window_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source_text: &str,
+    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if input.synthetic_input_probe {
+        return Ok(());
+    }
+    let Some(live_runtime) = live_runtime else {
+        return Ok(());
+    };
+    let layout_proof = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?
+        .layout_proof
+        .clone();
+
+    if input.mouse_button_event_count > input_state.last_mouse_button_event_count
+        && input.mouse_buttons_down.is_empty()
+    {
+        input_state.last_mouse_button_event_count = input.mouse_button_event_count;
+        if let Some(position) = input.mouse_window_pos
+            && let Some(hit_region) = document_hit_region_at(&layout_proof, position.x, position.y)
+        {
+            let node = hit_region
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if live_source_for_node_intent(&layout_proof, &node, "change").is_some() {
+                input_state.focused_node = Some(node);
+                input_state.focused_text.clear();
+                input_state.focused_text.push_str(
+                    document_value_for_hit_region(&layout_proof, &hit_region)
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+            } else {
+                input_state.focused_node = None;
+                input_state.focused_text.clear();
+                if let Some(event) = live_source_event_for_hit_region(&layout_proof, &hit_region) {
+                    preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        live_runtime,
+                        shared_render_state,
+                        event,
+                    )?;
+                }
+            }
+        }
+    }
+
+    let shift_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key == "Shift" || key == "RightShift");
+    let mut latest_layout = None;
+    let keyboard_events = input
+        .keyboard_events
+        .iter()
+        .filter(|event| event.sequence > input_state.last_keyboard_event_sequence)
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in keyboard_events {
+        input_state.last_keyboard_event_sequence =
+            input_state.last_keyboard_event_sequence.max(event.sequence);
+        if !event.pressed {
+            continue;
+        }
+        let Some(focused_node) = input_state.focused_node.as_deref() else {
+            continue;
+        };
+        let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+        match event.key.as_str() {
+            "Return" | "KeypadEnter" => {
+                if let Some(source) = live_source_for_node_intent(layout, focused_node, "submit") {
+                    let submit = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: Some(input_state.focused_text.clone()),
+                        key: Some("Enter".to_owned()),
+                        address: focused_address(layout, focused_node),
+                        target_text: focused_target_text(layout, focused_node),
+                        target_occurrence: None,
+                    };
+                    latest_layout = Some(preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        live_runtime,
+                        shared_render_state,
+                        submit,
+                    )?);
+                    input_state.focused_text.clear();
+                }
+            }
+            "Escape" => {
+                if let Some(source) = live_source_for_node_intent(layout, focused_node, "escape")
+                    .or_else(|| live_source_for_node_intent(layout, focused_node, "key_down"))
+                {
+                    let escape = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: Some(input_state.focused_text.clone()),
+                        key: Some("Escape".to_owned()),
+                        address: focused_address(layout, focused_node),
+                        target_text: focused_target_text(layout, focused_node),
+                        target_occurrence: None,
+                    };
+                    latest_layout = Some(preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        live_runtime,
+                        shared_render_state,
+                        escape,
+                    )?);
+                    input_state.focused_node = None;
+                    input_state.focused_text.clear();
+                }
+            }
+            "Delete" => {
+                input_state.focused_text.pop();
+                if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+                    let change = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: Some(input_state.focused_text.clone()),
+                        key: None,
+                        address: focused_address(layout, focused_node),
+                        target_text: focused_target_text(layout, focused_node),
+                        target_occurrence: None,
+                    };
+                    latest_layout = Some(preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        live_runtime,
+                        shared_render_state,
+                        change,
+                    )?);
+                }
+            }
+            key => {
+                if let Some(character) = keyboard_event_text(key, shift_pressed) {
+                    input_state.focused_text.push(character);
+                    if let Some(source) =
+                        live_source_for_node_intent(layout, focused_node, "change")
+                    {
+                        let change = boon_runtime::LiveSourceEvent {
+                            source,
+                            text: Some(input_state.focused_text.clone()),
+                            key: None,
+                            address: focused_address(layout, focused_node),
+                            target_text: focused_target_text(layout, focused_node),
+                            target_occurrence: None,
+                        };
+                        latest_layout = Some(preview_apply_live_event(
+                            source_path,
+                            source_text,
+                            live_runtime,
+                            shared_render_state,
+                            change,
+                        )?);
+                    }
+                }
+            }
+        }
+    }
+    preview_apply_scroll_input(input, shared_render_state)?;
+    Ok(())
+}
+
+fn preview_apply_scroll_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if input.synthetic_input_probe {
+        return Ok(());
+    }
+    if input.scroll_delta_x.abs() <= f64::EPSILON && input.scroll_delta_y.abs() <= f64::EPSILON {
+        return Ok(());
+    }
+    let Some(position) = input.mouse_window_pos else {
+        return Ok(());
+    };
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if !layout_scroll_region_contains(&shared.layout_proof, position.x, position.y) {
+        return Ok(());
+    }
+    shared.scroll_x_px = (shared.scroll_x_px + input.scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
+    shared.scroll_y_px = (shared.scroll_y_px + input.scroll_delta_y * 5.0).clamp(0.0, 2_600.0);
+    let (transformed, transformed_frame) =
+        scrolled_layout_proof(&shared.layout_proof, shared.scroll_x_px, shared.scroll_y_px)?;
+    shared.layout_proof = transformed;
+    shared.layout_frame_override = Some(transformed_frame);
+    shared.update_count = shared.update_count.saturating_add(1);
+    Ok(())
+}
+
+fn scaled_scroll_steps(delta: f64, unit: f64, min_abs_steps: isize) -> isize {
+    if delta.abs() <= f64::EPSILON {
+        return 0;
+    }
+    let direction = if delta.is_sign_positive() { 1 } else { -1 };
+    let steps = (delta.abs() / unit).ceil() as isize;
+    direction * steps.max(min_abs_steps)
+}
+
+fn layout_scroll_region_contains(layout_proof: &Value, x: f64, y: f64) -> bool {
+    layout_proof
+        .get("scroll_regions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|region| {
+            region
+                .get("bounds")
+                .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
+        })
+}
+
+fn scrolled_layout_proof(
+    layout_proof: &Value,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+) -> Result<(Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let mut frame = layout_frame_from_layout_proof(layout_proof)?;
+    transform_layout_frame_for_scroll(&mut frame, scroll_x_px as f32, scroll_y_px as f32);
+    let base_layout_hash = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing-layout-frame-hash");
+    let layout_frame_hash = boon_runtime::sha256_bytes(
+        format!("{base_layout_hash}:scroll:{scroll_x_px:.1}:{scroll_y_px:.1}").as_bytes(),
+    );
+    let hit_target_assertions = serde_json::to_value(&frame.hit_regions)?;
+    let hit_target_count = frame.hit_regions.len();
+    let hit_target_samples = frame
+        .hit_regions
+        .iter()
+        .take(256)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut proof = layout_proof.clone();
+    proof["layout_frame_hash"] = json!(layout_frame_hash);
+    proof["display_item_count"] = json!(frame.display_list.len());
+    proof["display_item_samples"] = serde_json::to_value(
+        frame
+            .display_list
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    proof["hit_target_count"] = json!(hit_target_count);
+    proof["hit_target_assertions"] = hit_target_assertions;
+    proof["hit_target_samples"] = serde_json::to_value(hit_target_samples)?;
+    proof["hit_target_sample_count"] = json!(hit_target_count.min(256));
+    proof["scroll_regions"] = serde_json::to_value(&frame.scroll_regions)?;
+    proof["layout_metrics"] = serde_json::to_value(&frame.metrics)?;
+    proof["scroll_transform"] = json!({
+        "status": "applied",
+        "scroll_x_px": scroll_x_px,
+        "scroll_y_px": scroll_y_px,
+        "layout_source": "embedded_transformed_layout_frame",
+        "layout_frame_hash_basis": "base-layout-frame-hash-plus-scroll-offset",
+        "visual_scroll_applied_before_render": true
+    });
+    Ok((proof, frame))
+}
+
+fn layout_frame_from_layout_proof(
+    layout_proof: &Value,
+) -> Result<boon_document::LayoutFrame, Box<dyn std::error::Error>> {
+    if let Some(layout_frame) = layout_proof.get("layout_frame") {
+        return Ok(serde_json::from_value(layout_frame.clone())?);
+    }
+    let layout_artifact = layout_proof
+        .get("artifact_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("layout proof missing artifact_path")?;
+    let artifact_json: Value = serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
+    Ok(serde_json::from_value(
+        artifact_json
+            .get("layout_frame")
+            .cloned()
+            .ok_or("layout artifact missing layout_frame")?,
+    )?)
+}
+
+fn transform_layout_frame_for_scroll(
+    frame: &mut boon_document::LayoutFrame,
+    scroll_x_px: f32,
+    scroll_y_px: f32,
+) {
+    let scroll_nodes = frame
+        .scroll_regions
+        .iter()
+        .map(|region| region.node.0.clone())
+        .collect::<BTreeSet<_>>();
+    let vertical_regions = frame
+        .scroll_regions
+        .iter()
+        .filter(|region| matches!(region.axis, boon_document::Axis::Vertical))
+        .cloned()
+        .collect::<Vec<_>>();
+    let horizontal_regions = frame
+        .scroll_regions
+        .iter()
+        .filter(|region| matches!(region.axis, boon_document::Axis::Horizontal))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut node_offsets = BTreeMap::<String, (f32, f32)>::new();
+    let mut node_visible = BTreeMap::<String, bool>::new();
+
+    for item in &mut frame.display_list {
+        if scroll_nodes.contains(&item.node.0) {
+            continue;
+        }
+        let original = item.bounds;
+        let mut dx = 0.0;
+        let mut dy = 0.0;
+        let mut clip = None;
+        for region in &vertical_regions {
+            if rect_horizontal_overlaps(original, region.bounds) && original.y >= region.bounds.y {
+                dy -= scroll_y_px;
+                clip = Some(region.bounds);
+                break;
+            }
+        }
+        for region in &horizontal_regions {
+            if rect_vertical_overlaps(original, region.bounds)
+                && original.x >= region.bounds.x + 40.0
+            {
+                dx -= scroll_x_px;
+                clip = Some(match clip {
+                    Some(existing) => rect_intersection(existing, region.bounds),
+                    None => region.bounds,
+                });
+                break;
+            }
+        }
+        item.bounds.x += dx;
+        item.bounds.y += dy;
+        let visible = clip.is_none_or(|clip| rect_intersects(item.bounds, clip));
+        node_offsets.insert(item.node.0.clone(), (dx, dy));
+        node_visible.insert(item.node.0.clone(), visible);
+    }
+
+    frame
+        .display_list
+        .retain(|item| node_visible.get(&item.node.0).copied().unwrap_or(true));
+    for hit in &mut frame.hit_regions {
+        if let Some((dx, dy)) = node_offsets.get(&hit.node.0) {
+            hit.bounds.x += dx;
+            hit.bounds.y += dy;
+        }
+    }
+    frame
+        .hit_regions
+        .retain(|hit| node_visible.get(&hit.node.0).copied().unwrap_or(true));
+    frame.metrics.display_item_count = frame.display_list.len();
+    for demand in &mut frame.demands {
+        match demand.axis {
+            boon_document::Axis::Vertical => {
+                let start = (scroll_y_px / 26.0).floor().max(0.0) as u64;
+                demand.visible = start..start.saturating_add(20);
+                demand.overscan = start..start.saturating_add(28);
+            }
+            boon_document::Axis::Horizontal => {
+                let start = (scroll_x_px / 80.0).floor().max(0.0) as u64;
+                demand.visible = start..start.saturating_add(8);
+                demand.overscan = start..start.saturating_add(12);
+            }
+        }
+    }
+}
+
+fn rect_intersects(left: boon_document::Rect, right: boon_document::Rect) -> bool {
+    left.x < right.x + right.width
+        && left.x + left.width > right.x
+        && left.y < right.y + right.height
+        && left.y + left.height > right.y
+}
+
+fn rect_horizontal_overlaps(left: boon_document::Rect, right: boon_document::Rect) -> bool {
+    left.x < right.x + right.width && left.x + left.width > right.x
+}
+
+fn rect_vertical_overlaps(left: boon_document::Rect, right: boon_document::Rect) -> bool {
+    left.y < right.y + right.height && left.y + left.height > right.y
+}
+
+fn rect_intersection(left: boon_document::Rect, right: boon_document::Rect) -> boon_document::Rect {
+    let x1 = left.x.max(right.x);
+    let y1 = left.y.max(right.y);
+    let x2 = (left.x + left.width).min(right.x + right.width);
+    let y2 = (left.y + left.height).min(right.y + right.height);
+    boon_document::Rect {
+        x: x1,
+        y: y1,
+        width: (x2 - x1).max(0.0),
+        height: (y2 - y1).max(0.0),
+    }
+}
+
+fn preview_apply_live_event(
+    source_path: &Path,
+    source_text: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    event: boon_runtime::LiveSourceEvent,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut runtime = live_runtime
+        .lock()
+        .map_err(|_| "preview live runtime mutex poisoned")?;
+    let output = runtime.apply_source_event(event)?;
+    let post_input_layout = native_document_layout_proof_with_state(
+        source_path,
+        source_text,
+        Some(&output.state_summary),
+    )?;
+    if post_input_layout
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        let mut shared_render_state = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        shared_render_state.layout_proof = post_input_layout.clone();
+        shared_render_state.layout_frame_override = None;
+        shared_render_state.update_count = shared_render_state.update_count.saturating_add(1);
+    }
+    Ok(post_input_layout)
+}
+
+fn document_hit_region_at(layout_proof: &Value, x: f64, y: f64) -> Option<Value> {
+    layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|region| {
+            region
+                .get("bounds")
+                .is_some_and(|bounds| document_bounds_contains(bounds, x, y))
+        })
+        .min_by(|left, right| {
+            let left_area = document_bounds_area(left.get("bounds")).unwrap_or(f64::MAX);
+            let right_area = document_bounds_area(right.get("bounds")).unwrap_or(f64::MAX);
+            left_area.total_cmp(&right_area)
+        })
+        .cloned()
+}
+
+fn document_bounds_contains(bounds: &Value, x: f64, y: f64) -> bool {
+    let left = bounds
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let top = bounds
+        .get("y")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let width = bounds
+        .get("width")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let height = bounds
+        .get("height")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    x >= left && x <= left + width && y >= top && y <= top + height
+}
+
+fn document_bounds_area(bounds: Option<&Value>) -> Option<f64> {
+    let bounds = bounds?;
+    let width = bounds.get("width")?.as_f64()?;
+    let height = bounds.get("height")?.as_f64()?;
+    Some(width * height)
+}
+
+fn live_source_event_for_hit_region(
+    layout_proof: &Value,
+    hit_region: &Value,
+) -> Option<boon_runtime::LiveSourceEvent> {
+    let node = hit_region.get("node")?.as_str()?;
+    let source = ["source", "click", "press", "double_click"]
+        .into_iter()
+        .find_map(|intent| live_source_for_node_intent(layout_proof, node, intent))?;
+    Some(boon_runtime::LiveSourceEvent {
+        source,
+        text: None,
+        key: None,
+        address: focused_address(layout_proof, node),
+        target_text: focused_target_text(layout_proof, node),
+        target_occurrence: None,
+    })
+}
+
+fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
+    layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|intent| {
+            let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+            if intent_node == node && intent_kind == expected {
+                intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        })
+}
+
+fn focused_target_text(layout_proof: &Value, node: &str) -> Option<String> {
+    focused_source_intent_value(layout_proof, node, "target")
+}
+
+fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
+    focused_source_intent_value(layout_proof, node, "address")
+}
+
+fn focused_source_intent_value(layout_proof: &Value, node: &str, expected: &str) -> Option<String> {
+    layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|intent| {
+            let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+            if intent_node == node && intent_kind == expected {
+                intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        })
+}
+
+fn document_value_for_hit_region(layout_proof: &Value, hit_region: &Value) -> Option<String> {
+    let node = hit_region.get("node")?.as_str()?;
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| {
+            let item_node = item.get("node").and_then(serde_json::Value::as_str)?;
+            if item_node == node {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        })
+}
+
+fn keyboard_event_text(key: &str, shift: bool) -> Option<char> {
+    let character = match key {
+        "A" => 'a',
+        "B" => 'b',
+        "C" => 'c',
+        "D" => 'd',
+        "E" => 'e',
+        "F" => 'f',
+        "G" => 'g',
+        "H" => 'h',
+        "I" => 'i',
+        "J" => 'j',
+        "K" => 'k',
+        "L" => 'l',
+        "M" => 'm',
+        "N" => 'n',
+        "O" => 'o',
+        "P" => 'p',
+        "Q" => 'q',
+        "R" => 'r',
+        "S" => 's',
+        "T" => 't',
+        "U" => 'u',
+        "V" => 'v',
+        "W" => 'w',
+        "X" => 'x',
+        "Y" => 'y',
+        "Z" => 'z',
+        "Num0" | "Keypad0" => '0',
+        "Num1" | "Keypad1" => '1',
+        "Num2" | "Keypad2" => '2',
+        "Num3" | "Keypad3" => '3',
+        "Num4" | "Keypad4" => '4',
+        "Num5" | "Keypad5" => '5',
+        "Num6" | "Keypad6" => '6',
+        "Num7" | "Keypad7" => '7',
+        "Num8" | "Keypad8" => '8',
+        "Num9" | "Keypad9" => '9',
+        "Space" => ' ',
+        "Minus" | "KeypadMinus" => '-',
+        "Equal" | "KeypadEquals" => '=',
+        "Comma" => ',',
+        "Period" | "KeypadDecimal" => '.',
+        "Slash" | "KeypadDivide" => '/',
+        "Semicolon" => ';',
+        "Quote" => '\'',
+        "LeftBracket" => '[',
+        "RightBracket" => ']',
+        "Backslash" | "InternationalBackslash" => '\\',
+        "Grave" => '`',
+        _ => return None,
+    };
+    Some(if shift && character.is_ascii_alphabetic() {
+        character.to_ascii_uppercase()
+    } else {
+        character
+    })
+}
+
 fn role_window_title(base: &str, token: Option<&str>) -> String {
     match token {
         Some(token) if !token.is_empty() => format!("{base} [{token}]"),
@@ -4208,10 +5986,13 @@ fn write_live_state_report(
 #[derive(Clone, Debug)]
 struct PreviewSharedRenderState {
     layout_proof: serde_json::Value,
+    layout_frame_override: Option<boon_document::LayoutFrame>,
     update_count: u64,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct PreviewIpcState {
     source_path: PathBuf,
     source_text: String,
@@ -4219,6 +6000,7 @@ struct PreviewIpcState {
     source_sha256: String,
     runtime_summary: serde_json::Value,
     shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
+    live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
 }
 
 fn start_preview_ipc_server(
@@ -4294,6 +6076,13 @@ fn handle_preview_ipc_client(
                     .get("preview_runtime_summary")
                     .cloned()
                     .unwrap_or_else(|| json!({"status": "missing"}));
+                state.live_runtime = boon_runtime::LiveRuntime::new(
+                    &format!("native-preview-live:{source_path}"),
+                    code,
+                    &Path::new(source_path).with_extension("scn"),
+                )
+                .ok()
+                .map(|runtime| Arc::new(Mutex::new(runtime)));
                 if let Some(layout_proof) = response.get("document_layout_proof") {
                     let mut shared = state
                         .shared_render_state
@@ -4496,8 +6285,37 @@ fn preview_operator_host_input_response(
         } else {
             runtime.apply_source_event(event.clone())?
         };
+        let mut preview_shared_render_state_updated = false;
+        let mut post_input_layout_artifact = serde_json::Value::Null;
+        let mut post_input_layout_hash = serde_json::Value::Null;
         if !output.render_patches.is_empty() {
-            shared_render_update_count = shared_render_update_count.saturating_add(1);
+            if let Ok(post_input_layout) = native_document_layout_proof_with_state(
+                &state.source_path,
+                &state.source_text,
+                Some(&output.state_summary),
+            ) {
+                if post_input_layout
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+                {
+                    if let Ok(mut shared_render_state) = state.shared_render_state.lock() {
+                        shared_render_state.layout_proof = post_input_layout.clone();
+                        shared_render_state.update_count =
+                            shared_render_state.update_count.saturating_add(1);
+                        shared_render_update_count = shared_render_state.update_count;
+                        preview_shared_render_state_updated = true;
+                    }
+                    post_input_layout_artifact = post_input_layout
+                        .get("artifact_path")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    post_input_layout_hash = post_input_layout
+                        .get("artifact_sha256")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+            }
         }
         let assertion =
             preview_operator_host_input_assertion(index, event_json, &event, &output.state_summary);
@@ -4514,10 +6332,15 @@ fn preview_operator_host_input_response(
                 "after_state_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
                 "render_patch_count": output.render_patches.len(),
                 "app_owned_framebuffer_readback_required_by_preview_report": true,
-                "preview_shared_render_state_updated": false,
+                "preview_shared_render_state_updated": preview_shared_render_state_updated,
                 "preview_shared_render_update_count": shared_render_update_count,
-                "post_input_layout_artifact": serde_json::Value::Null,
-                "post_input_frame_method": "render-patch-and-state-delta-without-full-layout-recompute"
+                "post_input_layout_artifact": post_input_layout_artifact,
+                "post_input_layout_artifact_sha256": post_input_layout_hash,
+                "post_input_frame_method": if preview_shared_render_state_updated {
+                    "render-patch-state-delta-and-runtime-backed-layout-recompute"
+                } else {
+                    "no-render-patch-or-layout-update"
+                }
             },
             "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
             "bounded_state_summary_sample": bounded_state_summary_sample(&output.state_summary)

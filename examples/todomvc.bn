@@ -18,17 +18,17 @@ store: [
     ]
 
     new_todo_text:
-        Text/empty |> HOLD text {
+        Text/empty() |> HOLD text {
             LATEST {
                 sources.new_todo_input.change.text
-                title_to_add |> THEN { Text/empty }
+                title_to_add |> THEN { Text/empty() }
             }
         }
 
     title_to_add:
         sources.new_todo_input.key_down |> WHEN {
             [key: Enter, text: text] =>
-                text |> Text/trim |> WHEN {
+                text |> Text/trim() |> WHEN {
                     TEXT {} => SKIP
                     title => title
                 }
@@ -67,20 +67,20 @@ store: [
         |> List/retain(todo, if:
             selected_filter |> WHEN {
                 All => True
-                Active => todo.completed |> Bool/not
+                Active => todo.completed |> Bool/not()
                 Completed => todo.completed
             }
         )
 
     active_count:
         todos
-        |> List/retain(todo, if: todo.completed |> Bool/not)
-        |> List/count
+        |> List/retain(todo, if: todo.completed |> Bool/not())
+        |> List/count()
 
     completed_count:
         todos
         |> List/retain(todo, if: todo.completed)
-        |> List/count
+        |> List/count()
 
     has_completed:
         completed_count > 0
@@ -107,14 +107,14 @@ FUNCTION new_todo(seed, store) {
                 LATEST {
                     sources.editing_todo_title_element.key_down |> WHEN {
                         [key: Enter, text: text] =>
-                            text |> Text/trim |> WHEN {
+                            text |> Text/trim() |> WHEN {
                                 TEXT {} => title
                                 trimmed => trimmed
                             }
                         __ => SKIP
                     }
                     sources.editing_todo_title_element.blur |> THEN {
-                        edit_text |> Text/trim |> WHEN {
+                        edit_text |> Text/trim() |> WHEN {
                             TEXT {} => title
                             trimmed => trimmed
                         }
@@ -130,7 +130,7 @@ FUNCTION new_todo(seed, store) {
                     }
                     sources.editing_todo_title_element.change.text |> WHEN {
                         changed =>
-                            changed |> Text/trim |> WHEN {
+                            changed |> Text/trim() |> WHEN {
                                 TEXT {} => draft
                                 trimmed => trimmed
                             }
@@ -146,10 +146,10 @@ FUNCTION new_todo(seed, store) {
             False |> HOLD completed {
                 LATEST {
                     sources.todo_checkbox.click |> THEN {
-                        completed |> Bool/not
+                        completed |> Bool/not()
                     }
                     store.sources.toggle_all_checkbox.click |> THEN {
-                        store.all_completed |> Bool/not
+                        store.all_completed |> Bool/not()
                     }
                 }
             }
@@ -168,235 +168,248 @@ FUNCTION new_todo(seed, store) {
             }
 
         not_editing:
-            editing |> Bool/not
+            editing |> Bool/not()
     ]
 }
 
-document:
-    children:
-        element:
-            kind: Text
-            text: "todos"
-            size: 80
-            color: "#b83f45"
-            bg: "#f5f5f5"
-            width: 550
-            height: 118
-            center: true
-            align: center
-        element:
-            kind: Column
-            id: "todomvc_surface"
-            width: 550
-            center: true
-            bg: "#ffffff"
-            border: "#ead7d7"
-            children:
-                element:
-                    kind: Row
-                    id: "todomvc_input_row"
-                    height: 66
-                    bg: "#ffffff"
-                    border: "#ead7d7"
-                    padding: "8,8,5,5"
-                    gap: 9
-                    children:
-                        element:
-                            kind: Button
-                            id: "todo_toggle_all"
-                            text: "⌄"
-                            source: store.sources.toggle_all_checkbox.click
-                            width: 36
-                            height: 50
-                            size: 28
-                            color: "#777777"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-                        element:
-                            kind: Input
-                            id: "todo_new_input"
-                            value: new_todo_text
-                            placeholder: "What needs to be done?"
-                            change: store.sources.new_todo_input.change
-                            submit: store.sources.new_todo_input.key_down
-                            width: 480
-                            size: 24
-                            height: 56
-                            color: "#4d4d4d"
-                            placeholder_color: "#9a9a9a"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-                element:
-                    kind: ForEach
-                    list: visible_todos
-                    item: todo
-                    children:
-                        element:
-                            kind: Row
-                            id: "todo_row"
-                            height: 59
-                            bg: "#ffffff"
-                            border: "#ededed"
-                            padding: "6,6,5,5"
-                            gap: 11
-                            children:
-                                element:
-                                    kind: Checkbox
-                                    id: "todo_row_checkbox"
-                                    checked: todo.completed
-                                    source: todo.sources.todo_checkbox.click
-                                    target: todo.title
-                                    size: 28
-                                element:
-                                    kind: Button
-                                    id: "todo_row_title"
-                                    text: todo.title
-                                    double_click: todo.sources.todo_title_element.double_click
-                                    target: todo.title
-                                    visible: todo.not_editing
-                                    width: 430
-                                    height: 42
-                                    size: 24
-                                    color: "#4d4d4d"
-                                    bg: "#ffffff"
-                                    border: "#ffffff"
-                                    color_if: todo.completed
-                                    if_color: "#949494"
-                                    strike_if: todo.completed
-                                    align: left
-                                element:
-                                    kind: Input
-                                    id: "todo_row_edit"
-                                    value: todo.edit_text
-                                    placeholder: todo.title
-                                    change: todo.sources.editing_todo_title_element.change
-                                    submit: todo.sources.editing_todo_title_element.key_down
-                                    escape: todo.sources.editing_todo_title_element.key_down
-                                    blur: todo.sources.editing_todo_title_element.blur
-                                    target: todo.title
-                                    visible: todo.editing
-                                    size: 24
-                                    height: 43
-                                    color: "#4d4d4d"
-                                    placeholder_color: "#777777"
-                                    bg: "#ffffff"
-                                    border: "#999999"
-                                element:
-                                    kind: Button
-                                    id: "todo_row_delete"
-                                    text: "×"
-                                    source: todo.sources.remove_todo_button.press
-                                    target: todo.title
-                                    hover_visible: true
-                                    width: 32
-                                    height: 32
-                                    size: 24
-                                    color: "#cc9a9a"
-                                    bg: "#ffffff"
-                                    border: "#ffffff"
-                element:
-                    kind: Row
-                    id: "todomvc_footer"
-                    height: 41
-                    bg: "#ffffff"
-                    border: "#ededed"
-                    padding: "9,9,4,4"
-                    gap: 9
-                    children:
-                        element:
-                            kind: Text
-                            template: "{active_count} items left"
-                            size: 14
-                            color: "#111111"
-                            width: 130
-                            height: 24
-                        element:
-                            kind: Button
-                            id: "todo_filter_all"
-                            text: "All"
-                            selected: selected_filter == All
-                            source: store.sources.filter_all.press
-                            width: 43
-                            height: 24
-                            size: 14
-                            color: "#111111"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-                            selected_border: "#d65d52"
-                        element:
-                            kind: Button
-                            id: "todo_filter_active"
-                            text: "Active"
-                            selected: selected_filter == Active
-                            source: store.sources.filter_active.press
-                            width: 65
-                            height: 24
-                            size: 14
-                            color: "#111111"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-                            selected_border: "#d65d52"
-                        element:
-                            kind: Button
-                            id: "todo_filter_completed"
-                            text: "Completed"
-                            selected: selected_filter == Completed
-                            source: store.sources.filter_completed.press
-                            width: 95
-                            height: 24
-                            size: 14
-                            color: "#111111"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-                            selected_border: "#d65d52"
-                        element:
-                            kind: Button
-                            id: "todo_clear_completed"
-                            text: "Clear completed"
-                            source: store.sources.clear_completed_button.press
-                            visible: has_completed
-                            width: 130
-                            height: 24
-                            size: 14
-                            color: "#111111"
-                            bg: "#ffffff"
-                            border: "#ffffff"
-        element:
-            kind: Text
-            text: ""
-            size: 1
-            color: "#f5f5f5"
-            bg: "#f5f5f5"
-            width: fill
-            height: 43
-            center: true
-        element:
-            kind: Text
-            text: "Double-click to edit a todo"
-            size: 12
-            color: "#4d4d4d"
-            bg: "#f5f5f5"
-            width: fill
-            height: 30
-            center: true
-            align: center
-        element:
-            kind: Text
-            text: "Created by Martin Kavík"
-            size: 12
-            color: "#4d4d4d"
-            bg: "#f5f5f5"
-            width: fill
-            height: 23
-            center: true
-            align: center
-        element:
-            kind: Text
-            text: "Part of TodoMVC"
-            size: 12
-            color: "#4d4d4d"
-            bg: "#f5f5f5"
-            width: fill
-            height: 23
-            center: true
-            align: center
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            width: Fill
+            height: Fill
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 14, color: Oklch[lightness:0.17]]
+        ]
+        items: LIST {
+            Element/container(
+                element: [tag: Header]
+                style: [
+                    width: 550
+                    height: 118
+                    align: [row: Center]
+                    background: [color: Oklch[lightness:0.97]]
+                    font: [size: 80, color: Oklch[lightness:0.54,chroma:0.156,hue:21.2]]
+                ]
+                child: TEXT { todos }
+            )
+            Element/stripe(
+                element: [tag: Section]
+                direction: Column
+                gap: 0
+                style: [
+                    width: 550
+                    align: [row: Center]
+                    background: [color: Oklch[lightness:1]]
+                    border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+                ]
+                items: LIST {
+                    Element/stripe(
+                        element: []
+                        direction: Row
+                        gap: 9
+                        style: [
+                            width: Fill
+                            height: 66
+                            padding: 8
+                            background: [color: Oklch[lightness:1]]
+                            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+                        ]
+                        items: LIST {
+                            Element/button(
+                                element: [
+                                    event: [
+                                        click: store.sources.toggle_all_checkbox.click
+                                    ]
+                                ]
+                                style: [
+                                    width: 36
+                                    height: 50
+                                    background: [color: Oklch[lightness:1]]
+                                    font: [size: 28, color: Oklch[lightness:0.56]]
+                                ]
+                                label: TEXT { ⌄ }
+                            )
+                            Element/text_input(
+                                element: [
+                                    event: [
+                                        change: store.sources.new_todo_input.change
+                                        key_down: store.sources.new_todo_input.key_down
+                                    ]
+                                ]
+                                style: [
+                                    width: 480
+                                    height: 56
+                                    background: [color: Oklch[lightness:1]]
+                                    font: [size: 24, color: Oklch[lightness:0.42]]
+                                ]
+                                label: TEXT { What needs to be done? }
+                                text: new_todo_text
+                                placeholder: [text: TEXT { What needs to be done? }]
+                                focus: True
+                            )
+                        }
+                    )
+                    Element/stripe(
+                        element: [tag: TodoList]
+                        direction: Column
+                        gap: 0
+                        style: [
+                            width: Fill
+                            height: 354
+                            background: [color: Oklch[lightness:1]]
+                            scroll: True
+                            scrollbars: True
+                        ]
+                        items: LIST {
+                            Element/repeat(
+                                element: []
+                                list: visible_todos
+                                item: todo
+                                child: Element/stripe(
+                                    element: []
+                                    direction: Row
+                                    gap: 11
+                                    style: [
+                                        width: Fill
+                                        height: 59
+                                        padding: 6
+                                        background: [color: Oklch[lightness:1]]
+                                        border: [color: Oklch[lightness:0.93]]
+                                    ]
+                                    items: LIST {
+                                        Element/checkbox(
+                                            element: [
+                                                event: [
+                                                    click: todo.sources.todo_checkbox.click
+                                                ]
+                                            ]
+                                            style: [size: 28]
+                                            label: Text/empty()
+                                            checked: todo.completed
+                                            target: todo.title
+                                        )
+                                        Element/button(
+                                            element: [
+                                                event: [
+                                                    double_click: todo.sources.todo_title_element.double_click
+                                                ]
+                                            ]
+                                            style: [
+                                                width: 430
+                                                height: 42
+                                                background: [color: Oklch[lightness:1]]
+                                                font: [size: 24, color: Oklch[lightness:0.42]]
+                                            ]
+                                            label: todo.title
+                                            visible: todo.not_editing
+                                            target: todo.title
+                                        )
+                                        Element/text_input(
+                                            element: [
+                                                event: [
+                                                    change: todo.sources.editing_todo_title_element.change
+                                                    key_down: todo.sources.editing_todo_title_element.key_down
+                                                    blur: todo.sources.editing_todo_title_element.blur
+                                                ]
+                                            ]
+                                            style: [
+                                                width: 430
+                                                height: 43
+                                                background: [color: Oklch[lightness:1]]
+                                                border: [color: Oklch[lightness:0.67]]
+                                                font: [size: 24, color: Oklch[lightness:0.42]]
+                                            ]
+                                            label: TEXT { Edit todo }
+                                            text: todo.edit_text
+                                            placeholder: [text: todo.title]
+                                            visible: todo.editing
+                                            target: todo.title
+                                            focus: True
+                                        )
+                                        Element/button(
+                                            element: [
+                                                event: [
+                                                    press: todo.sources.remove_todo_button.press
+                                                ]
+                                            ]
+                                            style: [
+                                                width: 32
+                                                height: 32
+                                                background: [color: Oklch[lightness:1]]
+                                                font: [size: 24, color: Oklch[lightness:0.73,chroma:0.06,hue:18.6]]
+                                            ]
+                                            label: TEXT { × }
+                                            target: todo.title
+                                        )
+                                    }
+                                )
+                            )
+                        }
+                    )
+                    Element/stripe(
+                        element: [tag: Footer]
+                        direction: Row
+                        gap: 9
+                        style: [
+                            width: Fill
+                            height: 41
+                            padding: 9
+                            background: [color: Oklch[lightness:1]]
+                            border: [color: Oklch[lightness:0.93]]
+                        ]
+                        items: LIST {
+                            Element/label(
+                                element: []
+                                style: [width: 130, height: 24, font: [size: 14, color: Oklch[lightness:0.17]]]
+                                label: TEXT { {active_count} items left }
+                            )
+                            Element/button(
+                                element: [event: [press: store.sources.filter_all.press]]
+                                style: [width: 43, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                                label: TEXT { All }
+                                selected: selected_filter == All
+                            )
+                            Element/button(
+                                element: [event: [press: store.sources.filter_active.press]]
+                                style: [width: 65, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                                label: TEXT { Active }
+                                selected: selected_filter == Active
+                            )
+                            Element/button(
+                                element: [event: [press: store.sources.filter_completed.press]]
+                                style: [width: 95, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                                label: TEXT { Completed }
+                                selected: selected_filter == Completed
+                            )
+                            Element/button(
+                                element: [event: [press: store.sources.clear_completed_button.press]]
+                                style: [width: 130, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                                label: TEXT { Clear completed }
+                                visible: has_completed
+                            )
+                        }
+                    )
+                }
+            )
+            Element/label(
+                element: []
+                style: [width: 550, height: 30, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                label: TEXT { Double-click to edit a todo }
+            )
+            Element/label(
+                element: []
+                style: [width: 550, height: 23, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                label: TEXT { Created by Martin Kavík }
+            )
+            Element/label(
+                element: []
+                style: [width: 550, height: 23, align: [row: Center], background: [color: Oklch[lightness:0.97]], font: [size: 12, color: Oklch[lightness:0.42]]]
+                label: TEXT { Part of TodoMVC }
+            )
+        }
+    )
+)

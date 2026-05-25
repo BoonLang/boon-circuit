@@ -72,8 +72,12 @@ pub struct FrameMetrics {
     pub frame_seq: u64,
     pub draw_calls: u32,
     pub upload_bytes: u64,
+    pub visible_display_item_count: u32,
+    pub rendered_rect_count: u32,
+    pub rect_cap_hit: bool,
     pub text_runs_shaped: u32,
     pub rendered_text_runs: u32,
+    pub text_cap_hit: bool,
     pub glyphon_text_area_count: u32,
     pub color_only_rect_fallback: bool,
     pub preview_blocked_on_ipc_count: u64,
@@ -156,8 +160,12 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 frame_seq: self.frame_seq,
                 draw_calls: 0,
                 upload_bytes: 0,
+                visible_display_item_count: 0,
+                rendered_rect_count: 0,
+                rect_cap_hit: false,
                 text_runs_shaped: 0,
                 rendered_text_runs: 0,
+                text_cap_hit: false,
                 glyphon_text_area_count: 0,
                 color_only_rect_fallback: false,
                 preview_blocked_on_ipc_count: 0,
@@ -265,7 +273,8 @@ fn encode_layout_to_surface_with_pipeline(
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
     let height = request.height.clamp(1, 1080);
-    let (positions, colors) = rect_vertices(request.frame, width as f32, height as f32);
+    let (positions, colors, rect_metrics) =
+        rect_vertices(request.frame, width as f32, height as f32);
     let vertex_count = (positions.len() / 2) as u32;
     let position_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("boon-native-gpu-visible-position-buffer"),
@@ -332,8 +341,12 @@ fn encode_layout_to_surface_with_pipeline(
         frame_seq,
         draw_calls: 1 + u32::from(rendered_text_runs > 0),
         upload_bytes: ((positions.len() + colors.len()) * std::mem::size_of::<f32>()) as u64,
+        visible_display_item_count: rect_metrics.visible_display_item_count,
+        rendered_rect_count: rect_metrics.rendered_rect_count,
+        rect_cap_hit: rect_metrics.cap_hit,
         text_runs_shaped,
         rendered_text_runs,
+        text_cap_hit: false,
         glyphon_text_area_count: rendered_text_runs,
         color_only_rect_fallback: rendered_text_runs == 0 && text_runs_shaped > 0,
         preview_blocked_on_ipc_count: 0,
@@ -500,10 +513,23 @@ struct GlyphonTextState {
     renderer: TextRenderer,
     buffers: Vec<Buffer>,
     buffer_signatures: Vec<TextRunSignature>,
+    prepared_signatures: Vec<TextRunPlacementSignature>,
+    prepared_viewport: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextRunSignature {
+    text: String,
+    font_family: String,
+    width: u32,
+    height: u32,
+    size: u32,
+    color: [u8; 4],
+    align: TextAlign,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextRunPlacementSignature {
     text: String,
     font_family: String,
     x: u32,
@@ -516,6 +542,20 @@ struct TextRunSignature {
 }
 
 impl TextRunSignature {
+    fn from_run(run: &TextRun) -> Self {
+        Self {
+            text: run.text.clone(),
+            font_family: run.font_family.clone(),
+            width: run.bounds.width.to_bits(),
+            height: run.bounds.height.to_bits(),
+            size: run.size.to_bits(),
+            color: run.color,
+            align: run.align,
+        }
+    }
+}
+
+impl TextRunPlacementSignature {
     fn from_run(run: &TextRun) -> Self {
         Self {
             text: run.text.clone(),
@@ -551,6 +591,8 @@ impl GlyphonTextState {
             renderer,
             buffers: Vec::new(),
             buffer_signatures: Vec::new(),
+            prepared_signatures: Vec::new(),
+            prepared_viewport: None,
         }
     }
 
@@ -572,61 +614,70 @@ impl GlyphonTextState {
             .iter()
             .map(TextRunSignature::from_run)
             .collect::<Vec<_>>();
+        let placement_signatures = runs
+            .iter()
+            .map(TextRunPlacementSignature::from_run)
+            .collect::<Vec<_>>();
         if self.buffer_signatures != signatures {
-            self.buffers.clear();
+            let old_signatures = std::mem::take(&mut self.buffer_signatures);
+            let old_buffers = std::mem::take(&mut self.buffers);
+            let mut old_buffers = old_signatures
+                .into_iter()
+                .zip(old_buffers)
+                .collect::<Vec<_>>();
             self.buffers.reserve(runs.len());
-            for run in &runs {
-                let bounds = run.bounds;
-                let text = &run.text;
-                let font_size = run.size.clamp(8.0, 120.0);
-                let mut buffer = Buffer::new(
-                    &mut self.font_system,
-                    Metrics::new(font_size, font_size * 1.25),
-                );
-                buffer.set_size(
-                    &mut self.font_system,
-                    Some(bounds.width.max(1.0)),
-                    Some(bounds.height.max(font_size * 1.25)),
-                );
-                buffer.set_text(
-                    &mut self.font_system,
-                    text,
-                    &Attrs::new().family(Family::Name(&run.font_family)),
-                    Shaping::Advanced,
-                    None,
-                );
-                buffer.shape_until_scroll(&mut self.font_system, false);
-                self.buffers.push(buffer);
+            for (signature, run) in signatures.iter().cloned().zip(runs.iter()) {
+                if let Some(index) = old_buffers
+                    .iter()
+                    .position(|(old_signature, _)| *old_signature == signature)
+                {
+                    let (_, buffer) = old_buffers.swap_remove(index);
+                    self.buffers.push(buffer);
+                } else {
+                    let buffer = self.shape_text_run(run);
+                    self.buffers.push(buffer);
+                }
             }
             self.buffer_signatures = signatures;
         }
-        let mut areas = Vec::with_capacity(self.buffers.len());
-        for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
-            let left = text_left(run);
-            let top = run.bounds.y + 4.0;
-            areas.push(TextArea {
-                buffer,
-                left,
-                top,
-                scale: 1.0,
-                bounds: text_bounds(run.bounds, width, height),
-                default_color: Color::rgba(run.color[0], run.color[1], run.color[2], run.color[3]),
-                custom_glyphs: &[],
-            });
+        if self.prepared_signatures != placement_signatures
+            || self.prepared_viewport != Some((width, height))
+        {
+            let mut areas = Vec::with_capacity(self.buffers.len());
+            for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
+                let left = text_left(run);
+                let top = run.bounds.y + 1.0;
+                areas.push(TextArea {
+                    buffer,
+                    left,
+                    top,
+                    scale: 1.0,
+                    bounds: text_bounds(run.bounds, width, height),
+                    default_color: Color::rgba(
+                        run.color[0],
+                        run.color[1],
+                        run.color[2],
+                        run.color[3],
+                    ),
+                    custom_glyphs: &[],
+                });
+            }
+            self.renderer
+                .prepare(
+                    device,
+                    queue,
+                    &mut self.font_system,
+                    &mut self.atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .map_err(|error| RenderError {
+                    message: format!("glyphon prepare: {error}"),
+                })?;
+            self.prepared_signatures = placement_signatures;
+            self.prepared_viewport = Some((width, height));
         }
-        self.renderer
-            .prepare(
-                device,
-                queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                areas,
-                &mut self.swash_cache,
-            )
-            .map_err(|error| RenderError {
-                message: format!("glyphon prepare: {error}"),
-            })?;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("boon-native-gpu-glyphon-pass"),
@@ -651,6 +702,29 @@ impl GlyphonTextState {
                 })?;
         }
         Ok(self.buffers.len() as u32)
+    }
+
+    fn shape_text_run(&mut self, run: &TextRun) -> Buffer {
+        let bounds = run.bounds;
+        let font_size = run.size.clamp(8.0, 120.0);
+        let mut buffer = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(font_size, font_size * 1.25),
+        );
+        buffer.set_size(
+            &mut self.font_system,
+            Some(bounds.width.max(1.0)),
+            Some(bounds.height.max(font_size * 1.25)),
+        );
+        buffer.set_text(
+            &mut self.font_system,
+            &run.text,
+            &Attrs::new().family(Family::Name(&run.font_family)),
+            Shaping::Basic,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
     }
 }
 
@@ -683,14 +757,17 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         .filter(|item| rect_intersects(item.bounds, viewport))
         .filter_map(|item| {
             let size = style_number(&item.style, "size").unwrap_or(14.0);
-            let text = item.text.as_deref().unwrap_or_default().trim();
-            let (text, color) = if text.is_empty() {
-                if style_bool(&item.style, "checked") == Some(true) {
+            let raw_text = item.text.as_deref().unwrap_or_default();
+            let checked = style_bool(&item.style, "checked") == Some(true);
+            let (text, color) = if raw_text.trim().is_empty() {
+                if checked {
                     (
                         "✓".to_owned(),
                         style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
                     )
-                } else if let Some(placeholder) = style_text(&item.style, "placeholder") {
+                } else if let Some(placeholder) =
+                    style_text(&item.style, "placeholder").filter(|text| !text.trim().is_empty())
+                {
                     (
                         placeholder.to_owned(),
                         style_color_u8(&item.style, "placeholder_color")
@@ -707,20 +784,22 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                 } else {
                     style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255])
                 };
-                (text.to_owned(), color)
+                (raw_text.to_owned(), color)
+            };
+            let font_family = if checked {
+                "DejaVu Sans"
+            } else {
+                style_text(&item.style, "font").unwrap_or("JetBrains Mono")
             };
             Some(TextRun {
                 bounds: item.bounds,
                 text,
-                font_family: style_text(&item.style, "font")
-                    .unwrap_or("JetBrains Mono")
-                    .to_owned(),
+                font_family: font_family.to_owned(),
                 color,
                 size,
                 align: text_align(&item.style),
             })
         })
-        .take(160)
         .collect()
 }
 
@@ -780,9 +859,24 @@ fn text_bounds(bounds: Rect, width: u32, height: u32) -> TextBounds {
     }
 }
 
-fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec<f32>) {
+#[derive(Clone, Copy, Debug, Default)]
+struct RectVertexMetrics {
+    visible_display_item_count: u32,
+    rendered_rect_count: u32,
+    cap_hit: bool,
+}
+
+fn rect_vertices(
+    frame: &LayoutFrame,
+    width: f32,
+    height: f32,
+) -> (Vec<f32>, Vec<f32>, RectVertexMetrics) {
     let mut positions = Vec::new();
     let mut colors = Vec::new();
+    let mut metrics = RectVertexMetrics {
+        rendered_rect_count: 1,
+        ..RectVertexMetrics::default()
+    };
     push_rect(
         &mut positions,
         &mut colors,
@@ -806,9 +900,9 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
         .display_list
         .iter()
         .filter(|item| rect_intersects(item.bounds, viewport))
-        .take(512)
         .enumerate()
     {
+        metrics.visible_display_item_count += 1;
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
@@ -820,6 +914,7 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
             height,
             fill,
         );
+        metrics.rendered_rect_count += 1;
         let selected_border = (style_bool(&item.style, "selected") == Some(true))
             .then(|| style_color_f32(&item.style, "selected_border"))
             .flatten();
@@ -836,6 +931,7 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
                     border
                 },
             );
+            metrics.rendered_rect_count += 1;
         }
         if style_bool(&item.style, "strike_if") == Some(true) {
             let color = style_color_f32(&item.style, "if_color")
@@ -854,6 +950,64 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
                 height,
                 color,
             );
+            metrics.rendered_rect_count += 1;
+        }
+        if matches!(item.kind, DocumentNodeKind::Button)
+            && style_bool(&item.style, "checked") == Some(true)
+        {
+            let color = style_color_f32(&item.style, "check_color")
+                .or_else(|| style_color_f32(&item.style, "color"))
+                .unwrap_or([0.36, 0.76, 0.69, 1.0]);
+            let left = item.bounds.x + 9.0;
+            let top = item.bounds.y + 12.0;
+            push_rect(
+                &mut positions,
+                &mut colors,
+                Rect {
+                    x: left,
+                    y: top + 11.0,
+                    width: 3.0,
+                    height: 9.0,
+                },
+                width,
+                height,
+                color,
+            );
+            push_rect(
+                &mut positions,
+                &mut colors,
+                Rect {
+                    x: left + 5.0,
+                    y: top + 4.0,
+                    width: 3.0,
+                    height: 17.0,
+                },
+                width,
+                height,
+                color,
+            );
+            metrics.rendered_rect_count += 2;
+        }
+        if matches!(item.kind, DocumentNodeKind::TextInput)
+            && (item.focused || style_bool(&item.style, "focus") == Some(true))
+        {
+            let color = style_color_f32(&item.style, "caret_color")
+                .or_else(|| style_color_f32(&item.style, "color"))
+                .unwrap_or([0.22, 0.22, 0.22, 1.0]);
+            push_rect(
+                &mut positions,
+                &mut colors,
+                Rect {
+                    x: item.bounds.x + 12.0,
+                    y: item.bounds.y + 11.0,
+                    width: 2.0,
+                    height: (item.bounds.height - 22.0).max(16.0),
+                },
+                width,
+                height,
+                color,
+            );
+            metrics.rendered_rect_count += 1;
         }
     }
     if positions.is_empty() {
@@ -864,7 +1018,7 @@ fn rect_vertices(frame: &LayoutFrame, width: f32, height: f32) -> (Vec<f32>, Vec
             colors.extend_from_slice(&[0.2, 0.6, 0.9, 1.0]);
         }
     }
-    (positions, colors)
+    (positions, colors, metrics)
 }
 
 fn push_rect(
@@ -962,7 +1116,55 @@ fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {
     let StyleValue::Text(value) = style.get(key)? else {
         return None;
     };
-    parse_hex_color(value)
+    parse_oklch_color(value).or_else(|| parse_hex_color(value))
+}
+
+fn parse_oklch_color(value: &str) -> Option<[u8; 4]> {
+    let body = value.trim().strip_prefix("Oklch[")?.strip_suffix(']')?;
+    let mut lightness = None;
+    let mut chroma = Some(0.0);
+    let mut hue = Some(0.0);
+    let mut alpha = Some(1.0);
+    for part in body.split(',') {
+        let (key, value) = part.split_once(':')?;
+        let number = value.trim().parse::<f64>().ok()?;
+        match key.trim() {
+            "lightness" => lightness = Some(number),
+            "chroma" => chroma = Some(number),
+            "hue" => hue = Some(number),
+            "alpha" => alpha = Some(number),
+            _ => {}
+        }
+    }
+    let l = lightness?;
+    let c = chroma.unwrap_or_default();
+    let h = hue.unwrap_or_default().to_radians();
+    let a = c * h.cos();
+    let b = c * h.sin();
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548 * b;
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+    let r = 4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s;
+    let g = -1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s;
+    let blue = -0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701 * s;
+    let to_u8 = |channel: f64| (linear_to_srgb(channel).clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some([
+        to_u8(r),
+        to_u8(g),
+        to_u8(blue),
+        (alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+    ])
+}
+
+fn linear_to_srgb(channel: f64) -> f64 {
+    if channel <= 0.003_130_8 {
+        12.92 * channel
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 fn parse_hex_color(value: &str) -> Option<[u8; 4]> {

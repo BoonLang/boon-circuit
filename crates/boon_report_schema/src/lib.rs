@@ -223,6 +223,15 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
                 | "verify-native-dev-editor-speed"
+                | "verify-boon-driver-schema"
+                | "verify-boon-driver-e2e"
+                | "verify-boon-driver-dev-window"
+                | "verify-boon-driver-speed"
+                | "verify-boon-driver-all"
+                | "verify-linux-human-like-environment"
+                | "verify-linux-human-like-e2e"
+                | "verify-linux-human-like-speed"
+                | "verify-linux-human-like-all"
         )
     )
 }

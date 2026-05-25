@@ -520,6 +520,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_driver"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boon_host"
 version = "0.1.0"
 dependencies = [
@@ -3620,6 +3628,7 @@ version = "0.1.0"
 dependencies = [
  "boon_document",
  "boon_document_model",
+ "boon_driver",
  "boon_host",
  "boon_ir",
  "boon_native_app_window",

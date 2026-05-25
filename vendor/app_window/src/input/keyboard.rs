@@ -88,10 +88,12 @@
 //! When using the `app_window` crate's window management, this integration is handled
 //! automatically.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
+use std::sync::Mutex;
 
 /// Keyboard key definitions and enumerations.
 pub mod key;
@@ -138,12 +140,22 @@ struct Shared {
     window_ptr: AtomicPtr<c_void>,
     last_window_protocol_id: AtomicU64,
     key_event_count: AtomicU64,
+    recent_events: Mutex<VecDeque<KeyboardEventRecord>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardEventProvenance {
     pub last_window_protocol_id: Option<u64>,
     pub key_event_count: u64,
+    pub recent_events: Vec<KeyboardEventRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardEventRecord {
+    pub sequence: u64,
+    pub key: KeyboardKey,
+    pub pressed: bool,
+    pub window_protocol_id: Option<u64>,
 }
 
 impl Shared {
@@ -160,6 +172,7 @@ impl Shared {
             window_ptr: AtomicPtr::new(std::ptr::null_mut()),
             last_window_protocol_id: AtomicU64::new(0),
             key_event_count: AtomicU64::new(0),
+            recent_events: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -188,8 +201,21 @@ impl Shared {
             window_ptr as usize as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.key_event_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sequence = self
+            .key_event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let mut recent_events = self.recent_events.lock().unwrap();
+        recent_events.push_back(KeyboardEventRecord {
+            sequence,
+            key,
+            pressed: state,
+            window_protocol_id: (window_ptr as usize as u64 != 0)
+                .then_some(window_ptr as usize as u64),
+        });
+        while recent_events.len() > 256 {
+            recent_events.pop_front();
+        }
         self.key_states[key as usize].store(state, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -370,6 +396,14 @@ impl Keyboard {
                 .shared
                 .key_event_count
                 .load(std::sync::atomic::Ordering::Relaxed),
+            recent_events: self
+                .shared
+                .recent_events
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect(),
         }
     }
 

@@ -143,6 +143,7 @@ pub struct AppWindowSurfaceProof {
     pub interactive_frame_loop: bool,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
+    pub post_input_frame_timing: Option<NativeFrameTimingProof>,
     pub input_adapter: NativeInputAdapterProof,
     pub external_render_proof: Option<serde_json::Value>,
     pub readback_artifact: Option<AppWindowReadbackArtifact>,
@@ -180,11 +181,20 @@ pub struct NativeInputAdapterProof {
     pub mouse_scroll_event_count: u64,
     pub mouse_total_event_count: u64,
     pub keyboard_key_event_count: u64,
+    pub keyboard_events: Vec<NativeKeyboardEventProof>,
     pub mouse_window_pos: Option<NativeMouseWindowPosition>,
     pub mouse_buttons_down: Vec<String>,
     pub pressed_keys: Vec<String>,
     pub scroll_delta_x: f64,
     pub scroll_delta_y: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeKeyboardEventProof {
+    pub sequence: u64,
+    pub key: String,
+    pub pressed: bool,
+    pub window_protocol_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -229,6 +239,7 @@ pub struct NativeRenderFrameContext<'a> {
     pub surface_format: String,
     pub width: u32,
     pub height: u32,
+    pub input: NativeInputAdapterProof,
 }
 
 pub type NativeRenderHook = Box<
@@ -398,12 +409,18 @@ async fn run_surface_probe_inner(
         })
         .await
         .map_err(|error| NativeWindowError::Failed(format!("request_device: {error}")))?;
-    let width = ((size.width() * scale).round() as u32).max(1);
-    let height = ((size.height() * scale).round() as u32).max(1);
+    let mut width = ((size.width() * scale).round() as u32).max(1);
+    let mut height = ((size.height() * scale).round() as u32).max(1);
     let capabilities = surface.get_capabilities(&adapter);
     let mut config = surface
         .get_default_config(&adapter, width, height)
         .ok_or_else(|| NativeWindowError::Failed("surface default config unavailable".into()))?;
+    if capabilities
+        .alpha_modes
+        .contains(&wgpu::CompositeAlphaMode::Opaque)
+    {
+        config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+    }
     if options.readback_artifact_dir.is_some() {
         if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             return Err(NativeWindowError::Failed(format!(
@@ -447,6 +464,7 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-probe-encoder"),
         });
+        let input = empty_input_adapter_proof(false);
         let render_hook_ms = match render_hook.as_mut() {
             Some(render_hook) => {
                 let render_start = Instant::now();
@@ -461,6 +479,7 @@ async fn run_surface_probe_inner(
                     surface_format: surface_format.clone(),
                     width,
                     height,
+                    input,
                 })
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
@@ -531,7 +550,7 @@ async fn run_surface_probe_inner(
             .then(|| percentile(&render_hook_samples, 0.95)),
     };
     let readback_start = Instant::now();
-    let readback_artifact = if let (Some(pending), Some(artifact_dir)) =
+    let mut readback_artifact = if let (Some(pending), Some(artifact_dir)) =
         (pending_readback, options.readback_artifact_dir.as_deref())
     {
         Some(finish_visible_surface_readback(
@@ -552,6 +571,109 @@ async fn run_surface_probe_inner(
         inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
     }
     let input_adapter = sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
+    let mut post_input_frame_timing = None;
+    if input_adapter.real_os_events_observed && render_hook.is_some() {
+        let post_input_sample_count = sample_frame_count.max(1);
+        let mut post_input_presented_frame_samples = Vec::new();
+        let mut post_input_render_hook_samples = Vec::new();
+        let mut post_input_first_frame_ms = 0.0;
+        let mut post_input_readback = None;
+        for frame_index in 0..post_input_sample_count {
+            let acquire_start = Instant::now();
+            let frame = match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                other => {
+                    return Err(NativeWindowError::Failed(format!(
+                        "get_current_texture after input sample: {other:?}"
+                    )));
+                }
+            };
+            let current_surface_acquire_ms = elapsed_ms(acquire_start);
+            let present_start = Instant::now();
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("boon-native-app-window-input-sample-encoder"),
+            });
+            let frame_input = if frame_index == 0 {
+                input_adapter.clone()
+            } else {
+                sample_input_adapter(&mut mouse, &keyboard, false)
+            };
+            if let Some(render_hook) = render_hook.as_mut() {
+                let render_start = Instant::now();
+                external_render_proof = Some(
+                    render_hook(NativeRenderFrameContext {
+                        device: &device,
+                        queue: &queue,
+                        encoder: &mut encoder,
+                        surface_view: &view,
+                        surface_texture_format: config.format,
+                        surface_id: surface_id.clone(),
+                        surface_epoch: 1,
+                        surface_format: surface_format.clone(),
+                        width,
+                        height,
+                        input: frame_input,
+                    })
+                    .map_err(|error| {
+                        NativeWindowError::Failed(format!(
+                            "external render hook after input: {error}"
+                        ))
+                    })?,
+                );
+                post_input_render_hook_samples.push(elapsed_ms(render_start));
+            }
+            if frame_index + 1 == post_input_sample_count && options.readback_artifact_dir.is_some()
+            {
+                post_input_readback = Some(queue_visible_surface_readback(
+                    &device,
+                    &mut encoder,
+                    &frame.texture,
+                    options.role,
+                    width,
+                    height,
+                    config.format,
+                    &options.title,
+                )?);
+            }
+            queue.submit(Some(encoder.finish()));
+            frame.present();
+            let current_present_submit_ms = elapsed_ms(present_start);
+            let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
+            if frame_index == 0 {
+                post_input_first_frame_ms = frame_ms;
+            }
+            post_input_presented_frame_samples.push(frame_ms);
+        }
+        post_input_frame_timing = Some(NativeFrameTimingProof {
+            warmup_frame_count: 0,
+            sample_frame_count: post_input_sample_count,
+            measured_frame_count: post_input_presented_frame_samples.len() as u32,
+            first_presented_frame_ms: post_input_first_frame_ms,
+            presented_frame_ms_p50: percentile(&post_input_presented_frame_samples, 0.50),
+            presented_frame_ms_p95: percentile(&post_input_presented_frame_samples, 0.95),
+            presented_frame_ms_p99: percentile(&post_input_presented_frame_samples, 0.99),
+            presented_frame_ms_max: post_input_presented_frame_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            render_hook_ms_p95: (!post_input_render_hook_samples.is_empty())
+                .then(|| percentile(&post_input_render_hook_samples, 0.95)),
+        });
+        if let (Some(pending), Some(artifact_dir)) = (
+            post_input_readback,
+            options.readback_artifact_dir.as_deref(),
+        ) {
+            readback_artifact = Some(finish_visible_surface_readback(
+                &device,
+                pending,
+                artifact_dir,
+            )?);
+        }
+    }
 
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
@@ -593,6 +715,7 @@ async fn run_surface_probe_inner(
         interactive_frame_loop: true,
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
+        post_input_frame_timing,
         input_adapter,
         external_render_proof,
         readback_artifact,
@@ -602,6 +725,16 @@ async fn run_surface_probe_inner(
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             break;
+        }
+        let (current_size, current_scale) = app_surface.size_scale().await;
+        let current_width = ((current_size.width() * current_scale).round() as u32).max(1);
+        let current_height = ((current_size.height() * current_scale).round() as u32).max(1);
+        if current_width != width || current_height != height {
+            width = current_width;
+            height = current_height;
+            config.width = width;
+            config.height = height;
+            surface.configure(&device, &config);
         }
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -618,6 +751,7 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-interactive-encoder"),
         });
+        let input = sample_input_adapter(&mut mouse, &keyboard, false);
         match render_hook.as_mut() {
             Some(render_hook) => {
                 render_hook(NativeRenderFrameContext {
@@ -631,6 +765,7 @@ async fn run_surface_probe_inner(
                     surface_format: surface_format.clone(),
                     width,
                     height,
+                    input,
                 })
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
@@ -755,6 +890,15 @@ fn finish_visible_surface_readback(
     drop(mapped);
     pending.buffer.unmap();
 
+    if matches!(
+        pending.format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+
     let nonblank_samples = pixels
         .chunks_exact(4)
         .filter(|rgba| rgba[0] != 0 || rgba[1] != 0 || rgba[2] != 0 || rgba[3] != 0)
@@ -870,9 +1014,13 @@ fn sample_input_adapter(
         KeyboardKey::Return,
         KeyboardKey::Escape,
         KeyboardKey::Shift,
+        KeyboardKey::RightShift,
         KeyboardKey::Control,
+        KeyboardKey::RightControl,
         KeyboardKey::Option,
+        KeyboardKey::RightOption,
         KeyboardKey::Command,
+        KeyboardKey::RightCommand,
     ]
     .into_iter()
     .filter_map(|key| keyboard.is_pressed(key).then(|| format!("{key:?}")))
@@ -880,6 +1028,16 @@ fn sample_input_adapter(
     let (scroll_delta_x, scroll_delta_y) = mouse.load_clear_scroll_delta();
     let mouse_provenance = mouse.event_provenance();
     let keyboard_provenance = keyboard.event_provenance();
+    let keyboard_events = keyboard_provenance
+        .recent_events
+        .iter()
+        .map(|event| NativeKeyboardEventProof {
+            sequence: event.sequence,
+            key: format!("{:?}", event.key),
+            pressed: event.pressed,
+            window_protocol_id: event.window_protocol_id,
+        })
+        .collect::<Vec<_>>();
     let real_os_events_observed = mouse_window_pos.is_some()
         || !mouse_buttons_down.is_empty()
         || !pressed_keys.is_empty()
@@ -911,11 +1069,45 @@ fn sample_input_adapter(
         mouse_scroll_event_count: mouse_provenance.scroll_event_count,
         mouse_total_event_count: mouse_provenance.total_event_count,
         keyboard_key_event_count: keyboard_provenance.key_event_count,
+        keyboard_events,
         mouse_window_pos,
         mouse_buttons_down,
         pressed_keys,
         scroll_delta_x,
         scroll_delta_y,
+    }
+}
+
+fn empty_input_adapter_proof(synthetic_input_probe: bool) -> NativeInputAdapterProof {
+    NativeInputAdapterProof {
+        installed: true,
+        capture_scope: "app_window_coalesced_input_with_per_window_event_provenance".to_owned(),
+        keyboard_api: "app_window::input::keyboard::Keyboard::coalesced".to_owned(),
+        mouse_api: "app_window::input::mouse::Mouse::coalesced".to_owned(),
+        wheel_api: "app_window::input::mouse::Mouse::load_clear_scroll_delta".to_owned(),
+        per_window_event_provenance_api: "app_window::input::{mouse,keyboard}::event_provenance"
+            .to_owned(),
+        sampled_after_visible_window: true,
+        real_os_events_observed: false,
+        input_injection_method: if synthetic_input_probe {
+            "app_window_per_window_synthetic_input_harness".to_owned()
+        } else {
+            "none-observation-only".to_owned()
+        },
+        synthetic_input_probe,
+        mouse_last_window_protocol_id: None,
+        keyboard_last_window_protocol_id: None,
+        mouse_motion_event_count: 0,
+        mouse_button_event_count: 0,
+        mouse_scroll_event_count: 0,
+        mouse_total_event_count: 0,
+        keyboard_key_event_count: 0,
+        keyboard_events: Vec::new(),
+        mouse_window_pos: None,
+        mouse_buttons_down: Vec::new(),
+        pressed_keys: Vec::new(),
+        scroll_delta_x: 0.0,
+        scroll_delta_y: 0.0,
     }
 }
 

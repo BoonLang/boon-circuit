@@ -169,9 +169,13 @@ impl Dispatch<XdgSurface, Arc<Mutex<WindowInternal>>> for App {
                 if let Some(mut configure) = proposed {
                     let app_state = locked_data.app_state.upgrade().unwrap();
                     if configure.width == 0 && configure.height == 0 {
-                        //pick our own size
-                        configure.width = 800;
-                        configure.height = 600;
+                        // xdg-shell uses 0x0 to let the client pick its own size.
+                        // Keep the size requested by Window::new instead of falling
+                        // back to the library demo default.
+                        if let Some(applied) = locked_data.applied_configure.as_ref() {
+                            configure.width = applied.width;
+                            configure.height = applied.height;
+                        }
                     }
                     //check size (always attach on first configure)
                     let size_changed = locked_data
@@ -423,11 +427,14 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
             wayland_client::protocol::wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 data.wl_pointer_enter_serial = Some(serial);
                 data.wl_pointer_enter_surface = Some(surface);
+                let position = Position::new(surface_x, surface_y);
+                data.wl_pointer_pos.replace(position);
+                crate::input::linux::motion_event(0, surface_x, surface_y);
                 //set cursor?
                 let app = data.app_state.upgrade().expect("App state gone");
                 let cursor_request = app
@@ -575,6 +582,18 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                         }
                     }
                 }
+            }
+            wayland_client::protocol::wl_pointer::Event::Axis {
+                time: _time,
+                axis,
+                value,
+            } => {
+                crate::input::linux::axis_event(
+                    _time,
+                    axis.into(),
+                    value,
+                    data.wl_surface.as_ref().unwrap().id(),
+                );
             }
             _ => {
                 //?

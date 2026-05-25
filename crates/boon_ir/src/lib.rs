@@ -1,6 +1,6 @@
 use boon_parser::{
-    AstExpr, AstExprKind, AstStatement, AstStatementKind, ParsedProgram, ParserItem as AstItem,
-    ProgramKind,
+    AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, ParsedProgram,
+    ParserItem as AstItem, ProgramKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -963,6 +963,7 @@ fn attr_can_bind_data(attr: &str) -> bool {
     matches!(
         attr,
         "text"
+            | "label"
             | "value"
             | "display_value"
             | "edit_value"
@@ -986,7 +987,18 @@ fn collect_document_view_bindings(
     bindings: &mut Vec<ViewBinding>,
 ) {
     for statement in statements {
-        if document_statement_field(statement).as_deref() == Some("element")
+        if let Some(function) = document_statement_call(statement, expressions)
+            && function.starts_with("Element/")
+        {
+            collect_canonical_element_view_bindings(
+                function,
+                statement,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+            );
+        } else if document_statement_field(statement).as_deref() == Some("element")
             && let Some(kind) = document_child_value(statement, "kind", expressions)
         {
             collect_document_element_bindings(
@@ -1005,6 +1017,157 @@ fn collect_document_view_bindings(
             source_paths,
             bindings,
         );
+    }
+}
+
+fn collect_canonical_element_view_bindings(
+    function: &str,
+    element: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    let node_kind = canonical_view_node_kind(function).to_owned();
+    for child in &element.children {
+        let Some(attr) = document_statement_field(child) else {
+            continue;
+        };
+        if attr == "element" {
+            collect_canonical_element_source_bindings(
+                &node_kind,
+                child,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+            );
+            continue;
+        }
+        if attr_can_bind_data(&attr)
+            && let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id))
+            && let Some(path) = view_data_path_for_expr(expr, expressions)
+        {
+            bindings.push(ViewBinding {
+                id: ViewBindingId(bindings.len()),
+                node_kind: node_kind.clone(),
+                attr: attr.clone(),
+                scope_id: scope_id_for_path(row_scopes, &path),
+                source_id: None,
+                kind: if attr == "target" {
+                    ViewBindingKind::Target
+                } else {
+                    ViewBindingKind::Data
+                },
+                path,
+            });
+        }
+        for nested in &child.children {
+            if attr_can_bind_data(&attr)
+                && document_statement_field(nested).as_deref() == Some("text")
+                && let Some(expr) = nested.expr.and_then(|expr_id| expressions.get(expr_id))
+                && let Some(path) = view_data_path_for_expr(expr, expressions)
+            {
+                bindings.push(ViewBinding {
+                    id: ViewBindingId(bindings.len()),
+                    node_kind: node_kind.clone(),
+                    attr: attr.clone(),
+                    scope_id: scope_id_for_path(row_scopes, &path),
+                    source_id: None,
+                    kind: ViewBindingKind::Data,
+                    path,
+                });
+            }
+        }
+    }
+}
+
+fn canonical_view_node_kind(function: &str) -> &str {
+    match function {
+        "Element/text_input" => "Input",
+        "Element/checkbox" => "Checkbox",
+        "Element/button" => "Button",
+        "Element/label" | "Element/text" | "Element/paragraph" | "Element/link" => "Text",
+        "Element/stripe" if function.ends_with("stripe") => "Column",
+        _ => function.strip_prefix("Element/").unwrap_or(function),
+    }
+}
+
+fn collect_canonical_element_source_bindings(
+    node_kind: &str,
+    element_field: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    if let Some(fields) = record_fields_for_statement(element_field, expressions) {
+        for field in fields {
+            if field.name != "event" {
+                continue;
+            }
+            if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
+                for source_field in event_fields {
+                    if let Some(value) = document_expr_value_by_id(source_field.value, expressions)
+                    {
+                        push_canonical_view_source_binding(
+                            node_kind,
+                            &source_field.name,
+                            &value,
+                            row_scopes,
+                            source_paths,
+                            bindings,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for event_field in &element_field.children {
+        if document_statement_field(event_field).as_deref() != Some("event") {
+            continue;
+        }
+        for source_field in &event_field.children {
+            let Some(attr) = document_statement_field(source_field) else {
+                continue;
+            };
+            let Some(value) = document_statement_value(source_field, expressions) else {
+                continue;
+            };
+            push_canonical_view_source_binding(
+                node_kind,
+                &attr,
+                &value,
+                row_scopes,
+                source_paths,
+                bindings,
+            );
+        }
+    }
+}
+
+fn push_canonical_view_source_binding(
+    node_kind: &str,
+    attr: &str,
+    value: &str,
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    if let Some((path, source_id)) = source_paths
+        .iter()
+        .find(|(source_path, _)| *source_path == value)
+    {
+        let binding_attr = if attr == "key_down" { "submit" } else { attr };
+        bindings.push(ViewBinding {
+            id: ViewBindingId(bindings.len()),
+            node_kind: node_kind.to_owned(),
+            attr: binding_attr.to_owned(),
+            path: (*path).to_owned(),
+            kind: ViewBindingKind::Source,
+            scope_id: scope_id_for_path(row_scopes, path),
+            source_id: Some(*source_id),
+        });
     }
 }
 
@@ -1076,8 +1239,40 @@ fn document_child_value(
 fn document_statement_field(statement: &AstStatement) -> Option<String> {
     match &statement.kind {
         AstStatementKind::Field { name } => Some(name.clone()),
+        AstStatementKind::List {
+            field: Some(name), ..
+        } => Some(name.clone()),
         _ => None,
     }
+}
+
+fn document_statement_call<'a>(
+    statement: &AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a str> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { function, .. } => Some(function.as_str()),
+        _ => None,
+    }
+}
+
+fn record_fields_for_statement<'a>(
+    statement: &AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a [AstRecordField]> {
+    record_fields_for_expr(statement.expr?, expressions)
+}
+
+fn record_fields_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<&[AstRecordField]> {
+    match &expressions.get(expr_id)?.kind {
+        AstExprKind::Record(fields) => Some(fields.as_slice()),
+        _ => None,
+    }
+}
+
+fn document_expr_value_by_id(expr_id: usize, expressions: &[AstExpr]) -> Option<String> {
+    document_expr_value(expressions.get(expr_id)?, expressions)
 }
 
 fn document_statement_value(statement: &AstStatement, expressions: &[AstExpr]) -> Option<String> {
@@ -4100,7 +4295,7 @@ FUNCTION new_todo(seed) {
             "\n    selected_filter:",
             "\n    visible_when_selected:\n        selected_filter |> WHILE { True }\n\n    selected_filter:",
         );
-        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("row-scope-fixture.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert!(
             ir.nodes
@@ -4115,7 +4310,7 @@ FUNCTION new_todo(seed) {
             "\n    selected_filter:",
             "\n    cycle_left:\n        cycle_right |> WHILE { cycle_right }\n\n    cycle_right:\n        cycle_left |> WHILE { cycle_left }\n\n    selected_filter:",
         );
-        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("row-scope-fixture.bn", source).unwrap();
         let error = lower(&parsed).unwrap_err();
         assert!(error.contains("combinational dependency cycle"));
         assert!(error.contains("broken by HOLD"));
@@ -4224,7 +4419,7 @@ FUNCTION new_todo(seed) {
 document:
     children:
 "#;
-        let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("row-scope-fixture.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert!(parsed.row_scope_functions.iter().any(|scope| {
             scope.function == "make_entry" && scope.list == "entries" && scope.row_scope == "entry"

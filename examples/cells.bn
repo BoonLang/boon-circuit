@@ -59,157 +59,178 @@ FUNCTION new_cell(seed) {
     ]
 }
 
-document:
-    children:
-        element:
-            kind: Column
-            id: "spreadsheet_view"
-            width: 1000
-            bg: "#F6F8FB"
-            gap: 4
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [
+            width: Fill
+            height: Fill
             padding: 8
-            border: "#CBD5E1"
-            children:
-                element:
-                    kind: Row
-                    id: "spreadsheet_formula_bar"
+            background: [color: Oklch[lightness:0.98]]
+            border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
+            font: [size: 10, color: Oklch[lightness:0.12]]
+        ]
+        items: LIST {
+            Element/stripe(
+                element: []
+                direction: Row
+                gap: 4
+                style: [
+                    width: Fill
                     height: 34
-                    bg: "#F6F8FB"
-                    gap: 4
-                    padding: 0
-                    children:
-                        element:
-                            kind: Text
-                            value: "$selected_input.address"
+                    background: [color: Oklch[lightness:0.98]]
+                ]
+                items: LIST {
+                    Element/label(
+                        element: []
+                        style: [
                             width: 40
                             height: 30
-                            bg: "#E4EAF2"
-                            color: "#344256"
-                            center: true
-                            size: 10
-                        element:
-                            kind: Text
-                            value: "fx"
+                            background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                            font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                        ]
+                        label: selected_input.address
+                    )
+                    Element/label(
+                        element: []
+                        style: [
                             width: 24
                             height: 30
-                            bg: "#E4EAF2"
-                            color: "#344256"
-                            center: true
-                            size: 10
-                        element:
-                            kind: Column
-                            id: "formula_value"
+                            background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                            font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                        ]
+                        label: TEXT { fx }
+                    )
+                    Element/text_input(
+                        element: [
+                            event: [
+                                change: cell.sources.editor.change
+                                key_down: cell.sources.editor.commit
+                                escape: cell.sources.editor.cancel
+                                blur: cell.sources.editor.blur
+                            ]
+                        ]
+                        style: [
+                            width: Fill
                             height: 30
-                            bg: "#FFFFFF"
-                            padding: 0
-                            border: "#CBD5E1"
-                            children:
-                                element:
-                                    kind: Input
-                                    id: "formula_editor"
-                                    width: fill
-                                    height: 30
-                                    value: "$selected_input.edit_value"
-                                    edit_value: "$selected_input.edit_value"
-                                    display_value: "$selected_input.edit_value"
-                                    placeholder: ""
-                                    change: "$selected_input.change_source"
-                                    submit: "$selected_input.submit_source"
-                                    cancel: "$selected_input.cancel_source"
-                                    blur: "$selected_input.blur_source"
-                                    address: "$selected_input.address"
-                                    focus_proxy: true
-                                    size: 12
-                                    bg: "#FFFFFF"
-                                    border: "#CBD5E1"
-                                    focused_bg: "#FFFFFF"
-                                    focused_border: "#2F6FB8"
-                element:
-                    kind: Row
-                    id: "spreadsheet_header"
+                            background: [color: Oklch[lightness:1]]
+                            border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
+                            font: [size: 12, color: Oklch[lightness:0.12]]
+                        ]
+                        label: TEXT { Formula }
+                        text: selected_input.edit_value
+                        placeholder: [text: Text/empty()]
+                        address: selected_input.address
+                    )
+                }
+            )
+            Element/stripe(
+                element: []
+                direction: Row
+                gap: 1
+                style: [
+                    width: Fill
                     height: 26
-                    bg: "#E4EAF2"
-                    gap: 1
-                    padding: 0
-                    scroll_x: true
-                    sync_scroll_x: "spreadsheet_body"
-                    children:
-                        element:
-                            kind: Text
-                            value: ""
+                    background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                    scroll_x: True
+                ]
+                items: LIST {
+                    Element/label(
+                        element: []
+                        style: [
                             width: 40
                             height: 24
-                            bg: "#D5DDE8"
-                            center: true
-                            size: 10
-                        element:
-                            kind: ForEach
-                            list: grid_columns
-                            item: column
-                            children:
-                                element:
-                                    kind: Text
-                                    value: "$column.label"
-                                    width: 80
-                                    height: 24
-                                    bg: "#D5DDE8"
-                                    color: "#344256"
-                                    center: true
-                                    size: 10
-                element:
-                    kind: Column
-                    id: "spreadsheet_body"
-                    height: 520
-                    bg: "#FFFFFF"
-                    gap: 1
-                    padding: 0
-                    scroll: true
-                    scrollbar: true
-                    children:
-                        element:
-                            kind: ForEach
-                            list: grid_rows
-                            item: grid_row
-                            children:
-                                element:
-                                    kind: Row
-                                    id: "spreadsheet_row"
-                                    height: 26
-                                    bg: "#FFFFFF"
-                                    gap: 1
-                                    padding: 0
-                                    children:
-                                        element:
-                                            kind: Text
-                                            value: "$grid_row.row_number"
-                                            width: 40
+                            background: [color: Oklch[lightness:0.89,chroma:0.02,hue:250]]
+                        ]
+                        label: Text/empty()
+                    )
+                    Element/repeat(
+                        element: []
+                        list: grid_columns
+                        item: column
+                        child: Element/label(
+                            element: []
+                            style: [
+                                width: 80
+                                height: 24
+                                background: [color: Oklch[lightness:0.89,chroma:0.02,hue:250]]
+                                font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                            ]
+                            label: column.label
+                        )
+                    )
+                }
+            )
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 1
+                style: [
+                    width: Fill
+                    height: 620
+                    background: [color: Oklch[lightness:1]]
+                    scroll: True
+                    scrollbars: True
+                ]
+                items: LIST {
+                    Element/repeat(
+                        element: []
+                        list: grid_rows
+                        item: grid_row
+                        child: Element/stripe(
+                            element: []
+                            direction: Row
+                            gap: 1
+                            style: [
+                                width: Fill
+                                height: 26
+                                background: [color: Oklch[lightness:1]]
+                            ]
+                            items: LIST {
+                                Element/label(
+                                    element: []
+                                    style: [
+                                        width: 40
+                                        height: 24
+                                        background: [color: Oklch[lightness:0.96,chroma:0.01,hue:250]]
+                                        font: [size: 10, color: Oklch[lightness:0.46,chroma:0.04,hue:250]]
+                                    ]
+                                    label: grid_row.row_number
+                                )
+                                Element/repeat(
+                                    element: []
+                                    list: grid_row.cells
+                                    item: cell
+                                    child: Element/text_input(
+                                        element: [
+                                            event: [
+                                                change: cell.sources.editor.change
+                                                key_down: cell.sources.editor.commit
+                                                escape: cell.sources.editor.cancel
+                                                blur: cell.sources.editor.blur
+                                            ]
+                                        ]
+                                        style: [
+                                            width: 80
                                             height: 24
-                                            bg: "#EDF1F6"
-                                            color: "#4A5A70"
-                                            center: true
-                                            size: 10
-                                        element:
-                                            kind: ForEach
-                                            list: grid_row.cells
-                                            item: cell
-                                            children:
-                                                element:
-                                                    kind: Input
-                                                    id: "cell_editor"
-                                                    key: "$cell.address"
-                                                    width: 80
-                                                    height: 24
-                                                    value: "$cell.value"
-                                                    edit_value: "$cell.editing_text"
-                                                    display_value: "$cell.value"
-                                                    placeholder: "$cell.value"
-                                                    change: cell.sources.editor.change
-                                                    submit: cell.sources.editor.commit
-                                                    cancel: cell.sources.editor.cancel
-                                                    blur: cell.sources.editor.blur
-                                                    address: "$cell.address"
-                                                    size: 10
-                                                    bg: "#FFFFFF"
-                                                    border: "#D9E2EC"
-                                                    focused_bg: "#FFF7D6"
-                                                    focused_border: "#2F6FB8"
+                                            background: [color: Oklch[lightness:1]]
+                                            border: [color: Oklch[lightness:0.91,chroma:0.02,hue:250]]
+                                            font: [size: 10, color: Oklch[lightness:0.12]]
+                                        ]
+                                        label: cell.address
+                                        text: cell.value
+                                        placeholder: [text: Text/empty()]
+                                        key: cell.address
+                                        address: cell.address
+                                    )
+                                )
+                            }
+                        )
+                    )
+                }
+            )
+        }
+    )
+)

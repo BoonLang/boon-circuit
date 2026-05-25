@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex, Weak};
 use wayland_client::QueueHandle;
+use wayland_client::protocol::wl_keyboard::WlKeyboard;
+use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -36,6 +38,8 @@ pub(super) struct WindowInternal {
     pub wl_pointer_enter_serial: Option<u32>,
     pub wl_pointer_enter_surface: Option<WlSurface>,
     pub wl_pointer_pos: Option<Position>,
+    pub wl_pointer: Option<WlPointer>,
+    pub wl_keyboard: Option<WlKeyboard>,
     pub xdg_toplevel: Option<XdgToplevel>,
     pub wl_surface: Option<WlSurface>,
     pub xdg_surface: Option<XdgSurface>,
@@ -69,6 +73,8 @@ impl WindowInternal {
             wl_pointer_enter_serial: None,
             wl_pointer_enter_surface: None,
             wl_pointer_pos: None,
+            wl_pointer: None,
+            wl_keyboard: None,
             xdg_toplevel: None,
             wl_surface: None,
             requested_maximize: false,
@@ -227,7 +233,7 @@ impl Window {
 
                 // Seat (input devices) may not be available in headless environments
                 let seat_result: Result<WlSeat, _> =
-                    info.globals.bind(&info.queue_handle, 8..=9, ());
+                    info.globals.bind(&info.queue_handle, 1..=9, ());
                 if let Ok(seat) = seat_result {
                     window_internal
                         .lock()
@@ -239,8 +245,11 @@ impl Window {
                         .lock()
                         .unwrap()
                         .replace(seat.clone());
-                    let _pointer = seat.get_pointer(&info.queue_handle, window_internal.clone());
-                    let _keyboard = seat.get_keyboard(&info.queue_handle, window_internal.clone());
+                    let pointer = seat.get_pointer(&info.queue_handle, window_internal.clone());
+                    let keyboard = seat.get_keyboard(&info.queue_handle, window_internal.clone());
+                    let mut window = window_internal.lock().unwrap();
+                    window.wl_pointer = Some(pointer);
+                    window.wl_keyboard = Some(keyboard);
                 }
 
                 MAIN_THREAD_INFO.replace(Some(info));

@@ -3131,8 +3131,10 @@ impl PreviewTransport {
             Ok(ack) => {
                 let hash_matches =
                     ack.get("hash_matches").and_then(serde_json::Value::as_bool) == Some(true);
+                let ack_pass =
+                    ack.get("status").and_then(serde_json::Value::as_str) == Some("pass");
                 json!({
-                    "status": if hash_matches { "pass" } else { "fail" },
+                    "status": if hash_matches && ack_pass { "pass" } else { "fail" },
                     "kind": "ReplaceCode",
                     "command": command,
                     "transport_bound": true,
@@ -3165,6 +3167,7 @@ struct DevWindowShell {
     initial_workspace: ExampleWorkspace,
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
+    last_preview_transport: serde_json::Value,
 }
 
 impl DevWindowShell {
@@ -3188,6 +3191,10 @@ impl DevWindowShell {
             initial_workspace,
             editor_view: CodeEditorView::new(),
             preview_transport,
+            last_preview_transport: json!({
+                "status": "not-run",
+                "reason": "no preview transport command has run yet"
+            }),
         }
     }
 
@@ -3494,13 +3501,15 @@ impl DevWindowShell {
         })
     }
 
-    fn replace_selected_preview(&self, command: &str) -> serde_json::Value {
-        self.preview_transport.replace_code(
+    fn replace_selected_preview(&mut self, command: &str) -> serde_json::Value {
+        let value = self.preview_transport.replace_code(
             command,
             &self.workspace.selected_example_id,
             &self.workspace.selected_buffer.file_name,
             &self.workspace.selected_buffer.source_text,
-        )
+        );
+        self.last_preview_transport = value.clone();
+        value
     }
 
     fn command_probe(&self) -> serde_json::Value {
@@ -4028,15 +4037,33 @@ fn dev_shell_document(
     );
     let tabs = dev_tabs_node(shell);
     let toolbar = dev_toolbar_node();
+    let preview_status = shell
+        .last_preview_transport
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not-run");
+    let preview_diagnostic = shell
+        .last_preview_transport
+        .get("diagnostic")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            shell
+                .last_preview_transport
+                .pointer("/ack/diagnostic")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
     let debug = dev_node(
         "dev-debug-panel",
         DocumentNodeKind::Text,
         Some(format!(
-            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\ntokens: {}\ndiagnostics: {}\npreview transport: ReplaceCode\nselected example: {}\ncurrent file: {}\ndirty: {}\ncaret: {}:{}\nscroll: line {}, column {}\nformatted hash: {}\ncatalog: {}",
+            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\ntokens: {}\ndiagnostics: {}\npreview transport: ReplaceCode ({})\npreview diagnostic: {}\nselected example: {}\ncurrent file: {}\ndirty: {}\ncaret: {}:{}\nscroll: line {}, column {}\nformatted hash: {}\ncatalog: {}",
             shell.workspace.selected_buffer.source_text.len(),
             shell.workspace.selected_buffer.line_count,
             shell.workspace.selected_buffer.syntax_token_count(),
             shell.workspace.selected_buffer.diagnostics.len(),
+            preview_status,
+            preview_diagnostic,
             shell.workspace.selected_example_id,
             shell.workspace.selected_buffer.file_name,
             shell.workspace.dirty,
@@ -6594,11 +6621,13 @@ fn handle_preview_ipc_client(
                 "preview_pid": std::process::id()
             })
         });
-        if response
-            .get("hash_matches")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
+        let replace_code_accepted = response.get("status").and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && response
+                .get("hash_matches")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        if replace_code_accepted {
             if let (Some(code), Some(source_path), Some(actual_hash)) = (
                 request.get("code").and_then(serde_json::Value::as_str),
                 request
@@ -6761,8 +6790,29 @@ fn preview_replace_code_response(
             "full_state_mirroring_allowed": false
         })
     };
+    let hash_matches = actual_hash == expected_hash;
+    let layout_status = layout_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let runtime_status = runtime_summary
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let deferred = code.len() > REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX;
+    let accepted = hash_matches
+        && (deferred || layout_status == "pass")
+        && (deferred || runtime_status == "pass");
+    let diagnostic = if accepted {
+        serde_json::Value::Null
+    } else {
+        json!(format!(
+            "ReplaceCode rejected before preview mutation: hash_matches={hash_matches}, layout_status={layout_status}, runtime_status={runtime_status}"
+        ))
+    };
     Ok(json!({
         "kind": "replace-code-ack",
+        "status": if accepted { "pass" } else { "fail" },
         "preview_command": "ReplaceCode",
         "replace_code_protocol": true,
         "sync_layout_budget_bytes": REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX,
@@ -6771,7 +6821,9 @@ fn preview_replace_code_response(
         "code_bytes": code.len(),
         "expected_hash": expected_hash,
         "actual_hash": actual_hash,
-        "hash_matches": actual_hash == expected_hash,
+        "hash_matches": hash_matches,
+        "accepted_for_preview_mutation": accepted,
+        "diagnostic": diagnostic,
         "preview_receives_example_name": false,
         "full_state_mirroring_observed": false,
         "document_layout_proof": layout_proof,
@@ -7971,6 +8023,10 @@ mod tests {
             workspace,
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
+            last_preview_transport: json!({
+                "status": "not-run",
+                "reason": "test shell has not sent preview transport yet"
+            }),
         };
 
         let activation =
@@ -8012,5 +8068,28 @@ mod tests {
         assert!(!shell.workspace.open_buffers.contains_key(&custom_id));
 
         let _ = std::fs::remove_file(store_path);
+    }
+
+    #[test]
+    fn replace_code_rejects_invalid_source_before_preview_mutation() {
+        let source = "";
+        let response = preview_replace_code_response(&json!({
+            "kind": "replace-code",
+            "source_path": "custom://empty.bn",
+            "code": source,
+            "expected_hash": boon_runtime::sha256_bytes(source.as_bytes())
+        }))
+        .unwrap();
+
+        assert_eq!(response["status"], "fail");
+        assert_eq!(response["hash_matches"], true);
+        assert_eq!(response["accepted_for_preview_mutation"], false);
+        assert_eq!(response["preview_receives_example_name"], false);
+        assert!(
+            response["diagnostic"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ReplaceCode rejected before preview mutation")
+        );
     }
 }

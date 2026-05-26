@@ -8170,6 +8170,8 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         ("selection", "selection"),
         ("undo-redo", "undo"),
         ("clipboard", "clipboard"),
+        ("bracket-matching", "bracket"),
+        ("auto-close-brackets", "auto_close"),
         ("keyboard-edit-commands", "keyboard"),
     ];
     for (feature, needle) in editor_feature_needles {
@@ -8206,6 +8208,16 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         ("selection", "/editor_model/selection_supported"),
         ("undo-redo", "/editor_model/undo_redo_supported"),
         ("clipboard", "/editor_model/clipboard_adapter_supported"),
+        (
+            "bracket-matching",
+            "/editor_model/bracket_matching_supported",
+        ),
+        ("caret-overlay", "/editor_model/caret_overlay_supported"),
+        ("caret-blink", "/editor_model/caret_blink_supported"),
+        (
+            "selection-overlay",
+            "/editor_model/selection_overlay_supported",
+        ),
     ] {
         let feature_pass = dev_probe
             .and_then(|probe| probe.pointer(pointer))
@@ -8234,6 +8246,20 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         format!("keyboard_command_count={keyboard_commands}"),
         (keyboard_commands < 8)
             .then(|| "native code editor model probe lacks required keyboard commands".to_owned()),
+    );
+    let auto_close_pairs = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/auto_close_brackets"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:model-probe:auto-close-brackets"),
+        auto_close_pairs >= 3,
+        format!("auto_close_pair_count={auto_close_pairs}"),
+        (auto_close_pairs < 3).then(|| {
+            "native code editor model probe does not prove auto-close bracket support".to_owned()
+        }),
     );
     let editor_text_input_pass = dev_probe
         .and_then(|probe| probe.pointer("/editor_text_input/status"))
@@ -8871,6 +8897,14 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
                 "scroll",
                 "caret",
                 "selection",
+                "selection-overlay",
+                "caret-overlay",
+                "caret-blink",
+                "bracket-matching",
+                "auto-close-brackets",
+                "clipboard",
+                "undo-redo",
+                "keyboard-edit-commands",
                 "diagnostics"
             ]
         }),

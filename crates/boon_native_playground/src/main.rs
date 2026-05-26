@@ -1,3 +1,4 @@
+use boon_editor::{ClipboardAdapter, EditorBuffer, EditorPosition, EditorSelection};
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
 use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
@@ -26,6 +27,13 @@ const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
 const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
 const BOON_EDITOR_HIGHLIGHT_BACKGROUND: &str = "#2c313a";
 const BOON_EDITOR_GUTTER: &str = "#5c6773";
+const BOON_EDITOR_SELECTION: &str = "#3E4451";
+const BOON_EDITOR_CURSOR: &str = "#528bff";
+const BOON_EDITOR_BRACKET_MATCH: &str = "#bad0f847";
+const BOON_EDITOR_SELECTION_MATCH: &str = "#aafe661a";
+const BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX: usize = 256 * 1024;
+const BOON_EDITOR_DEFERRED_SYNTAX_LINES: usize = 256;
+const BOON_EDITOR_CARET_BLINK_FRAMES: u64 = 30;
 
 fn main() {
     if let Err(error) = run() {
@@ -1436,10 +1444,14 @@ fn native_gpu_dev_visible_render_hook(
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> Result<serde_json::Value, String> {
+    input_state.render_frame_index = input_state.render_frame_index.saturating_add(1);
+    let caret_visible = (input_state.render_frame_index / BOON_EDITOR_CARET_BLINK_FRAMES) % 2 == 0;
+    let caret_blink_changed = shell.caret_visible != caret_visible;
+    shell.caret_visible = caret_visible;
     let cache_stale = layout_frame_cache
         .as_ref()
         .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
-    if cache_stale {
+    if cache_stale || caret_blink_changed {
         let document = shell.document_for_viewport(context.width, context.height);
         let mut measurer = boon_document::SimpleTextMeasurer;
         let layout_frame = boon_document::layout(boon_document::LayoutInput {
@@ -1549,7 +1561,9 @@ fn native_gpu_dev_visible_render_hook(
 struct DevNativeInputState {
     last_mouse_button_event_count: u64,
     last_keyboard_event_sequence: u64,
+    render_frame_index: u64,
     editor_focused: bool,
+    mouse_select_anchor: Option<EditorPosition>,
 }
 
 fn dev_apply_real_window_input(
@@ -1606,40 +1620,85 @@ fn dev_apply_real_window_input(
         changed = true;
     }
 
-    for mouse_release in
-        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
-    {
+    let mouse_events = input
+        .mouse_button_events
+        .iter()
+        .filter(|event| event.sequence > input_state.last_mouse_button_event_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    for mouse_event in mouse_events {
         input_state.last_mouse_button_event_count = input_state
             .last_mouse_button_event_count
-            .max(mouse_release.sequence);
+            .max(mouse_event.sequence);
+        if mouse_event.button != "left" {
+            continue;
+        }
         if let Some(position) = input.mouse_window_pos {
             if let Some((node_id, source_path)) =
                 dev_source_binding_at(document, layout_frame, position.x as f32, position.y as f32)
             {
                 if source_path == "dev.editor.insert_text" || node_id == "dev-code-editor" {
                     input_state.editor_focused = true;
-                    dev_move_caret_from_pointer(
-                        &mut shell.workspace.selected_buffer,
+                    if let Some(editor_position) = dev_position_from_pointer(
+                        &shell.workspace.selected_buffer,
                         layout_frame,
                         position.x as f32,
                         position.y as f32,
-                    );
+                    ) {
+                        if mouse_event.pressed {
+                            shell
+                                .workspace
+                                .selected_buffer
+                                .set_selection(editor_position.clone(), editor_position.clone());
+                            input_state.mouse_select_anchor = Some(editor_position);
+                        } else if let Some(anchor) = input_state.mouse_select_anchor.take() {
+                            shell
+                                .workspace
+                                .selected_buffer
+                                .set_selection(anchor, editor_position);
+                        }
+                    }
                     changed = true;
                 } else {
                     input_state.editor_focused = false;
+                    input_state.mouse_select_anchor = None;
                     shell.dispatch_source_path(&source_path);
                     changed = true;
                 }
             } else {
                 input_state.editor_focused = false;
+                input_state.mouse_select_anchor = None;
             }
         }
+    }
+    if input
+        .mouse_buttons_down
+        .iter()
+        .any(|button| button == "left")
+        && input_state.editor_focused
+        && let Some(anchor) = input_state.mouse_select_anchor.clone()
+        && let Some(position) = input.mouse_window_pos
+        && let Some(head) = dev_position_from_pointer(
+            &shell.workspace.selected_buffer,
+            layout_frame,
+            position.x as f32,
+            position.y as f32,
+        )
+    {
+        shell.workspace.selected_buffer.set_selection(anchor, head);
+        changed = true;
     }
 
     let shift_pressed = input
         .pressed_keys
         .iter()
         .any(|key| key == "Shift" || key == "RightShift");
+    let primary_modifier_pressed = input.pressed_keys.iter().any(|key| {
+        matches!(
+            key.as_str(),
+            "Control" | "RightControl" | "Command" | "RightCommand"
+        )
+    });
     let keyboard_events = input
         .keyboard_events
         .iter()
@@ -1652,45 +1711,106 @@ fn dev_apply_real_window_input(
         if !event.pressed || !input_state.editor_focused {
             continue;
         }
+        if primary_modifier_pressed {
+            let mut clipboard = NativeClipboardAdapter;
+            match event.key.as_str() {
+                "A" => shell.workspace.selected_buffer.select_all(),
+                "C" => {
+                    let _ = shell
+                        .workspace
+                        .selected_buffer
+                        .copy_to_adapter(&mut clipboard);
+                }
+                "X" => {
+                    let _ = shell
+                        .workspace
+                        .selected_buffer
+                        .cut_to_adapter(&mut clipboard);
+                    shell.workspace.persist_selected_buffer();
+                    shell.workspace.set_selected_dirty(true);
+                }
+                "V" => {
+                    let _ = shell
+                        .workspace
+                        .selected_buffer
+                        .paste_from_adapter(&mut clipboard);
+                    shell.workspace.persist_selected_buffer();
+                    shell.workspace.set_selected_dirty(true);
+                }
+                "Z" => {
+                    let _ = shell.workspace.selected_buffer.undo();
+                    shell.workspace.persist_selected_buffer();
+                    shell.workspace.set_selected_dirty(true);
+                }
+                "Y" => {
+                    let _ = shell.workspace.selected_buffer.redo();
+                    shell.workspace.persist_selected_buffer();
+                    shell.workspace.set_selected_dirty(true);
+                }
+                _ => {}
+            }
+            changed = true;
+            continue;
+        }
         match event.key.as_str() {
             "Return" | "KeypadEnter" => {
                 shell.workspace.selected_buffer.insert_newline_with_indent();
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
-                let _ = shell.persist_selected_custom_source("EditorTextInput");
-                shell.replace_selected_preview("EditorTextInput");
                 changed = true;
             }
             "Delete" => {
                 shell.workspace.selected_buffer.delete_backward();
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
-                let _ = shell.persist_selected_custom_source("EditorTextInput");
-                shell.replace_selected_preview("EditorTextInput");
+                changed = true;
+            }
+            "ForwardDelete" => {
+                shell.workspace.selected_buffer.delete_forward();
+                shell.workspace.persist_selected_buffer();
+                shell.workspace.set_selected_dirty(true);
                 changed = true;
             }
             "Tab" => {
-                shell.workspace.selected_buffer.insert_text_at_caret("    ");
+                if shift_pressed {
+                    shell.workspace.selected_buffer.unindent_selection();
+                } else {
+                    shell.workspace.selected_buffer.indent_selection();
+                }
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
-                let _ = shell.persist_selected_custom_source("EditorTextInput");
-                shell.replace_selected_preview("EditorTextInput");
                 changed = true;
             }
             "Home" => {
-                shell.workspace.selected_buffer.move_home();
+                shell.workspace.selected_buffer.move_home(shift_pressed);
                 changed = true;
             }
             "End" => {
-                shell.workspace.selected_buffer.move_end();
+                shell.workspace.selected_buffer.move_end(shift_pressed);
+                changed = true;
+            }
+            "LeftArrow" => {
+                shell.workspace.selected_buffer.move_left(shift_pressed);
+                changed = true;
+            }
+            "RightArrow" => {
+                shell.workspace.selected_buffer.move_right(shift_pressed);
+                changed = true;
+            }
+            "UpArrow" => {
+                shell.workspace.selected_buffer.move_up(shift_pressed);
+                changed = true;
+            }
+            "DownArrow" => {
+                shell.workspace.selected_buffer.move_down(shift_pressed);
                 changed = true;
             }
             "PageDown" => {
-                shell.workspace.selected_buffer.page_down();
+                shell.workspace.selected_buffer.page_down(shift_pressed);
                 changed = true;
             }
             "PageUp" => {
-                shell.workspace.selected_buffer.page_up();
+                shell.workspace.selected_buffer.page_up(shift_pressed);
                 changed = true;
             }
             key => {
@@ -1701,8 +1821,6 @@ fn dev_apply_real_window_input(
                         .insert_text_at_caret(&character.to_string());
                     shell.workspace.persist_selected_buffer();
                     shell.workspace.set_selected_dirty(true);
-                    let _ = shell.persist_selected_custom_source("EditorTextInput");
-                    shell.replace_selected_preview("EditorTextInput");
                     changed = true;
                 }
             }
@@ -1742,19 +1860,37 @@ fn dev_source_binding_at(
     })
 }
 
-fn dev_move_caret_from_pointer(
-    model: &mut CodeEditorModel,
+struct NativeClipboardAdapter;
+
+impl ClipboardAdapter for NativeClipboardAdapter {
+    fn get_text(&mut self) -> Result<String, String> {
+        arboard::Clipboard::new()
+            .map_err(|error| error.to_string())?
+            .get_text()
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), String> {
+        arboard::Clipboard::new()
+            .map_err(|error| error.to_string())?
+            .set_text(text.to_owned())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn dev_position_from_pointer(
+    model: &CodeEditorModel,
     layout_frame: &boon_document::LayoutFrame,
     x: f32,
     y: f32,
-) {
+) -> Option<EditorPosition> {
     let Some(editor_bounds) = layout_frame
         .display_list
         .iter()
         .find(|item| item.node.0 == "dev-code-editor")
         .map(|item| item.bounds)
     else {
-        return;
+        return None;
     };
     let relative_y = (y - editor_bounds.y - BOON_EDITOR_PADDING as f32).max(0.0);
     let line = model
@@ -1774,10 +1910,7 @@ fn dev_move_caret_from_pointer(
     let char_width = BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR;
     let column =
         ((relative_x / char_width).floor() as usize + 1).min(line_text.chars().count() + 1);
-    model.set_selection(
-        EditorPosition { line, column },
-        EditorPosition { line, column },
-    );
+    Some(EditorPosition { line, column })
 }
 
 fn rect_contains(rect: boon_document::Rect, x: f32, y: f32) -> bool {
@@ -2614,6 +2747,9 @@ struct BoonLanguageService;
 
 impl BoonLanguageService {
     fn diagnostics(path: &str, source: &str) -> Vec<String> {
+        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            return Vec::new();
+        }
         match boon_parser::parse_source(path.to_owned(), source.to_owned()) {
             Ok(_) => Vec::new(),
             Err(error) => vec![error.to_string()],
@@ -2621,6 +2757,9 @@ impl BoonLanguageService {
     }
 
     fn format(path: &str, source: &str) -> Result<String, boon_parser::ParseError> {
+        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            return Ok(source.to_owned());
+        }
         boon_parser::format_source(path.to_owned(), source.to_owned())
     }
 
@@ -2680,6 +2819,16 @@ impl BoonLanguageService {
     }
 
     fn syntax_highlighting(source: &str) -> SyntaxHighlighting {
+        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            return SyntaxHighlighting {
+                backend: "editor-fallback-tokenizer-deferred-large-buffer",
+                parser_backed: false,
+                tokens: Self::syntax_tokens_fallback_limited(
+                    source,
+                    BOON_EDITOR_DEFERRED_SYNTAX_LINES,
+                ),
+            };
+        }
         if let Ok(ast) = boon_parser::parse_ast("<editor>", source) {
             let tokens = ast
                 .tokens
@@ -2698,6 +2847,22 @@ impl BoonLanguageService {
             parser_backed: false,
             tokens: Self::syntax_tokens_fallback(source),
         }
+    }
+
+    fn syntax_tokens_fallback_limited(source: &str, max_lines: usize) -> Vec<SyntaxToken> {
+        let mut end = 0usize;
+        let mut lines = 0usize;
+        for raw_line in source.split_inclusive('\n') {
+            if lines >= max_lines {
+                break;
+            }
+            end += raw_line.len();
+            lines += 1;
+        }
+        if end == 0 {
+            end = source.len();
+        }
+        Self::syntax_tokens_fallback(&source[..end.min(source.len())])
     }
 
     fn syntax_token_from_ast_token(
@@ -3316,45 +3481,6 @@ impl BoonLanguageService {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EditorPosition {
-    line: usize,
-    column: usize,
-}
-
-impl EditorPosition {
-    fn start() -> Self {
-        Self { line: 1, column: 1 }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct EditorSelection {
-    anchor: EditorPosition,
-    head: EditorPosition,
-}
-
-impl EditorSelection {
-    fn collapsed(position: EditorPosition) -> Self {
-        Self {
-            anchor: position.clone(),
-            head: position,
-        }
-    }
-
-    fn is_collapsed(&self) -> bool {
-        self.anchor == self.head
-    }
-}
-
-#[derive(Clone, Debug)]
-struct EditorSnapshot {
-    source_text: String,
-    selection: EditorSelection,
-    scroll_line: usize,
-    scroll_column: usize,
-}
-
 #[derive(Clone, Debug)]
 struct SyntaxHighlighting {
     backend: &'static str,
@@ -3437,6 +3563,7 @@ impl SyntaxLineSegment {
 #[derive(Clone, Debug)]
 struct CodeEditorModel {
     file_name: String,
+    buffer: EditorBuffer,
     source_text: String,
     line_count: usize,
     selection: EditorSelection,
@@ -3447,8 +3574,6 @@ struct CodeEditorModel {
     syntax_backend: &'static str,
     syntax_parser_backed: bool,
     formatted_preview_hash: Option<String>,
-    undo_stack: Vec<EditorSnapshot>,
-    redo_stack: Vec<EditorSnapshot>,
     clipboard_cache: String,
     last_command: Option<&'static str>,
 }
@@ -3456,14 +3581,21 @@ struct CodeEditorModel {
 impl CodeEditorModel {
     fn new(source_path_label: &str, source_text: &str) -> Self {
         let diagnostics = BoonLanguageService::diagnostics(source_path_label, source_text);
-        let formatted_preview_hash = BoonLanguageService::format(source_path_label, source_text)
-            .ok()
-            .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()));
+        let formatted_preview_hash = if source_text.len() <= BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            BoonLanguageService::format(source_path_label, source_text)
+                .ok()
+                .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()))
+        } else {
+            None
+        };
         let syntax = BoonLanguageService::syntax_highlighting(source_text);
+        let buffer = EditorBuffer::new(source_text);
+        let line_count = buffer.line_count();
         Self {
             file_name: source_path_label.to_owned(),
+            buffer,
             source_text: source_text.to_owned(),
-            line_count: source_text.lines().count().max(1),
+            line_count,
             selection: EditorSelection::collapsed(EditorPosition::start()),
             scroll_line: 0,
             scroll_column: 0,
@@ -3472,8 +3604,6 @@ impl CodeEditorModel {
             syntax_backend: syntax.backend,
             syntax_parser_backed: syntax.parser_backed,
             formatted_preview_hash,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
             clipboard_cache: String::new(),
             last_command: None,
         }
@@ -3579,6 +3709,10 @@ impl CodeEditorModel {
             "gutter": BOON_EDITOR_GUTTER,
             "dark_background": BOON_EDITOR_DARK_BACKGROUND,
             "highlight_background": BOON_EDITOR_HIGHLIGHT_BACKGROUND,
+            "selection": BOON_EDITOR_SELECTION,
+            "cursor": BOON_EDITOR_CURSOR,
+            "bracket_match": BOON_EDITOR_BRACKET_MATCH,
+            "selection_match": BOON_EDITOR_SELECTION_MATCH,
             "rules": {
                 "keyword": syntax_style_json("keyword"),
                 "source-binding": syntax_style_json("source-binding"),
@@ -3654,162 +3788,147 @@ impl CodeEditorModel {
         &self.selection.head
     }
 
+    fn sync_from_buffer(&mut self) {
+        self.source_text = self.buffer.source_text();
+        self.selection = self.buffer.selection().clone();
+        self.line_count = self.buffer.line_count();
+        self.last_command = self.buffer.last_command;
+    }
+
+    fn sync_from_buffer_and_refresh(&mut self) {
+        self.sync_from_buffer();
+        self.refresh_language_state();
+    }
+
     fn refresh_language_state(&mut self) {
-        self.line_count = self.source_text.lines().count().max(1);
+        self.line_count = self.buffer.line_count();
         self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
         let syntax = BoonLanguageService::syntax_highlighting(&self.source_text);
         self.syntax_tokens = syntax.tokens;
         self.syntax_backend = syntax.backend;
         self.syntax_parser_backed = syntax.parser_backed;
         self.formatted_preview_hash =
-            BoonLanguageService::format(&self.file_name, &self.source_text)
-                .ok()
-                .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()));
-    }
-
-    fn snapshot(&self) -> EditorSnapshot {
-        EditorSnapshot {
-            source_text: self.source_text.clone(),
-            selection: self.selection.clone(),
-            scroll_line: self.scroll_line,
-            scroll_column: self.scroll_column,
-        }
-    }
-
-    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
-        self.source_text = snapshot.source_text;
-        self.selection = snapshot.selection;
-        self.scroll_line = snapshot.scroll_line;
-        self.scroll_column = snapshot.scroll_column;
-        self.refresh_language_state();
-    }
-
-    fn push_undo(&mut self) {
-        self.undo_stack.push(self.snapshot());
-        self.redo_stack.clear();
-    }
-
-    fn byte_offset(&self, position: &EditorPosition) -> usize {
-        let mut offset = 0;
-        for (index, line) in self.source_text.split_inclusive('\n').enumerate() {
-            if index + 1 == position.line {
-                let line_without_newline = line.trim_end_matches('\n');
-                let column_offset = line_without_newline
-                    .char_indices()
-                    .nth(position.column.saturating_sub(1))
-                    .map(|(byte, _)| byte)
-                    .unwrap_or(line_without_newline.len());
-                return offset + column_offset;
-            }
-            offset += line.len();
-        }
-        self.source_text.len()
+            if self.source_text.len() <= BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+                BoonLanguageService::format(&self.file_name, &self.source_text)
+                    .ok()
+                    .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()))
+            } else {
+                None
+            };
     }
 
     fn position_for_offset(&self, target: usize) -> EditorPosition {
-        let mut offset = 0;
-        for (index, line) in self.source_text.split_inclusive('\n').enumerate() {
-            let next = offset + line.len();
-            if target <= next {
-                let column = line[..target.saturating_sub(offset).min(line.len())]
-                    .chars()
-                    .count()
-                    + 1;
-                return EditorPosition {
-                    line: index + 1,
-                    column,
-                };
-            }
-            offset = next;
-        }
-        EditorPosition {
-            line: self.line_count.max(1),
-            column: self
-                .source_text
-                .lines()
-                .last()
-                .map(|line| line.chars().count() + 1)
-                .unwrap_or(1),
-        }
+        self.buffer.position_for_byte_offset(target)
     }
 
     fn selection_offsets(&self) -> (usize, usize) {
-        let anchor = self.byte_offset(&self.selection.anchor);
-        let head = self.byte_offset(&self.selection.head);
-        if anchor <= head {
-            (anchor, head)
-        } else {
-            (head, anchor)
-        }
+        self.buffer.selection_byte_offsets()
     }
 
     fn selected_text(&self) -> String {
-        let (start, end) = self.selection_offsets();
-        self.source_text[start..end].to_owned()
+        self.buffer.selected_text()
+    }
+
+    fn selection_columns_for_line(&self, line: usize) -> Option<(usize, usize)> {
+        if self.selection.is_collapsed() {
+            return None;
+        }
+        let (start_byte, end_byte) = self.selection_offsets();
+        if start_byte == end_byte {
+            return None;
+        }
+        let start = self.position_for_offset(start_byte);
+        let end = self.position_for_offset(end_byte);
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let line_len = self
+            .source_text
+            .lines()
+            .nth(line.saturating_sub(1))
+            .map(|text| text.chars().count())
+            .unwrap_or_default();
+        let start_col = if line == start.line {
+            start.column.saturating_sub(1)
+        } else {
+            0
+        };
+        let end_col = if line == end.line {
+            end.column.saturating_sub(1)
+        } else {
+            line_len
+        };
+        (end_col > start_col).then_some((start_col, end_col))
+    }
+
+    fn bracket_columns_for_line(&self, line: usize) -> Vec<usize> {
+        let ignored_ranges = self.bracket_ignored_ranges();
+        self.buffer
+            .bracket_match(&ignored_ranges)
+            .into_iter()
+            .flat_map(|pair| [pair.open_byte, pair.close_byte])
+            .map(|byte| self.position_for_offset(byte))
+            .filter(|position| position.line == line)
+            .map(|position| position.column.saturating_sub(1))
+            .collect()
+    }
+
+    fn bracket_ignored_ranges(&self) -> Vec<(usize, usize)> {
+        self.syntax_tokens
+            .iter()
+            .filter(|token| {
+                matches!(
+                    token.kind,
+                    "comment"
+                        | "string"
+                        | "text-literal-content"
+                        | "text-literal-interpolation"
+                        | "text-literal-delimiter"
+                )
+            })
+            .map(|token| (token.start, token.end))
+            .collect()
     }
 
     fn set_selection(&mut self, anchor: EditorPosition, head: EditorPosition) {
-        self.selection = EditorSelection { anchor, head };
+        self.buffer.set_selection(anchor, head);
+        self.sync_from_buffer();
         self.last_command = Some("selection");
     }
 
     fn insert_text_at_caret(&mut self, text: &str) {
-        self.push_undo();
-        let (start, end) = self.selection_offsets();
-        self.source_text.replace_range(start..end, text);
-        let position = self.position_for_offset(start + text.len());
-        self.selection = EditorSelection::collapsed(position);
-        self.refresh_language_state();
-        self.last_command = Some("keyboard-insert-text");
+        self.buffer.insert_text_at_caret(text);
+        self.sync_from_buffer_and_refresh();
+    }
+
+    fn insert_plain_text_at_caret(&mut self, text: &str, command: &'static str) {
+        self.buffer.insert_plain_text_at_caret(text, command);
+        self.sync_from_buffer_and_refresh();
     }
 
     fn delete_backward(&mut self) {
-        self.push_undo();
-        let (start, end) = self.selection_offsets();
-        if start != end {
-            self.source_text.replace_range(start..end, "");
-            self.selection = EditorSelection::collapsed(self.position_for_offset(start));
-        } else if start > 0 {
-            let previous = self.source_text[..start]
-                .char_indices()
-                .last()
-                .map(|(byte, _)| byte)
-                .unwrap_or(0);
-            self.source_text.replace_range(previous..start, "");
-            self.selection = EditorSelection::collapsed(self.position_for_offset(previous));
-        }
-        self.refresh_language_state();
-        self.last_command = Some("keyboard-delete-backward");
+        self.buffer.delete_backward();
+        self.sync_from_buffer_and_refresh();
+    }
+
+    fn delete_forward(&mut self) {
+        self.buffer.delete_forward();
+        self.sync_from_buffer_and_refresh();
     }
 
     fn insert_newline_with_indent(&mut self) {
-        let line = self
-            .source_text
-            .lines()
-            .nth(self.caret().line.saturating_sub(1))
-            .unwrap_or_default();
-        let indent = line
-            .chars()
-            .take_while(|character| character.is_whitespace())
-            .collect::<String>();
-        self.insert_text_at_caret(&format!("\n{indent}"));
-        self.last_command = Some("keyboard-enter-indent");
+        self.buffer.insert_newline_with_indent();
+        self.sync_from_buffer_and_refresh();
     }
 
     fn indent_selection(&mut self) {
-        self.push_undo();
-        let (start, end) = self.selection_offsets();
-        let before = &self.source_text[..start];
-        let selected = &self.source_text[start..end];
-        let after = &self.source_text[end..];
-        let indented = selected
-            .lines()
-            .map(|line| format!("    {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.source_text = format!("{before}{indented}{after}");
-        self.refresh_language_state();
-        self.last_command = Some("keyboard-tab-indent");
+        self.buffer.indent_selection();
+        self.sync_from_buffer_and_refresh();
+    }
+
+    fn unindent_selection(&mut self) {
+        self.buffer.unindent_selection();
+        self.sync_from_buffer_and_refresh();
     }
 
     fn copy_selection_to_clipboard(&mut self) -> String {
@@ -3820,55 +3939,103 @@ impl CodeEditorModel {
 
     fn paste_from_clipboard(&mut self, text: &str) {
         self.clipboard_cache = text.to_owned();
-        self.insert_text_at_caret(text);
+        self.insert_plain_text_at_caret(text, "clipboard-paste");
         self.last_command = Some("clipboard-paste");
     }
 
-    fn move_home(&mut self) {
-        let line = self.caret().line;
-        self.selection = EditorSelection::collapsed(EditorPosition { line, column: 1 });
-        self.last_command = Some("keyboard-home");
+    fn copy_to_adapter(&mut self, clipboard: &mut dyn ClipboardAdapter) -> serde_json::Value {
+        let text = self.copy_selection_to_clipboard();
+        match clipboard.set_text(&text) {
+            Ok(()) => json!({"status": "pass", "command": "clipboard-copy", "bytes": text.len()}),
+            Err(error) => {
+                json!({"status": "fallback", "command": "clipboard-copy", "reason": error, "bytes": text.len()})
+            }
+        }
     }
 
-    fn move_end(&mut self) {
-        let line = self.caret().line;
-        let column = self
-            .source_text
-            .lines()
-            .nth(line.saturating_sub(1))
-            .map(|line| line.chars().count() + 1)
-            .unwrap_or(1);
-        self.selection = EditorSelection::collapsed(EditorPosition { line, column });
-        self.last_command = Some("keyboard-end");
+    fn cut_to_adapter(&mut self, clipboard: &mut dyn ClipboardAdapter) -> serde_json::Value {
+        if self.selection.is_collapsed() {
+            self.last_command = Some("clipboard-cut-empty-selection");
+            return json!({"status": "noop", "command": "clipboard-cut", "reason": "selection empty"});
+        }
+        let text = self.copy_selection_to_clipboard();
+        let clipboard_status = clipboard
+            .set_text(&text)
+            .map(|_| "pass".to_owned())
+            .unwrap_or_else(|error| format!("fallback:{error}"));
+        self.delete_backward();
+        json!({"status": "pass", "command": "clipboard-cut", "clipboard_status": clipboard_status, "bytes": text.len()})
     }
 
-    fn page_down(&mut self) {
+    fn paste_from_adapter(&mut self, clipboard: &mut dyn ClipboardAdapter) -> serde_json::Value {
+        let text = clipboard
+            .get_text()
+            .unwrap_or_else(|_| self.clipboard_cache.clone());
+        self.paste_from_clipboard(&text);
+        json!({"status": "pass", "command": "clipboard-paste", "bytes": text.len()})
+    }
+
+    fn move_home(&mut self, extend: bool) {
+        self.buffer.move_home(extend);
+        self.sync_from_buffer();
+    }
+
+    fn move_end(&mut self, extend: bool) {
+        self.buffer.move_end(extend);
+        self.sync_from_buffer();
+    }
+
+    fn move_left(&mut self, extend: bool) {
+        self.buffer.move_left(extend);
+        self.sync_from_buffer();
+    }
+
+    fn move_right(&mut self, extend: bool) {
+        self.buffer.move_right(extend);
+        self.sync_from_buffer();
+    }
+
+    fn move_up(&mut self, extend: bool) {
+        self.buffer.move_up(extend);
+        self.scroll_line = self.scroll_line.min(self.caret().line.saturating_sub(1));
+        self.sync_from_buffer();
+    }
+
+    fn move_down(&mut self, extend: bool) {
+        self.buffer.move_down(extend);
+        self.sync_from_buffer();
+    }
+
+    fn page_down(&mut self, extend: bool) {
+        self.buffer.page_down(extend);
         self.scroll_line = (self.scroll_line + 24).min(self.line_count.saturating_sub(1));
-        self.last_command = Some("keyboard-page-down");
+        self.sync_from_buffer();
     }
 
-    fn page_up(&mut self) {
+    fn page_up(&mut self, extend: bool) {
+        self.buffer.page_up(extend);
         self.scroll_line = self.scroll_line.saturating_sub(24);
-        self.last_command = Some("keyboard-page-up");
+        self.sync_from_buffer();
+    }
+
+    fn select_all(&mut self) {
+        self.buffer.select_all();
+        self.sync_from_buffer();
     }
 
     fn undo(&mut self) -> serde_json::Value {
-        if let Some(snapshot) = self.undo_stack.pop() {
-            self.redo_stack.push(self.snapshot());
-            self.restore_snapshot(snapshot);
-            self.last_command = Some("undo");
-            json!({"status": "pass", "undo_depth": self.undo_stack.len(), "redo_depth": self.redo_stack.len()})
+        if self.buffer.undo() {
+            self.sync_from_buffer_and_refresh();
+            json!({"status": "pass", "undo_depth": self.buffer.undo_depth(), "redo_depth": self.buffer.redo_depth()})
         } else {
             json!({"status": "noop", "reason": "undo stack empty"})
         }
     }
 
     fn redo(&mut self) -> serde_json::Value {
-        if let Some(snapshot) = self.redo_stack.pop() {
-            self.undo_stack.push(self.snapshot());
-            self.restore_snapshot(snapshot);
-            self.last_command = Some("redo");
-            json!({"status": "pass", "undo_depth": self.undo_stack.len(), "redo_depth": self.redo_stack.len()})
+        if self.buffer.redo() {
+            self.sync_from_buffer_and_refresh();
+            json!({"status": "pass", "undo_depth": self.buffer.undo_depth(), "redo_depth": self.buffer.redo_depth()})
         } else {
             json!({"status": "noop", "reason": "redo stack empty"})
         }
@@ -3882,10 +4049,10 @@ impl CodeEditorModel {
         );
         probe.insert_text_at_caret("-- probe\n");
         probe.insert_newline_with_indent();
-        probe.move_home();
-        probe.move_end();
-        probe.page_down();
-        probe.page_up();
+        probe.move_home(false);
+        probe.move_end(false);
+        probe.page_down(false);
+        probe.page_up(false);
         probe.set_selection(
             EditorPosition { line: 1, column: 1 },
             EditorPosition { line: 1, column: 4 },
@@ -3893,7 +4060,10 @@ impl CodeEditorModel {
         let copied = probe.copy_selection_to_clipboard();
         probe.paste_from_clipboard(&copied);
         probe.indent_selection();
+        probe.unindent_selection();
         probe.delete_backward();
+        probe.insert_text_at_caret("(");
+        probe.insert_text_at_caret(")");
         let undo = probe.undo();
         let redo = probe.redo();
         json!({
@@ -3905,15 +4075,32 @@ impl CodeEditorModel {
             "selection_collapsed": self.selection.is_collapsed(),
             "undo_redo_supported": true,
             "clipboard_adapter_supported": true,
+            "bracket_matching_supported": true,
+            "auto_close_brackets": ["(", "[", "{"],
+            "caret_overlay_supported": true,
+            "caret_blink_supported": true,
+            "selection_overlay_supported": true,
             "keyboard_commands_supported": [
                 "insert_text",
                 "delete_backward",
+                "delete_forward",
                 "enter_newline_indent",
                 "tab_indent",
+                "shift_tab_unindent",
                 "home",
                 "end",
+                "arrow_left",
+                "arrow_right",
+                "arrow_up",
+                "arrow_down",
                 "page_up",
-                "page_down"
+                "page_down",
+                "select_all",
+                "copy",
+                "cut",
+                "paste",
+                "undo",
+                "redo"
             ],
             "undo_probe": undo,
             "redo_probe": redo,
@@ -3964,6 +4151,7 @@ impl CodeEditorView {
         parent: boon_document_model::DocumentNodeId,
         model: &CodeEditorModel,
         height: u32,
+        caret_visible: bool,
     ) {
         let editor_height = height.max(96);
         let mut editor = dev_node(
@@ -4021,6 +4209,11 @@ impl CodeEditorView {
             .max(1) as usize;
         for (line_number, line) in model.visible_lines(visible_line_count) {
             let row_id = format!("dev-code-editor-line-{line_number}");
+            let row_bg = if line_number == model.caret().line {
+                BOON_EDITOR_HIGHLIGHT_BACKGROUND
+            } else {
+                BOON_EDITOR_BACKGROUND
+            };
             let row = dev_node(
                 &row_id,
                 boon_document_model::DocumentNodeKind::Row,
@@ -4030,7 +4223,7 @@ impl CodeEditorView {
                     ("width", "fill"),
                     ("gap", &BOON_EDITOR_ROW_GAP.to_string()),
                     ("padding", "0"),
-                    ("bg", BOON_EDITOR_BACKGROUND),
+                    ("bg", row_bg),
                 ],
             );
             let row_parent = row.id.clone();
@@ -4044,7 +4237,7 @@ impl CodeEditorView {
                     ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
                     ("color", BOON_EDITOR_GUTTER),
                     ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
-                    ("bg", BOON_EDITOR_BACKGROUND),
+                    ("bg", row_bg),
                     ("font", self.font_family),
                     ("font_features", BOON_EDITOR_FONT_FEATURES),
                 ],
@@ -4057,14 +4250,21 @@ impl CodeEditorView {
                 &[
                     ("width", "fill"),
                     ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
-                    ("bg", BOON_EDITOR_BACKGROUND),
+                    ("bg", row_bg),
                     ("gap", "0"),
                     ("padding", "0"),
                 ],
             );
             let code_row_parent = code_row.id.clone();
             append_child(frame, row_parent, code_row);
-            self.append_highlighted_line(frame, code_row_parent, model, line_number, &line);
+            self.append_highlighted_line(
+                frame,
+                code_row_parent,
+                model,
+                line_number,
+                &line,
+                caret_visible,
+            );
         }
     }
 
@@ -4075,12 +4275,13 @@ impl CodeEditorView {
         model: &CodeEditorModel,
         line_number: usize,
         line: &str,
+        caret_visible: bool,
     ) {
         let segments = model.highlighted_line_segments(line_number, line);
         append_child(
             frame,
             parent,
-            self.editor_line_node(line_number, line, &segments),
+            self.editor_line_node(line_number, line, &segments, model, caret_visible),
         );
     }
 
@@ -4089,6 +4290,8 @@ impl CodeEditorView {
         line_number: usize,
         line: &str,
         segments: &[SyntaxLineSegment],
+        model: &CodeEditorModel,
+        caret_visible: bool,
     ) -> boon_document_model::DocumentNode {
         let syntax_spans_json = syntax_spans_json(segments);
         let mut node = dev_node(
@@ -4106,8 +4309,46 @@ impl CodeEditorView {
                 ("syntax_spans_json", &syntax_spans_json),
                 ("text_inset", "0"),
                 ("text_clip_padding", "4"),
+                ("editor_selection_color", BOON_EDITOR_SELECTION),
+                ("editor_caret_color", BOON_EDITOR_CURSOR),
+                ("editor_bracket_color", BOON_EDITOR_BRACKET_MATCH),
+                ("editor_selection_match_color", BOON_EDITOR_SELECTION_MATCH),
             ],
         );
+        if let Some((start, end)) = model.selection_columns_for_line(line_number) {
+            node.style.insert(
+                "editor_selection_start".to_owned(),
+                boon_document_model::StyleValue::Number(start as f64),
+            );
+            node.style.insert(
+                "editor_selection_end".to_owned(),
+                boon_document_model::StyleValue::Number(end as f64),
+            );
+        }
+        if model.caret().line == line_number {
+            node.style.insert(
+                "editor_caret_column".to_owned(),
+                boon_document_model::StyleValue::Number(
+                    model.caret().column.saturating_sub(1) as f64
+                ),
+            );
+            node.style.insert(
+                "editor_caret_visible".to_owned(),
+                boon_document_model::StyleValue::Bool(caret_visible),
+            );
+        }
+        let bracket_columns = model
+            .bracket_columns_for_line(line_number)
+            .into_iter()
+            .map(|column| column.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !bracket_columns.is_empty() {
+            node.style.insert(
+                "editor_bracket_columns".to_owned(),
+                boon_document_model::StyleValue::Text(bracket_columns),
+            );
+        }
         node.style.insert(
             "rich_text".to_owned(),
             boon_document_model::StyleValue::Bool(true),
@@ -4354,6 +4595,7 @@ struct DevWindowShell {
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
     last_preview_transport: serde_json::Value,
+    caret_visible: bool,
 }
 
 impl DevWindowShell {
@@ -4381,6 +4623,7 @@ impl DevWindowShell {
                 "status": "not-run",
                 "reason": "no preview transport command has run yet"
             }),
+            caret_visible: true,
         }
     }
 
@@ -5557,6 +5800,7 @@ fn dev_shell_document(
         root.clone(),
         &shell.workspace.selected_buffer,
         editor_height,
+        shell.caret_visible,
     );
     append_child(&mut frame, root, debug);
     frame.focus = Some(boon_document_model::DocumentNodeId(
@@ -8018,62 +8262,104 @@ fn document_value_for_hit_region(layout_proof: &Value, hit_region: &Value) -> Op
 }
 
 fn keyboard_event_text(key: &str, shift: bool) -> Option<char> {
-    let character = match key {
-        "A" => 'a',
-        "B" => 'b',
-        "C" => 'c',
-        "D" => 'd',
-        "E" => 'e',
-        "F" => 'f',
-        "G" => 'g',
-        "H" => 'h',
-        "I" => 'i',
-        "J" => 'j',
-        "K" => 'k',
-        "L" => 'l',
-        "M" => 'm',
-        "N" => 'n',
-        "O" => 'o',
-        "P" => 'p',
-        "Q" => 'q',
-        "R" => 'r',
-        "S" => 's',
-        "T" => 't',
-        "U" => 'u',
-        "V" => 'v',
-        "W" => 'w',
-        "X" => 'x',
-        "Y" => 'y',
-        "Z" => 'z',
-        "Num0" | "Keypad0" => '0',
-        "Num1" | "Keypad1" => '1',
-        "Num2" | "Keypad2" => '2',
-        "Num3" | "Keypad3" => '3',
-        "Num4" | "Keypad4" => '4',
-        "Num5" | "Keypad5" => '5',
-        "Num6" | "Keypad6" => '6',
-        "Num7" | "Keypad7" => '7',
-        "Num8" | "Keypad8" => '8',
-        "Num9" | "Keypad9" => '9',
-        "Space" => ' ',
-        "Minus" | "KeypadMinus" => '-',
-        "Equal" | "KeypadEquals" => '=',
-        "Comma" => ',',
-        "Period" | "KeypadDecimal" => '.',
-        "Slash" | "KeypadDivide" => '/',
-        "Semicolon" => ';',
-        "Quote" => '\'',
-        "LeftBracket" => '[',
-        "RightBracket" => ']',
-        "Backslash" | "InternationalBackslash" => '\\',
-        "Grave" => '`',
-        _ => return None,
-    };
-    Some(if shift && character.is_ascii_alphabetic() {
-        character.to_ascii_uppercase()
-    } else {
-        character
-    })
+    match (key, shift) {
+        ("A", false) => Some('a'),
+        ("A", true) => Some('A'),
+        ("B", false) => Some('b'),
+        ("B", true) => Some('B'),
+        ("C", false) => Some('c'),
+        ("C", true) => Some('C'),
+        ("D", false) => Some('d'),
+        ("D", true) => Some('D'),
+        ("E", false) => Some('e'),
+        ("E", true) => Some('E'),
+        ("F", false) => Some('f'),
+        ("F", true) => Some('F'),
+        ("G", false) => Some('g'),
+        ("G", true) => Some('G'),
+        ("H", false) => Some('h'),
+        ("H", true) => Some('H'),
+        ("I", false) => Some('i'),
+        ("I", true) => Some('I'),
+        ("J", false) => Some('j'),
+        ("J", true) => Some('J'),
+        ("K", false) => Some('k'),
+        ("K", true) => Some('K'),
+        ("L", false) => Some('l'),
+        ("L", true) => Some('L'),
+        ("M", false) => Some('m'),
+        ("M", true) => Some('M'),
+        ("N", false) => Some('n'),
+        ("N", true) => Some('N'),
+        ("O", false) => Some('o'),
+        ("O", true) => Some('O'),
+        ("P", false) => Some('p'),
+        ("P", true) => Some('P'),
+        ("Q", false) => Some('q'),
+        ("Q", true) => Some('Q'),
+        ("R", false) => Some('r'),
+        ("R", true) => Some('R'),
+        ("S", false) => Some('s'),
+        ("S", true) => Some('S'),
+        ("T", false) => Some('t'),
+        ("T", true) => Some('T'),
+        ("U", false) => Some('u'),
+        ("U", true) => Some('U'),
+        ("V", false) => Some('v'),
+        ("V", true) => Some('V'),
+        ("W", false) => Some('w'),
+        ("W", true) => Some('W'),
+        ("X", false) => Some('x'),
+        ("X", true) => Some('X'),
+        ("Y", false) => Some('y'),
+        ("Y", true) => Some('Y'),
+        ("Z", false) => Some('z'),
+        ("Z", true) => Some('Z'),
+        ("Num0" | "Keypad0", false) => Some('0'),
+        ("Num0", true) => Some(')'),
+        ("Num1" | "Keypad1", false) => Some('1'),
+        ("Num1", true) => Some('!'),
+        ("Num2" | "Keypad2", false) => Some('2'),
+        ("Num2", true) => Some('@'),
+        ("Num3" | "Keypad3", false) => Some('3'),
+        ("Num3", true) => Some('#'),
+        ("Num4" | "Keypad4", false) => Some('4'),
+        ("Num4", true) => Some('$'),
+        ("Num5" | "Keypad5", false) => Some('5'),
+        ("Num5", true) => Some('%'),
+        ("Num6" | "Keypad6", false) => Some('6'),
+        ("Num6", true) => Some('^'),
+        ("Num7" | "Keypad7", false) => Some('7'),
+        ("Num7", true) => Some('&'),
+        ("Num8" | "Keypad8", false) => Some('8'),
+        ("Num8", true) => Some('*'),
+        ("Num9" | "Keypad9", false) => Some('9'),
+        ("Num9", true) => Some('('),
+        ("Space", _) => Some(' '),
+        ("Minus" | "KeypadMinus", false) => Some('-'),
+        ("Minus", true) => Some('_'),
+        ("Equal" | "KeypadEquals", false) => Some('='),
+        ("Equal", true) => Some('+'),
+        ("Comma", false) => Some(','),
+        ("Comma", true) => Some('<'),
+        ("Period" | "KeypadDecimal", false) => Some('.'),
+        ("Period", true) => Some('>'),
+        ("Slash" | "KeypadDivide", false) => Some('/'),
+        ("Slash", true) => Some('?'),
+        ("Semicolon", false) => Some(';'),
+        ("Semicolon", true) => Some(':'),
+        ("Quote", false) => Some('\''),
+        ("Quote", true) => Some('"'),
+        ("LeftBracket", false) => Some('['),
+        ("LeftBracket", true) => Some('{'),
+        ("RightBracket", false) => Some(']'),
+        ("RightBracket", true) => Some('}'),
+        ("Backslash" | "InternationalBackslash", false) => Some('\\'),
+        ("Backslash" | "InternationalBackslash", true) => Some('|'),
+        ("Grave", false) => Some('`'),
+        ("Grave", true) => Some('~'),
+        _ => None,
+    }
 }
 
 fn role_window_title(base: &str, token: Option<&str>) -> String {
@@ -9699,7 +9985,7 @@ mod tests {
         let model = CodeEditorModel::new("custom://view.bn", "count: SOURCE\ncount + 1\n");
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let parent = frame.root.clone();
-        CodeEditorView::new().append_to(&mut frame, parent, &model, 160);
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 160, true);
 
         let code_row = frame
             .nodes
@@ -9756,7 +10042,7 @@ mod tests {
         let model = CodeEditorModel::new("custom://view.bn", "0 |> HOLD count\n");
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let parent = frame.root.clone();
-        CodeEditorView::new().append_to(&mut frame, parent, &model, 80);
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 80, true);
         let code_row = frame
             .nodes
             .get(&boon_document_model::DocumentNodeId(
@@ -9789,6 +10075,91 @@ mod tests {
     }
 
     #[test]
+    fn code_editor_core_supports_selection_auto_pair_and_bracket_overlays() {
+        let mut model =
+            CodeEditorModel::new("custom://editor.bn", "value: [count]\n-- [ignored]\n");
+        model.set_selection(
+            EditorPosition { line: 1, column: 9 },
+            EditorPosition {
+                line: 1,
+                column: 14,
+            },
+        );
+        assert_eq!(model.selected_text(), "count");
+        assert_eq!(model.selection_columns_for_line(1), Some((8, 13)));
+        model.insert_text_at_caret("(");
+        assert_eq!(model.source_text, "value: [(count)]\n-- [ignored]\n");
+        assert_eq!(
+            model
+                .bracket_columns_for_line(1)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([8, 14])
+        );
+        assert!(model.bracket_columns_for_line(2).is_empty());
+        model.undo();
+        assert_eq!(model.source_text, "value: [count]\n-- [ignored]\n");
+        model.redo();
+        assert_eq!(model.source_text, "value: [(count)]\n-- [ignored]\n");
+    }
+
+    #[test]
+    fn code_editor_view_attaches_caret_selection_and_bracket_metadata() {
+        let mut model = CodeEditorModel::new("custom://view.bn", "value: [count]\n");
+        model.set_selection(
+            EditorPosition { line: 1, column: 9 },
+            EditorPosition {
+                line: 1,
+                column: 14,
+            },
+        );
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let parent = frame.root.clone();
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 80, true);
+        let rendered = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-code-editor-line-text-1".to_owned(),
+            ))
+            .expect("line text should render");
+
+        assert_eq!(
+            rendered.style.get("editor_selection_start"),
+            Some(&boon_document_model::StyleValue::Number(8.0))
+        );
+        assert_eq!(
+            rendered.style.get("editor_selection_end"),
+            Some(&boon_document_model::StyleValue::Number(13.0))
+        );
+        assert_eq!(
+            rendered.style.get("editor_caret_column"),
+            Some(&boon_document_model::StyleValue::Number(13.0))
+        );
+        assert_eq!(
+            rendered.style.get("editor_caret_visible"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        assert_eq!(
+            rendered.style.get("editor_bracket_columns"),
+            Some(&boon_document_model::StyleValue::Text("7,13".to_owned()))
+        );
+
+        let mut hidden_frame = boon_document_model::DocumentFrame::empty("root");
+        let hidden_parent = hidden_frame.root.clone();
+        CodeEditorView::new().append_to(&mut hidden_frame, hidden_parent, &model, 80, false);
+        let hidden = hidden_frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-code-editor-line-text-1".to_owned(),
+            ))
+            .expect("line text should render");
+        assert_eq!(
+            hidden.style.get("editor_caret_visible"),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+    }
+
+    #[test]
     fn fallback_tokenizer_keeps_malformed_buffers_renderable() {
         let tokens = BoonLanguageService::syntax_tokens_fallback("SOURCE @\n-- ok\n");
         assert!(
@@ -9817,6 +10188,9 @@ mod tests {
         assert_eq!(BOON_EDITOR_LINE_HEIGHT, 22);
         assert_eq!(BOON_EDITOR_FONT_FEATURES, "zero,calt");
         assert_eq!(BOON_EDITOR_FONT_FEATURE_SETTINGS, "'zero' 1, 'calt' 1");
+        assert_eq!(BOON_EDITOR_SELECTION, "#3E4451");
+        assert_eq!(BOON_EDITOR_CURSOR, "#528bff");
+        assert_eq!(BOON_EDITOR_BRACKET_MATCH, "#bad0f847");
 
         let keyword = syntax_style_for_kind("keyword");
         assert_eq!(keyword.color, "#D2691E");
@@ -9893,6 +10267,7 @@ mod tests {
                 "status": "not-run",
                 "reason": "test shell has not sent preview transport yet"
             }),
+            caret_visible: true,
         };
 
         let activation =
@@ -9978,6 +10353,7 @@ mod tests {
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
             last_preview_transport: json!({"status": "not-run"}),
+            caret_visible: true,
         };
 
         let official_frame = shell.document_for_viewport(1180, 820);

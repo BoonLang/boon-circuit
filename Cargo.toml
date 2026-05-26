@@ -7,6 +7,7 @@ members = [
     "crates/boon_cli",
     "crates/boon_ply_playground",
     "crates/boon_document_model",
+    "crates/boon_editor",
     "crates/boon_driver",
     "crates/boon_host",
     "crates/boon_document",
@@ -29,6 +30,7 @@ boon_ir = { path = "crates/boon_ir" }
 boon_runtime = { path = "crates/boon_runtime" }
 boon_report_schema = { path = "crates/boon_report_schema" }
 boon_document_model = { path = "crates/boon_document_model" }
+boon_editor = { path = "crates/boon_editor" }
 boon_driver = { path = "crates/boon_driver" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
@@ -40,6 +42,9 @@ toml = "0.9"
 sha2 = "0.10"
 chumsky = "0.9"
 bitvec = "1.0"
+ropey = "1.6"
+unicode-segmentation = "1.13"
+arboard = "3.6"
 image = { version = "0.24.9", default-features = false, features = ["png"] }
 ply-engine = { version = "1.1.1", default-features = false }
 wgpu = "=29.0.1"

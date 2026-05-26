@@ -1161,6 +1161,80 @@ fn rect_vertices(
             );
             metrics.rendered_rect_count += 1;
         }
+        if matches!(item.kind, DocumentNodeKind::Text) {
+            let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+            let char_width = font_size * 0.60;
+            let inset = style_number(&item.style, "text_inset").unwrap_or(0.0);
+            let line_top = item.bounds.y + 2.0;
+            let line_height = (item.bounds.height - 4.0).max(font_size);
+            if let (Some(start), Some(end)) = (
+                style_number(&item.style, "editor_selection_start"),
+                style_number(&item.style, "editor_selection_end"),
+            ) {
+                let selection_color = style_color_f32(&item.style, "editor_selection_color")
+                    .unwrap_or([0.048, 0.06, 0.08, 1.0]);
+                let start = start.max(0.0);
+                let end = end.max(start);
+                push_rect(
+                    &mut positions,
+                    &mut colors,
+                    Rect {
+                        x: item.bounds.x + inset + start * char_width,
+                        y: line_top,
+                        width: ((end - start) * char_width).max(2.0),
+                        height: line_height,
+                    },
+                    width,
+                    height,
+                    selection_color,
+                );
+                metrics.rendered_rect_count += 1;
+            }
+            if let Some(columns) = style_text(&item.style, "editor_bracket_columns") {
+                let bracket_color = style_color_f32(&item.style, "editor_bracket_color")
+                    .unwrap_or([0.49, 0.63, 0.94, 0.28]);
+                for column in columns
+                    .split(',')
+                    .filter_map(|column| column.parse::<f32>().ok())
+                {
+                    push_rect(
+                        &mut positions,
+                        &mut colors,
+                        Rect {
+                            x: item.bounds.x + inset + column.max(0.0) * char_width,
+                            y: line_top,
+                            width: char_width.max(2.0),
+                            height: line_height,
+                        },
+                        width,
+                        height,
+                        bracket_color,
+                    );
+                    metrics.rendered_rect_count += 1;
+                }
+            }
+            if style_bool(&item.style, "editor_caret_visible") == Some(true)
+                && let Some(column) = style_number(&item.style, "editor_caret_column")
+            {
+                let caret_color = style_color_f32(&item.style, "editor_caret_color")
+                    .or_else(|| style_color_f32(&item.style, "color"))
+                    .unwrap_or([0.09, 0.23, 1.0, 1.0]);
+                push_rect(
+                    &mut positions,
+                    &mut colors,
+                    Rect {
+                        x: item.bounds.x + inset + column.max(0.0) * char_width,
+                        y: line_top,
+                        width: 2.0,
+                        height: line_height,
+                    },
+                    width,
+                    height,
+                    caret_color,
+                );
+                metrics.rendered_rect_count += 1;
+            }
+        }
         if style_bool(&item.style, "strike_if") == Some(true) {
             let color = style_color_f32(&item.style, "if_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
@@ -1422,6 +1496,7 @@ fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_document::{AccessibilityTree, DisplayItem, DocumentNodeId, LayoutMetrics};
 
     fn shape_glyph_ids(text: &str, font_features: FontFeatures) -> Vec<u16> {
         shape_glyphs(text, font_features)
@@ -1592,6 +1667,60 @@ mod tests {
                 .iter()
                 .all(|(_, advance)| (*advance - 0.60).abs() < f32::EPSILON),
             "styled punctuation must stay on the bundled monospace JetBrains variants: {punctuation:?}"
+        );
+    }
+
+    #[test]
+    fn editor_text_overlays_emit_selection_bracket_and_caret_rects() {
+        let mut style = StyleMap::new();
+        style.insert("bg".to_owned(), StyleValue::Text("#282c34".to_owned()));
+        style.insert("size".to_owned(), StyleValue::Number(16.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert("editor_selection_start".to_owned(), StyleValue::Number(1.0));
+        style.insert("editor_selection_end".to_owned(), StyleValue::Number(4.0));
+        style.insert(
+            "editor_selection_color".to_owned(),
+            StyleValue::Text("#3E4451".to_owned()),
+        );
+        style.insert(
+            "editor_bracket_columns".to_owned(),
+            StyleValue::Text("0,5".to_owned()),
+        );
+        style.insert(
+            "editor_bracket_color".to_owned(),
+            StyleValue::Text("#bad0f847".to_owned()),
+        );
+        style.insert("editor_caret_column".to_owned(), StyleValue::Number(3.0));
+        style.insert("editor_caret_visible".to_owned(), StyleValue::Bool(true));
+        style.insert(
+            "editor_caret_color".to_owned(),
+            StyleValue::Text("#528bff".to_owned()),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("editor-line".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 200.0,
+                    height: 22.0,
+                },
+                text: Some("(abc)".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (_, _, metrics) = rect_vertices(&frame, 320.0, 120.0);
+        assert!(
+            metrics.rendered_rect_count >= 6,
+            "background + item + selection + two brackets + caret should render"
         );
     }
 

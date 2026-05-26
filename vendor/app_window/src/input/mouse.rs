@@ -27,7 +27,9 @@ pub(crate) use linux as sys;
 use crate::application::is_main_thread_running;
 use crate::input::Window;
 use atomic_float::AtomicF64;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 /// Mouse button constant for the left mouse button.
@@ -99,13 +101,22 @@ pub struct MouseWindowLocation {
     window: Option<Window>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MouseEventProvenance {
     pub last_window_protocol_id: Option<u64>,
     pub motion_event_count: u64,
     pub button_event_count: u64,
     pub scroll_event_count: u64,
     pub total_event_count: u64,
+    pub recent_button_events: Vec<MouseButtonEventRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseButtonEventRecord {
+    pub sequence: u64,
+    pub button: u8,
+    pub pressed: bool,
+    pub window_protocol_id: Option<u64>,
 }
 
 impl MouseWindowLocation {
@@ -215,6 +226,7 @@ struct Shared {
     button_event_count: AtomicU64,
     scroll_event_count: AtomicU64,
     total_event_count: AtomicU64,
+    recent_button_events: Mutex<VecDeque<MouseButtonEventRecord>>,
 }
 impl Shared {
     fn new() -> Self {
@@ -229,6 +241,7 @@ impl Shared {
             button_event_count: AtomicU64::new(0),
             scroll_event_count: AtomicU64::new(0),
             total_event_count: AtomicU64::new(0),
+            recent_button_events: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -254,7 +267,25 @@ impl Shared {
     fn set_key_state(&self, key: u8, down: bool, window: *mut c_void) {
         logwise::debuginternal_sync!("Set mouse key {key} state {down}", key = key, down = down);
         self.buttons[key as usize].store(down, std::sync::atomic::Ordering::Relaxed);
-        self.record_window_event(window, &self.button_event_count);
+        self.last_window.store(window, Ordering::Relaxed);
+        let window_protocol_id = window as usize as u64;
+        self.last_window_protocol_id
+            .store(window_protocol_id, Ordering::Relaxed);
+        let sequence = self
+            .button_event_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.total_event_count.fetch_add(1, Ordering::Relaxed);
+        let mut recent_events = self.recent_button_events.lock().unwrap();
+        recent_events.push_back(MouseButtonEventRecord {
+            sequence,
+            button: key,
+            pressed: down,
+            window_protocol_id: (window_protocol_id != 0).then_some(window_protocol_id),
+        });
+        while recent_events.len() > 256 {
+            recent_events.pop_front();
+        }
     }
 
     fn add_scroll_delta(&self, delta_x: f64, delta_y: f64, window: *mut c_void) {
@@ -423,6 +454,14 @@ impl Mouse {
             button_event_count: self.shared.button_event_count.load(Ordering::Relaxed),
             scroll_event_count: self.shared.scroll_event_count.load(Ordering::Relaxed),
             total_event_count: self.shared.total_event_count.load(Ordering::Relaxed),
+            recent_button_events: self
+                .shared
+                .recent_button_events
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect(),
         }
     }
 

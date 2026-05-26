@@ -7130,10 +7130,9 @@ impl RuntimeRowSnapshotTemplate {
                 InitialValue::Text { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
-                InitialValue::Number { value } => {
-                    row.columns
-                        .set_textlike(&field.field_name, &value.to_string())?
-                }
+                InitialValue::Number { value } => row
+                    .columns
+                    .set_textlike(&field.field_name, &value.to_string())?,
                 InitialValue::Bool { value } => row.columns.set_bool(&field.field_name, *value)?,
                 InitialValue::Enum { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
@@ -7317,7 +7316,10 @@ enum ScalarUpdateExpression {
         right: String,
     },
     PreviousValue(String),
-    TextTrimOrPrevious { path: String, previous: String },
+    TextTrimOrPrevious {
+        path: String,
+        previous: String,
+    },
     BoolNot(String),
     Unsupported,
 }
@@ -12265,13 +12267,21 @@ mod tests {
         .unwrap();
 
         let expected = [
-            ("press-increment", "store.sources.increment_button.press", "1"),
+            (
+                "press-increment",
+                "store.sources.increment_button.press",
+                "1",
+            ),
             (
                 "press-increment-again",
                 "store.sources.increment_button.press",
                 "2",
             ),
-            ("press-decrement", "store.sources.decrement_button.press", "1"),
+            (
+                "press-decrement",
+                "store.sources.decrement_button.press",
+                "1",
+            ),
             ("press-reset", "store.sources.reset_button.press", "0"),
             (
                 "press-decrement-negative",

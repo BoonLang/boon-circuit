@@ -61,6 +61,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-example-tabs",
     "verify-native-editor-format",
     "verify-native-example-speed",
+    "verify-native-counter-interaction-speed",
     "verify-native-dev-editor-speed",
     "verify-native-two-window-content",
     "verify-native-todomvc-reference-parity",
@@ -140,6 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-example-tabs" => verify_native_example_tabs(&args),
         "verify-native-editor-format" => verify_native_editor_format(&args),
         "verify-native-example-speed" => verify_native_example_speed(&args),
+        "verify-native-counter-interaction-speed" => verify_native_counter_interaction_speed(&args),
         "verify-native-dev-editor-speed" => verify_native_dev_editor_speed(&args),
         "verify-native-two-window-content" => verify_native_two_window_content(&args),
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
@@ -8972,6 +8974,262 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
     )
 }
 
+fn verify_native_counter_interaction_speed(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let event_count = value_arg(args, "--event-count")
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(24)
+        .max(1);
+    let max_total_ms = value_arg(args, "--max-total-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(250.0);
+    let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
+    let example_ok = example == "counter";
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:example-selector",
+        example_ok,
+        format!("example={example}"),
+        (!example_ok)
+            .then(|| "counter interaction speed gate only supports --example counter".to_owned()),
+    );
+
+    let source_path = PathBuf::from("examples/counter.bn");
+    let scenario_path = PathBuf::from("examples/counter.scn");
+    let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
+    std::fs::create_dir_all(&artifacts_dir)?;
+    let role_report = artifacts_dir.join("counter-interaction-speed-role.json");
+    let _ = std::fs::remove_file(&role_report);
+
+    let build = Command::new("cargo")
+        .args(["build", "-p", "boon_native_playground"])
+        .status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:playground-build",
+        build.success(),
+        format!("cargo build -p boon_native_playground status={build}"),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+    );
+
+    let binary_path = PathBuf::from("target/debug/boon_native_playground");
+    let event_count_arg = event_count.to_string();
+    let max_total_ms_arg = max_total_ms.to_string();
+    let role_report_arg = role_report.display().to_string();
+    let role_output = if build.success() && example_ok {
+        Some(
+            Command::new(&binary_path)
+                .args([
+                    "--role",
+                    "interaction-speed",
+                    "--example",
+                    "counter",
+                    "--event-count",
+                    &event_count_arg,
+                    "--max-total-ms",
+                    &max_total_ms_arg,
+                    "--report",
+                    &role_report_arg,
+                ])
+                .output()?,
+        )
+    } else {
+        None
+    };
+    let role_exit_success = role_output
+        .as_ref()
+        .is_some_and(|output| output.status.success());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:role-exit-success",
+        role_exit_success,
+        format!(
+            "status={:?}",
+            role_output
+                .as_ref()
+                .map(|output| output.status.to_string())
+                .unwrap_or_else(|| "not-run".to_owned())
+        ),
+        (!role_exit_success).then(|| {
+            format!(
+                "boon_native_playground interaction-speed role failed; report={}",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_report_json = read_optional_json(&role_report)?;
+    let role_report_present = role_report_json.is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:role-report-present",
+        role_report_present,
+        format!("report={}", role_report.display()),
+        (!role_report_present).then(|| {
+            format!(
+                "interaction-speed role did not write `{}`",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
+        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:role-status-pass",
+        role_status_pass,
+        format!(
+            "status={:?}",
+            role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!role_status_pass).then(|| "interaction-speed role report status was not pass".to_owned()),
+    );
+
+    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
+        report
+            .get("per_step_pass_fail")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| {
+                !steps.is_empty()
+                    && steps.iter().all(|step| {
+                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+            })
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:role-checks-pass",
+        role_checks_all_pass,
+        "role per_step_pass_fail entries all pass",
+        (!role_checks_all_pass)
+            .then(|| "interaction-speed role contained a failing step".to_owned()),
+    );
+
+    let observed_final = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("final_count"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let observed_expected = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("expected_count"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let final_count_ok = observed_final == event_count_arg && observed_expected == event_count_arg;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:all-clicks-applied",
+        final_count_ok,
+        format!(
+            "event_count={event_count}, final_count={observed_final}, expected_count={observed_expected}"
+        ),
+        (!final_count_ok).then(|| {
+            format!(
+                "counter interaction burst dropped clicks: event_count={event_count}, final_count={observed_final}, expected_count={observed_expected}"
+            )
+        }),
+    );
+
+    let render_update_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("preview_shared_render_update_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let render_update_ok = render_update_count >= event_count;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:render-updated-for-each-click",
+        render_update_ok,
+        format!("render_update_count={render_update_count}, event_count={event_count}"),
+        (!render_update_ok).then(|| {
+            format!(
+                "counter interaction render updates lagged clicks: render_update_count={render_update_count}, event_count={event_count}"
+            )
+        }),
+    );
+
+    let interaction_total_ms = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("interaction_total_ms"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let interaction_per_event_ms = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("interaction_per_event_ms"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let latency_ok = interaction_total_ms <= max_total_ms;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-interaction-speed:latency-budget",
+        latency_ok,
+        format!(
+            "interaction_total_ms={interaction_total_ms:.3}, interaction_per_event_ms={interaction_per_event_ms:.3}, max_total_ms={max_total_ms:.3}"
+        ),
+        (!latency_ok).then(|| {
+            format!(
+                "counter interaction burst exceeded latency budget: interaction_total_ms={interaction_total_ms:.3}, max_total_ms={max_total_ms:.3}"
+            )
+        }),
+    );
+
+    let role_artifact = if role_report.exists() {
+        vec![artifact_hash(&role_report)?]
+    } else {
+        Vec::new()
+    };
+    write_native_gate_report(
+        args,
+        "verify-native-counter-interaction-speed",
+        checks,
+        blockers,
+        json!({
+            "example": "counter",
+            "source_path": source_path,
+            "scenario_path": scenario_path,
+            "source_hash": file_hash("examples/counter.bn"),
+            "scenario_hash": file_hash("examples/counter.scn"),
+            "playground_binary_path": binary_path,
+            "playground_binary_hash": file_hash("target/debug/boon_native_playground"),
+            "role_report": role_report,
+            "role_report_status": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "event_count": event_count,
+            "final_count": observed_final,
+            "expected_count": observed_expected,
+            "interaction_total_ms": interaction_total_ms,
+            "interaction_per_event_ms": interaction_per_event_ms,
+            "preview_shared_render_update_count": render_update_count,
+            "max_total_ms": max_total_ms,
+            "artifact_sha256s": role_artifact
+        }),
+    )
+}
+
 fn verify_native_dev_editor_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -10794,6 +11052,12 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "cells")],
         ),
         native_gpu_required_report(
+            "counter-interaction-speed",
+            "target/reports/native-gpu/counter-interaction-speed.json",
+            "verify-native-counter-interaction-speed",
+            &[],
+        ),
+        native_gpu_required_report(
             "scroll-speed-cells",
             "target/reports/native-gpu/scroll-speed-cells.json",
             "verify-native-gpu-scroll-speed",
@@ -10995,6 +11259,36 @@ fn validate_native_gpu_child_report(
 fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -> Vec<String> {
     let mut blockers = Vec::new();
     match label {
+        "counter-interaction-speed" => {
+            require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "preview_shared_render_update_count",
+                report
+                    .get("event_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "interaction_total_ms",
+                report
+                    .get("max_total_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(250.0),
+            );
+            if report
+                .get("final_count")
+                .and_then(serde_json::Value::as_str)
+                != report
+                    .get("expected_count")
+                    .and_then(serde_json::Value::as_str)
+            {
+                blockers.push("final_count must match expected_count".to_owned());
+            }
+        }
         "multiwindow" => {
             require_str_field(
                 &mut blockers,
@@ -11960,6 +12254,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("cells") => "speed-cells",
             _ => "speed-example",
         },
+        "verify-native-counter-interaction-speed" => "counter-interaction-speed",
         "verify-native-dev-editor-speed" => "dev-editor-speed",
         "verify-native-two-window-content" => "todomvc-two-window-content",
         "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
@@ -15325,6 +15620,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
+                | "verify-native-counter-interaction-speed"
                 | "verify-native-dev-editor-speed"
                 | "verify-boon-driver-schema"
                 | "verify-boon-driver-e2e"

@@ -181,6 +181,7 @@ pub struct NativeInputAdapterProof {
     pub mouse_scroll_event_count: u64,
     pub mouse_total_event_count: u64,
     pub keyboard_key_event_count: u64,
+    pub mouse_button_events: Vec<NativeMouseButtonEventProof>,
     pub keyboard_events: Vec<NativeKeyboardEventProof>,
     pub mouse_window_pos: Option<NativeMouseWindowPosition>,
     pub mouse_buttons_down: Vec<String>,
@@ -193,6 +194,14 @@ pub struct NativeInputAdapterProof {
 pub struct NativeKeyboardEventProof {
     pub sequence: u64,
     pub key: String,
+    pub pressed: bool,
+    pub window_protocol_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeMouseButtonEventProof {
+    pub sequence: u64,
+    pub button: String,
     pub pressed: bool,
     pub window_protocol_id: Option<u64>,
 }
@@ -1034,6 +1043,16 @@ fn sample_input_adapter(
             window_protocol_id: event.window_protocol_id,
         })
         .collect::<Vec<_>>();
+    let mouse_button_events = mouse_provenance
+        .recent_button_events
+        .iter()
+        .map(|event| NativeMouseButtonEventProof {
+            sequence: event.sequence,
+            button: mouse_button_label(event.button).to_owned(),
+            pressed: event.pressed,
+            window_protocol_id: event.window_protocol_id,
+        })
+        .collect::<Vec<_>>();
     let real_os_events_observed = mouse_window_pos.is_some()
         || !mouse_buttons_down.is_empty()
         || !pressed_keys.is_empty()
@@ -1065,12 +1084,22 @@ fn sample_input_adapter(
         mouse_scroll_event_count: mouse_provenance.scroll_event_count,
         mouse_total_event_count: mouse_provenance.total_event_count,
         keyboard_key_event_count: keyboard_provenance.key_event_count,
+        mouse_button_events,
         keyboard_events,
         mouse_window_pos,
         mouse_buttons_down,
         pressed_keys,
         scroll_delta_x,
         scroll_delta_y,
+    }
+}
+
+fn mouse_button_label(button: u8) -> &'static str {
+    match button {
+        MOUSE_BUTTON_LEFT => "left",
+        MOUSE_BUTTON_RIGHT => "right",
+        MOUSE_BUTTON_MIDDLE => "middle",
+        _ => "other",
     }
 }
 
@@ -1098,6 +1127,7 @@ fn empty_input_adapter_proof(synthetic_input_probe: bool) -> NativeInputAdapterP
         mouse_scroll_event_count: 0,
         mouse_total_event_count: 0,
         keyboard_key_event_count: 0,
+        mouse_button_events: Vec::new(),
         keyboard_events: Vec::new(),
         mouse_window_pos: None,
         mouse_buttons_down: Vec::new(),

@@ -27,6 +27,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "dev" => run_dev(&args),
         "desktop" => run_desktop(&args),
         "layout-proof" => run_layout_proof(&args),
+        "interaction-speed" => run_interaction_speed(&args),
         other => Err(format!("unknown --role `{other}`").into()),
     }
 }
@@ -69,6 +70,137 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     boon_runtime::write_json(Path::new(&report), &report_value)?;
     boon_runtime::verify_report_schema(Path::new(&report))?;
     Ok(())
+}
+
+fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    if entry.id != "counter" {
+        return Err("interaction-speed currently targets the Counter interaction contract".into());
+    }
+    let event_count = numeric_arg(args, "--event-count").unwrap_or(24).max(1);
+    let max_total_ms = numeric_arg(args, "--max-total-ms").unwrap_or(250) as f64;
+    let report = value_arg(args, "--report").ok_or("interaction-speed role requires --report")?;
+    let source_path = PathBuf::from(&entry.source);
+    let source = std::fs::read_to_string(&source_path)?;
+    let scenario = boon_runtime::parse_scenario(Path::new(&entry.scenario))?;
+    let step = scenario
+        .step
+        .iter()
+        .find(|step| step.id == "press-increment")
+        .ok_or("counter scenario is missing press-increment step")?;
+    let source_event = step
+        .expected_source_event
+        .as_ref()
+        .and_then(|event| event.get("source"))
+        .and_then(toml_value_as_str)
+        .ok_or("press-increment step is missing expected source event")?;
+    let layout_proof = native_document_layout_proof(&source_path, &source)?;
+    let (x, y, target_node) = source_hit_center(&layout_proof, source_event)?;
+    let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+        layout_proof: layout_proof.clone(),
+        layout_frame_override: None,
+        update_count: 0,
+        scroll_x_px: 0.0,
+        scroll_y_px: 0.0,
+        last_error: None,
+        last_error_count: 0,
+    }));
+    let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
+        &format!("interaction-speed:{}", source_path.display()),
+        &source,
+        Path::new(&entry.scenario),
+    )?));
+    let mut input_state = PreviewNativeInputState::default();
+    let input = deterministic_click_input(event_count, x, y);
+    let started = Instant::now();
+    preview_apply_real_window_input(
+        &input,
+        &source_path,
+        &source,
+        Some(&live_runtime),
+        &shared_render_state,
+        &mut input_state,
+    )?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (state_summary, update_count, layout_hash, last_error) = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?;
+        let state_summary = runtime.state_summary();
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "interaction-speed render state mutex poisoned")?;
+        (
+            state_summary,
+            shared.update_count,
+            shared
+                .layout_proof
+                .get("layout_frame_hash")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            shared.last_error.clone(),
+        )
+    };
+    let expected_count = event_count.to_string();
+    let observed_count = state_summary
+        .pointer("/store/count")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let final_count_ok = observed_count == expected_count;
+    let update_count_ok = update_count >= event_count;
+    let timing_ok = elapsed_ms <= max_total_ms;
+    let status = if final_count_ok && update_count_ok && timing_ok && last_error.is_none() {
+        "pass"
+    } else {
+        "fail"
+    };
+    let mut report_value = base_report("boon-native-playground-interaction-speed", args, status);
+    report_value["native_gpu_contract"] = json!(true);
+    report_value["example"] = json!(entry.id);
+    report_value["source_path"] = json!(entry.source);
+    report_value["scenario_path"] = json!(entry.scenario);
+    report_value["scenario_step"] = json!(step.id);
+    report_value["source_event"] = json!(source_event);
+    report_value["target_node"] = json!(target_node);
+    report_value["event_count"] = json!(event_count);
+    report_value["max_total_ms"] = json!(max_total_ms);
+    report_value["interaction_total_ms"] = json!(elapsed_ms);
+    report_value["interaction_per_event_ms"] = json!(elapsed_ms / event_count as f64);
+    report_value["preview_shared_render_update_count"] = json!(update_count);
+    report_value["final_count"] = json!(observed_count);
+    report_value["expected_count"] = json!(expected_count);
+    report_value["layout_frame_hash"] = layout_hash;
+    report_value["preview_last_error"] = json!(last_error);
+    report_value["per_step_pass_fail"] = json!([
+        {
+            "id": "counter-interaction-speed:all-clicks-applied",
+            "pass": final_count_ok,
+            "detail": format!("expected final count {event_count}, observed {observed_count}")
+        },
+        {
+            "id": "counter-interaction-speed:render-updated-for-each-click",
+            "pass": update_count_ok,
+            "detail": format!("preview_shared_render_update_count={update_count}, event_count={event_count}")
+        },
+        {
+            "id": "counter-interaction-speed:total-latency-budget",
+            "pass": timing_ok,
+            "detail": format!("interaction_total_ms={elapsed_ms:.3}, max_total_ms={max_total_ms:.3}")
+        },
+        {
+            "id": "counter-interaction-speed:no-preview-error",
+            "pass": last_error.is_none(),
+            "detail": format!("preview_last_error={last_error:?}")
+        }
+    ]);
+    boon_runtime::write_json(Path::new(&report), &report_value)?;
+    if status == "pass" {
+        Ok(())
+    } else {
+        Err(format!("interaction-speed failed; wrote {report}").into())
+    }
 }
 
 fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1105,7 +1237,6 @@ fn native_gpu_app_owned_render_hook(
             }
         };
         *layout_frame_cache = Some((layout_cache_key.to_owned(), layout_frame));
-        *app_owned_proof = None;
     }
     let layout_frame = layout_frame_cache
         .as_ref()
@@ -1137,6 +1268,7 @@ fn native_gpu_app_owned_render_hook(
         width: context.width,
         height: context.height,
     })?;
+    let app_owned_readback_reused = app_owned_proof.is_some();
     let proof = match app_owned_proof {
         Some(proof) => proof.clone(),
         None => {
@@ -1177,6 +1309,7 @@ fn native_gpu_app_owned_render_hook(
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
+        "app_owned_readback_reused": app_owned_readback_reused,
         "proof": proof,
         "copy_to_present_limitation": serde_json::Value::Null
     }))
@@ -1447,10 +1580,12 @@ fn dev_apply_real_window_input(
         changed = true;
     }
 
-    if input.mouse_button_event_count > input_state.last_mouse_button_event_count
-        && input.mouse_buttons_down.is_empty()
+    for mouse_release in
+        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
     {
-        input_state.last_mouse_button_event_count = input.mouse_button_event_count;
+        input_state.last_mouse_button_event_count = input_state
+            .last_mouse_button_event_count
+            .max(mouse_release.sequence);
         if let Some(position) = input.mouse_window_pos {
             if let Some((node_id, source_path)) =
                 dev_source_binding_at(document, layout_frame, position.x as f32, position.y as f32)
@@ -6005,6 +6140,142 @@ struct PreviewNativeInputState {
     focused_text: String,
 }
 
+fn unhandled_primary_mouse_releases(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    last_seen_sequence: u64,
+) -> Vec<boon_native_app_window::NativeMouseButtonEventProof> {
+    let releases = input
+        .mouse_button_events
+        .iter()
+        .filter(|event| {
+            event.sequence > last_seen_sequence && event.button == "left" && !event.pressed
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !releases.is_empty() || !input.mouse_button_events.is_empty() {
+        return releases;
+    }
+    if input.mouse_button_event_count > last_seen_sequence && input.mouse_buttons_down.is_empty() {
+        vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: input.mouse_button_event_count,
+            button: "left".to_owned(),
+            pressed: false,
+            window_protocol_id: input.mouse_last_window_protocol_id,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn deterministic_click_input(
+    event_count: u64,
+    x: f64,
+    y: f64,
+) -> boon_native_app_window::NativeInputAdapterProof {
+    let mut mouse_button_events = Vec::new();
+    for index in 0..event_count {
+        let press_sequence = index.saturating_mul(2).saturating_add(1);
+        let release_sequence = press_sequence.saturating_add(1);
+        mouse_button_events.push(boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: press_sequence,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        });
+        mouse_button_events.push(boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: release_sequence,
+            button: "left".to_owned(),
+            pressed: false,
+            window_protocol_id: Some(1),
+        });
+    }
+    boon_native_app_window::NativeInputAdapterProof {
+        installed: true,
+        capture_scope: "deterministic_recent_mouse_button_events".to_owned(),
+        keyboard_api: "none".to_owned(),
+        mouse_api: "app_window::input::mouse::Mouse::event_provenance".to_owned(),
+        wheel_api: "none".to_owned(),
+        per_window_event_provenance_api:
+            "app_window::input::mouse::MouseEventProvenance::recent_button_events".to_owned(),
+        sampled_after_visible_window: true,
+        real_os_events_observed: true,
+        input_injection_method: "deterministic_app_owned_mouse_event_batch".to_owned(),
+        synthetic_input_probe: false,
+        mouse_last_window_protocol_id: Some(1),
+        keyboard_last_window_protocol_id: None,
+        mouse_motion_event_count: 1,
+        mouse_button_event_count: event_count.saturating_mul(2),
+        mouse_scroll_event_count: 0,
+        mouse_total_event_count: event_count.saturating_mul(2).saturating_add(1),
+        keyboard_key_event_count: 0,
+        mouse_button_events,
+        keyboard_events: Vec::new(),
+        mouse_window_pos: Some(boon_native_app_window::NativeMouseWindowPosition {
+            x,
+            y,
+            window_width: 920.0,
+            window_height: 720.0,
+        }),
+        mouse_buttons_down: Vec::new(),
+        pressed_keys: Vec::new(),
+        scroll_delta_x: 0.0,
+        scroll_delta_y: 0.0,
+    }
+}
+
+fn source_hit_center(
+    layout_proof: &Value,
+    source_event: &str,
+) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+    let source_intents = layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("layout proof missing source intents")?;
+    let target_node = source_intents
+        .iter()
+        .find_map(|intent| {
+            (intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_event))
+            .then(|| intent.get("node").and_then(serde_json::Value::as_str))
+            .flatten()
+            .map(str::to_owned)
+        })
+        .ok_or_else(|| format!("source event `{source_event}` has no document source intent"))?;
+    let hit_region = layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|region| {
+            region.get("node").and_then(serde_json::Value::as_str) == Some(target_node.as_str())
+        })
+        .ok_or_else(|| format!("source event `{source_event}` target has no hit region"))?;
+    let bounds = hit_region
+        .get("bounds")
+        .ok_or("target hit region missing bounds")?;
+    let x = bounds
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default()
+        + bounds
+            .get("width")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+            / 2.0;
+    let y = bounds
+        .get("y")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default()
+        + bounds
+            .get("height")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default()
+            / 2.0;
+    Ok((x, y, target_node))
+}
+
 fn preview_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
@@ -6025,47 +6296,58 @@ fn preview_apply_real_window_input(
         .layout_proof
         .clone();
 
-    if input.mouse_button_event_count > input_state.last_mouse_button_event_count
-        && input.mouse_buttons_down.is_empty()
+    let mut latest_layout = None;
+    let mut pending_mouse_events = Vec::new();
+    for mouse_release in
+        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
     {
-        input_state.last_mouse_button_event_count = input.mouse_button_event_count;
+        input_state.last_mouse_button_event_count = input_state
+            .last_mouse_button_event_count
+            .max(mouse_release.sequence);
         if let Some(position) = input.mouse_window_pos
-            && let Some(hit_region) = document_hit_region_at(&layout_proof, position.x, position.y)
+            && let Some(hit_region) = document_hit_region_at(
+                latest_layout.as_ref().unwrap_or(&layout_proof),
+                position.x,
+                position.y,
+            )
         {
             let node = hit_region
                 .get("node")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            if live_source_for_node_intent(&layout_proof, &node, "change").is_some() {
+            let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+            if live_source_for_node_intent(layout, &node, "change").is_some() {
                 input_state.focused_node = Some(node);
                 input_state.focused_text.clear();
                 input_state.focused_text.push_str(
-                    document_value_for_hit_region(&layout_proof, &hit_region)
+                    document_value_for_hit_region(layout, &hit_region)
                         .as_deref()
                         .unwrap_or_default(),
                 );
             } else {
                 input_state.focused_node = None;
                 input_state.focused_text.clear();
-                if let Some(event) = live_source_event_for_hit_region(&layout_proof, &hit_region) {
-                    preview_apply_live_event(
-                        source_path,
-                        source_text,
-                        live_runtime,
-                        shared_render_state,
-                        event,
-                    )?;
+                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region) {
+                    pending_mouse_events.push(event);
                 }
             }
         }
+    }
+    if !pending_mouse_events.is_empty() {
+        latest_layout = Some(preview_apply_live_events(
+            source_path,
+            source_text,
+            live_runtime,
+            shared_render_state,
+            pending_mouse_events,
+        )?);
     }
 
     let shift_pressed = input
         .pressed_keys
         .iter()
         .any(|key| key == "Shift" || key == "RightShift");
-    let mut latest_layout = None;
     let keyboard_events = input
         .keyboard_events
         .iter()
@@ -6420,15 +6702,45 @@ fn preview_apply_live_event(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     event: boon_runtime::LiveSourceEvent,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let mut runtime = live_runtime
-        .lock()
-        .map_err(|_| "preview live runtime mutex poisoned")?;
-    let output = runtime.apply_source_event(event)?;
-    let post_input_layout = native_document_layout_proof_with_state(
+    preview_apply_live_events(
         source_path,
         source_text,
-        Some(&output.state_summary),
-    )?;
+        live_runtime,
+        shared_render_state,
+        vec![event],
+    )
+}
+
+fn preview_apply_live_events(
+    source_path: &Path,
+    source_text: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    events: Vec<boon_runtime::LiveSourceEvent>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if events.is_empty() {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        return Ok(shared.layout_proof.clone());
+    }
+    let (state_summary, event_count) = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "preview live runtime mutex poisoned")?;
+        let mut state_summary = None;
+        let event_count = events.len() as u64;
+        for event in events {
+            let output = runtime.apply_source_event(event)?;
+            state_summary = Some(output.state_summary);
+        }
+        (
+            state_summary.ok_or("preview live event batch produced no state summary")?,
+            event_count,
+        )
+    };
+    let post_input_layout =
+        native_document_layout_proof_with_state(source_path, source_text, Some(&state_summary))?;
     if post_input_layout
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -6440,7 +6752,8 @@ fn preview_apply_live_event(
         shared_render_state.layout_proof = post_input_layout.clone();
         shared_render_state.layout_frame_override = None;
         shared_render_state.last_error = None;
-        shared_render_state.update_count = shared_render_state.update_count.saturating_add(1);
+        shared_render_state.update_count =
+            shared_render_state.update_count.saturating_add(event_count);
     }
     Ok(post_input_layout)
 }

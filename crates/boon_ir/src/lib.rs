@@ -351,17 +351,30 @@ pub struct UpdateBranch {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UpdateExpression {
-    SourcePayload { path: String },
-    Const { value: String },
+    SourcePayload {
+        path: String,
+    },
+    Const {
+        value: String,
+    },
     NumberInfix {
         left: String,
         op: String,
         right: String,
     },
-    PreviousValue { path: String },
-    TextTrimOrPrevious { path: String, previous: String },
-    BoolNot { path: String },
-    Unknown { summary: String },
+    PreviousValue {
+        path: String,
+    },
+    TextTrimOrPrevious {
+        path: String,
+        previous: String,
+    },
+    BoolNot {
+        path: String,
+    },
+    Unknown {
+        summary: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2327,11 +2340,9 @@ fn field_initial_value(field: &FieldDef) -> InitialValue {
 
 fn ast_initial_value(expr: &AstExpr) -> InitialValue {
     match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
-            InitialValue::Text {
-                value: value.clone(),
-            }
-        }
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
+            value: value.clone(),
+        },
         AstExprKind::Number(value) => value
             .parse::<i64>()
             .map(|value| InitialValue::Number { value })
@@ -2548,7 +2559,10 @@ fn scalar_number_operand(field: &FieldDef, expr_id: usize, target: &str) -> Opti
     if value.parse::<i64>().is_ok() {
         return Some(value);
     }
-    let target_field = target.rsplit_once('.').map(|(_, field)| field).unwrap_or(target);
+    let target_field = target
+        .rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(target);
     let canonical = if value == field.local_name || value == target_field {
         target.to_owned()
     } else {
@@ -3194,7 +3208,10 @@ impl RoutedBranch {
             else {
                 return None;
             };
-            let output = self.ast_exprs.iter().find(|candidate| candidate.id == output)?;
+            let output = self
+                .ast_exprs
+                .iter()
+                .find(|candidate| candidate.id == output)?;
             let AstExprKind::Infix { left, op, right } = &output.kind else {
                 return None;
             };

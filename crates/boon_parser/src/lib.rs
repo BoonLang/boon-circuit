@@ -783,10 +783,7 @@ fn ast_expr_kind(
     if tokens.len() == 1 && tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
         return AstExprKind::Number(tokens[0].clone());
     }
-    if tokens.len() == 2
-        && tokens[0] == "-"
-        && tokens[1].chars().all(|ch| ch.is_ascii_digit())
-    {
+    if tokens.len() == 2 && tokens[0] == "-" && tokens[1].chars().all(|ch| ch.is_ascii_digit()) {
         return AstExprKind::Number(format!("-{}", tokens[1]));
     }
     if let Some(value) = string_literal_value(tokens) {
@@ -1016,7 +1013,9 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
-            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" if depth == 0 && index > 0 && index + 1 < tokens.len() => {
+            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-"
+                if depth == 0 && index > 0 && index + 1 < tokens.len() =>
+            {
                 return Some((&tokens[..index], token, &tokens[index + 1..]));
             }
             _ => {}

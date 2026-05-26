@@ -660,6 +660,7 @@ struct TextRunSignature {
     size: u32,
     color: [u8; 4],
     align: TextAlign,
+    vertical_align: TextVerticalAlign,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -679,6 +680,7 @@ struct TextRunPlacementSignature {
     size: u32,
     color: [u8; 4],
     align: TextAlign,
+    vertical_align: TextVerticalAlign,
 }
 
 impl TextRunSignature {
@@ -697,6 +699,7 @@ impl TextRunSignature {
             size: run.size.to_bits(),
             color: run.color,
             align: run.align,
+            vertical_align: run.vertical_align,
         }
     }
 }
@@ -719,6 +722,7 @@ impl TextRunPlacementSignature {
             size: run.size.to_bits(),
             color: run.color,
             align: run.align,
+            vertical_align: run.vertical_align,
         }
     }
 }
@@ -772,7 +776,7 @@ impl GlyphonTextState {
                 let line_width =
                     shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
                 let left = text_left_for_width(run, line_width);
-                let top = run.bounds.y + 1.0;
+                let top = text_top_for_height(run);
                 areas.push(TextArea {
                     buffer,
                     left,
@@ -970,6 +974,7 @@ struct TextRun {
     color: [u8; 4],
     size: f32,
     align: TextAlign,
+    vertical_align: TextVerticalAlign,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -977,6 +982,13 @@ enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextVerticalAlign {
+    Top,
+    Center,
+    Bottom,
 }
 
 fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
@@ -1042,7 +1054,8 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                 text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
                 color,
                 size,
-                align: text_align(&item.style),
+                align: text_align(&item.kind, &item.style),
+                vertical_align: text_vertical_align(&item.kind, &item.style),
             })
         })
         .collect()
@@ -1269,6 +1282,19 @@ fn text_left_for_width(run: &TextRun, text_width: f32) -> f32 {
     }
 }
 
+fn text_top_for_height(run: &TextRun) -> f32 {
+    let line_height = (run.size.clamp(8.0, 120.0) * 1.25).max(1.0);
+    match run.vertical_align {
+        TextVerticalAlign::Top => run.bounds.y + 1.0,
+        TextVerticalAlign::Center => {
+            run.bounds.y + ((run.bounds.height - line_height) / 2.0).max(0.0)
+        }
+        TextVerticalAlign::Bottom => {
+            run.bounds.y + (run.bounds.height - line_height - run.text_inset).max(0.0)
+        }
+    }
+}
+
 fn shaped_column_edges(text: &str, buffer: &Buffer, line_width: f32) -> Vec<f32> {
     let char_count = text.chars().count();
     let mut edges = vec![None; char_count.saturating_add(1)];
@@ -1348,14 +1374,31 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
         .collect()
 }
 
-fn text_align(style: &StyleMap) -> TextAlign {
+fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextAlign {
     if style_bool(style, "center") == Some(true) {
         return TextAlign::Center;
     }
     match style_text(style, "align") {
+        Some("left") => TextAlign::Left,
         Some("center") => TextAlign::Center,
         Some("right") => TextAlign::Right,
+        _ if matches!(kind, DocumentNodeKind::Button) => TextAlign::Center,
         _ => TextAlign::Left,
+    }
+}
+
+fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVerticalAlign {
+    if style_bool(style, "center_y") == Some(true)
+        || style_bool(style, "center_vertical") == Some(true)
+    {
+        return TextVerticalAlign::Center;
+    }
+    match style_text(style, "vertical_align").or_else(|| style_text(style, "align_y")) {
+        Some("top") => TextVerticalAlign::Top,
+        Some("center") => TextVerticalAlign::Center,
+        Some("bottom") => TextVerticalAlign::Bottom,
+        _ if matches!(kind, DocumentNodeKind::Button) => TextVerticalAlign::Center,
+        _ => TextVerticalAlign::Top,
     }
 }
 
@@ -2060,6 +2103,86 @@ mod tests {
             &colors[first_bracket_rect * 24..first_bracket_rect * 24 + 4],
             &[22, 66, 255, 51]
         );
+    }
+
+    #[test]
+    fn button_text_runs_are_centered_by_default() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(16.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(4.0));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("button".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 40.0,
+                },
+                text: Some("RUN".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 320, 120);
+        let run = runs.first().expect("button text should render");
+        assert_eq!(run.align, TextAlign::Center);
+        assert_eq!(run.vertical_align, TextVerticalAlign::Center);
+
+        let mut font_system = editor_font_system();
+        let buffer = shape_text_run(&mut font_system, run);
+        let line_width = shaped_line_width(&buffer).expect("button label should shape");
+        let left = text_left_for_width(run, line_width);
+        let top = text_top_for_height(run);
+        assert!(
+            left > run.bounds.x + run.text_inset,
+            "centered button text should not use the left inset"
+        );
+        assert!((top - 30.0).abs() <= 0.5, "button text top={top}");
+    }
+
+    #[test]
+    fn explicit_button_text_alignment_overrides_center_default() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(16.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(4.0));
+        style.insert("align".to_owned(), StyleValue::Text("left".to_owned()));
+        style.insert(
+            "vertical_align".to_owned(),
+            StyleValue::Text("top".to_owned()),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("button".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 40.0,
+                },
+                text: Some("RUN".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 320, 120);
+        let run = runs.first().expect("button text should render");
+        assert_eq!(run.align, TextAlign::Left);
+        assert_eq!(run.vertical_align, TextVerticalAlign::Top);
+        assert_eq!(text_left_for_width(run, 30.0), 14.0);
+        assert_eq!(text_top_for_height(run), 21.0);
     }
 
     fn test_text_layouts(frame: &LayoutFrame, width: u32, height: u32) -> TextRunLayoutMap {

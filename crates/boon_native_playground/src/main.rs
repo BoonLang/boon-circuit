@@ -6679,12 +6679,19 @@ fn dev_button_node(
     text: String,
     styles: &[(&str, &str)],
 ) -> boon_document_model::DocumentNode {
-    dev_node(
+    let mut node = dev_node(
         id,
         boon_document_model::DocumentNodeKind::Button,
         Some(text),
         styles,
-    )
+    );
+    node.style
+        .entry("align".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Text("center".to_owned()));
+    node.style
+        .entry("vertical_align".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Text("center".to_owned()));
+    node
 }
 
 fn dev_node(
@@ -11502,6 +11509,23 @@ mod tests {
             assert!(
                 !matches!(bg, "#ffffff" | "#f8fafc" | "#edf2f7" | "#f3f6f9"),
                 "{} should not use a light fallback bg",
+                node.id.0
+            );
+        }
+        for node in frame.nodes.values().filter(|node| {
+            node.id.0.starts_with("dev-")
+                && matches!(node.kind, boon_document_model::DocumentNodeKind::Button)
+        }) {
+            assert_eq!(
+                style_text_value(node, "align"),
+                Some("center"),
+                "{} button label should be horizontally centered",
+                node.id.0
+            );
+            assert_eq!(
+                style_text_value(node, "vertical_align"),
+                Some("center"),
+                "{} button label should be vertically centered",
                 node.id.0
             );
         }

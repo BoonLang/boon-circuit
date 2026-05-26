@@ -37,6 +37,23 @@ const BOON_EDITOR_KEY_REPEAT_DELAY_MS: u64 = 500;
 const BOON_EDITOR_KEY_REPEAT_INTERVAL_MS: u64 = 30;
 const BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP: usize = 8;
 
+const DEV_BG: &str = "#0f1724";
+const DEV_PANEL: &str = "#141b2a";
+const DEV_PANEL_RAISED: &str = "#1a2435";
+const DEV_PANEL_ACTIVE: &str = "#26354d";
+const DEV_BORDER: &str = "#334155";
+const DEV_BORDER_MUTED: &str = "#243244";
+const DEV_TEXT: &str = "#eef2ff";
+const DEV_TEXT_MUTED: &str = "#9aa8bd";
+const DEV_ACCENT: &str = "#6ca2ff";
+const DEV_PASS: &str = "#2a9d8f";
+const DEV_WARN: &str = "#f4a261";
+const DEV_FAIL: &str = "#e63946";
+const DEV_DIRTY: &str = "#fcbf49";
+const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
+const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 1_000;
+const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("boon_native_playground: {error}");
@@ -1458,10 +1475,11 @@ fn native_gpu_dev_visible_render_hook(
         == 0;
     let caret_blink_changed = shell.caret_visible != caret_visible;
     shell.caret_visible = caret_visible;
+    let footer_summary_changed = shell.refresh_preview_summary_if_due(Instant::now());
     let cache_stale = layout_frame_cache
         .as_ref()
         .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
-    if cache_stale || caret_blink_changed {
+    if cache_stale || caret_blink_changed || footer_summary_changed {
         let document = shell.document_for_viewport(context.width, context.height);
         let layout_frame = boon_document::layout(boon_document::LayoutInput {
             document: &document,
@@ -1630,6 +1648,30 @@ fn dev_apply_real_window_input(
     let mut changed = false;
 
     if (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+        && let Some(footer_bounds) = layout_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-footer")
+            .map(|item| item.bounds)
+        && rect_contains(footer_bounds, position.x as f32, position.y as f32)
+    {
+        let max_scroll_line = shell.footer_lines().len().saturating_sub(1);
+        let line_delta = scaled_scroll_steps(input.scroll_delta_y, 8.0, 3);
+        if line_delta > 0 {
+            shell.footer_scroll_line = shell
+                .footer_scroll_line
+                .saturating_add(line_delta as usize)
+                .min(max_scroll_line);
+        } else if line_delta < 0 {
+            shell.footer_scroll_line = shell
+                .footer_scroll_line
+                .saturating_sub((-line_delta) as usize);
+        }
+        changed = true;
+    } else if (input.scroll_delta_y.abs() > f64::EPSILON
+        || input.scroll_delta_x.abs() > f64::EPSILON)
         && let Some(position) =
             input_layout_position(input.mouse_window_pos, surface_width, surface_height)
         && let Some(editor_bounds) = layout_frame
@@ -4796,6 +4838,33 @@ impl PreviewTransport {
             }),
         }
     }
+
+    fn runtime_summary(&self) -> serde_json::Value {
+        let Some(connect) = &self.connect else {
+            return json!({
+                "status": "not-bound",
+                "kind": "debug-query-result",
+                "debug_query": "RuntimeSummary",
+                "transport_bound": false
+            });
+        };
+        match send_preview_ipc_request_with_timeouts(
+            connect,
+            json!({"kind": "runtime-summary"}),
+            Duration::ZERO,
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+        ) {
+            Ok(value) => value,
+            Err(error) => json!({
+                "status": "unavailable",
+                "kind": "debug-query-result",
+                "debug_query": "RuntimeSummary",
+                "transport_bound": true,
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4806,6 +4875,10 @@ struct DevWindowShell {
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
     last_preview_transport: serde_json::Value,
+    last_preview_summary: serde_json::Value,
+    last_preview_summary_refresh: Option<Instant>,
+    last_dev_command: String,
+    footer_scroll_line: usize,
     caret_visible: bool,
 }
 
@@ -4834,6 +4907,15 @@ impl DevWindowShell {
                 "status": "not-run",
                 "reason": "no preview transport command has run yet"
             }),
+            last_preview_summary: json!({
+                "status": "not-run",
+                "kind": "debug-query-result",
+                "debug_query": "RuntimeSummary",
+                "reason": "preview summary has not been queried yet"
+            }),
+            last_preview_summary_refresh: None,
+            last_dev_command: "startup".to_owned(),
+            footer_scroll_line: 0,
             caret_visible: true,
         }
     }
@@ -4844,6 +4926,168 @@ impl DevWindowShell {
 
     fn document_for_viewport(&self, width: u32, height: u32) -> boon_document_model::DocumentFrame {
         dev_shell_document(self, width, height)
+    }
+
+    fn footer_lines(&self) -> Vec<(String, String)> {
+        let buffer = &self.workspace.selected_buffer;
+        let preview_status = self
+            .last_preview_transport
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run");
+        let summary_status = self
+            .last_preview_summary
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run");
+        let runtime_summary = self
+            .last_preview_summary
+            .get("runtime_summary")
+            .unwrap_or(&serde_json::Value::Null);
+        let runtime_state_hash = runtime_summary
+            .get("state_summary_hash")
+            .and_then(serde_json::Value::as_str)
+            .map(short_hash)
+            .unwrap_or_else(|| "-".to_owned());
+        let source_hash = runtime_summary
+            .get("source_sha256")
+            .and_then(serde_json::Value::as_str)
+            .map(short_hash)
+            .or_else(|| {
+                self.last_preview_transport
+                    .get("source_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .map(short_hash)
+            })
+            .unwrap_or_else(|| "-".to_owned());
+        let state_keys = runtime_summary
+            .get("state_summary_top_level_keys")
+            .and_then(serde_json::Value::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|keys| !keys.is_empty())
+            .unwrap_or_else(|| "-".to_owned());
+        let preview_error = self
+            .last_preview_summary
+            .get("preview_last_error")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                self.last_preview_transport
+                    .get("diagnostic")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("-");
+        let preview_error_count = self
+            .last_preview_summary
+            .get("preview_last_error_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let visible_examples = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.shown_by_default && !entry.custom)
+            .count();
+        let custom_examples = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.custom)
+            .count();
+        vec![
+            (
+                "editor".to_owned(),
+                format!(
+                    "{} bytes, {} lines, {} tokens, {} diagnostics",
+                    buffer.source_text.len(),
+                    buffer.line_count,
+                    buffer.syntax_token_count(),
+                    buffer.diagnostics.len()
+                ),
+            ),
+            (
+                "cursor".to_owned(),
+                format!(
+                    "line {}, column {}, scroll {}:{}",
+                    buffer.caret().line,
+                    buffer.caret().column,
+                    buffer.scroll_line,
+                    buffer.scroll_column
+                ),
+            ),
+            (
+                "syntax".to_owned(),
+                format!(
+                    "{}{}",
+                    buffer.syntax_backend(),
+                    if buffer.syntax_parser_backed() {
+                        " parser-backed"
+                    } else {
+                        " fallback"
+                    }
+                ),
+            ),
+            (
+                "workspace".to_owned(),
+                format!(
+                    "{} ({})",
+                    buffer.file_name,
+                    if self.selected_example_is_custom() {
+                        "custom"
+                    } else {
+                        "official"
+                    }
+                ),
+            ),
+            (
+                "example".to_owned(),
+                format!(
+                    "{} dirty={}",
+                    self.workspace.selected_example_id, self.workspace.dirty
+                ),
+            ),
+            (
+                "preview".to_owned(),
+                format!(
+                    "transport={preview_status}, summary={summary_status}, last command={}",
+                    self.last_dev_command
+                ),
+            ),
+            (
+                "runtime".to_owned(),
+                format!(
+                    "state {}, source {}, keys [{}]",
+                    runtime_state_hash, source_hash, state_keys
+                ),
+            ),
+            (
+                "errors".to_owned(),
+                format!(
+                    "count {}, {}",
+                    preview_error_count,
+                    one_line(preview_error, 96)
+                ),
+            ),
+            (
+                "catalog".to_owned(),
+                format!("{visible_examples} official visible, {custom_examples} custom"),
+            ),
+            (
+                "format".to_owned(),
+                format!(
+                    "formatted hash {}",
+                    buffer
+                        .formatted_preview_hash
+                        .as_deref()
+                        .map(short_hash)
+                        .unwrap_or_else(|| "format-error".to_owned())
+                ),
+            ),
+        ]
     }
 
     fn selected_example_is_custom(&self) -> bool {
@@ -5270,8 +5514,44 @@ impl DevWindowShell {
             &self.workspace.selected_buffer.file_name,
             &self.workspace.selected_buffer.source_text,
         );
+        self.last_dev_command = command.to_owned();
+        self.update_preview_summary_from_transport(&value);
         self.last_preview_transport = value.clone();
         value
+    }
+
+    fn update_preview_summary_from_transport(&mut self, transport: &serde_json::Value) {
+        if let Some(summary) = transport
+            .pointer("/ack/preview_runtime_summary")
+            .or_else(|| transport.pointer("/preview_runtime_summary"))
+        {
+            self.last_preview_summary = json!({
+                "status": "pass",
+                "kind": "debug-query-result",
+                "debug_query": "RuntimeSummary",
+                "source": "replace-code-ack",
+                "runtime_summary": summary
+            });
+            self.last_preview_summary_refresh = Some(Instant::now());
+        }
+    }
+
+    fn refresh_preview_summary_if_due(&mut self, now: Instant) -> bool {
+        let due = self.last_preview_summary_refresh.is_none_or(|last| {
+            now.duration_since(last) >= Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS)
+        });
+        if !due {
+            return false;
+        }
+        let previous_hash = boon_runtime::sha256_bytes(
+            &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
+        );
+        self.last_preview_summary = self.preview_transport.runtime_summary();
+        self.last_preview_summary_refresh = Some(now);
+        let next_hash = boon_runtime::sha256_bytes(
+            &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
+        );
+        previous_hash != next_hash
     }
 
     fn command_probe(&self) -> serde_json::Value {
@@ -5795,36 +6075,40 @@ fn dev_shell_document(
 
     let mut frame = DocumentFrame::empty("dev-root");
     let root_height = viewport_height.max(360);
+    let footer_height = 154_u32;
     let editor_height = viewport_height
-        .saturating_sub(40)
+        .saturating_sub(46)
         .saturating_sub(42)
         .saturating_sub(44)
-        .saturating_sub(130)
+        .saturating_sub(footer_height)
         .max(160);
     set_style(
         frame.nodes.get_mut(&frame.root).expect("root exists"),
         &[
-            ("bg", "#f3f6f9"),
-            ("padding", "12"),
-            ("gap", "10"),
+            ("bg", DEV_BG),
+            ("color", DEV_TEXT),
+            ("padding", "10"),
+            ("gap", "8"),
             ("width", "fill"),
             ("height", &root_height.to_string()),
         ],
     );
 
-    let title = dev_node(
+    let header = dev_node(
         "dev-header",
         DocumentNodeKind::Row,
-        Some(format!("Boon Dev  {}", shell.workspace.current_file)),
+        None,
         &[
-            ("bg", "#26313f"),
-            ("color", "#f6f8fb"),
-            ("padding", "10"),
+            ("bg", DEV_PANEL),
+            ("color", DEV_TEXT),
+            ("border", DEV_BORDER_MUTED),
+            ("padding", "8"),
             ("gap", "12"),
-            ("height", "40"),
+            ("height", "46"),
             ("width", "fill"),
         ],
     );
+    let header_parent = header.id.clone();
     let tabs = dev_tabs_node(shell);
     let toolbar = dev_toolbar_node();
     let preview_status = shell
@@ -5832,60 +6116,81 @@ fn dev_shell_document(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("not-run");
-    let preview_diagnostic = shell
-        .last_preview_transport
-        .get("diagnostic")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            shell
-                .last_preview_transport
-                .pointer("/ack/diagnostic")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or("");
-    let debug = dev_node(
-        "dev-debug-panel",
-        DocumentNodeKind::Text,
-        Some(format!(
-            "runtime: bounded query mode\nsource bytes: {}\nlines: {}\ntokens: {}\ndiagnostics: {}\npreview transport: ReplaceCode ({})\npreview diagnostic: {}\nselected example: {}\ncurrent file: {}\ndirty: {}\ncaret: {}:{}\nscroll: line {}, column {}\nformatted hash: {}\ncatalog: {}",
-            shell.workspace.selected_buffer.source_text.len(),
-            shell.workspace.selected_buffer.line_count,
-            shell.workspace.selected_buffer.syntax_token_count(),
-            shell.workspace.selected_buffer.diagnostics.len(),
-            preview_status,
-            preview_diagnostic,
-            shell.workspace.selected_example_id,
-            shell.workspace.selected_buffer.file_name,
-            shell.workspace.dirty,
-            shell.workspace.selected_buffer.caret().line,
-            shell.workspace.selected_buffer.caret().column,
-            shell.workspace.selected_buffer.scroll_line,
-            shell.workspace.selected_buffer.scroll_column,
-            shell
-                .workspace
-                .selected_buffer
-                .formatted_preview_hash
-                .as_deref()
-                .unwrap_or("format-error"),
-            shell
-                .catalog
-                .entries
-                .iter()
-                .map(|entry| format!("{}:{}:{}", entry.category, entry.order, entry.label))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        &[
-            ("bg", "#edf2f7"),
-            ("color", "#1f2937"),
-            ("border", "#b8c2cc"),
-            ("padding", "10"),
-            ("height", "130"),
-            ("width", "fill"),
-        ],
-    );
     let root = frame.root.clone();
-    append_child(&mut frame, root.clone(), title);
+    append_child(&mut frame, root.clone(), header);
+    append_child(
+        &mut frame,
+        header_parent.clone(),
+        dev_text_node(
+            "dev-header-title",
+            "Boon Dev",
+            DEV_TEXT,
+            16,
+            &[
+                ("width", "auto"),
+                ("height", "30"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
+        ),
+    );
+    append_child(
+        &mut frame,
+        header_parent.clone(),
+        dev_text_node(
+            "dev-header-file",
+            &one_line(&shell.workspace.current_file, 52),
+            DEV_TEXT_MUTED,
+            13,
+            &[
+                ("width", "360"),
+                ("height", "30"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
+        ),
+    );
+    append_child(
+        &mut frame,
+        header_parent.clone(),
+        dev_status_pill(
+            "dev-header-preview-status",
+            &format!("preview {preview_status}"),
+            status_color(preview_status),
+            142,
+        ),
+    );
+    append_child(
+        &mut frame,
+        header_parent.clone(),
+        dev_status_pill(
+            "dev-header-dirty-status",
+            if shell.workspace.dirty {
+                "dirty"
+            } else {
+                "saved"
+            },
+            if shell.workspace.dirty {
+                DEV_DIRTY
+            } else {
+                DEV_PASS
+            },
+            86,
+        ),
+    );
+    append_child(
+        &mut frame,
+        header_parent,
+        dev_text_node(
+            "dev-header-example",
+            &shell.workspace.selected_example_id,
+            DEV_TEXT_MUTED,
+            12,
+            &[
+                ("width", "220"),
+                ("height", "30"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
+        ),
+    );
     let tabs_parent = tabs.id.clone();
     append_child(&mut frame, root.clone(), tabs);
     for entry in shell
@@ -5898,20 +6203,33 @@ fn dev_shell_document(
         if shell.workspace.dirty_examples.contains(&entry.id) {
             label.push('*');
         }
+        let selected = entry.id == shell.workspace.selected_example_id;
         let mut tab = dev_button_node(
             &format!("dev-tab-{}", entry.id),
-            if entry.id == shell.workspace.selected_example_id {
-                format!("[{}]", label)
-            } else {
-                label
-            },
+            label,
             &[
-                ("bg", "#f8fafc"),
-                ("color", "#1f2937"),
-                ("border", "#aeb8c2"),
+                (
+                    "bg",
+                    if selected {
+                        DEV_PANEL_ACTIVE
+                    } else {
+                        DEV_PANEL_RAISED
+                    },
+                ),
+                ("color", if selected { DEV_TEXT } else { DEV_TEXT_MUTED }),
+                ("border", if selected { DEV_ACCENT } else { DEV_BORDER }),
                 ("padding", "6"),
                 ("height", "30"),
-                ("width", "120"),
+                (
+                    "width",
+                    if entry.id.starts_with("custom:") {
+                        "156"
+                    } else {
+                        "120"
+                    },
+                ),
+                ("size", "13"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
             ],
         );
         tab.source_binding = Some(boon_document_model::SourceBinding {
@@ -5925,12 +6243,14 @@ fn dev_shell_document(
         "dev-tab-new",
         "+".to_owned(),
         &[
-            ("bg", "#ffffff"),
-            ("color", "#1f2937"),
-            ("border", "#aeb8c2"),
+            ("bg", DEV_PANEL_RAISED),
+            ("color", DEV_TEXT),
+            ("border", DEV_BORDER),
             ("padding", "6"),
             ("height", "30"),
             ("width", "42"),
+            ("size", "14"),
+            ("font", BOON_EDITOR_FONT_FAMILY),
         ],
     );
     new_tab.source_binding = Some(boon_document_model::SourceBinding {
@@ -5959,25 +6279,33 @@ fn dev_shell_document(
                 (
                     "bg",
                     if remove_disabled {
-                        "#edf1f5"
+                        "#172031"
+                    } else if command == "run" {
+                        DEV_ACCENT
+                    } else if command == "remove_custom" {
+                        DEV_FAIL
                     } else {
-                        "#ffffff"
+                        DEV_PANEL_RAISED
                     },
                 ),
                 (
                     "color",
                     if remove_disabled {
-                        "#8a96a3"
+                        "#64748b"
+                    } else if command == "run" {
+                        "#061528"
                     } else {
-                        "#1f2937"
+                        DEV_TEXT
                     },
                 ),
                 (
                     "border",
                     if remove_disabled {
-                        "#cbd5df"
+                        DEV_BORDER_MUTED
+                    } else if command == "run" {
+                        DEV_ACCENT
                     } else {
-                        "#9aa7b5"
+                        DEV_BORDER
                     },
                 ),
                 ("padding", "8"),
@@ -5990,6 +6318,8 @@ fn dev_shell_document(
                         "96"
                     },
                 ),
+                ("size", "13"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
             ],
         );
         if remove_disabled {
@@ -6013,11 +6343,290 @@ fn dev_shell_document(
         editor_height,
         shell.caret_visible,
     );
-    append_child(&mut frame, root, debug);
+    append_dev_footer(&mut frame, root, shell, footer_height);
     frame.focus = Some(boon_document_model::DocumentNodeId(
         "dev-code-editor".to_owned(),
     ));
     frame
+}
+
+fn append_dev_footer(
+    frame: &mut boon_document_model::DocumentFrame,
+    parent: boon_document_model::DocumentNodeId,
+    shell: &DevWindowShell,
+    height: u32,
+) {
+    let footer = dev_node(
+        "dev-footer",
+        boon_document_model::DocumentNodeKind::Stack,
+        None,
+        &[
+            ("bg", DEV_PANEL),
+            ("border", DEV_BORDER_MUTED),
+            ("padding", "8"),
+            ("gap", "6"),
+            ("height", &height.to_string()),
+            ("width", "fill"),
+        ],
+    );
+    let footer_parent = footer.id.clone();
+    append_child(frame, parent, footer);
+
+    let status_row = dev_node(
+        "dev-footer-status",
+        boon_document_model::DocumentNodeKind::Row,
+        None,
+        &[
+            ("bg", DEV_PANEL_RAISED),
+            ("border", DEV_BORDER_MUTED),
+            ("padding", "4"),
+            ("gap", "6"),
+            ("height", "32"),
+            ("width", "fill"),
+        ],
+    );
+    let status_parent = status_row.id.clone();
+    append_child(frame, footer_parent.clone(), status_row);
+
+    let preview_status = shell
+        .last_preview_transport
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not-run");
+    let summary_status = shell
+        .last_preview_summary
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not-run");
+    append_child(
+        frame,
+        status_parent.clone(),
+        dev_status_pill(
+            "dev-footer-preview-chip",
+            &format!("preview {preview_status}"),
+            status_color(preview_status),
+            132,
+        ),
+    );
+    append_child(
+        frame,
+        status_parent.clone(),
+        dev_status_pill(
+            "dev-footer-runtime-chip",
+            &format!("runtime {summary_status}"),
+            status_color(summary_status),
+            132,
+        ),
+    );
+    append_child(
+        frame,
+        status_parent.clone(),
+        dev_status_pill(
+            "dev-footer-source-chip",
+            if shell.selected_example_is_custom() {
+                "custom source"
+            } else {
+                "official source"
+            },
+            if shell.selected_example_is_custom() {
+                DEV_WARN
+            } else {
+                DEV_ACCENT
+            },
+            132,
+        ),
+    );
+    append_child(
+        frame,
+        status_parent,
+        dev_text_node(
+            "dev-footer-command-chip",
+            &format!("last {}", shell.last_dev_command),
+            DEV_TEXT_MUTED,
+            12,
+            &[
+                ("bg", DEV_PANEL_RAISED),
+                ("border", DEV_BORDER),
+                ("padding", "5"),
+                ("height", "24"),
+                ("width", "220"),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
+        ),
+    );
+
+    let scroll_height = height.saturating_sub(54).max(44);
+    let mut scroll = dev_node(
+        "dev-footer-scroll",
+        boon_document_model::DocumentNodeKind::ScrollRoot,
+        None,
+        &[
+            ("bg", DEV_BG),
+            ("border", DEV_BORDER_MUTED),
+            ("padding", "6"),
+            ("gap", "3"),
+            ("height", &scroll_height.to_string()),
+            ("width", "fill"),
+            ("scroll", "true"),
+        ],
+    );
+    scroll.scroll = Some(boon_document_model::ScrollState {
+        x: 0.0,
+        y: shell.footer_scroll_line as f32,
+    });
+    scroll
+        .materialized
+        .push(boon_document_model::MaterializedRange {
+            axis: boon_document_model::Axis::Vertical,
+            visible: 0..6,
+            overscan: 0..10,
+        });
+    let scroll_parent = scroll.id.clone();
+    frame.scroll_roots.insert(
+        boon_document_model::ScrollRootId(scroll_parent.0.clone()),
+        boon_document_model::ScrollState {
+            x: 0.0,
+            y: shell.footer_scroll_line as f32,
+        },
+    );
+    append_child(frame, footer_parent, scroll);
+
+    let visible_line_count =
+        (scroll_height.saturating_sub(12) / DEV_FOOTER_LINE_HEIGHT).max(1) as usize;
+    for (visible_index, (label, value)) in shell
+        .footer_lines()
+        .into_iter()
+        .skip(shell.footer_scroll_line)
+        .take(visible_line_count)
+        .enumerate()
+    {
+        let row_id = format!("dev-footer-row-{visible_index}");
+        let row_bg = if visible_index % 2 == 0 {
+            DEV_BG
+        } else {
+            "#101a2c"
+        };
+        let row = dev_node(
+            &row_id,
+            boon_document_model::DocumentNodeKind::Row,
+            None,
+            &[
+                ("bg", row_bg),
+                ("padding", "0"),
+                ("gap", "8"),
+                ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                ("width", "fill"),
+            ],
+        );
+        let row_parent = row.id.clone();
+        append_child(frame, scroll_parent.clone(), row);
+        append_child(
+            frame,
+            row_parent.clone(),
+            dev_text_node(
+                &format!("dev-footer-row-{visible_index}-label"),
+                &label,
+                DEV_ACCENT,
+                12,
+                &[
+                    ("bg", row_bg),
+                    ("width", "92"),
+                    ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                    ("font", BOON_EDITOR_FONT_FAMILY),
+                ],
+            ),
+        );
+        append_child(
+            frame,
+            row_parent,
+            dev_text_node(
+                &format!("dev-footer-row-{visible_index}-value"),
+                &one_line(&value, 118),
+                DEV_TEXT_MUTED,
+                12,
+                &[
+                    ("bg", row_bg),
+                    ("width", "fill"),
+                    ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                    ("font", BOON_EDITOR_FONT_FAMILY),
+                ],
+            ),
+        );
+    }
+}
+
+fn dev_text_node(
+    id: &str,
+    text: &str,
+    color: &str,
+    size: u32,
+    extra_styles: &[(&str, &str)],
+) -> boon_document_model::DocumentNode {
+    let size_text = size.to_string();
+    let mut styles = vec![
+        ("bg", DEV_PANEL),
+        ("color", color),
+        ("size", size_text.as_str()),
+    ];
+    styles.extend_from_slice(extra_styles);
+    dev_node(
+        id,
+        boon_document_model::DocumentNodeKind::Text,
+        Some(text.to_owned()),
+        &styles,
+    )
+}
+
+fn dev_status_pill(
+    id: &str,
+    text: &str,
+    accent: &str,
+    width: u32,
+) -> boon_document_model::DocumentNode {
+    let width_text = width.to_string();
+    dev_text_node(
+        id,
+        text,
+        DEV_TEXT,
+        12,
+        &[
+            ("bg", DEV_PANEL_RAISED),
+            ("border", accent),
+            ("padding", "5"),
+            ("height", "24"),
+            ("width", width_text.as_str()),
+            ("font", BOON_EDITOR_FONT_FAMILY),
+        ],
+    )
+}
+
+fn status_color(status: &str) -> &'static str {
+    match status {
+        "pass" => DEV_PASS,
+        "fail" | "unavailable" => DEV_FAIL,
+        "not-run" | "deferred" | "not-bound" => DEV_WARN,
+        _ => DEV_ACCENT,
+    }
+}
+
+fn short_hash(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+fn one_line(value: &str, max_chars: usize) -> String {
+    let mut text = value
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() > max_chars {
+        text = text
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>();
+        text.push_str("...");
+    }
+    text
 }
 
 fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
@@ -6026,7 +6635,8 @@ fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
         boon_document_model::DocumentNodeKind::Row,
         None,
         &[
-            ("bg", "#d8e0ea"),
+            ("bg", DEV_PANEL),
+            ("border", DEV_BORDER_MUTED),
             ("padding", "6"),
             ("gap", "6"),
             ("height", "42"),
@@ -6047,8 +6657,9 @@ fn dev_toolbar_node() -> boon_document_model::DocumentNode {
         boon_document_model::DocumentNodeKind::Row,
         None,
         &[
-            ("bg", "#e8eef5"),
-            ("color", "#1f2937"),
+            ("bg", DEV_PANEL),
+            ("border", DEV_BORDER_MUTED),
+            ("color", DEV_TEXT),
             ("padding", "8"),
             ("gap", "10"),
             ("height", "44"),
@@ -9670,19 +10281,35 @@ fn send_preview_ipc_request(
     connect: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    send_preview_ipc_request_with_timeouts(
+        connect,
+        request,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    )
+}
+
+fn send_preview_ipc_request_with_timeouts(
+    connect: &str,
+    request: serde_json::Value,
+    connect_retry_for: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut stream = loop {
         match UnixStream::connect(connect) {
             Ok(stream) => break stream,
-            Err(error) if start.elapsed() < Duration::from_secs(5) => {
+            Err(error) if start.elapsed() < connect_retry_for => {
                 let _ = error;
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(error) => return Err(Box::new(error)),
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(write_timeout))?;
     writeln!(stream, "{}", serde_json::to_string(&request)?)?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
@@ -10655,6 +11282,10 @@ mod tests {
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
             last_preview_transport: json!({"status": "not-run"}),
+            last_preview_summary: json!({"status": "not-run"}),
+            last_preview_summary_refresh: None,
+            last_dev_command: "test".to_owned(),
+            footer_scroll_line: 0,
             caret_visible: false,
         };
         let input_state = DevNativeInputState {
@@ -10726,6 +11357,17 @@ mod tests {
         let input = test_keyboard_input(Vec::new(), vec![key]);
         let _ =
             dev_apply_real_window_input(&input, document, layout, 1180, 820, shell, input_state);
+    }
+
+    fn style_text_value<'a>(
+        node: &'a boon_document_model::DocumentNode,
+        key: &str,
+    ) -> Option<&'a str> {
+        match node.style.get(key)? {
+            boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
+            boon_document_model::StyleValue::Number(_)
+            | boon_document_model::StyleValue::Bool(_) => None,
+        }
     }
 
     fn test_keyboard_input(
@@ -10809,6 +11451,188 @@ mod tests {
     }
 
     #[test]
+    fn dev_shell_visual_refresh_preserves_editor_theme_and_structures_footer() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        shell.last_preview_transport = json!({"status": "pass"});
+        shell.last_preview_summary = json!({
+            "status": "pass",
+            "runtime_summary": {
+                "state_summary_hash": "abcdef1234567890",
+                "source_sha256": "0123456789abcdef",
+                "state_summary_top_level_keys": ["count", "store"]
+            },
+            "preview_last_error_count": 0,
+            "preview_last_error": null
+        });
+        let frame = shell.document_for_viewport(1180, 820);
+
+        let root = frame.nodes.get(&frame.root).expect("root should exist");
+        assert_eq!(style_text_value(root, "bg"), Some(DEV_BG));
+        assert_eq!(
+            style_text_value(
+                frame
+                    .nodes
+                    .get(&boon_document_model::DocumentNodeId(
+                        "dev-header".to_owned()
+                    ))
+                    .expect("dev header should render"),
+                "bg"
+            ),
+            Some(DEV_PANEL)
+        );
+        assert_eq!(
+            style_text_value(
+                frame
+                    .nodes
+                    .get(&boon_document_model::DocumentNodeId(
+                        "dev-code-editor".to_owned()
+                    ))
+                    .expect("code editor should render"),
+                "bg"
+            ),
+            Some(BOON_EDITOR_BACKGROUND),
+            "visual refresh must not change editor colors"
+        );
+        for node in frame.nodes.values().filter(|node| {
+            node.id.0.starts_with("dev-")
+                && matches!(node.kind, boon_document_model::DocumentNodeKind::Text)
+        }) {
+            let bg = style_text_value(node, "bg")
+                .unwrap_or_else(|| panic!("{} text node should set explicit bg", node.id.0));
+            assert!(
+                !matches!(bg, "#ffffff" | "#f8fafc" | "#edf2f7" | "#f3f6f9"),
+                "{} should not use a light fallback bg",
+                node.id.0
+            );
+        }
+        assert!(
+            frame
+                .nodes
+                .contains_key(&boon_document_model::DocumentNodeId(
+                    "dev-footer".to_owned()
+                ))
+        );
+        assert!(
+            frame
+                .nodes
+                .contains_key(&boon_document_model::DocumentNodeId(
+                    "dev-footer-scroll".to_owned()
+                ))
+        );
+        assert_eq!(
+            style_text_value(
+                frame
+                    .nodes
+                    .get(&boon_document_model::DocumentNodeId(
+                        "dev-footer-runtime-chip".to_owned()
+                    ))
+                    .expect("runtime chip should render"),
+                "border"
+            ),
+            Some(DEV_PASS)
+        );
+        let visible_footer_text = frame
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible_footer_text.contains("official"));
+        let footer_lines = shell
+            .footer_lines()
+            .into_iter()
+            .map(|(label, value)| format!("{label} {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(footer_lines.contains("runtime state abcdef123456"));
+
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &frame,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 1180.0,
+                height: 820.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let bottom = layout
+            .display_list
+            .iter()
+            .map(|item| item.bounds.y + item.bounds.height)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (820.0 - bottom).abs() <= 0.5,
+            "dev shell should fill viewport height without a bottom gutter, bottom={bottom}"
+        );
+    }
+
+    #[test]
+    fn footer_scroll_is_routed_separately_from_editor_scroll() {
+        let source = (0..160)
+            .map(|index| format!("line_{index}: TEXT {{ value }}\n"))
+            .collect::<String>();
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(&source);
+        let footer_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-footer")
+            .expect("footer should be laid out")
+            .bounds;
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+
+        let mut footer_scroll = test_keyboard_input(Vec::new(), Vec::new());
+        footer_scroll.scroll_delta_y = 24.0;
+        footer_scroll.mouse_scroll_event_count = 1;
+        footer_scroll.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(footer_bounds.x + footer_bounds.width * 0.5),
+            y: f64::from(footer_bounds.y + footer_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &footer_scroll,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(shell.footer_scroll_line > 0);
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
+
+        let footer_after = shell.footer_scroll_line;
+        let mut editor_scroll = test_keyboard_input(Vec::new(), Vec::new());
+        editor_scroll.scroll_delta_y = 24.0;
+        editor_scroll.mouse_scroll_event_count = 2;
+        editor_scroll.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(editor_bounds.x + editor_bounds.width * 0.5),
+            y: f64::from(editor_bounds.y + editor_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &editor_scroll,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(shell.workspace.selected_buffer.scroll_line > 0);
+        assert_eq!(shell.footer_scroll_line, footer_after);
+    }
+
+    #[test]
     fn original_boon_semantic_rules_split_module_paths_and_text_literals() {
         let model = CodeEditorModel::new(
             "custom://theme.bn",
@@ -10868,6 +11692,10 @@ mod tests {
                 "status": "not-run",
                 "reason": "test shell has not sent preview transport yet"
             }),
+            last_preview_summary: json!({"status": "not-run"}),
+            last_preview_summary_refresh: None,
+            last_dev_command: "test".to_owned(),
+            footer_scroll_line: 0,
             caret_visible: true,
         };
 
@@ -10954,6 +11782,10 @@ mod tests {
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
             last_preview_transport: json!({"status": "not-run"}),
+            last_preview_summary: json!({"status": "not-run"}),
+            last_preview_summary_refresh: None,
+            last_dev_command: "test".to_owned(),
+            footer_scroll_line: 0,
             caret_visible: true,
         };
 

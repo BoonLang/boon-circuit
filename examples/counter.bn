@@ -102,36 +102,20 @@ FUNCTION counter_controls() {
 }
 
 FUNCTION decrement_button() {
-    Element/button(
-        element: [event: [press: store.sources.decrement_button.press]]
-        style: [
-            width: 96
-            height: 40
-            background: [color: Oklch[lightness:0.96]]
-            border: [color: Oklch[lightness:0.78]]
-            font: [size: 16, color: Oklch[lightness:0.22]]
-        ]
-        label: TEXT { - }
-    )
+    counter_button(press: store.sources.decrement_button.press, label: TEXT { - })
 }
 
 FUNCTION reset_button() {
-    Element/button(
-        element: [event: [press: store.sources.reset_button.press]]
-        style: [
-            width: 96
-            height: 40
-            background: [color: Oklch[lightness:0.96]]
-            border: [color: Oklch[lightness:0.78]]
-            font: [size: 16, color: Oklch[lightness:0.22]]
-        ]
-        label: TEXT { Reset }
-    )
+    counter_button(press: store.sources.reset_button.press, label: TEXT { Reset })
 }
 
 FUNCTION increment_button() {
+    counter_button(press: store.sources.increment_button.press, label: TEXT { + })
+}
+
+FUNCTION counter_button(press, label) {
     Element/button(
-        element: [event: [press: store.sources.increment_button.press]]
+        element: [event: [press: press]]
         style: [
             width: 96
             height: 40
@@ -139,6 +123,6 @@ FUNCTION increment_button() {
             border: [color: Oklch[lightness:0.78]]
             font: [size: 16, color: Oklch[lightness:0.22]]
         ]
-        label: TEXT { + }
+        label: label
     )
 }

@@ -956,6 +956,7 @@ fn view_bindings(
             &source_paths,
             &mut bindings,
             &mut Vec::new(),
+            &DocumentViewBindingContext::default(),
         );
     }
     bindings
@@ -989,22 +990,78 @@ impl<'a> DocumentViewFunctionRegistry<'a> {
     }
 }
 
+#[derive(Clone, Default)]
+struct DocumentViewBindingContext {
+    arg_exprs: Vec<BTreeMap<String, usize>>,
+}
+
+impl DocumentViewBindingContext {
+    fn arg_expr(&self, name: &str) -> Option<usize> {
+        self.arg_exprs
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn with_function_call(
+        &self,
+        function: &AstStatement,
+        call: &AstStatement,
+        expressions: &[AstExpr],
+    ) -> Self {
+        let mut next = self.clone();
+        let formals = match &function.kind {
+            AstStatementKind::Function { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        let mut scope = BTreeMap::new();
+        if let Some(args) = document_call_args(call, expressions) {
+            for (index, arg) in args.iter().enumerate() {
+                let Some(name) = arg
+                    .name
+                    .as_deref()
+                    .or_else(|| formals.get(index).map(String::as_str))
+                else {
+                    continue;
+                };
+                scope.insert(name.to_owned(), arg.value);
+            }
+        }
+        next.arg_exprs.push(scope);
+        next
+    }
+}
+
 fn view_data_path(value: &str) -> Option<String> {
     let path = value.strip_prefix('$')?;
     let path = path.split_once(':').map_or(path, |(path, _)| path);
     (!path.trim().is_empty()).then(|| path.to_owned())
 }
 
-fn view_data_path_for_expr(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String> {
+fn view_data_path_for_expr_id(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
+    view_data_path_for_expr(expressions.get(expr_id)?, expressions, context)
+}
+
+fn view_data_path_for_expr(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
             view_data_path(value)
         }
-        AstExprKind::Identifier(value) => Some(value.clone()),
+        AstExprKind::Identifier(value) => context
+            .arg_expr(value)
+            .and_then(|expr_id| view_data_path_for_expr_id(expr_id, expressions, context))
+            .or_else(|| Some(value.clone())),
         AstExprKind::Path(parts) => Some(parts.join(".")),
-        AstExprKind::Infix { left, .. } => {
-            view_data_path_for_expr(expressions.get(*left)?, expressions)
-        }
+        AstExprKind::Infix { left, .. } => view_data_path_for_expr_id(*left, expressions, context),
         _ => None,
     }
 }
@@ -1037,6 +1094,7 @@ fn collect_document_view_bindings(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     function_stack: &mut Vec<String>,
+    context: &DocumentViewBindingContext,
 ) {
     for statement in statements {
         if let Some(function) = document_statement_call(statement, expressions)
@@ -1049,12 +1107,15 @@ fn collect_document_view_bindings(
                 row_scopes,
                 source_paths,
                 bindings,
+                context,
             );
         } else if let Some(function) = document_statement_call(statement, expressions)
             && let Some(function_statement) = functions.get(function)
             && !function_stack.iter().any(|active| active == function)
         {
             function_stack.push(function.to_owned());
+            let scoped_context =
+                context.with_function_call(function_statement, statement, expressions);
             collect_document_view_bindings(
                 &function_statement.children,
                 expressions,
@@ -1063,6 +1124,7 @@ fn collect_document_view_bindings(
                 source_paths,
                 bindings,
                 function_stack,
+                &scoped_context,
             );
             function_stack.pop();
         } else if document_statement_field(statement).as_deref() == Some("element")
@@ -1075,6 +1137,7 @@ fn collect_document_view_bindings(
                 row_scopes,
                 source_paths,
                 bindings,
+                context,
             );
         }
         collect_document_view_bindings(
@@ -1085,6 +1148,7 @@ fn collect_document_view_bindings(
             source_paths,
             bindings,
             function_stack,
+            context,
         );
     }
 }
@@ -1096,6 +1160,7 @@ fn collect_canonical_element_view_bindings(
     row_scopes: &[RowScope],
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
 ) {
     let node_kind = canonical_view_node_kind(function).to_owned();
     for child in &element.children {
@@ -1110,12 +1175,13 @@ fn collect_canonical_element_view_bindings(
                 row_scopes,
                 source_paths,
                 bindings,
+                context,
             );
             continue;
         }
         if attr_can_bind_data(&attr)
-            && let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id))
-            && let Some(path) = view_data_path_for_expr(expr, expressions)
+            && let Some(expr_id) = child.expr
+            && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
         {
             bindings.push(ViewBinding {
                 id: ViewBindingId(bindings.len()),
@@ -1134,8 +1200,8 @@ fn collect_canonical_element_view_bindings(
         for nested in &child.children {
             if attr_can_bind_data(&attr)
                 && document_statement_field(nested).as_deref() == Some("text")
-                && let Some(expr) = nested.expr.and_then(|expr_id| expressions.get(expr_id))
-                && let Some(path) = view_data_path_for_expr(expr, expressions)
+                && let Some(expr_id) = nested.expr
+                && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
             {
                 bindings.push(ViewBinding {
                     id: ViewBindingId(bindings.len()),
@@ -1169,6 +1235,7 @@ fn collect_canonical_element_source_bindings(
     row_scopes: &[RowScope],
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
 ) {
     if let Some(fields) = record_fields_for_statement(element_field, expressions) {
         for field in fields {
@@ -1177,7 +1244,8 @@ fn collect_canonical_element_source_bindings(
             }
             if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
                 for source_field in event_fields {
-                    if let Some(value) = document_expr_value_by_id(source_field.value, expressions)
+                    if let Some(value) =
+                        document_expr_value_by_id(source_field.value, expressions, context)
                     {
                         push_canonical_view_source_binding(
                             node_kind,
@@ -1200,7 +1268,7 @@ fn collect_canonical_element_source_bindings(
             let Some(attr) = document_statement_field(source_field) else {
                 continue;
             };
-            let Some(value) = document_statement_value(source_field, expressions) else {
+            let Some(value) = document_statement_value(source_field, expressions, context) else {
                 continue;
             };
             push_canonical_view_source_binding(
@@ -1247,6 +1315,7 @@ fn collect_document_element_bindings(
     row_scopes: &[RowScope],
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
 ) {
     for child in &element.children {
         let Some(attr) = document_statement_field(child) else {
@@ -1255,7 +1324,7 @@ fn collect_document_element_bindings(
         if matches!(attr.as_str(), "kind" | "children") {
             continue;
         }
-        let Some(value) = document_statement_value(child, expressions) else {
+        let Some(value) = document_statement_value(child, expressions, context) else {
             continue;
         };
         if attr != "target"
@@ -1273,8 +1342,8 @@ fn collect_document_element_bindings(
                 source_id: Some(*source_id),
             });
         } else if attr_can_bind_data(&attr)
-            && let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id))
-            && let Some(path) = view_data_path_for_expr(expr, expressions)
+            && let Some(expr_id) = child.expr
+            && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
         {
             bindings.push(ViewBinding {
                 id: ViewBindingId(bindings.len()),
@@ -1302,7 +1371,9 @@ fn document_child_value(
         .children
         .iter()
         .find(|child| document_statement_field(child).as_deref() == Some(field))
-        .and_then(|child| document_statement_value(child, expressions))
+        .and_then(|child| {
+            document_statement_value(child, expressions, &DocumentViewBindingContext::default())
+        })
 }
 
 fn document_statement_field(statement: &AstStatement) -> Option<String> {
@@ -1326,6 +1397,17 @@ fn document_statement_call<'a>(
     }
 }
 
+fn document_call_args<'a>(
+    statement: &AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<&'a [boon_parser::AstCallArg]> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => Some(args.as_slice()),
+        _ => None,
+    }
+}
+
 fn record_fields_for_statement<'a>(
     statement: &AstStatement,
     expressions: &'a [AstExpr],
@@ -1340,25 +1422,62 @@ fn record_fields_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<&[A
     }
 }
 
-fn document_expr_value_by_id(expr_id: usize, expressions: &[AstExpr]) -> Option<String> {
-    document_expr_value(expressions.get(expr_id)?, expressions)
+fn document_expr_value_by_id(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
+    document_expr_value(expressions.get(expr_id)?, expressions, context)
 }
 
-fn document_statement_value(statement: &AstStatement, expressions: &[AstExpr]) -> Option<String> {
-    let expr = expressions.get(statement.expr?)?;
-    document_expr_value(expr, expressions)
+fn document_statement_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let expr_id = statement.expr?;
+    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
+    document_expr_value(expressions.get(expr_id)?, expressions, context)
 }
 
-fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String> {
+fn document_resolved_expr_id(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+    seen: &mut BTreeSet<usize>,
+) -> Option<usize> {
+    if !seen.insert(expr_id) {
+        return Some(expr_id);
+    }
+    match &expressions.get(expr_id)?.kind {
+        AstExprKind::Identifier(value) => context
+            .arg_expr(value)
+            .and_then(|mapped| document_resolved_expr_id(mapped, expressions, context, seen)),
+        AstExprKind::Path(parts) if parts.len() == 1 => context
+            .arg_expr(&parts[0])
+            .and_then(|mapped| document_resolved_expr_id(mapped, expressions, context, seen)),
+        _ => None,
+    }
+    .or(Some(expr_id))
+}
+
+fn document_expr_value(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
-        AstExprKind::Number(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value) => {
-            Some(value.clone())
-        }
+        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Identifier(value) => context
+            .arg_expr(value)
+            .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context))
+            .or_else(|| Some(value.clone())),
         AstExprKind::Bool(value) => Some(value.to_string()),
         AstExprKind::Path(parts) => Some(parts.join(".")),
         AstExprKind::Pipe { input, op, args } => {
-            let mut value = document_expr_value(expressions.get(*input)?, expressions)?;
+            let mut value = document_expr_value_by_id(*input, expressions, context)?;
             value.push_str("|>");
             value.push_str(op);
             if !args.is_empty() {
@@ -1368,7 +1487,7 @@ fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String
                         .iter()
                         .filter_map(|arg| {
                             let mut arg_value =
-                                document_expr_value(expressions.get(arg.value)?, expressions)?;
+                                document_expr_value_by_id(arg.value, expressions, context)?;
                             if let Some(name) = &arg.name {
                                 arg_value = format!("{name}:{arg_value}");
                             }
@@ -3723,6 +3842,50 @@ fn sanitize_node_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_view_bindings_resolve_function_arguments_generically() {
+        let source = r#"
+store: [
+    sources: [
+        increment_button: [press: SOURCE]
+    ]
+
+    count:
+        0 |> HOLD count {
+            LATEST {
+                sources.increment_button.press |> THEN { count + 1 }
+            }
+        }
+]
+
+document: Document/new(
+    root: counter_button(press: store.sources.increment_button.press, label: TEXT { + })
+)
+
+FUNCTION counter_button(press, label) {
+    Element/button(
+        element: [event: [press: press]]
+        style: []
+        label: label
+    )
+}
+"#;
+        let parsed = boon_parser::parse_source("function-arg-view-bindings.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Button"
+                && binding.attr == "press"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.sources.increment_button.press"
+        }));
+        assert!(
+            !ir.view_bindings
+                .iter()
+                .any(|binding| binding.kind == ViewBindingKind::Data && binding.path == "label")
+        );
+    }
 
     #[test]
     fn todomvc_lowering_is_static_and_keyed() {

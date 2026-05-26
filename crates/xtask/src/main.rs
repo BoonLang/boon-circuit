@@ -8437,19 +8437,19 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
     let editor_font_assets = [
         (
             "assets/fonts/JetBrainsMono-Patched.ttf",
-            "59db9682007022934e252dfc01ff00a507b8548d2f319d14fd10ebf7df934b62",
+            "d116bf61a4cdb4c4ccc86ece8cc652310421128bb6256333f0db53ad2edd8663",
         ),
         (
             "assets/fonts/JetBrainsMono-Patched-Bold.ttf",
-            "dd2203176ee475d90845bd36b542ed73730346aebb4f6386bd6649289951139f",
+            "20318de782f2121132514507f64b2e9c19ce9adc667aff691a4cdd33e7a6dbf7",
         ),
         (
             "assets/fonts/JetBrainsMono-Patched-Italic.ttf",
-            "a63c7d71acc8a24f7d509c9095fbbca802fbc0e3fefd10a72e10c81c0be31518",
+            "d88b1f96c507b433fdd4cbbda425b79acbef8f317feca3767980141cc74227a1",
         ),
         (
             "assets/fonts/JetBrainsMono-Patched-BoldItalic.ttf",
-            "cd6e0e78c01b7841613a4234db6910bc298997b08c3fbdccf074c3e131e4b6f3",
+            "95be8ef81a03236c53e3063648ef0129c3dd8dcf8cbd6260b2042f2a9bd5190e",
         ),
     ];
     let editor_font_hashes = editor_font_assets

@@ -1456,6 +1456,13 @@ mod tests {
     }
 
     fn shape_rich_glyph_ids(spans: &[(&str, [u8; 4], Style, Weight)]) -> Vec<u16> {
+        shape_rich_glyphs(spans)
+            .into_iter()
+            .map(|(glyph_id, _)| glyph_id)
+            .collect()
+    }
+
+    fn shape_rich_glyphs(spans: &[(&str, [u8; 4], Style, Weight)]) -> Vec<(u16, f32)> {
         let mut font_system = editor_font_system();
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(16.0, 22.0));
         buffer.set_size(&mut font_system, Some(320.0), Some(32.0));
@@ -1464,20 +1471,14 @@ mod tests {
             Style::Normal,
             Weight::NORMAL,
             [217, 225, 242, 255],
-            "zero,calt,liga,clig",
+            "zero,calt",
         );
         buffer.set_rich_text(
             &mut font_system,
             spans.iter().map(|(text, color, style, weight)| {
                 (
                     *text,
-                    text_attrs(
-                        "JetBrains Mono",
-                        *style,
-                        *weight,
-                        *color,
-                        "zero,calt,liga,clig",
-                    ),
+                    text_attrs("JetBrains Mono", *style, *weight, *color, "zero,calt"),
                 )
             }),
             &default_attrs,
@@ -1492,7 +1493,7 @@ mod tests {
             .iter()
             .flat_map(|span| span.words.iter())
             .flat_map(|word| word.glyphs.iter())
-            .map(|glyph| glyph.glyph_id)
+            .map(|glyph| (glyph.glyph_id, glyph.x_advance))
             .collect()
     }
 
@@ -1571,6 +1572,26 @@ mod tests {
         assert!(
             styled_dash.iter().any(|glyph_id| *glyph_id == 876),
             "italic comment spans must shape -- through the bundled patched JetBrains variant"
+        );
+    }
+
+    #[test]
+    fn styled_editor_punctuation_stays_monospace_across_weights() {
+        let punctuation = shape_rich_glyphs(&[
+            ("_([", [210, 105, 30, 255], Style::Normal, Weight::BOLD),
+            (
+                " (([]))",
+                [210, 105, 30, 255],
+                Style::Italic,
+                Weight::EXTRA_BOLD,
+            ),
+        ]);
+        assert_eq!(punctuation.len(), 10);
+        assert!(
+            punctuation
+                .iter()
+                .all(|(_, advance)| (*advance - 0.60).abs() < f32::EPSILON),
+            "styled punctuation must stay on the bundled monospace JetBrains variants: {punctuation:?}"
         );
     }
 

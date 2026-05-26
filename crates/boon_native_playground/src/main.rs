@@ -118,6 +118,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         update_count: 0,
         scroll_x_px: 0.0,
         scroll_y_px: 0.0,
+        last_error: None,
+        last_error_count: 0,
     }));
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(
@@ -144,28 +146,32 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let render_source = source.clone();
         let mut input_state = PreviewNativeInputState::default();
         Some(Box::new(move |context| {
-            preview_apply_real_window_input(
+            if let Err(error) = preview_apply_real_window_input(
                 &context.input,
                 Path::new(&render_code_file),
                 &render_source,
                 live_runtime.as_ref(),
                 &shared_render_state,
                 &mut input_state,
-            )
-            .map_err(|error| error.to_string())?;
-            let (render_layout_proof, render_layout_frame_override) = {
+            ) {
+                preview_note_render_error(&shared_render_state, error.to_string())
+                    .map_err(|error| error.to_string())?;
+            }
+            let (render_layout_proof, render_layout_frame_override, render_error) = {
                 let shared = shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
                 (
                     shared.layout_proof.clone(),
                     shared.layout_frame_override.clone(),
+                    shared.last_error.clone(),
                 )
             };
             native_gpu_app_owned_render_hook(
                 context,
                 &render_layout_proof,
                 render_layout_frame_override.as_ref(),
+                render_error.as_deref(),
                 &mut visible_renderer,
                 &mut app_owned_proof,
                 &mut layout_frame_cache,
@@ -439,6 +445,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             dev_start_delay_ms
                 .saturating_add(dev_hold_ms)
                 .saturating_add(input_sample_delay_ms)
+                .max(dev_start_delay_ms.saturating_add(role_report_timeout_ms))
                 .saturating_add(5_000),
         )
     } else {
@@ -934,7 +941,11 @@ fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<
     Ok(runtime.state_summary())
 }
 
-fn preview_runtime_summary_response(runtime_summary: &serde_json::Value) -> serde_json::Value {
+fn preview_runtime_summary_response(
+    runtime_summary: &serde_json::Value,
+    last_error: Option<&str>,
+    last_error_count: u64,
+) -> serde_json::Value {
     let payload = serde_json::to_vec(runtime_summary).unwrap_or_default();
     json!({
         "kind": "debug-query-result",
@@ -945,6 +956,8 @@ fn preview_runtime_summary_response(runtime_summary: &serde_json::Value) -> serd
         "payload_hash": boon_runtime::sha256_bytes(&payload),
         "full_state_mirroring_allowed": false,
         "full_state_mirroring_observed": false,
+        "preview_last_error": last_error,
+        "preview_last_error_count": last_error_count,
         "runtime_summary": runtime_summary
     })
 }
@@ -1054,6 +1067,7 @@ fn native_gpu_app_owned_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     layout_proof: &serde_json::Value,
     layout_frame_override: Option<&boon_document::LayoutFrame>,
+    last_error: Option<&str>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
@@ -1097,6 +1111,15 @@ fn native_gpu_app_owned_render_hook(
         .as_ref()
         .map(|(_, frame)| frame)
         .ok_or("layout frame cache was not initialized")?;
+    let render_frame = match last_error {
+        Some(error) => preview_frame_with_error_overlay(
+            layout_frame,
+            error,
+            context.width as f32,
+            context.height as f32,
+        ),
+        None => layout_frame.clone(),
+    };
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
             context.device,
@@ -1109,7 +1132,7 @@ fn native_gpu_app_owned_render_hook(
         queue: context.queue,
         encoder: context.encoder,
         view: context.surface_view,
-        frame: layout_frame,
+        frame: &render_frame,
         format: context.surface_texture_format,
         width: context.width,
         height: context.height,
@@ -1121,7 +1144,7 @@ fn native_gpu_app_owned_render_hook(
                 boon_native_gpu::render_app_owned_pixels(boon_native_gpu::AppOwnedRenderRequest {
                     device: context.device,
                     queue: context.queue,
-                    frame: layout_frame,
+                    frame: &render_frame,
                     surface_id: context.surface_id.clone(),
                     surface_epoch: context.surface_epoch,
                     width: context.width,
@@ -1148,13 +1171,109 @@ fn native_gpu_app_owned_render_hook(
         "visible_style_mode": "document_style",
         "debug_palette_used": false,
         "viewport_fill_ratio": 1.0,
-        "content_bounds_fill_ratio": viewport_fill_ratio(layout_frame, context.width, context.height),
+        "content_bounds_fill_ratio": viewport_fill_ratio(&render_frame, context.width, context.height),
+        "preview_last_error": last_error,
+        "preview_error_overlay_visible": last_error.is_some(),
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
         "proof": proof,
         "copy_to_present_limitation": serde_json::Value::Null
     }))
+}
+
+fn preview_frame_with_error_overlay(
+    frame: &boon_document::LayoutFrame,
+    error: &str,
+    width: f32,
+    height: f32,
+) -> boon_document::LayoutFrame {
+    let mut frame = frame.clone();
+    let overlay_width = (width - 32.0).max(1.0);
+    let overlay_height = 72.0_f32.min((height - 32.0).max(1.0));
+    let overlay_y = (height - overlay_height - 16.0).max(0.0);
+    let mut background_style = BTreeMap::new();
+    background_style.insert(
+        "bg".to_owned(),
+        boon_document_model::StyleValue::Text("#fee2e2".to_owned()),
+    );
+    background_style.insert(
+        "border".to_owned(),
+        boon_document_model::StyleValue::Text("#dc2626".to_owned()),
+    );
+    frame.display_list.push(boon_document::DisplayItem {
+        node: boon_document_model::DocumentNodeId("preview-error-overlay-bg".to_owned()),
+        kind: boon_document_model::DocumentNodeKind::Text,
+        bounds: boon_document::Rect {
+            x: 16.0,
+            y: overlay_y,
+            width: overlay_width,
+            height: overlay_height,
+        },
+        text: Some(String::new()),
+        style: background_style,
+        focused: false,
+    });
+
+    let mut text_style = BTreeMap::new();
+    text_style.insert(
+        "bg".to_owned(),
+        boon_document_model::StyleValue::Text("#fee2e2".to_owned()),
+    );
+    text_style.insert(
+        "color".to_owned(),
+        boon_document_model::StyleValue::Text("#7f1d1d".to_owned()),
+    );
+    text_style.insert(
+        "size".to_owned(),
+        boon_document_model::StyleValue::Number(14.0),
+    );
+    text_style.insert(
+        "font".to_owned(),
+        boon_document_model::StyleValue::Text("JetBrains Mono".to_owned()),
+    );
+    frame.display_list.push(boon_document::DisplayItem {
+        node: boon_document_model::DocumentNodeId("preview-error-overlay-text".to_owned()),
+        kind: boon_document_model::DocumentNodeKind::Text,
+        bounds: boon_document::Rect {
+            x: 28.0,
+            y: overlay_y + 12.0,
+            width: (overlay_width - 24.0).max(1.0),
+            height: (overlay_height - 24.0).max(1.0),
+        },
+        text: Some(format!(
+            "Preview input error: {}",
+            single_line_preview_error(error)
+        )),
+        style: text_style,
+        focused: false,
+    });
+    frame.metrics.display_item_count = frame.display_list.len();
+    frame
+}
+
+fn single_line_preview_error(error: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 180;
+    let mut value = error
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while value.contains("  ") {
+        value = value.replace("  ", " ");
+    }
+    if value.chars().count() > MAX_ERROR_CHARS {
+        let mut truncated = value.chars().take(MAX_ERROR_CHARS).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        value
+    }
 }
 
 fn native_gpu_dev_visible_render_hook(
@@ -6082,6 +6201,7 @@ fn preview_apply_scroll_input(
         scrolled_layout_proof(&shared.layout_proof, shared.scroll_x_px, shared.scroll_y_px)?;
     shared.layout_proof = transformed;
     shared.layout_frame_override = Some(transformed_frame);
+    shared.last_error = None;
     shared.update_count = shared.update_count.saturating_add(1);
     Ok(())
 }
@@ -6319,6 +6439,7 @@ fn preview_apply_live_event(
             .map_err(|_| "preview render state mutex poisoned")?;
         shared_render_state.layout_proof = post_input_layout.clone();
         shared_render_state.layout_frame_override = None;
+        shared_render_state.last_error = None;
         shared_render_state.update_count = shared_render_state.update_count.saturating_add(1);
     }
     Ok(post_input_layout)
@@ -6560,6 +6681,8 @@ struct PreviewSharedRenderState {
     update_count: u64,
     scroll_x_px: f64,
     scroll_y_px: f64,
+    last_error: Option<String>,
+    last_error_count: u64,
 }
 
 #[derive(Clone)]
@@ -6571,6 +6694,21 @@ struct PreviewIpcState {
     runtime_summary: serde_json::Value,
     shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+}
+
+fn preview_note_render_error(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    error: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if shared.last_error.as_deref() != Some(error.as_str()) {
+        shared.last_error = Some(error);
+        shared.last_error_count = shared.last_error_count.saturating_add(1);
+        shared.update_count = shared.update_count.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn start_preview_ipc_server(
@@ -6669,21 +6807,47 @@ fn handle_preview_ipc_client(
                         .lock()
                         .map_err(|_| "preview render state mutex poisoned")?;
                     shared.layout_proof = layout_proof.clone();
+                    shared.layout_frame_override = None;
+                    shared.last_error = None;
                     shared.update_count = shared.update_count.saturating_add(1);
                 }
             }
+        } else if let Some(diagnostic) = response
+            .get("diagnostic")
+            .and_then(serde_json::Value::as_str)
+        {
+            let shared_render_state = state
+                .lock()
+                .map_err(|_| "preview IPC state mutex poisoned")?
+                .shared_render_state
+                .clone();
+            preview_note_render_error(&shared_render_state, diagnostic.to_owned())?;
         }
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
     }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("runtime-summary") {
-        let runtime_summary = state
-            .lock()
-            .map_err(|_| "preview IPC state mutex poisoned")?
-            .runtime_summary
-            .clone();
-        let response = preview_runtime_summary_response(&runtime_summary);
+        let (runtime_summary, shared_render_state) = {
+            let state = state
+                .lock()
+                .map_err(|_| "preview IPC state mutex poisoned")?;
+            (
+                state.runtime_summary.clone(),
+                state.shared_render_state.clone(),
+            )
+        };
+        let (last_error, last_error_count) = {
+            let shared = shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            (shared.last_error.clone(), shared.last_error_count)
+        };
+        let response = preview_runtime_summary_response(
+            &runtime_summary,
+            last_error.as_deref(),
+            last_error_count,
+        );
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
@@ -8090,6 +8254,36 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("ReplaceCode rejected before preview mutation")
+        );
+    }
+
+    #[test]
+    fn preview_error_overlay_keeps_frame_renderable() {
+        let frame = boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: boon_document::LayoutMetrics {
+                node_count: 0,
+                display_item_count: 0,
+                materialized_range_count: 0,
+                native_capability_required: false,
+            },
+        };
+
+        let with_error =
+            preview_frame_with_error_overlay(&frame, "line one\nline two", 800.0, 600.0);
+
+        assert_eq!(with_error.display_list.len(), 2);
+        assert_eq!(with_error.metrics.display_item_count, 2);
+        assert!(
+            with_error.display_list[1]
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Preview input error: line one line two")
         );
     }
 }

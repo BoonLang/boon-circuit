@@ -139,8 +139,11 @@ initial_visible_assertions = [
 ]
 input_scenarios = [
   "press-increment",
+  "press-increment-again",
   "press-decrement",
   "press-reset",
+  "press-decrement-negative",
+  "press-increment-back-to-zero",
 ]
 scroll_focus_scenarios = []
 visual_artifacts = [

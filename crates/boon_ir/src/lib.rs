@@ -282,6 +282,7 @@ pub struct StateCell {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum InitialValue {
     Text { value: String },
+    Number { value: i64 },
     Bool { value: bool },
     Enum { value: String },
     SeedField { path: String },
@@ -352,6 +353,11 @@ pub struct UpdateBranch {
 pub enum UpdateExpression {
     SourcePayload { path: String },
     Const { value: String },
+    NumberInfix {
+        left: String,
+        op: String,
+        right: String,
+    },
     PreviousValue { path: String },
     TextTrimOrPrevious { path: String, previous: String },
     BoolNot { path: String },
@@ -1427,6 +1433,15 @@ fn verify_scheduled_update_expression(
 ) -> Result<(), String> {
     match value {
         UpdateExpression::SourcePayload { .. } | UpdateExpression::Const { .. } => Ok(()),
+        UpdateExpression::NumberInfix { left, right, .. } => {
+            if left.parse::<i64>().is_err() {
+                require_known_symbol("number infix left", left, known_symbols)?;
+            }
+            if right.parse::<i64>().is_err() {
+                require_known_symbol("number infix right", right, known_symbols)?;
+            }
+            Ok(())
+        }
         UpdateExpression::PreviousValue { path } | UpdateExpression::BoolNot { path } => {
             require_known_symbol("update expression path", path, known_symbols)
         }
@@ -1622,7 +1637,9 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         InitialValue::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown initializer", summary)
         }
-        InitialValue::Text { .. } | InitialValue::Bool { .. } => Ok(()),
+        InitialValue::Text { .. } | InitialValue::Number { .. } | InitialValue::Bool { .. } => {
+            Ok(())
+        }
     }
 }
 
@@ -1655,6 +1672,10 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::TextTrimOrPrevious { path, previous } => {
             reject_hidden_identity_identifier("trim source", path)?;
             reject_hidden_identity_identifier("trim previous", previous)
+        }
+        UpdateExpression::NumberInfix { left, right, .. } => {
+            reject_hidden_identity_identifier("number infix left", left)?;
+            reject_hidden_identity_identifier("number infix right", right)
         }
         UpdateExpression::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown update expression", summary)
@@ -2306,9 +2327,17 @@ fn field_initial_value(field: &FieldDef) -> InitialValue {
 
 fn ast_initial_value(expr: &AstExpr) -> InitialValue {
     match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
-            value: value.clone(),
-        },
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+            InitialValue::Text {
+                value: value.clone(),
+            }
+        }
+        AstExprKind::Number(value) => value
+            .parse::<i64>()
+            .map(|value| InitialValue::Number { value })
+            .unwrap_or_else(|_| InitialValue::Unknown {
+                summary: value.clone(),
+            }),
         AstExprKind::Bool(value) => InitialValue::Bool { value: *value },
         AstExprKind::Enum(value) if value == "Text/empty" => InitialValue::Text {
             value: String::new(),
@@ -2438,6 +2467,9 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
     match value.as_str() {
         "True" => InitialValue::Bool { value: true },
         "False" => InitialValue::Bool { value: false },
+        value if value.parse::<i64>().is_ok() => InitialValue::Number {
+            value: value.parse().unwrap_or_default(),
+        },
         value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
             value: value.to_owned(),
         },
@@ -2509,6 +2541,20 @@ fn ast_named_call_argument(field: &FieldDef, function: &str, name: &str) -> Opti
 
 fn ast_argument_value(field: &FieldDef, expr_id: usize) -> Option<String> {
     ast_argument_value_in_exprs(&field.ast_exprs, expr_id)
+}
+
+fn scalar_number_operand(field: &FieldDef, expr_id: usize, target: &str) -> Option<String> {
+    let value = ast_argument_value(field, expr_id)?;
+    if value.parse::<i64>().is_ok() {
+        return Some(value);
+    }
+    let target_field = target.rsplit_once('.').map(|(_, field)| field).unwrap_or(target);
+    let canonical = if value == field.local_name || value == target_field {
+        target.to_owned()
+    } else {
+        canonical_local_path(&value, &field.parent_path)
+    };
+    Some(canonical)
 }
 
 fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
@@ -2926,8 +2972,8 @@ fn update_expression_for_source(
     if let Some(expression) = text_trim_or_previous_update(program, target, &branch) {
         return expression;
     }
-    if let Some(value) = branch.then_negative_number_value() {
-        return UpdateExpression::Const { value };
+    if let Some(expression) = branch.then_number_infix_expression(field, target) {
+        return expression;
     }
     if let Some(value) = branch.then_simple_value() {
         return if value_starts_lowercase_identifier(&value) {
@@ -3135,14 +3181,32 @@ impl RoutedBranch {
         })
     }
 
-    fn then_negative_number_value(&self) -> Option<String> {
-        self.items.iter().find_map(|item| {
-            if !item_has_symbol(item, "THEN") {
+    fn then_number_infix_expression(
+        &self,
+        field: &FieldDef,
+        target: &str,
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then {
+                output: Some(output),
+                ..
+            } = expr.kind
+            else {
+                return None;
+            };
+            let output = self.ast_exprs.iter().find(|candidate| candidate.id == output)?;
+            let AstExprKind::Infix { left, op, right } = &output.kind else {
+                return None;
+            };
+            if op != "+" && op != "-" {
                 return None;
             }
-            item.symbols.windows(2).find_map(|window| {
-                (window[0] == "-" && window[1].parse::<i64>().is_ok())
-                    .then(|| format!("-{}", window[1]))
+            let left = scalar_number_operand(field, *left, target)?;
+            let right = scalar_number_operand(field, *right, target)?;
+            Some(UpdateExpression::NumberInfix {
+                left,
+                op: op.clone(),
+                right,
             })
         })
     }

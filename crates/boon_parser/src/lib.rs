@@ -485,7 +485,7 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         just(">=").ignored(),
         just("<=").ignored(),
         just("!=").ignored(),
-        one_of("><=|").ignored(),
+        one_of("><=|+-").ignored(),
     ))
     .to(AstTokenKind::Operator);
     let symbol = one_of("[]{}():,.$#").to(AstTokenKind::Symbol);
@@ -783,6 +783,12 @@ fn ast_expr_kind(
     if tokens.len() == 1 && tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
         return AstExprKind::Number(tokens[0].clone());
     }
+    if tokens.len() == 2
+        && tokens[0] == "-"
+        && tokens[1].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return AstExprKind::Number(format!("-{}", tokens[1]));
+    }
     if let Some(value) = string_literal_value(tokens) {
         return AstExprKind::StringLiteral(value);
     }
@@ -1010,7 +1016,7 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
-            "==" | ">" | "<" | ">=" | "<=" | "!=" if depth == 0 => {
+            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" if depth == 0 && index > 0 && index + 1 < tokens.len() => {
                 return Some((&tokens[..index], token, &tokens[index + 1..]));
             }
             _ => {}

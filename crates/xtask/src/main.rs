@@ -24,6 +24,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-runtime-finality",
     "audit-genericity",
     "verify-playground-genericity",
+    "playground-watch",
     "verify-boon-source-syntax",
     "verify-boon-driver-schema",
     "verify-boon-driver-e2e",
@@ -99,6 +100,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-runtime-finality" => verify_runtime_finality(&args),
         "audit-genericity" => audit_genericity(&args),
         "verify-playground-genericity" => verify_playground_genericity(&args),
+        "playground-watch" => playground_watch(&args),
         "verify-boon-source-syntax" => verify_boon_source_syntax(&args),
         "verify-boon-driver-schema" => verify_boon_driver_schema(&args),
         "verify-boon-driver-e2e" => verify_boon_driver_e2e(&args),
@@ -853,6 +855,342 @@ fn verify_playground_genericity(args: &[String]) -> Result<(), Box<dyn std::erro
             "renderer_scanned_paths": scan_paths,
         }),
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WatchFileFingerprint {
+    modified_ns: u128,
+    len: u64,
+}
+
+type WatchSnapshot = BTreeMap<PathBuf, WatchFileFingerprint>;
+
+fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/native-gpu/playground-watch.json"));
+    if args.iter().any(|arg| arg == "--stop") {
+        let stopped = stop_recorded_playground(&report)?;
+        write_json(
+            &report,
+            &json!({
+                "status": "stopped",
+                "generated_at_utc": current_unix_seconds().to_string(),
+                "stopped_pid_count": stopped,
+                "report_path": report
+            }),
+        )?;
+        println!("stopped {stopped} watcher-owned playground process(es)");
+        return Ok(());
+    }
+
+    if !command_available("cosmic-background-launch") {
+        return Err("playground-watch requires cosmic-background-launch for workspace-qualified visible launches".into());
+    }
+
+    let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
+    let entry = boon_runtime::example_manifest_entry(&example)?;
+    let poll_ms = value_arg(args, "--poll-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000)
+        .max(250);
+    let once = args.iter().any(|arg| arg == "--once");
+    let stopped = stop_recorded_playground(&report)?;
+    if stopped > 0 {
+        println!("stopped {stopped} previously watcher-owned playground process(es)");
+    }
+
+    let watch_roots = playground_watch_roots();
+    let mut snapshot = playground_watch_snapshot(&watch_roots)?;
+    let mut generation = 0u64;
+    loop {
+        generation = generation.saturating_add(1);
+        let build = Command::new("cargo")
+            .args(["build", "-p", "boon_native_playground"])
+            .status()?;
+        if !build.success() {
+            write_json(
+                &report,
+                &json!({
+                    "status": "fail",
+                    "generated_at_utc": current_unix_seconds().to_string(),
+                    "example": entry.id,
+                    "generation": generation,
+                    "build_status": build.to_string(),
+                    "watch_roots": watch_roots,
+                    "watch_file_count": snapshot.len(),
+                    "blockers": ["cargo build -p boon_native_playground failed"]
+                }),
+            )?;
+            if once {
+                return Err("cargo build -p boon_native_playground failed".into());
+            }
+            eprintln!("build failed; waiting for changes before retrying");
+            snapshot = wait_for_playground_change(&watch_roots, snapshot, poll_ms)?;
+            continue;
+        }
+
+        let launch = launch_watched_playground(&entry)?;
+        let root_pid = launch.get("child_pid").and_then(serde_json::Value::as_u64);
+        thread::sleep(Duration::from_millis(1_000));
+        let pgrep = playground_pgrep_snapshot();
+        let launched_pids = root_pid
+            .map(playground_pid_tree)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        write_json(
+            &report,
+            &json!({
+                "status": if launch.get("success").and_then(serde_json::Value::as_bool) == Some(true) { "running" } else { "fail" },
+                "generated_at_utc": current_unix_seconds().to_string(),
+                "example": entry.id,
+                "source_path": entry.source,
+                "binary_path": "target/debug/boon_native_playground",
+                "binary_hash": file_hash("target/debug/boon_native_playground"),
+                "generation": generation,
+                "watch_roots": watch_roots,
+                "watch_file_count": snapshot.len(),
+                "watch_snapshot_hash": playground_snapshot_hash(&snapshot),
+                "poll_ms": poll_ms,
+                "workspace": "boon-circuit",
+                "launcher": "cosmic-background-launch --workspace boon-circuit",
+                "root_pid": root_pid,
+                "launched_pids": launched_pids,
+                "pgrep_boon_native_playground": pgrep,
+                "launch": launch
+            }),
+        )?;
+        println!(
+            "playground ready: example={} root_pid={:?} report={}",
+            entry.id,
+            root_pid,
+            report.display()
+        );
+
+        if once {
+            return Ok(());
+        }
+
+        let new_snapshot = wait_for_playground_change(&watch_roots, snapshot.clone(), poll_ms)?;
+        let changed = playground_snapshot_diff(&snapshot, &new_snapshot);
+        println!(
+            "detected playground input change; restarting: {}",
+            changed.join(", ")
+        );
+        if let Some(root_pid) = root_pid {
+            stop_playground_pid_tree(root_pid)?;
+        }
+        snapshot = new_snapshot;
+    }
+}
+
+fn launch_watched_playground(
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let script = format!(
+        "cd {} && exec ./target/debug/boon_native_playground --role desktop --example {}",
+        shell_quote(&cwd.display().to_string()),
+        shell_quote(&entry.id)
+    );
+    run_cosmic_background_launch("boon-circuit", &script)
+}
+
+fn playground_watch_roots() -> Vec<PathBuf> {
+    [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/boon_native_playground/src",
+        "crates/boon_runtime/src",
+        "crates/boon_ir/src",
+        "crates/boon_parser/src",
+        "crates/boon_document/src",
+        "crates/boon_document_model/src",
+        "crates/boon_native_gpu/src",
+        "crates/boon_native_app_window/src",
+        "examples",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn playground_watch_snapshot(
+    roots: &[PathBuf],
+) -> Result<WatchSnapshot, Box<dyn std::error::Error>> {
+    let mut snapshot = BTreeMap::new();
+    for root in roots {
+        collect_watch_fingerprints(root, &mut snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn collect_watch_fingerprints(
+    path: &Path,
+    snapshot: &mut WatchSnapshot,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let child = entry.path();
+            if child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "target" || name == ".git")
+            {
+                continue;
+            }
+            collect_watch_fingerprints(&child, snapshot)?;
+        }
+    } else if metadata.is_file() {
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        snapshot.insert(
+            path.to_path_buf(),
+            WatchFileFingerprint {
+                modified_ns,
+                len: metadata.len(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn wait_for_playground_change(
+    roots: &[PathBuf],
+    snapshot: WatchSnapshot,
+    poll_ms: u64,
+) -> Result<WatchSnapshot, Box<dyn std::error::Error>> {
+    loop {
+        thread::sleep(Duration::from_millis(poll_ms));
+        let next = playground_watch_snapshot(roots)?;
+        if next != snapshot {
+            return Ok(next);
+        }
+    }
+}
+
+fn playground_snapshot_diff(old: &WatchSnapshot, new: &WatchSnapshot) -> Vec<String> {
+    let mut changed = Vec::new();
+    for path in old.keys().chain(new.keys()) {
+        if old.get(path) != new.get(path) && !changed.iter().any(|item| item == path) {
+            changed.push(path.display().to_string());
+        }
+    }
+    changed
+}
+
+fn playground_snapshot_hash(snapshot: &WatchSnapshot) -> String {
+    boon_runtime::sha256_bytes(format!("{snapshot:?}").as_bytes())
+}
+
+fn stop_recorded_playground(report: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    if !report.exists() {
+        return Ok(0);
+    }
+    let report_json = read_json(report)?;
+    let mut pids = BTreeSet::new();
+    if let Some(pid) = report_json
+        .get("root_pid")
+        .and_then(serde_json::Value::as_u64)
+    {
+        pids.insert(pid);
+    }
+    if let Some(pid) = report_json
+        .pointer("/launch/child_pid")
+        .and_then(serde_json::Value::as_u64)
+    {
+        pids.insert(pid);
+    }
+    let mut stopped = 0usize;
+    for pid in pids {
+        stopped += stop_playground_pid_tree(pid)?;
+    }
+    Ok(stopped)
+}
+
+fn stop_playground_pid_tree(root_pid: u64) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut pids = playground_pid_tree(root_pid);
+    pids.sort_unstable_by(|left, right| right.cmp(left));
+    let mut stopped = 0usize;
+    for pid in pids {
+        if !playground_pid_cmdline(pid).contains("boon_native_playground") {
+            continue;
+        }
+        let pid_text = pid.to_string();
+        let _ = Command::new("kill").args(["-TERM", &pid_text]).status();
+        stopped += 1;
+    }
+    thread::sleep(Duration::from_millis(500));
+    for pid in playground_pid_tree(root_pid) {
+        if playground_pid_cmdline(pid).contains("boon_native_playground") {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+    Ok(stopped)
+}
+
+fn playground_pid_tree(root_pid: u64) -> Vec<u64> {
+    let mut pids = Vec::new();
+    collect_playground_pid_tree(root_pid, &mut pids);
+    pids
+}
+
+fn collect_playground_pid_tree(pid: u64, pids: &mut Vec<u64>) {
+    if pids.contains(&pid) {
+        return;
+    }
+    pids.push(pid);
+    let output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output();
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for child in stdout
+            .lines()
+            .filter_map(|line| line.trim().parse::<u64>().ok())
+        {
+            collect_playground_pid_tree(child, pids);
+        }
+    }
+}
+
+fn playground_pid_cmdline(pid: u64) -> String {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|part| std::str::from_utf8(part).ok())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn playground_pgrep_snapshot() -> Vec<String> {
+    Command::new("pgrep")
+        .args(["-af", "boon_native_playground"])
+        .output()
+        .ok()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -11555,6 +11893,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-gpu-observability" => "observability",
         "verify-native-real-window-input-environment" => "real-window-input-environment",
         "verify-native-gpu-preview-e2e" => match value_arg(args, "--example").as_deref() {
+            Some("counter") => "preview-e2e-counter",
             Some("todomvc") => "preview-e2e-todomvc",
             Some("cells") => "preview-e2e-cells",
             _ => "preview-e2e",

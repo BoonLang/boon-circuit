@@ -14,15 +14,36 @@ expected_source_event = { source = "store.sources.increment_button.press" }
   "store.count" = "1"
 
 [[step]]
+id = "press-increment-again"
+user_action = { kind = "button_press", target_text = "+" }
+expected_source_event = { source = "store.sources.increment_button.press" }
+  [step.expect_root_text]
+  "store.count" = "2"
+
+[[step]]
 id = "press-decrement"
+user_action = { kind = "button_press", target_text = "-" }
+expected_source_event = { source = "store.sources.decrement_button.press" }
+  [step.expect_root_text]
+  "store.count" = "1"
+
+[[step]]
+id = "press-reset"
+user_action = { kind = "button_press", target_text = "Reset" }
+expected_source_event = { source = "store.sources.reset_button.press" }
+  [step.expect_root_text]
+  "store.count" = "0"
+
+[[step]]
+id = "press-decrement-negative"
 user_action = { kind = "button_press", target_text = "-" }
 expected_source_event = { source = "store.sources.decrement_button.press" }
   [step.expect_root_text]
   "store.count" = "-1"
 
 [[step]]
-id = "press-reset"
-user_action = { kind = "button_press", target_text = "Reset" }
-expected_source_event = { source = "store.sources.reset_button.press" }
+id = "press-increment-back-to-zero"
+user_action = { kind = "button_press", target_text = "+" }
+expected_source_event = { source = "store.sources.increment_button.press" }
   [step.expect_root_text]
   "store.count" = "0"

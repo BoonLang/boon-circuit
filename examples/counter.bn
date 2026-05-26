@@ -12,10 +12,10 @@ store: [
     ]
 
     count:
-        TEXT { 0 } |> HOLD count {
+        0 |> HOLD count {
             LATEST {
-                sources.increment_button.press |> THEN { 1 }
-                sources.decrement_button.press |> THEN { -1 }
+                sources.increment_button.press |> THEN { count + 1 }
+                sources.decrement_button.press |> THEN { count - 1 }
                 sources.reset_button.press |> THEN { 0 }
             }
         }

@@ -1757,6 +1757,10 @@ impl RuntimeSymbols {
                     symbols.intern(path);
                     symbols.intern(previous);
                 }
+                UpdateExpression::NumberInfix { left, right, .. } => {
+                    symbols.intern(left);
+                    symbols.intern(right);
+                }
                 UpdateExpression::Unknown { summary } => {
                     symbols.intern(summary);
                 }
@@ -2056,7 +2060,12 @@ impl TypedStorageLayoutCounts {
             match (cell.indexed, &cell.initial_value) {
                 (false, InitialValue::Bool { .. }) => counts.root_bool_slot_count += 1,
                 (false, InitialValue::Enum { .. }) => counts.root_enum_slot_count += 1,
-                (false, InitialValue::Text { .. } | InitialValue::SeedField { .. }) => {
+                (
+                    false,
+                    InitialValue::Text { .. }
+                    | InitialValue::Number { .. }
+                    | InitialValue::SeedField { .. },
+                ) => {
                     counts.root_text_slot_count += 1;
                 }
                 (false, InitialValue::Unknown { .. }) => {}
@@ -2068,7 +2077,12 @@ impl TypedStorageLayoutCounts {
                     counts.list_row_template_field_count += 1;
                     counts.list_row_enum_slot_count += 1;
                 }
-                (true, InitialValue::Text { .. } | InitialValue::SeedField { .. }) => {
+                (
+                    true,
+                    InitialValue::Text { .. }
+                    | InitialValue::Number { .. }
+                    | InitialValue::SeedField { .. },
+                ) => {
                     counts.list_row_template_field_count += 1;
                     counts.list_row_text_slot_count += 1;
                 }
@@ -5660,7 +5674,10 @@ impl GenericCircuitRuntime {
         payload_text: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let Some(value) = equations.eval_text(target, source, payload_text)? else {
+        let Some(value) = equations.eval_text(target, source, payload_text, |path| {
+            self.root_textlike(path).ok()?.parse::<i64>().ok()
+        })?
+        else {
             return Err(format!(
                 "no supported scalar update branch for `{target}` from `{source}`"
             )
@@ -6214,6 +6231,7 @@ impl GenericCircuitRuntime {
                 ))
             }
             ScalarUpdateExpression::Const(_)
+            | ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::BoolNot(_)
             | ScalarUpdateExpression::Unsupported => Err(format!(
                 "text branch for `{target}` from `{source}` is not a supported indexed text expression"
@@ -7112,6 +7130,10 @@ impl RuntimeRowSnapshotTemplate {
                 InitialValue::Text { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
+                InitialValue::Number { value } => {
+                    row.columns
+                        .set_textlike(&field.field_name, &value.to_string())?
+                }
                 InitialValue::Bool { value } => row.columns.set_bool(&field.field_name, *value)?,
                 InitialValue::Enum { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
@@ -7143,6 +7165,7 @@ fn runtime_value_from_initial(
 ) -> RuntimeResult<FieldValue> {
     match initial {
         InitialValue::Text { value } => Ok(FieldValue::Text(value.clone())),
+        InitialValue::Number { value } => Ok(FieldValue::Text(value.to_string())),
         InitialValue::Bool { value } => Ok(FieldValue::Bool(*value)),
         InitialValue::Enum { value } => Ok(FieldValue::Enum(value.clone())),
         InitialValue::SeedField { path } => seed_fields
@@ -7288,6 +7311,11 @@ struct ScalarUpdateBranch {
 enum ScalarUpdateExpression {
     SourceText,
     Const(String),
+    NumberInfix {
+        left: String,
+        op: String,
+        right: String,
+    },
     PreviousValue(String),
     TextTrimOrPrevious { path: String, previous: String },
     BoolNot(String),
@@ -8173,6 +8201,13 @@ impl ScalarEquationPlan {
                     UpdateExpression::Const { value } => {
                         ScalarUpdateExpression::Const(value.clone())
                     }
+                    UpdateExpression::NumberInfix { left, op, right } => {
+                        ScalarUpdateExpression::NumberInfix {
+                            left: left.clone(),
+                            op: op.clone(),
+                            right: right.clone(),
+                        }
+                    }
                     UpdateExpression::PreviousValue { path } => {
                         ScalarUpdateExpression::PreviousValue(path.clone())
                     }
@@ -8197,8 +8232,9 @@ impl ScalarEquationPlan {
         target: &str,
         source: &str,
         payload_text: Option<&'a str>,
+        read_number: impl Fn(&str) -> Option<i64> + Copy,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let Some(value) = self.eval_text_value(target, source, payload_text)? else {
+        let Some(value) = self.eval_text_value(target, source, payload_text, read_number)? else {
             return Ok(None);
         };
         match value {
@@ -8212,6 +8248,7 @@ impl ScalarEquationPlan {
         target: &str,
         source: &str,
         payload_text: Option<&'a str>,
+        read_number: impl Fn(&str) -> Option<i64> + Copy,
     ) -> RuntimeResult<Option<ScalarTextValue<'a>>> {
         let Some(branch) = self
             .branches
@@ -8229,6 +8266,27 @@ impl ScalarEquationPlan {
             }
             ScalarUpdateExpression::Const(value) => {
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.clone()))))
+            }
+            ScalarUpdateExpression::NumberInfix { left, op, right } => {
+                let left = scalar_number_operand_value(left, read_number).ok_or_else(|| {
+                    format!("source `{source}` for `{target}` cannot read numeric operand `{left}`")
+                })?;
+                let right = scalar_number_operand_value(right, read_number).ok_or_else(|| {
+                    format!(
+                        "source `{source}` for `{target}` cannot read numeric operand `{right}`"
+                    )
+                })?;
+                let value = match op.as_str() {
+                    "+" => left + right,
+                    "-" => left - right,
+                    _ => {
+                        return Err(format!(
+                            "source `{source}` for `{target}` uses unsupported numeric operator `{op}`"
+                        )
+                        .into());
+                    }
+                };
+                Ok(Some(ScalarTextValue::Text(Cow::Owned(value.to_string()))))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::TextTrimOrPrevious { .. }
@@ -8272,6 +8330,13 @@ impl ScalarEquationPlan {
             _ => Ok(None),
         }
     }
+}
+
+fn scalar_number_operand_value(
+    operand: &str,
+    read_number: impl Fn(&str) -> Option<i64> + Copy,
+) -> Option<i64> {
+    operand.parse::<i64>().ok().or_else(|| read_number(operand))
 }
 
 impl DerivedEquationPlan {
@@ -8622,6 +8687,7 @@ impl SourceRoute {
                         SourceRouteTextAction::TextTrimOrPrevious
                     }
                     ScalarUpdateExpression::Const(_)
+                    | ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::BoolNot(_)
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
@@ -8642,6 +8708,7 @@ impl SourceRoute {
                     }
                     ScalarUpdateExpression::SourceText
                     | ScalarUpdateExpression::Const(_)
+                    | ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
@@ -12184,6 +12251,56 @@ mod tests {
                 .iter()
                 .any(|delta| delta.kind == "ListInsert")
         );
+    }
+
+    #[test]
+    fn live_runtime_applies_numeric_counter_hold_updates_generically() {
+        let source = include_str!("../../../examples/counter.bn");
+        let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
+        let mut runtime = LiveRuntime::new(
+            "playground-live:counter",
+            source,
+            Path::new("../../examples/counter.scn"),
+        )
+        .unwrap();
+
+        let expected = [
+            ("press-increment", "store.sources.increment_button.press", "1"),
+            (
+                "press-increment-again",
+                "store.sources.increment_button.press",
+                "2",
+            ),
+            ("press-decrement", "store.sources.decrement_button.press", "1"),
+            ("press-reset", "store.sources.reset_button.press", "0"),
+            (
+                "press-decrement-negative",
+                "store.sources.decrement_button.press",
+                "-1",
+            ),
+            (
+                "press-increment-back-to-zero",
+                "store.sources.increment_button.press",
+                "0",
+            ),
+        ];
+        for (step_id, source, count) in expected {
+            let step = scenario
+                .step
+                .iter()
+                .find(|step| step.id == step_id)
+                .expect("counter scenario includes expected step");
+            let output = runtime
+                .apply_source_event_for_step(
+                    step,
+                    LiveSourceEvent {
+                        source: source.to_owned(),
+                        ..LiveSourceEvent::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(output.state_summary["store"]["count"], count);
+        }
     }
 
     #[test]

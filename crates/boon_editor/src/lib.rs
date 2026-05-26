@@ -579,24 +579,7 @@ pub fn bracket_match_for_source(
         return Some(pair);
     }
 
-    if let Some(pair) = pairs
-        .into_iter()
-        .min_by_key(|pair| byte_distance_to_range(caret_byte, pair.open_byte, pair.close_byte))
-    {
-        return Some(pair);
-    }
-
-    unmatched
-        .into_iter()
-        .min_by_key(|pair| byte_distance_to_range(caret_byte, pair.open_byte, pair.close_byte))
-}
-
-fn byte_distance_to_range(caret_byte: usize, start: usize, end: usize) -> usize {
-    if caret_byte < start {
-        start - caret_byte
-    } else {
-        caret_byte.saturating_sub(end)
-    }
+    None
 }
 
 fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
@@ -697,16 +680,19 @@ mod tests {
     }
 
     #[test]
-    fn bracket_matching_selects_nearest_pair_when_caret_is_outside_any_pair() {
+    fn bracket_matching_is_empty_when_caret_is_outside_any_pair() {
         let source = "left()  right[]";
         let caret = source.find("right").unwrap();
-        let pair = bracket_match_for_source(source, caret, &[]).unwrap();
-        assert_eq!(&source[pair.open_byte..pair.open_byte + 1], "(");
-        assert_eq!(&source[pair.close_byte..pair.close_byte + 1], ")");
+        assert!(bracket_match_for_source(source, caret, &[]).is_none());
 
         let caret = source.len();
-        let pair = bracket_match_for_source(source, caret, &[]).unwrap();
-        assert_eq!(&source[pair.open_byte..pair.open_byte + 1], "[");
-        assert_eq!(&source[pair.close_byte..pair.close_byte + 1], "]");
+        assert!(bracket_match_for_source(source, caret, &[]).is_some());
+    }
+
+    #[test]
+    fn bracket_matching_does_not_highlight_first_pair_from_root_text() {
+        let source = "root\n  first: []\n  second: {}\n";
+        let caret = source.find("root").unwrap() + "root".len();
+        assert!(bracket_match_for_source(source, caret, &[]).is_none());
     }
 }

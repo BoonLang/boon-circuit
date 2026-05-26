@@ -51,6 +51,7 @@ const DEV_WARN: &str = "#f4a261";
 const DEV_FAIL: &str = "#e63946";
 const DEV_DIRTY: &str = "#fcbf49";
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
+const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 1_000;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 
@@ -1466,16 +1467,11 @@ fn native_gpu_dev_visible_render_hook(
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> Result<serde_json::Value, String> {
-    let caret_blink_started_at = *input_state
-        .caret_blink_started_at
-        .get_or_insert_with(Instant::now);
-    let caret_visible = (caret_blink_started_at.elapsed().as_millis()
-        / BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS as u128)
-        % 2
-        == 0;
+    let now = Instant::now();
+    let caret_visible = dev_editor_caret_visible(input_state, now);
     let caret_blink_changed = shell.caret_visible != caret_visible;
     shell.caret_visible = caret_visible;
-    let footer_summary_changed = shell.refresh_preview_summary_if_due(Instant::now());
+    let footer_summary_changed = shell.refresh_preview_summary_if_due(now);
     let cache_stale = layout_frame_cache
         .as_ref()
         .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
@@ -1595,6 +1591,7 @@ struct DevNativeInputState {
     held_repeat_key: Option<String>,
     held_repeat_next_at: Option<Instant>,
     editor_focused: bool,
+    focused_dev_text_input: Option<String>,
     mouse_select_anchor: Option<EditorPosition>,
     column_metric_cache: EditorColumnMetricCache,
 }
@@ -1721,6 +1718,7 @@ fn dev_apply_real_window_input(
             {
                 if source_path == "dev.editor.insert_text" || node_id == "dev-code-editor" {
                     input_state.editor_focused = true;
+                    input_state.focused_dev_text_input = None;
                     if let Some(editor_position) = dev_position_from_pointer(
                         &shell.workspace.selected_buffer,
                         layout_frame,
@@ -1742,14 +1740,22 @@ fn dev_apply_real_window_input(
                         }
                     }
                     changed = true;
+                } else if source_path == "dev.custom.name" {
+                    input_state.editor_focused = false;
+                    input_state.focused_dev_text_input = Some(source_path);
+                    input_state.mouse_select_anchor = None;
+                    clear_dev_key_repeat(input_state);
+                    changed = true;
                 } else {
                     input_state.editor_focused = false;
+                    input_state.focused_dev_text_input = None;
                     input_state.mouse_select_anchor = None;
                     shell.dispatch_source_path(&source_path);
                     changed = true;
                 }
             } else {
                 input_state.editor_focused = false;
+                input_state.focused_dev_text_input = None;
                 input_state.mouse_select_anchor = None;
             }
         }
@@ -1793,7 +1799,7 @@ fn dev_apply_real_window_input(
     for event in keyboard_events {
         input_state.last_keyboard_event_sequence =
             input_state.last_keyboard_event_sequence.max(event.sequence);
-        if !input_state.editor_focused {
+        if !input_state.editor_focused && input_state.focused_dev_text_input.is_none() {
             continue;
         }
         if !event.pressed {
@@ -1804,46 +1810,55 @@ fn dev_apply_real_window_input(
         }
         if primary_modifier_pressed {
             let mut clipboard = NativeClipboardAdapter;
-            match event.key.as_str() {
-                "A" => shell.workspace.selected_buffer.select_all(),
-                "C" => {
-                    let _ = shell
-                        .workspace
-                        .selected_buffer
-                        .copy_to_adapter(&mut clipboard);
+            if input_state.editor_focused {
+                match event.key.as_str() {
+                    "A" => shell.workspace.selected_buffer.select_all(),
+                    "C" => {
+                        let _ = shell
+                            .workspace
+                            .selected_buffer
+                            .copy_to_adapter(&mut clipboard);
+                    }
+                    "X" => {
+                        let _ = shell
+                            .workspace
+                            .selected_buffer
+                            .cut_to_adapter(&mut clipboard);
+                        shell.workspace.persist_selected_buffer();
+                        shell.workspace.set_selected_dirty(true);
+                    }
+                    "V" => {
+                        let _ = shell
+                            .workspace
+                            .selected_buffer
+                            .paste_from_adapter(&mut clipboard);
+                        shell.workspace.persist_selected_buffer();
+                        shell.workspace.set_selected_dirty(true);
+                    }
+                    "Z" => {
+                        let _ = shell.workspace.selected_buffer.undo();
+                        shell.workspace.persist_selected_buffer();
+                        shell.workspace.set_selected_dirty(true);
+                    }
+                    "Y" => {
+                        let _ = shell.workspace.selected_buffer.redo();
+                        shell.workspace.persist_selected_buffer();
+                        shell.workspace.set_selected_dirty(true);
+                    }
+                    _ => {}
                 }
-                "X" => {
-                    let _ = shell
-                        .workspace
-                        .selected_buffer
-                        .cut_to_adapter(&mut clipboard);
-                    shell.workspace.persist_selected_buffer();
-                    shell.workspace.set_selected_dirty(true);
-                }
-                "V" => {
-                    let _ = shell
-                        .workspace
-                        .selected_buffer
-                        .paste_from_adapter(&mut clipboard);
-                    shell.workspace.persist_selected_buffer();
-                    shell.workspace.set_selected_dirty(true);
-                }
-                "Z" => {
-                    let _ = shell.workspace.selected_buffer.undo();
-                    shell.workspace.persist_selected_buffer();
-                    shell.workspace.set_selected_dirty(true);
-                }
-                "Y" => {
-                    let _ = shell.workspace.selected_buffer.redo();
-                    shell.workspace.persist_selected_buffer();
-                    shell.workspace.set_selected_dirty(true);
-                }
-                _ => {}
             }
             changed = true;
             continue;
         }
-        if apply_dev_editor_key(shell, event.key.as_str(), shift_pressed) {
+        let applied = if input_state.editor_focused {
+            apply_dev_editor_key(shell, event.key.as_str(), shift_pressed)
+        } else if input_state.focused_dev_text_input.as_deref() == Some("dev.custom.name") {
+            apply_dev_custom_name_key(shell, event.key.as_str(), shift_pressed)
+        } else {
+            false
+        };
+        if applied {
             if dev_key_is_repeatable(event.key.as_str()) {
                 let now = Instant::now();
                 input_state.held_repeat_key = Some(event.key.clone());
@@ -1855,7 +1870,9 @@ fn dev_apply_real_window_input(
             changed = true;
         }
     }
-    if input_state.editor_focused && !primary_modifier_pressed {
+    if (input_state.editor_focused || input_state.focused_dev_text_input.is_some())
+        && !primary_modifier_pressed
+    {
         if let Some(key) = input_state.held_repeat_key.clone() {
             if input.pressed_keys.iter().any(|pressed| pressed == &key) {
                 let now = Instant::now();
@@ -1865,7 +1882,16 @@ fn dev_apply_real_window_input(
                     .is_some_and(|next| now >= next)
                     && applied < BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP
                 {
-                    if apply_dev_editor_key(shell, &key, shift_pressed) {
+                    let key_applied = if input_state.editor_focused {
+                        apply_dev_editor_key(shell, &key, shift_pressed)
+                    } else if input_state.focused_dev_text_input.as_deref()
+                        == Some("dev.custom.name")
+                    {
+                        apply_dev_custom_name_key(shell, &key, shift_pressed)
+                    } else {
+                        false
+                    };
+                    if key_applied {
                         changed = true;
                     }
                     applied += 1;
@@ -1895,6 +1921,17 @@ fn dev_apply_real_window_input(
     }
 
     changed
+}
+
+fn dev_editor_caret_visible(input_state: &mut DevNativeInputState, now: Instant) -> bool {
+    if !input_state.editor_focused {
+        return true;
+    }
+    let caret_blink_started_at = *input_state.caret_blink_started_at.get_or_insert(now);
+    (now.duration_since(caret_blink_started_at).as_millis()
+        / BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS as u128)
+        % 2
+        == 0
 }
 
 fn input_layout_position(
@@ -2020,6 +2057,31 @@ fn apply_dev_editor_key(shell: &mut DevWindowShell, key: &str, shift_pressed: bo
                     .insert_text_at_caret(&character.to_string());
                 shell.workspace.persist_selected_buffer();
                 shell.workspace.set_selected_dirty(true);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn apply_dev_custom_name_key(shell: &mut DevWindowShell, key: &str, shift_pressed: bool) -> bool {
+    if !shell.selected_example_is_custom() {
+        return false;
+    }
+    match key {
+        "Return" | "KeypadEnter" | "Escape" => true,
+        "Delete" | "ForwardDelete" => {
+            let mut label = shell.selected_example_label();
+            label.pop();
+            shell.rename_selected_custom_label(&label);
+            true
+        }
+        key => {
+            if let Some(character) = keyboard_event_text(key, shift_pressed) {
+                let mut label = shell.selected_example_label();
+                label.push(character);
+                shell.rename_selected_custom_label(&label);
                 true
             } else {
                 false
@@ -4876,8 +4938,11 @@ struct DevWindowShell {
     preview_transport: PreviewTransport,
     last_preview_transport: serde_json::Value,
     last_preview_summary: serde_json::Value,
+    last_good_runtime_summary: Option<serde_json::Value>,
     last_preview_summary_refresh: Option<Instant>,
     last_dev_command: String,
+    last_dev_command_status: String,
+    last_dev_command_detail: Option<String>,
     footer_scroll_line: usize,
     caret_visible: bool,
 }
@@ -4913,8 +4978,11 @@ impl DevWindowShell {
                 "debug_query": "RuntimeSummary",
                 "reason": "preview summary has not been queried yet"
             }),
+            last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
             last_dev_command: "startup".to_owned(),
+            last_dev_command_status: "not-run".to_owned(),
+            last_dev_command_detail: None,
             footer_scroll_line: 0,
             caret_visible: true,
         }
@@ -4930,19 +4998,14 @@ impl DevWindowShell {
 
     fn footer_lines(&self) -> Vec<(String, String)> {
         let buffer = &self.workspace.selected_buffer;
-        let preview_status = self
-            .last_preview_transport
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("not-run");
         let summary_status = self
             .last_preview_summary
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("not-run");
+        let current_source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
         let runtime_summary = self
-            .last_preview_summary
-            .get("runtime_summary")
+            .visible_runtime_summary(&current_source_hash)
             .unwrap_or(&serde_json::Value::Null);
         let runtime_state_hash = runtime_summary
             .get("state_summary_hash")
@@ -4960,17 +5023,6 @@ impl DevWindowShell {
                     .map(short_hash)
             })
             .unwrap_or_else(|| "-".to_owned());
-        let state_keys = runtime_summary
-            .get("state_summary_top_level_keys")
-            .and_then(serde_json::Value::as_array)
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|keys| !keys.is_empty())
-            .unwrap_or_else(|| "-".to_owned());
         let preview_error = self
             .last_preview_summary
             .get("preview_last_error")
@@ -4986,108 +5038,93 @@ impl DevWindowShell {
             .get("preview_last_error_count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let visible_examples = self
-            .catalog
-            .entries
-            .iter()
-            .filter(|entry| entry.shown_by_default && !entry.custom)
-            .count();
-        let custom_examples = self
-            .catalog
-            .entries
-            .iter()
-            .filter(|entry| entry.custom)
-            .count();
-        vec![
+        let saved_state = if self.workspace.dirty {
+            "Unsaved"
+        } else {
+            "Saved"
+        };
+        let diagnostics_text = match buffer.diagnostics.len() {
+            0 => "no diagnostics".to_owned(),
+            1 => "1 diagnostic".to_owned(),
+            count => format!("{count} diagnostics"),
+        };
+        let mut lines = vec![
             (
-                "editor".to_owned(),
+                "Code".to_owned(),
                 format!(
-                    "{} bytes, {} lines, {} tokens, {} diagnostics",
-                    buffer.source_text.len(),
+                    "{} lines, {}, {}, {} bytes",
                     buffer.line_count,
-                    buffer.syntax_token_count(),
-                    buffer.diagnostics.len()
+                    diagnostics_text,
+                    saved_state,
+                    buffer.source_text.len(),
                 ),
             ),
             (
-                "cursor".to_owned(),
+                "Cursor".to_owned(),
                 format!(
                     "line {}, column {}, scroll {}:{}",
-                    buffer.caret().line,
-                    buffer.caret().column,
+                    buffer.caret().line.saturating_add(1),
+                    buffer.caret().column.saturating_add(1),
                     buffer.scroll_line,
                     buffer.scroll_column
                 ),
             ),
-            (
-                "syntax".to_owned(),
+        ];
+        if runtime_state_hash != "-" {
+            lines.push((
+                "Runtime".to_owned(),
+                runtime_footer_summary(runtime_summary, &runtime_state_hash, &source_hash),
+            ));
+        } else if let Some(diagnostic) = self.preview_diagnostic() {
+            lines.push((
+                "Preview".to_owned(),
                 format!(
-                    "{}{}",
-                    buffer.syntax_backend(),
-                    if buffer.syntax_parser_backed() {
-                        " parser-backed"
-                    } else {
-                        " fallback"
-                    }
+                    "{}: {}",
+                    ui_status_label(summary_status),
+                    one_line(&diagnostic, 110)
                 ),
-            ),
-            (
-                "workspace".to_owned(),
+            ));
+        }
+        if preview_error_count > 0 || preview_error != "-" {
+            lines.push((
+                "Preview error".to_owned(),
                 format!(
-                    "{} ({})",
-                    buffer.file_name,
-                    if self.selected_example_is_custom() {
-                        "custom"
-                    } else {
-                        "official"
-                    }
-                ),
-            ),
-            (
-                "example".to_owned(),
-                format!(
-                    "{} dirty={}",
-                    self.workspace.selected_example_id, self.workspace.dirty
-                ),
-            ),
-            (
-                "preview".to_owned(),
-                format!(
-                    "transport={preview_status}, summary={summary_status}, last command={}",
-                    self.last_dev_command
-                ),
-            ),
-            (
-                "runtime".to_owned(),
-                format!(
-                    "state {}, source {}, keys [{}]",
-                    runtime_state_hash, source_hash, state_keys
-                ),
-            ),
-            (
-                "errors".to_owned(),
-                format!(
-                    "count {}, {}",
+                    "{} error{}, {}",
                     preview_error_count,
+                    if preview_error_count == 1 { "" } else { "s" },
                     one_line(preview_error, 96)
                 ),
-            ),
-            (
-                "catalog".to_owned(),
-                format!("{visible_examples} official visible, {custom_examples} custom"),
-            ),
-            (
-                "format".to_owned(),
-                format!(
-                    "formatted hash {}",
-                    buffer
-                        .formatted_preview_hash
-                        .as_deref()
-                        .map(short_hash)
-                        .unwrap_or_else(|| "format-error".to_owned())
-                ),
-            ),
-        ]
+            ));
+        }
+        if self.last_dev_command != "startup" || self.last_dev_command_status != "not-run" {
+            let mut action = format!(
+                "{}: {}",
+                friendly_dev_command(&self.last_dev_command),
+                ui_status_label(&self.last_dev_command_status)
+            );
+            if let Some(detail) = &self.last_dev_command_detail {
+                action.push_str(" - ");
+                action.push_str(&one_line(detail, 92));
+            }
+            lines.push(("Last action".to_owned(), action));
+        }
+        lines
+    }
+
+    fn preview_diagnostic(&self) -> Option<String> {
+        json_diagnostic(&self.last_preview_summary)
+            .or_else(|| json_diagnostic(&self.last_preview_transport))
+    }
+
+    fn visible_runtime_summary(&self, current_source_hash: &str) -> Option<&serde_json::Value> {
+        let current = self.last_preview_summary.get("runtime_summary");
+        let current =
+            current.filter(|summary| runtime_summary_matches_source(summary, current_source_hash));
+        current.or_else(|| {
+            self.last_good_runtime_summary
+                .as_ref()
+                .filter(|summary| runtime_summary_matches_source(summary, current_source_hash))
+        })
     }
 
     fn selected_example_is_custom(&self) -> bool {
@@ -5095,6 +5132,29 @@ impl DevWindowShell {
             .entries
             .iter()
             .any(|entry| entry.id == self.workspace.selected_example_id && entry.custom)
+    }
+
+    fn selected_example_label(&self) -> String {
+        self.catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.workspace.selected_example_id)
+            .map(|entry| entry.label.clone())
+            .unwrap_or_else(|| self.workspace.selected_example_id.clone())
+    }
+
+    fn rename_selected_custom_label(&mut self, label: &str) -> serde_json::Value {
+        if !self.selected_example_is_custom() {
+            return json!({
+                "status": "skipped",
+                "command": "RenameCustomExample",
+                "selected_example_id": self.workspace.selected_example_id,
+                "reason": "selected example is manifest-backed"
+            });
+        }
+        let normalized = normalize_custom_example_label(label);
+        self.catalog
+            .rename_custom_example(&self.workspace.selected_example_id, &normalized)
     }
 
     fn document_source_paths(&self) -> Vec<String> {
@@ -5271,6 +5331,19 @@ impl DevWindowShell {
                 });
             }
         };
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            self.last_dev_command = value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(source_path)
+                .to_owned();
+            self.last_dev_command_status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("fail")
+                .to_owned();
+            self.last_dev_command_detail = json_diagnostic(&value);
+        }
         if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
             if matches!(
                 value.get("command").and_then(serde_json::Value::as_str),
@@ -5515,6 +5588,12 @@ impl DevWindowShell {
             &self.workspace.selected_buffer.source_text,
         );
         self.last_dev_command = command.to_owned();
+        self.last_dev_command_status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run")
+            .to_owned();
+        self.last_dev_command_detail = json_diagnostic(&value);
         self.update_preview_summary_from_transport(&value);
         self.last_preview_transport = value.clone();
         value
@@ -5525,6 +5604,9 @@ impl DevWindowShell {
             .pointer("/ack/preview_runtime_summary")
             .or_else(|| transport.pointer("/preview_runtime_summary"))
         {
+            if runtime_summary_is_ready(summary) {
+                self.last_good_runtime_summary = Some(summary.clone());
+            }
             self.last_preview_summary = json!({
                 "status": "pass",
                 "kind": "debug-query-result",
@@ -5546,7 +5628,13 @@ impl DevWindowShell {
         let previous_hash = boon_runtime::sha256_bytes(
             &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
         );
-        self.last_preview_summary = self.preview_transport.runtime_summary();
+        let next_summary = self.preview_transport.runtime_summary();
+        if let Some(runtime_summary) = next_summary.get("runtime_summary")
+            && runtime_summary_is_ready(runtime_summary)
+        {
+            self.last_good_runtime_summary = Some(runtime_summary.clone());
+        }
+        self.last_preview_summary = next_summary;
         self.last_preview_summary_refresh = Some(now);
         let next_hash = boon_runtime::sha256_bytes(
             &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
@@ -6153,9 +6241,9 @@ fn dev_shell_document(
         header_parent.clone(),
         dev_status_pill(
             "dev-header-preview-status",
-            &format!("preview {preview_status}"),
+            &format!("Preview: {}", ui_status_label(preview_status)),
             status_color(preview_status),
-            142,
+            154,
         ),
     );
     append_child(
@@ -6164,9 +6252,9 @@ fn dev_shell_document(
         dev_status_pill(
             "dev-header-dirty-status",
             if shell.workspace.dirty {
-                "dirty"
+                "Unsaved"
             } else {
-                "saved"
+                "Saved"
             },
             if shell.workspace.dirty {
                 DEV_DIRTY
@@ -6178,10 +6266,10 @@ fn dev_shell_document(
     );
     append_child(
         &mut frame,
-        header_parent,
+        header_parent.clone(),
         dev_text_node(
             "dev-header-example",
-            &shell.workspace.selected_example_id,
+            &one_line(&shell.workspace.selected_example_id, 24),
             DEV_TEXT_MUTED,
             12,
             &[
@@ -6191,6 +6279,7 @@ fn dev_shell_document(
             ],
         ),
     );
+    append_child(&mut frame, header_parent, dev_custom_name_input(shell));
     let tabs_parent = tabs.id.clone();
     append_child(&mut frame, root.clone(), tabs);
     for entry in shell
@@ -6199,7 +6288,12 @@ fn dev_shell_document(
         .iter()
         .filter(|entry| entry.shown_by_default)
     {
-        let mut label = entry.label.clone();
+        let max_label_chars = if entry.id.starts_with("custom:") {
+            18
+        } else {
+            14
+        };
+        let mut label = one_line(&entry.label, max_label_chars);
         if shell.workspace.dirty_examples.contains(&entry.id) {
             label.push('*');
         }
@@ -6372,90 +6466,11 @@ fn append_dev_footer(
     let footer_parent = footer.id.clone();
     append_child(frame, parent, footer);
 
-    let status_row = dev_node(
-        "dev-footer-status",
-        boon_document_model::DocumentNodeKind::Row,
-        None,
-        &[
-            ("bg", DEV_PANEL_RAISED),
-            ("border", DEV_BORDER_MUTED),
-            ("padding", "4"),
-            ("gap", "6"),
-            ("height", "32"),
-            ("width", "fill"),
-        ],
-    );
-    let status_parent = status_row.id.clone();
-    append_child(frame, footer_parent.clone(), status_row);
-
-    let preview_status = shell
-        .last_preview_transport
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("not-run");
-    let summary_status = shell
-        .last_preview_summary
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("not-run");
-    append_child(
-        frame,
-        status_parent.clone(),
-        dev_status_pill(
-            "dev-footer-preview-chip",
-            &format!("preview {preview_status}"),
-            status_color(preview_status),
-            132,
-        ),
-    );
-    append_child(
-        frame,
-        status_parent.clone(),
-        dev_status_pill(
-            "dev-footer-runtime-chip",
-            &format!("runtime {summary_status}"),
-            status_color(summary_status),
-            132,
-        ),
-    );
-    append_child(
-        frame,
-        status_parent.clone(),
-        dev_status_pill(
-            "dev-footer-source-chip",
-            if shell.selected_example_is_custom() {
-                "custom source"
-            } else {
-                "official source"
-            },
-            if shell.selected_example_is_custom() {
-                DEV_WARN
-            } else {
-                DEV_ACCENT
-            },
-            132,
-        ),
-    );
-    append_child(
-        frame,
-        status_parent,
-        dev_text_node(
-            "dev-footer-command-chip",
-            &format!("last {}", shell.last_dev_command),
-            DEV_TEXT_MUTED,
-            12,
-            &[
-                ("bg", DEV_PANEL_RAISED),
-                ("border", DEV_BORDER),
-                ("padding", "5"),
-                ("height", "24"),
-                ("width", "220"),
-                ("font", BOON_EDITOR_FONT_FAMILY),
-            ],
-        ),
-    );
-
-    let scroll_height = height.saturating_sub(54).max(44);
+    let scroll_height = height.saturating_sub(16).max(44);
+    let footer_lines = wrap_footer_lines(shell.footer_lines(), DEV_FOOTER_VALUE_WRAP_CHARS);
+    let effective_scroll_line = shell
+        .footer_scroll_line
+        .min(footer_lines.len().saturating_sub(1));
     let mut scroll = dev_node(
         "dev-footer-scroll",
         boon_document_model::DocumentNodeKind::ScrollRoot,
@@ -6472,7 +6487,7 @@ fn append_dev_footer(
     );
     scroll.scroll = Some(boon_document_model::ScrollState {
         x: 0.0,
-        y: shell.footer_scroll_line as f32,
+        y: effective_scroll_line as f32,
     });
     scroll
         .materialized
@@ -6486,17 +6501,16 @@ fn append_dev_footer(
         boon_document_model::ScrollRootId(scroll_parent.0.clone()),
         boon_document_model::ScrollState {
             x: 0.0,
-            y: shell.footer_scroll_line as f32,
+            y: effective_scroll_line as f32,
         },
     );
     append_child(frame, footer_parent, scroll);
 
     let visible_line_count =
         (scroll_height.saturating_sub(12) / DEV_FOOTER_LINE_HEIGHT).max(1) as usize;
-    for (visible_index, (label, value)) in shell
-        .footer_lines()
+    for (visible_index, (label, value)) in footer_lines
         .into_iter()
-        .skip(shell.footer_scroll_line)
+        .skip(effective_scroll_line)
         .take(visible_line_count)
         .enumerate()
     {
@@ -6541,7 +6555,7 @@ fn append_dev_footer(
             row_parent,
             dev_text_node(
                 &format!("dev-footer-row-{visible_index}-value"),
-                &one_line(&value, 118),
+                &value,
                 DEV_TEXT_MUTED,
                 12,
                 &[
@@ -6584,9 +6598,10 @@ fn dev_status_pill(
     width: u32,
 ) -> boon_document_model::DocumentNode {
     let width_text = width.to_string();
+    let text = one_line(text, (width / 8).max(4) as usize);
     dev_text_node(
         id,
-        text,
+        &text,
         DEV_TEXT,
         12,
         &[
@@ -6596,8 +6611,73 @@ fn dev_status_pill(
             ("height", "24"),
             ("width", width_text.as_str()),
             ("font", BOON_EDITOR_FONT_FAMILY),
+            ("align", "center"),
+            ("vertical_align", "center"),
+            ("text_inset", "0"),
         ],
     )
+}
+
+fn dev_custom_name_input(shell: &DevWindowShell) -> boon_document_model::DocumentNode {
+    let selected_is_custom = shell.selected_example_is_custom();
+    let label = if selected_is_custom {
+        shell.selected_example_label()
+    } else {
+        "official example".to_owned()
+    };
+    let mut input = dev_node(
+        "dev-custom-name-input",
+        boon_document_model::DocumentNodeKind::TextInput,
+        Some(one_line(&label, 22)),
+        &[
+            (
+                "bg",
+                if selected_is_custom {
+                    DEV_PANEL_RAISED
+                } else {
+                    "#172031"
+                },
+            ),
+            (
+                "color",
+                if selected_is_custom {
+                    DEV_TEXT
+                } else {
+                    "#64748b"
+                },
+            ),
+            (
+                "border",
+                if selected_is_custom {
+                    DEV_ACCENT
+                } else {
+                    DEV_BORDER_MUTED
+                },
+            ),
+            ("padding", "5"),
+            ("height", "24"),
+            ("width", "190"),
+            ("size", "12"),
+            ("font", BOON_EDITOR_FONT_FAMILY),
+            ("align", "center"),
+            ("vertical_align", "center"),
+            ("text_inset", "0"),
+            ("placeholder", "custom name"),
+        ],
+    );
+    if selected_is_custom {
+        input.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId("source:dev-custom-name".to_owned()),
+            source_path: "dev.custom.name".to_owned(),
+            intent: "text_input".to_owned(),
+        });
+    } else {
+        input.style.insert(
+            "disabled".to_owned(),
+            boon_document_model::StyleValue::Bool(true),
+        );
+    }
+    input
 }
 
 fn status_color(status: &str) -> &'static str {
@@ -6607,6 +6687,183 @@ fn status_color(status: &str) -> &'static str {
         "not-run" | "deferred" | "not-bound" => DEV_WARN,
         _ => DEV_ACCENT,
     }
+}
+
+fn ui_status_label(status: &str) -> &'static str {
+    match status {
+        "pass" => "Synced",
+        "fail" => "Error",
+        "unavailable" => "Offline",
+        "deferred" => "Updating",
+        "not-run" | "not-bound" => "Waiting",
+        _ => "Ready",
+    }
+}
+
+fn friendly_dev_command(command: &str) -> &'static str {
+    match command {
+        "startup" => "Startup",
+        "test" => "Test",
+        "Run" => "Run",
+        "Format" => "Format",
+        "Reset" => "Reset",
+        "RemoveCustomExample" => "Remove",
+        "NewCustomTab" => "New custom",
+        "SelectTab" => "Select example",
+        "EditorTextInput" => "Edit",
+        _ => "Action",
+    }
+}
+
+fn json_diagnostic(value: &serde_json::Value) -> Option<String> {
+    for pointer in [
+        "/diagnostic",
+        "/reason",
+        "/blocker",
+        "/ack/diagnostic",
+        "/ack/reason",
+        "/ack/blocker",
+        "/preview_runtime_summary/reason",
+        "/runtime_summary/reason",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(serde_json::Value::as_str) {
+            let text = one_line(text, 160);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn runtime_footer_summary(
+    summary: &serde_json::Value,
+    runtime_state_hash: &str,
+    source_hash: &str,
+) -> String {
+    let keys = summary
+        .get("state_summary_top_level_keys")
+        .and_then(serde_json::Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let bytes = summary
+        .get("state_summary_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .map(format_runtime_bytes);
+    let mut parts = vec![
+        format!("state {runtime_state_hash}"),
+        format!("source {source_hash}"),
+    ];
+    if let Some(bytes) = bytes {
+        parts.push(format!("state size {bytes}"));
+    }
+    if keys.is_empty() {
+        return parts.join(", ");
+    }
+    let sample_limit = 5;
+    let sample = keys
+        .iter()
+        .take(sample_limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extra = keys.len().saturating_sub(sample_limit);
+    let keys_text = if extra == 0 {
+        format!("{} keys: {sample}", keys.len())
+    } else {
+        format!("{} keys: {sample}, +{extra} more", keys.len())
+    };
+    parts.push(keys_text);
+    parts.join(", ")
+}
+
+fn format_runtime_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+fn wrap_footer_lines(lines: Vec<(String, String)>, max_chars: usize) -> Vec<(String, String)> {
+    lines
+        .into_iter()
+        .flat_map(|(label, value)| {
+            wrap_text_chunks(&value, max_chars)
+                .into_iter()
+                .enumerate()
+                .map(move |(index, chunk)| {
+                    if index == 0 {
+                        (label.clone(), chunk)
+                    } else {
+                        ("".to_owned(), chunk)
+                    }
+                })
+        })
+        .collect()
+}
+
+fn wrap_text_chunks(value: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(8);
+    let normalized = value
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return vec![String::new()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for word in normalized.split(' ') {
+        if word.chars().count() > max_chars {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let chars = word.chars().collect::<Vec<_>>();
+            for piece in chars.chunks(max_chars) {
+                chunks.push(piece.iter().collect());
+            }
+            continue;
+        }
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if current.chars().count() + separator + word.chars().count() > max_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn runtime_summary_is_ready(summary: &serde_json::Value) -> bool {
+    summary.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && summary
+            .get("state_summary_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && summary
+            .get("source_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+fn runtime_summary_matches_source(summary: &serde_json::Value, source_hash: &str) -> bool {
+    runtime_summary_is_ready(summary)
+        && summary
+            .get("source_sha256")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_hash)
 }
 
 fn short_hash(value: &str) -> String {
@@ -6627,6 +6884,19 @@ fn one_line(value: &str, max_chars: usize) -> String {
         text.push_str("...");
     }
     text
+}
+
+fn normalize_custom_example_label(value: &str) -> String {
+    let label = value
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        label.chars().take(80).collect()
+    }
 }
 
 fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
@@ -10949,6 +11219,19 @@ mod tests {
     }
 
     #[test]
+    fn code_editor_brackets_do_not_highlight_when_caret_is_in_root_text() {
+        let mut model =
+            CodeEditorModel::new("custom://editor.bn", "root\n  first: []\n  second: {}\n");
+        model.set_selection(
+            EditorPosition { line: 1, column: 5 },
+            EditorPosition { line: 1, column: 5 },
+        );
+        assert!(model.bracket_columns_for_line(1).is_empty());
+        assert!(model.bracket_columns_for_line(2).is_empty());
+        assert!(model.bracket_columns_for_line(3).is_empty());
+    }
+
+    #[test]
     fn code_editor_view_attaches_caret_selection_and_bracket_metadata() {
         let mut model = CodeEditorModel::new("custom://view.bn", "value: [count]\n");
         model.set_selection(
@@ -11290,8 +11573,11 @@ mod tests {
             preview_transport: PreviewTransport::new(None),
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
+            last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
             last_dev_command: "test".to_owned(),
+            last_dev_command_status: "not-run".to_owned(),
+            last_dev_command_detail: None,
             footer_scroll_line: 0,
             caret_visible: false,
         };
@@ -11460,12 +11746,15 @@ mod tests {
     #[test]
     fn dev_shell_visual_refresh_preserves_editor_theme_and_structures_footer() {
         let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        let source_hash =
+            boon_runtime::sha256_bytes(shell.workspace.selected_buffer.source_text.as_bytes());
         shell.last_preview_transport = json!({"status": "pass"});
         shell.last_preview_summary = json!({
             "status": "pass",
             "runtime_summary": {
+                "status": "pass",
                 "state_summary_hash": "abcdef1234567890",
-                "source_sha256": "0123456789abcdef",
+                "source_sha256": source_hash,
                 "state_summary_top_level_keys": ["count", "store"]
             },
             "preview_last_error_count": 0,
@@ -11543,17 +11832,28 @@ mod tests {
                     "dev-footer-scroll".to_owned()
                 ))
         );
+        assert!(
+            !frame
+                .nodes
+                .contains_key(&boon_document_model::DocumentNodeId(
+                    "dev-footer-runtime-chip".to_owned()
+                )),
+            "footer should not duplicate header/runtime status chips"
+        );
+        let preview_pill = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-header-preview-status".to_owned(),
+            ))
+            .expect("preview status pill should render");
+        assert_eq!(style_text_value(preview_pill, "align"), Some("center"));
         assert_eq!(
-            style_text_value(
-                frame
-                    .nodes
-                    .get(&boon_document_model::DocumentNodeId(
-                        "dev-footer-runtime-chip".to_owned()
-                    ))
-                    .expect("runtime chip should render"),
-                "border"
-            ),
-            Some(DEV_PASS)
+            style_text_value(preview_pill, "vertical_align"),
+            Some("center")
+        );
+        assert_eq!(
+            preview_pill.text.as_ref().map(|text| text.text.as_str()),
+            Some("Preview: Synced")
         );
         let visible_footer_text = frame
             .nodes
@@ -11562,13 +11862,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(visible_footer_text.contains("official"));
+        assert!(!visible_footer_text.contains("not-run"));
+        assert!(!visible_footer_text.contains("deferred"));
+        assert!(!visible_footer_text.contains("not-bound"));
         let footer_lines = shell
             .footer_lines()
             .into_iter()
             .map(|(label, value)| format!("{label} {value}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(footer_lines.contains("runtime state abcdef123456"));
+        for removed_label in [
+            "syntax",
+            "catalog",
+            "format",
+            "workspace",
+            "example",
+            "preview",
+        ] {
+            assert!(
+                !shell
+                    .footer_lines()
+                    .iter()
+                    .any(|(label, _)| label.eq_ignore_ascii_case(removed_label)),
+                "{removed_label} should not be a visible footer row"
+            );
+        }
+        assert!(footer_lines.contains("Code"));
+        assert!(footer_lines.contains("Cursor"));
+        assert!(footer_lines.contains("Runtime state abcdef123456"));
+        assert!(footer_lines.contains("Last action"));
+        assert!(!footer_lines.contains("Errors none"));
 
         let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let layout = boon_document::layout(boon_document::LayoutInput {
@@ -11591,6 +11914,246 @@ mod tests {
             (820.0 - bottom).abs() <= 0.5,
             "dev shell should fill viewport height without a bottom gutter, bottom={bottom}"
         );
+    }
+
+    #[test]
+    fn dev_shell_translates_raw_statuses_for_visible_ui() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        shell.last_dev_command = "startup".to_owned();
+        shell.last_dev_command_status = "not-run".to_owned();
+        shell.last_dev_command_detail = None;
+        let startup_frame = shell.document_for_viewport(1180, 820);
+        let startup_text = startup_frame
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(startup_text.contains("Preview: Waiting"));
+        assert!(!startup_text.contains("Waiting for preview summary"));
+        assert!(!startup_text.contains("Startup: Waiting"));
+        assert!(!startup_text.contains("not-run"));
+        assert!(!startup_text.contains("not-bound"));
+
+        shell.last_preview_transport = json!({
+            "status": "fail",
+            "diagnostic": "preview socket closed"
+        });
+        shell.last_preview_summary = json!({
+            "status": "unavailable",
+            "diagnostic": "preview socket closed"
+        });
+        shell.last_dev_command = "Run".to_owned();
+        shell.last_dev_command_status = "fail".to_owned();
+        shell.last_dev_command_detail = Some("preview socket closed".to_owned());
+        let error_frame = shell.document_for_viewport(1180, 820);
+        let error_text = error_frame
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(error_text.contains("Preview: Error"));
+        assert!(error_text.contains("Preview\nOffline: preview socket closed"));
+        assert!(error_text.contains("Run: Error - preview socket closed"));
+        assert!(!error_text.contains(" fail"));
+        assert!(!error_text.contains("unavailable"));
+    }
+
+    #[test]
+    fn dev_footer_keeps_last_good_runtime_summary_during_transient_poll_failures() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        let source_hash =
+            boon_runtime::sha256_bytes(shell.workspace.selected_buffer.source_text.as_bytes());
+        shell.last_good_runtime_summary = Some(json!({
+            "status": "pass",
+            "state_summary_hash": "abcdef1234567890",
+            "source_sha256": source_hash,
+            "state_summary_top_level_keys": ["store"]
+        }));
+        shell.last_preview_summary = json!({
+            "status": "unavailable",
+            "diagnostic": "runtime-summary poll timed out"
+        });
+        let footer_lines = shell
+            .footer_lines()
+            .into_iter()
+            .map(|(label, value)| format!("{label} {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(footer_lines.contains("Runtime state abcdef123456"));
+        assert!(!footer_lines.contains("Preview Offline"));
+
+        shell
+            .workspace
+            .selected_buffer
+            .insert_plain_text_at_caret("-- changed", "test");
+        let stale_footer_lines = shell
+            .footer_lines()
+            .into_iter()
+            .map(|(label, value)| format!("{label} {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!stale_footer_lines.contains("Runtime state abcdef123456"));
+    }
+
+    #[test]
+    fn dev_footer_runtime_summary_is_compact_and_wrapped() {
+        let summary = json!({
+            "status": "pass",
+            "state_summary_hash": "abcdef1234567890",
+            "source_sha256": "0123456789abcdef",
+            "state_summary_bytes": 4096,
+            "state_summary_top_level_keys": [
+                "todos",
+                "new_todo_text",
+                "filter",
+                "visible_todos",
+                "active_count",
+                "completed_count",
+                "editing_id"
+            ]
+        });
+        let text = runtime_footer_summary(&summary, "abcdef123456", "0123456789ab");
+        assert!(text.contains("state abcdef123456"));
+        assert!(text.contains("source 0123456789ab"));
+        assert!(text.contains("state size 4.0 KiB"));
+        assert!(text.contains(
+            "7 keys: todos, new_todo_text, filter, visible_todos, active_count, +2 more"
+        ));
+        assert!(!text.contains("completed_count"));
+        assert!(!text.contains("editing_id"));
+
+        let wrapped = wrap_footer_lines(vec![("Runtime".to_owned(), text)], 48);
+        assert!(wrapped.len() > 1);
+        assert_eq!(
+            wrapped.first().map(|(label, _)| label.as_str()),
+            Some("Runtime")
+        );
+        assert!(
+            wrapped
+                .iter()
+                .skip(1)
+                .all(|(label, value)| { label.is_empty() && value.chars().count() <= 48 })
+        );
+    }
+
+    #[test]
+    fn dev_editor_caret_blinks_only_while_editor_is_focused() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(
+                BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS,
+            ))
+            .unwrap_or_else(Instant::now);
+        let mut focused = DevNativeInputState {
+            editor_focused: true,
+            caret_blink_started_at: Some(started),
+            ..DevNativeInputState::default()
+        };
+        assert!(!dev_editor_caret_visible(&mut focused, Instant::now()));
+
+        let mut unfocused = DevNativeInputState {
+            editor_focused: false,
+            caret_blink_started_at: Some(started),
+            ..DevNativeInputState::default()
+        };
+        assert!(dev_editor_caret_visible(&mut unfocused, Instant::now()));
+    }
+
+    #[test]
+    fn custom_example_name_input_renames_and_truncates_visible_labels() {
+        let store_path = PathBuf::from(format!(
+            "target/artifacts/native-gpu/tests/custom-name-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&store_path);
+        let long_label = "Custom Example With A Name That Is Far Too Long For A Tab".to_owned();
+        let catalog = ExampleCatalog {
+            entries: vec![ExampleCatalogEntry {
+                id: "custom:long".to_owned(),
+                label: long_label,
+                source: "custom://long.bn".to_owned(),
+                inline_source: Some("document: []\n".to_owned()),
+                category: "custom".to_owned(),
+                order: 20_000,
+                shown_by_default: true,
+                custom: true,
+            }],
+            custom_store_path: store_path.clone(),
+        };
+        let workspace = ExampleWorkspace::new(
+            &catalog,
+            "custom://long.bn",
+            "document: []\n",
+            Some("custom:long"),
+        );
+        let mut shell = DevWindowShell {
+            catalog,
+            initial_workspace: workspace.clone(),
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport: PreviewTransport::new(None),
+            last_preview_transport: json!({"status": "not-run"}),
+            last_preview_summary: json!({"status": "not-run"}),
+            last_good_runtime_summary: None,
+            last_preview_summary_refresh: None,
+            last_dev_command: "test".to_owned(),
+            last_dev_command_status: "not-run".to_owned(),
+            last_dev_command_detail: None,
+            footer_scroll_line: 0,
+            caret_visible: true,
+        };
+
+        let frame = shell.document_for_viewport(1180, 820);
+        let custom_tab = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-tab-custom:long".to_owned(),
+            ))
+            .expect("custom tab should render");
+        let tab_text = custom_tab.text.as_ref().expect("tab text").text.as_str();
+        assert!(tab_text.ends_with("..."));
+        assert!(!tab_text.contains('\n'));
+        let name_input = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-custom-name-input".to_owned(),
+            ))
+            .expect("custom name input should render");
+        assert_eq!(
+            name_input
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("dev.custom.name")
+        );
+
+        let rename = shell.rename_selected_custom_label("Short");
+        assert_eq!(rename["status"], "pass");
+        assert_eq!(shell.selected_example_label(), "Short");
+        assert!(apply_dev_custom_name_key(&mut shell, "A", false));
+        assert_eq!(shell.selected_example_label(), "Shorta");
+        assert!(apply_dev_custom_name_key(&mut shell, "Delete", false));
+        assert_eq!(shell.selected_example_label(), "Short");
+        let stored = ExampleCatalog::load_custom_store(&store_path).unwrap();
+        assert_eq!(
+            stored.first().map(|entry| entry.label.as_str()),
+            Some("Short")
+        );
+
+        let renamed_frame = shell.document_for_viewport(1180, 820);
+        let name_input = renamed_frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-custom-name-input".to_owned(),
+            ))
+            .expect("custom name input should render");
+        assert_eq!(
+            name_input.text.as_ref().map(|text| text.text.as_str()),
+            Some("Short")
+        );
+
+        let _ = std::fs::remove_file(store_path);
     }
 
     #[test]
@@ -11717,8 +12280,11 @@ mod tests {
                 "reason": "test shell has not sent preview transport yet"
             }),
             last_preview_summary: json!({"status": "not-run"}),
+            last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
             last_dev_command: "test".to_owned(),
+            last_dev_command_status: "not-run".to_owned(),
+            last_dev_command_detail: None,
             footer_scroll_line: 0,
             caret_visible: true,
         };
@@ -11807,8 +12373,11 @@ mod tests {
             preview_transport: PreviewTransport::new(None),
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
+            last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
             last_dev_command: "test".to_owned(),
+            last_dev_command_status: "not-run".to_owned(),
+            last_dev_command_detail: None,
             footer_scroll_line: 0,
             caret_visible: true,
         };

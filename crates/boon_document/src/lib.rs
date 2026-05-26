@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-const SIMPLE_MONOSPACE_WIDTH_FACTOR: f32 = 0.56;
+const SIMPLE_MONOSPACE_WIDTH_FACTOR: f32 = 0.60;
 
 pub trait TextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics;

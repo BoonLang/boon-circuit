@@ -15,12 +15,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 const BOON_EDITOR_FONT_SIZE: u32 = 16;
 const BOON_EDITOR_LINE_HEIGHT: u32 = 22;
-const BOON_EDITOR_FONT_FEATURES: &str = "zero,calt,liga,clig";
+const BOON_EDITOR_FONT_FEATURES: &str = "zero,calt";
 const BOON_EDITOR_FONT_FEATURE_SETTINGS: &str = "'zero' 1, 'calt' 1";
 const BOON_EDITOR_PADDING: u32 = 10;
 const BOON_EDITOR_GUTTER_WIDTH: u32 = 44;
 const BOON_EDITOR_ROW_GAP: u32 = 8;
-const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.56;
+const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.60;
 const BOON_EDITOR_BACKGROUND: &str = "#282c34";
 const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
 const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
@@ -4077,62 +4077,60 @@ impl CodeEditorView {
         line: &str,
     ) {
         let segments = model.highlighted_line_segments(line_number, line);
-        if segments.is_empty() {
-            append_child(
-                frame,
-                parent,
-                self.editor_text_node(line_number, 0, "plain", ""),
-            );
-            return;
-        }
-        for (segment_index, segment) in segments.into_iter().enumerate() {
-            append_child(
-                frame,
-                parent.clone(),
-                self.editor_text_node(line_number, segment_index, segment.kind, &segment.text),
-            );
-        }
+        append_child(
+            frame,
+            parent,
+            self.editor_line_node(line_number, line, &segments),
+        );
     }
 
-    fn editor_text_node(
+    fn editor_line_node(
         &self,
         line_number: usize,
-        segment_index: usize,
-        kind: &str,
-        text: &str,
+        line: &str,
+        segments: &[SyntaxLineSegment],
     ) -> boon_document_model::DocumentNode {
-        let style = syntax_style_for_kind(kind);
+        let syntax_spans_json = syntax_spans_json(segments);
         let mut node = dev_node(
-            &format!("dev-code-editor-token-{line_number}-{segment_index}-{kind}"),
+            &format!("dev-code-editor-line-text-{line_number}"),
             boon_document_model::DocumentNodeKind::Text,
-            Some(text.to_owned()),
+            Some(line.to_owned()),
             &[
-                ("width", "auto"),
+                ("width", "fill"),
                 ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
-                ("color", style.color),
+                ("color", BOON_EDITOR_FOREGROUND),
                 ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
                 ("bg", BOON_EDITOR_BACKGROUND),
                 ("font", self.font_family),
                 ("font_features", BOON_EDITOR_FONT_FEATURES),
-                ("auto_padding", "0"),
+                ("syntax_spans_json", &syntax_spans_json),
                 ("text_inset", "0"),
                 ("text_clip_padding", "4"),
             ],
         );
-        if let Some(weight) = style.font_weight {
-            node.style.insert(
-                "weight".to_owned(),
-                boon_document_model::StyleValue::Text(weight.to_owned()),
-            );
-        }
-        if let Some(font_style) = style.font_style {
-            node.style.insert(
-                "font_style".to_owned(),
-                boon_document_model::StyleValue::Text(font_style.to_owned()),
-            );
-        }
+        node.style.insert(
+            "rich_text".to_owned(),
+            boon_document_model::StyleValue::Bool(true),
+        );
         node
     }
+}
+
+fn syntax_spans_json(segments: &[SyntaxLineSegment]) -> String {
+    let spans = segments
+        .iter()
+        .map(|segment| {
+            let style = syntax_style_for_kind(segment.kind);
+            json!({
+                "text": segment.text,
+                "source_text": segment.text,
+                "color": style.color,
+                "font_weight": style.font_weight,
+                "font_style": style.font_style
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&spans).unwrap_or_else(|_| "[]".to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -9683,6 +9681,20 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_line_segments_keep_space_before_closing_punctuation() {
+        let model = CodeEditorModel::new("custom://line.bn", "thing: [press: SOURCE ]\n");
+        let segments = model.highlighted_line_segments(1, "thing: [press: SOURCE ]");
+        let source_index = segments
+            .iter()
+            .position(|segment| segment.text == "SOURCE")
+            .expect("SOURCE token should be highlighted");
+
+        assert_eq!(segments[source_index].kind, "keyword");
+        assert_eq!(segments[source_index + 1].text, " ");
+        assert_eq!(segments[source_index + 2].text, "]");
+    }
+
+    #[test]
     fn code_editor_view_renders_mixed_lines_as_colored_segments() {
         let model = CodeEditorModel::new("custom://view.bn", "count: SOURCE\ncount + 1\n");
         let mut frame = boon_document_model::DocumentFrame::empty("root");
@@ -9695,50 +9707,84 @@ mod tests {
                 "dev-code-editor-code-row-2".to_owned(),
             ))
             .expect("line 2 code row should render");
-        let rendered = code_row
-            .children
-            .iter()
-            .filter_map(|id| frame.nodes.get(id))
-            .map(|node| {
-                (
-                    node.text.as_ref().map(|text| text.text.as_str()),
-                    node.style.get("color"),
-                    node.style.get("auto_padding"),
-                    node.style.get("text_inset"),
-                    node.style.get("text_clip_padding"),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            rendered
-                .iter()
-                .all(|(_, _, auto_padding, text_inset, text_clip_padding)| {
-                    *auto_padding == Some(&boon_document_model::StyleValue::Number(0.0))
-                        && *text_inset == Some(&boon_document_model::StyleValue::Number(0.0))
-                        && *text_clip_padding == Some(&boon_document_model::StyleValue::Number(4.0))
-                })
+        assert_eq!(code_row.children.len(), 1);
+        let rendered = frame
+            .nodes
+            .get(&code_row.children[0])
+            .expect("line text should render as one rich text node");
+        assert_eq!(
+            rendered.text.as_ref().map(|text| text.text.as_str()),
+            Some("count + 1")
         );
-        assert!(rendered.iter().any(|(text, color, _, _, _)| {
-            *text == Some("count")
-                && *color
-                    == Some(&boon_document_model::StyleValue::Text(
-                        syntax_color_for_kind("variable").to_owned(),
-                    ))
+        assert_eq!(
+            rendered.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Number(0.0))
+        );
+        assert_eq!(
+            rendered.style.get("text_clip_padding"),
+            Some(&boon_document_model::StyleValue::Number(4.0))
+        );
+
+        let boon_document_model::StyleValue::Text(spans_json) = rendered
+            .style
+            .get("syntax_spans_json")
+            .expect("rich syntax spans should be attached")
+        else {
+            panic!("syntax_spans_json should be text");
+        };
+        let spans = serde_json::from_str::<Vec<serde_json::Value>>(spans_json)
+            .expect("syntax spans should be valid JSON");
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span["text"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["count", " ", "+", " ", "1"]
+        );
+        assert!(spans.iter().any(|span| {
+            span["text"].as_str() == Some("+")
+                && span["color"].as_str() == Some(syntax_color_for_kind("operator"))
         }));
-        assert!(rendered.iter().any(|(text, color, _, _, _)| {
-            *text == Some("+")
-                && *color
-                    == Some(&boon_document_model::StyleValue::Text(
-                        syntax_color_for_kind("operator").to_owned(),
-                    ))
+        assert!(spans.iter().any(|span| {
+            span["text"].as_str() == Some("1")
+                && span["color"].as_str() == Some(syntax_color_for_kind("number"))
         }));
-        assert!(rendered.iter().any(|(text, color, _, _, _)| {
-            *text == Some("1")
-                && *color
-                    == Some(&boon_document_model::StyleValue::Text(
-                        syntax_color_for_kind("number").to_owned(),
-                    ))
+    }
+
+    #[test]
+    fn code_editor_view_preserves_pipe_forward_source_for_font_ligature_shaping() {
+        let model = CodeEditorModel::new("custom://view.bn", "0 |> HOLD count\n");
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let parent = frame.root.clone();
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 80);
+        let code_row = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-code-editor-code-row-1".to_owned(),
+            ))
+            .expect("line 1 code row should render");
+        let rendered = frame
+            .nodes
+            .get(&code_row.children[0])
+            .expect("line text should render");
+        let boon_document_model::StyleValue::Text(spans_json) = rendered
+            .style
+            .get("syntax_spans_json")
+            .expect("rich syntax spans should be attached")
+        else {
+            panic!("syntax_spans_json should be text");
+        };
+        let spans = serde_json::from_str::<Vec<serde_json::Value>>(spans_json)
+            .expect("syntax spans should be valid JSON");
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span["text"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["0", " ", "|>", " ", "HOLD", " ", "count"]
+        );
+        assert!(spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("|>") && span["text"].as_str() == Some("|>")
         }));
     }
 
@@ -9769,6 +9815,7 @@ mod tests {
         assert_eq!(BOON_EDITOR_FONT_FAMILY, "JetBrains Mono");
         assert_eq!(BOON_EDITOR_FONT_SIZE, 16);
         assert_eq!(BOON_EDITOR_LINE_HEIGHT, 22);
+        assert_eq!(BOON_EDITOR_FONT_FEATURES, "zero,calt");
         assert_eq!(BOON_EDITOR_FONT_FEATURE_SETTINGS, "'zero' 1, 'calt' 1");
 
         let keyword = syntax_style_for_kind("keyword");

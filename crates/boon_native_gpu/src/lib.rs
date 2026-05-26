@@ -5,7 +5,7 @@ use boon_host::SurfaceId;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
-    cosmic_text::{FeatureTag, FontFeatures},
+    cosmic_text::{FeatureTag, FontFeatures, fontdb},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,8 +20,14 @@ pub mod generated {
 pub const REQUIRED_WGPU_VERSION: &str = "29.0.1";
 pub const REQUIRED_GLYPHON_VERSION: &str = "0.11.0";
 const JETBRAINS_MONO_FONT_BYTES: &[u8] =
-    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched.woff2");
-const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.56;
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched.ttf");
+const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-Bold.ttf");
+const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-Italic.ttf");
+const JETBRAINS_MONO_BOLD_ITALIC_FONT_BYTES: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-BoldItalic.ttf");
+const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.60;
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -518,8 +524,26 @@ struct GlyphonTextState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct RichTextSpan {
+    text: String,
+    color: [u8; 4],
+    font_style: Style,
+    font_weight: Weight,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RichTextSpanPayload {
+    text: String,
+    source_text: Option<String>,
+    color: Option<String>,
+    font_style: Option<String>,
+    font_weight: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TextRunSignature {
     text: String,
+    rich_spans: Vec<RichTextSpan>,
     font_family: String,
     font_style: Style,
     font_weight: Weight,
@@ -536,6 +560,7 @@ struct TextRunSignature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextRunPlacementSignature {
     text: String,
+    rich_spans: Vec<RichTextSpan>,
     font_family: String,
     font_style: Style,
     font_weight: Weight,
@@ -555,6 +580,7 @@ impl TextRunSignature {
     fn from_run(run: &TextRun) -> Self {
         Self {
             text: run.text.clone(),
+            rich_spans: run.rich_spans.clone(),
             font_family: run.font_family.clone(),
             font_style: run.font_style,
             font_weight: run.font_weight,
@@ -574,6 +600,7 @@ impl TextRunPlacementSignature {
     fn from_run(run: &TextRun) -> Self {
         Self {
             text: run.text.clone(),
+            rich_spans: run.rich_spans.clone(),
             font_family: run.font_family.clone(),
             font_style: run.font_style,
             font_weight: run.font_weight,
@@ -593,10 +620,7 @@ impl TextRunPlacementSignature {
 
 impl GlyphonTextState {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let mut font_system = FontSystem::new();
-        font_system
-            .db_mut()
-            .load_font_data(JETBRAINS_MONO_FONT_BYTES.to_vec());
+        let font_system = editor_font_system();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
@@ -727,7 +751,13 @@ impl GlyphonTextState {
     fn shape_text_run(&mut self, run: &TextRun) -> Buffer {
         let bounds = run.bounds;
         let font_size = run.size.clamp(8.0, 120.0);
-        let font_features = text_font_features(&run.font_features);
+        let default_attrs = text_attrs(
+            &run.font_family,
+            run.font_style,
+            run.font_weight,
+            run.color,
+            &run.font_features,
+        );
         let mut buffer = Buffer::new(
             &mut self.font_system,
             Metrics::new(font_size, font_size * 1.25),
@@ -737,25 +767,69 @@ impl GlyphonTextState {
             Some((bounds.width + run.text_clip_padding).max(1.0)),
             Some(bounds.height.max(font_size * 1.25)),
         );
-        buffer.set_text(
-            &mut self.font_system,
-            &run.text,
-            &Attrs::new()
-                .family(Family::Name(&run.font_family))
-                .style(run.font_style)
-                .weight(run.font_weight)
-                .font_features(font_features),
-            Shaping::Advanced,
-            None,
-        );
+        if run.rich_spans.is_empty() {
+            buffer.set_text(
+                &mut self.font_system,
+                &run.text,
+                &default_attrs,
+                Shaping::Advanced,
+                None,
+            );
+        } else {
+            buffer.set_rich_text(
+                &mut self.font_system,
+                run.rich_spans.iter().map(|span| {
+                    (
+                        span.text.as_str(),
+                        text_attrs(
+                            &run.font_family,
+                            span.font_style,
+                            span.font_weight,
+                            span.color,
+                            &run.font_features,
+                        ),
+                    )
+                }),
+                &default_attrs,
+                Shaping::Advanced,
+                None,
+            );
+        }
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
     }
 }
 
+fn text_attrs<'a>(
+    font_family: &'a str,
+    font_style: Style,
+    font_weight: Weight,
+    color: [u8; 4],
+    font_features: &str,
+) -> Attrs<'a> {
+    Attrs::new()
+        .family(Family::Name(font_family))
+        .style(font_style)
+        .weight(font_weight)
+        .color(Color::rgba(color[0], color[1], color[2], color[3]))
+        .font_features(text_font_features(font_features))
+}
+
+fn editor_font_system() -> FontSystem {
+    let mut db = fontdb::Database::new();
+    db.load_font_data(JETBRAINS_MONO_FONT_BYTES.to_vec());
+    db.load_font_data(JETBRAINS_MONO_BOLD_FONT_BYTES.to_vec());
+    db.load_font_data(JETBRAINS_MONO_ITALIC_FONT_BYTES.to_vec());
+    db.load_font_data(JETBRAINS_MONO_BOLD_ITALIC_FONT_BYTES.to_vec());
+    db.load_system_fonts();
+    db.set_monospace_family("JetBrains Mono");
+    FontSystem::new_with_locale_and_db("en-US".to_owned(), db)
+}
+
 struct TextRun {
     bounds: Rect,
     text: String,
+    rich_spans: Vec<RichTextSpan>,
     font_family: String,
     font_style: Style,
     font_weight: Weight,
@@ -821,9 +895,11 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             } else {
                 style_text(&item.style, "font").unwrap_or("JetBrains Mono")
             };
+            let rich_spans = rich_text_spans(&item.style, &text, color);
             Some(TextRun {
                 bounds: item.bounds,
                 text,
+                rich_spans,
                 font_family: font_family.to_owned(),
                 font_style: text_font_style(&item.style),
                 font_weight: text_font_weight(&item.style),
@@ -838,6 +914,45 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             })
         })
         .collect()
+}
+
+fn rich_text_spans(style: &StyleMap, text: &str, default_color: [u8; 4]) -> Vec<RichTextSpan> {
+    let Some(spans_json) = style_text(style, "syntax_spans_json") else {
+        return Vec::new();
+    };
+    let Ok(payloads) = serde_json::from_str::<Vec<RichTextSpanPayload>>(spans_json) else {
+        return Vec::new();
+    };
+    let mut source_text = String::new();
+    let spans = payloads
+        .into_iter()
+        .map(|payload| {
+            source_text.push_str(payload.source_text.as_deref().unwrap_or(&payload.text));
+            RichTextSpan {
+                text: payload.text,
+                color: payload
+                    .color
+                    .as_deref()
+                    .and_then(parse_hex_color)
+                    .unwrap_or(default_color),
+                font_style: payload
+                    .font_style
+                    .as_deref()
+                    .map(text_font_style_value)
+                    .unwrap_or(Style::Normal),
+                font_weight: payload
+                    .font_weight
+                    .as_deref()
+                    .map(text_font_weight_value)
+                    .unwrap_or(Weight::NORMAL),
+            }
+        })
+        .collect::<Vec<_>>();
+    if source_text == text {
+        spans
+    } else {
+        Vec::new()
+    }
 }
 
 fn text_font_features(value: &str) -> FontFeatures {
@@ -873,28 +988,38 @@ fn text_font_features(value: &str) -> FontFeatures {
 }
 
 fn text_font_style(style: &StyleMap) -> Style {
-    match style_text(style, "font_style")
+    style_text(style, "font_style")
         .or_else(|| style_text(style, "style"))
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("italic") | Some("cursive") => Style::Italic,
-        Some("oblique") => Style::Oblique,
+        .map(text_font_style_value)
+        .unwrap_or(Style::Normal)
+}
+
+fn text_font_style_value(value: &str) -> Style {
+    match value.to_ascii_lowercase().as_str() {
+        "italic" | "cursive" => Style::Italic,
+        "oblique" => Style::Oblique,
         _ => Style::Normal,
     }
 }
 
 fn text_font_weight(style: &StyleMap) -> Weight {
-    match style_text(style, "weight").map(str::to_ascii_lowercase) {
-        Some(value) if value == "bold" => Weight::BOLD,
-        Some(value) if value == "bolder" => Weight::EXTRA_BOLD,
-        Some(value) if value == "semibold" || value == "semi-bold" => Weight::SEMIBOLD,
-        Some(value) if value == "medium" => Weight::MEDIUM,
-        Some(value) if value == "normal" => Weight::NORMAL,
-        Some(value) => value.parse::<u16>().map(Weight).unwrap_or(Weight::NORMAL),
-        None => style_number(style, "weight")
-            .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
-            .unwrap_or(Weight::NORMAL),
+    style_text(style, "weight")
+        .map(text_font_weight_value)
+        .or_else(|| {
+            style_number(style, "weight")
+                .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
+        })
+        .unwrap_or(Weight::NORMAL)
+}
+
+fn text_font_weight_value(value: &str) -> Weight {
+    match value.to_ascii_lowercase().as_str() {
+        "bold" => Weight::BOLD,
+        "bolder" => Weight::EXTRA_BOLD,
+        "semibold" | "semi-bold" => Weight::SEMIBOLD,
+        "medium" => Weight::MEDIUM,
+        "normal" => Weight::NORMAL,
+        value => value.parse::<u16>().map(Weight).unwrap_or(Weight::NORMAL),
     }
 }
 
@@ -1291,6 +1416,201 @@ fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
         6 => Some([parse(0..2)?, parse(2..4)?, parse(4..6)?, 255]),
         8 => Some([parse(0..2)?, parse(2..4)?, parse(4..6)?, parse(6..8)?]),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape_glyph_ids(text: &str, font_features: FontFeatures) -> Vec<u16> {
+        shape_glyphs(text, font_features)
+            .into_iter()
+            .map(|(glyph_id, _)| glyph_id)
+            .collect()
+    }
+
+    fn shape_glyphs(text: &str, font_features: FontFeatures) -> Vec<(u16, f32)> {
+        let mut font_system = editor_font_system();
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(16.0, 22.0));
+        buffer.set_size(&mut font_system, Some(320.0), Some(32.0));
+        buffer.set_text(
+            &mut font_system,
+            text,
+            &Attrs::new()
+                .family(Family::Name("JetBrains Mono"))
+                .font_features(font_features),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut font_system, false);
+        buffer.lines[0]
+            .shape_opt()
+            .expect("line should be shaped")
+            .spans
+            .iter()
+            .flat_map(|span| span.words.iter())
+            .flat_map(|word| word.glyphs.iter())
+            .map(|glyph| (glyph.glyph_id, glyph.x_advance))
+            .collect()
+    }
+
+    fn shape_rich_glyph_ids(spans: &[(&str, [u8; 4], Style, Weight)]) -> Vec<u16> {
+        let mut font_system = editor_font_system();
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(16.0, 22.0));
+        buffer.set_size(&mut font_system, Some(320.0), Some(32.0));
+        let default_attrs = text_attrs(
+            "JetBrains Mono",
+            Style::Normal,
+            Weight::NORMAL,
+            [217, 225, 242, 255],
+            "zero,calt,liga,clig",
+        );
+        buffer.set_rich_text(
+            &mut font_system,
+            spans.iter().map(|(text, color, style, weight)| {
+                (
+                    *text,
+                    text_attrs(
+                        "JetBrains Mono",
+                        *style,
+                        *weight,
+                        *color,
+                        "zero,calt,liga,clig",
+                    ),
+                )
+            }),
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut font_system, false);
+        buffer.lines[0]
+            .shape_opt()
+            .expect("line should be shaped")
+            .spans
+            .iter()
+            .flat_map(|span| span.words.iter())
+            .flat_map(|word| word.glyphs.iter())
+            .map(|glyph| glyph.glyph_id)
+            .collect()
+    }
+
+    fn disabled_editor_ligature_features() -> FontFeatures {
+        let mut features = FontFeatures::new();
+        features.disable(FeatureTag::CONTEXTUAL_ALTERNATES);
+        features.disable(FeatureTag::STANDARD_LIGATURES);
+        features.disable(FeatureTag::CONTEXTUAL_LIGATURES);
+        features
+    }
+
+    #[test]
+    fn bundled_editor_font_applies_calt_ligature_substitutions() {
+        let enabled = text_font_features("zero,calt");
+        assert_ne!(
+            shape_glyph_ids("--", disabled_editor_ligature_features()),
+            shape_glyph_ids("--", enabled.clone()),
+            "patched JetBrains Mono must substitute dash sequences through calt"
+        );
+        let raw_pipe = shape_glyph_ids("|>", disabled_editor_ligature_features());
+        let shaped_pipe = shape_glyph_ids("|>", enabled);
+        assert_eq!(raw_pipe.len(), 2);
+        assert_eq!(shaped_pipe.len(), 2);
+        assert_ne!(
+            raw_pipe, shaped_pipe,
+            "patched JetBrains Mono must substitute pipe-forward through calt"
+        );
+        assert_ne!(
+            raw_pipe[0], shaped_pipe[0],
+            "pipe-forward must replace the raw bar with the pipe ligature glyph"
+        );
+        assert_ne!(
+            raw_pipe[1], shaped_pipe[1],
+            "pipe-forward must replace the raw greater-than with an invisible filler glyph"
+        );
+    }
+
+    #[test]
+    fn rich_editor_spans_shape_pipe_forward_inside_operator_span() {
+        let raw_pipe = shape_glyph_ids("|>", disabled_editor_ligature_features());
+        let rich_pipe = shape_rich_glyph_ids(&[
+            ("0 ", [217, 225, 242, 255], Style::Normal, Weight::NORMAL),
+            ("|>", [255, 159, 67, 255], Style::Normal, Weight::BOLD),
+            (
+                " HOLD",
+                [210, 105, 30, 255],
+                Style::Italic,
+                Weight::EXTRA_BOLD,
+            ),
+        ]);
+        assert!(
+            !rich_pipe
+                .windows(raw_pipe.len())
+                .any(|window| window == raw_pipe)
+        );
+        assert!(
+            rich_pipe.iter().any(|glyph_id| *glyph_id == 1563),
+            "rich editor spans must shape |> to the bundled pipe-forward ligature glyph"
+        );
+    }
+
+    #[test]
+    fn styled_editor_spans_keep_dash_ligatures_on_patched_jetbrains_variants() {
+        let raw_dash = shape_glyph_ids("--", disabled_editor_ligature_features());
+        let styled_dash = shape_rich_glyph_ids(&[(
+            "-- comment",
+            [119, 136, 153, 255],
+            Style::Italic,
+            Weight::NORMAL,
+        )]);
+        assert!(
+            !styled_dash
+                .windows(raw_dash.len())
+                .any(|window| window == raw_dash)
+        );
+        assert!(
+            styled_dash.iter().any(|glyph_id| *glyph_id == 876),
+            "italic comment spans must shape -- through the bundled patched JetBrains variant"
+        );
+    }
+
+    #[test]
+    fn rich_text_spans_preserve_exact_line_text() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "syntax_spans_json".to_owned(),
+            StyleValue::Text(
+                r##"[{"text":"SOURCE","color":"#D2691E","font_weight":"800","font_style":"italic"},{"text":" ","color":"#d9e1f2","font_weight":null,"font_style":null},{"text":"]","color":"#D2691E","font_weight":"700","font_style":null}]"##
+                    .to_owned(),
+            ),
+        );
+
+        let spans = rich_text_spans(&style, "SOURCE ]", [217, 225, 242, 255]);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SOURCE", " ", "]"]
+        );
+        assert!(rich_text_spans(&style, "SOURCE]", [217, 225, 242, 255]).is_empty());
+    }
+
+    #[test]
+    fn rich_text_spans_preserve_pipe_forward_source_text() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "syntax_spans_json".to_owned(),
+            StyleValue::Text(
+                r##"[{"text":"|>","source_text":"|>","color":"#ff9f43","font_weight":"600","font_style":null}]"##
+                    .to_owned(),
+            ),
+        );
+
+        let spans = rich_text_spans(&style, "|>", [255, 159, 67, 255]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "|>");
+        assert!(rich_text_spans(&style, "\u{276F} ", [255, 159, 67, 255]).is_empty());
     }
 }
 

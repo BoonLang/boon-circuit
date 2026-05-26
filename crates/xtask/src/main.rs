@@ -1002,6 +1002,8 @@ fn playground_watch_roots() -> Vec<PathBuf> {
     [
         "Cargo.toml",
         "Cargo.lock",
+        "assets/fonts",
+        "crates/xtask/src",
         "crates/boon_native_playground/src",
         "crates/boon_runtime/src",
         "crates/boon_ir/src",
@@ -8432,19 +8434,43 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             "native code editor syntax theme does not match the original TypeScript playground theme evidence".to_owned()
         }),
     );
-    let editor_font_asset = Path::new("assets/fonts/JetBrainsMono-Patched.woff2");
-    let editor_font_hash = boon_runtime::sha256_file(editor_font_asset).ok();
-    let expected_editor_font_hash =
-        "79735bd616e11701e89fb12b9af42a004545434b8b0d390ab3cc8a2a03d637d0";
+    let editor_font_assets = [
+        (
+            "assets/fonts/JetBrainsMono-Patched.ttf",
+            "59db9682007022934e252dfc01ff00a507b8548d2f319d14fd10ebf7df934b62",
+        ),
+        (
+            "assets/fonts/JetBrainsMono-Patched-Bold.ttf",
+            "dd2203176ee475d90845bd36b542ed73730346aebb4f6386bd6649289951139f",
+        ),
+        (
+            "assets/fonts/JetBrainsMono-Patched-Italic.ttf",
+            "a63c7d71acc8a24f7d509c9095fbbca802fbc0e3fefd10a72e10c81c0be31518",
+        ),
+        (
+            "assets/fonts/JetBrainsMono-Patched-BoldItalic.ttf",
+            "cd6e0e78c01b7841613a4234db6910bc298997b08c3fbdccf074c3e131e4b6f3",
+        ),
+    ];
+    let editor_font_hashes = editor_font_assets
+        .iter()
+        .map(|(path, _)| (*path, boon_runtime::sha256_file(Path::new(path)).ok()))
+        .collect::<Vec<_>>();
     let reported_font_family = dev_probe
         .and_then(|probe| probe.pointer("/editor_model/font_family"))
         .and_then(serde_json::Value::as_str);
-    let font_pass = editor_font_hash.as_deref() == Some(expected_editor_font_hash)
-        && reported_font_family == Some("JetBrains Mono")
-        && native_gpu_source.contains("JetBrainsMono-Patched.woff2")
+    let reported_font_features = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/syntax_theme/font_features"))
+        .and_then(serde_json::Value::as_str);
+    let font_pass = editor_font_assets.iter().all(|(path, expected)| {
+        boon_runtime::sha256_file(Path::new(path))
+            .map(|hash| hash == *expected)
+            .unwrap_or(false)
+            && native_gpu_source.contains(path.rsplit('/').next().unwrap_or(path))
+    }) && reported_font_family == Some("JetBrains Mono")
+        && reported_font_features == Some("zero,calt")
         && native_gpu_source.contains("Shaping::Advanced")
         && native_gpu_source.contains("FeatureTag::CONTEXTUAL_ALTERNATES")
-        && native_gpu_source.contains("FeatureTag::STANDARD_LIGATURES")
         && native_gpu_source.contains("FeatureTag::new(b\"zero\")")
         && !native_gpu_source.contains("Shaping::Basic");
     push_audit_check(
@@ -8453,10 +8479,10 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         format!("native-dev-window-editor:{example}:jetbrains-mono-font-asset"),
         font_pass,
         format!(
-            "font_hash={editor_font_hash:?}, reported_font_family={reported_font_family:?}, shaping=Shaping::Advanced, font_features=zero,calt,liga,clig"
+            "font_hashes={editor_font_hashes:?}, reported_font_family={reported_font_family:?}, reported_font_features={reported_font_features:?}, shaping=Shaping::Advanced, font_features=zero,calt"
         ),
         (!font_pass).then(|| {
-            "native code editor is not proven to bundle JetBrains Mono and render it with advanced shaping/ligature support".to_owned()
+            "native code editor is not proven to bundle all styled JetBrains Mono variants and render them with advanced shaping/ligature support".to_owned()
         }),
     );
     let custom_example_pass = dev_probe

@@ -5,6 +5,7 @@ use boon_host::SurfaceId;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    cosmic_text::{FeatureTag, FontFeatures},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ pub const REQUIRED_WGPU_VERSION: &str = "29.0.1";
 pub const REQUIRED_GLYPHON_VERSION: &str = "0.11.0";
 const JETBRAINS_MONO_FONT_BYTES: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Patched.woff2");
-const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.60;
+const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.56;
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -522,6 +523,7 @@ struct TextRunSignature {
     font_family: String,
     font_style: Style,
     font_weight: Weight,
+    font_features: String,
     text_inset: u32,
     text_clip_padding: u32,
     width: u32,
@@ -537,6 +539,7 @@ struct TextRunPlacementSignature {
     font_family: String,
     font_style: Style,
     font_weight: Weight,
+    font_features: String,
     text_inset: u32,
     text_clip_padding: u32,
     x: u32,
@@ -555,6 +558,7 @@ impl TextRunSignature {
             font_family: run.font_family.clone(),
             font_style: run.font_style,
             font_weight: run.font_weight,
+            font_features: run.font_features.clone(),
             text_inset: run.text_inset.to_bits(),
             text_clip_padding: run.text_clip_padding.to_bits(),
             width: run.bounds.width.to_bits(),
@@ -573,6 +577,7 @@ impl TextRunPlacementSignature {
             font_family: run.font_family.clone(),
             font_style: run.font_style,
             font_weight: run.font_weight,
+            font_features: run.font_features.clone(),
             text_inset: run.text_inset.to_bits(),
             text_clip_padding: run.text_clip_padding.to_bits(),
             x: run.bounds.x.to_bits(),
@@ -722,6 +727,7 @@ impl GlyphonTextState {
     fn shape_text_run(&mut self, run: &TextRun) -> Buffer {
         let bounds = run.bounds;
         let font_size = run.size.clamp(8.0, 120.0);
+        let font_features = text_font_features(&run.font_features);
         let mut buffer = Buffer::new(
             &mut self.font_system,
             Metrics::new(font_size, font_size * 1.25),
@@ -737,7 +743,8 @@ impl GlyphonTextState {
             &Attrs::new()
                 .family(Family::Name(&run.font_family))
                 .style(run.font_style)
-                .weight(run.font_weight),
+                .weight(run.font_weight)
+                .font_features(font_features),
             Shaping::Advanced,
             None,
         );
@@ -752,6 +759,7 @@ struct TextRun {
     font_family: String,
     font_style: Style,
     font_weight: Weight,
+    font_features: String,
     text_inset: f32,
     text_clip_padding: f32,
     color: [u8; 4],
@@ -819,6 +827,9 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                 font_family: font_family.to_owned(),
                 font_style: text_font_style(&item.style),
                 font_weight: text_font_weight(&item.style),
+                font_features: style_text(&item.style, "font_features")
+                    .unwrap_or("")
+                    .to_owned(),
                 text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
                 text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
                 color,
@@ -827,6 +838,38 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             })
         })
         .collect()
+}
+
+fn text_font_features(value: &str) -> FontFeatures {
+    let mut features = FontFeatures::new();
+    for tag in value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace() || ch == '\'' || ch == '"')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty() && *tag != "1")
+    {
+        match tag {
+            "zero" => {
+                features.enable(FeatureTag::new(b"zero"));
+            }
+            "calt" => {
+                features.enable(FeatureTag::CONTEXTUAL_ALTERNATES);
+            }
+            "liga" => {
+                features.enable(FeatureTag::STANDARD_LIGATURES);
+            }
+            "clig" => {
+                features.enable(FeatureTag::CONTEXTUAL_LIGATURES);
+            }
+            "dlig" => {
+                features.enable(FeatureTag::DISCRETIONARY_LIGATURES);
+            }
+            "kern" => {
+                features.enable(FeatureTag::KERNING);
+            }
+            _ => {}
+        }
+    }
+    features
 }
 
 fn text_font_style(style: &StyleMap) -> Style {

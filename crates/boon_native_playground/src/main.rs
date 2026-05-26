@@ -13,12 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
-const BOON_EDITOR_FONT_SIZE: u32 = 13;
-const BOON_EDITOR_LINE_HEIGHT: u32 = 18;
+const BOON_EDITOR_FONT_SIZE: u32 = 16;
+const BOON_EDITOR_LINE_HEIGHT: u32 = 22;
+const BOON_EDITOR_FONT_FEATURES: &str = "zero,calt,liga,clig";
+const BOON_EDITOR_FONT_FEATURE_SETTINGS: &str = "'zero' 1, 'calt' 1";
 const BOON_EDITOR_PADDING: u32 = 10;
 const BOON_EDITOR_GUTTER_WIDTH: u32 = 44;
 const BOON_EDITOR_ROW_GAP: u32 = 8;
-const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.60;
+const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.56;
 const BOON_EDITOR_BACKGROUND: &str = "#282c34";
 const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
 const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
@@ -3569,6 +3571,9 @@ impl CodeEditorModel {
             "grammar_source": "~/repos/boon/playground/frontend/typescript/code_editor/boon.grammar",
             "font_family": BOON_EDITOR_FONT_FAMILY,
             "font_size": BOON_EDITOR_FONT_SIZE,
+            "line_height": BOON_EDITOR_LINE_HEIGHT,
+            "font_features": BOON_EDITOR_FONT_FEATURES,
+            "font_feature_settings": BOON_EDITOR_FONT_FEATURE_SETTINGS,
             "background": BOON_EDITOR_BACKGROUND,
             "foreground": BOON_EDITOR_FOREGROUND,
             "gutter": BOON_EDITOR_GUTTER,
@@ -3976,6 +3981,7 @@ impl CodeEditorView {
                 ("scroll_x", "true"),
                 ("font", self.font_family),
                 ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
+                ("font_features", BOON_EDITOR_FONT_FEATURES),
             ],
         );
         editor.scroll = Some(boon_document_model::ScrollState {
@@ -4040,6 +4046,7 @@ impl CodeEditorView {
                     ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
                     ("bg", BOON_EDITOR_BACKGROUND),
                     ("font", self.font_family),
+                    ("font_features", BOON_EDITOR_FONT_FEATURES),
                 ],
             );
             append_child(frame, row_parent.clone(), gutter);
@@ -4106,6 +4113,7 @@ impl CodeEditorView {
                 ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
                 ("bg", BOON_EDITOR_BACKGROUND),
                 ("font", self.font_family),
+                ("font_features", BOON_EDITOR_FONT_FEATURES),
                 ("auto_padding", "0"),
                 ("text_inset", "0"),
                 ("text_clip_padding", "4"),
@@ -9759,7 +9767,9 @@ mod tests {
         assert_eq!(BOON_EDITOR_BACKGROUND, "#282c34");
         assert_eq!(BOON_EDITOR_FOREGROUND, "#d9e1f2");
         assert_eq!(BOON_EDITOR_FONT_FAMILY, "JetBrains Mono");
-        assert_eq!(BOON_EDITOR_FONT_SIZE, 13);
+        assert_eq!(BOON_EDITOR_FONT_SIZE, 16);
+        assert_eq!(BOON_EDITOR_LINE_HEIGHT, 22);
+        assert_eq!(BOON_EDITOR_FONT_FEATURE_SETTINGS, "'zero' 1, 'calt' 1");
 
         let keyword = syntax_style_for_kind("keyword");
         assert_eq!(keyword.color, "#D2691E");

@@ -8390,7 +8390,11 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         && dev_probe
             .and_then(|probe| probe.pointer("/editor_model/syntax_theme/font_size"))
             .and_then(serde_json::Value::as_u64)
-            == Some(13)
+            == Some(16)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/font_feature_settings"))
+            .and_then(serde_json::Value::as_str)
+            == Some("'zero' 1, 'calt' 1")
         && dev_probe
             .and_then(|probe| probe.pointer("/editor_model/syntax_theme/background"))
             .and_then(serde_json::Value::as_str)
@@ -8439,6 +8443,9 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         && reported_font_family == Some("JetBrains Mono")
         && native_gpu_source.contains("JetBrainsMono-Patched.woff2")
         && native_gpu_source.contains("Shaping::Advanced")
+        && native_gpu_source.contains("FeatureTag::CONTEXTUAL_ALTERNATES")
+        && native_gpu_source.contains("FeatureTag::STANDARD_LIGATURES")
+        && native_gpu_source.contains("FeatureTag::new(b\"zero\")")
         && !native_gpu_source.contains("Shaping::Basic");
     push_audit_check(
         &mut checks,
@@ -8446,7 +8453,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         format!("native-dev-window-editor:{example}:jetbrains-mono-font-asset"),
         font_pass,
         format!(
-            "font_hash={editor_font_hash:?}, reported_font_family={reported_font_family:?}, shaping=Shaping::Advanced"
+            "font_hash={editor_font_hash:?}, reported_font_family={reported_font_family:?}, shaping=Shaping::Advanced, font_features=zero,calt,liga,clig"
         ),
         (!font_pass).then(|| {
             "native code editor is not proven to bundle JetBrains Mono and render it with advanced shaping/ligature support".to_owned()

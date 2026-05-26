@@ -8438,14 +8438,50 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             .and_then(|probe| probe.pointer("/new_custom_remove/direct_dispatch_without_hit_test"))
             .and_then(serde_json::Value::as_bool)
             == Some(false);
-    let remove_custom_binding_pass = dev_probe
-        .and_then(|probe| probe.pointer("/ui_source_bindings"))
+    let official_remove_disabled_pass = dev_probe
+        .and_then(|probe| probe.pointer("/official_remove_disabled/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/official_remove_disabled/control/style_disabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/official_remove_disabled/control/source_binding_present")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer(
+                    "/official_remove_disabled/host_synthetic_activation/source_binding_resolved",
+                )
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let custom_remove_binding_pass = dev_probe
+        .and_then(|probe| probe.pointer("/custom_remove_enabled/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/custom_ui_source_bindings"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|bindings| {
+                bindings
+                    .iter()
+                    .any(|binding| binding.as_str() == Some("dev.commands.remove_custom"))
+            });
+    let initial_remove_unbound_pass = dev_probe
+        .and_then(|probe| probe.pointer("/initial_ui_source_bindings"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|bindings| {
-            bindings
+            !bindings
                 .iter()
                 .any(|binding| binding.as_str() == Some("dev.commands.remove_custom"))
         });
+    let remove_custom_binding_pass =
+        official_remove_disabled_pass && custom_remove_binding_pass && initial_remove_unbound_pass;
     let inject_source_pass = dev_probe
         .and_then(|probe| probe.pointer("/inject_source/status"))
         .and_then(serde_json::Value::as_str)
@@ -8508,7 +8544,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         format!("native-dev-window-editor:{example}:custom-example-api"),
         custom_api_pass,
         format!(
-            "custom_example_pass={custom_example_pass}, custom_example_persistent={custom_example_persistent}, custom_store_pass={custom_store_pass}, custom_store_persistent={custom_store_persistent}, custom_tab_after_create={custom_tab_after_create}, custom_rename_pass={custom_rename_pass}, custom_remove_pass={custom_remove_pass}, new_custom_tab_pass={new_custom_tab_pass}, new_custom_edit_persistent={new_custom_edit_persistent}, new_custom_remove_pass={new_custom_remove_pass}, remove_custom_binding_pass={remove_custom_binding_pass}, inject_source_pass={inject_source_pass}, dirty_tab_preservation_pass={dirty_tab_preservation_pass}, custom_generic_runtime_example_catalog_pass={custom_generic_runtime_example_catalog_pass}"
+            "custom_example_pass={custom_example_pass}, custom_example_persistent={custom_example_persistent}, custom_store_pass={custom_store_pass}, custom_store_persistent={custom_store_persistent}, custom_tab_after_create={custom_tab_after_create}, custom_rename_pass={custom_rename_pass}, custom_remove_pass={custom_remove_pass}, new_custom_tab_pass={new_custom_tab_pass}, new_custom_edit_persistent={new_custom_edit_persistent}, new_custom_remove_pass={new_custom_remove_pass}, official_remove_disabled_pass={official_remove_disabled_pass}, custom_remove_binding_pass={custom_remove_binding_pass}, initial_remove_unbound_pass={initial_remove_unbound_pass}, remove_custom_binding_pass={remove_custom_binding_pass}, inject_source_pass={inject_source_pass}, dirty_tab_preservation_pass={dirty_tab_preservation_pass}, custom_generic_runtime_example_catalog_pass={custom_generic_runtime_example_catalog_pass}"
         ),
         (!custom_api_pass).then(|| {
             "native dev window lacks persistent generic custom example/injected source/dirty-tab API evidence, or generic document examples are not executable through the generic live runtime".to_owned()

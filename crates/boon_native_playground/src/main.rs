@@ -253,19 +253,17 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         last_error: None,
         last_error_count: 0,
     }));
+    let preview_ipc_state = Arc::new(Mutex::new(PreviewIpcState {
+        source_path: PathBuf::from(&code_file),
+        source_text: source.clone(),
+        source_bytes: source.len() as u64,
+        source_sha256: code_hash.clone(),
+        runtime_summary: runtime_summary.clone(),
+        shared_render_state: Arc::clone(&shared_render_state),
+        live_runtime: live_runtime.clone(),
+    }));
     if let Some(path) = connect.as_deref() {
-        start_preview_ipc_server(
-            path,
-            PreviewIpcState {
-                source_path: PathBuf::from(&code_file),
-                source_text: source.clone(),
-                source_bytes: source.len() as u64,
-                source_sha256: code_hash.clone(),
-                runtime_summary: runtime_summary.clone(),
-                shared_render_state: Arc::clone(&shared_render_state),
-                live_runtime: live_runtime.clone(),
-            },
-        )?;
+        start_preview_ipc_server(path, Arc::clone(&preview_ipc_state))?;
     }
     let role_args = args[1..].to_vec();
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
@@ -273,19 +271,26 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut app_owned_proof = None;
         let mut layout_frame_cache = None;
         let shared_render_state = Arc::clone(&shared_render_state);
-        let live_runtime = live_runtime.clone();
-        let render_code_file = code_file.clone();
-        let render_source = source.clone();
+        let preview_ipc_state = Arc::clone(&preview_ipc_state);
         let mut input_state = PreviewNativeInputState::default();
         Some(Box::new(move |context| {
-            if let Err(error) = preview_apply_real_window_input(
-                &context.input,
-                Path::new(&render_code_file),
-                &render_source,
-                live_runtime.as_ref(),
-                &shared_render_state,
-                &mut input_state,
-            ) {
+            if preview_input_has_unhandled_source_events(&context.input, &input_state) {
+                let input_context = preview_input_runtime_context(&preview_ipc_state)
+                    .map_err(|error| error.to_string())?;
+                if let Err(error) = preview_apply_real_window_input(
+                    &context.input,
+                    &input_context.source_path,
+                    &input_context.source_text,
+                    input_context.live_runtime.as_ref(),
+                    &shared_render_state,
+                    &mut input_state,
+                ) {
+                    preview_note_render_error(&shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?;
+                }
+            } else if let Err(error) =
+                preview_apply_scroll_input(&context.input, &shared_render_state)
+            {
                 preview_note_render_error(&shared_render_state, error.to_string())
                     .map_err(|error| error.to_string())?;
             }
@@ -2059,6 +2064,21 @@ impl ExampleCatalog {
         })
     }
 
+    fn fastest_manifest_fallback_id(&self, removed_id: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.id != removed_id && entry.shown_by_default && !entry.custom)
+            .min_by_key(|entry| (entry.source_weight_bytes(), entry.order))
+            .map(|entry| entry.id.clone())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.id != removed_id)
+                    .min_by_key(|entry| (entry.custom, entry.source_weight_bytes(), entry.order))
+                    .map(|entry| entry.id.clone())
+            })
+    }
+
     fn custom_store_probe() -> serde_json::Value {
         let path = PathBuf::from("target/artifacts/native-gpu/custom-example-store-probe.toml");
         let catalog = Self {
@@ -2117,6 +2137,18 @@ impl ExampleCatalogEntry {
         } else {
             Ok(std::fs::read_to_string(&self.source)?)
         }
+    }
+
+    fn source_weight_bytes(&self) -> u64 {
+        self.inline_source
+            .as_ref()
+            .map(|source| source.len() as u64)
+            .or_else(|| {
+                std::fs::metadata(&self.source)
+                    .ok()
+                    .map(|metadata| metadata.len())
+            })
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -2458,19 +2490,7 @@ impl ExampleWorkspace {
                 "diagnostic": "selected example is manifest-backed and cannot be removed"
             });
         }
-        let fallback_id = catalog
-            .entries
-            .iter()
-            .filter(|entry| entry.id != removed_id && entry.shown_by_default)
-            .min_by_key(|entry| entry.order)
-            .map(|entry| entry.id.clone())
-            .or_else(|| {
-                catalog
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id != removed_id)
-                    .map(|entry| entry.id.clone())
-            });
+        let fallback_id = catalog.fastest_manifest_fallback_id(&removed_id);
         let removed_open_buffer = self.open_buffers.remove(&removed_id).is_some();
         let removed_dirty_marker = self.dirty_examples.remove(&removed_id);
         let removal = catalog.remove_custom_example(&removed_id);
@@ -2503,6 +2523,7 @@ impl ExampleWorkspace {
                     "removed_not_listed": catalog.entries.iter().all(|entry| entry.id != removed_id),
                     "catalog_removal": removal,
                     "fallback_selection": selection,
+                    "fallback_strategy": "smallest-manifest-source",
                     "preview_transport": "ReplaceCode"
                 })
             }
@@ -3460,6 +3481,128 @@ impl DevWindowShell {
         dev_shell_document(self, width, height)
     }
 
+    fn selected_example_is_custom(&self) -> bool {
+        self.catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == self.workspace.selected_example_id && entry.custom)
+    }
+
+    fn document_source_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .document()
+            .nodes
+            .values()
+            .filter_map(|node| {
+                node.source_binding
+                    .as_ref()
+                    .map(|binding| binding.source_path.clone())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    fn remove_custom_control_state(&self) -> serde_json::Value {
+        let document = self.document();
+        let button = document.nodes.get(&boon_document_model::DocumentNodeId(
+            "dev-command-remove_custom".to_owned(),
+        ));
+        let style_disabled = button
+            .and_then(|node| node.style.get("disabled"))
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Bool(disabled) => Some(*disabled),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let source_path = button
+            .and_then(|node| node.source_binding.as_ref())
+            .map(|binding| binding.source_path.clone());
+        json!({
+            "node_present": button.is_some(),
+            "style_disabled": style_disabled,
+            "source_binding_present": source_path.is_some(),
+            "source_path": source_path,
+            "selected_example_id": self.workspace.selected_example_id,
+            "selected_is_custom": self.selected_example_is_custom()
+        })
+    }
+
+    fn remove_custom_disabled_probe(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let control = self.remove_custom_control_state();
+        let activation = self.host_synthetic_activation_for_source_path(
+            "dev.commands.remove_custom",
+            viewport_width,
+            viewport_height,
+        );
+        let selected_is_custom = control
+            .get("selected_is_custom")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let disabled = control
+            .get("style_disabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let binding_present = control
+            .get("source_binding_present")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let source_binding_resolved = activation
+            .get("source_binding_resolved")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let pass = !selected_is_custom && disabled && !binding_present && !source_binding_resolved;
+        json!({
+            "status": if pass { "pass" } else { "fail" },
+            "command": "OfficialRemoveCustomDisabled",
+            "control": control,
+            "host_synthetic_activation": activation,
+            "direct_dispatch_without_hit_test": false
+        })
+    }
+
+    fn remove_custom_enabled_probe(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let control = self.remove_custom_control_state();
+        let activation = self.host_synthetic_activation_for_source_path(
+            "dev.commands.remove_custom",
+            viewport_width,
+            viewport_height,
+        );
+        let selected_is_custom = control
+            .get("selected_is_custom")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let disabled = control
+            .get("style_disabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let source_path = control
+            .get("source_path")
+            .and_then(serde_json::Value::as_str);
+        let activation_pass =
+            activation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let pass = selected_is_custom
+            && !disabled
+            && source_path == Some("dev.commands.remove_custom")
+            && activation_pass;
+        json!({
+            "status": if pass { "pass" } else { "fail" },
+            "command": "CustomRemoveCustomEnabled",
+            "control": control,
+            "host_synthetic_activation": activation,
+            "direct_dispatch_without_hit_test": false
+        })
+    }
+
     fn dispatch_source_path(&mut self, source_path: &str) -> serde_json::Value {
         if source_path == "dev.tabs.new" {
             let mut value = self.create_blank_custom_tab();
@@ -3775,6 +3918,8 @@ impl DevWindowShell {
             shell.workspace.selected_buffer.model_feature_probe();
         selected_example_editor_model["font_family"] = json!(shell.editor_view.font_family);
         let selected_example_inventory = shell.structural_inventory();
+        let initial_ui_source_bindings = shell.document_source_paths();
+        let official_remove_disabled = shell.remove_custom_disabled_probe(1180.0, 820.0);
         let alternate = shell
             .catalog
             .entries
@@ -3842,6 +3987,8 @@ impl DevWindowShell {
             1180.0,
             820.0,
         );
+        let custom_ui_source_bindings = shell.document_source_paths();
+        let custom_remove_enabled = shell.remove_custom_enabled_probe(1180.0, 820.0);
         let custom_remove =
             shell.dispatch_host_synthetic_source_path("dev.commands.remove_custom", 1180.0, 820.0);
         let dirty_tab_preservation = shell
@@ -3888,7 +4035,7 @@ impl DevWindowShell {
             1180.0,
             820.0,
         );
-        let all_pass = [
+        let status_pass = [
             &tab_switch_json,
             &run,
             &format,
@@ -3910,6 +4057,16 @@ impl DevWindowShell {
         ]
         .iter()
         .all(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("pass"));
+        let all_pass = status_pass
+            && custom_tab_after_create
+            && official_remove_disabled
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+            && custom_remove_enabled
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass");
         let source_dispatches = [
             &tab_switch_json,
             &run,
@@ -3938,15 +4095,9 @@ impl DevWindowShell {
             "command_activation_boundary": "HostInputEvent -> layout hit region -> Document SourceBinding -> DevWindowShell",
             "command_dispatch_count": source_dispatches,
             "internal_command_shortcut": false,
-            "ui_source_bindings": [
-                "dev.tabs.select",
-                "dev.tabs.new",
-                "dev.commands.run",
-                "dev.commands.format",
-                "dev.commands.reset",
-                "dev.commands.remove_custom",
-                "dev.editor.insert_text"
-            ],
+            "ui_source_bindings": initial_ui_source_bindings,
+            "initial_ui_source_bindings": initial_ui_source_bindings,
+            "custom_ui_source_bindings": custom_ui_source_bindings,
             "catalog_listing": catalog_listing,
             "tab_switch": tab_switch_json,
             "run": run,
@@ -3960,7 +4111,9 @@ impl DevWindowShell {
             "custom_store": custom_store,
             "custom_tab_after_create": custom_tab_after_create,
             "custom_rename": custom_rename,
+            "official_remove_disabled": official_remove_disabled,
             "select_probe_custom": select_probe_custom,
+            "custom_remove_enabled": custom_remove_enabled,
             "custom_remove": custom_remove,
             "new_custom_remove": new_custom_remove,
             "inject_source": injected_source,
@@ -4092,14 +4245,27 @@ impl DevWindowShell {
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let selected_is_custom = self.selected_example_is_custom();
+        let remove_custom_control = self.remove_custom_control_state();
+        let remove_custom_disabled_for_manifest = !selected_is_custom
+            && remove_custom_control
+                .get("style_disabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && remove_custom_control
+                .get("source_binding_present")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false);
         let required_sources = {
             let mut sources = vec![
                 "dev.commands.run".to_owned(),
                 "dev.commands.format".to_owned(),
                 "dev.commands.reset".to_owned(),
-                "dev.commands.remove_custom".to_owned(),
                 "dev.editor.insert_text".to_owned(),
             ];
+            if selected_is_custom {
+                sources.push("dev.commands.remove_custom".to_owned());
+            }
             sources.extend(
                 self.catalog
                     .entries
@@ -4140,17 +4306,22 @@ impl DevWindowShell {
         let pass = !route_assertions.is_empty()
             && route_assertions.iter().all(|assertion| {
                 assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-            });
+            })
+            && (selected_is_custom || remove_custom_disabled_for_manifest);
         json!({
             "status": if pass { "pass" } else { "fail" },
             "surface_pid": surface_proof.pid,
             "surface_id": surface_proof.surface_id,
             "window_id": surface_proof.window_id,
             "window_title": surface_proof.window_title,
+            "selected_example_id": self.workspace.selected_example_id,
+            "selected_is_custom": selected_is_custom,
             "source_intent_count": source_intents.len(),
             "hit_region_count": hit_regions.len(),
             "required_sources": required_sources,
             "route_assertions": route_assertions,
+            "remove_custom_control": remove_custom_control,
+            "remove_custom_disabled_for_manifest": remove_custom_disabled_for_manifest,
             "layout_metrics": layout_json.get("metrics").cloned().unwrap_or_else(|| json!({})),
             "app_owned_readback": surface_proof.readback_artifact,
             "input_adapter": surface_proof.input_adapter
@@ -4405,18 +4576,45 @@ fn dev_shell_document(
     append_child(&mut frame, tabs_parent.clone(), new_tab);
     let toolbar_parent = toolbar.id.clone();
     append_child(&mut frame, root.clone(), toolbar);
+    let selected_is_custom = shell
+        .catalog
+        .entries
+        .iter()
+        .any(|entry| entry.id == shell.workspace.selected_example_id && entry.custom);
     for command in ["run", "format", "reset", "remove_custom"] {
         let label = match command {
             "remove_custom" => "REMOVE".to_owned(),
             other => other.to_ascii_uppercase(),
         };
+        let remove_disabled = command == "remove_custom" && !selected_is_custom;
         let mut button = dev_button_node(
             &format!("dev-command-{command}"),
             label,
             &[
-                ("bg", "#ffffff"),
-                ("color", "#1f2937"),
-                ("border", "#9aa7b5"),
+                (
+                    "bg",
+                    if remove_disabled {
+                        "#edf1f5"
+                    } else {
+                        "#ffffff"
+                    },
+                ),
+                (
+                    "color",
+                    if remove_disabled {
+                        "#8a96a3"
+                    } else {
+                        "#1f2937"
+                    },
+                ),
+                (
+                    "border",
+                    if remove_disabled {
+                        "#cbd5df"
+                    } else {
+                        "#9aa7b5"
+                    },
+                ),
                 ("padding", "8"),
                 ("height", "32"),
                 (
@@ -4429,11 +4627,18 @@ fn dev_shell_document(
                 ),
             ],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
-            id: boon_document_model::SourceBindingId(format!("source:dev-command:{command}")),
-            source_path: format!("dev.commands.{command}"),
-            intent: "press".to_owned(),
-        });
+        if remove_disabled {
+            button.style.insert(
+                "disabled".to_owned(),
+                boon_document_model::StyleValue::Bool(true),
+            );
+        } else {
+            button.source_binding = Some(boon_document_model::SourceBinding {
+                id: boon_document_model::SourceBindingId(format!("source:dev-command:{command}")),
+                source_path: format!("dev.commands.{command}"),
+                intent: "press".to_owned(),
+            });
+        }
         append_child(&mut frame, toolbar_parent.clone(), button);
     }
     shell.editor_view.append_to(
@@ -6167,6 +6372,20 @@ fn unhandled_primary_mouse_releases(
     }
 }
 
+fn preview_input_has_unhandled_source_events(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    input_state: &PreviewNativeInputState,
+) -> bool {
+    if input.synthetic_input_probe {
+        return false;
+    }
+    !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count).is_empty()
+        || input
+            .keyboard_events
+            .iter()
+            .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
+}
+
 fn deterministic_click_input(
     event_count: u64,
     x: f64,
@@ -7009,6 +7228,26 @@ struct PreviewIpcState {
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
 }
 
+#[derive(Clone)]
+struct PreviewInputRuntimeContext {
+    source_path: PathBuf,
+    source_text: String,
+    live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+}
+
+fn preview_input_runtime_context(
+    state: &Arc<Mutex<PreviewIpcState>>,
+) -> Result<PreviewInputRuntimeContext, Box<dyn std::error::Error>> {
+    let state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?;
+    Ok(PreviewInputRuntimeContext {
+        source_path: state.source_path.clone(),
+        source_text: state.source_text.clone(),
+        live_runtime: state.live_runtime.clone(),
+    })
+}
+
 fn preview_note_render_error(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     error: String,
@@ -7026,12 +7265,11 @@ fn preview_note_render_error(
 
 fn start_preview_ipc_server(
     path: &Path,
-    state: PreviewIpcState,
+    state: Arc<Mutex<PreviewIpcState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     let path = path.to_path_buf();
-    let state = Arc::new(Mutex::new(state));
     std::thread::Builder::new()
         .name("boon-native-preview-ipc".to_owned())
         .spawn(move || {
@@ -7072,62 +7310,12 @@ fn handle_preview_ipc_client(
                 "preview_pid": std::process::id()
             })
         });
-        let replace_code_accepted = response.get("status").and_then(serde_json::Value::as_str)
-            == Some("pass")
-            && response
-                .get("hash_matches")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true);
-        if replace_code_accepted {
-            if let (Some(code), Some(source_path), Some(actual_hash)) = (
-                request.get("code").and_then(serde_json::Value::as_str),
-                request
-                    .get("source_path")
-                    .and_then(serde_json::Value::as_str),
-                response
-                    .get("actual_hash")
-                    .and_then(serde_json::Value::as_str),
-            ) {
-                let mut state = state
-                    .lock()
-                    .map_err(|_| "preview IPC state mutex poisoned")?;
-                state.source_path = PathBuf::from(source_path);
-                state.source_text = code.to_owned();
-                state.source_bytes = code.len() as u64;
-                state.source_sha256 = actual_hash.to_owned();
-                state.runtime_summary = response
-                    .get("preview_runtime_summary")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"status": "missing"}));
-                let scenario_path = Path::new(source_path).with_extension("scn");
-                state.live_runtime = if scenario_path.exists() {
-                    boon_runtime::LiveRuntime::new(
-                        &format!("native-preview-live:{source_path}"),
-                        code,
-                        &scenario_path,
-                    )
-                } else {
-                    boon_runtime::LiveRuntime::from_source(
-                        &format!("native-preview-live:{source_path}"),
-                        code,
-                    )
-                }
-                .ok()
-                .map(|runtime| Arc::new(Mutex::new(runtime)));
-                if let Some(layout_proof) = response.get("document_layout_proof") {
-                    let mut shared = state
-                        .shared_render_state
-                        .lock()
-                        .map_err(|_| "preview render state mutex poisoned")?;
-                    shared.layout_proof = layout_proof.clone();
-                    shared.layout_frame_override = None;
-                    shared.last_error = None;
-                    shared.update_count = shared.update_count.saturating_add(1);
-                }
-            }
-        } else if let Some(diagnostic) = response
-            .get("diagnostic")
-            .and_then(serde_json::Value::as_str)
+        let replace_code_updated =
+            preview_apply_replace_code_to_state(&state, &request, &response)?;
+        if !replace_code_updated
+            && let Some(diagnostic) = response
+                .get("diagnostic")
+                .and_then(serde_json::Value::as_str)
         {
             let shared_render_state = state
                 .lock()
@@ -7222,6 +7410,69 @@ fn handle_preview_ipc_client(
     writeln!(stream, "{}", serde_json::to_string(&response)?)?;
     stream.flush()?;
     Ok(())
+}
+
+fn preview_apply_replace_code_to_state(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let replace_code_accepted = response.get("status").and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && response
+            .get("hash_matches")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !replace_code_accepted {
+        return Ok(false);
+    }
+    let (Some(code), Some(source_path), Some(actual_hash)) = (
+        request.get("code").and_then(serde_json::Value::as_str),
+        request
+            .get("source_path")
+            .and_then(serde_json::Value::as_str),
+        response
+            .get("actual_hash")
+            .and_then(serde_json::Value::as_str),
+    ) else {
+        return Ok(false);
+    };
+    let mut state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?;
+    state.source_path = PathBuf::from(source_path);
+    state.source_text = code.to_owned();
+    state.source_bytes = code.len() as u64;
+    state.source_sha256 = actual_hash.to_owned();
+    state.runtime_summary = response
+        .get("preview_runtime_summary")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let scenario_path = Path::new(source_path).with_extension("scn");
+    state.live_runtime = if scenario_path.exists() {
+        boon_runtime::LiveRuntime::new(
+            &format!("native-preview-live:{source_path}"),
+            code,
+            &scenario_path,
+        )
+    } else {
+        boon_runtime::LiveRuntime::from_source(&format!("native-preview-live:{source_path}"), code)
+    }
+    .ok()
+    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    if let Some(layout_proof) = response.get("document_layout_proof") {
+        let mut shared = state
+            .shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        shared.layout_proof = layout_proof.clone();
+        shared.layout_frame_override = None;
+        shared.scroll_x_px = 0.0;
+        shared.scroll_y_px = 0.0;
+        shared.last_error = None;
+        shared.update_count = shared.update_count.saturating_add(1);
+    }
+    Ok(true)
 }
 
 fn preview_replace_code_response(
@@ -8466,6 +8717,12 @@ fn read_json(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error
 mod tests {
     use super::*;
 
+    fn repo_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    }
+
     #[test]
     fn new_custom_tab_starts_empty_and_persists_editor_text() {
         let store_path = PathBuf::from(format!(
@@ -8545,6 +8802,211 @@ mod tests {
         assert!(!shell.workspace.open_buffers.contains_key(&custom_id));
 
         let _ = std::fs::remove_file(store_path);
+    }
+
+    #[test]
+    fn remove_button_is_disabled_for_manifest_examples_and_bound_for_custom_examples() {
+        let catalog = ExampleCatalog {
+            entries: vec![
+                ExampleCatalogEntry {
+                    id: "counter".to_owned(),
+                    label: "Counter".to_owned(),
+                    source: "examples/counter.bn".to_owned(),
+                    inline_source: Some("document: []\n".to_owned()),
+                    category: "basic".to_owned(),
+                    order: 10,
+                    shown_by_default: true,
+                    custom: false,
+                },
+                ExampleCatalogEntry {
+                    id: "custom:one".to_owned(),
+                    label: "Custom One".to_owned(),
+                    source: "custom://one.bn".to_owned(),
+                    inline_source: Some("document: []\n".to_owned()),
+                    category: "custom".to_owned(),
+                    order: 20_000,
+                    shown_by_default: true,
+                    custom: true,
+                },
+            ],
+            custom_store_path: PathBuf::from(
+                "target/artifacts/native-gpu/tests/remove-button.toml",
+            ),
+        };
+        let workspace = ExampleWorkspace::new(
+            &catalog,
+            "examples/counter.bn",
+            "document: []\n",
+            Some("counter"),
+        );
+        let mut shell = DevWindowShell {
+            catalog,
+            initial_workspace: workspace.clone(),
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport: PreviewTransport::new(None),
+            last_preview_transport: json!({"status": "not-run"}),
+        };
+
+        let official_frame = shell.document_for_viewport(1180, 820);
+        let remove_button = official_frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-command-remove_custom".to_owned(),
+            ))
+            .expect("remove button should render");
+        assert!(remove_button.source_binding.is_none());
+        assert_eq!(
+            remove_button.style.get("disabled"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+
+        shell
+            .workspace
+            .select_example(&shell.catalog, "custom:one")
+            .unwrap();
+        let custom_frame = shell.document_for_viewport(1180, 820);
+        let remove_button = custom_frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-command-remove_custom".to_owned(),
+            ))
+            .expect("remove button should render");
+        assert_eq!(
+            remove_button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("dev.commands.remove_custom")
+        );
+        assert_ne!(
+            remove_button.style.get("disabled"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn custom_remove_falls_back_to_smallest_manifest_example() {
+        let catalog = ExampleCatalog {
+            entries: vec![
+                ExampleCatalogEntry {
+                    id: "cells".to_owned(),
+                    label: "Cells".to_owned(),
+                    source: "examples/cells.bn".to_owned(),
+                    inline_source: Some("x".repeat(100)),
+                    category: "7gui".to_owned(),
+                    order: 10,
+                    shown_by_default: true,
+                    custom: false,
+                },
+                ExampleCatalogEntry {
+                    id: "todomvc".to_owned(),
+                    label: "TodoMVC".to_owned(),
+                    source: "examples/todomvc.bn".to_owned(),
+                    inline_source: Some("x".repeat(50)),
+                    category: "main".to_owned(),
+                    order: 20,
+                    shown_by_default: true,
+                    custom: false,
+                },
+                ExampleCatalogEntry {
+                    id: "counter".to_owned(),
+                    label: "Counter".to_owned(),
+                    source: "examples/counter.bn".to_owned(),
+                    inline_source: Some("x".repeat(10)),
+                    category: "basic".to_owned(),
+                    order: 30,
+                    shown_by_default: true,
+                    custom: false,
+                },
+                ExampleCatalogEntry {
+                    id: "custom:one".to_owned(),
+                    label: "Custom One".to_owned(),
+                    source: "custom://one.bn".to_owned(),
+                    inline_source: Some("document: []\n".to_owned()),
+                    category: "custom".to_owned(),
+                    order: 20_000,
+                    shown_by_default: true,
+                    custom: true,
+                },
+            ],
+            custom_store_path: PathBuf::from(
+                "target/artifacts/native-gpu/tests/remove-fallback.toml",
+            ),
+        };
+
+        assert_eq!(
+            catalog
+                .fastest_manifest_fallback_id("custom:one")
+                .as_deref(),
+            Some("counter")
+        );
+    }
+
+    #[test]
+    fn replace_code_updates_preview_input_runtime_context() {
+        let counter_path = repo_path("examples/counter.bn");
+        let counter_scenario_path = repo_path("examples/counter.scn");
+        let counter_source = std::fs::read_to_string(&counter_path).unwrap();
+        let counter_hash = boon_runtime::sha256_bytes(counter_source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&counter_path, &counter_source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 12.0,
+            scroll_y_px: 34.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: counter_path.clone(),
+            source_text: counter_source.clone(),
+            source_bytes: counter_source.len() as u64,
+            source_sha256: counter_hash.clone(),
+            runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: Some(Arc::new(Mutex::new(
+                boon_runtime::LiveRuntime::new(
+                    "test-counter",
+                    &counter_source,
+                    &counter_scenario_path,
+                )
+                .unwrap(),
+            ))),
+        }));
+
+        let todomvc_path = repo_path("examples/todomvc.bn");
+        let todomvc_source = std::fs::read_to_string(&todomvc_path).unwrap();
+        let request = json!({
+            "kind": "replace-code",
+            "source_path": todomvc_path.display().to_string(),
+            "code": todomvc_source,
+            "expected_hash": boon_runtime::sha256_bytes(todomvc_source.as_bytes())
+        });
+        let response = preview_replace_code_response(&request).unwrap();
+        assert_eq!(response["status"], "pass");
+        assert!(preview_apply_replace_code_to_state(&state, &request, &response).unwrap());
+
+        let context = preview_input_runtime_context(&state).unwrap();
+        assert_eq!(context.source_path, todomvc_path);
+        let output = context
+            .live_runtime
+            .expect("replace code should install todomvc runtime")
+            .lock()
+            .unwrap()
+            .apply_source_event(boon_runtime::LiveSourceEvent {
+                source: "store.sources.toggle_all_checkbox.click".to_owned(),
+                text: None,
+                key: None,
+                address: None,
+                target_text: None,
+                target_occurrence: None,
+            })
+            .unwrap();
+        assert!(!output.semantic_deltas.is_empty());
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(shared.scroll_x_px, 0.0);
+        assert_eq!(shared.scroll_y_px, 0.0);
     }
 
     #[test]

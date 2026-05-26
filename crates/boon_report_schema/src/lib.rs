@@ -1078,7 +1078,7 @@ fn verify_expression_coverage(report: &JsonValue, report_path: &Path) -> Runtime
         "unknown_ast_expression_count",
         "unknown_initial_value_count",
         "unknown_list_initializer_count",
-        "unknown_list_seed_value_count",
+        "unknown_list_initial_value_count",
         "unknown_update_expression_count",
         "unknown_list_predicate_count",
         "unknown_derived_value_count",

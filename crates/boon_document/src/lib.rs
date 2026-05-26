@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-const SIMPLE_MONOSPACE_WIDTH_FACTOR: f32 = 0.60;
-
 pub trait TextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics;
 }
@@ -383,7 +381,7 @@ pub struct SimpleTextMeasurer;
 impl TextMeasurer for SimpleTextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics {
         TextMetrics {
-            width: text.chars().count() as f32 * font_size * SIMPLE_MONOSPACE_WIDTH_FACTOR,
+            width: text.chars().count() as f32 * font_size,
             height: font_size * 1.4,
         }
     }

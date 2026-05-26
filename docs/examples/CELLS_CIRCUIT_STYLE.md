@@ -52,9 +52,9 @@ Illustrative target:
 ```boon
 cells:
     Grid/cells(columns: 26, rows: 100)
-    |> List/map(seed, new: new_cell(seed: seed))
+    |> List/map(cell, new: new_cell(cell: cell))
 
-FUNCTION new_cell(seed) {
+FUNCTION new_cell(cell) {
     sources: [
         editor: [
             change: SOURCE
@@ -64,10 +64,10 @@ FUNCTION new_cell(seed) {
     ]
 
     [
-        address: seed.address
+        address: cell.address
 
         editing_text:
-            seed.default_formula |> HOLD draft {
+            cell.default_formula |> HOLD draft {
                 LATEST {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
@@ -76,7 +76,7 @@ FUNCTION new_cell(seed) {
             }
 
         formula_text:
-            seed.default_formula |> HOLD formula_text {
+            cell.default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
                 }
@@ -119,7 +119,7 @@ checked example uses `change`, `commit`, and `cancel`, but hidden source routing
 should follow parsed `SOURCE` ports rather than a separate Rust list of editor
 event names.
 
-`Grid/cells` produces domain coordinates, display addresses, and seed demo
+`Grid/cells` produces domain coordinates, display addresses, and initial demo
 formulas, for example:
 
 ```text

@@ -21,7 +21,6 @@ const BOON_EDITOR_FONT_FEATURE_SETTINGS: &str = "'zero' 1, 'calt' 1";
 const BOON_EDITOR_PADDING: u32 = 10;
 const BOON_EDITOR_GUTTER_WIDTH: u32 = 44;
 const BOON_EDITOR_ROW_GAP: u32 = 8;
-const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.55;
 const BOON_EDITOR_BACKGROUND: &str = "#282c34";
 const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
 const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
@@ -34,8 +33,9 @@ const BOON_EDITOR_SELECTION_MATCH: &str = "#aafe661a";
 const BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX: usize = 256 * 1024;
 const BOON_EDITOR_DEFERRED_SYNTAX_LINES: usize = 256;
 const BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS: u64 = 600;
-const BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES: u64 = 18;
-const BOON_EDITOR_KEY_REPEAT_INTERVAL_FRAMES: u64 = 3;
+const BOON_EDITOR_KEY_REPEAT_DELAY_MS: u64 = 500;
+const BOON_EDITOR_KEY_REPEAT_INTERVAL_MS: u64 = 30;
+const BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP: usize = 8;
 
 fn main() {
     if let Err(error) = run() {
@@ -437,6 +437,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
         let mut visible_renderer = None;
         let mut layout_frame_cache = None;
+        let mut text_measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let mut input_state = DevNativeInputState::default();
         let shell = Arc::clone(&dev_shell);
         Some(Box::new(move |context| {
@@ -447,6 +448,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 context,
                 &mut visible_renderer,
                 &mut layout_frame_cache,
+                &mut text_measurer,
                 &mut shell,
                 &mut input_state,
             )
@@ -930,7 +932,7 @@ fn native_document_layout_proof_with_state(
         );
     }
 
-    let mut measurer = boon_document::SimpleTextMeasurer;
+    let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
         viewport: boon_host::Viewport {
@@ -1443,6 +1445,7 @@ fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     layout_frame_cache: &mut Option<(u32, u32, boon_document::LayoutFrame)>,
+    text_measurer: &mut boon_native_gpu::GlyphonTextMeasurer,
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> Result<serde_json::Value, String> {
@@ -1460,7 +1463,6 @@ fn native_gpu_dev_visible_render_hook(
         .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
     if cache_stale || caret_blink_changed {
         let document = shell.document_for_viewport(context.width, context.height);
-        let mut measurer = boon_document::SimpleTextMeasurer;
         let layout_frame = boon_document::layout(boon_document::LayoutInput {
             document: &document,
             viewport: boon_host::Viewport {
@@ -1469,25 +1471,28 @@ fn native_gpu_dev_visible_render_hook(
                 height: context.height as f32,
                 scale: 1.0,
             },
-            text: &mut measurer,
+            text: text_measurer,
             capabilities: boon_document::RenderCapabilities::fake_portable(),
         });
         *layout_frame_cache = Some((context.width, context.height, layout_frame));
     }
     let mut layout_changed = false;
-    if let Some((_, _, layout_frame)) = layout_frame_cache.as_ref() {
+    if dev_input_may_change(&context.input, input_state)
+        && let Some((_, _, layout_frame)) = layout_frame_cache.as_ref()
+    {
         let document = shell.document_for_viewport(context.width, context.height);
         layout_changed = dev_apply_real_window_input(
             &context.input,
             &document,
             layout_frame,
+            context.width,
+            context.height,
             shell,
             input_state,
         );
     }
     if layout_changed {
         let document = shell.document_for_viewport(context.width, context.height);
-        let mut measurer = boon_document::SimpleTextMeasurer;
         let layout_frame = boon_document::layout(boon_document::LayoutInput {
             document: &document,
             viewport: boon_host::Viewport {
@@ -1496,7 +1501,7 @@ fn native_gpu_dev_visible_render_hook(
                 height: context.height as f32,
                 scale: 1.0,
             },
-            text: &mut measurer,
+            text: text_measurer,
             capabilities: boon_document::RenderCapabilities::fake_portable(),
         });
         *layout_frame_cache = Some((context.width, context.height, layout_frame));
@@ -1570,15 +1575,52 @@ struct DevNativeInputState {
     last_keyboard_event_sequence: u64,
     caret_blink_started_at: Option<Instant>,
     held_repeat_key: Option<String>,
-    held_repeat_frame_count: u64,
+    held_repeat_next_at: Option<Instant>,
     editor_focused: bool,
     mouse_select_anchor: Option<EditorPosition>,
+    column_metric_cache: EditorColumnMetricCache,
+}
+
+type EditorColumnMetricCache = BTreeMap<EditorColumnMetricKey, Vec<f32>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EditorColumnMetricKey {
+    text: String,
+    style_signature: String,
+    line_height_bits: u32,
+}
+
+fn dev_input_may_change(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    input_state: &DevNativeInputState,
+) -> bool {
+    (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
+        || input
+            .mouse_button_events
+            .iter()
+            .any(|event| event.sequence > input_state.last_mouse_button_event_count)
+        || (input_state.editor_focused
+            && input_state.mouse_select_anchor.is_some()
+            && input
+                .mouse_buttons_down
+                .iter()
+                .any(|button| button == "left"))
+        || input
+            .keyboard_events
+            .iter()
+            .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
+        || input_state.held_repeat_key.as_ref().is_some_and(|key| {
+            input_state.held_repeat_next_at.is_some()
+                && input.pressed_keys.iter().any(|pressed| pressed == key)
+        })
 }
 
 fn dev_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     document: &boon_document_model::DocumentFrame,
     layout_frame: &boon_document::LayoutFrame,
+    surface_width: u32,
+    surface_height: u32,
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> bool {
@@ -1588,7 +1630,8 @@ fn dev_apply_real_window_input(
     let mut changed = false;
 
     if (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
-        && let Some(position) = input.mouse_window_pos
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
         && let Some(editor_bounds) = layout_frame
             .display_list
             .iter()
@@ -1612,20 +1655,6 @@ fn dev_apply_real_window_input(
                 .scroll_line
                 .saturating_sub((-line_delta) as usize);
         }
-        let column_delta = scaled_scroll_steps(input.scroll_delta_x, 12.0, 2);
-        if column_delta > 0 {
-            shell.workspace.selected_buffer.scroll_column = shell
-                .workspace
-                .selected_buffer
-                .scroll_column
-                .saturating_add(column_delta as usize);
-        } else if column_delta < 0 {
-            shell.workspace.selected_buffer.scroll_column = shell
-                .workspace
-                .selected_buffer
-                .scroll_column
-                .saturating_sub((-column_delta) as usize);
-        }
         changed = true;
     }
 
@@ -1642,7 +1671,9 @@ fn dev_apply_real_window_input(
         if mouse_event.button != "left" {
             continue;
         }
-        if let Some(position) = input.mouse_window_pos {
+        if let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+        {
             if let Some((node_id, source_path)) =
                 dev_source_binding_at(document, layout_frame, position.x as f32, position.y as f32)
             {
@@ -1653,6 +1684,7 @@ fn dev_apply_real_window_input(
                         layout_frame,
                         position.x as f32,
                         position.y as f32,
+                        &mut input_state.column_metric_cache,
                     ) {
                         if mouse_event.pressed {
                             shell
@@ -1686,12 +1718,14 @@ fn dev_apply_real_window_input(
         .any(|button| button == "left")
         && input_state.editor_focused
         && let Some(anchor) = input_state.mouse_select_anchor.clone()
-        && let Some(position) = input.mouse_window_pos
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
         && let Some(head) = dev_position_from_pointer(
             &shell.workspace.selected_buffer,
             layout_frame,
             position.x as f32,
             position.y as f32,
+            &mut input_state.column_metric_cache,
         )
     {
         shell.workspace.selected_buffer.set_selection(anchor, head);
@@ -1769,8 +1803,10 @@ fn dev_apply_real_window_input(
         }
         if apply_dev_editor_key(shell, event.key.as_str(), shift_pressed) {
             if dev_key_is_repeatable(event.key.as_str()) {
+                let now = Instant::now();
                 input_state.held_repeat_key = Some(event.key.clone());
-                input_state.held_repeat_frame_count = 0;
+                input_state.held_repeat_next_at =
+                    now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
             } else {
                 clear_dev_key_repeat(input_state);
             }
@@ -1780,16 +1816,29 @@ fn dev_apply_real_window_input(
     if input_state.editor_focused && !primary_modifier_pressed {
         if let Some(key) = input_state.held_repeat_key.clone() {
             if input.pressed_keys.iter().any(|pressed| pressed == &key) {
-                input_state.held_repeat_frame_count =
-                    input_state.held_repeat_frame_count.saturating_add(1);
-                let frame = input_state.held_repeat_frame_count;
-                if frame >= BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES
-                    && (frame - BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES)
-                        % BOON_EDITOR_KEY_REPEAT_INTERVAL_FRAMES
-                        == 0
-                    && apply_dev_editor_key(shell, &key, shift_pressed)
+                let now = Instant::now();
+                let mut applied = 0usize;
+                while input_state
+                    .held_repeat_next_at
+                    .is_some_and(|next| now >= next)
+                    && applied < BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP
                 {
-                    changed = true;
+                    if apply_dev_editor_key(shell, &key, shift_pressed) {
+                        changed = true;
+                    }
+                    applied += 1;
+                    input_state.held_repeat_next_at = input_state
+                        .held_repeat_next_at
+                        .and_then(|next| {
+                            next.checked_add(Duration::from_millis(
+                                BOON_EDITOR_KEY_REPEAT_INTERVAL_MS,
+                            ))
+                        })
+                        .or_else(|| {
+                            now.checked_add(Duration::from_millis(
+                                BOON_EDITOR_KEY_REPEAT_INTERVAL_MS,
+                            ))
+                        });
                 }
             } else {
                 clear_dev_key_repeat(input_state);
@@ -1806,9 +1855,33 @@ fn dev_apply_real_window_input(
     changed
 }
 
+fn input_layout_position(
+    position: Option<boon_native_app_window::NativeMouseWindowPosition>,
+    surface_width: u32,
+    surface_height: u32,
+) -> Option<boon_native_app_window::NativeMouseWindowPosition> {
+    let position = position?;
+    let scale_x = if position.window_width > f64::EPSILON {
+        f64::from(surface_width) / position.window_width
+    } else {
+        1.0
+    };
+    let scale_y = if position.window_height > f64::EPSILON {
+        f64::from(surface_height) / position.window_height
+    } else {
+        1.0
+    };
+    Some(boon_native_app_window::NativeMouseWindowPosition {
+        x: position.x * scale_x,
+        y: position.y * scale_y,
+        window_width: f64::from(surface_width),
+        window_height: f64::from(surface_height),
+    })
+}
+
 fn clear_dev_key_repeat(input_state: &mut DevNativeInputState) {
     input_state.held_repeat_key = None;
-    input_state.held_repeat_frame_count = 0;
+    input_state.held_repeat_next_at = None;
 }
 
 fn reset_dev_caret_blink(shell: &mut DevWindowShell, input_state: &mut DevNativeInputState) {
@@ -1819,7 +1892,12 @@ fn reset_dev_caret_blink(shell: &mut DevWindowShell, input_state: &mut DevNative
 fn dev_key_is_repeatable(key: &str) -> bool {
     matches!(
         key,
-        "Home"
+        "Return"
+            | "KeypadEnter"
+            | "Delete"
+            | "ForwardDelete"
+            | "Tab"
+            | "Home"
             | "End"
             | "LeftArrow"
             | "RightArrow"
@@ -1827,7 +1905,7 @@ fn dev_key_is_repeatable(key: &str) -> bool {
             | "DownArrow"
             | "PageDown"
             | "PageUp"
-    )
+    ) || keyboard_event_text(key, false).is_some()
 }
 
 fn apply_dev_editor_key(shell: &mut DevWindowShell, key: &str, shift_pressed: bool) -> bool {
@@ -1961,6 +2039,7 @@ fn dev_position_from_pointer(
     layout_frame: &boon_document::LayoutFrame,
     x: f32,
     y: f32,
+    column_metric_cache: &mut EditorColumnMetricCache,
 ) -> Option<EditorPosition> {
     let editor_bounds = layout_frame
         .display_list
@@ -1983,19 +2062,55 @@ fn dev_position_from_pointer(
         .display_list
         .iter()
         .find(|item| item.node.0 == line_node_id)?;
-    let char_width = editor_cell_width(&line_item.style);
     let inset = style_number_from_map(&line_item.style, "text_inset").unwrap_or(0.0);
-    let relative_x =
-        (x - line_item.bounds.x - inset + model.scroll_column as f32 * char_width).max(0.0);
+    let column_edges = editor_column_edges_for_line(
+        column_metric_cache,
+        line_text,
+        &line_item.style,
+        line_item.bounds.height,
+    );
+    let relative_x = (x - line_item.bounds.x - inset).max(0.0);
     let column =
-        ((relative_x / char_width + 0.5).floor() as usize + 1).min(line_text.chars().count() + 1);
+        nearest_editor_column(&column_edges, relative_x).min(line_text.chars().count() + 1);
     Some(EditorPosition { line, column })
 }
 
-fn editor_cell_width(style: &BTreeMap<String, boon_document_model::StyleValue>) -> f32 {
-    style_number_from_map(style, "editor_cell_width")
-        .unwrap_or(BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR)
-        .max(1.0)
+fn editor_column_edges_for_line(
+    cache: &mut EditorColumnMetricCache,
+    line_text: &str,
+    style: &BTreeMap<String, boon_document_model::StyleValue>,
+    line_height: f32,
+) -> Vec<f32> {
+    let style_signature = serde_json::to_string(style).unwrap_or_default();
+    let key = EditorColumnMetricKey {
+        text: line_text.to_owned(),
+        style_signature,
+        line_height_bits: line_height.to_bits(),
+    };
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            boon_native_gpu::editor_text_column_edges_for_style(line_text, style, line_height)
+        })
+        .clone()
+}
+
+fn nearest_editor_column(column_edges: &[f32], relative_x: f32) -> usize {
+    if column_edges.is_empty() {
+        return 1;
+    }
+    column_edges
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            let left_distance = (*left - relative_x).abs();
+            let right_distance = (*right - relative_x).abs();
+            left_distance
+                .partial_cmp(&right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index + 1)
+        .unwrap_or(1)
 }
 
 fn style_number_from_map(
@@ -4405,10 +4520,6 @@ impl CodeEditorView {
                 ("syntax_spans_json", &syntax_spans_json),
                 ("text_inset", "0"),
                 ("text_clip_padding", "4"),
-                (
-                    "editor_cell_width",
-                    &(BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR).to_string(),
-                ),
                 ("editor_selection_color", BOON_EDITOR_SELECTION),
                 ("editor_caret_color", BOON_EDITOR_CURSOR),
                 ("editor_bracket_color", BOON_EDITOR_BRACKET_MATCH),
@@ -5097,7 +5208,7 @@ impl DevWindowShell {
                 })
             })
         });
-        let mut measurer = boon_document::SimpleTextMeasurer;
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let layout = boon_document::layout(boon_document::LayoutInput {
             document: &document,
             viewport: boon_host::Viewport {
@@ -5468,7 +5579,7 @@ impl DevWindowShell {
         surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
     ) -> serde_json::Value {
         let document = self.document();
-        let mut measurer = boon_document::SimpleTextMeasurer;
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let layout = boon_document::layout(boon_document::LayoutInput {
             document: &document,
             viewport: boon_host::Viewport {
@@ -10243,11 +10354,6 @@ mod tests {
             rendered.style.get("editor_bracket_columns"),
             Some(&boon_document_model::StyleValue::Text("7,13".to_owned()))
         );
-        assert_eq!(
-            rendered.style.get("editor_cell_width"),
-            Some(&boon_document_model::StyleValue::Number(8.8))
-        );
-
         let mut hidden_frame = boon_document_model::DocumentFrame::empty("root");
         let hidden_parent = hidden_frame.root.clone();
         CodeEditorView::new().append_to(&mut hidden_frame, hidden_parent, &model, 80, false);
@@ -10274,7 +10380,7 @@ mod tests {
         );
         CodeEditorView::new().append_to(&mut document, root, &model, 120, true);
 
-        let mut measurer = boon_document::SimpleTextMeasurer;
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let layout = boon_document::layout(boon_document::LayoutInput {
             document: &document,
             viewport: boon_host::Viewport {
@@ -10300,73 +10406,75 @@ mod tests {
             .bounds;
         let line_y =
             editor_bounds.y + BOON_EDITOR_PADDING as f32 + BOON_EDITOR_LINE_HEIGHT as f32 * 0.5;
-        let char_width = editor_cell_width(&line_item.style);
+        let mut column_cache = EditorColumnMetricCache::default();
+        let column_edges = editor_column_edges_for_line(
+            &mut column_cache,
+            "abcdef",
+            &line_item.style,
+            line_item.bounds.height,
+        );
 
         assert_eq!(
-            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 0.24, line_y),
+            dev_position_from_pointer(
+                &model,
+                &layout,
+                text_origin_x + column_edges[1] * 0.24,
+                line_y,
+                &mut column_cache
+            ),
             Some(EditorPosition { line: 1, column: 1 })
         );
         assert_eq!(
-            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 0.51, line_y),
+            dev_position_from_pointer(
+                &model,
+                &layout,
+                text_origin_x + column_edges[1] * 0.51,
+                line_y,
+                &mut column_cache
+            ),
             Some(EditorPosition { line: 1, column: 2 })
         );
         assert_eq!(
-            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 2.51, line_y),
+            dev_position_from_pointer(
+                &model,
+                &layout,
+                text_origin_x + column_edges[3] - (column_edges[3] - column_edges[2]) * 0.49,
+                line_y,
+                &mut column_cache
+            ),
             Some(EditorPosition { line: 1, column: 4 })
+        );
+
+        let target_layout_x =
+            text_origin_x + column_edges[3] - (column_edges[3] - column_edges[2]) * 0.49;
+        let scaled_position = input_layout_position(
+            Some(boon_native_app_window::NativeMouseWindowPosition {
+                x: f64::from(target_layout_x) * 0.5,
+                y: f64::from(line_y) * 0.5,
+                window_width: 320.0,
+                window_height: 90.0,
+            }),
+            640,
+            180,
+        )
+        .expect("scaled test position should normalize");
+        assert_eq!(
+            dev_position_from_pointer(
+                &model,
+                &layout,
+                scaled_position.x as f32,
+                scaled_position.y as f32,
+                &mut column_cache
+            ),
+            Some(EditorPosition { line: 1, column: 4 }),
+            "logical mouse positions must be normalized to the physical layout coordinates"
         );
     }
 
     #[test]
     fn held_arrow_repeats_and_resets_caret_blink() {
-        let catalog = ExampleCatalog {
-            entries: vec![ExampleCatalogEntry {
-                id: "counter".to_owned(),
-                label: "Counter".to_owned(),
-                source: "examples/counter.bn".to_owned(),
-                inline_source: Some("abcdef\n".to_owned()),
-                category: "test".to_owned(),
-                order: 0,
-                shown_by_default: true,
-                custom: false,
-            }],
-            custom_store_path: PathBuf::from("target/artifacts/native-gpu/tests/repeat.toml"),
-        };
-        let workspace =
-            ExampleWorkspace::new(&catalog, "examples/counter.bn", "abcdef\n", Some("counter"));
-        let mut shell = DevWindowShell {
-            catalog,
-            initial_workspace: workspace.clone(),
-            workspace,
-            editor_view: CodeEditorView::new(),
-            preview_transport: PreviewTransport::new(None),
-            last_preview_transport: json!({"status": "not-run"}),
-            caret_visible: false,
-        };
-        let mut input_state = DevNativeInputState {
-            editor_focused: true,
-            caret_blink_started_at: Some(
-                Instant::now()
-                    .checked_sub(Duration::from_millis(
-                        BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS,
-                    ))
-                    .unwrap_or_else(Instant::now),
-            ),
-            ..DevNativeInputState::default()
-        };
-
-        let document = shell.document_for_viewport(1180, 820);
-        let mut measurer = boon_document::SimpleTextMeasurer;
-        let layout = boon_document::layout(boon_document::LayoutInput {
-            document: &document,
-            viewport: boon_host::Viewport {
-                surface: 1,
-                width: 1180.0,
-                height: 820.0,
-                scale: 1.0,
-            },
-            text: &mut measurer,
-            capabilities: boon_document::RenderCapabilities::fake_portable(),
-        });
+        let (mut shell, mut input_state, document, layout) =
+            test_dev_editor_context("abcdefghijklmnop\n");
 
         let key_down = test_keyboard_input(
             vec![boon_native_app_window::NativeKeyboardEventProof {
@@ -10381,6 +10489,8 @@ mod tests {
             &key_down,
             &document,
             &layout,
+            1180,
+            820,
             &mut shell,
             &mut input_state
         ));
@@ -10392,18 +10502,36 @@ mod tests {
         assert!(input_state.caret_blink_started_at.is_some());
 
         let held = test_keyboard_input(Vec::new(), vec!["RightArrow"]);
-        for _ in 0..BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES {
-            let _ = dev_apply_real_window_input(
-                &held,
-                &document,
-                &layout,
-                &mut shell,
-                &mut input_state,
-            );
-        }
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(1));
+        let _ = dev_apply_real_window_input(
+            &held,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+        );
         assert!(
             shell.workspace.selected_buffer.caret().column > 2,
             "held RightArrow should move beyond the initial key-down"
+        );
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(
+            BOON_EDITOR_KEY_REPEAT_INTERVAL_MS * 4,
+        ));
+        let before_catch_up = shell.workspace.selected_buffer.caret().column;
+        let _ = dev_apply_real_window_input(
+            &held,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+        );
+        assert!(
+            shell.workspace.selected_buffer.caret().column >= before_catch_up + 4,
+            "time-based repeat should catch up when frames are slower than the repeat interval"
         );
 
         let key_up = test_keyboard_input(
@@ -10416,21 +10544,188 @@ mod tests {
             Vec::new(),
         );
         let column_after_repeat = shell.workspace.selected_buffer.caret().column;
-        let _ =
-            dev_apply_real_window_input(&key_up, &document, &layout, &mut shell, &mut input_state);
-        for _ in 0..BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES {
-            let _ = dev_apply_real_window_input(
-                &test_keyboard_input(Vec::new(), Vec::new()),
-                &document,
-                &layout,
-                &mut shell,
-                &mut input_state,
-            );
-        }
+        let _ = dev_apply_real_window_input(
+            &key_up,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+        );
+        input_state.held_repeat_next_at =
+            Instant::now().checked_sub(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_INTERVAL_MS));
+        let _ = dev_apply_real_window_input(
+            &test_keyboard_input(Vec::new(), Vec::new()),
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+        );
         assert_eq!(
             shell.workspace.selected_buffer.caret().column,
             column_after_repeat
         );
+    }
+
+    #[test]
+    fn held_printable_keys_repeat_letters_and_numbers() {
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context("\n");
+
+        apply_test_key_down("A", &document, &layout, &mut shell, &mut input_state);
+        apply_test_held_key("A", 4, &document, &layout, &mut shell, &mut input_state);
+        assert_eq!(shell.workspace.selected_buffer.source_text, "aaaaa\n");
+
+        apply_test_key_down("Num1", &document, &layout, &mut shell, &mut input_state);
+        apply_test_held_key("Num1", 4, &document, &layout, &mut shell, &mut input_state);
+        assert_eq!(shell.workspace.selected_buffer.source_text, "aaaaa11111\n");
+    }
+
+    #[test]
+    fn held_delete_keys_repeat_backward_and_forward_deletion() {
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context("abcdef\n");
+        shell.workspace.selected_buffer.set_selection(
+            EditorPosition { line: 1, column: 7 },
+            EditorPosition { line: 1, column: 7 },
+        );
+
+        apply_test_key_down("Delete", &document, &layout, &mut shell, &mut input_state);
+        apply_test_held_key(
+            "Delete",
+            4,
+            &document,
+            &layout,
+            &mut shell,
+            &mut input_state,
+        );
+        assert_eq!(shell.workspace.selected_buffer.source_text, "a\n");
+
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context("abcdef\n");
+        shell.workspace.selected_buffer.set_selection(
+            EditorPosition { line: 1, column: 2 },
+            EditorPosition { line: 1, column: 2 },
+        );
+        apply_test_key_down(
+            "ForwardDelete",
+            &document,
+            &layout,
+            &mut shell,
+            &mut input_state,
+        );
+        apply_test_held_key(
+            "ForwardDelete",
+            4,
+            &document,
+            &layout,
+            &mut shell,
+            &mut input_state,
+        );
+        assert_eq!(shell.workspace.selected_buffer.source_text, "a\n");
+    }
+
+    fn test_dev_editor_context(
+        source: &str,
+    ) -> (
+        DevWindowShell,
+        DevNativeInputState,
+        boon_document_model::DocumentFrame,
+        boon_document::LayoutFrame,
+    ) {
+        let catalog = ExampleCatalog {
+            entries: vec![ExampleCatalogEntry {
+                id: "counter".to_owned(),
+                label: "Counter".to_owned(),
+                source: "examples/counter.bn".to_owned(),
+                inline_source: Some(source.to_owned()),
+                category: "test".to_owned(),
+                order: 0,
+                shown_by_default: true,
+                custom: false,
+            }],
+            custom_store_path: PathBuf::from("target/artifacts/native-gpu/tests/repeat.toml"),
+        };
+        let workspace =
+            ExampleWorkspace::new(&catalog, "examples/counter.bn", source, Some("counter"));
+        let shell = DevWindowShell {
+            catalog,
+            initial_workspace: workspace.clone(),
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport: PreviewTransport::new(None),
+            last_preview_transport: json!({"status": "not-run"}),
+            caret_visible: false,
+        };
+        let input_state = DevNativeInputState {
+            editor_focused: true,
+            caret_blink_started_at: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(
+                        BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS,
+                    ))
+                    .unwrap_or_else(Instant::now),
+            ),
+            ..DevNativeInputState::default()
+        };
+        let document = shell.document_for_viewport(1180, 820);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 1180.0,
+                height: 820.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        (shell, input_state, document, layout)
+    }
+
+    fn apply_test_key_down(
+        key: &str,
+        document: &boon_document_model::DocumentFrame,
+        layout: &boon_document::LayoutFrame,
+        shell: &mut DevWindowShell,
+        input_state: &mut DevNativeInputState,
+    ) {
+        let input = test_keyboard_input(
+            vec![boon_native_app_window::NativeKeyboardEventProof {
+                sequence: input_state.last_keyboard_event_sequence.saturating_add(1),
+                key: key.to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            }],
+            vec![key],
+        );
+        assert!(dev_apply_real_window_input(
+            &input,
+            document,
+            layout,
+            1180,
+            820,
+            shell,
+            input_state
+        ));
+    }
+
+    fn apply_test_held_key(
+        key: &str,
+        repeat_count: u64,
+        document: &boon_document_model::DocumentFrame,
+        layout: &boon_document::LayoutFrame,
+        shell: &mut DevWindowShell,
+        input_state: &mut DevNativeInputState,
+    ) {
+        let elapsed_intervals = repeat_count.saturating_sub(1);
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(
+            BOON_EDITOR_KEY_REPEAT_INTERVAL_MS * elapsed_intervals,
+        ));
+        let input = test_keyboard_input(Vec::new(), vec![key]);
+        let _ =
+            dev_apply_real_window_input(&input, document, layout, 1180, 820, shell, input_state);
     }
 
     fn test_keyboard_input(
@@ -10544,11 +10839,11 @@ mod tests {
         let _ = std::fs::remove_file(&store_path);
         let catalog = ExampleCatalog {
             entries: vec![ExampleCatalogEntry {
-                id: "seed".to_owned(),
-                label: "Seed".to_owned(),
-                source: "custom://seed.bn".to_owned(),
+                id: "sample".to_owned(),
+                label: "Sample".to_owned(),
+                source: "custom://sample.bn".to_owned(),
                 inline_source: Some(
-                    "-- seed\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
+                    "-- sample\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
                 ),
                 category: "test".to_owned(),
                 order: 0,
@@ -10559,8 +10854,8 @@ mod tests {
         };
         let workspace = ExampleWorkspace::new(
             &catalog,
-            "custom://seed.bn",
-            "-- seed\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n",
+            "custom://sample.bn",
+            "-- sample\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n",
             None,
         );
         let mut shell = DevWindowShell {

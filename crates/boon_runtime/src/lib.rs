@@ -2064,7 +2064,7 @@ impl TypedStorageLayoutCounts {
                     false,
                     InitialValue::Text { .. }
                     | InitialValue::Number { .. }
-                    | InitialValue::SeedField { .. },
+                    | InitialValue::RowInitialField { .. },
                 ) => {
                     counts.root_text_slot_count += 1;
                 }
@@ -2081,7 +2081,7 @@ impl TypedStorageLayoutCounts {
                     true,
                     InitialValue::Text { .. }
                     | InitialValue::Number { .. }
-                    | InitialValue::SeedField { .. },
+                    | InitialValue::RowInitialField { .. },
                 ) => {
                     counts.list_row_template_field_count += 1;
                     counts.list_row_text_slot_count += 1;
@@ -5592,9 +5592,9 @@ impl GenericCircuitRuntime {
                 ListInitializer::RecordLiteral { rows } => rows
                     .iter()
                     .map(|row| {
-                        let seed_fields = list_seed_fields(row)?;
-                        let mut row = row_template.materialize(seed_fields)?;
-                        seed_indexed_formula_fields(ir, &row_scope, &mut row);
+                        let initial_fields = list_initial_fields(row)?;
+                        let mut row = row_template.materialize(initial_fields)?;
+                        initialize_indexed_formula_fields(ir, &row_scope, &mut row);
                         Ok(row)
                     })
                     .collect::<RuntimeResult<Vec<_>>>()?,
@@ -5608,15 +5608,15 @@ impl GenericCircuitRuntime {
                                     .ok_or("grid column label is out of range")?,
                                 row
                             );
-                            let mut seed_fields = ValueColumns::default();
-                            seed_fields
+                            let mut initial_fields = ValueColumns::default();
+                            initial_fields
                                 .insert_value("address".to_owned(), FieldValue::Text(address));
-                            seed_fields.insert_value(
+                            initial_fields.insert_value(
                                 "default_formula".to_owned(),
                                 FieldValue::Text(default_grid_formula(column, row)),
                             );
-                            let mut row = row_template.materialize(seed_fields)?;
-                            seed_indexed_formula_fields(ir, &row_scope, &mut row);
+                            let mut row = row_template.materialize(initial_fields)?;
+                            initialize_indexed_formula_fields(ir, &row_scope, &mut row);
                             grid_rows.push(row);
                         }
                     }
@@ -6290,13 +6290,13 @@ impl GenericCircuitRuntime {
             .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let mut row = self.lists.pop_spare(list).map(Ok).unwrap_or_else(|| {
-            let seed_fields = equations.append_seed_fields(list, trigger, trigger_value)?;
-            template.materialize(seed_fields)
+            let initial_fields = equations.append_initial_fields(list, trigger, trigger_value)?;
+            template.materialize(initial_fields)
         })?;
-        template.reset_from_text_seeds(&mut row, |seed_name| {
+        template.reset_from_initial_text(&mut row, |initial_name| {
             append_fields
                 .iter()
-                .any(|field| field.name == seed_name && field.source == trigger)
+                .any(|field| field.name == initial_name && field.source == trigger)
                 .then_some(trigger_value)
         })?;
         self.append_row_for_trigger(equations, list, trigger, row)
@@ -6326,8 +6326,8 @@ impl GenericCircuitRuntime {
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         spare_rows.reserve(additional + count);
         for _ in 0..additional {
-            let seed_fields = equations.append_seed_fields(list, trigger, "")?;
-            let mut row = template.materialize(seed_fields)?;
+            let initial_fields = equations.append_initial_fields(list, trigger, "")?;
+            let mut row = template.materialize(initial_fields)?;
             row.reserve_textlike_fields(text_capacity)?;
             spare_rows.push(row);
         }
@@ -7070,7 +7070,7 @@ impl ValueColumns {
     }
 }
 
-fn list_seed_fields(row: &boon_ir::ListSeedRecord) -> RuntimeResult<ValueColumns> {
+fn list_initial_fields(row: &boon_ir::ListInitialRecord) -> RuntimeResult<ValueColumns> {
     let mut columns = ValueColumns::default();
     for field in &row.fields {
         columns.insert_value(
@@ -7104,23 +7104,23 @@ impl RuntimeRowSnapshotTemplate {
         Ok(Self { fields })
     }
 
-    fn materialize(&self, mut seed_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
+    fn materialize(&self, mut initial_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
         for field in &self.fields {
-            if seed_fields.contains_key_id(field.field_id.clone()) {
+            if initial_fields.contains_key_id(field.field_id.clone()) {
                 continue;
             }
-            let value = runtime_value_from_initial(&field.initial_value, &seed_fields)?;
-            seed_fields.insert_value(field.field_name.to_string(), value);
+            let value = runtime_value_from_initial(&field.initial_value, &initial_fields)?;
+            initial_fields.insert_value(field.field_name.to_string(), value);
         }
         Ok(RuntimeRowSnapshot {
-            columns: seed_fields,
+            columns: initial_fields,
         })
     }
 
-    fn reset_from_text_seeds<'a>(
+    fn reset_from_initial_text<'a>(
         &self,
         row: &mut RuntimeRowSnapshot,
-        seed_text: impl Fn(&str) -> Option<&'a str>,
+        initial_text: impl Fn(&str) -> Option<&'a str>,
     ) -> RuntimeResult<()> {
         for field in &self.fields {
             if !row.columns.contains_key_id(field.field_id.clone()) {
@@ -7137,9 +7137,9 @@ impl RuntimeRowSnapshotTemplate {
                 InitialValue::Enum { value } => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
-                InitialValue::SeedField { path } => {
-                    let value =
-                        seed_text(path).ok_or_else(|| format!("seed field `{path}` is missing"))?;
+                InitialValue::RowInitialField { path } => {
+                    let value = initial_text(path)
+                        .ok_or_else(|| format!("row initial field `{path}` is missing"))?;
                     row.columns.set_textlike(&field.field_name, value)?;
                 }
                 InitialValue::Unknown { summary } => {
@@ -7160,23 +7160,27 @@ impl RuntimeRowSnapshot {
 
 fn runtime_value_from_initial(
     initial: &InitialValue,
-    seed_fields: &ValueColumns,
+    initial_fields: &ValueColumns,
 ) -> RuntimeResult<FieldValue> {
     match initial {
         InitialValue::Text { value } => Ok(FieldValue::Text(value.clone())),
         InitialValue::Number { value } => Ok(FieldValue::Text(value.to_string())),
         InitialValue::Bool { value } => Ok(FieldValue::Bool(*value)),
         InitialValue::Enum { value } => Ok(FieldValue::Enum(value.clone())),
-        InitialValue::SeedField { path } => seed_fields
+        InitialValue::RowInitialField { path } => initial_fields
             .owned_value(path)
-            .ok_or_else(|| format!("seed field `{path}` is missing").into()),
+            .ok_or_else(|| format!("row initial field `{path}` is missing").into()),
         InitialValue::Unknown { summary } => {
             Err(format!("unsupported state initializer `{summary}`").into())
         }
     }
 }
 
-fn seed_indexed_formula_fields(ir: &TypedProgram, row_scope: &str, row: &mut RuntimeRowSnapshot) {
+fn initialize_indexed_formula_fields(
+    ir: &TypedProgram,
+    row_scope: &str,
+    row: &mut RuntimeRowSnapshot,
+) {
     for value in ir
         .derived_values
         .iter()
@@ -8877,7 +8881,7 @@ impl ListEquationPlan {
             .ok_or_else(|| format!("list `{list}` has no append trigger `{trigger}` in IR").into())
     }
 
-    fn append_seed_fields(
+    fn append_initial_fields(
         &self,
         list: &str,
         trigger: &str,
@@ -8898,7 +8902,7 @@ impl ListEquationPlan {
         let RuntimeListOperationKind::Append { fields, .. } = &operation.kind else {
             unreachable!();
         };
-        let mut seed_fields = ValueColumns::default();
+        let mut initial_fields = ValueColumns::default();
         for field in fields {
             if field.source != trigger {
                 return Err(format!(
@@ -8907,12 +8911,12 @@ impl ListEquationPlan {
                 )
                 .into());
             }
-            seed_fields.insert_value(
+            initial_fields.insert_value(
                 field.name.to_owned(),
                 FieldValue::Text(trigger_value.to_owned()),
             );
         }
-        Ok(seed_fields)
+        Ok(initial_fields)
     }
 
     fn count_predicate(&self, list: &str, target: &str) -> RuntimeResult<RuntimeListPredicate> {
@@ -9070,7 +9074,7 @@ impl ListScenarioHarness {
                 .list_row_textlike("todos", index, "title")?
                 .is_empty()
             {
-                return Err("TodoMVC seed titles must not be empty".into());
+                return Err("TodoMVC initial titles must not be empty".into());
             }
         }
         Ok(self)
@@ -11123,7 +11127,7 @@ fn cell_index(address: &str, columns: usize, rows: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> {
+fn todomvc_initial_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> {
     let list = ir
         .lists
         .iter()
@@ -11138,10 +11142,10 @@ fn todomvc_seed_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> 
                 .fields
                 .iter()
                 .find(|field| field.name == "title")
-                .ok_or("TodoMVC seed row has no `title` field")?;
+                .ok_or("TodoMVC initial row has no `title` field")?;
             match &field.value {
                 InitialValue::Text { value } => Ok(value.clone()),
-                other => Err(format!("TodoMVC seed title is not text: {other:?}").into()),
+                other => Err(format!("TodoMVC initial title is not text: {other:?}").into()),
             }
         })
         .collect()
@@ -12533,7 +12537,7 @@ mod tests {
         let parsed = parse_source("examples/todomvc.bn", todo_source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert_eq!(
-            todomvc_seed_titles_from_ir(&ir).unwrap(),
+            todomvc_initial_titles_from_ir(&ir).unwrap(),
             vec![
                 "Source title A",
                 "Finish TodoMVC renderer",
@@ -12603,7 +12607,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_row_sources_are_bound_for_seed_and_append() {
+    fn todo_row_sources_are_bound_for_initial_and_append() {
         let parsed = parse_source(
             "examples/todomvc.bn",
             include_str!("../../../examples/todomvc.bn"),

@@ -71,14 +71,14 @@ store: [
                 }
             }
         )
-        |> List/map(seed, new: new_todo(seed: seed, store: store))
+        |> List/map(todo, new: new_todo(todo: todo, store: store))
 ]
 ```
 
 ## Todo Row Shape
 
 ```boon
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     sources: [
         remove_todo_button: [press: SOURCE]
         editing_todo_title_element: [
@@ -92,7 +92,7 @@ FUNCTION new_todo(seed) {
 
     [
         title:
-            seed.title |> HOLD title {
+            todo.title |> HOLD title {
                 LATEST {
                     sources.editing_todo_title_element.key_down |> WHEN {
                         [key: Enter, text: text] =>
@@ -114,7 +114,7 @@ FUNCTION new_todo(seed) {
             }
 
         edit_text:
-            seed.title |> HOLD draft {
+            todo.title |> HOLD draft {
                 LATEST {
                     sources.todo_title_element.double_click |> THEN {
                         title

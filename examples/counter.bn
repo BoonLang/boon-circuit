@@ -20,26 +20,15 @@ store: [
             }
         }
 
-    rows:
-        LIST {
-            [label: TEXT { Counter }]
-        }
-        |> List/map(seed, new: counter_row(seed: seed))
 ]
-
-FUNCTION counter_row(seed) {
-    [label: seed.label]
-}
 
 document: Document/new(
     root: counter_app()
 )
 
 FUNCTION counter_app() {
-    Element/stripe(
+    Element/container(
         element: []
-        direction: Column
-        gap: 20
         style: [
             width: Fill
             height: Fill
@@ -47,9 +36,7 @@ FUNCTION counter_app() {
             background: [color: Oklch[lightness:0.97]]
             font: [size: 16, color: Oklch[lightness:0.18]]
         ]
-        items: LIST {
-            counter_panel()
-        }
+        child: counter_panel()
     )
 }
 

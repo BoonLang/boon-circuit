@@ -6,7 +6,7 @@ Make the visible native Cells playground match the documented 7GUIs Cells
 example instead of only proving a four-cell scenario subset.
 
 The preview boundary is strict: the visible Cells surface must be generated from
-`examples/cells.bn` state, seed data, and `VIEW` declarations. The native
+`examples/cells.bn` state, initial data, and `VIEW` declarations. The native
 playground may provide generic UI components and generic interpretation of
 component attributes, but it must not add a Cells-specific widget, renderer
 branch, hardcoded formula bar, or hardcoded spreadsheet preview.
@@ -56,7 +56,7 @@ projection and verification-coverage issue.
   - Editing, commit, cancel, formula display, error display, and selection/focus
     must still route through the existing Boon `SOURCE` bindings.
 
-- Seed the Cells example with spreadsheet demo data through `Grid/cells` seed
+- Initialize the Cells example with spreadsheet demo data through `Grid/cells` initial
   fields, not through a renderer special case.
   - A0, A1, and A2 should start with literal demo numbers.
   - B0 should demonstrate a function formula such as `=add(A0,A1)`.

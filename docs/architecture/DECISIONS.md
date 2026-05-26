@@ -369,7 +369,7 @@ evidence plus dependent aggregate reports. Real human reports remain optional
 follow-up evidence and must not be fabricated.
 
 Implementation note: a generic initialization runtime now materializes root
-state cells and keyed list rows from `TypedProgram` initializers. TodoMVC seed
+state cells and keyed list rows from `TypedProgram` initializers. TodoMVC initial
 titles, `store.new_todo_text`, and `store.selected_filter` are initialized from
 that generic storage rather than by reparsing the source text in the runtime,
 and the Todo runtime no longer keeps separate root mirrors for those `HOLD`
@@ -399,7 +399,7 @@ Formula-derived value/error commits use the same generic keyed field commit path
 for their semantic deltas. Source bind facts emitted after list append now also
 flow through a generic `SourceBind` mutation and use the appended list's
 identity instead of a TodoMVC-specific `todos` helper.
-Cells formula-derived row fields (`value`, `error`, `dependencies`) are seeded
+Cells formula-derived row fields (`value`, `error`, `dependencies`) are initialized
 into each generic row when the static grid is materialized instead of being
 inserted lazily during the first recompute. The loaded Cells formula state keeps
 a reusable dependency-text buffer per cell and writes dependency addresses into
@@ -567,11 +567,11 @@ Example runtimes still adapt generic facts into their current protocol/render
 outputs; TodoMVC no longer mirrors committed row or root values for render/test
 checks, and Cells no longer mirrors committed formula/editing fields.
 `List/append` row construction now lowers the `THEN { [field: source] }` record
-into typed append seed fields. `GenericCircuitRuntime` stores a row template per
+into typed append initial fields. `GenericCircuitRuntime` stores a row template per
 list from indexed `HOLD` initializers and materializes appended rows from that
 template rather than from a TodoMVC-specific row constructor. The runtime keeps
 a generic per-list spare-row pool and resets spare rows from the typed append
-seed fields, preserving the zero-allocation speed budget after warmup without a
+initial fields, preserving the zero-allocation speed budget after warmup without a
 Todo-specific pool. Append routing is also part of the source-route action
 table: the TodoMVC key-down path asks the compiled route for its `ListAppend`
 trigger instead of comparing derived text target names outside the route plan.

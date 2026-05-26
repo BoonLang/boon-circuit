@@ -49,9 +49,9 @@ todos:
             clear_completed_button.press |> THEN { todo.completed }
         }
     )
-    |> List/map(seed, new: new_todo(seed: seed))
+    |> List/map(todo, new: new_todo(todo: todo))
 
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     sources: [
         remove_todo_button: [press: SOURCE]
         editing_todo_title_element: [change: SOURCE, key_down: SOURCE, blur: SOURCE]
@@ -60,7 +60,7 @@ FUNCTION new_todo(seed) {
     ]
 
     [
-        title: seed.title |> HOLD title { ... }
+        title: todo.title |> HOLD title { ... }
         completed: False |> HOLD completed { ... }
         editing: False |> HOLD editing { ... }
     ]
@@ -68,7 +68,7 @@ FUNCTION new_todo(seed) {
 ```
 
 There is no `[id: ...]` field and no app-visible `alive` field. List membership
-is hidden `valid` storage. `List/map(seed, new: new_todo(seed: seed))` creates a
+is hidden `valid` storage. `List/map(todo, new: new_todo(todo: todo))` creates a
 row scope for each live item. The compiler maps that scope to hardware storage.
 
 ## Hardware Profile

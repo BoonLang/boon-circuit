@@ -60,7 +60,7 @@ store: [
                 sources.clear_completed_button.press |> THEN { todo.completed }
             }
         )
-        |> List/map(seed, new: new_todo(seed: seed, store: store))
+        |> List/map(todo, new: new_todo(todo: todo, store: store))
 
     visible_todos:
         todos
@@ -89,7 +89,7 @@ store: [
         active_count == 0 |> Bool/and(completed_count > 0)
 ]
 
-FUNCTION new_todo(seed, store) {
+FUNCTION new_todo(todo, store) {
     sources: [
         remove_todo_button: [press: SOURCE]
         editing_todo_title_element: [
@@ -103,7 +103,7 @@ FUNCTION new_todo(seed, store) {
 
     [
         title:
-            seed.title |> HOLD title {
+            todo.title |> HOLD title {
                 LATEST {
                     sources.editing_todo_title_element.key_down |> WHEN {
                         [key: Enter, text: text] =>
@@ -123,7 +123,7 @@ FUNCTION new_todo(seed, store) {
             }
 
         edit_text:
-            seed.title |> HOLD draft {
+            todo.title |> HOLD draft {
                 LATEST {
                     sources.todo_title_element.double_click |> THEN {
                         title

@@ -524,8 +524,8 @@ Do not count persistence as passed before the storage layer exists.
 
 Required deterministic stress cases:
 
-- seed 1,000 todos.
-- seed target-profile maximum, such as 10,000 todos.
+- initialize 1,000 todos.
+- initialize target-profile maximum, such as 10,000 todos.
 - toggle one row.
 - edit one row.
 - filter active/completed.

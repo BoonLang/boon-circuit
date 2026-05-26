@@ -1326,19 +1326,13 @@ fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseE
 }
 
 fn validate_required_constructs(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    for required in ["SOURCE", "HOLD", "LATEST", "List/map"] {
+    for required in ["SOURCE", "HOLD", "LATEST"] {
         if !ast_has_lexeme(ast, required) {
             return Err(ParseError {
                 path: path.to_owned(),
                 message: format!("required construct `{required}` is missing"),
             });
         }
-    }
-    if !ast_has_lexeme(ast, "LIST") && !ast_has_lexeme(ast, "Grid/cells") {
-        return Err(ParseError {
-            path: path.to_owned(),
-            message: "required list source `LIST` or `Grid/cells` is missing".to_owned(),
-        });
     }
     Ok(())
 }
@@ -1914,9 +1908,9 @@ store: [
         }
     todos:
         LIST {}
-        |> List/map(seed, new: new_todo(seed: seed))
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     [
         title:
             Text/empty |> HOLD title { LATEST {} }
@@ -1966,8 +1960,8 @@ FUNCTION new_todo(seed) {
 label: "fake |> WHEN { SOURCE }"
 cells:
     Grid/cells(columns: 1, rows: 1)
-    |> List/map(seed, new: new_cell(seed: seed))
-FUNCTION new_cell(seed) {
+    |> List/map(cell, new: new_cell(cell: cell))
+FUNCTION new_cell(cell) {
     sources: [editor: [commit: SOURCE]]
     [
         value:
@@ -2028,12 +2022,12 @@ store:
         "All" |> HOLD selected { LATEST {} }
     entries:
         LIST[4] {}
-        |> List/map(entry, new: make_entry(seed: entry))
-FUNCTION make_entry(seed) {
+        |> List/map(entry, new: make_entry(entry: entry))
+FUNCTION make_entry(entry) {
     sources:
         checkbox: [click: SOURCE]
     title:
-        seed.title |> HOLD title { LATEST {} }
+        todo.title |> HOLD title { LATEST {} }
     completed:
         False |> HOLD completed {
             LATEST {
@@ -2118,7 +2112,7 @@ FUNCTION make_entry(seed) {
 -- label: "EXAMPLE TodoMVC"
 cells:
     Grid/cells(columns: 1, rows: 1)
-    |> List/map(seed, new: new_cell(seed: seed))
+    |> List/map(cell, new: new_cell(cell: cell))
 SOURCE
 HOLD
 LATEST
@@ -2164,8 +2158,8 @@ store:
     sources: [click: SOURCE]
 value: Text/empty() |> HOLD value { LATEST {} }
 items: LIST {}
-items |> List/map(item, new: row(seed: item))
-FUNCTION row(seed) { [title: seed.title] }
+items |> List/map(item, new: row(item: item))
+FUNCTION row(item) { [title: item.title] }
 document:
     children:
         element:
@@ -2182,7 +2176,7 @@ document:
 todos: LIST[10000] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
-todos |> List/map(todo, new: new_todo(seed: todo))
+todos |> List/map(todo, new: new_todo(todo: todo))
 "#;
         let program = parse_source("profiled-list.bn", source).unwrap();
         let todos = program
@@ -2199,7 +2193,7 @@ todos |> List/map(todo, new: new_todo(seed: todo))
 todos: LIST[many] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
-todos |> List/map(todo, new: new_todo(seed: todo))
+todos |> List/map(todo, new: new_todo(todo: todo))
 "#;
         let err = parse_source("bad-list-capacity.bn", source).unwrap_err();
         assert!(
@@ -2215,7 +2209,7 @@ todos |> List/map(todo, new: new_todo(seed: todo))
 todos: LIST[0] {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
-todos |> List/map(todo, new: new_todo(seed: todo))
+todos |> List/map(todo, new: new_todo(todo: todo))
 "#;
         let err = parse_source("bad-zero-list-capacity.bn", source).unwrap_err();
         assert!(
@@ -2255,9 +2249,9 @@ store:
         }
     }
 todos: LIST[4] {}
-todos |> List/map(todo, new: new_todo(seed: todo))
-FUNCTION new_todo(seed) {
-    title: seed.title |> HOLD title { LATEST {} }
+todos |> List/map(todo, new: new_todo(todo: todo))
+FUNCTION new_todo(todo) {
+    title: todo.title |> HOLD title { LATEST {} }
 }
 document:
     children:
@@ -2294,9 +2288,9 @@ store:
         new_todo_input: [change: SOURCE]
     new_todo_text: "" |> HOLD new_todo_text { LATEST {} }
 todos: LIST[4] {}
-todos |> List/map(todo, new: new_todo(seed: todo))
-FUNCTION new_todo(seed) {
-    title: seed.title |> HOLD title { LATEST {} }
+todos |> List/map(todo, new: new_todo(todo: todo))
+FUNCTION new_todo(todo) {
+    title: todo.title |> HOLD title { LATEST {} }
 }
 document:
     children:
@@ -2335,7 +2329,7 @@ FUNCTION update(state, event) {
 items: LIST {}
 click: SOURCE
 value: False |> HOLD value { LATEST { click |> THEN { True } } }
-items |> List/map(item, new: new_item(seed: item))
+items |> List/map(item, new: new_item(item: item))
 "#;
         let err = parse_source("examples/todomvc.bn", source).unwrap_err();
         assert!(err.message.contains("central reducer"));

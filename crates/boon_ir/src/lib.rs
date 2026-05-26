@@ -164,7 +164,7 @@ pub struct ExpressionCoverage {
     pub ignored_unknown_ast_expression_count: usize,
     pub unknown_initial_value_count: usize,
     pub unknown_list_initializer_count: usize,
-    pub unknown_list_seed_value_count: usize,
+    pub unknown_list_initial_value_count: usize,
     pub unknown_update_expression_count: usize,
     pub unknown_list_predicate_count: usize,
     pub unknown_derived_value_count: usize,
@@ -181,7 +181,7 @@ impl ExpressionCoverage {
             ignored_unknown_ast_expression_count: 0,
             unknown_initial_value_count: 0,
             unknown_list_initializer_count: 0,
-            unknown_list_seed_value_count: 0,
+            unknown_list_initial_value_count: 0,
             unknown_update_expression_count: 0,
             unknown_list_predicate_count: 0,
             unknown_derived_value_count: 0,
@@ -194,7 +194,7 @@ impl ExpressionCoverage {
         self.unknown_ast_expression_count
             + self.unknown_initial_value_count
             + self.unknown_list_initializer_count
-            + self.unknown_list_seed_value_count
+            + self.unknown_list_initial_value_count
             + self.unknown_update_expression_count
             + self.unknown_list_predicate_count
             + self.unknown_derived_value_count
@@ -285,25 +285,25 @@ pub enum InitialValue {
     Number { value: i64 },
     Bool { value: bool },
     Enum { value: String },
-    SeedField { path: String },
+    RowInitialField { path: String },
     Unknown { summary: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ListInitializer {
-    RecordLiteral { rows: Vec<ListSeedRecord> },
+    RecordLiteral { rows: Vec<ListInitialRecord> },
     Grid { columns: usize, rows: usize },
     Empty,
     Unknown { summary: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ListSeedRecord {
-    pub fields: Vec<ListSeedField>,
+pub struct ListInitialRecord {
+    pub fields: Vec<ListRowInitialField>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ListSeedField {
+pub struct ListRowInitialField {
     pub name: String,
     pub value: InitialValue,
 }
@@ -478,7 +478,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
             initial_value: fields
                 .iter()
                 .find(|field| field.path == cell.path)
-                .map(field_initial_value)
+                .map(|field| field_initial_value(field, &row_scopes))
                 .unwrap_or_else(|| InitialValue::Unknown {
                     summary: "missing initial value".to_owned(),
                 }),
@@ -1645,7 +1645,9 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
 
 fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
     match value {
-        InitialValue::SeedField { path } => reject_hidden_identity_identifier("seed field", path),
+        InitialValue::RowInitialField { path } => {
+            reject_hidden_identity_identifier("row initial field", path)
+        }
         InitialValue::Enum { value } => reject_hidden_identity_identifier("enum value", value),
         InitialValue::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown initializer", summary)
@@ -1661,7 +1663,7 @@ fn reject_list_initializer_identity(value: &ListInitializer) -> Result<(), Strin
         ListInitializer::RecordLiteral { rows } => {
             for row in rows {
                 for field in &row.fields {
-                    reject_hidden_identity_identifier("list seed field", &field.name)?;
+                    reject_hidden_identity_identifier("list initial field", &field.name)?;
                     reject_initial_value_identity(&field.value)?;
                 }
             }
@@ -1874,10 +1876,11 @@ fn expression_coverage(
                 for row in rows {
                     for field in &row.fields {
                         if let InitialValue::Unknown { summary } = &field.value {
-                            coverage.unknown_list_seed_value_count += 1;
-                            coverage
-                                .unknown_labels
-                                .push(format!("list seed {}.{}: {summary}", list.name, field.name));
+                            coverage.unknown_list_initial_value_count += 1;
+                            coverage.unknown_labels.push(format!(
+                                "list initial {}.{}: {summary}",
+                                list.name, field.name
+                            ));
                         }
                     }
                 }
@@ -2317,7 +2320,7 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
     }
 }
 
-fn field_initial_value(field: &FieldDef) -> InitialValue {
+fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValue {
     let initial_expr = if let Some(initial) =
         field.ast_exprs.iter().find_map(|expr| match expr.kind {
             AstExprKind::Hold { initial, .. } => Some(initial),
@@ -2335,10 +2338,10 @@ fn field_initial_value(field: &FieldDef) -> InitialValue {
             summary: "missing initial value".to_owned(),
         };
     };
-    ast_initial_value(expr)
+    ast_initial_value(expr, row_scopes)
 }
 
-fn ast_initial_value(expr: &AstExpr) -> InitialValue {
+fn ast_initial_value(expr: &AstExpr, row_scopes: &[RowScope]) -> InitialValue {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
             value: value.clone(),
@@ -2359,8 +2362,12 @@ fn ast_initial_value(expr: &AstExpr) -> InitialValue {
         AstExprKind::Path(parts) if parts.as_slice() == ["Text/empty"] => InitialValue::Text {
             value: String::new(),
         },
-        AstExprKind::Path(parts) if parts.first().map(String::as_str) == Some("seed") => {
-            InitialValue::SeedField {
+        AstExprKind::Path(parts)
+            if parts
+                .first()
+                .is_some_and(|root| row_scopes.iter().any(|scope| scope.row_scope == *root)) =>
+        {
+            InitialValue::RowInitialField {
                 path: parts[1..].join("."),
             }
         }
@@ -2421,7 +2428,7 @@ fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstIt
     None
 }
 
-fn list_record_literal_rows(items: &[AstItem]) -> Vec<ListSeedRecord> {
+fn list_record_literal_rows(items: &[AstItem]) -> Vec<ListInitialRecord> {
     let mut rows = Vec::new();
     let mut in_literal = false;
     for item in items {
@@ -2447,7 +2454,7 @@ fn list_record_literal_rows(items: &[AstItem]) -> Vec<ListSeedRecord> {
     rows
 }
 
-fn list_record_literal_item(item: &AstItem) -> Option<ListSeedRecord> {
+fn list_record_literal_item(item: &AstItem) -> Option<ListInitialRecord> {
     if item.symbols.first().map(String::as_str) != Some("[")
         || item.symbols.last().map(String::as_str) != Some("]")
     {
@@ -2462,12 +2469,12 @@ fn list_record_literal_item(item: &AstItem) -> Option<ListSeedRecord> {
         if !is_name(name) {
             continue;
         }
-        fields.push(ListSeedField {
+        fields.push(ListRowInitialField {
             name: name.to_owned(),
             value: literal_initial_value(&part[2..]),
         });
     }
-    (!fields.is_empty()).then_some(ListSeedRecord { fields })
+    (!fields.is_empty()).then_some(ListInitialRecord { fields })
 }
 
 fn literal_initial_value(tokens: &[String]) -> InitialValue {
@@ -3303,7 +3310,7 @@ impl FieldDef {
                     .iter()
                     .find(|candidate| candidate.id == output)
                     .is_some_and(|output| {
-                        ast_initial_value(output)
+                        ast_initial_value(output, &[])
                             == InitialValue::Text {
                                 value: String::new(),
                             }
@@ -3739,57 +3746,57 @@ mod tests {
             ir.lists[0].initializer,
             ListInitializer::RecordLiteral {
                 rows: vec![
-                    ListSeedRecord {
+                    ListInitialRecord {
                         fields: vec![
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "title".to_owned(),
                                 value: InitialValue::Text {
                                     value: "Read documentation".to_owned(),
                                 },
                             },
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "completed".to_owned(),
                                 value: InitialValue::Bool { value: false },
                             },
                         ],
                     },
-                    ListSeedRecord {
+                    ListInitialRecord {
                         fields: vec![
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "title".to_owned(),
                                 value: InitialValue::Text {
                                     value: "Finish TodoMVC renderer".to_owned(),
                                 },
                             },
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "completed".to_owned(),
                                 value: InitialValue::Bool { value: true },
                             },
                         ],
                     },
-                    ListSeedRecord {
+                    ListInitialRecord {
                         fields: vec![
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "title".to_owned(),
                                 value: InitialValue::Text {
                                     value: "Walk the dog".to_owned(),
                                 },
                             },
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "completed".to_owned(),
                                 value: InitialValue::Bool { value: false },
                             },
                         ],
                     },
-                    ListSeedRecord {
+                    ListInitialRecord {
                         fields: vec![
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "title".to_owned(),
                                 value: InitialValue::Text {
                                     value: "Buy groceries".to_owned(),
                                 },
                             },
-                            ListSeedField {
+                            ListRowInitialField {
                                 name: "completed".to_owned(),
                                 value: InitialValue::Bool { value: false },
                             },
@@ -3858,7 +3865,7 @@ mod tests {
         assert!(ir.state_cells.iter().any(|cell| {
             cell.path == "todo.title"
                 && cell.initial_value
-                    == InitialValue::SeedField {
+                    == InitialValue::RowInitialField {
                         path: "title".to_owned(),
                     }
         }));
@@ -3998,7 +4005,7 @@ mod tests {
     #[test]
     fn state_initial_values_are_lowered_from_ast_exprs() {
         let source = r#"
--- True False TEXT { comment } seed.title must not become an initializer
+-- True False TEXT { comment } todo.title must not become an initializer
 store: [
     sources: [
         click: SOURCE
@@ -4010,13 +4017,13 @@ store: [
     filter:
         All |> HOLD filter { LATEST {} }
     todos:
-        LIST { [title: TEXT { Seeded }, completed: False] }
-        |> List/map(seed, new: new_todo(seed: seed))
+        LIST { [title: TEXT { Initial }, completed: False] }
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     [
         title:
-            seed.title |> HOLD title { LATEST {} }
+            todo.title |> HOLD title { LATEST {} }
         completed:
             False |> HOLD completed { LATEST {} }
     ]
@@ -4044,7 +4051,7 @@ FUNCTION new_todo(seed) {
         assert!(ir.state_cells.iter().any(|cell| {
             cell.path == "todo.title"
                 && cell.initial_value
-                    == InitialValue::SeedField {
+                    == InitialValue::RowInitialField {
                         path: "title".to_owned(),
                     }
         }));
@@ -4061,9 +4068,9 @@ store: [
         TEXT { Formula/eval List/count List/retain WHEN THEN }
     todos:
         LIST {}
-        |> List/map(seed, new: new_todo(seed: seed))
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     [
         title:
             Text/empty |> HOLD title { LATEST {} }
@@ -4093,9 +4100,9 @@ store: [
         sources.real_button.press |> THEN { True }
     todos:
         LIST {}
-        |> List/map(seed, new: new_todo(seed: seed))
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     [
         title:
             Text/empty |> HOLD title { LATEST {} }
@@ -4139,12 +4146,12 @@ store: [
         |> List/append(item: pending_title |> THEN {
             [title: pending_title]
         })
-        |> List/map(seed, new: new_todo(seed: seed))
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     [
         title:
-            seed.title |> HOLD title { LATEST {} }
+            todo.title |> HOLD title { LATEST {} }
     ]
 }
 "#;
@@ -4180,17 +4187,17 @@ store: [
                 sources.clear_done.press |> THEN { todo.completed }
             }
         )
-        |> List/map(seed, new: new_todo(seed: seed))
+        |> List/map(todo, new: new_todo(todo: todo))
 ]
-FUNCTION new_todo(seed) {
+FUNCTION new_todo(todo) {
     sources: [
         delete_button: [press: SOURCE]
     ]
     [
         title:
-            seed.title |> HOLD title { LATEST {} }
+            todo.title |> HOLD title { LATEST {} }
         completed:
-            seed.completed |> HOLD completed { LATEST {} }
+            todo.completed |> HOLD completed { LATEST {} }
     ]
 }
 "#;
@@ -4267,7 +4274,7 @@ FUNCTION new_todo(seed) {
         assert!(ir.state_cells.iter().any(|cell| {
             cell.path == "cell.formula_text"
                 && cell.initial_value
-                    == InitialValue::SeedField {
+                    == InitialValue::RowInitialField {
                         path: "default_formula".to_owned(),
                     }
         }));
@@ -4507,12 +4514,12 @@ FUNCTION new_todo(seed) {
     fn cause_tables_derive_row_scope_from_list_map_function() {
         let source = include_str!("../../../examples/todomvc.bn")
             .replace(
-                "new_todo(seed: seed, store: store)",
-                "make_item(seed: seed, store: store)",
+                "new_todo(todo: todo, store: store)",
+                "make_item(todo: todo, store: store)",
             )
             .replace(
-                "FUNCTION new_todo(seed, store)",
-                "FUNCTION make_item(seed, store)",
+                "FUNCTION new_todo(todo, store)",
+                "FUNCTION make_item(todo, store)",
             );
         let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
@@ -4540,7 +4547,7 @@ FUNCTION new_todo(seed) {
 	        "All" |> HOLD selected { LATEST {} }
 	    entries:
 	        LIST[4] {}
-	        |> List/map(entry, new: make_entry(seed: entry))
+	        |> List/map(entry, new: make_entry(entry: entry))
 	    visible_entries:
 	        entries
 	        |> List/retain(entry, if:
@@ -4554,11 +4561,11 @@ FUNCTION new_todo(seed) {
 	        entries
 	        |> List/retain(entry, if: entry.completed |> Bool/not)
 	        |> List/count
-	FUNCTION make_entry(seed) {
+	FUNCTION make_entry(entry) {
     sources:
         checkbox: [click: SOURCE]
     title:
-        seed.title |> HOLD title { LATEST {} }
+        todo.title |> HOLD title { LATEST {} }
     completed:
         False |> HOLD completed {
             LATEST {

@@ -191,9 +191,9 @@ whose tier is explicit.
 Initial visible state must prove:
 
 - preview title is `todos`
-- seeded demo rows are visible
+- initial demo rows are visible
 - initial count is `3 items left`
-- one seeded completed row is visibly completed
+- one initial completed row is visibly completed
 - `Clear completed` visibility matches completed-count state
 - input placeholder is `What needs to be done?`
 - footer shows All, Active, and Completed filters
@@ -227,7 +227,7 @@ Initial visible state must prove:
 
 - grid is visible and not a placeholder
 - row and column headers are visible
-- seeded demo data is visible
+- initial demo data is visible
 - empty cells display empty, not `0`
 - focused cell style is visible
 - focused cell right/bottom borders are visible
@@ -314,7 +314,7 @@ Dev-editor speed requirements:
 The verifier must fail when:
 
 - the visible manual launch differs from automated artifacts
-- an app appears empty when seeded state is required
+- an app appears empty when initial state is required
 - visible controls do not match runtime state
 - a control is visible when its Boon `visible` condition is false
 - the user cannot interact with the visible window

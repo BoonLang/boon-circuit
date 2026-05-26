@@ -1,15 +1,15 @@
 use boon_document::{
-    DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap, StyleValue,
+    DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap, StyleValue,
 };
 use boon_host::SurfaceId;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, LayoutGlyph, Metrics, Resolution, Shaping,
+    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
     cosmic_text::{FeatureTag, FontFeatures, fontdb},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -27,7 +27,8 @@ const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-Italic.ttf");
 const JETBRAINS_MONO_BOLD_ITALIC_FONT_BYTES: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-BoldItalic.ttf");
-const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.60;
+const EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
+const EDITOR_FONT_FEATURES: &str = "zero,calt";
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -108,6 +109,65 @@ impl std::fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
+
+pub struct GlyphonTextMeasurer {
+    font_system: FontSystem,
+    cache: BTreeMap<(String, u32), boon_document::TextMetrics>,
+}
+
+impl GlyphonTextMeasurer {
+    pub fn new() -> Self {
+        Self {
+            font_system: editor_font_system(),
+            cache: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for GlyphonTextMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl boon_document::TextMeasurer for GlyphonTextMeasurer {
+    fn measure(&mut self, text: &str, font_size: f32) -> boon_document::TextMetrics {
+        let cache_key = (text.to_owned(), font_size.to_bits());
+        if let Some(metrics) = self.cache.get(&cache_key) {
+            return *metrics;
+        }
+        if text.is_empty() {
+            return boon_document::TextMetrics {
+                width: 0.0,
+                height: 0.0,
+            };
+        }
+        let font_size = font_size.max(1.0);
+        let line_height = (font_size * 1.25).max(1.0);
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
+        buffer.set_size(&mut self.font_system, None, Some(line_height));
+        buffer.set_text(
+            &mut self.font_system,
+            text,
+            &text_attrs(
+                EDITOR_FONT_FAMILY,
+                Style::Normal,
+                Weight::NORMAL,
+                [0, 0, 0, 255],
+                EDITOR_FONT_FEATURES,
+            ),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let metrics = boon_document::TextMetrics {
+            width: shaped_line_width(&buffer).unwrap_or_default(),
+            height: line_height,
+        };
+        self.cache.insert(cache_key, metrics);
+        metrics
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NativeGpuRenderer {
@@ -281,8 +341,22 @@ fn encode_layout_to_surface_with_pipeline(
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
     let height = request.height.clamp(1, 1080);
-    let (positions, colors, rect_metrics) =
-        rect_vertices(request.frame, width as f32, height as f32);
+    let visible_text_runs = text_runs(request.frame, width, height);
+    let text_runs_shaped = visible_text_runs.len() as u32;
+    let text_layout_nodes = text_layout_metric_nodes(request.frame);
+    let text_layout_metrics = match text.as_mut() {
+        Some(text) if !text_layout_nodes.is_empty() => {
+            Some(text.layout_metrics_for_runs(&visible_text_runs, &text_layout_nodes))
+        }
+        None => None,
+        Some(_) => None,
+    };
+    let (positions, colors, rect_metrics) = rect_vertices(
+        request.frame,
+        width as f32,
+        height as f32,
+        text_layout_metrics.as_ref(),
+    );
     let vertex_count = (positions.len() / 2) as u32;
     let position_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("boon-native-gpu-visible-position-buffer"),
@@ -329,8 +403,6 @@ fn encode_layout_to_surface_with_pipeline(
         pass.set_vertex_buffer(1, color_buffer.slice(..));
         pass.draw(0..vertex_count, 0..1);
     }
-    let visible_text_runs = text_runs(request.frame, width, height);
-    let text_runs_shaped = visible_text_runs.len() as u32;
     let rendered_text_runs = match text.as_mut() {
         Some(text) => text.render(
             request.device,
@@ -540,6 +612,39 @@ struct RichTextSpanPayload {
     font_weight: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct TextRunLayoutMetrics {
+    left: f32,
+    column_edges: Vec<f32>,
+}
+
+impl TextRunLayoutMetrics {
+    fn x_for_column(&self, column: f32) -> f32 {
+        let column = column.max(0.0);
+        let lower = column.floor() as usize;
+        let fraction = column - lower as f32;
+        let lower_x = self
+            .column_edges
+            .get(lower)
+            .copied()
+            .or_else(|| self.column_edges.last().copied())
+            .unwrap_or(0.0);
+        let upper_x = self
+            .column_edges
+            .get(lower.saturating_add(1))
+            .copied()
+            .or_else(|| self.column_edges.last().copied())
+            .unwrap_or(lower_x);
+        self.left + lower_x + (upper_x - lower_x) * fraction
+    }
+
+    fn width_for_column(&self, column: f32) -> f32 {
+        (self.x_for_column(column + 1.0) - self.x_for_column(column)).max(1.0)
+    }
+}
+
+type TextRunLayoutMap = BTreeMap<DocumentNodeId, TextRunLayoutMetrics>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextRunSignature {
     text: String,
@@ -654,42 +759,19 @@ impl GlyphonTextState {
             return Ok(0);
         }
         self.viewport.update(queue, Resolution { width, height });
-        let signatures = runs
-            .iter()
-            .map(TextRunSignature::from_run)
-            .collect::<Vec<_>>();
+        self.ensure_buffers(&runs);
         let placement_signatures = runs
             .iter()
             .map(TextRunPlacementSignature::from_run)
             .collect::<Vec<_>>();
-        if self.buffer_signatures != signatures {
-            let old_signatures = std::mem::take(&mut self.buffer_signatures);
-            let old_buffers = std::mem::take(&mut self.buffers);
-            let mut old_buffers = old_signatures
-                .into_iter()
-                .zip(old_buffers)
-                .collect::<Vec<_>>();
-            self.buffers.reserve(runs.len());
-            for (signature, run) in signatures.iter().cloned().zip(runs.iter()) {
-                if let Some(index) = old_buffers
-                    .iter()
-                    .position(|(old_signature, _)| *old_signature == signature)
-                {
-                    let (_, buffer) = old_buffers.swap_remove(index);
-                    self.buffers.push(buffer);
-                } else {
-                    let buffer = self.shape_text_run(run);
-                    self.buffers.push(buffer);
-                }
-            }
-            self.buffer_signatures = signatures;
-        }
         if self.prepared_signatures != placement_signatures
             || self.prepared_viewport != Some((width, height))
         {
             let mut areas = Vec::with_capacity(self.buffers.len());
             for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
-                let left = text_left(run);
+                let line_width =
+                    shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
+                let left = text_left_for_width(run, line_width);
                 let top = run.bounds.y + 1.0;
                 areas.push(TextArea {
                     buffer,
@@ -748,56 +830,104 @@ impl GlyphonTextState {
         Ok(self.buffers.len() as u32)
     }
 
-    fn shape_text_run(&mut self, run: &TextRun) -> Buffer {
-        let bounds = run.bounds;
-        let font_size = run.size.clamp(8.0, 120.0);
-        let default_attrs = text_attrs(
-            &run.font_family,
-            run.font_style,
-            run.font_weight,
-            run.color,
-            &run.font_features,
-        );
-        let mut buffer = Buffer::new(
-            &mut self.font_system,
-            Metrics::new(font_size, font_size * 1.25),
-        );
-        buffer.set_size(
-            &mut self.font_system,
-            Some((bounds.width + run.text_clip_padding).max(1.0)),
-            Some(bounds.height.max(font_size * 1.25)),
-        );
-        if run.rich_spans.is_empty() {
-            buffer.set_text(
-                &mut self.font_system,
-                &run.text,
-                &default_attrs,
-                Shaping::Advanced,
-                None,
-            );
-        } else {
-            buffer.set_rich_text(
-                &mut self.font_system,
-                run.rich_spans.iter().map(|span| {
-                    (
-                        span.text.as_str(),
-                        text_attrs(
-                            &run.font_family,
-                            span.font_style,
-                            span.font_weight,
-                            span.color,
-                            &run.font_features,
-                        ),
-                    )
-                }),
-                &default_attrs,
-                Shaping::Advanced,
-                None,
-            );
+    fn ensure_buffers(&mut self, runs: &[TextRun]) {
+        let signatures = runs
+            .iter()
+            .map(TextRunSignature::from_run)
+            .collect::<Vec<_>>();
+        if self.buffer_signatures != signatures {
+            let old_signatures = std::mem::take(&mut self.buffer_signatures);
+            let old_buffers = std::mem::take(&mut self.buffers);
+            let mut old_buffers = old_signatures
+                .into_iter()
+                .zip(old_buffers)
+                .collect::<Vec<_>>();
+            self.buffers.reserve(runs.len());
+            for (signature, run) in signatures.iter().cloned().zip(runs.iter()) {
+                if let Some(index) = old_buffers
+                    .iter()
+                    .position(|(old_signature, _)| *old_signature == signature)
+                {
+                    let (_, buffer) = old_buffers.swap_remove(index);
+                    self.buffers.push(buffer);
+                } else {
+                    let buffer = shape_text_run(&mut self.font_system, run);
+                    self.buffers.push(buffer);
+                }
+            }
+            self.buffer_signatures = signatures;
         }
-        buffer.shape_until_scroll(&mut self.font_system, false);
-        buffer
     }
+
+    fn layout_metrics_for_runs(
+        &mut self,
+        runs: &[TextRun],
+        required_nodes: &BTreeSet<DocumentNodeId>,
+    ) -> TextRunLayoutMap {
+        self.ensure_buffers(runs);
+        runs.iter()
+            .zip(self.buffers.iter())
+            .filter(|(run, _)| required_nodes.contains(&run.node))
+            .map(|(run, buffer)| {
+                let line_width =
+                    shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
+                let left = text_left_for_width(run, line_width);
+                let column_edges = shaped_column_edges(&run.text, buffer, line_width);
+                (
+                    run.node.clone(),
+                    TextRunLayoutMetrics { left, column_edges },
+                )
+            })
+            .collect()
+    }
+}
+
+fn shape_text_run(font_system: &mut FontSystem, run: &TextRun) -> Buffer {
+    let bounds = run.bounds;
+    let font_size = run.size.clamp(8.0, 120.0);
+    let default_attrs = text_attrs(
+        &run.font_family,
+        run.font_style,
+        run.font_weight,
+        run.color,
+        &run.font_features,
+    );
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.25));
+    buffer.set_size(
+        font_system,
+        Some((bounds.width + run.text_clip_padding).max(1.0)),
+        Some(bounds.height.max(font_size * 1.25)),
+    );
+    if run.rich_spans.is_empty() {
+        buffer.set_text(
+            font_system,
+            &run.text,
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+    } else {
+        buffer.set_rich_text(
+            font_system,
+            run.rich_spans.iter().map(|span| {
+                (
+                    span.text.as_str(),
+                    text_attrs(
+                        &run.font_family,
+                        span.font_style,
+                        span.font_weight,
+                        span.color,
+                        &run.font_features,
+                    ),
+                )
+            }),
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+    }
+    buffer.shape_until_scroll(font_system, false);
+    buffer
 }
 
 fn text_attrs<'a>(
@@ -827,6 +957,7 @@ fn editor_font_system() -> FontSystem {
 }
 
 struct TextRun {
+    node: DocumentNodeId,
     bounds: Rect,
     text: String,
     rich_spans: Vec<RichTextSpan>,
@@ -897,6 +1028,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             };
             let rich_spans = rich_text_spans(&item.style, &text, color);
             Some(TextRun {
+                node: item.node.clone(),
                 bounds: item.bounds,
                 text,
                 rich_spans,
@@ -953,6 +1085,96 @@ fn rich_text_spans(style: &StyleMap, text: &str, default_color: [u8; 4]) -> Vec<
     } else {
         Vec::new()
     }
+}
+
+pub fn editor_text_column_edges(
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    font_family: &str,
+    font_features: &str,
+) -> Vec<f32> {
+    let mut font_system = editor_font_system();
+    let color = [217, 225, 242, 255];
+    let mut buffer = Buffer::new(
+        &mut font_system,
+        Metrics::new(font_size.max(1.0), line_height.max(font_size.max(1.0))),
+    );
+    buffer.set_size(
+        &mut font_system,
+        None,
+        Some(line_height.max(font_size.max(1.0))),
+    );
+    buffer.set_text(
+        &mut font_system,
+        text,
+        &text_attrs(
+            font_family,
+            Style::Normal,
+            Weight::NORMAL,
+            color,
+            font_features,
+        ),
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(&mut font_system, false);
+    let line_width = shaped_line_width(&buffer).unwrap_or_default();
+    shaped_column_edges(text, &buffer, line_width)
+}
+
+pub fn editor_text_column_edges_for_style(
+    text: &str,
+    style: &StyleMap,
+    line_height: f32,
+) -> Vec<f32> {
+    let mut font_system = editor_font_system();
+    let font_size = style_number(style, "size").unwrap_or(14.0).max(1.0);
+    let line_height = line_height.max(font_size);
+    let color = style_color_u8(style, "color").unwrap_or([217, 225, 242, 255]);
+    let font_family = style_text(style, "font").unwrap_or(EDITOR_FONT_FAMILY);
+    let font_features = style_text(style, "font_features").unwrap_or(EDITOR_FONT_FEATURES);
+    let default_attrs = text_attrs(
+        font_family,
+        text_font_style(style),
+        text_font_weight(style),
+        color,
+        font_features,
+    );
+    let mut buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(&mut font_system, None, Some(line_height));
+    let rich_spans = rich_text_spans(style, text, color);
+    if rich_spans.is_empty() {
+        buffer.set_text(
+            &mut font_system,
+            text,
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+    } else {
+        buffer.set_rich_text(
+            &mut font_system,
+            rich_spans.iter().map(|span| {
+                (
+                    span.text.as_str(),
+                    text_attrs(
+                        font_family,
+                        span.font_style,
+                        span.font_weight,
+                        span.color,
+                        font_features,
+                    ),
+                )
+            }),
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+    }
+    buffer.shape_until_scroll(&mut font_system, false);
+    let line_width = shaped_line_width(&buffer).unwrap_or_default();
+    shaped_column_edges(text, &buffer, line_width)
 }
 
 fn text_font_features(value: &str) -> FontFeatures {
@@ -1023,16 +1245,84 @@ fn text_font_weight_value(value: &str) -> Weight {
     }
 }
 
-fn text_left(run: &TextRun) -> f32 {
-    let estimated_width = run.text.chars().count() as f32 * run.size * MONOSPACE_TEXT_WIDTH_FACTOR;
+fn estimated_text_width(run: &TextRun) -> f32 {
+    if run.text.is_empty() {
+        0.0
+    } else {
+        run.bounds.width
+    }
+}
+
+fn shaped_line_width(buffer: &Buffer) -> Option<f32> {
+    buffer.layout_runs().next().map(|run| run.line_w)
+}
+
+fn text_left_for_width(run: &TextRun, text_width: f32) -> f32 {
     match run.align {
         TextAlign::Left => run.bounds.x + run.text_inset,
         TextAlign::Center => {
-            run.bounds.x + ((run.bounds.width - estimated_width) / 2.0).max(run.text_inset)
+            run.bounds.x + ((run.bounds.width - text_width) / 2.0).max(run.text_inset)
         }
         TextAlign::Right => {
-            run.bounds.x + (run.bounds.width - estimated_width - run.text_inset).max(run.text_inset)
+            run.bounds.x + (run.bounds.width - text_width - run.text_inset).max(run.text_inset)
         }
+    }
+}
+
+fn shaped_column_edges(text: &str, buffer: &Buffer, line_width: f32) -> Vec<f32> {
+    let char_count = text.chars().count();
+    let mut edges = vec![None; char_count.saturating_add(1)];
+    if let Some(first) = edges.first_mut() {
+        *first = Some(0.0);
+    }
+    if let Some(last) = edges.last_mut() {
+        *last = Some(line_width.max(0.0));
+    }
+    if let Some(run) = buffer.layout_runs().next() {
+        for glyph in run.glyphs {
+            apply_glyph_edges(text, &mut edges, glyph);
+        }
+    }
+    fill_missing_column_edges(&mut edges, line_width.max(0.0));
+    edges.into_iter().map(|edge| edge.unwrap_or(0.0)).collect()
+}
+
+fn apply_glyph_edges(text: &str, edges: &mut [Option<f32>], glyph: &LayoutGlyph) {
+    let start = byte_to_char_column(text, glyph.start.min(text.len()));
+    let end = byte_to_char_column(text, glyph.end.min(text.len()));
+    if start >= edges.len() || end > edges.len() || end <= start {
+        return;
+    }
+    let glyph_left = glyph.x;
+    let glyph_right = glyph.x + glyph.w;
+    let span = (end - start) as f32;
+    for column in start..=end {
+        let fraction = (column - start) as f32 / span;
+        edges[column] = Some(glyph_left + (glyph_right - glyph_left) * fraction);
+    }
+}
+
+fn byte_to_char_column(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+fn fill_missing_column_edges(edges: &mut [Option<f32>], line_width: f32) {
+    let last_index = edges.len().saturating_sub(1);
+    let fallback_advance = if last_index > 0 {
+        line_width / last_index as f32
+    } else {
+        0.0
+    };
+    for index in 0..edges.len() {
+        if edges[index].is_none() {
+            edges[index] = Some(index as f32 * fallback_advance);
+        }
+    }
+    let mut previous = 0.0;
+    for edge in edges.iter_mut() {
+        let clamped = edge.unwrap_or(previous).max(previous);
+        *edge = Some(clamped);
+        previous = clamped;
     }
 }
 
@@ -1041,6 +1331,21 @@ fn rect_intersects(rect: Rect, viewport: Rect) -> bool {
         && rect.x + rect.width > viewport.x
         && rect.y < viewport.y + viewport.height
         && rect.y + rect.height > viewport.y
+}
+
+fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
+    frame
+        .display_list
+        .iter()
+        .filter(|item| matches!(item.kind, DocumentNodeKind::Text))
+        .filter(|item| {
+            item.style.contains_key("editor_selection_start")
+                || item.style.contains_key("editor_selection_end")
+                || item.style.contains_key("editor_bracket_columns")
+                || item.style.contains_key("editor_caret_column")
+        })
+        .map(|item| item.node.clone())
+        .collect()
 }
 
 fn text_align(style: &StyleMap) -> TextAlign {
@@ -1098,6 +1403,7 @@ fn rect_vertices(
     frame: &LayoutFrame,
     width: f32,
     height: f32,
+    text_layouts: Option<&TextRunLayoutMap>,
 ) -> (Vec<f32>, Vec<u8>, RectVertexMetrics) {
     let mut positions = Vec::new();
     let mut colors = Vec::new();
@@ -1163,27 +1469,27 @@ fn rect_vertices(
         }
         if matches!(item.kind, DocumentNodeKind::Text) {
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
-            let char_width = style_number(&item.style, "editor_cell_width")
-                .unwrap_or(font_size * MONOSPACE_TEXT_WIDTH_FACTOR)
-                .max(1.0);
-            let inset = style_number(&item.style, "text_inset").unwrap_or(0.0);
+            let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
             let line_top = item.bounds.y + 2.0;
             let line_height = (item.bounds.height - 4.0).max(font_size);
             if let (Some(start), Some(end)) = (
                 style_number(&item.style, "editor_selection_start"),
                 style_number(&item.style, "editor_selection_end"),
-            ) {
+            ) && let Some(text_layout) = text_layout
+            {
                 let selection_color = style_color_f32(&item.style, "editor_selection_color")
                     .unwrap_or([0.048, 0.06, 0.08, 1.0]);
                 let start = start.max(0.0);
                 let end = end.max(start);
+                let start_x = text_layout.x_for_column(start);
+                let end_x = text_layout.x_for_column(end);
                 push_rect(
                     &mut positions,
                     &mut colors,
                     Rect {
-                        x: item.bounds.x + inset + start * char_width,
+                        x: start_x,
                         y: line_top,
-                        width: ((end - start) * char_width).max(2.0),
+                        width: (end_x - start_x).max(2.0),
                         height: line_height,
                     },
                     width,
@@ -1192,18 +1498,19 @@ fn rect_vertices(
                 );
                 metrics.rendered_rect_count += 1;
             }
-            if let Some(columns) = style_text(&item.style, "editor_bracket_columns") {
+            if let Some(columns) = style_text(&item.style, "editor_bracket_columns")
+                && let Some(text_layout) = text_layout
+            {
                 let bracket_color = style_color_f32(&item.style, "editor_bracket_color")
                     .unwrap_or([0.322, 0.545, 1.0, 0.20]);
                 for column in columns
                     .split(',')
                     .filter_map(|column| column.parse::<f32>().ok())
                 {
-                    let bracket_width = (char_width * 0.72).max(2.0);
-                    let bracket_x = item.bounds.x
-                        + inset
-                        + column.max(0.0) * char_width
-                        + (char_width - bracket_width) * 0.5;
+                    let cell_width = text_layout.width_for_column(column.max(0.0));
+                    let bracket_width = (cell_width * 0.72).max(2.0);
+                    let bracket_x = text_layout.x_for_column(column.max(0.0))
+                        + (cell_width - bracket_width) * 0.5;
                     push_rect(
                         &mut positions,
                         &mut colors,
@@ -1222,6 +1529,7 @@ fn rect_vertices(
             }
             if style_bool(&item.style, "editor_caret_visible") == Some(true)
                 && let Some(column) = style_number(&item.style, "editor_caret_column")
+                && let Some(text_layout) = text_layout
             {
                 let caret_color = style_color_f32(&item.style, "editor_caret_color")
                     .or_else(|| style_color_f32(&item.style, "color"))
@@ -1230,7 +1538,7 @@ fn rect_vertices(
                     &mut positions,
                     &mut colors,
                     Rect {
-                        x: item.bounds.x + inset + column.max(0.0) * char_width,
+                        x: text_layout.x_for_column(column.max(0.0)),
                         y: line_top,
                         width: 2.0,
                         height: line_height,
@@ -1669,10 +1977,14 @@ mod tests {
             ),
         ]);
         assert_eq!(punctuation.len(), 10);
+        let first_advance = punctuation
+            .first()
+            .map(|(_, advance)| *advance)
+            .expect("punctuation should shape");
         assert!(
             punctuation
                 .iter()
-                .all(|(_, advance)| (*advance - 0.60).abs() < f32::EPSILON),
+                .all(|(_, advance)| (*advance - first_advance).abs() < f32::EPSILON),
             "styled punctuation must stay on the bundled monospace JetBrains variants: {punctuation:?}"
         );
     }
@@ -1682,7 +1994,6 @@ mod tests {
         let mut style = StyleMap::new();
         style.insert("bg".to_owned(), StyleValue::Text("#282c34".to_owned()));
         style.insert("size".to_owned(), StyleValue::Number(16.0));
-        style.insert("editor_cell_width".to_owned(), StyleValue::Number(8.8));
         style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
         style.insert("editor_selection_start".to_owned(), StyleValue::Number(1.0));
         style.insert("editor_selection_end".to_owned(), StyleValue::Number(4.0));
@@ -1725,25 +2036,50 @@ mod tests {
             metrics: LayoutMetrics::default(),
         };
 
-        let (_, _, metrics) = rect_vertices(&frame, 320.0, 120.0);
+        let text_layouts = test_text_layouts(&frame, 320, 120);
+        let (_, _, metrics) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
         assert!(
             metrics.rendered_rect_count >= 6,
             "background + item + selection + two brackets + caret should render"
         );
 
-        let (positions, colors, _) = rect_vertices(&frame, 320.0, 120.0);
+        let (positions, colors, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
         let first_bracket_rect = 3usize;
         let x0_ndc = positions[first_bracket_rect * 12];
         let x1_ndc = positions[first_bracket_rect * 12 + 2];
         let bracket_width = ((x1_ndc - x0_ndc) * 0.5) * 320.0;
+        let cell_width = text_layouts
+            .get(&DocumentNodeId("editor-line".to_owned()))
+            .expect("text layout should exist")
+            .width_for_column(0.0);
         assert!(
-            bracket_width < 8.8,
+            bracket_width < cell_width,
             "bracket highlight should be narrower than a full cell to avoid bleeding into neighbors"
         );
         assert_eq!(
             &colors[first_bracket_rect * 24..first_bracket_rect * 24 + 4],
             &[22, 66, 255, 51]
         );
+    }
+
+    fn test_text_layouts(frame: &LayoutFrame, width: u32, height: u32) -> TextRunLayoutMap {
+        let runs = text_runs(frame, width, height);
+        let required_nodes = text_layout_metric_nodes(frame);
+        let mut font_system = editor_font_system();
+        runs.iter()
+            .filter(|run| required_nodes.contains(&run.node))
+            .map(|run| {
+                let buffer = shape_text_run(&mut font_system, run);
+                let line_width =
+                    shaped_line_width(&buffer).unwrap_or_else(|| estimated_text_width(run));
+                let left = text_left_for_width(run, line_width);
+                let column_edges = shaped_column_edges(&run.text, &buffer, line_width);
+                (
+                    run.node.clone(),
+                    TextRunLayoutMetrics { left, column_edges },
+                )
+            })
+            .collect()
     }
 
     #[test]

@@ -1620,7 +1620,7 @@ fn verify_native_gpu_layout_contract(args: &[String]) -> Result<(), Box<dyn std:
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let frame = boon_document::fixture_frame_with_virtualized_grid();
-    let mut measurer = boon_document::SimpleTextMeasurer;
+    let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
         viewport: boon_host::Viewport {

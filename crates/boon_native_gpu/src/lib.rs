@@ -3,8 +3,8 @@ use boon_document::{
 };
 use boon_host::SurfaceId;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,7 @@ pub const REQUIRED_WGPU_VERSION: &str = "29.0.1";
 pub const REQUIRED_GLYPHON_VERSION: &str = "0.11.0";
 const JETBRAINS_MONO_FONT_BYTES: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Patched.woff2");
+const MONOSPACE_TEXT_WIDTH_FACTOR: f32 = 0.60;
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -519,6 +520,10 @@ struct GlyphonTextState {
 struct TextRunSignature {
     text: String,
     font_family: String,
+    font_style: Style,
+    font_weight: Weight,
+    text_inset: u32,
+    text_clip_padding: u32,
     width: u32,
     height: u32,
     size: u32,
@@ -530,6 +535,10 @@ struct TextRunSignature {
 struct TextRunPlacementSignature {
     text: String,
     font_family: String,
+    font_style: Style,
+    font_weight: Weight,
+    text_inset: u32,
+    text_clip_padding: u32,
     x: u32,
     y: u32,
     width: u32,
@@ -544,6 +553,10 @@ impl TextRunSignature {
         Self {
             text: run.text.clone(),
             font_family: run.font_family.clone(),
+            font_style: run.font_style,
+            font_weight: run.font_weight,
+            text_inset: run.text_inset.to_bits(),
+            text_clip_padding: run.text_clip_padding.to_bits(),
             width: run.bounds.width.to_bits(),
             height: run.bounds.height.to_bits(),
             size: run.size.to_bits(),
@@ -558,6 +571,10 @@ impl TextRunPlacementSignature {
         Self {
             text: run.text.clone(),
             font_family: run.font_family.clone(),
+            font_style: run.font_style,
+            font_weight: run.font_weight,
+            text_inset: run.text_inset.to_bits(),
+            text_clip_padding: run.text_clip_padding.to_bits(),
             x: run.bounds.x.to_bits(),
             y: run.bounds.y.to_bits(),
             width: run.bounds.width.to_bits(),
@@ -650,7 +667,7 @@ impl GlyphonTextState {
                     left,
                     top,
                     scale: 1.0,
-                    bounds: text_bounds(run.bounds, width, height),
+                    bounds: text_bounds(run, width, height),
                     default_color: Color::rgba(
                         run.color[0],
                         run.color[1],
@@ -711,13 +728,16 @@ impl GlyphonTextState {
         );
         buffer.set_size(
             &mut self.font_system,
-            Some(bounds.width.max(1.0)),
+            Some((bounds.width + run.text_clip_padding).max(1.0)),
             Some(bounds.height.max(font_size * 1.25)),
         );
         buffer.set_text(
             &mut self.font_system,
             &run.text,
-            &Attrs::new().family(Family::Name(&run.font_family)),
+            &Attrs::new()
+                .family(Family::Name(&run.font_family))
+                .style(run.font_style)
+                .weight(run.font_weight),
             Shaping::Advanced,
             None,
         );
@@ -730,6 +750,10 @@ struct TextRun {
     bounds: Rect,
     text: String,
     font_family: String,
+    font_style: Style,
+    font_weight: Weight,
+    text_inset: f32,
+    text_clip_padding: f32,
     color: [u8; 4],
     size: f32,
     align: TextAlign,
@@ -793,6 +817,10 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                 bounds: item.bounds,
                 text,
                 font_family: font_family.to_owned(),
+                font_style: text_font_style(&item.style),
+                font_weight: text_font_weight(&item.style),
+                text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
+                text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
                 color,
                 size,
                 align: text_align(&item.style),
@@ -801,12 +829,42 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         .collect()
 }
 
+fn text_font_style(style: &StyleMap) -> Style {
+    match style_text(style, "font_style")
+        .or_else(|| style_text(style, "style"))
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("italic") | Some("cursive") => Style::Italic,
+        Some("oblique") => Style::Oblique,
+        _ => Style::Normal,
+    }
+}
+
+fn text_font_weight(style: &StyleMap) -> Weight {
+    match style_text(style, "weight").map(str::to_ascii_lowercase) {
+        Some(value) if value == "bold" => Weight::BOLD,
+        Some(value) if value == "bolder" => Weight::EXTRA_BOLD,
+        Some(value) if value == "semibold" || value == "semi-bold" => Weight::SEMIBOLD,
+        Some(value) if value == "medium" => Weight::MEDIUM,
+        Some(value) if value == "normal" => Weight::NORMAL,
+        Some(value) => value.parse::<u16>().map(Weight).unwrap_or(Weight::NORMAL),
+        None => style_number(style, "weight")
+            .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
+            .unwrap_or(Weight::NORMAL),
+    }
+}
+
 fn text_left(run: &TextRun) -> f32 {
-    let estimated_width = run.text.chars().count() as f32 * run.size * 0.55;
+    let estimated_width = run.text.chars().count() as f32 * run.size * MONOSPACE_TEXT_WIDTH_FACTOR;
     match run.align {
-        TextAlign::Left => run.bounds.x + 4.0,
-        TextAlign::Center => run.bounds.x + ((run.bounds.width - estimated_width) / 2.0).max(4.0),
-        TextAlign::Right => run.bounds.x + (run.bounds.width - estimated_width - 4.0).max(4.0),
+        TextAlign::Left => run.bounds.x + run.text_inset,
+        TextAlign::Center => {
+            run.bounds.x + ((run.bounds.width - estimated_width) / 2.0).max(run.text_inset)
+        }
+        TextAlign::Right => {
+            run.bounds.x + (run.bounds.width - estimated_width - run.text_inset).max(run.text_inset)
+        }
     }
 }
 
@@ -851,12 +909,13 @@ fn style_text<'a>(style: &'a StyleMap, key: &str) -> Option<&'a str> {
     }
 }
 
-fn text_bounds(bounds: Rect, width: u32, height: u32) -> TextBounds {
+fn text_bounds(run: &TextRun, width: u32, height: u32) -> TextBounds {
+    let bounds = run.bounds;
     TextBounds {
         left: bounds.x.max(0.0) as i32,
         top: bounds.y.max(0.0) as i32,
-        right: (bounds.x + bounds.width).clamp(0.0, width as f32) as i32,
-        bottom: (bounds.y + bounds.height).clamp(0.0, height as f32) as i32,
+        right: (bounds.x + bounds.width + run.text_clip_padding).clamp(0.0, width as f32) as i32,
+        bottom: (bounds.y + bounds.height + run.text_clip_padding).clamp(0.0, height as f32) as i32,
     }
 }
 
@@ -1110,12 +1169,21 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
 fn style_color_f32(style: &StyleMap, key: &str) -> Option<[f32; 4]> {
     style_color_u8(style, key).map(|color| {
         [
-            color[0] as f32 / 255.0,
-            color[1] as f32 / 255.0,
-            color[2] as f32 / 255.0,
+            srgb_u8_to_linear_f32(color[0]),
+            srgb_u8_to_linear_f32(color[1]),
+            srgb_u8_to_linear_f32(color[2]),
             color[3] as f32 / 255.0,
         ]
     })
+}
+
+fn srgb_u8_to_linear_f32(channel: u8) -> f32 {
+    let channel = channel as f32 / 255.0;
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {

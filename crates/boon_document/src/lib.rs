@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+const SIMPLE_MONOSPACE_WIDTH_FACTOR: f32 = 0.60;
+
 pub trait TextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics;
 }
@@ -241,7 +243,9 @@ impl LayoutBuilder<'_, '_> {
                 height: 0.0,
             });
         let mut width = if auto_width {
-            (measured.width + style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9).max(1.0)
+            let auto_padding = style_spacing(&node.style, "auto_padding")
+                .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
+            (measured.width + auto_padding).max(1.0)
         } else {
             explicit_width
                 .unwrap_or_else(|| measured.width.max(available_width))
@@ -379,7 +383,7 @@ pub struct SimpleTextMeasurer;
 impl TextMeasurer for SimpleTextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics {
         TextMetrics {
-            width: text.chars().count() as f32 * font_size * 0.55,
+            width: text.chars().count() as f32 * font_size * SIMPLE_MONOSPACE_WIDTH_FACTOR,
             height: font_size * 1.4,
         }
     }

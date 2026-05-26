@@ -12,6 +12,19 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
+const BOON_EDITOR_FONT_SIZE: u32 = 13;
+const BOON_EDITOR_LINE_HEIGHT: u32 = 18;
+const BOON_EDITOR_PADDING: u32 = 10;
+const BOON_EDITOR_GUTTER_WIDTH: u32 = 44;
+const BOON_EDITOR_ROW_GAP: u32 = 8;
+const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.60;
+const BOON_EDITOR_BACKGROUND: &str = "#282c34";
+const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
+const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
+const BOON_EDITOR_HIGHLIGHT_BACKGROUND: &str = "#2c313a";
+const BOON_EDITOR_GUTTER: &str = "#5c6773";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("boon_native_playground: {error}");
@@ -1514,8 +1527,14 @@ fn native_gpu_dev_visible_render_hook(
         "code_editor_model": {
             "full_buffer_bytes": shell.workspace.selected_buffer.source_text.len(),
             "full_buffer_lines": shell.workspace.selected_buffer.line_count,
+            "syntax_backend": shell.workspace.selected_buffer.syntax_backend(),
+            "syntax_parser_backed": shell.workspace.selected_buffer.syntax_parser_backed(),
             "syntax_token_count": shell.workspace.selected_buffer.syntax_token_count(),
             "syntax_categories": shell.workspace.selected_buffer.syntax_categories(),
+            "syntax_render_categories": shell.workspace.selected_buffer.syntax_render_categories(),
+            "syntax_render_segment_samples": shell.workspace.selected_buffer.syntax_render_segment_samples(),
+            "syntax_render_segment_count": shell.workspace.selected_buffer.syntax_render_segments_for_visible_lines(40).len(),
+            "syntax_theme": shell.workspace.selected_buffer.syntax_theme_report(),
             "diagnostic_count": shell.workspace.selected_buffer.diagnostics.len(),
             "font_family": shell.editor_view.font_family,
             "native_rust_editor_model": true
@@ -1735,10 +1754,10 @@ fn dev_move_caret_from_pointer(
     else {
         return;
     };
-    let relative_y = (y - editor_bounds.y - 12.0).max(0.0);
+    let relative_y = (y - editor_bounds.y - BOON_EDITOR_PADDING as f32).max(0.0);
     let line = model
         .scroll_line
-        .saturating_add((relative_y / 16.0).floor() as usize)
+        .saturating_add((relative_y / BOON_EDITOR_LINE_HEIGHT as f32).floor() as usize)
         .saturating_add(1)
         .min(model.line_count.max(1));
     let line_text = model
@@ -1746,8 +1765,13 @@ fn dev_move_caret_from_pointer(
         .lines()
         .nth(line.saturating_sub(1))
         .unwrap_or("");
-    let relative_x = (x - editor_bounds.x - 64.0).max(0.0);
-    let column = ((relative_x / 7.5).floor() as usize + 1).min(line_text.chars().count() + 1);
+    let relative_x = (x
+        - editor_bounds.x
+        - (BOON_EDITOR_PADDING + BOON_EDITOR_GUTTER_WIDTH + BOON_EDITOR_ROW_GAP) as f32)
+        .max(0.0);
+    let char_width = BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR;
+    let column =
+        ((relative_x / char_width).floor() as usize + 1).min(line_text.chars().count() + 1);
     model.set_selection(
         EditorPosition { line, column },
         EditorPosition { line, column },
@@ -2653,23 +2677,67 @@ impl BoonLanguageService {
         }
     }
 
-    fn syntax_tokens(source: &str) -> Vec<SyntaxToken> {
+    fn syntax_highlighting(source: &str) -> SyntaxHighlighting {
         if let Ok(ast) = boon_parser::parse_ast("<editor>", source) {
-            return ast
+            let tokens = ast
                 .tokens
                 .iter()
                 .filter(|token| token.kind != AstTokenKind::Newline)
-                .map(|token| {
-                    SyntaxToken::new(
-                        Self::syntax_kind_from_ast_token(token.kind, &token.lexeme),
-                        token.line,
-                        token.column,
-                        token.lexeme.chars().count().max(1),
-                    )
-                })
-                .collect();
+                .filter_map(|token| Self::syntax_token_from_ast_token(source, token))
+                .collect::<Vec<_>>();
+            return SyntaxHighlighting {
+                backend: "boon_parser::parse_ast",
+                parser_backed: true,
+                tokens: Self::apply_original_boon_semantics(source, tokens),
+            };
         }
-        Self::syntax_tokens_fallback(source)
+        SyntaxHighlighting {
+            backend: "editor-fallback-tokenizer",
+            parser_backed: false,
+            tokens: Self::syntax_tokens_fallback(source),
+        }
+    }
+
+    fn syntax_token_from_ast_token(
+        source: &str,
+        token: &boon_parser::AstToken,
+    ) -> Option<SyntaxToken> {
+        let raw = source.get(token.start..token.end).unwrap_or(&token.lexeme);
+        let text = Self::visible_token_text(token.kind, raw, &token.lexeme)?;
+        let leading_chars = raw
+            .find(text)
+            .map(|byte| raw[..byte].chars().count())
+            .unwrap_or(0);
+        let leading_bytes = raw.find(text).unwrap_or(0);
+        let start = token.start.saturating_add(leading_bytes);
+        let end = start.saturating_add(text.len());
+        Some(SyntaxToken::new_at(
+            Self::syntax_kind_from_ast_token(token.kind, text),
+            token.line,
+            token.column + leading_chars,
+            text,
+            start,
+            end,
+        ))
+    }
+
+    fn visible_token_text<'a>(
+        kind: AstTokenKind,
+        raw: &'a str,
+        lexeme: &'a str,
+    ) -> Option<&'a str> {
+        match kind {
+            AstTokenKind::Comment => raw
+                .find("--")
+                .and_then(|start| raw.get(start..))
+                .or_else(|| (!lexeme.is_empty()).then_some(lexeme)),
+            AstTokenKind::String => raw
+                .find('"')
+                .and_then(|start| raw.get(start..))
+                .or_else(|| (!lexeme.is_empty()).then_some(lexeme)),
+            AstTokenKind::Newline => None,
+            _ => (!lexeme.is_empty()).then_some(lexeme),
+        }
     }
 
     fn syntax_kind_from_ast_token(kind: AstTokenKind, lexeme: &str) -> &'static str {
@@ -2680,30 +2748,466 @@ impl BoonLanguageService {
             AstTokenKind::Comment => "comment",
             AstTokenKind::String => "string",
             AstTokenKind::Number => "number",
-            AstTokenKind::Operator | AstTokenKind::Symbol => "operator",
+            AstTokenKind::Operator => "operator",
+            AstTokenKind::Symbol => match lexeme {
+                ":" | "," | "." | "(" | ")" | "{" | "}" | "[" | "]" => "punctuation",
+                _ => "invalid",
+            },
             AstTokenKind::Identifier => match lexeme {
-                "SOURCE" | "HOLD" | "LATEST" | "THEN" | "WHEN" | "WHILE" | "LIST" | "TEXT"
-                | "BOOL" | "INT" | "FLOAT" => "keyword",
                 _ if lexeme.contains('/') => "source-binding",
-                _ => "identifier",
+                _ if Self::is_keyword_lexeme(lexeme) => "keyword",
+                _ => "variable",
             },
             AstTokenKind::Unknown | AstTokenKind::Newline => "invalid",
         }
     }
 
+    fn is_keyword_lexeme(lexeme: &str) -> bool {
+        lexeme.chars().count() >= 2
+            && lexeme.chars().any(|ch| ch.is_ascii_uppercase())
+            && lexeme
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch == '_')
+    }
+
+    fn apply_original_boon_semantics(source: &str, tokens: Vec<SyntaxToken>) -> Vec<SyntaxToken> {
+        let mut decorations = Self::text_literal_decorations(source, &tokens);
+        decorations.extend(Self::single_quote_literal_decorations(source));
+        let decoration_ranges = decorations
+            .iter()
+            .map(|token| (token.start, token.end))
+            .collect::<Vec<_>>();
+        let base_tokens = tokens
+            .into_iter()
+            .filter(|token| {
+                !decoration_ranges.iter().any(|(start, end)| {
+                    token.start >= *start && token.end <= *end && token.start < token.end
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut styled = Vec::new();
+        let mut expect_function_name = false;
+        let mut chain_index = 0usize;
+        for (index, token) in base_tokens.iter().enumerate() {
+            let mut token = token.clone();
+            let previous_source_char = token
+                .start
+                .checked_sub(1)
+                .and_then(|start| source.get(start..token.start))
+                .and_then(|slice| slice.chars().next());
+            let next_token = base_tokens.get(index + 1);
+            match token.kind {
+                "keyword" => {
+                    expect_function_name = token.text == "FUNCTION";
+                    chain_index = 0;
+                    styled.push(token);
+                }
+                "source-binding" if Self::is_module_path_lexeme(&token.text) => {
+                    Self::push_module_path_tokens(&mut styled, &token);
+                    expect_function_name = false;
+                    chain_index = 0;
+                }
+                "variable" | "source-binding" => {
+                    if token.text == "__" {
+                        token.kind = "wildcard";
+                        expect_function_name = false;
+                    } else if token.text == "EXAMPLE" {
+                        token.kind = "invalid";
+                        expect_function_name = false;
+                    } else if Self::is_keyword_lexeme(&token.text) {
+                        token.kind = "keyword";
+                        expect_function_name = token.text == "FUNCTION";
+                    } else if Self::is_pascal_case_lexeme(&token.text) {
+                        token.kind = if next_token
+                            .is_some_and(|next| next.line == token.line && next.text == "[")
+                        {
+                            "tag"
+                        } else {
+                            "type"
+                        };
+                        expect_function_name = false;
+                    } else {
+                        if previous_source_char == Some('.') {
+                            chain_index += 1;
+                        } else {
+                            chain_index = 0;
+                        }
+                        token.kind = if expect_function_name {
+                            expect_function_name = false;
+                            "function"
+                        } else if next_token
+                            .is_some_and(|next| next.line == token.line && next.text == ":")
+                        {
+                            "definition"
+                        } else if next_token
+                            .is_some_and(|next| next.line == token.line && next.text == "(")
+                        {
+                            "function"
+                        } else if chain_index % 2 == 1 {
+                            "chain-alt"
+                        } else {
+                            "variable"
+                        };
+                    }
+                    styled.push(token);
+                }
+                "operator" => {
+                    token.kind = if token.text == "|>" {
+                        "pipe"
+                    } else if token.text == "-"
+                        && next_token
+                            .is_some_and(|next| next.kind == "number" && next.start == token.end)
+                    {
+                        "negative-sign"
+                    } else {
+                        "operator"
+                    };
+                    expect_function_name = false;
+                    chain_index = 0;
+                    styled.push(token);
+                }
+                "punctuation" => {
+                    token.kind = match token.text.as_str() {
+                        "." => "dot",
+                        _ => "punctuation",
+                    };
+                    if token.text != "." {
+                        chain_index = 0;
+                    }
+                    expect_function_name = false;
+                    styled.push(token);
+                }
+                "number" => {
+                    expect_function_name = false;
+                    chain_index = 0;
+                    styled.push(token);
+                }
+                "comment" | "string" | "invalid" => {
+                    expect_function_name = false;
+                    chain_index = 0;
+                    styled.push(token);
+                }
+                _ => {
+                    expect_function_name = false;
+                    chain_index = 0;
+                    styled.push(token);
+                }
+            }
+        }
+        styled.extend(decorations);
+        styled.sort_by_key(|token| (token.line, token.column, token.start, token.len));
+        styled
+    }
+
+    fn text_literal_decorations(source: &str, tokens: &[SyntaxToken]) -> Vec<SyntaxToken> {
+        let mut decorations = Vec::new();
+        for token in tokens.iter().filter(|token| token.text == "TEXT") {
+            let mut position = token.end;
+            while source
+                .as_bytes()
+                .get(position)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                position += 1;
+            }
+            let hash_start = position;
+            while source.as_bytes().get(position) == Some(&b'#') {
+                position += 1;
+            }
+            let hash_count = position.saturating_sub(hash_start);
+            if source.as_bytes().get(position) != Some(&b'{') {
+                continue;
+            }
+            let open_brace = position;
+            let Some(close_brace) = matching_brace_byte(source, open_brace) else {
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-delimiter",
+                    source,
+                    hash_start,
+                    open_brace + 1,
+                );
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-content",
+                    source,
+                    open_brace + 1,
+                    source.len(),
+                );
+                continue;
+            };
+            Self::push_range_tokens(
+                &mut decorations,
+                "text-literal-delimiter",
+                source,
+                hash_start,
+                open_brace + 1,
+            );
+            let content_start = open_brace + 1;
+            let content_end = close_brace;
+            let marker = if hash_count == 0 {
+                "{".to_owned()
+            } else {
+                format!("{}{{", "#".repeat(hash_count))
+            };
+            let mut content_position = content_start;
+            while content_position < content_end {
+                let Some(relative) = source[content_position..content_end].find(&marker) else {
+                    break;
+                };
+                let interpolation_start = content_position + relative;
+                if interpolation_start > content_position {
+                    Self::push_range_tokens(
+                        &mut decorations,
+                        "text-literal-content",
+                        source,
+                        content_position,
+                        interpolation_start,
+                    );
+                }
+                let interpolation_open_brace = interpolation_start + marker.len() - 1;
+                let Some(interpolation_close_brace) =
+                    matching_brace_byte(source, interpolation_open_brace)
+                else {
+                    content_position = interpolation_start + marker.len();
+                    continue;
+                };
+                if interpolation_close_brace > content_end {
+                    break;
+                }
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-delimiter",
+                    source,
+                    interpolation_start,
+                    interpolation_open_brace + 1,
+                );
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-interpolation",
+                    source,
+                    interpolation_open_brace + 1,
+                    interpolation_close_brace,
+                );
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-delimiter",
+                    source,
+                    interpolation_close_brace,
+                    interpolation_close_brace + 1,
+                );
+                content_position = interpolation_close_brace + 1;
+            }
+            if content_position < content_end {
+                Self::push_range_tokens(
+                    &mut decorations,
+                    "text-literal-content",
+                    source,
+                    content_position,
+                    content_end,
+                );
+            }
+            Self::push_range_tokens(
+                &mut decorations,
+                "text-literal-delimiter",
+                source,
+                close_brace,
+                close_brace + 1,
+            );
+        }
+        decorations
+    }
+
+    fn single_quote_literal_decorations(source: &str) -> Vec<SyntaxToken> {
+        let mut decorations = Vec::new();
+        let mut position = 0usize;
+        while let Some(relative_start) = source[position..].find('\'') {
+            let start = position + relative_start;
+            let mut end = start + 1;
+            let mut escaped = false;
+            while end < source.len() {
+                let Some(ch) = source[end..].chars().next() else {
+                    break;
+                };
+                end += ch.len_utf8();
+                if ch == '\n' || ch == '\r' {
+                    break;
+                }
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '\'' {
+                    break;
+                }
+            }
+            Self::push_range_tokens(&mut decorations, "string", source, start, end);
+            position = end;
+        }
+        decorations
+    }
+
+    fn push_range_tokens(
+        tokens: &mut Vec<SyntaxToken>,
+        kind: &'static str,
+        source: &str,
+        start: usize,
+        end: usize,
+    ) {
+        if start >= end || start >= source.len() {
+            return;
+        }
+        let mut line_start = 0usize;
+        for (line_index, line) in source.split_inclusive('\n').enumerate() {
+            let line_end = line_start + line.len();
+            let segment_start = start.max(line_start);
+            let segment_end = end.min(line_end);
+            if segment_start < segment_end {
+                let trimmed_end =
+                    if source.as_bytes().get(segment_end.saturating_sub(1)) == Some(&b'\n') {
+                        segment_end.saturating_sub(1)
+                    } else {
+                        segment_end
+                    };
+                if segment_start < trimmed_end {
+                    if let Some(text) = source.get(segment_start..trimmed_end) {
+                        let column = source
+                            .get(line_start..segment_start)
+                            .map(|prefix| prefix.chars().count() + 1)
+                            .unwrap_or(1);
+                        tokens.push(SyntaxToken::new_at(
+                            kind,
+                            line_index + 1,
+                            column,
+                            text,
+                            segment_start,
+                            trimmed_end,
+                        ));
+                    }
+                }
+            }
+            line_start = line_end;
+            if line_start >= end {
+                break;
+            }
+        }
+    }
+
+    fn push_module_path_tokens(tokens: &mut Vec<SyntaxToken>, token: &SyntaxToken) {
+        let last_slash = token.text.rfind('/').unwrap_or(token.text.len());
+        let mut byte_offset = 0usize;
+        while byte_offset < token.text.len() {
+            let Some(relative_slash) = token.text[byte_offset..].find('/') else {
+                let text = &token.text[byte_offset..];
+                if !text.is_empty() {
+                    let kind = if byte_offset > last_slash {
+                        "function"
+                    } else {
+                        "source-binding"
+                    };
+                    tokens.push(token.subtoken(kind, byte_offset, text));
+                }
+                break;
+            };
+            let slash = byte_offset + relative_slash;
+            if slash > byte_offset {
+                tokens.push(token.subtoken(
+                    "source-binding",
+                    byte_offset,
+                    &token.text[byte_offset..slash],
+                ));
+            }
+            tokens.push(token.subtoken("module-slash", slash, "/"));
+            byte_offset = slash + 1;
+        }
+    }
+
+    fn is_module_path_lexeme(lexeme: &str) -> bool {
+        let mut parts = lexeme.split('/').collect::<Vec<_>>();
+        if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+            return false;
+        }
+        let Some(final_part) = parts.pop() else {
+            return false;
+        };
+        final_part
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+            && parts.iter().all(|part| {
+                part.chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+            })
+    }
+
+    fn is_pascal_case_lexeme(lexeme: &str) -> bool {
+        lexeme
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+            && lexeme.chars().any(|ch| ch.is_ascii_lowercase())
+            && lexeme.chars().all(|ch| ch.is_ascii_alphanumeric())
+    }
+
+    fn invalid_syntax_probe() -> serde_json::Value {
+        let source = "EXAMPLE Demo\n# old comment\n";
+        let highlighting = Self::syntax_highlighting(source);
+        let invalid_tokens = highlighting
+            .tokens
+            .iter()
+            .filter(|token| token.kind == "invalid")
+            .map(|token| {
+                json!({
+                    "kind": token.kind,
+                    "text": token.text,
+                    "line": token.line,
+                    "column": token.column,
+                    "len": token.len,
+                    "color": syntax_color_for_kind(token.kind),
+                    "font_weight": syntax_font_weight_for_kind(token.kind),
+                    "font_style": syntax_font_style_for_kind(token.kind)
+                })
+            })
+            .collect::<Vec<_>>();
+        let example_invalid = invalid_tokens
+            .iter()
+            .any(|token| token.get("text").and_then(serde_json::Value::as_str) == Some("EXAMPLE"));
+        let hash_invalid = invalid_tokens
+            .iter()
+            .any(|token| token.get("text").and_then(serde_json::Value::as_str) == Some("#"));
+        json!({
+            "status": if example_invalid && hash_invalid { "pass" } else { "fail" },
+            "backend": highlighting.backend,
+            "parser_backed": highlighting.parser_backed,
+            "invalid_token_count": invalid_tokens.len(),
+            "invalid_token_samples": invalid_tokens,
+            "example_keyword_invalid": example_invalid,
+            "hash_comment_invalid": hash_invalid
+        })
+    }
+
     fn syntax_tokens_fallback(source: &str) -> Vec<SyntaxToken> {
         let mut tokens = Vec::new();
-        for (line_index, line) in source.lines().enumerate() {
+        let mut line_start = 0usize;
+        for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+            let line = raw_line.trim_end_matches('\n');
             let mut column = 0;
             let bytes = line.as_bytes();
             while column < bytes.len() {
                 let rest = &line[column..];
                 if rest.starts_with("--") {
-                    tokens.push(SyntaxToken::new(
+                    tokens.push(SyntaxToken::new_at(
                         "comment",
                         line_index + 1,
                         column + 1,
-                        rest.len(),
+                        rest,
+                        line_start + column,
+                        line_start + line.len(),
                     ));
                     break;
                 }
@@ -2714,66 +3218,99 @@ impl BoonLanguageService {
                     column += ch.len_utf8();
                     continue;
                 }
-                if ch == '"' {
+                if ch == '"' || ch == '\'' {
                     let mut len = ch.len_utf8();
                     for next in rest[ch.len_utf8()..].chars() {
                         len += next.len_utf8();
-                        if next == '"' {
+                        if next == ch || next == '\n' {
                             break;
                         }
                     }
-                    tokens.push(SyntaxToken::new("string", line_index + 1, column + 1, len));
+                    tokens.push(SyntaxToken::new_at(
+                        "string",
+                        line_index + 1,
+                        column + 1,
+                        &rest[..len],
+                        line_start + column,
+                        line_start + column + len,
+                    ));
                     column += len;
                     continue;
                 }
                 if ch.is_ascii_digit() {
-                    let len = rest
+                    let text = rest
                         .chars()
                         .take_while(|next| next.is_ascii_digit() || *next == '.')
-                        .map(char::len_utf8)
-                        .sum::<usize>();
-                    tokens.push(SyntaxToken::new("number", line_index + 1, column + 1, len));
-                    column += len;
+                        .collect::<String>();
+                    tokens.push(SyntaxToken::new_at(
+                        "number",
+                        line_index + 1,
+                        column + 1,
+                        &text,
+                        line_start + column,
+                        line_start + column + text.len(),
+                    ));
+                    column += text.len();
                     continue;
                 }
                 if ch.is_ascii_alphabetic() || ch == '_' {
                     let text = rest
                         .chars()
                         .take_while(|next| {
-                            next.is_ascii_alphanumeric() || *next == '_' || *next == '/'
+                            next.is_ascii_alphanumeric()
+                                || *next == '_'
+                                || *next == '/'
+                                || *next == '-'
                         })
                         .collect::<String>();
                     let kind = match text.as_str() {
-                        "SOURCE" | "HOLD" | "LATEST" | "THEN" | "WHEN" | "WHILE" | "LIST"
-                        | "TEXT" | "BOOL" | "INT" | "FLOAT" => "keyword",
                         "EXAMPLE" => "invalid",
-                        _ if text.contains('/') => "source-binding",
-                        _ => "identifier",
+                        "__" => "wildcard",
+                        _ if Self::is_module_path_lexeme(&text) => "source-binding",
+                        _ if Self::is_keyword_lexeme(&text) => "keyword",
+                        _ if Self::is_pascal_case_lexeme(&text) => "type",
+                        _ => "variable",
                     };
-                    tokens.push(SyntaxToken::new(
+                    let token = SyntaxToken::new_at(
                         kind,
                         line_index + 1,
                         column + 1,
-                        text.len(),
-                    ));
+                        &text,
+                        line_start + column,
+                        line_start + column + text.len(),
+                    );
+                    if kind == "source-binding" {
+                        Self::push_module_path_tokens(&mut tokens, &token);
+                    } else {
+                        tokens.push(token);
+                    }
                     column += text.len();
                     continue;
                 }
-                let kind = if "{}[]():.,|=+-*/<>".contains(ch) {
+                let kind = if ch == '#' || ch == '$' {
+                    "invalid"
+                } else if "{}[]():,".contains(ch) {
+                    "punctuation"
+                } else if ch == '.' {
+                    "dot"
+                } else if "|=+-*/<>".contains(ch) {
                     "operator"
                 } else {
                     "invalid"
                 };
-                tokens.push(SyntaxToken::new(
+                tokens.push(SyntaxToken::new_at(
                     kind,
                     line_index + 1,
                     column + 1,
-                    ch.len_utf8(),
+                    &rest[..ch.len_utf8()],
+                    line_start + column,
+                    line_start + column + ch.len_utf8(),
                 ));
                 column += ch.len_utf8();
             }
+            line_start += raw_line.len();
         }
-        tokens
+        Self::apply_original_boon_semantics(source, tokens)
     }
 }
 
@@ -2817,21 +3354,81 @@ struct EditorSnapshot {
 }
 
 #[derive(Clone, Debug)]
+struct SyntaxHighlighting {
+    backend: &'static str,
+    parser_backed: bool,
+    tokens: Vec<SyntaxToken>,
+}
+
+#[derive(Clone, Debug)]
 struct SyntaxToken {
     kind: &'static str,
     line: usize,
     column: usize,
     len: usize,
+    text: String,
+    start: usize,
+    end: usize,
 }
 
 impl SyntaxToken {
-    fn new(kind: &'static str, line: usize, column: usize, len: usize) -> Self {
+    fn new_at(
+        kind: &'static str,
+        line: usize,
+        column: usize,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> Self {
         Self {
             kind,
             line,
             column,
-            len,
+            len: text.chars().count().max(1),
+            text: text.to_owned(),
+            start,
+            end,
         }
+    }
+
+    fn subtoken(&self, kind: &'static str, byte_offset: usize, text: &str) -> Self {
+        let column = self.column + self.text[..byte_offset].chars().count();
+        let start = self.start + byte_offset;
+        Self::new_at(kind, self.line, column, text, start, start + text.len())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SyntaxLineSegment {
+    kind: &'static str,
+    line: usize,
+    column: usize,
+    len: usize,
+    text: String,
+}
+
+impl SyntaxLineSegment {
+    fn new(kind: &'static str, line: usize, column: usize, text: String) -> Self {
+        Self {
+            kind,
+            line,
+            column,
+            len: text.chars().count(),
+            text,
+        }
+    }
+
+    fn to_report_json(&self) -> serde_json::Value {
+        json!({
+            "kind": self.kind,
+            "line": self.line,
+            "column": self.column,
+            "len": self.len,
+            "text": self.text.chars().take(80).collect::<String>(),
+            "color": syntax_color_for_kind(self.kind),
+            "font_weight": syntax_font_weight_for_kind(self.kind),
+            "font_style": syntax_font_style_for_kind(self.kind)
+        })
     }
 }
 
@@ -2845,6 +3442,8 @@ struct CodeEditorModel {
     scroll_column: usize,
     diagnostics: Vec<String>,
     syntax_tokens: Vec<SyntaxToken>,
+    syntax_backend: &'static str,
+    syntax_parser_backed: bool,
     formatted_preview_hash: Option<String>,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
@@ -2858,6 +3457,7 @@ impl CodeEditorModel {
         let formatted_preview_hash = BoonLanguageService::format(source_path_label, source_text)
             .ok()
             .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()));
+        let syntax = BoonLanguageService::syntax_highlighting(source_text);
         Self {
             file_name: source_path_label.to_owned(),
             source_text: source_text.to_owned(),
@@ -2866,7 +3466,9 @@ impl CodeEditorModel {
             scroll_line: 0,
             scroll_column: 0,
             diagnostics,
-            syntax_tokens: BoonLanguageService::syntax_tokens(source_text),
+            syntax_tokens: syntax.tokens,
+            syntax_backend: syntax.backend,
+            syntax_parser_backed: syntax.parser_backed,
             formatted_preview_hash,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -2877,6 +3479,14 @@ impl CodeEditorModel {
 
     fn syntax_token_count(&self) -> usize {
         self.syntax_tokens.len()
+    }
+
+    fn syntax_backend(&self) -> &'static str {
+        self.syntax_backend
+    }
+
+    fn syntax_parser_backed(&self) -> bool {
+        self.syntax_parser_backed
     }
 
     fn syntax_categories(&self) -> Vec<&'static str> {
@@ -2895,12 +3505,144 @@ impl CodeEditorModel {
             .map(|token| {
                 json!({
                     "kind": token.kind,
+                    "text": token.text.chars().take(80).collect::<String>(),
                     "line": token.line,
                     "column": token.column,
-                    "len": token.len
+                    "len": token.len,
+                    "color": syntax_color_for_kind(token.kind),
+                    "font_weight": syntax_font_weight_for_kind(token.kind),
+                    "font_style": syntax_font_style_for_kind(token.kind)
                 })
             })
             .collect()
+    }
+
+    fn syntax_invalid_token_samples(&self) -> Vec<serde_json::Value> {
+        self.syntax_tokens
+            .iter()
+            .filter(|token| token.kind == "invalid")
+            .take(8)
+            .map(|token| {
+                json!({
+                    "kind": token.kind,
+                    "text": token.text.chars().take(80).collect::<String>(),
+                    "line": token.line,
+                    "column": token.column,
+                    "len": token.len,
+                    "color": syntax_color_for_kind(token.kind),
+                    "font_weight": syntax_font_weight_for_kind(token.kind),
+                    "font_style": syntax_font_style_for_kind(token.kind)
+                })
+            })
+            .collect()
+    }
+
+    fn syntax_render_segments_for_visible_lines(&self, max_lines: usize) -> Vec<SyntaxLineSegment> {
+        self.visible_lines(max_lines)
+            .into_iter()
+            .flat_map(|(line_number, line)| self.highlighted_line_segments(line_number, &line))
+            .collect()
+    }
+
+    fn syntax_render_categories(&self) -> Vec<&'static str> {
+        self.syntax_render_segments_for_visible_lines(40)
+            .into_iter()
+            .map(|segment| segment.kind)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn syntax_render_segment_samples(&self) -> Vec<serde_json::Value> {
+        self.syntax_render_segments_for_visible_lines(40)
+            .into_iter()
+            .filter(|segment| !segment.text.is_empty())
+            .take(16)
+            .map(|segment| segment.to_report_json())
+            .collect()
+    }
+
+    fn syntax_theme_report(&self) -> serde_json::Value {
+        json!({
+            "source": "~/repos/boon/playground/frontend/typescript/code_editor/boon-theme.ts",
+            "language_source": "~/repos/boon/playground/frontend/typescript/code_editor/boon-language.ts",
+            "grammar_source": "~/repos/boon/playground/frontend/typescript/code_editor/boon.grammar",
+            "font_family": BOON_EDITOR_FONT_FAMILY,
+            "font_size": BOON_EDITOR_FONT_SIZE,
+            "background": BOON_EDITOR_BACKGROUND,
+            "foreground": BOON_EDITOR_FOREGROUND,
+            "gutter": BOON_EDITOR_GUTTER,
+            "dark_background": BOON_EDITOR_DARK_BACKGROUND,
+            "highlight_background": BOON_EDITOR_HIGHLIGHT_BACKGROUND,
+            "rules": {
+                "keyword": syntax_style_json("keyword"),
+                "source-binding": syntax_style_json("source-binding"),
+                "tag": syntax_style_json("tag"),
+                "type": syntax_style_json("type"),
+                "variable": syntax_style_json("variable"),
+                "function": syntax_style_json("function"),
+                "definition": syntax_style_json("definition"),
+                "operator": syntax_style_json("operator"),
+                "punctuation": syntax_style_json("punctuation"),
+                "string": syntax_style_json("string"),
+                "number": syntax_style_json("number"),
+                "comment": syntax_style_json("comment"),
+                "invalid": syntax_style_json("invalid")
+            }
+        })
+    }
+
+    fn highlighted_line_segments(&self, line_number: usize, line: &str) -> Vec<SyntaxLineSegment> {
+        let line_len = line.chars().count();
+        let mut cursor = 0usize;
+        let mut segments = Vec::new();
+        let mut tokens = self
+            .syntax_tokens
+            .iter()
+            .filter(|token| token.line == line_number)
+            .collect::<Vec<_>>();
+        tokens.sort_by_key(|token| (token.column, token.len));
+        for token in tokens {
+            let token_start = token.column.saturating_sub(1).min(line_len);
+            let token_end = token_start.saturating_add(token.len).min(line_len);
+            if token_end <= cursor {
+                continue;
+            }
+            if token_start > cursor {
+                let text = slice_chars(line, cursor, token_start);
+                if !text.is_empty() {
+                    segments.push(SyntaxLineSegment::new(
+                        "plain",
+                        line_number,
+                        cursor + 1,
+                        text,
+                    ));
+                }
+            }
+            let segment_start = token_start.max(cursor);
+            let text = slice_chars(line, segment_start, token_end);
+            if !text.is_empty() {
+                segments.push(SyntaxLineSegment::new(
+                    token.kind,
+                    line_number,
+                    segment_start + 1,
+                    text,
+                ));
+            }
+            cursor = token_end;
+        }
+        if cursor < line_len {
+            let text = slice_chars(line, cursor, line_len);
+            if !text.is_empty() {
+                segments.push(SyntaxLineSegment::new(
+                    "plain",
+                    line_number,
+                    cursor + 1,
+                    text,
+                ));
+            }
+        }
+        segments
     }
 
     fn caret(&self) -> &EditorPosition {
@@ -2910,7 +3652,10 @@ impl CodeEditorModel {
     fn refresh_language_state(&mut self) {
         self.line_count = self.source_text.lines().count().max(1);
         self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
-        self.syntax_tokens = BoonLanguageService::syntax_tokens(&self.source_text);
+        let syntax = BoonLanguageService::syntax_highlighting(&self.source_text);
+        self.syntax_tokens = syntax.tokens;
+        self.syntax_backend = syntax.backend;
+        self.syntax_parser_backed = syntax.parser_backed;
         self.formatted_preview_hash =
             BoonLanguageService::format(&self.file_name, &self.source_text)
                 .ok()
@@ -3167,10 +3912,17 @@ impl CodeEditorModel {
             ],
             "undo_probe": undo,
             "redo_probe": redo,
-            "syntax_backend": "boon_parser::parse_ast token stream with editor fallback for malformed in-progress buffers",
+            "syntax_backend": self.syntax_backend(),
+            "syntax_parser_backed": self.syntax_parser_backed(),
             "syntax_categories": self.syntax_categories(),
             "syntax_token_samples": self.syntax_token_samples(),
-            "syntax_token_count": self.syntax_token_count()
+            "syntax_token_count": self.syntax_token_count(),
+            "syntax_render_categories": self.syntax_render_categories(),
+            "syntax_render_segment_samples": self.syntax_render_segment_samples(),
+            "syntax_render_segment_count": self.syntax_render_segments_for_visible_lines(40).len(),
+            "syntax_invalid_token_samples": self.syntax_invalid_token_samples(),
+            "syntax_theme": self.syntax_theme_report(),
+            "invalid_reserved_token_probe": BoonLanguageService::invalid_syntax_probe()
         })
     }
 
@@ -3197,7 +3949,7 @@ struct CodeEditorView {
 impl CodeEditorView {
     fn new() -> Self {
         Self {
-            font_family: "JetBrains Mono",
+            font_family: BOON_EDITOR_FONT_FAMILY,
         }
     }
 
@@ -3214,16 +3966,16 @@ impl CodeEditorView {
             boon_document_model::DocumentNodeKind::ScrollRoot,
             None,
             &[
-                ("bg", "#ffffff"),
-                ("color", "#202936"),
-                ("border", "#9aa7b5"),
-                ("padding", "12"),
+                ("bg", BOON_EDITOR_BACKGROUND),
+                ("color", BOON_EDITOR_FOREGROUND),
+                ("border", BOON_EDITOR_DARK_BACKGROUND),
+                ("padding", &BOON_EDITOR_PADDING.to_string()),
                 ("height", &editor_height.to_string()),
                 ("width", "fill"),
                 ("scroll", "true"),
                 ("scroll_x", "true"),
                 ("font", self.font_family),
-                ("size", "13"),
+                ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
             ],
         );
         editor.scroll = Some(boon_document_model::ScrollState {
@@ -3258,7 +4010,9 @@ impl CodeEditorView {
             },
         );
         append_child(frame, parent, editor);
-        let visible_line_count = (editor_height.saturating_sub(24) / 16).max(1) as usize;
+        let visible_line_count = (editor_height.saturating_sub(BOON_EDITOR_PADDING * 2)
+            / BOON_EDITOR_LINE_HEIGHT)
+            .max(1) as usize;
         for (line_number, line) in model.visible_lines(visible_line_count) {
             let row_id = format!("dev-code-editor-line-{line_number}");
             let row = dev_node(
@@ -3266,11 +4020,11 @@ impl CodeEditorView {
                 boon_document_model::DocumentNodeKind::Row,
                 None,
                 &[
-                    ("height", "16"),
+                    ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
                     ("width", "fill"),
-                    ("gap", "8"),
+                    ("gap", &BOON_EDITOR_ROW_GAP.to_string()),
                     ("padding", "0"),
-                    ("bg", "#ffffff"),
+                    ("bg", BOON_EDITOR_BACKGROUND),
                 ],
             );
             let row_parent = row.id.clone();
@@ -3280,11 +4034,12 @@ impl CodeEditorView {
                 boon_document_model::DocumentNodeKind::Text,
                 Some(format!("{line_number:>4}")),
                 &[
-                    ("width", "44"),
-                    ("height", "16"),
-                    ("color", "#64748b"),
-                    ("size", "12"),
-                    ("bg", "#f8fafc"),
+                    ("width", &BOON_EDITOR_GUTTER_WIDTH.to_string()),
+                    ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
+                    ("color", BOON_EDITOR_GUTTER),
+                    ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
+                    ("bg", BOON_EDITOR_BACKGROUND),
+                    ("font", self.font_family),
                 ],
             );
             append_child(frame, row_parent.clone(), gutter);
@@ -3294,8 +4049,8 @@ impl CodeEditorView {
                 None,
                 &[
                     ("width", "fill"),
-                    ("height", "16"),
-                    ("bg", "#ffffff"),
+                    ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
+                    ("bg", BOON_EDITOR_BACKGROUND),
                     ("gap", "0"),
                     ("padding", "0"),
                 ],
@@ -3310,20 +4065,26 @@ impl CodeEditorView {
         &self,
         frame: &mut boon_document_model::DocumentFrame,
         parent: boon_document_model::DocumentNodeId,
-        _model: &CodeEditorModel,
+        model: &CodeEditorModel,
         line_number: usize,
         line: &str,
     ) {
-        let color = if line.trim_start().starts_with("--") {
-            Self::syntax_color("comment")
-        } else {
-            Self::syntax_color("plain")
-        };
-        append_child(
-            frame,
-            parent,
-            self.editor_text_node(line_number, 0, "plain", line, color),
-        );
+        let segments = model.highlighted_line_segments(line_number, line);
+        if segments.is_empty() {
+            append_child(
+                frame,
+                parent,
+                self.editor_text_node(line_number, 0, "plain", ""),
+            );
+            return;
+        }
+        for (segment_index, segment) in segments.into_iter().enumerate() {
+            append_child(
+                frame,
+                parent.clone(),
+                self.editor_text_node(line_number, segment_index, segment.kind, &segment.text),
+            );
+        }
     }
 
     fn editor_text_node(
@@ -3332,35 +4093,179 @@ impl CodeEditorView {
         segment_index: usize,
         kind: &str,
         text: &str,
-        color: &'static str,
     ) -> boon_document_model::DocumentNode {
-        dev_node(
+        let style = syntax_style_for_kind(kind);
+        let mut node = dev_node(
             &format!("dev-code-editor-token-{line_number}-{segment_index}-{kind}"),
             boon_document_model::DocumentNodeKind::Text,
             Some(text.to_owned()),
             &[
                 ("width", "auto"),
-                ("height", "16"),
-                ("color", color),
-                ("size", "12"),
-                ("bg", "#ffffff"),
+                ("height", &BOON_EDITOR_LINE_HEIGHT.to_string()),
+                ("color", style.color),
+                ("size", &BOON_EDITOR_FONT_SIZE.to_string()),
+                ("bg", BOON_EDITOR_BACKGROUND),
                 ("font", self.font_family),
+                ("auto_padding", "0"),
+                ("text_inset", "0"),
+                ("text_clip_padding", "4"),
             ],
-        )
-    }
-
-    fn syntax_color(kind: &str) -> &'static str {
-        match kind {
-            "comment" => "#6A737D",
-            "keyword" => "#0B5CAD",
-            "string" => "#1A7F37",
-            "number" => "#953800",
-            "operator" => "#5B6472",
-            "source-binding" => "#8250DF",
-            "invalid" => "#CF222E",
-            _ => "#202936",
+        );
+        if let Some(weight) = style.font_weight {
+            node.style.insert(
+                "weight".to_owned(),
+                boon_document_model::StyleValue::Text(weight.to_owned()),
+            );
         }
+        if let Some(font_style) = style.font_style {
+            node.style.insert(
+                "font_style".to_owned(),
+                boon_document_model::StyleValue::Text(font_style.to_owned()),
+            );
+        }
+        node
     }
+}
+
+#[derive(Clone, Copy)]
+struct SyntaxStyle {
+    color: &'static str,
+    font_weight: Option<&'static str>,
+    font_style: Option<&'static str>,
+}
+
+fn syntax_style_for_kind(kind: &str) -> SyntaxStyle {
+    match kind {
+        "comment" => SyntaxStyle {
+            color: "#778899",
+            font_weight: None,
+            font_style: Some("italic"),
+        },
+        "keyword" => SyntaxStyle {
+            color: "#D2691E",
+            font_weight: Some("800"),
+            font_style: Some("italic"),
+        },
+        "source-binding" => SyntaxStyle {
+            color: "#6cb6ff",
+            font_weight: None,
+            font_style: None,
+        },
+        "tag" => SyntaxStyle {
+            color: "#6df59a",
+            font_weight: None,
+            font_style: None,
+        },
+        "type" => SyntaxStyle {
+            color: "#6f9cff",
+            font_weight: None,
+            font_style: None,
+        },
+        "variable" | "text-literal-interpolation" => SyntaxStyle {
+            color: "#eeeeee",
+            font_weight: None,
+            font_style: None,
+        },
+        "function" => SyntaxStyle {
+            color: "#fcbf49",
+            font_weight: Some("600"),
+            font_style: None,
+        },
+        "definition" => SyntaxStyle {
+            color: "#ff6ec7",
+            font_weight: Some("600"),
+            font_style: Some("italic"),
+        },
+        "operator" => SyntaxStyle {
+            color: "#ff9f43",
+            font_weight: Some("600"),
+            font_style: None,
+        },
+        "punctuation" | "module-slash" | "dot" | "pipe" | "text-literal-delimiter" => SyntaxStyle {
+            color: "#D2691E",
+            font_weight: Some("700"),
+            font_style: None,
+        },
+        "string" | "text-literal-content" => SyntaxStyle {
+            color: "#fff59e",
+            font_weight: None,
+            font_style: None,
+        },
+        "number" | "negative-sign" => SyntaxStyle {
+            color: "#7ad1ff",
+            font_weight: None,
+            font_style: None,
+        },
+        "wildcard" => SyntaxStyle {
+            color: "#D2691E",
+            font_weight: None,
+            font_style: None,
+        },
+        "chain-alt" => SyntaxStyle {
+            color: "#bbbbbb",
+            font_weight: None,
+            font_style: None,
+        },
+        "invalid" => SyntaxStyle {
+            color: "#ffffff",
+            font_weight: None,
+            font_style: None,
+        },
+        _ => SyntaxStyle {
+            color: BOON_EDITOR_FOREGROUND,
+            font_weight: None,
+            font_style: None,
+        },
+    }
+}
+
+fn syntax_color_for_kind(kind: &str) -> &'static str {
+    syntax_style_for_kind(kind).color
+}
+
+fn syntax_font_weight_for_kind(kind: &str) -> Option<&'static str> {
+    syntax_style_for_kind(kind).font_weight
+}
+
+fn syntax_font_style_for_kind(kind: &str) -> Option<&'static str> {
+    syntax_style_for_kind(kind).font_style
+}
+
+fn syntax_style_json(kind: &str) -> serde_json::Value {
+    let style = syntax_style_for_kind(kind);
+    json!({
+        "color": style.color,
+        "font_weight": style.font_weight,
+        "font_style": style.font_style
+    })
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn matching_brace_byte(source: &str, open_brace: usize) -> Option<usize> {
+    if source.as_bytes().get(open_brace) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut position = open_brace;
+    while position < source.len() {
+        let ch = source[position..].chars().next()?;
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(position);
+            }
+        }
+        position += ch.len_utf8();
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -8721,6 +9626,176 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    #[test]
+    fn parser_backed_syntax_tokens_classify_comments_and_invalid_reserved_tokens() {
+        let model = CodeEditorModel::new(
+            "custom://syntax.bn",
+            "-- comment\nEXAMPLE Demo\n# old comment\nSOURCE\nElement/label(label: TEXT { Hi })\ncount + 1\n",
+        );
+
+        assert_eq!(model.syntax_backend(), "boon_parser::parse_ast");
+        assert!(model.syntax_parser_backed());
+        let categories = model.syntax_categories();
+        assert!(categories.contains(&"comment"));
+        assert!(categories.contains(&"keyword"));
+        assert!(categories.contains(&"source-binding"));
+        assert!(categories.contains(&"operator"));
+        assert!(categories.contains(&"invalid"));
+
+        let invalid_texts = model
+            .syntax_tokens
+            .iter()
+            .filter(|token| token.kind == "invalid")
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(invalid_texts.contains(&"EXAMPLE"));
+        assert!(invalid_texts.contains(&"#"));
+    }
+
+    #[test]
+    fn highlighted_line_segments_preserve_plain_gaps_and_token_kinds() {
+        let model = CodeEditorModel::new("custom://line.bn", "count: SOURCE\ncount + 1\n");
+        let segments = model.highlighted_line_segments(2, "count + 1");
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.kind, segment.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("variable", "count"),
+                ("plain", " "),
+                ("operator", "+"),
+                ("plain", " "),
+                ("number", "1")
+            ]
+        );
+    }
+
+    #[test]
+    fn code_editor_view_renders_mixed_lines_as_colored_segments() {
+        let model = CodeEditorModel::new("custom://view.bn", "count: SOURCE\ncount + 1\n");
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let parent = frame.root.clone();
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 160);
+
+        let code_row = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-code-editor-code-row-2".to_owned(),
+            ))
+            .expect("line 2 code row should render");
+        let rendered = code_row
+            .children
+            .iter()
+            .filter_map(|id| frame.nodes.get(id))
+            .map(|node| {
+                (
+                    node.text.as_ref().map(|text| text.text.as_str()),
+                    node.style.get("color"),
+                    node.style.get("auto_padding"),
+                    node.style.get("text_inset"),
+                    node.style.get("text_clip_padding"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered
+                .iter()
+                .all(|(_, _, auto_padding, text_inset, text_clip_padding)| {
+                    *auto_padding == Some(&boon_document_model::StyleValue::Number(0.0))
+                        && *text_inset == Some(&boon_document_model::StyleValue::Number(0.0))
+                        && *text_clip_padding == Some(&boon_document_model::StyleValue::Number(4.0))
+                })
+        );
+        assert!(rendered.iter().any(|(text, color, _, _, _)| {
+            *text == Some("count")
+                && *color
+                    == Some(&boon_document_model::StyleValue::Text(
+                        syntax_color_for_kind("variable").to_owned(),
+                    ))
+        }));
+        assert!(rendered.iter().any(|(text, color, _, _, _)| {
+            *text == Some("+")
+                && *color
+                    == Some(&boon_document_model::StyleValue::Text(
+                        syntax_color_for_kind("operator").to_owned(),
+                    ))
+        }));
+        assert!(rendered.iter().any(|(text, color, _, _, _)| {
+            *text == Some("1")
+                && *color
+                    == Some(&boon_document_model::StyleValue::Text(
+                        syntax_color_for_kind("number").to_owned(),
+                    ))
+        }));
+    }
+
+    #[test]
+    fn fallback_tokenizer_keeps_malformed_buffers_renderable() {
+        let tokens = BoonLanguageService::syntax_tokens_fallback("SOURCE @\n-- ok\n");
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == "keyword" && token.text == "SOURCE")
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == "invalid" && token.text == "@")
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == "comment" && token.text == "-- ok")
+        );
+    }
+
+    #[test]
+    fn original_typescript_theme_colors_and_styles_are_native_styles() {
+        assert_eq!(BOON_EDITOR_BACKGROUND, "#282c34");
+        assert_eq!(BOON_EDITOR_FOREGROUND, "#d9e1f2");
+        assert_eq!(BOON_EDITOR_FONT_FAMILY, "JetBrains Mono");
+        assert_eq!(BOON_EDITOR_FONT_SIZE, 13);
+
+        let keyword = syntax_style_for_kind("keyword");
+        assert_eq!(keyword.color, "#D2691E");
+        assert_eq!(keyword.font_weight, Some("800"));
+        assert_eq!(keyword.font_style, Some("italic"));
+
+        let definition = syntax_style_for_kind("definition");
+        assert_eq!(definition.color, "#ff6ec7");
+        assert_eq!(definition.font_weight, Some("600"));
+        assert_eq!(definition.font_style, Some("italic"));
+
+        let comment = syntax_style_for_kind("comment");
+        assert_eq!(comment.color, "#778899");
+        assert_eq!(comment.font_style, Some("italic"));
+    }
+
+    #[test]
+    fn original_boon_semantic_rules_split_module_paths_and_text_literals() {
+        let model = CodeEditorModel::new(
+            "custom://theme.bn",
+            "FUNCTION greet(name) {\n    title: TEXT { Hello {name} }\n    Element/label(label: title)\n}\n",
+        );
+        let rendered = model
+            .syntax_render_segments_for_visible_lines(8)
+            .into_iter()
+            .map(|segment| (segment.kind, segment.text))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.contains(&("keyword", "FUNCTION".to_owned())));
+        assert!(rendered.contains(&("function", "greet".to_owned())));
+        assert!(rendered.contains(&("definition", "title".to_owned())));
+        assert!(rendered.contains(&("text-literal-content", " Hello ".to_owned())));
+        assert!(rendered.contains(&("text-literal-interpolation", "name".to_owned())));
+        assert!(rendered.contains(&("source-binding", "Element".to_owned())));
+        assert!(rendered.contains(&("module-slash", "/".to_owned())));
+        assert!(rendered.contains(&("function", "label".to_owned())));
     }
 
     #[test]

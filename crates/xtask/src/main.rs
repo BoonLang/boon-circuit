@@ -8275,7 +8275,11 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
     let parser_backed_highlighting = dev_probe
         .and_then(|probe| probe.pointer("/editor_model/syntax_backend"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|backend| backend.contains("boon_parser::parse_ast"));
+        == Some("boon_parser::parse_ast")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_parser_backed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -8290,6 +8294,138 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         (!parser_backed_highlighting).then(|| {
             "native syntax highlighting is not proven to use the Boon parser token stream"
                 .to_owned()
+        }),
+    );
+    let syntax_category_contains = |pointer: &str, expected: &str| -> bool {
+        dev_probe
+            .and_then(|probe| probe.pointer(pointer))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|categories| {
+                categories
+                    .iter()
+                    .any(|category| category.as_str() == Some(expected))
+            })
+    };
+    let model_operator_family_pass = ["operator", "pipe"]
+        .iter()
+        .any(|category| syntax_category_contains("/editor_model/syntax_categories", category));
+    let rendered_operator_family_pass = ["operator", "pipe"].iter().any(|category| {
+        syntax_category_contains("/editor_model/syntax_render_categories", category)
+    });
+    let model_categories_pass = ["comment", "keyword", "punctuation", "source-binding"]
+        .iter()
+        .all(|category| syntax_category_contains("/editor_model/syntax_categories", category))
+        && model_operator_family_pass;
+    let rendered_categories_pass = ["comment", "keyword", "punctuation", "source-binding"]
+        .iter()
+        .all(|category| {
+            syntax_category_contains("/editor_model/syntax_render_categories", category)
+        })
+        && rendered_operator_family_pass;
+    let rendered_segment_count = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/syntax_render_segment_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let rendered_samples = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/syntax_render_segment_samples"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rendered_non_plain_sample_count = rendered_samples
+        .iter()
+        .filter(|sample| sample.get("kind").and_then(serde_json::Value::as_str) != Some("plain"))
+        .count();
+    let rendered_segmented_highlighting = model_categories_pass
+        && rendered_categories_pass
+        && rendered_segment_count >= 8
+        && rendered_non_plain_sample_count >= 4;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:rendered-syntax-segments"),
+        rendered_segmented_highlighting,
+        format!(
+            "model_categories_pass={model_categories_pass}, rendered_categories_pass={rendered_categories_pass}, model_operator_family_pass={model_operator_family_pass}, rendered_operator_family_pass={rendered_operator_family_pass}, rendered_segment_count={rendered_segment_count}, rendered_non_plain_sample_count={rendered_non_plain_sample_count}"
+        ),
+        (!rendered_segmented_highlighting).then(|| {
+            "native code editor did not prove visible rows are rendered as parser-token-colored segments".to_owned()
+        }),
+    );
+    let invalid_reserved_probe_pass = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/invalid_reserved_token_probe/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/editor_model/invalid_reserved_token_probe/example_keyword_invalid")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/editor_model/invalid_reserved_token_probe/hash_comment_invalid")
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:invalid-reserved-token-highlighting"),
+        invalid_reserved_probe_pass,
+        format!(
+            "invalid_reserved_token_probe={:?}",
+            dev_probe.and_then(
+                |probe| probe.pointer("/editor_model/invalid_reserved_token_probe/status")
+            )
+        ),
+        (!invalid_reserved_probe_pass).then(|| {
+            "`EXAMPLE` and `#` are not proven to highlight as invalid/reserved native tokens"
+                .to_owned()
+        }),
+    );
+    let original_theme_pass = dev_probe
+        .and_then(|probe| probe.pointer("/editor_model/syntax_theme/font_family"))
+        .and_then(serde_json::Value::as_str)
+        == Some("JetBrains Mono")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/font_size"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(13)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/background"))
+            .and_then(serde_json::Value::as_str)
+            == Some("#282c34")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/foreground"))
+            .and_then(serde_json::Value::as_str)
+            == Some("#d9e1f2")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/rules/keyword/color"))
+            .and_then(serde_json::Value::as_str)
+            == Some("#D2691E")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/rules/keyword/font_style"))
+            .and_then(serde_json::Value::as_str)
+            == Some("italic")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/rules/definition/color"))
+            .and_then(serde_json::Value::as_str)
+            == Some("#ff6ec7")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/editor_model/syntax_theme/rules/comment/font_style"))
+            .and_then(serde_json::Value::as_str)
+            == Some("italic");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:original-typescript-theme-parity"),
+        original_theme_pass,
+        format!(
+            "syntax_theme={:?}",
+            dev_probe.and_then(|probe| probe.pointer("/editor_model/syntax_theme"))
+        ),
+        (!original_theme_pass).then(|| {
+            "native code editor syntax theme does not match the original TypeScript playground theme evidence".to_owned()
         }),
     );
     let editor_font_asset = Path::new("assets/fonts/JetBrainsMono-Patched.woff2");

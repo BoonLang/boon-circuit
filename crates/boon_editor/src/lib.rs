@@ -510,8 +510,12 @@ pub fn bracket_match_for_source(
         if is_open(ch) {
             stack.push((ch, byte));
         } else if let Some(open) = matching_open(ch) {
-            if let Some(index) = stack.iter().rposition(|(candidate, _)| *candidate == open) {
-                let (open, open_byte) = stack.remove(index);
+            if stack
+                .last()
+                .map(|(candidate, _)| *candidate == open)
+                .unwrap_or(false)
+            {
+                let (open, open_byte) = stack.pop().expect("stack top checked above");
                 pairs.push(BracketMatch {
                     open_byte,
                     close_byte: byte,
@@ -562,14 +566,37 @@ pub fn bracket_match_for_source(
         }
     }
 
-    pairs
-        .into_iter()
+    if let Some(pair) = pairs
+        .iter()
         .filter(|pair| pair.open_byte <= caret_byte && caret_byte <= pair.close_byte)
         .min_by_key(|pair| pair.close_byte.saturating_sub(pair.open_byte))
+        .cloned()
         .map(|mut pair| {
             pair.contains_caret = true;
             pair
         })
+    {
+        return Some(pair);
+    }
+
+    if let Some(pair) = pairs
+        .into_iter()
+        .min_by_key(|pair| byte_distance_to_range(caret_byte, pair.open_byte, pair.close_byte))
+    {
+        return Some(pair);
+    }
+
+    unmatched
+        .into_iter()
+        .min_by_key(|pair| byte_distance_to_range(caret_byte, pair.open_byte, pair.close_byte))
+}
+
+fn byte_distance_to_range(caret_byte: usize, start: usize, end: usize) -> usize {
+    if caret_byte < start {
+        start - caret_byte
+    } else {
+        caret_byte.saturating_sub(end)
+    }
 }
 
 fn previous_grapheme_boundary(text: &str, byte: usize) -> usize {
@@ -657,5 +684,29 @@ mod tests {
         let pair = bracket_match_for_source(source, caret, &ignored).unwrap();
         assert_eq!(&source[pair.open_byte..pair.open_byte + 1], "{");
         assert_eq!(&source[pair.close_byte..pair.close_byte + 1], "}");
+    }
+
+    #[test]
+    fn bracket_matching_prefers_closest_pair_without_crossing_invalid_nesting() {
+        let source = "outer: ([bad)]";
+        let caret = source.find(')').unwrap();
+        let pair = bracket_match_for_source(source, caret, &[]).unwrap();
+        assert!(!pair.matched);
+        assert_eq!(pair.open_byte, caret);
+        assert_eq!(pair.close_byte, caret);
+    }
+
+    #[test]
+    fn bracket_matching_selects_nearest_pair_when_caret_is_outside_any_pair() {
+        let source = "left()  right[]";
+        let caret = source.find("right").unwrap();
+        let pair = bracket_match_for_source(source, caret, &[]).unwrap();
+        assert_eq!(&source[pair.open_byte..pair.open_byte + 1], "(");
+        assert_eq!(&source[pair.close_byte..pair.close_byte + 1], ")");
+
+        let caret = source.len();
+        let pair = bracket_match_for_source(source, caret, &[]).unwrap();
+        assert_eq!(&source[pair.open_byte..pair.open_byte + 1], "[");
+        assert_eq!(&source[pair.close_byte..pair.close_byte + 1], "]");
     }
 }

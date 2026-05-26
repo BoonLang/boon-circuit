@@ -21,7 +21,7 @@ const BOON_EDITOR_FONT_FEATURE_SETTINGS: &str = "'zero' 1, 'calt' 1";
 const BOON_EDITOR_PADDING: u32 = 10;
 const BOON_EDITOR_GUTTER_WIDTH: u32 = 44;
 const BOON_EDITOR_ROW_GAP: u32 = 8;
-const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.60;
+const BOON_EDITOR_CHAR_WIDTH_FACTOR: f32 = 0.55;
 const BOON_EDITOR_BACKGROUND: &str = "#282c34";
 const BOON_EDITOR_FOREGROUND: &str = "#d9e1f2";
 const BOON_EDITOR_DARK_BACKGROUND: &str = "#21252b";
@@ -29,11 +29,13 @@ const BOON_EDITOR_HIGHLIGHT_BACKGROUND: &str = "#2c313a";
 const BOON_EDITOR_GUTTER: &str = "#5c6773";
 const BOON_EDITOR_SELECTION: &str = "#3E4451";
 const BOON_EDITOR_CURSOR: &str = "#528bff";
-const BOON_EDITOR_BRACKET_MATCH: &str = "#bad0f847";
+const BOON_EDITOR_BRACKET_MATCH: &str = "#528bff33";
 const BOON_EDITOR_SELECTION_MATCH: &str = "#aafe661a";
 const BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX: usize = 256 * 1024;
 const BOON_EDITOR_DEFERRED_SYNTAX_LINES: usize = 256;
-const BOON_EDITOR_CARET_BLINK_FRAMES: u64 = 30;
+const BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS: u64 = 600;
+const BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES: u64 = 18;
+const BOON_EDITOR_KEY_REPEAT_INTERVAL_FRAMES: u64 = 3;
 
 fn main() {
     if let Err(error) = run() {
@@ -1444,8 +1446,13 @@ fn native_gpu_dev_visible_render_hook(
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> Result<serde_json::Value, String> {
-    input_state.render_frame_index = input_state.render_frame_index.saturating_add(1);
-    let caret_visible = (input_state.render_frame_index / BOON_EDITOR_CARET_BLINK_FRAMES) % 2 == 0;
+    let caret_blink_started_at = *input_state
+        .caret_blink_started_at
+        .get_or_insert_with(Instant::now);
+    let caret_visible = (caret_blink_started_at.elapsed().as_millis()
+        / BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS as u128)
+        % 2
+        == 0;
     let caret_blink_changed = shell.caret_visible != caret_visible;
     shell.caret_visible = caret_visible;
     let cache_stale = layout_frame_cache
@@ -1561,7 +1568,9 @@ fn native_gpu_dev_visible_render_hook(
 struct DevNativeInputState {
     last_mouse_button_event_count: u64,
     last_keyboard_event_sequence: u64,
-    render_frame_index: u64,
+    caret_blink_started_at: Option<Instant>,
+    held_repeat_key: Option<String>,
+    held_repeat_frame_count: u64,
     editor_focused: bool,
     mouse_select_anchor: Option<EditorPosition>,
 }
@@ -1708,7 +1717,13 @@ fn dev_apply_real_window_input(
     for event in keyboard_events {
         input_state.last_keyboard_event_sequence =
             input_state.last_keyboard_event_sequence.max(event.sequence);
-        if !event.pressed || !input_state.editor_focused {
+        if !input_state.editor_focused {
+            continue;
+        }
+        if !event.pressed {
+            if input_state.held_repeat_key.as_deref() == Some(event.key.as_str()) {
+                clear_dev_key_repeat(input_state);
+            }
             continue;
         }
         if primary_modifier_pressed {
@@ -1752,82 +1767,145 @@ fn dev_apply_real_window_input(
             changed = true;
             continue;
         }
-        match event.key.as_str() {
-            "Return" | "KeypadEnter" => {
-                shell.workspace.selected_buffer.insert_newline_with_indent();
-                shell.workspace.persist_selected_buffer();
-                shell.workspace.set_selected_dirty(true);
-                changed = true;
+        if apply_dev_editor_key(shell, event.key.as_str(), shift_pressed) {
+            if dev_key_is_repeatable(event.key.as_str()) {
+                input_state.held_repeat_key = Some(event.key.clone());
+                input_state.held_repeat_frame_count = 0;
+            } else {
+                clear_dev_key_repeat(input_state);
             }
-            "Delete" => {
-                shell.workspace.selected_buffer.delete_backward();
-                shell.workspace.persist_selected_buffer();
-                shell.workspace.set_selected_dirty(true);
-                changed = true;
-            }
-            "ForwardDelete" => {
-                shell.workspace.selected_buffer.delete_forward();
-                shell.workspace.persist_selected_buffer();
-                shell.workspace.set_selected_dirty(true);
-                changed = true;
-            }
-            "Tab" => {
-                if shift_pressed {
-                    shell.workspace.selected_buffer.unindent_selection();
-                } else {
-                    shell.workspace.selected_buffer.indent_selection();
-                }
-                shell.workspace.persist_selected_buffer();
-                shell.workspace.set_selected_dirty(true);
-                changed = true;
-            }
-            "Home" => {
-                shell.workspace.selected_buffer.move_home(shift_pressed);
-                changed = true;
-            }
-            "End" => {
-                shell.workspace.selected_buffer.move_end(shift_pressed);
-                changed = true;
-            }
-            "LeftArrow" => {
-                shell.workspace.selected_buffer.move_left(shift_pressed);
-                changed = true;
-            }
-            "RightArrow" => {
-                shell.workspace.selected_buffer.move_right(shift_pressed);
-                changed = true;
-            }
-            "UpArrow" => {
-                shell.workspace.selected_buffer.move_up(shift_pressed);
-                changed = true;
-            }
-            "DownArrow" => {
-                shell.workspace.selected_buffer.move_down(shift_pressed);
-                changed = true;
-            }
-            "PageDown" => {
-                shell.workspace.selected_buffer.page_down(shift_pressed);
-                changed = true;
-            }
-            "PageUp" => {
-                shell.workspace.selected_buffer.page_up(shift_pressed);
-                changed = true;
-            }
-            key => {
-                if let Some(character) = keyboard_event_text(key, shift_pressed) {
-                    shell
-                        .workspace
-                        .selected_buffer
-                        .insert_text_at_caret(&character.to_string());
-                    shell.workspace.persist_selected_buffer();
-                    shell.workspace.set_selected_dirty(true);
+            changed = true;
+        }
+    }
+    if input_state.editor_focused && !primary_modifier_pressed {
+        if let Some(key) = input_state.held_repeat_key.clone() {
+            if input.pressed_keys.iter().any(|pressed| pressed == &key) {
+                input_state.held_repeat_frame_count =
+                    input_state.held_repeat_frame_count.saturating_add(1);
+                let frame = input_state.held_repeat_frame_count;
+                if frame >= BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES
+                    && (frame - BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES)
+                        % BOON_EDITOR_KEY_REPEAT_INTERVAL_FRAMES
+                        == 0
+                    && apply_dev_editor_key(shell, &key, shift_pressed)
+                {
                     changed = true;
                 }
+            } else {
+                clear_dev_key_repeat(input_state);
             }
         }
+    } else {
+        clear_dev_key_repeat(input_state);
+    }
+
+    if changed {
+        reset_dev_caret_blink(shell, input_state);
     }
 
     changed
+}
+
+fn clear_dev_key_repeat(input_state: &mut DevNativeInputState) {
+    input_state.held_repeat_key = None;
+    input_state.held_repeat_frame_count = 0;
+}
+
+fn reset_dev_caret_blink(shell: &mut DevWindowShell, input_state: &mut DevNativeInputState) {
+    input_state.caret_blink_started_at = Some(Instant::now());
+    shell.caret_visible = true;
+}
+
+fn dev_key_is_repeatable(key: &str) -> bool {
+    matches!(
+        key,
+        "Home"
+            | "End"
+            | "LeftArrow"
+            | "RightArrow"
+            | "UpArrow"
+            | "DownArrow"
+            | "PageDown"
+            | "PageUp"
+    )
+}
+
+fn apply_dev_editor_key(shell: &mut DevWindowShell, key: &str, shift_pressed: bool) -> bool {
+    match key {
+        "Return" | "KeypadEnter" => {
+            shell.workspace.selected_buffer.insert_newline_with_indent();
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        "Delete" => {
+            shell.workspace.selected_buffer.delete_backward();
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        "ForwardDelete" => {
+            shell.workspace.selected_buffer.delete_forward();
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        "Tab" => {
+            if shift_pressed {
+                shell.workspace.selected_buffer.unindent_selection();
+            } else {
+                shell.workspace.selected_buffer.indent_selection();
+            }
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        "Home" => {
+            shell.workspace.selected_buffer.move_home(shift_pressed);
+            true
+        }
+        "End" => {
+            shell.workspace.selected_buffer.move_end(shift_pressed);
+            true
+        }
+        "LeftArrow" => {
+            shell.workspace.selected_buffer.move_left(shift_pressed);
+            true
+        }
+        "RightArrow" => {
+            shell.workspace.selected_buffer.move_right(shift_pressed);
+            true
+        }
+        "UpArrow" => {
+            shell.workspace.selected_buffer.move_up(shift_pressed);
+            true
+        }
+        "DownArrow" => {
+            shell.workspace.selected_buffer.move_down(shift_pressed);
+            true
+        }
+        "PageDown" => {
+            shell.workspace.selected_buffer.page_down(shift_pressed);
+            true
+        }
+        "PageUp" => {
+            shell.workspace.selected_buffer.page_up(shift_pressed);
+            true
+        }
+        key => {
+            if let Some(character) = keyboard_event_text(key, shift_pressed) {
+                shell
+                    .workspace
+                    .selected_buffer
+                    .insert_text_at_caret(&character.to_string());
+                shell.workspace.persist_selected_buffer();
+                shell.workspace.set_selected_dirty(true);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 fn dev_source_binding_at(
@@ -1884,14 +1962,11 @@ fn dev_position_from_pointer(
     x: f32,
     y: f32,
 ) -> Option<EditorPosition> {
-    let Some(editor_bounds) = layout_frame
+    let editor_bounds = layout_frame
         .display_list
         .iter()
         .find(|item| item.node.0 == "dev-code-editor")
-        .map(|item| item.bounds)
-    else {
-        return None;
-    };
+        .map(|item| item.bounds)?;
     let relative_y = (y - editor_bounds.y - BOON_EDITOR_PADDING as f32).max(0.0);
     let line = model
         .scroll_line
@@ -1903,14 +1978,35 @@ fn dev_position_from_pointer(
         .lines()
         .nth(line.saturating_sub(1))
         .unwrap_or("");
-    let relative_x = (x
-        - editor_bounds.x
-        - (BOON_EDITOR_PADDING + BOON_EDITOR_GUTTER_WIDTH + BOON_EDITOR_ROW_GAP) as f32)
-        .max(0.0);
-    let char_width = BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR;
+    let line_node_id = format!("dev-code-editor-line-text-{line}");
+    let line_item = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == line_node_id)?;
+    let char_width = editor_cell_width(&line_item.style);
+    let inset = style_number_from_map(&line_item.style, "text_inset").unwrap_or(0.0);
+    let relative_x =
+        (x - line_item.bounds.x - inset + model.scroll_column as f32 * char_width).max(0.0);
     let column =
-        ((relative_x / char_width).floor() as usize + 1).min(line_text.chars().count() + 1);
+        ((relative_x / char_width + 0.5).floor() as usize + 1).min(line_text.chars().count() + 1);
     Some(EditorPosition { line, column })
+}
+
+fn editor_cell_width(style: &BTreeMap<String, boon_document_model::StyleValue>) -> f32 {
+    style_number_from_map(style, "editor_cell_width")
+        .unwrap_or(BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR)
+        .max(1.0)
+}
+
+fn style_number_from_map(
+    style: &BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> Option<f32> {
+    match style.get(key)? {
+        boon_document_model::StyleValue::Number(value) => Some(*value as f32),
+        boon_document_model::StyleValue::Text(value) => value.parse::<f32>().ok(),
+        boon_document_model::StyleValue::Bool(_) => None,
+    }
 }
 
 fn rect_contains(rect: boon_document::Rect, x: f32, y: f32) -> bool {
@@ -4309,6 +4405,10 @@ impl CodeEditorView {
                 ("syntax_spans_json", &syntax_spans_json),
                 ("text_inset", "0"),
                 ("text_clip_padding", "4"),
+                (
+                    "editor_cell_width",
+                    &(BOON_EDITOR_FONT_SIZE as f32 * BOON_EDITOR_CHAR_WIDTH_FACTOR).to_string(),
+                ),
                 ("editor_selection_color", BOON_EDITOR_SELECTION),
                 ("editor_caret_color", BOON_EDITOR_CURSOR),
                 ("editor_bracket_color", BOON_EDITOR_BRACKET_MATCH),
@@ -10143,6 +10243,10 @@ mod tests {
             rendered.style.get("editor_bracket_columns"),
             Some(&boon_document_model::StyleValue::Text("7,13".to_owned()))
         );
+        assert_eq!(
+            rendered.style.get("editor_cell_width"),
+            Some(&boon_document_model::StyleValue::Number(8.8))
+        );
 
         let mut hidden_frame = boon_document_model::DocumentFrame::empty("root");
         let hidden_parent = hidden_frame.root.clone();
@@ -10157,6 +10261,208 @@ mod tests {
             hidden.style.get("editor_caret_visible"),
             Some(&boon_document_model::StyleValue::Bool(false))
         );
+    }
+
+    #[test]
+    fn pointer_to_editor_position_uses_nearest_character_boundary() {
+        let model = CodeEditorModel::new("custom://click.bn", "abcdef\n");
+        let mut document = boon_document_model::DocumentFrame::empty("root");
+        let root = document.root.clone();
+        set_style(
+            document.nodes.get_mut(&root).expect("root exists"),
+            &[("width", "fill"), ("height", "160"), ("bg", "#282c34")],
+        );
+        CodeEditorView::new().append_to(&mut document, root, &model, 120, true);
+
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 640.0,
+                height: 180.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let line_item = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor-line-text-1")
+            .expect("line text should be laid out");
+        let text_origin_x = line_item.bounds.x;
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+        let line_y =
+            editor_bounds.y + BOON_EDITOR_PADDING as f32 + BOON_EDITOR_LINE_HEIGHT as f32 * 0.5;
+        let char_width = editor_cell_width(&line_item.style);
+
+        assert_eq!(
+            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 0.24, line_y),
+            Some(EditorPosition { line: 1, column: 1 })
+        );
+        assert_eq!(
+            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 0.51, line_y),
+            Some(EditorPosition { line: 1, column: 2 })
+        );
+        assert_eq!(
+            dev_position_from_pointer(&model, &layout, text_origin_x + char_width * 2.51, line_y),
+            Some(EditorPosition { line: 1, column: 4 })
+        );
+    }
+
+    #[test]
+    fn held_arrow_repeats_and_resets_caret_blink() {
+        let catalog = ExampleCatalog {
+            entries: vec![ExampleCatalogEntry {
+                id: "counter".to_owned(),
+                label: "Counter".to_owned(),
+                source: "examples/counter.bn".to_owned(),
+                inline_source: Some("abcdef\n".to_owned()),
+                category: "test".to_owned(),
+                order: 0,
+                shown_by_default: true,
+                custom: false,
+            }],
+            custom_store_path: PathBuf::from("target/artifacts/native-gpu/tests/repeat.toml"),
+        };
+        let workspace =
+            ExampleWorkspace::new(&catalog, "examples/counter.bn", "abcdef\n", Some("counter"));
+        let mut shell = DevWindowShell {
+            catalog,
+            initial_workspace: workspace.clone(),
+            workspace,
+            editor_view: CodeEditorView::new(),
+            preview_transport: PreviewTransport::new(None),
+            last_preview_transport: json!({"status": "not-run"}),
+            caret_visible: false,
+        };
+        let mut input_state = DevNativeInputState {
+            editor_focused: true,
+            caret_blink_started_at: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(
+                        BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS,
+                    ))
+                    .unwrap_or_else(Instant::now),
+            ),
+            ..DevNativeInputState::default()
+        };
+
+        let document = shell.document_for_viewport(1180, 820);
+        let mut measurer = boon_document::SimpleTextMeasurer;
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 1180.0,
+                height: 820.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+
+        let key_down = test_keyboard_input(
+            vec![boon_native_app_window::NativeKeyboardEventProof {
+                sequence: 1,
+                key: "RightArrow".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            }],
+            vec!["RightArrow"],
+        );
+        assert!(dev_apply_real_window_input(
+            &key_down,
+            &document,
+            &layout,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(
+            *shell.workspace.selected_buffer.caret(),
+            EditorPosition { line: 1, column: 2 }
+        );
+        assert!(shell.caret_visible);
+        assert!(input_state.caret_blink_started_at.is_some());
+
+        let held = test_keyboard_input(Vec::new(), vec!["RightArrow"]);
+        for _ in 0..BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES {
+            let _ = dev_apply_real_window_input(
+                &held,
+                &document,
+                &layout,
+                &mut shell,
+                &mut input_state,
+            );
+        }
+        assert!(
+            shell.workspace.selected_buffer.caret().column > 2,
+            "held RightArrow should move beyond the initial key-down"
+        );
+
+        let key_up = test_keyboard_input(
+            vec![boon_native_app_window::NativeKeyboardEventProof {
+                sequence: 2,
+                key: "RightArrow".to_owned(),
+                pressed: false,
+                window_protocol_id: Some(1),
+            }],
+            Vec::new(),
+        );
+        let column_after_repeat = shell.workspace.selected_buffer.caret().column;
+        let _ =
+            dev_apply_real_window_input(&key_up, &document, &layout, &mut shell, &mut input_state);
+        for _ in 0..BOON_EDITOR_KEY_REPEAT_DELAY_FRAMES {
+            let _ = dev_apply_real_window_input(
+                &test_keyboard_input(Vec::new(), Vec::new()),
+                &document,
+                &layout,
+                &mut shell,
+                &mut input_state,
+            );
+        }
+        assert_eq!(
+            shell.workspace.selected_buffer.caret().column,
+            column_after_repeat
+        );
+    }
+
+    fn test_keyboard_input(
+        keyboard_events: Vec<boon_native_app_window::NativeKeyboardEventProof>,
+        pressed_keys: Vec<&str>,
+    ) -> boon_native_app_window::NativeInputAdapterProof {
+        boon_native_app_window::NativeInputAdapterProof {
+            installed: true,
+            capture_scope: "test".to_owned(),
+            keyboard_api: "test".to_owned(),
+            mouse_api: "test".to_owned(),
+            wheel_api: "test".to_owned(),
+            per_window_event_provenance_api: "test".to_owned(),
+            sampled_after_visible_window: true,
+            real_os_events_observed: true,
+            input_injection_method: "test".to_owned(),
+            synthetic_input_probe: false,
+            mouse_last_window_protocol_id: None,
+            keyboard_last_window_protocol_id: Some(1),
+            mouse_motion_event_count: 0,
+            mouse_button_event_count: 0,
+            mouse_scroll_event_count: 0,
+            mouse_total_event_count: 0,
+            keyboard_key_event_count: keyboard_events.len() as u64,
+            mouse_button_events: Vec::new(),
+            keyboard_events,
+            mouse_window_pos: None,
+            mouse_buttons_down: Vec::new(),
+            pressed_keys: pressed_keys.into_iter().map(str::to_owned).collect(),
+            scroll_delta_x: 0.0,
+            scroll_delta_y: 0.0,
+        }
     }
 
     #[test]
@@ -10190,7 +10496,7 @@ mod tests {
         assert_eq!(BOON_EDITOR_FONT_FEATURE_SETTINGS, "'zero' 1, 'calt' 1");
         assert_eq!(BOON_EDITOR_SELECTION, "#3E4451");
         assert_eq!(BOON_EDITOR_CURSOR, "#528bff");
-        assert_eq!(BOON_EDITOR_BRACKET_MATCH, "#bad0f847");
+        assert_eq!(BOON_EDITOR_BRACKET_MATCH, "#528bff33");
 
         let keyword = syntax_style_for_kind("keyword");
         assert_eq!(keyword.color, "#D2691E");

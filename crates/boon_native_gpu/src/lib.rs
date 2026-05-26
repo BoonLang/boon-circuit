@@ -1163,7 +1163,9 @@ fn rect_vertices(
         }
         if matches!(item.kind, DocumentNodeKind::Text) {
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
-            let char_width = font_size * 0.60;
+            let char_width = style_number(&item.style, "editor_cell_width")
+                .unwrap_or(font_size * MONOSPACE_TEXT_WIDTH_FACTOR)
+                .max(1.0);
             let inset = style_number(&item.style, "text_inset").unwrap_or(0.0);
             let line_top = item.bounds.y + 2.0;
             let line_height = (item.bounds.height - 4.0).max(font_size);
@@ -1192,18 +1194,23 @@ fn rect_vertices(
             }
             if let Some(columns) = style_text(&item.style, "editor_bracket_columns") {
                 let bracket_color = style_color_f32(&item.style, "editor_bracket_color")
-                    .unwrap_or([0.49, 0.63, 0.94, 0.28]);
+                    .unwrap_or([0.322, 0.545, 1.0, 0.20]);
                 for column in columns
                     .split(',')
                     .filter_map(|column| column.parse::<f32>().ok())
                 {
+                    let bracket_width = (char_width * 0.72).max(2.0);
+                    let bracket_x = item.bounds.x
+                        + inset
+                        + column.max(0.0) * char_width
+                        + (char_width - bracket_width) * 0.5;
                     push_rect(
                         &mut positions,
                         &mut colors,
                         Rect {
-                            x: item.bounds.x + inset + column.max(0.0) * char_width,
+                            x: bracket_x,
                             y: line_top,
-                            width: char_width.max(2.0),
+                            width: bracket_width,
                             height: line_height,
                         },
                         width,
@@ -1675,6 +1682,7 @@ mod tests {
         let mut style = StyleMap::new();
         style.insert("bg".to_owned(), StyleValue::Text("#282c34".to_owned()));
         style.insert("size".to_owned(), StyleValue::Number(16.0));
+        style.insert("editor_cell_width".to_owned(), StyleValue::Number(8.8));
         style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
         style.insert("editor_selection_start".to_owned(), StyleValue::Number(1.0));
         style.insert("editor_selection_end".to_owned(), StyleValue::Number(4.0));
@@ -1688,7 +1696,7 @@ mod tests {
         );
         style.insert(
             "editor_bracket_color".to_owned(),
-            StyleValue::Text("#bad0f847".to_owned()),
+            StyleValue::Text("#528bff33".to_owned()),
         );
         style.insert("editor_caret_column".to_owned(), StyleValue::Number(3.0));
         style.insert("editor_caret_visible".to_owned(), StyleValue::Bool(true));
@@ -1721,6 +1729,20 @@ mod tests {
         assert!(
             metrics.rendered_rect_count >= 6,
             "background + item + selection + two brackets + caret should render"
+        );
+
+        let (positions, colors, _) = rect_vertices(&frame, 320.0, 120.0);
+        let first_bracket_rect = 3usize;
+        let x0_ndc = positions[first_bracket_rect * 12];
+        let x1_ndc = positions[first_bracket_rect * 12 + 2];
+        let bracket_width = ((x1_ndc - x0_ndc) * 0.5) * 320.0;
+        assert!(
+            bracket_width < 8.8,
+            "bracket highlight should be narrower than a full cell to avoid bleeding into neighbors"
+        );
+        assert_eq!(
+            &colors[first_bracket_rect * 24..first_bracket_rect * 24 + 4],
+            &[22, 66, 255, 51]
         );
     }
 

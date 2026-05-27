@@ -15574,7 +15574,6 @@ fn generic_runtime_execution_fixture(name: &str) -> serde_json::Value {
         "generic_routed_root_target_application",
         "generic_routed_indexed_target_application",
         "ir_list_operation_table_loaded",
-        "ir_formula_operation_table_loaded",
         "ir_state_initializers_loaded",
         "ir_list_initializers_loaded",
         "ir_derived_value_table_loaded",

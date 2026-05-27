@@ -543,7 +543,7 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         just(">=").ignored(),
         just("<=").ignored(),
         just("!=").ignored(),
-        one_of("><=|+-%*").ignored(),
+        one_of("><=|+-%*/").ignored(),
     ))
     .to(AstTokenKind::Operator);
     let symbol = one_of("[]{}():,.$#").to(AstTokenKind::Symbol);
@@ -752,6 +752,10 @@ fn ast_statement(
         }
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
+    } else if item.symbols.first().map(String::as_str) == Some("BLOCK")
+        && item.symbols.last().map(String::as_str) == Some("{")
+    {
+        AstStatementKind::Block
     } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
     {
         AstStatementKind::Block
@@ -845,6 +849,13 @@ fn ast_expr_kind(
     if tokens.len() == 2 && tokens[0] == "-" && tokens[1].chars().all(|ch| ch.is_ascii_digit()) {
         return AstExprKind::Number(format!("-{}", tokens[1]));
     }
+    if let Some(arrow) = find_top_level_token(tokens, "=>") {
+        return AstExprKind::MatchArm {
+            pattern: tokens[..arrow].to_vec(),
+            output: (!tokens[arrow + 1..].is_empty())
+                .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
+        };
+    }
     if let Some(value) = string_literal_value(tokens) {
         return AstExprKind::StringLiteral(value);
     }
@@ -877,13 +888,6 @@ fn ast_expr_kind(
             left,
             op: op.to_owned(),
             right,
-        };
-    }
-    if let Some(arrow) = find_top_level_token(tokens, "=>") {
-        return AstExprKind::MatchArm {
-            pattern: tokens[..arrow].to_vec(),
-            output: (!tokens[arrow + 1..].is_empty())
-                .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
         };
     }
     if let Some(pipe) = find_top_level_pipe(tokens) {
@@ -1048,7 +1052,19 @@ fn ast_function_args(tokens: &[String]) -> Vec<String> {
 }
 
 fn find_top_level_pipe(tokens: &[String]) -> Option<usize> {
-    find_top_level_token(tokens, "|>")
+    let mut depth = 0i32;
+    let mut pipe = None;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.as_str() {
+            "[" | "{" | "(" => depth += 1,
+            "]" | "}" | ")" => depth -= 1,
+            _ => {}
+        }
+        if token == "|>" && depth == 0 {
+            pipe = Some(index);
+        }
+    }
+    pipe
 }
 
 fn find_top_level_token(tokens: &[String], needle: &str) -> Option<usize> {
@@ -1072,7 +1088,7 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
-            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" | "*" | "%"
+            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" | "*" | "/" | "%"
                 if depth == 0 && index > 0 && index + 1 < tokens.len() =>
             {
                 return Some((&tokens[..index], token, &tokens[index + 1..]));
@@ -1541,11 +1557,14 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "WHILE"
             | "LATEST"
             | "LIST"
+            | "BLOCK"
             | "List/map"
             | "List/append"
             | "List/range"
             | "List/table"
             | "List/get"
+            | "List/find"
+            | "List/chunk"
             | "List/remove"
             | "List/retain"
             | "List/count"
@@ -1564,6 +1583,9 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/to_number"
             | "Text/is_empty"
             | "Bool/not"
+            | "Bool/and"
+            | "Error/new"
+            | "Error/text"
     )
 }
 

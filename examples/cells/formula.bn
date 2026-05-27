@@ -1,4 +1,165 @@
--- Cells formula reader declaration.
+-- Cells formula helpers.
 
-sheet_reader:
-    Formula/reader(list: cells, address: address, value: value)
+FUNCTION cell_value(target_address) {
+    BLOCK {
+        found: List/find(cells, field: address, value: target_address)
+        raw: found.value
+        raw |> Text/to_number() |> WHILE {
+            NaN => raw
+            number => number
+        }
+    }
+}
+
+FUNCTION range_cell_value(column, row) {
+    cell_value(target_address: column + row)
+}
+
+FUNCTION sum_range(start_address, end_address) {
+    BLOCK {
+        start_column: start_address |> Text/substring(start: 0, length: 1)
+        start_length: start_address |> Text/length()
+        start_row_length: start_length - 1
+        start_row:
+            start_address
+            |> Text/substring(start: 1, length: start_row_length)
+            |> Text/to_number()
+        end_length: end_address |> Text/length()
+        end_row_length: end_length - 1
+        end_row:
+            end_address
+            |> Text/substring(start: 1, length: end_row_length)
+            |> Text/to_number()
+        List/range(from: start_row, to: end_row)
+        |> List/map(row, new: range_cell_value(column: start_column, row: row))
+        |> List/sum()
+    }
+}
+
+FUNCTION add_value(text) {
+    BLOCK {
+        text_length: text |> Text/length()
+        inner_length: text_length - 5
+        inner: text |> Text/substring(start: 4, length: inner_length)
+        comma: inner |> Text/find(needle: TEXT { , })
+        comma |> WHILE {
+            NaN => Error/new(code: TEXT { parse_error })
+            index => BLOCK {
+                inner_length: inner |> Text/length()
+                right_start: index + 1
+                right_length: inner_length - right_start
+                left: inner |> Text/substring(start: 0, length: index)
+                right: inner |> Text/substring(start: right_start, length: right_length)
+                expression_value(text: left) + expression_value(text: right)
+            }
+        }
+    }
+}
+
+FUNCTION sum_value(text) {
+    BLOCK {
+        text_length: text |> Text/length()
+        inner_length: text_length - 5
+        inner: text |> Text/substring(start: 4, length: inner_length)
+        colon: inner |> Text/find(needle: TEXT { : })
+        colon |> WHILE {
+            NaN => Error/new(code: TEXT { parse_error })
+            index => BLOCK {
+                inner_length: inner |> Text/length()
+                right_start: index + 1
+                right_length: inner_length - right_start
+                start_address: inner |> Text/substring(start: 0, length: index)
+                end_address: inner |> Text/substring(start: right_start, length: right_length)
+                sum_range(start_address: start_address, end_address: end_address)
+            }
+        }
+    }
+}
+
+FUNCTION binary_value(text, operator_index, operator_text) {
+    BLOCK {
+        text_length: text |> Text/length()
+        right_start: operator_index + 1
+        right_length: text_length - right_start
+        left: text |> Text/substring(start: 0, length: operator_index)
+        right: text |> Text/substring(start: right_start, length: right_length)
+        operator_text |> WHILE {
+            TEXT { + } => expression_value(text: left) + expression_value(text: right)
+            TEXT { - } => expression_value(text: left) - expression_value(text: right)
+            TEXT { * } => expression_value(text: left) * expression_value(text: right)
+            TEXT { / } => expression_value(text: left) / expression_value(text: right)
+            __ => Error/new(code: TEXT { parse_error })
+        }
+    }
+}
+
+FUNCTION reference_or_number(text) {
+    BLOCK {
+        text |> Text/to_number() |> WHILE {
+            NaN => cell_value(target_address: text)
+            number => number
+        }
+    }
+}
+
+FUNCTION expression_value(text) {
+    BLOCK {
+        trimmed: text |> Text/trim()
+        plus_index: trimmed |> Text/find(needle: TEXT { + })
+        plus_index |> WHILE {
+            NaN => BLOCK {
+                minus_index: trimmed |> Text/find(needle: TEXT { - })
+                minus_index |> WHILE {
+                    NaN => BLOCK {
+                        multiply_index: trimmed |> Text/find(needle: TEXT { * })
+                        multiply_index |> WHILE {
+                            NaN => BLOCK {
+                                divide_index: trimmed |> Text/find(needle: TEXT { / })
+                                divide_index |> WHILE {
+                                    NaN => BLOCK {
+                                        add_call: trimmed |> Text/starts_with(prefix: "add(")
+                                        add_call |> WHILE {
+                                            True => add_value(text: trimmed)
+                                            False => BLOCK {
+                                                sum_call: trimmed |> Text/starts_with(prefix: "sum(")
+                                                sum_call |> WHILE {
+                                                    True => sum_value(text: trimmed)
+                                                    False => reference_or_number(text: trimmed)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { / })
+                                }
+                            }
+                            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { * })
+                        }
+                    }
+                    index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { - })
+                }
+            }
+            index => binary_value(text: trimmed, operator_index: index, operator_text: TEXT { + })
+        }
+    }
+}
+
+FUNCTION compute_value(address, formula_text) {
+    BLOCK {
+        trimmed: formula_text |> Text/trim()
+        trimmed |> Text/is_empty() |> WHILE {
+            True => TEXT {}
+            False => BLOCK {
+                formula: trimmed |> Text/starts_with(prefix: TEXT { = })
+                formula |> WHILE {
+                    False => trimmed
+                    True => BLOCK {
+                        formula_length: trimmed |> Text/length()
+                        expression_length: formula_length - 1
+                        expression: trimmed |> Text/substring(start: 1, length: expression_length)
+                        expression_value(text: expression)
+                    }
+                }
+            }
+        }
+    }
+}

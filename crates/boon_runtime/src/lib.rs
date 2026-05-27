@@ -1137,29 +1137,13 @@ fn run_loaded_scenario(
 
 struct LoadedRuntime {
     generic: Option<GenericScheduledRuntime>,
-    formula_runtime: Option<AddressedFormulaRuntimeCache>,
 }
 
 impl LoadedRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
-        let mut generic = GenericScheduledRuntime::new(ir, compiled)?;
-        let formula_runtime = if compiled.formula_operation_count > 0 {
-            let Some(plan) =
-                addressed_formula_runtime_plan_from_ir(ir, &compiled.formula_operators)?
-            else {
-                return Err(
-                    "formula operations require an addressed list with Formula/* row fields".into(),
-                );
-            };
-            let mut state = formula_runtime_cache_from_generic(&generic, plan)?;
-            initialize_addressed_formula_from_generic(&mut generic, &mut state)?;
-            Some(state)
-        } else {
-            None
-        };
+        let generic = GenericScheduledRuntime::new(ir, compiled)?;
         Ok(Self {
             generic: Some(generic),
-            formula_runtime,
         })
     }
 
@@ -1178,23 +1162,20 @@ impl LoadedRuntime {
         deltas: &mut Vec<SemanticDelta<'a>>,
         patches: &mut Vec<RenderPatch<'a>>,
     ) -> RuntimeResult<StepExecutionMetrics> {
-        if let Some(state) = &mut self.formula_runtime {
-            let generic = self
-                .generic
-                .as_mut()
-                .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-            return apply_addressed_formula_step(generic, state, step, deltas, patches);
-        }
         let Some(source_event) = GenericSourceEvent::from_step(step)? else {
             return Ok(StepExecutionMetrics {
                 dirty_key_count: 0,
-                extra: StepExecutionExtra::Generic,
+                extra: StepExecutionExtra::Generic {
+                    recomputed_field_count: 0,
+                    recompute_candidate_count: 0,
+                },
             });
         };
         let generic = self
             .generic
             .as_mut()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
+        let delta_start = deltas.len();
         let input = generic.source_action_input_for_event(
             &step.id,
             source_event,
@@ -1213,547 +1194,24 @@ impl LoadedRuntime {
                 Ok(())
             },
         )?;
+        let changed_reads = generic.read_keys_from_deltas(&deltas[delta_start..])?;
+        let (derived_commits, recompute_metrics) =
+            generic.recompute_generic_derived_after_changes(changed_reads)?;
+        for commit in derived_commits {
+            let mutation = GenericSourceMutation::ValueField(commit);
+            if let Some(delta) = mutation.semantic_delta() {
+                deltas.push(delta);
+            }
+            patches.push(generic_document_invalidation_patch(&mutation));
+        }
         Ok(StepExecutionMetrics {
             dirty_key_count: deltas.len(),
-            extra: StepExecutionExtra::Generic,
+            extra: StepExecutionExtra::Generic {
+                recomputed_field_count: recompute_metrics.recomputed_field_count,
+                recompute_candidate_count: recompute_metrics.recompute_candidate_count,
+            },
         })
     }
-}
-
-fn initialize_addressed_formula_from_generic(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-) -> RuntimeResult<()> {
-    generic.formula_operators.validate_formula_pipeline()?;
-    for index in 0..state.parsed_formulas.len() {
-        let formula =
-            generic.list_row_textlike(&state.plan.list, index, &state.plan.formula_field)?;
-        state.parsed_formulas[index] = generic
-            .formula_operators
-            .parse_addressed_formula(formula, &state.address_to_index)?;
-        replace_addressed_formula_dependencies(generic, state, index)?;
-    }
-    state.evaluation_cache.begin_tick();
-    for index in 0..state.parsed_formulas.len() {
-        let _ = state
-            .evaluation_cache
-            .eval_cell(&state.parsed_formulas, index);
-    }
-    for index in 0..state.parsed_formulas.len() {
-        let result = state.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
-        sync_addressed_formula_result(generic, state, index, index, result)?;
-        sync_addressed_formula_derived_fields(generic, state, index)?;
-    }
-    Ok(())
-}
-
-fn prepare_addressed_formula_scenario(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    scenario: &Scenario,
-) -> RuntimeResult<()> {
-    let requirements = generic.prepare_addressed_formula_scenario_storage(scenario, &state.plan)?;
-    reserve_addressed_formula_cache(state, requirements.max_text_len, requirements.max_deps);
-    Ok(())
-}
-
-fn addressed_formula_protocol_text<'a>(value: &str) -> ProtocolValue<'a> {
-    ProtocolValue::Text(Cow::Owned(value.to_owned()))
-}
-
-fn reserve_addressed_formula_cache(
-    state: &mut AddressedFormulaRuntimeCache,
-    _max_text_len: usize,
-    max_deps: usize,
-) {
-    for dependencies in &mut state.dependencies {
-        dependencies.reserve(max_deps);
-    }
-    let minimum_fanout_capacity = max_deps.max(4);
-    state
-        .dependency_cache
-        .reserve_dependents(minimum_fanout_capacity);
-}
-
-fn apply_addressed_formula_step<'a>(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    step: &'a ScenarioStep,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-    patches: &mut Vec<RenderPatch<'a>>,
-) -> RuntimeResult<StepExecutionMetrics> {
-    let mut step_recomputed = std::mem::take(&mut state.step_recomputed);
-    step_recomputed.clear();
-    let patch_count_before = patches.len();
-    apply_addressed_formula_step_into(generic, state, step, deltas, patches, &mut step_recomputed)?;
-    if patches.len() > patch_count_before
-        && !patches[patch_count_before..]
-            .iter()
-            .any(|patch| patch.kind == "InvalidateDocument")
-    {
-        patches.push(patch(
-            "InvalidateDocument",
-            RenderTarget::Static(Cow::Borrowed("document")),
-            ProtocolValue::Text(Cow::Borrowed("formula")),
-        ));
-    }
-    state
-        .dirty_key_sets
-        .mark_indexes(&state.plan.list, &state.plan.value_field, &step_recomputed);
-    let dirty_key_count = state.dirty_key_sets.key_count();
-    let recomputed_cell_count = step_recomputed.len();
-    let recompute_candidate_count = state.last_recompute_candidates;
-    let formula_eval_call_count = state.evaluation_cache.last_eval_calls();
-    let dependency_edge_walk_count = state.dependency_cache.last_edge_walks();
-    state.step_recomputed = step_recomputed;
-    Ok(StepExecutionMetrics {
-        dirty_key_count,
-        extra: StepExecutionExtra::AddressedFormula {
-            recomputed_cell_count,
-            recompute_candidate_count,
-            formula_eval_call_count,
-            dependency_edge_walk_count,
-        },
-    })
-}
-
-fn apply_addressed_formula_step_into<'a>(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    step: &'a ScenarioStep,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-    patches: &mut Vec<RenderPatch<'a>>,
-    recomputed: &mut Vec<usize>,
-) -> RuntimeResult<()> {
-    let Some(routed) = route_addressed_formula_step(generic, state, step)? else {
-        return Ok(());
-    };
-    assert_routed_source_event_matches(step, routed.event)?;
-    match routed.route_kind {
-        SourceActionKind::IndexedTextChange => {
-            let source = routed.source();
-            let address = routed.require_address(&step.id)?;
-            addressed_formula_row_index(generic, state, address)?;
-            let text = routed.require_text(&step.id)?;
-            let source_event = GenericSourceEvent {
-                source,
-                text: Some(text),
-                key: None,
-                target_text: None,
-                address: Some(address),
-            };
-            let input = generic.source_action_input_for_event_by_row_field(
-                "addressed-formula-change",
-                source_event,
-                TickSeq(0),
-                &state.plan.address_field,
-                Some(address),
-            )?;
-            let batch = generic.apply_source_actions_to_batch(
-                input,
-                |_| None,
-                |mutation| {
-                    emit_addressed_formula_default_protocol_mutation(
-                        mutation, address, None, true, false, deltas, patches,
-                    )?;
-                    Ok(())
-                },
-            )?;
-            batch.require_first_text_except(
-                source,
-                "addressed-formula draft update",
-                &state.plan.formula_field,
-            )?;
-            batch.require_first_bool(source, "addressed-formula editing update")?;
-        }
-        SourceActionKind::IndexedTextCommit => {
-            let source = routed.source();
-            let address = routed.require_address(&step.id)?;
-            addressed_formula_row_index(generic, state, address)?;
-            let text = routed.require_text(&step.id)?;
-            addressed_formula_commit_from_source(
-                generic, state, source, address, text, deltas, patches, recomputed,
-            )?;
-        }
-        SourceActionKind::IndexedTextIdentity => {
-            let source = routed.source();
-            let address = routed.require_address(&step.id)?;
-            addressed_formula_row_index(generic, state, address)?;
-            let source_event = GenericSourceEvent {
-                source,
-                text: None,
-                key: None,
-                target_text: None,
-                address: Some(address),
-            };
-            let input = generic.source_action_input_for_event_by_row_field(
-                "addressed-formula-cancel",
-                source_event,
-                TickSeq(0),
-                &state.plan.address_field,
-                Some(address),
-            )?;
-            let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-            let editing_text =
-                batch.require_first_identity(source, "addressed-formula draft cancel")?;
-            let editing = batch.require_first_bool(source, "addressed-formula editing cancel")?;
-            let index = addressed_formula_row_index(generic, state, address)?;
-            let value = generic.list_row_textlike(&state.plan.list, index, &editing_text.field)?;
-            let identity_value = addressed_formula_protocol_text(value);
-            emit_addressed_formula_default_protocol_mutation(
-                GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
-                address,
-                Some(identity_value),
-                false,
-                false,
-                deltas,
-                patches,
-            )?;
-            emit_addressed_formula_default_protocol_mutation(
-                GenericSourceMutation::BoolField(editing),
-                address,
-                None,
-                false,
-                false,
-                deltas,
-                patches,
-            )?;
-        }
-        route_kind => {
-            return Err(format!(
-                "{} addressed-formula source `{}` classified as unsupported route `{route_kind:?}`",
-                step.id,
-                routed.source()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn route_addressed_formula_step<'a>(
-    generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    step: &'a ScenarioStep,
-) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
-    if step.user_action.is_none() {
-        return Ok(None);
-    }
-    let source_event = GenericSourceEvent::require(step)?;
-    route_addressed_formula_source_event(generic, state, step, source_event)
-}
-
-fn route_addressed_formula_source_event<'a>(
-    generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    step: &'a ScenarioStep,
-    source_event: GenericSourceEvent<'a>,
-) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
-    let source = source_event.source;
-    let routed = generic
-        .route_source_event(&state.plan.list, &state.plan.formula_field, source_event)
-        .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
-    let address = routed.event.address.ok_or_else(|| {
-        format!(
-            "{} addressed-formula source event missing valid address",
-            step.id
-        )
-    })?;
-    addressed_formula_row_index(generic, state, address)?;
-    match routed.route_kind {
-        SourceActionKind::IndexedTextCommit | SourceActionKind::IndexedTextChange => {
-            routed.require_text(&step.id)?;
-            Ok(Some(routed))
-        }
-        SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
-        route_kind => Err(format!(
-            "{} addressed-formula source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
-            step.id
-        )
-        .into()),
-    }
-}
-
-fn addressed_formula_commit_from_source<'a>(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    source: &'a str,
-    address: &'a str,
-    formula: &'a str,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-    patches: &mut Vec<RenderPatch<'a>>,
-    recomputed: &mut Vec<usize>,
-) -> RuntimeResult<()> {
-    generic.formula_operators.validate_formula_pipeline()?;
-    let committed_index = addressed_formula_row_index(generic, state, address)?;
-    let source_event = GenericSourceEvent {
-        source,
-        text: Some(formula),
-        key: None,
-        target_text: None,
-        address: Some(address),
-    };
-    let input = generic.source_action_input_for_event_by_row_field(
-        "addressed-formula-commit",
-        source_event,
-        TickSeq(0),
-        &state.plan.address_field,
-        Some(address),
-    )?;
-    let batch = generic.apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-    let formula = batch.require_text(
-        source,
-        "addressed-formula formula update",
-        &state.plan.formula_field,
-    )?;
-    let editing_text = batch.require_first_text_except(
-        source,
-        "addressed-formula draft update",
-        &state.plan.formula_field,
-    )?;
-    let editing = batch.require_first_bool(source, "addressed-formula editing update")?;
-    state.parsed_formulas[committed_index] = generic
-        .formula_operators
-        .parse_addressed_formula(formula.value, &state.address_to_index)?;
-    replace_addressed_formula_dependencies(generic, state, committed_index)?;
-    recompute_addressed_formula_affected(generic, state, address, recomputed)?;
-    let display_key = formula.key;
-    let display_generation = formula.generation;
-    let display_value = addressed_formula_display_protocol_value(generic, state, committed_index)?;
-    let display_error = addressed_formula_error(generic, state, committed_index)?;
-    emit_addressed_formula_default_protocol_mutation(
-        GenericSourceMutation::TextField(formula),
-        address,
-        None,
-        false,
-        false,
-        deltas,
-        patches,
-    )?;
-    emit_addressed_formula_default_protocol_mutation(
-        GenericSourceMutation::TextField(editing_text),
-        address,
-        None,
-        false,
-        false,
-        deltas,
-        patches,
-    )?;
-    emit_addressed_formula_default_protocol_mutation(
-        GenericSourceMutation::BoolField(editing),
-        address,
-        None,
-        false,
-        false,
-        deltas,
-        patches,
-    )?;
-    generic
-        .formula_operators
-        .emit_addressed_formula_display_protocol_mutations(
-            &state.plan.list,
-            display_key,
-            display_generation,
-            display_value,
-            display_error.as_deref(),
-            address,
-            deltas,
-            patches,
-        )?;
-    Ok(())
-}
-
-fn recompute_addressed_formula_affected(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    changed_address: &str,
-    recomputed: &mut Vec<usize>,
-) -> RuntimeResult<()> {
-    let changed_index = addressed_formula_row_index(generic, state, changed_address)?;
-    state.dependency_cache.collect_affected(changed_index);
-    let affected_len = state.dependency_cache.affected().len();
-    state.last_recompute_candidates = affected_len;
-    state.evaluation_cache.begin_tick();
-    for offset in 0..affected_len {
-        let index = state.dependency_cache.affected()[offset];
-        let _ = state
-            .evaluation_cache
-            .eval_cell(&state.parsed_formulas, index);
-    }
-    for offset in 0..affected_len {
-        let index = state.dependency_cache.affected()[offset];
-        let result = state.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
-        let changed = sync_addressed_formula_result(generic, state, index, changed_index, result)?;
-        if changed {
-            sync_addressed_formula_derived_fields(generic, state, index)?;
-            recomputed.push(index);
-        }
-    }
-    recomputed.sort_unstable();
-    Ok(())
-}
-
-fn sync_addressed_formula_derived_fields(
-    generic: &mut GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    index: usize,
-) -> RuntimeResult<()> {
-    let dependency_text = addressed_formula_dependency_text(state, index);
-    let fields = generic.formula_operators.derived_storage_fields()?;
-    let value = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.value_field)
-        .unwrap_or("")
-        .to_owned();
-    let error = addressed_formula_error(generic, state, index)?;
-    sync_formula_derived_fields(
-        generic,
-        &state.plan.list,
-        index,
-        fields,
-        &value,
-        error.as_deref(),
-        &dependency_text,
-    )
-}
-
-fn sync_addressed_formula_result(
-    generic: &mut GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    index: usize,
-    changed_index: usize,
-    result: Result<i64, String>,
-) -> RuntimeResult<bool> {
-    let display = FormulaDisplay::from_result(state.parsed_formulas[index], result);
-    let current_value = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.value_field)
-        .unwrap_or("");
-    let current_error = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.error_field)
-        .unwrap_or("");
-    let changed = index == changed_index
-        || current_value != display.value
-        || current_error != display.error.as_deref().unwrap_or_default();
-    generic.set_or_insert_list_row_textlike(
-        &state.plan.list,
-        index,
-        &state.plan.value_field,
-        &display.value,
-    )?;
-    generic.set_or_insert_list_row_textlike(
-        &state.plan.list,
-        index,
-        &state.plan.error_field,
-        display.error.as_deref().unwrap_or_default(),
-    )?;
-    Ok(changed)
-}
-
-fn addressed_formula_dependency_text(state: &AddressedFormulaRuntimeCache, index: usize) -> String {
-    let mut text = String::new();
-    for offset in 0..state.dependencies[index].len() {
-        if offset > 0 {
-            text.push(',');
-        }
-        let dependency = state.dependencies[index][offset];
-        if let Some(address) = state.row_addresses.get(dependency) {
-            text.push_str(address);
-        }
-    }
-    text
-}
-
-fn addressed_formula_error(
-    generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    index: usize,
-) -> RuntimeResult<Option<String>> {
-    let error = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.error_field)
-        .unwrap_or("");
-    Ok((!error.is_empty()).then(|| error.to_owned()))
-}
-
-fn addressed_formula_display_protocol_value(
-    generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    index: usize,
-) -> RuntimeResult<ProtocolValue<'static>> {
-    let error = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.error_field)
-        .unwrap_or("");
-    if !error.is_empty() {
-        return Ok(ProtocolValue::Text(Cow::Borrowed("")));
-    }
-    let value = generic
-        .list_row_textlike_opt(&state.plan.list, index, &state.plan.value_field)
-        .unwrap_or("");
-    if let Ok(value) = value.parse::<i64>() {
-        Ok(ProtocolValue::NumberText(value))
-    } else {
-        Ok(ProtocolValue::Text(Cow::Owned(value.to_owned())))
-    }
-}
-
-fn replace_addressed_formula_dependencies(
-    generic: &GenericScheduledRuntime,
-    state: &mut AddressedFormulaRuntimeCache,
-    cell_index: usize,
-) -> RuntimeResult<()> {
-    state.dependencies[cell_index].clear();
-    generic.formula_operators.dependencies_into(
-        state.parsed_formulas[cell_index],
-        &mut state.dependencies[cell_index],
-    )?;
-    state
-        .dependency_cache
-        .replace_dependencies(cell_index, &state.dependencies[cell_index]);
-    Ok(())
-}
-
-fn addressed_formula_row_index(
-    _generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-    address: &str,
-) -> RuntimeResult<usize> {
-    state.address_to_index.get(address).copied().ok_or_else(|| {
-        format!(
-            "formula row `{}`=`{address}` was not found in list `{}`",
-            state.plan.address_field, state.plan.list
-        )
-        .into()
-    })
-}
-
-fn addressed_formula_cell_address(state: &AddressedFormulaRuntimeCache, index: usize) -> String {
-    state.row_addresses.get(index).cloned().unwrap_or_default()
-}
-
-fn assert_addressed_formula_generic_fields(
-    generic: &GenericScheduledRuntime,
-    state: &AddressedFormulaRuntimeCache,
-) -> RuntimeResult<()> {
-    let generic_len = generic.list_len(&state.plan.list)?;
-    if generic_len != state.parsed_formulas.len() {
-        return Err(format!(
-            "generic addressed-formula length {generic_len} != formula state {}",
-            state.parsed_formulas.len()
-        )
-        .into());
-    }
-    for index in 0..state.parsed_formulas.len() {
-        let address = addressed_formula_cell_address(state, index);
-        let generic_address =
-            generic.list_row_textlike(&state.plan.list, index, &state.plan.address_field)?;
-        if generic_address != address {
-            return Err(format!(
-                "row {index} address generic `{generic_address}` != computed `{address}`"
-            )
-            .into());
-        }
-        generic.list_row_textlike(&state.plan.list, index, &state.plan.formula_field)?;
-        generic.list_row_textlike(&state.plan.list, index, &state.plan.value_field)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1763,7 +1221,6 @@ struct CompiledProgram {
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
     list_equations: ListEquationPlan,
-    formula_operators: FormulaOperatorPlan,
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
@@ -1776,7 +1233,6 @@ struct CompiledProgram {
     derived_text_transform_count: usize,
     update_branch_count: usize,
     list_operation_count: usize,
-    formula_operation_count: usize,
     list_projection_count: usize,
     view_binding_count: usize,
     source_payload_schema_count: usize,
@@ -1875,29 +1331,6 @@ impl RuntimeSymbols {
                     symbols.intern_list_predicate(predicate);
                 }
             }
-        }
-        for operation in &ir.formula_operations {
-            symbols.intern(&operation.target);
-            match &operation.kind {
-                FormulaOperationKind::Parse { input }
-                | FormulaOperationKind::Dependencies { input } => {
-                    symbols.intern(input);
-                }
-                FormulaOperationKind::Eval { formula, read } => {
-                    symbols.intern(formula);
-                    symbols.intern(read);
-                }
-                FormulaOperationKind::Error { formula, value } => {
-                    symbols.intern(formula);
-                    symbols.intern(value);
-                }
-            }
-        }
-        for reader in &ir.formula_readers {
-            symbols.intern(&reader.target);
-            symbols.intern(&reader.list);
-            symbols.intern(&reader.address_field);
-            symbols.intern(&reader.value_field);
         }
         for projection in &ir.list_projections {
             symbols.intern(&projection.target);
@@ -2010,7 +1443,6 @@ impl CompiledProgram {
         let generic_derived = GenericDerivedPlan::from_ir(ir);
         let derived_text_transform_count = derived_equations.text_transforms.len();
         let list_equations = ListEquationPlan::from_ir(ir);
-        let formula_operators = FormulaOperatorPlan::from_ir(ir);
         let list_projections = ListProjectionPlan::from_ir(ir);
         let root_state_paths = ir
             .state_cells
@@ -2042,7 +1474,6 @@ impl CompiledProgram {
             derived_equations,
             generic_derived,
             list_equations,
-            formula_operators,
             list_projections,
             source_routes,
             list_source_bindings,
@@ -2055,7 +1486,6 @@ impl CompiledProgram {
             derived_text_transform_count,
             update_branch_count: ir.update_branches.len(),
             list_operation_count: ir.list_operations.len(),
-            formula_operation_count: ir.formula_operations.len(),
             list_projection_count: ir.list_projections.len(),
             view_binding_count: ir.view_bindings.len(),
             source_payload_schema_count: source_payload_counts.schema_count,
@@ -2094,7 +1524,6 @@ impl CompiledProgram {
             "derived_text_transform_count": self.derived_text_transform_count,
             "update_branch_count": self.update_branch_count,
             "list_operation_count": self.list_operation_count,
-            "formula_operation_count": self.formula_operation_count,
             "list_projection_count": self.list_projection_count,
             "view_binding_count": self.view_binding_count,
             "source_payload_schema_count": self.source_payload_schema_count,
@@ -2357,13 +1786,10 @@ impl DirtyKeySets {
 }
 
 enum StepExecutionExtra {
-    AddressedFormula {
-        recomputed_cell_count: usize,
+    Generic {
+        recomputed_field_count: usize,
         recompute_candidate_count: usize,
-        formula_eval_call_count: usize,
-        dependency_edge_walk_count: usize,
     },
-    Generic,
 }
 
 trait ScenarioExecutor {
@@ -2456,31 +1882,19 @@ fn run_generic_scenario<R: ScenarioExecutor>(
             .as_object_mut()
             .expect("step report is an object");
         match metrics.extra {
-            StepExecutionExtra::AddressedFormula {
-                recomputed_cell_count,
+            StepExecutionExtra::Generic {
+                recomputed_field_count,
                 recompute_candidate_count,
-                formula_eval_call_count,
-                dependency_edge_walk_count,
             } => {
+                object.insert("generic_runtime_step".to_owned(), json!(true));
                 object.insert(
-                    "recomputed_cell_count".to_owned(),
-                    json!(recomputed_cell_count),
+                    "recomputed_field_count".to_owned(),
+                    json!(recomputed_field_count),
                 );
                 object.insert(
                     "recompute_candidate_count".to_owned(),
                     json!(recompute_candidate_count),
                 );
-                object.insert(
-                    "formula_eval_call_count".to_owned(),
-                    json!(formula_eval_call_count),
-                );
-                object.insert(
-                    "dependency_edge_walk_count".to_owned(),
-                    json!(dependency_edge_walk_count),
-                );
-            }
-            StepExecutionExtra::Generic => {
-                object.insert("generic_runtime_step".to_owned(), json!(true));
             }
         }
         per_step.push(step_report);
@@ -2785,7 +2199,6 @@ fn remaining_example_specific_shells(
 }
 
 fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) -> JsonValue {
-    let has_formula_runtime = compiled.formula_operation_count > 0;
     let route_action_count = compiled
         .source_routes
         .route_slots
@@ -2863,7 +2276,6 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
     let list_initializers_loaded =
         compiled.list_initializer_count == ir.lists.len() && !ir.lists.is_empty();
     let derived_values_loaded = compiled.derived_value_count == ir.derived_values.len();
-    let formula_operations_loaded = compiled.formula_operation_count == ir.formula_operations.len();
     let has_indexed_routes = indexed_text_route_count > 0 || indexed_bool_route_count > 0;
     let has_render_bindings = !ir.view_bindings.is_empty();
     let has_list_source_bindings = !compiled.list_source_bindings.list_slots.is_empty();
@@ -2882,26 +2294,26 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_indexed_scalar_commit_executor": has_indexed_routes,
         "generic_semantic_delta_emitter": route_action_count > 0 || !ir.list_operations.is_empty(),
         "generic_source_mutation_semantic_delta_emitter": route_action_count > 0,
-        "generic_derived_value_semantic_delta_emitter": compiled.derived_text_transform_count > 0 || compiled.formula_operation_count > 0,
+        "generic_derived_value_semantic_delta_emitter": compiled.derived_text_transform_count > 0,
         "generic_source_bind_semantic_delta_emitter": has_list_source_bindings,
-        "generic_list_remove_semantic_delta_emitter": list_remove_operation_count > 0 || has_formula_runtime,
-        "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0 || has_formula_runtime,
+        "generic_list_remove_semantic_delta_emitter": list_remove_operation_count > 0,
+        "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0,
         "generic_render_lowering_plan": has_render_bindings,
         "generic_common_render_patch_lowering": has_render_bindings,
         "generic_loaded_runtime_shell": state_initializers_loaded && source_routes_dense,
         "generic_source_route_action_executor": route_action_count > 0,
         "generic_source_effects_through_action_executor": route_action_count > 0,
-        "generic_root_text_tick_executor": root_scalar_route_count > 0 || has_formula_runtime,
-        "generic_route_selected_root_hold_commit_executor": root_scalar_route_count > 0 || has_formula_runtime,
+        "generic_root_text_tick_executor": root_scalar_route_count > 0,
+        "generic_route_selected_root_hold_commit_executor": root_scalar_route_count > 0,
         "generic_indexed_hold_commit_executor": has_indexed_routes,
         "generic_route_selected_indexed_bool_commit_executor": indexed_bool_route_count > 0,
         "generic_route_selected_indexed_text_commit_executor": indexed_text_route_count > 0,
         "generic_route_selected_indexed_bool_field_commit_executor": indexed_bool_route_count > 0,
         "generic_indexed_bulk_bool_commit_executor": indexed_bool_route_count > 0,
-        "generic_list_append_source_binding_executor": (list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings) || has_formula_runtime,
-        "generic_list_remove_source_unbinding_executor": (list_remove_operation_count > 0 && list_remove_route_count > 0) || has_formula_runtime,
+        "generic_list_append_source_binding_executor": list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings,
+        "generic_list_remove_source_unbinding_executor": list_remove_operation_count > 0 && list_remove_route_count > 0,
         "generic_list_move_semantic_delta_emitter": !ir.lists.is_empty(),
-        "generic_list_count_retain_executor": list_count_retain_operation_count > 0 || has_formula_runtime,
+        "generic_list_count_retain_executor": list_count_retain_operation_count > 0,
         "generic_summary_reads_authoritative_storage": state_initializers_loaded || list_initializers_loaded,
         "generic_loaded_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
         "generic_root_holds_no_mirror": state_initializers_loaded,
@@ -2909,11 +2321,11 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_delta_identities_from_authoritative_storage": route_action_count > 0,
         "generic_committed_fields_hold_no_mirror": has_indexed_routes,
         "generic_root_source_dispatch": source_routes_dense,
-        "generic_derived_text_transform_executor": compiled.derived_text_transform_count > 0 || has_formula_runtime,
+        "generic_derived_text_transform_executor": compiled.derived_text_transform_count > 0,
         "generic_source_event_route_executor": source_routes_dense && route_action_count > 0,
         "generic_compiled_source_route_index": source_routes_dense,
         "generic_source_route_classifier": source_routes_dense,
-        "generic_address_row_context_resolution": has_formula_runtime,
+        "generic_address_row_context_resolution": has_indexed_routes,
         "generic_routed_source_event": source_routes_dense,
         "generic_row_routed_source_event": has_indexed_routes,
         "generic_visible_row_occurrence_resolution": has_indexed_routes,
@@ -2928,31 +2340,22 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_loaded_runtime_render_only_hover_executor": false,
         "generic_loaded_runtime_assertion_executor": true,
         "generic_loaded_runtime_stress_profile_executor": false,
-        "generic_formula_scenario_expectation_assertions": has_formula_runtime,
-        "generic_formula_scenario_storage_preparation": has_formula_runtime,
         "generic_bound_source_target_resolution": has_list_source_bindings,
         "generic_stale_source_key_generation_bind_epoch_rejection": has_list_source_bindings,
-        "generic_formula_dependency_cache": has_formula_runtime,
-        "generic_formula_evaluation_cache": has_formula_runtime,
-        "generic_formula_derived_storage_sync": has_formula_runtime,
-        "generic_formula_display_mutation_emitter": has_formula_runtime,
-        "generic_formula_display_protocol_lowering": has_formula_runtime,
         "generic_source_action_batch_executor": route_action_count > 0,
         "generic_source_route_scalar_expression_index": root_scalar_route_count > 0 || has_indexed_routes,
         "generic_indexed_text_route_index": indexed_text_route_count > 0,
         "generic_indexed_bool_route_index": indexed_bool_route_count > 0,
         "generic_editor_route_uses_indexed_targets": has_indexed_routes,
-        "generic_root_source_route_index": root_scalar_route_count > 0 || has_formula_runtime,
-        "generic_list_remove_predicate_route": list_remove_route_count > 0 || has_formula_runtime,
-        "generic_routed_root_target_application": root_scalar_route_count > 0 || has_formula_runtime,
+        "generic_root_source_route_index": root_scalar_route_count > 0,
+        "generic_list_remove_predicate_route": list_remove_route_count > 0,
+        "generic_routed_root_target_application": root_scalar_route_count > 0,
         "generic_routed_indexed_target_application": has_indexed_routes,
         "generic_routed_indexed_bool_target_application": indexed_bool_route_count > 0,
         "generic_routed_indexed_text_target_application": indexed_text_route_count > 0,
         "ir_list_operation_table_loaded": list_operations_loaded,
         "list_operation_count": ir.list_operations.len(),
         "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
-        "ir_formula_operation_table_loaded": formula_operations_loaded,
-        "formula_operation_count": ir.formula_operations.len(),
         "ir_state_initializers_loaded": state_initializers_loaded,
         "state_initializer_count": ir.state_cells.len(),
         "ir_list_initializers_loaded": list_initializers_loaded,
@@ -2966,9 +2369,7 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_indexed_bool_hold_from_ir": indexed_bool_route_count > 0,
         "generic_append_remove_from_ir": list_append_operation_count > 0 || list_remove_operation_count > 0,
         "generic_count_and_filter_views_from_ir": list_count_retain_operation_count > 0,
-        "generic_formula_edit_state_holds_from_ir": has_formula_runtime,
-        "generic_hidden_list_keys_from_generic_storage": has_formula_runtime,
-        "generic_formula_pipeline_from_ir": has_formula_runtime
+        "generic_hidden_list_keys_from_generic_storage": list_initializers_loaded
     })
 }
 
@@ -3054,7 +2455,6 @@ fn generic_runtime_slice_evidence_report(
         "list_append_operation_count": list_append_operation_count,
         "list_remove_operation_count": list_remove_operation_count,
         "list_count_retain_operation_count": list_count_retain_operation_count,
-        "formula_operation_count": compiled.formula_operation_count,
         "list_projection_count": compiled.list_projection_count,
         "view_binding_count": compiled.view_binding_count,
         "source_payload_schema_count": source_payload_counts.schema_count,
@@ -4562,8 +3962,8 @@ struct GenericScheduledRuntime {
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
+    generic_derived_state: GenericDerivedState,
     list_equations: ListEquationPlan,
-    formula_operators: FormulaOperatorPlan,
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
     list_source_bindings: ListSourceBindingPlan,
@@ -4578,8 +3978,8 @@ impl GenericScheduledRuntime {
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
             generic_derived: compiled.generic_derived.clone(),
+            generic_derived_state: GenericDerivedState::default(),
             list_equations: compiled.list_equations.clone(),
-            formula_operators: compiled.formula_operators.clone(),
             list_projections: compiled.list_projections.clone(),
             source_routes: compiled.source_routes.clone(),
             list_source_bindings: compiled.list_source_bindings.clone(),
@@ -4587,6 +3987,7 @@ impl GenericScheduledRuntime {
             list_summary_fields: compiled.list_summary_fields.clone(),
         };
         runtime.bind_initial_list_sources()?;
+        runtime.initialize_generic_derived_fields()?;
         Ok(runtime)
     }
 
@@ -5050,43 +4451,42 @@ impl GenericScheduledRuntime {
         }
         Ok(None)
     }
-
-    fn assert_addressed_formula_step_expectations(
-        &self,
-        step: &ScenarioStep,
-        state: &AddressedFormulaRuntimeCache,
-        recomputed: &[usize],
-    ) -> RuntimeResult<()> {
+    fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
-            let index = self.addressed_formula_index_by_address(state, &expect.address)?;
+            let (list, index) = self.generic_addressed_row(&expect.address)?;
             if let Some(value) = &expect.value {
-                let actual = self
-                    .list_row_textlike_opt(&state.plan.list, index, &state.plan.value_field)
-                    .unwrap_or("");
-                let expected = value.as_str();
-                assert_eq_report(&step.id, "cell.value", &expected, &actual)?;
+                self.assert_list_row_textlike(&step.id, "cell.value", &list, index, "value", value)?;
             }
             if let Some(formula) = &expect.formula {
                 self.assert_list_row_textlike(
                     &step.id,
                     "cell.formula",
-                    &state.plan.list,
+                    &list,
                     index,
-                    &state.plan.formula_field,
+                    "formula_text",
                     formula,
                 )?;
             }
             if let Some(editing_text) = &expect.editing_text {
-                self.assert_addressed_formula_draft_text(&step.id, state, index, editing_text)?;
+                self.assert_list_row_textlike(
+                    &step.id,
+                    "cell.editing_text",
+                    &list,
+                    index,
+                    "editing_text",
+                    editing_text,
+                )?;
             }
             if let Some(editing) = expect.editing {
-                self.assert_addressed_formula_editing_bool(&step.id, state, index, editing)?;
+                let actual = self.storage.list_row_bool(&list, index, "editing")?;
+                assert_eq_report(&step.id, "cell.editing", &editing, &actual)?;
             }
         }
         if let Some(expect) = &step.expect_error {
-            let index = self.addressed_formula_index_by_address(state, &expect.address)?;
+            let (list, index) = self.generic_addressed_row(&expect.address)?;
             let actual = self
-                .list_row_textlike_opt(&state.plan.list, index, &state.plan.error_field)
+                .storage
+                .list_row_textlike_opt(&list, index, "error")
                 .filter(|error| !error.is_empty());
             assert_eq_report(
                 &step.id,
@@ -5096,79 +4496,44 @@ impl GenericScheduledRuntime {
             )?;
         }
         if let Some(expected) = &step.expect_recomputed {
-            let actual = recomputed
+            let actual = self
+                .generic_derived_state
+                .last_recomputed
                 .iter()
-                .map(|index| {
-                    self.list_row_textlike(&state.plan.list, *index, &state.plan.address_field)
+                .filter(|key| key.field == "value")
+                .map(|key| {
+                    self.storage
+                        .list_row_textlike(&key.list, key.index, "address")
                         .map(str::to_owned)
                 })
                 .collect::<RuntimeResult<Vec<_>>>()?;
             assert_eq_report(&step.id, "recomputed", expected, &actual)?;
         }
-        Ok(())
-    }
-
-    fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
         for (path, expected) in &step.expect_root_text {
             self.assert_root_textlike(&step.id, path, path, expected)?;
         }
         Ok(())
     }
 
-    fn addressed_formula_index_by_address(
-        &self,
-        state: &AddressedFormulaRuntimeCache,
-        address: &str,
-    ) -> RuntimeResult<usize> {
-        self.storage
-            .find_list_index_by_textlike(&state.plan.list, &state.plan.address_field, address)?
-            .ok_or_else(|| format!("cell `{address}` not found").into())
-    }
-
-    fn assert_addressed_formula_draft_text(
-        &self,
-        step_id: &str,
-        state: &AddressedFormulaRuntimeCache,
-        index: usize,
-        expected: &str,
-    ) -> RuntimeResult<()> {
-        for field in self.storage.text_fields_for_row(&state.plan.list, index)? {
-            if field == state.plan.formula_field
-                || field == state.plan.value_field
-                || field == state.plan.error_field
-                || field == state.plan.dependencies_field
-                || field == state.plan.address_field
+    fn generic_addressed_row(&self, address: &str) -> RuntimeResult<(String, usize)> {
+        for slot in &self.storage.lists.list_slots {
+            let list = &slot.name;
+            if self
+                .storage
+                .list_row_textlike_opt(list, 0, "address")
+                .is_none()
             {
                 continue;
             }
-            if self
-                .list_row_textlike_opt(&state.plan.list, index, &field)
-                .is_some_and(|actual| actual == expected)
+            if let Some(index) = self
+                .storage
+                .find_list_index_by_textlike(list, "address", address)?
             {
-                return Ok(());
+                return Ok((list.clone(), index));
             }
         }
-        Err(format!("{step_id}: addressed-formula draft text expected `{expected}`").into())
+        Err(format!("cell `{address}` not found in any addressed generic list").into())
     }
-
-    fn assert_addressed_formula_editing_bool(
-        &self,
-        step_id: &str,
-        state: &AddressedFormulaRuntimeCache,
-        index: usize,
-        expected: bool,
-    ) -> RuntimeResult<()> {
-        for field in self.storage.bool_fields_for_row(&state.plan.list, index)? {
-            if self
-                .list_row_bool(&state.plan.list, index, &field)
-                .is_ok_and(|actual| actual == expected)
-            {
-                return Ok(());
-            }
-        }
-        Err(format!("{step_id}: addressed-formula editing bool expected `{expected}`").into())
-    }
-
     #[cfg(test)]
     fn list_all_completed_by_count_targets(&self) -> bool {
         let active_count = self
@@ -5403,329 +4768,152 @@ impl GenericScheduledRuntime {
         }
         Ok(row)
     }
+}
 
-    fn addressed_formula_scenario_text_requirements(
-        scenario: &Scenario,
-    ) -> GenericFormulaScenarioPreparation {
-        let mut max_text_len = 0usize;
-        let mut max_deps = 1usize;
-        for step in &scenario.step {
-            if let Some(action) = &step.user_action
-                && let Some(text) = toml_string_ref(action, "text")
-            {
-                max_text_len = max_text_len.max(text.len());
-                max_deps = max_deps.max(count_formula_dependencies(text));
-            }
-            if let Some(expected) = &step.expected_source_event
-                && let Some(text) = toml_string_ref(expected, "text")
-            {
-                max_text_len = max_text_len.max(text.len());
-                max_deps = max_deps.max(count_formula_dependencies(text));
-            }
-            if let Some(expect) = &step.expect_cell {
-                if let Some(value) = &expect.value {
-                    max_text_len = max_text_len.max(value.len());
-                }
-                if let Some(formula) = &expect.formula {
-                    max_text_len = max_text_len.max(formula.len());
-                    max_deps = max_deps.max(count_formula_dependencies(formula));
-                }
-                if let Some(editing_text) = &expect.editing_text {
-                    max_text_len = max_text_len.max(editing_text.len());
-                    max_deps = max_deps.max(count_formula_dependencies(editing_text));
-                }
-            }
-            if let Some(expect) = &step.expect_error {
-                max_text_len = max_text_len.max(expect.error.len());
-            }
-        }
-        max_text_len = max_text_len.max("cycle_error".len());
-        GenericFormulaScenarioPreparation {
-            max_text_len,
-            max_deps,
-        }
+fn field_value_to_boon(value: FieldValue) -> BoonValue {
+    match value {
+        FieldValue::Text(value) | FieldValue::Enum(value) => BoonValue::Text(value),
+        FieldValue::Bool(value) => BoonValue::Bool(value),
     }
+}
 
-    fn prepare_addressed_formula_scenario_storage(
-        &mut self,
-        scenario: &Scenario,
-        plan: &AddressedFormulaRuntimePlan,
-    ) -> RuntimeResult<GenericFormulaScenarioPreparation> {
-        let requirements = Self::addressed_formula_scenario_text_requirements(scenario);
-        self.reserve_list_row_textlike_fields(&plan.list, &plan.formula_field, |_, current| {
-            requirements.max_text_len.saturating_sub(current.len())
-        })?;
-        self.reserve_list_row_textlike_fields(&plan.list, &plan.value_field, |_, current| {
-            requirements.max_text_len.saturating_sub(current.len())
-        })?;
-        self.reserve_list_row_textlike_fields(&plan.list, &plan.error_field, |_, current| {
-            requirements.max_text_len.saturating_sub(current.len())
-        })?;
-        self.reserve_list_row_textlike_fields(
-            &plan.list,
-            &plan.dependencies_field,
-            |_, current| {
-                requirements
-                    .max_deps
-                    .saturating_mul(8)
-                    .saturating_sub(current.len())
-            },
-        )?;
-        Ok(requirements)
+fn field_ref_to_boon(value: FieldValueRef<'_>) -> BoonValue {
+    match value {
+        FieldValueRef::Text(value) | FieldValueRef::Enum(value) => BoonValue::Text(value.to_owned()),
+        FieldValueRef::Bool(value) => BoonValue::Bool(value),
     }
+}
 
-    fn indexed_target_list(&self, target: &str) -> RuntimeResult<&str> {
-        let scope = target
-            .split_once('.')
-            .map(|(scope, _)| scope)
-            .ok_or_else(|| format!("indexed target `{target}` has no row scope"))?;
-        self.list_source_bindings
-            .list_for_row_scope(scope)
-            .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
+fn generic_infix_value(left: BoonValue, op: &str, right: BoonValue) -> BoonValue {
+    if let BoonValue::Error(error) = left {
+        return BoonValue::Error(error);
     }
-
-    fn apply_source_actions<'a>(
-        &mut self,
-        input: GenericSourceActionInput<'a>,
-        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
-        mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
-    ) -> RuntimeResult<()> {
-        let actions = self.source_routes.actions_for_source_id(input.source_id)?;
-        for action in actions {
-            match action {
-                SourceAction::RootScalar => {
-                    if let Some(commit) = self.storage.apply_root_text_action_source(
-                        &self.source_routes,
-                        &self.scalar_equations,
-                        input.source,
-                        input.source_id,
-                        input.text,
-                        input.address,
-                        input.seq,
-                    )? {
-                        observe(GenericSourceMutation::RootText(commit))?;
-                    }
-                }
-                SourceAction::DerivedText { .. } => {}
-                SourceAction::ListAppend { list, trigger } => {
-                    let source_paths = self.list_source_bindings.source_paths(list)?;
-                    let Some(value) = self.storage.eval_derived_text_transform(
-                        &self.derived_equations,
-                        trigger,
-                        input.source,
-                        input.key,
-                        input.text,
-                    )?
-                    else {
-                        continue;
-                    };
-                    let insert = self.storage.append_row_for_trigger_text_and_bind_sources(
-                        &self.list_equations,
-                        list,
-                        trigger,
-                        value,
-                        source_paths,
-                    )?;
-                    observe(GenericSourceMutation::ListAppend(
-                        GenericTextListAppendCommit {
-                            list: list.to_owned(),
-                            key: insert.key,
-                            generation: insert.generation,
-                            value,
-                        },
-                    ))?;
-                    let bindings = self
-                        .storage
-                        .row_source_bindings(list, insert.key, insert.generation)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for binding in bindings {
-                        observe(GenericSourceMutation::SourceBind(binding))?;
-                    }
-                }
-                SourceAction::ListRemove { list } => {
-                    if let Some(index) = input.index {
-                        let Some((key, generation)) =
-                            self.storage.remove_index_source_action_and_unbind_sources(
-                                &self.source_routes,
-                                list,
-                                input.source_id,
-                                index,
-                                |binding| {
-                                    observe(GenericSourceMutation::SourceUnbind(binding.clone()))
-                                },
-                            )?
-                        else {
-                            continue;
-                        };
-                        observe(GenericSourceMutation::ListRemove {
-                            list: list.to_owned(),
-                            key,
-                            generation,
-                        })?;
-                    } else {
-                        self.storage.remove_where_source_action_and_unbind_sources(
-                            &self.source_routes,
-                            list,
-                            input.source_id,
-                            |observation| match observation {
-                                GenericListRemoveObservation::SourceUnbind(binding) => {
-                                    observe(GenericSourceMutation::SourceUnbind(binding.clone()))
-                                }
-                                GenericListRemoveObservation::RowRemoved { key, generation } => {
-                                    observe(GenericSourceMutation::ListRemove {
-                                        list: list.to_owned(),
-                                        key,
-                                        generation,
-                                    })
-                                }
-                            },
-                        )?;
-                    }
-                }
-                SourceAction::IndexedText { kind, target } => {
-                    let Some(list) = input.list.as_deref() else {
-                        return Err(format!(
-                            "source `{}` indexed text action `{target}` needs a list context",
-                            input.source
-                        )
-                        .into());
-                    };
-                    let Some(index) = input.index else {
-                        return Err(format!(
-                            "source `{}` indexed text action `{target}` needs a row index",
-                            input.source
-                        )
-                        .into());
-                    };
-                    if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
-                        let commit = self.storage.commit_indexed_previous_text_target_source(
-                            &self.scalar_equations,
-                            list,
-                            index,
-                            target,
-                            input.source,
-                        )?;
-                        observe(GenericSourceMutation::TextFieldIdentity(commit))?;
-                    } else if let Some(commit) = self.storage.commit_indexed_text_source(
-                        &self.scalar_equations,
-                        list,
-                        index,
-                        target,
-                        input.source,
-                        input.text,
-                    )? {
-                        observe(GenericSourceMutation::TextField(commit))?;
-                    }
-                }
-                SourceAction::IndexedBool { target, .. } => {
-                    let Some(list) = input.list.as_deref() else {
-                        return Err(format!(
-                            "source `{}` indexed bool action `{target}` needs a list context",
-                            input.source
-                        )
-                        .into());
-                    };
-                    if let Some(index) = input.index {
-                        if self.scalar_equations.bool_const_value(target, input.source)
-                            == Some(true)
-                        {
-                            let field = row_field_name(target).to_owned();
-                            self.storage.commit_other_indexed_bool_fields(
-                                list,
-                                index,
-                                &field,
-                                false,
-                                |commit| {
-                                    observe(GenericSourceMutation::BoolField(commit))?;
-                                    Ok(())
-                                },
-                            )?;
-                        }
-                        let commit = self.storage.commit_indexed_bool_source(
-                            &self.scalar_equations,
-                            list,
-                            index,
-                            target,
-                            input.source,
-                            read_extra_bool,
-                        )?;
-                        observe(GenericSourceMutation::BoolField(commit))?;
-                    } else {
-                        self.storage.commit_each_indexed_bool_source(
-                            &self.scalar_equations,
-                            list,
-                            target,
-                            input.source,
-                            read_extra_bool,
-                            |commit| {
-                                observe(GenericSourceMutation::BoolField(commit))?;
-                                Ok(())
-                            },
-                        )?;
-                    }
-                }
+    if let BoonValue::Error(error) = right {
+        return BoonValue::Error(error);
+    }
+    match op {
+        "+" => match (left.number(), right.number()) {
+            (Ok(left), Ok(right)) => BoonValue::Number(left + right),
+            _ => BoonValue::Text(format!(
+                "{}{}",
+                left.as_text().unwrap_or_default(),
+                right.as_text().unwrap_or_default()
+            )),
+        },
+        "-" | "*" | "/" | "%" => {
+            let left = match left.number() {
+                Ok(value) => value,
+                Err(error) => return BoonValue::Error(error),
+            };
+            let right = match right.number() {
+                Ok(value) => value,
+                Err(error) => return BoonValue::Error(error),
+            };
+            match op {
+                "-" => BoonValue::Number(left - right),
+                "*" => BoonValue::Number(left * right),
+                "/" if right == 0 => BoonValue::Error("div_by_zero".to_owned()),
+                "/" => BoonValue::Number(left / right),
+                "%" if right == 0 => BoonValue::Error("div_by_zero".to_owned()),
+                "%" => BoonValue::Number(left % right),
+                _ => BoonValue::Error("type_error".to_owned()),
             }
         }
-        Ok(())
+        "==" => BoonValue::Bool(generic_values_equal(&left, &right)),
+        "!=" => BoonValue::Bool(!generic_values_equal(&left, &right)),
+        ">" | ">=" | "<" | "<=" => {
+            let left = match left.number() {
+                Ok(value) => value,
+                Err(error) => return BoonValue::Error(error),
+            };
+            let right = match right.number() {
+                Ok(value) => value,
+                Err(error) => return BoonValue::Error(error),
+            };
+            BoonValue::Bool(match op {
+                ">" => left > right,
+                ">=" => left >= right,
+                "<" => left < right,
+                "<=" => left <= right,
+                _ => false,
+            })
+        }
+        _ => BoonValue::Error("type_error".to_owned()),
     }
+}
 
-    fn apply_source_actions_to_batch<'a>(
-        &mut self,
-        input: GenericSourceActionInput<'a>,
-        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
-        mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
-    ) -> RuntimeResult<GenericSourceMutationBatch<'a>> {
-        let mut batch = GenericSourceMutationBatch::new();
-        self.apply_source_actions(input, read_extra_bool, |mutation| {
-            batch.observe(&mutation)?;
-            observe(mutation)
-        })?;
-        Ok(batch)
+fn generic_values_equal(left: &BoonValue, right: &BoonValue) -> bool {
+    match (left, right) {
+        (BoonValue::Text(left), BoonValue::Text(right)) => left == right,
+        (BoonValue::Number(left), BoonValue::Number(right)) => left == right,
+        (BoonValue::Bool(left), BoonValue::Bool(right)) => left == right,
+        (BoonValue::NaN, BoonValue::NaN) => true,
+        _ => left.as_text().zip(right.as_text()).is_some_and(|(left, right)| left == right),
     }
+}
 
-    #[cfg(test)]
-    fn reserve_spare_rows_for_list_append_text(
-        &mut self,
-        list: &str,
-        count: usize,
-        text_capacity: usize,
-    ) -> RuntimeResult<()> {
-        let append_trigger = self.list_equations.append_trigger(list)?;
-        self.storage.reserve_spare_rows_for_trigger_text(
-            &self.list_equations,
-            list,
-            append_trigger,
-            count,
-            text_capacity,
+fn generic_pattern_binding(
+    pattern: &[String],
+    input: &BoonValue,
+) -> Option<Option<(String, BoonValue)>> {
+    if pattern == ["__"] {
+        return Some(None);
+    }
+    if pattern.len() == 1 {
+        let token = pattern[0].as_str();
+        if token == "True" {
+            return matches!(input, BoonValue::Bool(true)).then_some(None);
+        }
+        if token == "False" {
+            return matches!(input, BoonValue::Bool(false)).then_some(None);
+        }
+        if token == "NaN" {
+            return matches!(input, BoonValue::NaN).then_some(None);
+        }
+        if let Ok(number) = token.parse::<i64>() {
+            return matches!(input, BoonValue::Number(value) if *value == number).then_some(None);
+        }
+        if token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+        {
+            return Some(Some((token.to_owned(), input.clone())));
+        }
+        return input
+            .as_text()
+            .filter(|value| value == token)
+            .map(|_| None);
+    }
+    if pattern.first().map(String::as_str) == Some("TEXT")
+        && pattern.get(1).map(String::as_str) == Some("{")
+        && pattern.last().map(String::as_str) == Some("}")
+    {
+        let expected = pattern[2..pattern.len() - 1].join(" ");
+        return input
+            .as_text()
+            .filter(|value| value == &expected)
+            .map(|_| None);
+    }
+    None
+}
+
+fn statement_is_row_initial_passthrough(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    row_scope: &str,
+    field: &str,
+) -> bool {
+    let Some(expr_id) = statement.expr else {
+        return false;
+    };
+    expressions.get(expr_id).is_some_and(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Path(parts) if parts.as_slice() == [row_scope, field]
+                || (parts.len() == 2 && parts.get(1).is_some_and(|part| part == field))
         )
-    }
-
-    #[cfg(test)]
-    fn append_text_row_source_action_and_bind_sources<'a>(
-        &mut self,
-        list: &str,
-        source: &str,
-        key: Option<&str>,
-        text: Option<&'a str>,
-    ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
-        let source_paths = self.list_source_bindings.source_paths(list)?;
-        self.storage.append_text_row_source_action_and_bind_sources(
-            &self.source_routes,
-            &self.derived_equations,
-            &self.list_equations,
-            list,
-            source,
-            key,
-            text,
-            source_paths,
-        )
-    }
-
-    fn count_list_rows_for_target(&self, list: &str, target: &str) -> RuntimeResult<usize> {
-        self.storage
-            .count_list_rows_for_target(&self.list_equations, list, target)
-    }
+    })
 }
 
 impl Deref for GenericScheduledRuntime {
@@ -7872,12 +7060,6 @@ enum GenericBoundSourceIndex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GenericFormulaScenarioPreparation {
-    max_text_len: usize,
-    max_deps: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericVisibleRowOccurrence {
     Occurrence(usize),
     Stale,
@@ -8208,6 +7390,68 @@ struct GenericDerivedIndexedField {
     row_scope: String,
     field: String,
     statement: AstStatement,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GenericDerivedState {
+    reads_by_field: BTreeMap<GenericDerivedKey, BTreeSet<GenericReadKey>>,
+    dependents_by_read: BTreeMap<GenericReadKey, BTreeSet<GenericDerivedKey>>,
+    last_recomputed: Vec<GenericDerivedKey>,
+    last_candidate_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct GenericDerivedKey {
+    list: String,
+    index: usize,
+    field: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum GenericReadKey {
+    Root { field: String },
+    ListField {
+        list: String,
+        index: usize,
+        field: String,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct GenericRecomputeMetrics {
+    recomputed_field_count: usize,
+    recompute_candidate_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum BoonValue {
+    Empty,
+    Text(String),
+    Number(i64),
+    Bool(bool),
+    Record(BTreeMap<String, BoonValue>),
+    List(Vec<BoonValue>),
+    RowRef { list: String, index: usize },
+    ListRef(String),
+    NaN,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+struct GenericEvalRow {
+    list: String,
+    row_scope: String,
+    index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GenericEvalFrame {
+    env: BTreeMap<String, BoonValue>,
+    row: Option<GenericEvalRow>,
+    reads: BTreeSet<GenericReadKey>,
+    stack: Vec<GenericDerivedKey>,
+    call_depth: usize,
+    eval_budget: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -8675,6 +7919,14 @@ impl GenericDerivedPlan {
                     .iter()
                     .find(|scope| scope.row_scope == row_scope)
                     .map(|scope| scope.list.clone())?;
+                if statement_is_row_initial_passthrough(
+                    &value.statement,
+                    &ir.expressions,
+                    row_scope,
+                    field,
+                ) {
+                    return None;
+                }
                 Some(GenericDerivedIndexedField {
                     list,
                     row_scope: row_scope.to_owned(),
@@ -8692,6 +7944,178 @@ impl GenericDerivedPlan {
 
     fn is_empty(&self) -> bool {
         self.indexed_fields.is_empty()
+    }
+
+    fn field_plan(&self, key: &GenericDerivedKey) -> Option<&GenericDerivedIndexedField> {
+        self.indexed_fields
+            .iter()
+            .find(|field| field.list == key.list && field.field == key.field)
+    }
+
+    fn contains_field(&self, list: &str, field: &str) -> bool {
+        self.indexed_fields
+            .iter()
+            .any(|candidate| candidate.list == list && candidate.field == field)
+    }
+
+    fn expr_is_block_marker(&self, expr_id: usize) -> bool {
+        self.expressions
+            .get(expr_id)
+            .is_some_and(|expr| match &expr.kind {
+                AstExprKind::Identifier(value) if value == "BLOCK" => true,
+                AstExprKind::Unknown(tokens) => {
+                    tokens.first().map(String::as_str) == Some("BLOCK")
+                        && tokens.last().map(String::as_str) == Some("{")
+                }
+                _ => false,
+            })
+    }
+
+    fn expr_is_pipe_continuation(&self, expr_id: usize) -> bool {
+        let Some(expr) = self.expressions.get(expr_id) else {
+            return false;
+        };
+        let AstExprKind::Pipe { input, .. } = &expr.kind else {
+            return false;
+        };
+        self.expressions
+            .get(*input)
+            .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+    }
+
+    fn keys_for_runtime(&self, runtime: &GenericCircuitRuntime) -> RuntimeResult<Vec<GenericDerivedKey>> {
+        let mut keys = Vec::new();
+        for field in &self.indexed_fields {
+            for index in 0..runtime.list_len(&field.list)? {
+                keys.push(GenericDerivedKey {
+                    list: field.list.clone(),
+                    index,
+                    field: field.field.clone(),
+                });
+            }
+        }
+        Ok(keys)
+    }
+}
+
+impl GenericDerivedState {
+    fn clear_last_step(&mut self) {
+        self.last_recomputed.clear();
+        self.last_candidate_count = 0;
+    }
+
+    fn replace_reads(&mut self, key: GenericDerivedKey, reads: BTreeSet<GenericReadKey>) {
+        if let Some(previous) = self.reads_by_field.remove(&key) {
+            for read in previous {
+                if let Some(dependents) = self.dependents_by_read.get_mut(&read) {
+                    dependents.remove(&key);
+                    if dependents.is_empty() {
+                        self.dependents_by_read.remove(&read);
+                    }
+                }
+            }
+        }
+        for read in &reads {
+            self.dependents_by_read
+                .entry(read.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.reads_by_field.insert(key, reads);
+    }
+
+    fn dependents_for_reads(
+        &self,
+        reads: impl IntoIterator<Item = GenericReadKey>,
+    ) -> BTreeSet<GenericDerivedKey> {
+        let mut dependents = BTreeSet::new();
+        for read in reads {
+            if let Some(keys) = self.dependents_by_read.get(&read) {
+                dependents.extend(keys.iter().cloned());
+            }
+        }
+        dependents
+    }
+}
+
+impl GenericEvalFrame {
+    fn for_row(list: &str, row_scope: &str, index: usize) -> Self {
+        Self {
+            env: BTreeMap::new(),
+            row: Some(GenericEvalRow {
+                list: list.to_owned(),
+                row_scope: row_scope.to_owned(),
+                index,
+            }),
+            reads: BTreeSet::new(),
+            stack: Vec::new(),
+            call_depth: 0,
+            eval_budget: 20_000,
+        }
+    }
+
+    fn child(&self) -> Self {
+        Self {
+            env: self.env.clone(),
+            row: self.row.clone(),
+            reads: BTreeSet::new(),
+            stack: self.stack.clone(),
+            call_depth: self.call_depth,
+            eval_budget: self.eval_budget,
+        }
+    }
+
+    fn consume_budget(&mut self) -> RuntimeResult<()> {
+        self.eval_budget = self
+            .eval_budget
+            .checked_sub(1)
+            .ok_or("generic Boon evaluation budget exhausted")?;
+        Ok(())
+    }
+}
+
+impl BoonValue {
+    fn as_text(&self) -> Option<String> {
+        match self {
+            Self::Text(value) => Some(value.clone()),
+            Self::Number(value) => Some(value.to_string()),
+            Self::Bool(true) => Some("True".to_owned()),
+            Self::Bool(false) => Some("False".to_owned()),
+            Self::NaN => Some("NaN".to_owned()),
+            Self::Empty => Some(String::new()),
+            Self::Error(_) | Self::Record(_) | Self::List(_) | Self::RowRef { .. } | Self::ListRef(_) => None,
+        }
+    }
+
+    fn visible_text(&self) -> String {
+        match self {
+            Self::Error(_) | Self::Empty | Self::NaN => String::new(),
+            Self::Text(value) => value.clone(),
+            Self::Number(value) => value.to_string(),
+            Self::Bool(true) => "True".to_owned(),
+            Self::Bool(false) => "False".to_owned(),
+            Self::Record(_) | Self::List(_) | Self::RowRef { .. } | Self::ListRef(_) => String::new(),
+        }
+    }
+
+    fn number(&self) -> Result<i64, String> {
+        match self {
+            Self::Number(value) => Ok(*value),
+            Self::Text(value) => value.trim().parse::<i64>().map_err(|_| "type_error".to_owned()),
+            Self::NaN => Err("type_error".to_owned()),
+            Self::Error(error) => Err(error.clone()),
+            _ => Err("type_error".to_owned()),
+        }
+    }
+
+    fn bool_value(&self) -> Result<bool, String> {
+        match self {
+            Self::Bool(value) => Ok(*value),
+            Self::Text(value) if value == "True" => Ok(true),
+            Self::Text(value) if value == "False" => Ok(false),
+            Self::Error(error) => Err(error.clone()),
+            _ => Err("type_error".to_owned()),
+        }
     }
 }
 
@@ -10159,14 +9583,7 @@ impl ListScenarioHarness {
 }
 
 impl ScenarioExecutor for LoadedRuntime {
-    fn prepare_for_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<()> {
-        if let Some(state) = &mut self.formula_runtime {
-            let generic = self
-                .generic
-                .as_mut()
-                .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-            prepare_addressed_formula_scenario(generic, state, scenario)?;
-        }
+    fn prepare_for_scenario(&mut self, _scenario: &Scenario) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -10184,14 +9601,6 @@ impl ScenarioExecutor for LoadedRuntime {
             .generic
             .as_ref()
             .ok_or("LoadedRuntime generic schedule was already borrowed")?;
-        if let Some(state) = &self.formula_runtime {
-            generic.assert_addressed_formula_step_expectations(
-                step,
-                state,
-                &state.step_recomputed,
-            )?;
-            assert_addressed_formula_generic_fields(generic, state)?;
-        }
         generic.assert_generic_step_expectations(step)
     }
 
@@ -10203,1154 +9612,6 @@ impl ScenarioExecutor for LoadedRuntime {
         Ok(None)
     }
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FormulaDisplay {
-    value: String,
-    error: Option<String>,
-}
-
-impl FormulaDisplay {
-    fn from_result(parsed: FormulaAst, result: Result<i64, String>) -> Self {
-        match result {
-            Ok(_) if matches!(parsed, FormulaAst::Empty) => Self {
-                value: String::new(),
-                error: None,
-            },
-            Ok(value) => Self {
-                value: value.to_string(),
-                error: None,
-            },
-            Err(error) => Self {
-                value: String::new(),
-                error: Some(error),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-enum FormulaAst {
-    #[default]
-    Empty,
-    Number(i64),
-    Cell(usize),
-    Binary(FormulaTerm, FormulaOp, FormulaTerm),
-    Add(FormulaTerm, FormulaTerm),
-    SumRange {
-        start_index: usize,
-        end_index: usize,
-        step: usize,
-    },
-    ParseError,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FormulaTerm {
-    Number(i64),
-    Cell(usize),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FormulaOp {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-}
-
-#[derive(Clone, Debug)]
-struct FormulaOperatorPlan {
-    operations: Vec<RuntimeFormulaOperation>,
-}
-
-#[derive(Clone, Debug)]
-struct RuntimeFormulaOperation {
-    target: String,
-    kind: RuntimeFormulaOperationKind,
-}
-
-#[derive(Clone, Debug)]
-struct FormulaDerivedStorageFields {
-    value: String,
-    error: String,
-    dependencies: String,
-}
-
-#[derive(Clone, Debug)]
-enum RuntimeFormulaOperationKind {
-    Parse { input: String },
-    Dependencies { input: String },
-    Eval { formula: String, read: String },
-    Error { formula: String, value: String },
-}
-
-impl FormulaOperatorPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let operations = ir
-            .formula_operations
-            .iter()
-            .map(|operation| RuntimeFormulaOperation {
-                target: operation.target.clone(),
-                kind: match &operation.kind {
-                    FormulaOperationKind::Parse { input } => RuntimeFormulaOperationKind::Parse {
-                        input: input.clone(),
-                    },
-                    FormulaOperationKind::Dependencies { input } => {
-                        RuntimeFormulaOperationKind::Dependencies {
-                            input: input.clone(),
-                        }
-                    }
-                    FormulaOperationKind::Eval { formula, read } => {
-                        RuntimeFormulaOperationKind::Eval {
-                            formula: formula.clone(),
-                            read: read.clone(),
-                        }
-                    }
-                    FormulaOperationKind::Error { formula, value } => {
-                        RuntimeFormulaOperationKind::Error {
-                            formula: formula.clone(),
-                            value: value.clone(),
-                        }
-                    }
-                },
-            })
-            .collect();
-        Self { operations }
-    }
-
-    fn validate_formula_pipeline(&self) -> RuntimeResult<()> {
-        self.parse_input_field()?;
-        self.dependencies_field()?;
-        self.value_field()?;
-        self.error_field()?;
-        Ok(())
-    }
-
-    fn parse_addressed_formula(
-        &self,
-        formula: &str,
-        address_to_index: &BTreeMap<String, usize>,
-    ) -> RuntimeResult<FormulaAst> {
-        self.parse_input_field()?;
-        Ok(parse_formula_ast(formula, address_to_index))
-    }
-
-    fn dependencies_into(&self, parsed: FormulaAst, deps: &mut Vec<usize>) -> RuntimeResult<()> {
-        self.dependencies_field()?;
-        formula_ast_dependencies_into(parsed, deps);
-        Ok(())
-    }
-
-    fn emit_cell_display_mutations<'a>(
-        &self,
-        list: &str,
-        key: u64,
-        generation: u64,
-        value: ProtocolValue<'a>,
-        error: Option<&str>,
-        mut emit: impl FnMut(GenericSourceMutation<'a>, bool) -> RuntimeResult<()>,
-    ) -> RuntimeResult<()> {
-        let value_field = self.value_field()?;
-        emit(
-            GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                list: list.to_owned(),
-                key,
-                generation,
-                field: value_field,
-                value,
-            }),
-            true,
-        )?;
-        if let Some(error) = error {
-            let error_field = self.error_field()?;
-            emit(
-                GenericSourceMutation::ValueField(GenericValueFieldCommit {
-                    list: list.to_owned(),
-                    key,
-                    generation,
-                    field: error_field,
-                    value: ProtocolValue::Text(Cow::Owned(error.to_owned())),
-                }),
-                false,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn emit_addressed_formula_display_protocol_mutations<'a>(
-        &self,
-        list: &str,
-        key: u64,
-        generation: u64,
-        value: ProtocolValue<'a>,
-        error: Option<&str>,
-        address: &'a str,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-    ) -> RuntimeResult<()> {
-        self.emit_cell_display_mutations(
-            list,
-            key,
-            generation,
-            value,
-            error,
-            |mutation, patch_value_text| {
-                emit_addressed_formula_default_protocol_mutation(
-                    mutation,
-                    address,
-                    None,
-                    false,
-                    patch_value_text,
-                    deltas,
-                    patches,
-                )
-            },
-        )
-    }
-
-    fn derived_storage_fields(&self) -> RuntimeResult<FormulaDerivedStorageFields> {
-        Ok(FormulaDerivedStorageFields {
-            value: self.value_field()?,
-            error: self.error_field()?,
-            dependencies: self.dependencies_field()?,
-        })
-    }
-
-    fn parse_input_field(&self) -> RuntimeResult<String> {
-        self.operations
-            .iter()
-            .find_map(|operation| match &operation.kind {
-                RuntimeFormulaOperationKind::Parse { input } => Some(input.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| "missing Formula/parse operation".into())
-    }
-
-    fn expect_parse(&self, target: &str, input: &str) -> RuntimeResult<()> {
-        self.operations
-            .iter()
-            .any(|operation| {
-                operation.target == target
-                    && matches!(
-                        &operation.kind,
-                        RuntimeFormulaOperationKind::Parse { input: candidate } if candidate == input
-                    )
-            })
-            .then_some(())
-            .ok_or_else(|| format!("missing Formula/parse operation `{target}` from `{input}`").into())
-    }
-
-    fn expect_dependencies(&self, target: &str, input: &str) -> RuntimeResult<()> {
-        self.operations
-            .iter()
-            .any(|operation| {
-                operation.target == target
-                    && matches!(
-                        &operation.kind,
-                        RuntimeFormulaOperationKind::Dependencies { input: candidate } if candidate == input
-                    )
-            })
-            .then_some(())
-            .ok_or_else(|| {
-                format!("missing Formula/dependencies operation `{target}` from `{input}`").into()
-            })
-    }
-
-    fn expect_eval(&self, target: &str, formula: &str, read: &str) -> RuntimeResult<()> {
-        self.operations
-            .iter()
-            .any(|operation| {
-                operation.target == target
-                    && matches!(
-                        &operation.kind,
-                        RuntimeFormulaOperationKind::Eval { formula: candidate_formula, read: candidate_read }
-                            if candidate_formula == formula && candidate_read == read
-                    )
-            })
-            .then_some(())
-            .ok_or_else(|| {
-                format!("missing Formula/eval operation `{target}` from `{formula}`").into()
-            })
-    }
-
-    fn expect_error(&self, target: &str, formula: &str, value: &str) -> RuntimeResult<()> {
-        self.operations
-            .iter()
-            .any(|operation| {
-                operation.target == target
-                    && matches!(
-                        &operation.kind,
-                        RuntimeFormulaOperationKind::Error { formula: candidate_formula, value: candidate_value }
-                            if candidate_formula == formula && candidate_value == value
-                    )
-            })
-            .then_some(())
-            .ok_or_else(|| {
-                format!("missing Formula/error operation `{target}` from `{formula}` and `{value}`").into()
-            })
-    }
-
-    fn dependencies_field(&self) -> RuntimeResult<String> {
-        self.operations
-            .iter()
-            .find(|operation| {
-                matches!(
-                    &operation.kind,
-                    RuntimeFormulaOperationKind::Dependencies { .. }
-                )
-            })
-            .map(|operation| row_field_name(&operation.target).to_owned())
-            .ok_or_else(|| "missing Formula/dependencies operation".into())
-    }
-
-    fn value_field(&self) -> RuntimeResult<String> {
-        self.operations
-            .iter()
-            .find(|operation| matches!(&operation.kind, RuntimeFormulaOperationKind::Eval { .. }))
-            .map(|operation| row_field_name(&operation.target).to_owned())
-            .ok_or_else(|| "missing Formula/eval operation".into())
-    }
-
-    fn error_field(&self) -> RuntimeResult<String> {
-        self.operations
-            .iter()
-            .find(|operation| matches!(&operation.kind, RuntimeFormulaOperationKind::Error { .. }))
-            .map(|operation| row_field_name(&operation.target).to_owned())
-            .ok_or_else(|| "missing Formula/error operation".into())
-    }
-
-    fn eval_reader(&self) -> RuntimeResult<String> {
-        self.operations
-            .iter()
-            .find_map(|operation| match &operation.kind {
-                RuntimeFormulaOperationKind::Eval { read, .. } => Some(read.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| "missing Formula/eval operation".into())
-    }
-
-    fn row_scope(&self) -> RuntimeResult<Option<String>> {
-        let mut scope: Option<String> = None;
-        for operation in &self.operations {
-            let Some((candidate, _)) = operation.target.split_once('.') else {
-                return Err(format!(
-                    "Formula operation target `{}` is not row-scoped",
-                    operation.target
-                )
-                .into());
-            };
-            match &scope {
-                Some(existing) if existing != candidate => {
-                    return Err(format!(
-                        "Formula operations span multiple row scopes: `{existing}` and `{candidate}`"
-                    )
-                    .into());
-                }
-                Some(_) => {}
-                None => scope = Some(candidate.to_owned()),
-            }
-        }
-        Ok(scope)
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct AddressedFormulaScenarioHarness {
-    generic: GenericScheduledRuntime,
-    plan: AddressedFormulaRuntimePlan,
-    row_addresses: Vec<String>,
-    address_to_index: BTreeMap<String, usize>,
-    parsed_formulas: Vec<FormulaAst>,
-    dependencies: Vec<Vec<usize>>,
-    dependency_cache: GenericFormulaDependencyCache,
-    evaluation_cache: GenericFormulaEvaluationCache,
-    last_recompute_candidates: usize,
-}
-
-#[derive(Clone, Debug)]
-struct AddressedFormulaRuntimePlan {
-    list: String,
-    address_field: String,
-    formula_field: String,
-    value_field: String,
-    error_field: String,
-    dependencies_field: String,
-}
-
-#[derive(Clone, Debug)]
-struct AddressedFormulaRuntimeCache {
-    plan: AddressedFormulaRuntimePlan,
-    row_addresses: Vec<String>,
-    address_to_index: BTreeMap<String, usize>,
-    parsed_formulas: Vec<FormulaAst>,
-    dependencies: Vec<Vec<usize>>,
-    dependency_cache: GenericFormulaDependencyCache,
-    evaluation_cache: GenericFormulaEvaluationCache,
-    step_recomputed: Vec<usize>,
-    dirty_key_sets: DirtyKeySets,
-    last_recompute_candidates: usize,
-}
-
-fn formula_runtime_cache_from_generic(
-    generic: &GenericScheduledRuntime,
-    plan: AddressedFormulaRuntimePlan,
-) -> RuntimeResult<AddressedFormulaRuntimeCache> {
-    let len = generic.list_len(&plan.list)?;
-    let mut row_addresses = Vec::with_capacity(len);
-    let mut address_to_index = BTreeMap::new();
-    for index in 0..len {
-        let address = generic
-            .list_row_textlike(&plan.list, index, &plan.address_field)?
-            .to_owned();
-        if address.trim().is_empty() {
-            return Err(format!(
-                "formula list `{}` row {index} has an empty `{}` address field",
-                plan.list, plan.address_field
-            )
-            .into());
-        }
-        if let Some(previous) = address_to_index.insert(address.clone(), index) {
-            return Err(format!(
-                "formula list `{}` has duplicate `{}` address `{address}` at rows {previous} and {index}",
-                plan.list, plan.address_field
-            )
-            .into());
-        }
-        row_addresses.push(address);
-    }
-    Ok(AddressedFormulaRuntimeCache {
-        plan,
-        row_addresses,
-        address_to_index,
-        parsed_formulas: vec![FormulaAst::default(); len],
-        dependencies: vec![Vec::new(); len],
-        dependency_cache: GenericFormulaDependencyCache::with_capacity(len),
-        evaluation_cache: GenericFormulaEvaluationCache::with_capacity(len),
-        step_recomputed: Vec::with_capacity(8),
-        dirty_key_sets: DirtyKeySets::with_capacity(len.clamp(16, 128)),
-        last_recompute_candidates: 0,
-    })
-}
-
-#[derive(Clone, Debug)]
-struct GenericFormulaDependencyCache {
-    reverse_deps: Vec<Vec<usize>>,
-    affected: Vec<usize>,
-    queue: Vec<usize>,
-    last_edge_walks: usize,
-}
-
-#[derive(Clone, Debug)]
-struct GenericFormulaEvaluationCache {
-    visiting: Vec<bool>,
-    eval_cache: Vec<Option<Result<i64, String>>>,
-    last_eval_calls: usize,
-}
-
-impl GenericFormulaDependencyCache {
-    fn with_capacity(cell_count: usize) -> Self {
-        Self {
-            reverse_deps: vec![Vec::new(); cell_count],
-            affected: Vec::with_capacity(cell_count),
-            queue: Vec::with_capacity(cell_count),
-            last_edge_walks: 0,
-        }
-    }
-
-    fn reserve_dependents(&mut self, minimum_capacity: usize) {
-        for dependents in &mut self.reverse_deps {
-            dependents.reserve(minimum_capacity);
-        }
-    }
-
-    fn replace_dependencies(&mut self, cell_index: usize, deps: &[usize]) {
-        for dependents in &mut self.reverse_deps {
-            if let Some(index) = dependents
-                .iter()
-                .position(|candidate| *candidate == cell_index)
-            {
-                dependents.swap_remove(index);
-            }
-        }
-        for dependency in deps {
-            if let Some(dependents) = self.reverse_deps.get_mut(*dependency)
-                && !dependents.contains(&cell_index)
-            {
-                dependents.push(cell_index);
-            }
-        }
-    }
-
-    fn collect_affected(&mut self, changed_index: usize) -> &[usize] {
-        self.affected.clear();
-        self.queue.clear();
-        self.last_edge_walks = 0;
-        self.affected.push(changed_index);
-        self.queue.push(changed_index);
-        while let Some(changed) = self.queue.pop() {
-            for offset in 0..self.reverse_deps[changed].len() {
-                self.last_edge_walks += 1;
-                let index = self.reverse_deps[changed][offset];
-                if !self.affected.contains(&index) {
-                    self.affected.push(index);
-                    self.queue.push(index);
-                }
-            }
-        }
-        &self.affected
-    }
-
-    fn affected(&self) -> &[usize] {
-        &self.affected
-    }
-
-    fn last_edge_walks(&self) -> usize {
-        self.last_edge_walks
-    }
-}
-
-impl GenericFormulaEvaluationCache {
-    fn with_capacity(cell_count: usize) -> Self {
-        Self {
-            visiting: vec![false; cell_count],
-            eval_cache: vec![None; cell_count],
-            last_eval_calls: 0,
-        }
-    }
-
-    fn begin_tick(&mut self) {
-        self.last_eval_calls = 0;
-        self.eval_cache.fill(None);
-        self.visiting.fill(false);
-    }
-
-    fn eval_cell(&mut self, parsed_formulas: &[FormulaAst], index: usize) -> Result<i64, String> {
-        self.last_eval_calls += 1;
-        if let Some(result) = &self.eval_cache[index] {
-            return result.clone();
-        }
-        if self.visiting[index] {
-            return Err("cycle_error".to_owned());
-        }
-        self.visiting[index] = true;
-        let result = self.eval_formula(parsed_formulas, index);
-        self.visiting[index] = false;
-        self.eval_cache[index] = Some(result.clone());
-        result
-    }
-
-    fn cached_result(&self, index: usize) -> Option<Result<i64, String>> {
-        self.eval_cache[index].clone()
-    }
-
-    fn last_eval_calls(&self) -> usize {
-        self.last_eval_calls
-    }
-
-    fn eval_formula(
-        &mut self,
-        parsed_formulas: &[FormulaAst],
-        index: usize,
-    ) -> Result<i64, String> {
-        match parsed_formulas[index] {
-            FormulaAst::Empty => Ok(0),
-            FormulaAst::Number(value) => Ok(value),
-            FormulaAst::Cell(cell) => self.eval_cell(parsed_formulas, cell),
-            FormulaAst::Binary(left, op, right) => {
-                let left = self.eval_term(parsed_formulas, left)?;
-                let right = self.eval_term(parsed_formulas, right)?;
-                match op {
-                    FormulaOp::Add => Ok(left + right),
-                    FormulaOp::Subtract => Ok(left - right),
-                    FormulaOp::Multiply => Ok(left * right),
-                    FormulaOp::Divide if right == 0 => Err("div_by_zero".to_owned()),
-                    FormulaOp::Divide => Ok(left / right),
-                }
-            }
-            FormulaAst::Add(left, right) => {
-                let left = self.eval_term(parsed_formulas, left)?;
-                let right = self.eval_term(parsed_formulas, right)?;
-                Ok(left + right)
-            }
-            FormulaAst::SumRange {
-                start_index,
-                end_index,
-                step,
-            } => {
-                let mut sum = 0i64;
-                let mut index = start_index;
-                while index <= end_index {
-                    sum += self.eval_cell(parsed_formulas, index)?;
-                    index = index.saturating_add(step);
-                }
-                Ok(sum)
-            }
-            FormulaAst::ParseError => Err("parse_error".to_owned()),
-        }
-    }
-
-    fn eval_term(
-        &mut self,
-        parsed_formulas: &[FormulaAst],
-        term: FormulaTerm,
-    ) -> Result<i64, String> {
-        match term {
-            FormulaTerm::Number(value) => Ok(value),
-            FormulaTerm::Cell(index) => self.eval_cell(parsed_formulas, index),
-        }
-    }
-}
-
-fn sync_formula_derived_fields(
-    runtime: &mut GenericScheduledRuntime,
-    list: &str,
-    index: usize,
-    fields: FormulaDerivedStorageFields,
-    value: &str,
-    error: Option<&str>,
-    dependencies: &str,
-) -> RuntimeResult<()> {
-    runtime.set_or_insert_list_row_textlike(list, index, &fields.value, value)?;
-    runtime.set_or_insert_list_row_textlike(
-        list,
-        index,
-        &fields.error,
-        error.unwrap_or_default(),
-    )?;
-    runtime.set_or_insert_list_row_textlike(list, index, &fields.dependencies, dependencies)
-}
-
-#[cfg(test)]
-impl AddressedFormulaScenarioHarness {
-    fn from_generic(
-        mut generic: GenericScheduledRuntime,
-        ir: &TypedProgram,
-    ) -> RuntimeResult<Self> {
-        let Some(plan) = addressed_formula_runtime_plan_from_ir(ir, &generic.formula_operators)?
-        else {
-            return Err("addressed-formula harness source has no formula runtime plan".into());
-        };
-        let mut cache = formula_runtime_cache_from_generic(&generic, plan)?;
-        initialize_addressed_formula_from_generic(&mut generic, &mut cache)?;
-        Ok(Self::from_formula_cache(generic, cache))
-    }
-
-    fn with_dimensions(columns: usize, rows: usize) -> Self {
-        let source = cells_project_source_with_dimensions_for_test(columns, rows);
-        let parsed = parse_source("cells-test-harness.bn", source)
-            .expect("Cells test harness source should parse");
-        let ir = lower(&parsed).expect("checked-in addressed-formula source should lower");
-        let compiled = CompiledProgram::from_ir(&ir)
-            .expect("checked-in addressed-formula source should compile");
-        let generic = GenericScheduledRuntime::new(&ir, &compiled)
-            .expect("checked-in addressed-formula source should initialize generic runtime");
-        Self::from_generic(generic, &ir)
-            .expect("checked-in addressed-formula source should be generic")
-    }
-
-    fn from_formula_cache(
-        generic: GenericScheduledRuntime,
-        cache: AddressedFormulaRuntimeCache,
-    ) -> Self {
-        Self {
-            generic,
-            plan: cache.plan,
-            row_addresses: cache.row_addresses,
-            address_to_index: cache.address_to_index,
-            parsed_formulas: cache.parsed_formulas,
-            dependencies: cache.dependencies,
-            dependency_cache: cache.dependency_cache,
-            evaluation_cache: cache.evaluation_cache,
-            last_recompute_candidates: 0,
-        }
-    }
-
-    fn protocol_text<'a>(&self, value: &str) -> ProtocolValue<'a> {
-        ProtocolValue::Text(Cow::Owned(value.to_owned()))
-    }
-
-    fn reserve_cell_cache(&mut self, max_text_len: usize, max_deps: usize) {
-        let _ = max_text_len;
-        for dependencies in &mut self.dependencies {
-            dependencies.reserve(max_deps);
-        }
-        let minimum_fanout_capacity = max_deps.max(4);
-        self.dependency_cache
-            .reserve_dependents(minimum_fanout_capacity);
-    }
-
-    fn apply_step_into<'a>(
-        &mut self,
-        step: &'a ScenarioStep,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-        recomputed: &mut Vec<usize>,
-    ) -> RuntimeResult<()> {
-        let Some(routed) = self.route_step(step)? else {
-            return Ok(());
-        };
-        assert_routed_source_event_matches(step, routed.event)?;
-        match routed.route_kind {
-            SourceActionKind::IndexedTextChange => {
-                let source = routed.source();
-                let address = routed.require_address(&step.id)?;
-                if !self.address_to_index.contains_key(address) {
-                    return Err(format!(
-                        "{} addressed-formula source event missing valid address",
-                        step.id
-                    )
-                    .into());
-                }
-                let text = routed.require_text(&step.id)?;
-                let source_event = GenericSourceEvent {
-                    source,
-                    text: Some(text),
-                    key: None,
-                    target_text: None,
-                    address: Some(address),
-                };
-                let input = self.generic.source_action_input_for_event_by_row_field(
-                    "formula-change",
-                    source_event,
-                    TickSeq(0),
-                    &self.plan.address_field,
-                    Some(address),
-                )?;
-                let batch = self.generic.apply_source_actions_to_batch(
-                    input,
-                    |_| None,
-                    |mutation| {
-                        emit_addressed_formula_default_protocol_mutation(
-                            mutation, address, None, true, false, deltas, patches,
-                        )?;
-                        Ok(())
-                    },
-                )?;
-                batch.require_first_text_except(
-                    source,
-                    "editing-text update",
-                    &self.plan.formula_field,
-                )?;
-                batch.require_first_bool(source, "editing update")?;
-            }
-            SourceActionKind::IndexedTextCommit => {
-                let source = routed.source();
-                let address = routed.require_address(&step.id)?;
-                if !self.address_to_index.contains_key(address) {
-                    return Err(format!(
-                        "{} addressed-formula source event missing valid address",
-                        step.id
-                    )
-                    .into());
-                }
-                let text = routed.require_text(&step.id)?;
-                self.commit_from_source(source, address, text, deltas, patches, recomputed)?;
-            }
-            SourceActionKind::IndexedTextIdentity => {
-                let source = routed.source();
-                let address = routed.require_address(&step.id)?;
-                if !self.address_to_index.contains_key(address) {
-                    return Err(format!(
-                        "{} addressed-formula source event missing valid address",
-                        step.id
-                    )
-                    .into());
-                }
-                let source_event = GenericSourceEvent {
-                    source,
-                    text: None,
-                    key: None,
-                    target_text: None,
-                    address: Some(address),
-                };
-                let input = self.generic.source_action_input_for_event_by_row_field(
-                    "formula-identity",
-                    source_event,
-                    TickSeq(0),
-                    &self.plan.address_field,
-                    Some(address),
-                )?;
-                let batch =
-                    self.generic
-                        .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-                let editing_text = batch.require_first_identity(source, "editing-text cancel")?;
-                let editing = batch.require_first_bool(source, "editing cancel")?;
-                let index = self.cell_index(address)?;
-                let value = self.cell_text_field(index, &editing_text.field)?;
-                let identity_value = self.protocol_text(value);
-                emit_addressed_formula_default_protocol_mutation(
-                    GenericSourceMutation::TextFieldIdentity(editing_text.clone()),
-                    address,
-                    Some(identity_value),
-                    false,
-                    false,
-                    deltas,
-                    patches,
-                )?;
-                emit_addressed_formula_default_protocol_mutation(
-                    GenericSourceMutation::BoolField(editing),
-                    address,
-                    None,
-                    false,
-                    false,
-                    deltas,
-                    patches,
-                )?;
-            }
-            route_kind => {
-                return Err(format!(
-                    "{} addressed-formula source `{}` classified as unsupported route `{route_kind:?}`",
-                    step.id,
-                    routed.source()
-                )
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn route_step<'a>(
-        &self,
-        step: &'a ScenarioStep,
-    ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
-        if step.user_action.is_none() {
-            return Ok(None);
-        }
-        let source_event = GenericSourceEvent::require(step)?;
-        self.route_source_event(step, source_event)
-    }
-
-    fn route_source_event<'a>(
-        &self,
-        step: &'a ScenarioStep,
-        source_event: GenericSourceEvent<'a>,
-    ) -> RuntimeResult<Option<GenericRoutedSourceEvent<'a>>> {
-        let source = source_event.source;
-        let routed = self
-            .generic
-            .route_source_event(&self.plan.list, &self.plan.formula_field, source_event)
-            .map_err(|_| format!("{} source `{source}` has no compiled route", step.id))?;
-        let address = routed
-            .event
-            .address
-            .filter(|candidate| self.address_to_index.contains_key(*candidate))
-            .ok_or_else(|| {
-                format!(
-                    "{} addressed-formula source event missing valid address",
-                    step.id
-                )
-            })?;
-        match routed.route_kind {
-            SourceActionKind::IndexedTextCommit
-            | SourceActionKind::IndexedTextChange => {
-                routed.require_text(&step.id)?;
-                Ok(Some(routed))
-            }
-            SourceActionKind::IndexedTextIdentity => Ok(Some(routed)),
-            route_kind => Err(format!(
-                "{} addressed-formula source `{source}` for address `{address}` classified as unsupported route `{route_kind:?}`",
-                step.id
-            )
-            .into()),
-        }
-    }
-
-    fn commit<'a>(
-        &mut self,
-        address: &'a str,
-        formula: &'a str,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-        recomputed: &mut Vec<usize>,
-    ) -> RuntimeResult<()> {
-        self.commit_from_source(
-            "cell.sources.editor.commit",
-            address,
-            formula,
-            deltas,
-            patches,
-            recomputed,
-        )
-    }
-
-    fn commit_from_source<'a>(
-        &mut self,
-        source: &'a str,
-        address: &'a str,
-        formula: &'a str,
-        deltas: &mut Vec<SemanticDelta<'a>>,
-        patches: &mut Vec<RenderPatch<'a>>,
-        recomputed: &mut Vec<usize>,
-    ) -> RuntimeResult<()> {
-        self.generic.formula_operators.validate_formula_pipeline()?;
-        let committed_index = self.cell_index(address)?;
-        let source_event = GenericSourceEvent {
-            source,
-            text: Some(formula),
-            key: None,
-            target_text: None,
-            address: Some(address),
-        };
-        let input = self.generic.source_action_input_for_event_by_row_field(
-            "formula-commit",
-            source_event,
-            TickSeq(0),
-            &self.plan.address_field,
-            Some(address),
-        )?;
-        let batch = self
-            .generic
-            .apply_source_actions_to_batch(input, |_| None, |_| Ok(()))?;
-        let formula = batch.require_text(source, "formula update", &self.plan.formula_field)?;
-        let editing_text = batch.require_first_text_except(
-            source,
-            "editing text update",
-            &self.plan.formula_field,
-        )?;
-        let editing = batch.require_first_bool(source, "editing update")?;
-        self.parsed_formulas[committed_index] = self
-            .generic
-            .formula_operators
-            .parse_addressed_formula(formula.value, &self.address_to_index)?;
-        self.replace_cell_dependencies(committed_index)?;
-        self.recompute_affected(address, recomputed)?;
-        let display_key = formula.key;
-        let display_generation = formula.generation;
-        let display_value = self.cell_display_protocol_value(committed_index)?;
-        let display_error = self.cell_error_by_index(committed_index)?;
-        emit_addressed_formula_default_protocol_mutation(
-            GenericSourceMutation::TextField(formula),
-            address,
-            None,
-            false,
-            false,
-            deltas,
-            patches,
-        )?;
-        emit_addressed_formula_default_protocol_mutation(
-            GenericSourceMutation::TextField(editing_text),
-            address,
-            None,
-            false,
-            false,
-            deltas,
-            patches,
-        )?;
-        emit_addressed_formula_default_protocol_mutation(
-            GenericSourceMutation::BoolField(editing),
-            address,
-            None,
-            false,
-            false,
-            deltas,
-            patches,
-        )?;
-        self.generic
-            .formula_operators
-            .emit_addressed_formula_display_protocol_mutations(
-                &self.plan.list,
-                display_key,
-                display_generation,
-                display_value,
-                display_error.as_deref(),
-                address,
-                deltas,
-                patches,
-            )?;
-        Ok(())
-    }
-
-    fn recompute_affected(
-        &mut self,
-        changed_address: &str,
-        recomputed: &mut Vec<usize>,
-    ) -> RuntimeResult<()> {
-        let changed_index = self.cell_index(changed_address)?;
-        self.dependency_cache.collect_affected(changed_index);
-        let affected_len = self.dependency_cache.affected().len();
-        self.last_recompute_candidates = affected_len;
-        self.evaluation_cache.begin_tick();
-        for offset in 0..affected_len {
-            let index = self.dependency_cache.affected()[offset];
-            let _ = self
-                .evaluation_cache
-                .eval_cell(&self.parsed_formulas, index);
-        }
-        for offset in 0..affected_len {
-            let index = self.dependency_cache.affected()[offset];
-            let result = self.evaluation_cache.cached_result(index).unwrap_or(Ok(0));
-            let changed = self.sync_cell_result(index, changed_index, result)?;
-            if changed {
-                self.sync_cell_derived_fields(index)?;
-                recomputed.push(index);
-            }
-        }
-        recomputed.sort_unstable();
-        Ok(())
-    }
-
-    fn sync_cell_derived_fields(&mut self, index: usize) -> RuntimeResult<()> {
-        let dependency_text = self.cell_dependency_text(index);
-        let fields = self.generic.formula_operators.derived_storage_fields()?;
-        let value = self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.value)
-            .unwrap_or("")
-            .to_owned();
-        let error = self.cell_error_by_index(index)?;
-        sync_formula_derived_fields(
-            &mut self.generic,
-            &self.plan.list,
-            index,
-            fields,
-            &value,
-            error.as_deref(),
-            &dependency_text,
-        )
-    }
-
-    fn sync_cell_result(
-        &mut self,
-        index: usize,
-        changed_index: usize,
-        result: Result<i64, String>,
-    ) -> RuntimeResult<bool> {
-        let fields = self.generic.formula_operators.derived_storage_fields()?;
-        let display = FormulaDisplay::from_result(self.parsed_formulas[index], result);
-        let current_value = self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.value)
-            .unwrap_or("");
-        let current_error = self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.error)
-            .unwrap_or("");
-        let changed = index == changed_index
-            || current_value != display.value
-            || current_error != display.error.as_deref().unwrap_or_default();
-        self.generic.set_or_insert_list_row_textlike(
-            &self.plan.list,
-            index,
-            &fields.value,
-            &display.value,
-        )?;
-        self.generic.set_or_insert_list_row_textlike(
-            &self.plan.list,
-            index,
-            &fields.error,
-            display.error.as_deref().unwrap_or_default(),
-        )?;
-        Ok(changed)
-    }
-
-    fn cell_dependency_text(&self, index: usize) -> String {
-        let mut text = String::new();
-        for offset in 0..self.dependencies[index].len() {
-            if offset > 0 {
-                text.push(',');
-            }
-            let dependency = self.dependencies[index][offset];
-            text.push_str(self.address_for(dependency).as_str());
-        }
-        text
-    }
-
-    fn replace_cell_dependencies(&mut self, cell_index: usize) -> RuntimeResult<()> {
-        self.dependencies[cell_index].clear();
-        self.generic.formula_operators.dependencies_into(
-            self.parsed_formulas[cell_index],
-            &mut self.dependencies[cell_index],
-        )?;
-        self.dependency_cache
-            .replace_dependencies(cell_index, &self.dependencies[cell_index]);
-        Ok(())
-    }
-
-    fn cell_index(&self, address: &str) -> RuntimeResult<usize> {
-        self.address_to_index
-            .get(address)
-            .copied()
-            .ok_or_else(|| format!("unknown cell {address}").into())
-    }
-
-    #[cfg(test)]
-    fn cell_key_generation(&self, index: usize) -> (u64, u64) {
-        self.generic
-            .row_identity(&self.plan.list, index)
-            .expect("formula generic runtime has matching addressed row")
-    }
-
-    fn cell_text_field(&self, index: usize, field: &str) -> RuntimeResult<&str> {
-        self.generic
-            .list_row_textlike(&self.plan.list, index, field)
-    }
-
-    #[cfg(test)]
-    fn cell_value(&self, address: &str) -> RuntimeResult<&str> {
-        let index = self.cell_index(address)?;
-        self.generic
-            .list_row_textlike(&self.plan.list, index, &self.plan.value_field)
-    }
-
-    #[cfg(test)]
-    fn cell_error(&self, address: &str) -> RuntimeResult<Option<&str>> {
-        let index = self.cell_index(address)?;
-        Ok(self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &self.plan.error_field)
-            .filter(|error| !error.is_empty()))
-    }
-
-    #[cfg(test)]
-    fn cell_deps(&self, address: &str) -> RuntimeResult<&[usize]> {
-        let index = self.cell_index(address)?;
-        Ok(&self.dependencies[index])
-    }
-
-    fn cell_error_by_index(&self, index: usize) -> RuntimeResult<Option<String>> {
-        let fields = self.generic.formula_operators.derived_storage_fields()?;
-        Ok(self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.error)
-            .filter(|error| !error.is_empty())
-            .map(str::to_owned))
-    }
-
-    fn cell_display_protocol_value(&self, index: usize) -> RuntimeResult<ProtocolValue<'static>> {
-        let fields = self.generic.formula_operators.derived_storage_fields()?;
-        if self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.error)
-            .is_some_and(|error| !error.is_empty())
-        {
-            return Ok(ProtocolValue::Text(Cow::Borrowed("")));
-        }
-        let value = self
-            .generic
-            .list_row_textlike_opt(&self.plan.list, index, &fields.value)
-            .unwrap_or("");
-        if let Ok(value) = value.parse::<i64>() {
-            Ok(ProtocolValue::NumberText(value))
-        } else {
-            Ok(ProtocolValue::Text(Cow::Owned(value.to_owned())))
-        }
-    }
-
-    #[cfg(test)]
-    fn cell_bool_field(&self, index: usize, field: &str) -> RuntimeResult<bool> {
-        self.generic.list_row_bool(&self.plan.list, index, field)
-    }
-
-    fn address_for(&self, index: usize) -> String {
-        self.row_addresses
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| format!("row-{index}"))
-    }
-}
-
 fn push_cell_address(columns: usize, index: usize, output: &mut String) {
     let col = index % columns;
     let row = index / columns;
@@ -11372,216 +9633,6 @@ fn push_spreadsheet_column_label(mut index: usize, output: &mut String) {
         output.push(*byte as char);
     }
 }
-
-fn parse_formula_ast(formula: &str, address_to_index: &BTreeMap<String, usize>) -> FormulaAst {
-    let trimmed = formula.trim();
-    if trimmed.is_empty() {
-        return FormulaAst::Empty;
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return FormulaAst::Number(value);
-    }
-    let expr = trimmed.strip_prefix('=').unwrap_or(trimmed);
-    if let Some((left, right)) = parse_two_arg_function(expr, "add") {
-        let Some(left) = parse_formula_term(left.trim(), address_to_index) else {
-            return FormulaAst::ParseError;
-        };
-        let Some(right) = parse_formula_term(right.trim(), address_to_index) else {
-            return FormulaAst::ParseError;
-        };
-        return FormulaAst::Add(left, right);
-    }
-    if let Some(range) = parse_one_arg_function(expr, "sum") {
-        let Some((start_index, end_index, step)) = parse_cell_range(range.trim(), address_to_index)
-        else {
-            return FormulaAst::ParseError;
-        };
-        return FormulaAst::SumRange {
-            start_index,
-            end_index,
-            step,
-        };
-    }
-    if let Some((left, op, right)) = split_formula_binary(expr) {
-        let Some(left) = parse_formula_term(left.trim(), address_to_index) else {
-            return FormulaAst::ParseError;
-        };
-        let Some(right) = parse_formula_term(right.trim(), address_to_index) else {
-            return FormulaAst::ParseError;
-        };
-        return FormulaAst::Binary(left, op, right);
-    }
-    parse_formula_term(expr.trim(), address_to_index)
-        .map(|term| match term {
-            FormulaTerm::Number(value) => FormulaAst::Number(value),
-            FormulaTerm::Cell(index) => FormulaAst::Cell(index),
-        })
-        .unwrap_or(FormulaAst::ParseError)
-}
-
-fn parse_two_arg_function<'a>(expr: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
-    let body = parse_function_body(expr, name)?;
-    body.split_once(',')
-}
-
-fn parse_one_arg_function<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
-    parse_function_body(expr, name)
-}
-
-fn parse_function_body<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
-    let expr = expr.trim();
-    let open = expr.find('(')?;
-    let close = expr.rfind(')')?;
-    if close != expr.len().saturating_sub(1) {
-        return None;
-    }
-    if !expr[..open].trim().eq_ignore_ascii_case(name) {
-        return None;
-    }
-    Some(&expr[open + 1..close])
-}
-
-fn parse_cell_range(
-    range: &str,
-    address_to_index: &BTreeMap<String, usize>,
-) -> Option<(usize, usize, usize)> {
-    let (start, end) = range.split_once(':')?;
-    let (start_column, start_row) = parse_formula_address(start.trim())?;
-    let (end_column, end_row) = parse_formula_address(end.trim())?;
-    if start_column != end_column {
-        return None;
-    }
-    let min_row = start_row.min(end_row);
-    let max_row = start_row.max(end_row);
-    let mut indexes = Vec::with_capacity(max_row.saturating_sub(min_row).saturating_add(1));
-    for row in min_row..=max_row {
-        let address = format!("{start_column}{row}");
-        indexes.push(*address_to_index.get(&address)?);
-    }
-    indexes.sort_unstable();
-    let start_index = *indexes.first()?;
-    let end_index = *indexes.last()?;
-    let step = match indexes.as_slice() {
-        [_] => 1,
-        [first, second, rest @ ..] => {
-            let step = second.checked_sub(*first)?;
-            if step == 0 {
-                return None;
-            }
-            let mut previous = *second;
-            for index in rest {
-                if index.checked_sub(previous)? != step {
-                    return None;
-                }
-                previous = *index;
-            }
-            step
-        }
-        [] => return None,
-    };
-    Some((start_index, end_index, step))
-}
-
-fn split_formula_binary(expr: &str) -> Option<(&str, FormulaOp, &str)> {
-    for (symbol, op) in [
-        ('+', FormulaOp::Add),
-        ('-', FormulaOp::Subtract),
-        ('*', FormulaOp::Multiply),
-        ('/', FormulaOp::Divide),
-    ] {
-        if let Some((left, right)) = expr.split_once(symbol)
-            && !left.trim().is_empty()
-            && !right.trim().is_empty()
-        {
-            return Some((left, op, right));
-        }
-    }
-    None
-}
-
-fn parse_formula_term(
-    term: &str,
-    address_to_index: &BTreeMap<String, usize>,
-) -> Option<FormulaTerm> {
-    if let Ok(value) = term.parse::<i64>() {
-        return Some(FormulaTerm::Number(value));
-    }
-    address_to_index.get(term).copied().map(FormulaTerm::Cell)
-}
-
-fn parse_formula_address(address: &str) -> Option<(String, usize)> {
-    let split = address
-        .char_indices()
-        .find_map(|(index, ch)| ch.is_ascii_digit().then_some(index))?;
-    let (column, row) = address.split_at(split);
-    if column.is_empty()
-        || !column.chars().all(|ch| ch.is_ascii_uppercase())
-        || row.is_empty()
-        || !row.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((column.to_owned(), row.parse().ok()?))
-}
-
-fn formula_ast_dependencies_into(ast: FormulaAst, deps: &mut Vec<usize>) {
-    match ast {
-        FormulaAst::Cell(index) => push_unique_dependency(deps, index),
-        FormulaAst::Binary(left, _, right) | FormulaAst::Add(left, right) => {
-            formula_term_dependencies_into(left, deps);
-            formula_term_dependencies_into(right, deps);
-        }
-        FormulaAst::SumRange {
-            start_index,
-            end_index,
-            step,
-        } => {
-            let mut index = start_index;
-            while index <= end_index {
-                push_unique_dependency(deps, index);
-                index = index.saturating_add(step);
-            }
-        }
-        FormulaAst::Empty | FormulaAst::Number(_) | FormulaAst::ParseError => {}
-    }
-}
-
-fn formula_term_dependencies_into(term: FormulaTerm, deps: &mut Vec<usize>) {
-    if let FormulaTerm::Cell(index) = term {
-        push_unique_dependency(deps, index);
-    }
-}
-
-fn push_unique_dependency(deps: &mut Vec<usize>, index: usize) {
-    if !deps.contains(&index) {
-        deps.push(index);
-    }
-}
-
-fn count_formula_dependencies(formula: &str) -> usize {
-    formula
-        .split(|ch: char| !(ch.is_ascii_alphanumeric()))
-        .filter(|part| is_cell_address(part))
-        .count()
-}
-
-fn cell_index(address: &str, columns: usize, rows: usize) -> Option<usize> {
-    let mut chars = address.chars();
-    let col = chars.next()? as u8;
-    if !col.is_ascii_uppercase() {
-        return None;
-    }
-    let col = usize::from(col - b'A');
-    if col >= columns {
-        return None;
-    }
-    let row = chars.as_str().parse::<usize>().ok()?;
-    if row >= rows {
-        return None;
-    }
-    Some(row * columns + col)
-}
-
 #[cfg(test)]
 fn todomvc_initial_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> {
     let list = ir
@@ -11661,57 +9712,6 @@ fn cells_project_source_with_dimensions_for_test(columns: usize, rows: usize) ->
         &format!("columns: {columns}\n        rows: {rows}"),
     )
 }
-
-fn addressed_formula_runtime_plan_from_ir(
-    ir: &TypedProgram,
-    formula_operators: &FormulaOperatorPlan,
-) -> RuntimeResult<Option<AddressedFormulaRuntimePlan>> {
-    let Some(row_scope) = formula_operators.row_scope()? else {
-        return Ok(None);
-    };
-    let reader_target = formula_operators.eval_reader()?;
-    let reader = ir
-        .formula_readers
-        .iter()
-        .find(|reader| reader.target == reader_target)
-        .ok_or_else(|| {
-            format!("Formula/eval reader `{reader_target}` is not declared with Formula/reader")
-        })?;
-    let list = ir
-        .lists
-        .iter()
-        .find(|list| list.name == reader.list)
-        .ok_or_else(|| {
-            format!(
-                "Formula/reader `{}` references unknown list `{}`",
-                reader.target, reader.list
-            )
-        })?;
-    if !row_scope_matches_list(&list.name, &row_scope) {
-        return Err(format!(
-            "Formula operations target row scope `{row_scope}` but Formula/reader `{}` points at list `{}`",
-            reader.target, list.name
-        )
-        .into());
-    }
-    let fields = formula_operators.derived_storage_fields()?;
-    if reader.value_field != fields.value {
-        return Err(format!(
-            "Formula/reader `{}` value field `{}` does not match Formula/eval target field `{}`",
-            reader.target, reader.value_field, fields.value
-        )
-        .into());
-    }
-    Ok(Some(AddressedFormulaRuntimePlan {
-        list: list.name.clone(),
-        address_field: reader.address_field.clone(),
-        formula_field: formula_operators.parse_input_field()?,
-        value_field: fields.value,
-        error_field: fields.error,
-        dependencies_field: fields.dependencies,
-    }))
-}
-
 #[cfg(test)]
 fn cells_table_dimensions_from_ir(ir: &TypedProgram) -> Option<(usize, usize)> {
     ir.lists.iter().find_map(|list| match list.initializer {
@@ -11886,45 +9886,6 @@ fn emit_generic_render_patch_for_mutation<'a>(
 ) -> RuntimeResult<()> {
     let lowerer = GenericRenderLoweringPlan::generic();
     if let Some(render_patch) = lowerer.lower_mutation_patch(mutation, context)? {
-        patches.push(render_patch);
-    }
-    Ok(())
-}
-
-fn emit_addressed_formula_default_protocol_mutation<'a>(
-    mutation: GenericSourceMutation<'a>,
-    address: &'a str,
-    identity_value: Option<ProtocolValue<'a>>,
-    patch_editor_text: bool,
-    patch_value_text: bool,
-    deltas: &mut Vec<SemanticDelta<'a>>,
-    patches: &mut Vec<RenderPatch<'a>>,
-) -> RuntimeResult<()> {
-    let lowerer = GenericRenderLoweringPlan::generic();
-    match &mutation {
-        GenericSourceMutation::TextFieldIdentity(commit) => {
-            let value = identity_value.ok_or_else(|| {
-                format!(
-                    "addressed text identity mutation for `{}` requires the copied field value",
-                    commit.field
-                )
-            })?;
-            deltas.push(commit.semantic_delta_with_value(value));
-        }
-        _ => {
-            if let Some(delta) = mutation.semantic_delta() {
-                deltas.push(delta);
-            }
-        }
-    }
-    if let Some(render_patch) = lowerer.lower_mutation_patch(
-        &mutation,
-        GenericRenderContext {
-            address: Some(address),
-            patch_editor_text,
-            patch_value_text,
-        },
-    )? {
         patches.push(render_patch);
     }
     Ok(())
@@ -12105,6 +10066,55 @@ fn current_binary_hash() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_sources_do_not_use_legacy_formula_operators() {
+        let legacy_operator_prefix = ["Formula", "/"].concat();
+        for (path, source) in [
+            (
+                "examples/cells/formula.bn",
+                include_str!("../../../examples/cells/formula.bn"),
+            ),
+            (
+                "examples/cells/cell.bn",
+                include_str!("../../../examples/cells/cell.bn"),
+            ),
+        ] {
+            assert!(
+                !source.contains(&legacy_operator_prefix),
+                "{path} must express cell calculation in ordinary Boon source"
+            );
+        }
+    }
+
+    #[test]
+    fn production_runtime_sources_do_not_contain_legacy_formula_runtime_symbols() {
+        let forbidden = [
+            ["Formula", "Ast"].concat(),
+            ["Formula", "Term"].concat(),
+            ["Formula", "Operator", "Plan"].concat(),
+            ["Addressed", "Formula", "Runtime"].concat(),
+            ["parse", "_formula", "_ast"].concat(),
+            ["formula", "_ast", "_dependencies"].concat(),
+        ];
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "../boon_parser/src/lib.rs",
+            "../boon_ir/src/lib.rs",
+            "src/lib.rs",
+        ] {
+            let path = crate_root.join(relative);
+            let text = std::fs::read_to_string(&path).unwrap();
+            for needle in &forbidden {
+                assert!(
+                    !text.contains(needle),
+                    "{} still contains legacy formula runtime symbol `{}`",
+                    path.display(),
+                    needle
+                );
+            }
+        }
+    }
 
     fn list_scenario_harness_from_parsed(parsed: &ParsedProgram) -> ListScenarioHarness {
         let ir = lower(parsed).unwrap();

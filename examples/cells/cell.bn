@@ -45,16 +45,10 @@ FUNCTION new_cell(cell) {
                 }
             }
 
-        parsed_formula:
-            Formula/parse(formula_text)
-
-        dependencies:
-            Formula/dependencies(parsed_formula)
-
         value:
-            Formula/eval(formula: parsed_formula, read: sheet_reader)
+            compute_value(address: address, formula_text: formula_text)
 
         error:
-            Formula/error(parsed_formula, value)
+            Error/text(compute_value(address: address, formula_text: formula_text))
     ]
 }

@@ -12728,7 +12728,7 @@ mod tests {
         );
         let source = cells.source_text().unwrap();
         assert!(source.contains("-- file:"));
-        assert!(source.contains("Formula/reader"));
+        assert!(!source.contains(&["Formula", "/"].concat()));
         assert!(source.contains("FUNCTION new_cell"));
         assert!(source.contains("FUNCTION new_sheet_column"));
         assert!(source.contains("FUNCTION cells_app"));

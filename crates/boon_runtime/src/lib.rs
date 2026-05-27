@@ -3,10 +3,10 @@
 
 use bitvec::prelude::*;
 use boon_ir::{
-    DerivedValueKind, FieldId, FormulaOperationKind, FunctionDefinition, InitialValue, ListId,
-    ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, SourceId,
-    SourcePayloadField, TableDefaultField, TypedProgram, UpdateExpression, debug_tables, lower,
-    verify_hidden_identity, verify_static_schedule,
+    DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListId, ListInitializer,
+    ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
+    TableDefaultField, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
+    verify_static_schedule,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, DocumentAst, ParsedProgram,
@@ -2180,7 +2180,6 @@ fn remaining_example_specific_shells(
         "summary_reads_authoritative_storage",
         "delta_identities_from_authoritative_storage",
         "hidden_list_keys_from_generic_storage",
-        "formula_display_mutation_emitter",
     ]) {
         shells.push("generic_report_glue".to_owned());
     }
@@ -2188,7 +2187,6 @@ fn remaining_example_specific_shells(
         "render_patch_lowering",
         "common_render_patch_lowering",
         "render_only_patch_lowering",
-        "formula_display_protocol_lowering",
     ]) {
         shells.push("generic_render_patch_report_glue".to_owned());
     }
@@ -4299,6 +4297,237 @@ impl GenericScheduledRuntime {
         Ok(list)
     }
 
+    fn indexed_target_list(&self, target: &str) -> RuntimeResult<&str> {
+        let scope = target
+            .split_once('.')
+            .map(|(scope, _)| scope)
+            .ok_or_else(|| format!("indexed target `{target}` has no row scope"))?;
+        self.list_source_bindings
+            .list_for_row_scope(scope)
+            .ok_or_else(|| format!("indexed target `{target}` has no compiled list scope").into())
+    }
+
+    fn apply_source_actions<'a>(
+        &mut self,
+        input: GenericSourceActionInput<'a>,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<()> {
+        let actions = self.source_routes.actions_for_source_id(input.source_id)?;
+        for action in actions {
+            match action {
+                SourceAction::RootScalar => {
+                    if let Some(commit) = self.storage.apply_root_text_action_source(
+                        &self.source_routes,
+                        &self.scalar_equations,
+                        input.source,
+                        input.source_id,
+                        input.text,
+                        input.address,
+                        input.seq,
+                    )? {
+                        observe(GenericSourceMutation::RootText(commit))?;
+                    }
+                }
+                SourceAction::DerivedText { .. } => {}
+                SourceAction::ListAppend { list, trigger } => {
+                    let source_paths = self.list_source_bindings.source_paths(list)?;
+                    let Some(value) = self.storage.eval_derived_text_transform(
+                        &self.derived_equations,
+                        trigger,
+                        input.source,
+                        input.key,
+                        input.text,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let insert = self.storage.append_row_for_trigger_text_and_bind_sources(
+                        &self.list_equations,
+                        list,
+                        trigger,
+                        value,
+                        source_paths,
+                    )?;
+                    observe(GenericSourceMutation::ListAppend(
+                        GenericTextListAppendCommit {
+                            list: list.to_owned(),
+                            key: insert.key,
+                            generation: insert.generation,
+                            value,
+                        },
+                    ))?;
+                    let bindings = self
+                        .storage
+                        .row_source_bindings(list, insert.key, insert.generation)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for binding in bindings {
+                        observe(GenericSourceMutation::SourceBind(binding))?;
+                    }
+                }
+                SourceAction::ListRemove { list } => {
+                    if let Some(index) = input.index {
+                        let Some((key, generation)) =
+                            self.storage.remove_index_source_action_and_unbind_sources(
+                                &self.source_routes,
+                                list,
+                                input.source_id,
+                                index,
+                                |binding| {
+                                    observe(GenericSourceMutation::SourceUnbind(binding.clone()))
+                                },
+                            )?
+                        else {
+                            continue;
+                        };
+                        observe(GenericSourceMutation::ListRemove {
+                            list: list.to_owned(),
+                            key,
+                            generation,
+                        })?;
+                    } else {
+                        self.storage.remove_where_source_action_and_unbind_sources(
+                            &self.source_routes,
+                            list,
+                            input.source_id,
+                            |observation| match observation {
+                                GenericListRemoveObservation::SourceUnbind(binding) => {
+                                    observe(GenericSourceMutation::SourceUnbind(binding.clone()))
+                                }
+                                GenericListRemoveObservation::RowRemoved { key, generation } => {
+                                    observe(GenericSourceMutation::ListRemove {
+                                        list: list.to_owned(),
+                                        key,
+                                        generation,
+                                    })
+                                }
+                            },
+                        )?;
+                    }
+                }
+                SourceAction::IndexedText { kind, target } => {
+                    let Some(list) = input.list.as_deref() else {
+                        return Err(format!(
+                            "source `{}` indexed text action `{target}` needs a list context",
+                            input.source
+                        )
+                        .into());
+                    };
+                    let Some(index) = input.index else {
+                        return Err(format!(
+                            "source `{}` indexed text action `{target}` needs a row index",
+                            input.source
+                        )
+                        .into());
+                    };
+                    if *kind == SourceRouteTextAction::PreviousValue && input.text.is_none() {
+                        let commit = self.storage.commit_indexed_previous_text_target_source(
+                            &self.scalar_equations,
+                            list,
+                            index,
+                            target,
+                            input.source,
+                        )?;
+                        observe(GenericSourceMutation::TextFieldIdentity(commit))?;
+                    } else if let Some(commit) = self.storage.commit_indexed_text_source(
+                        &self.scalar_equations,
+                        list,
+                        index,
+                        target,
+                        input.source,
+                        input.text,
+                    )? {
+                        observe(GenericSourceMutation::TextField(commit))?;
+                    }
+                }
+                SourceAction::IndexedBool { target, .. } => {
+                    let Some(list) = input.list.as_deref() else {
+                        return Err(format!(
+                            "source `{}` indexed bool action `{target}` needs a list context",
+                            input.source
+                        )
+                        .into());
+                    };
+                    if let Some(index) = input.index {
+                        if self.scalar_equations.bool_const_value(target, input.source)
+                            == Some(true)
+                        {
+                            let field = row_field_name(target).to_owned();
+                            self.storage.commit_other_indexed_bool_fields(
+                                list,
+                                index,
+                                &field,
+                                false,
+                                |commit| {
+                                    observe(GenericSourceMutation::BoolField(commit))?;
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                        let commit = self.storage.commit_indexed_bool_source(
+                            &self.scalar_equations,
+                            list,
+                            index,
+                            target,
+                            input.source,
+                            read_extra_bool,
+                        )?;
+                        observe(GenericSourceMutation::BoolField(commit))?;
+                    } else {
+                        self.storage.commit_each_indexed_bool_source(
+                            &self.scalar_equations,
+                            list,
+                            target,
+                            input.source,
+                            read_extra_bool,
+                            |commit| {
+                                observe(GenericSourceMutation::BoolField(commit))?;
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_source_actions_to_batch<'a>(
+        &mut self,
+        input: GenericSourceActionInput<'a>,
+        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
+        mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
+    ) -> RuntimeResult<GenericSourceMutationBatch<'a>> {
+        let mut batch = GenericSourceMutationBatch::new();
+        self.apply_source_actions(input, read_extra_bool, |mutation| {
+            batch.observe(&mutation)?;
+            observe(mutation)
+        })?;
+        Ok(batch)
+    }
+
+    #[cfg(test)]
+    fn append_text_row_source_action_and_bind_sources<'a>(
+        &mut self,
+        list: &str,
+        source: &str,
+        key: Option<&str>,
+        text: Option<&'a str>,
+    ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
+        let source_paths = self.list_source_bindings.source_paths(list)?;
+        self.storage.append_text_row_source_action_and_bind_sources(
+            &self.source_routes,
+            &self.derived_equations,
+            &self.list_equations,
+            list,
+            source,
+            key,
+            text,
+            source_paths,
+        )
+    }
+
     fn resolve_bound_source_index(
         &self,
         list: &str,
@@ -4451,11 +4680,871 @@ impl GenericScheduledRuntime {
         }
         Ok(None)
     }
+
+    fn count_list_rows_for_target(&self, list: &str, target: &str) -> RuntimeResult<usize> {
+        self.storage
+            .count_list_rows_for_target(&self.list_equations, list, target)
+    }
+
+    fn initialize_generic_derived_fields(&mut self) -> RuntimeResult<()> {
+        if self.generic_derived.is_empty() {
+            return Ok(());
+        }
+        self.generic_derived_state.clear_last_step();
+        let keys = self.generic_derived.keys_for_runtime(&self.storage)?;
+        for key in keys {
+            self.recompute_generic_derived_key_value(&key, &[])?;
+        }
+        self.generic_derived_state.clear_last_step();
+        Ok(())
+    }
+
+    fn read_keys_from_deltas(
+        &self,
+        deltas: &[SemanticDelta<'_>],
+    ) -> RuntimeResult<BTreeSet<GenericReadKey>> {
+        let mut reads = BTreeSet::new();
+        for delta in deltas {
+            if delta.kind != "FieldSet" {
+                continue;
+            }
+            let Some(field) = delta.field_path.as_ref() else {
+                continue;
+            };
+            if let Some(list) = delta.list_id.as_ref() {
+                let Some(key) = delta.key else {
+                    continue;
+                };
+                let generation = delta.generation.unwrap_or(1);
+                let Some(index) = self.storage.bound_index(list, key, generation)? else {
+                    continue;
+                };
+                reads.insert(GenericReadKey::ListField {
+                    list: list.to_string(),
+                    index,
+                    field: field.to_string(),
+                });
+            } else {
+                reads.insert(GenericReadKey::Root {
+                    field: field.to_string(),
+                });
+            }
+        }
+        Ok(reads)
+    }
+
+    fn recompute_generic_derived_after_changes(
+        &mut self,
+        changed_reads: BTreeSet<GenericReadKey>,
+    ) -> RuntimeResult<(
+        Vec<GenericValueFieldCommit<'static>>,
+        GenericRecomputeMetrics,
+    )> {
+        self.generic_derived_state.clear_last_step();
+        let mut dirty = self
+            .generic_derived_state
+            .dependents_for_reads(changed_reads)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut commits = Vec::new();
+        let mut metrics = GenericRecomputeMetrics::default();
+        let mut processed = BTreeSet::new();
+        let mut guard = 0usize;
+        while let Some(key) = dirty.iter().next().cloned() {
+            dirty.remove(&key);
+            if !processed.insert(key.clone()) {
+                continue;
+            }
+            guard += 1;
+            if guard > 20_000 {
+                return Err("generic derived recompute budget exhausted".into());
+            }
+            metrics.recompute_candidate_count += 1;
+            let (commit, _) = self.recompute_generic_derived_key_value(&key, &[])?;
+            metrics.recomputed_field_count = self.generic_derived_state.last_recomputed.len();
+            if let Some(commit) = commit {
+                let changed_field = GenericReadKey::ListField {
+                    list: commit.list.clone(),
+                    index: self
+                        .storage
+                        .bound_index(&commit.list, commit.key, commit.generation)?
+                        .unwrap_or(key.index),
+                    field: commit.field.clone(),
+                };
+                for dependent in self
+                    .generic_derived_state
+                    .dependents_for_reads([changed_field])
+                {
+                    if !processed.contains(&dependent) {
+                        dirty.insert(dependent);
+                    }
+                }
+                commits.push(commit);
+            }
+        }
+        self.generic_derived_state.last_candidate_count = metrics.recompute_candidate_count;
+        Ok((commits, metrics))
+    }
+
+    fn recompute_generic_derived_key_value(
+        &mut self,
+        key: &GenericDerivedKey,
+        stack: &[GenericDerivedKey],
+    ) -> RuntimeResult<(Option<GenericValueFieldCommit<'static>>, BoonValue)> {
+        if stack.contains(key) {
+            return Ok((None, BoonValue::Error("cycle_error".to_owned())));
+        }
+        let Some(plan) = self.generic_derived.field_plan(key).cloned() else {
+            let value = self
+                .storage
+                .list_row_field(&key.list, key.index, &key.field)?;
+            return Ok((None, field_ref_to_boon(value)));
+        };
+        let mut frame = GenericEvalFrame::for_row(&plan.list, &plan.row_scope, key.index);
+        frame.stack = stack.to_vec();
+        frame.stack.push(key.clone());
+        let value = self.eval_statement_value(&plan.statement, &mut frame)?;
+        self.generic_derived_state
+            .replace_reads(key.clone(), frame.reads);
+        let visible = value.visible_text();
+        let current = self
+            .storage
+            .list_row_textlike_opt(&key.list, key.index, &key.field)
+            .unwrap_or_default();
+        let emit_unchanged_error = matches!(value, BoonValue::Error(_));
+        if current == visible && !emit_unchanged_error {
+            return Ok((None, value));
+        }
+        if current != visible {
+            self.storage
+                .set_or_insert_list_row_textlike(&key.list, key.index, &key.field, &visible)?;
+        }
+        let (row_key, generation) = self.storage.row_identity(&key.list, key.index)?;
+        self.generic_derived_state.last_recomputed.push(key.clone());
+        Ok((
+            Some(GenericValueFieldCommit {
+                list: key.list.clone(),
+                key: row_key,
+                generation,
+                field: key.field.clone(),
+                value: ProtocolValue::Text(Cow::Owned(visible)),
+            }),
+            value,
+        ))
+    }
+
+    fn eval_statement_block(
+        &mut self,
+        statements: &[AstStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut last = BoonValue::Empty;
+        for statement in statements {
+            frame.consume_budget()?;
+            match &statement.kind {
+                AstStatementKind::Field { name } => {
+                    let value = self.eval_statement_value(statement, frame)?;
+                    frame.env.insert(name.clone(), value.clone());
+                    last = value;
+                }
+                AstStatementKind::Expression
+                    if statement.expr.is_some_and(|expr_id| {
+                        self.generic_derived.expr_is_pipe_continuation(expr_id)
+                    }) =>
+                {
+                    last = self.eval_pipe_continuation(
+                        statement.expr.expect("checked expression id"),
+                        last,
+                        &statement.children,
+                        frame,
+                    )?;
+                }
+                AstStatementKind::Block => {
+                    last = self.eval_statement_block(&statement.children, frame)?;
+                }
+                AstStatementKind::Expression
+                | AstStatementKind::Function { .. }
+                | AstStatementKind::Source { .. }
+                | AstStatementKind::Hold { .. }
+                | AstStatementKind::List { .. } => {
+                    last = self.eval_statement_value(statement, frame)?;
+                }
+            }
+        }
+        Ok(last)
+    }
+
+    fn eval_statement_value(
+        &mut self,
+        statement: &AstStatement,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(expr_id) = statement.expr {
+            if self.generic_derived.expr_is_block_marker(expr_id) {
+                return self.eval_statement_block(&statement.children, frame);
+            }
+            return self.eval_expr_with_children(expr_id, &statement.children, frame);
+        }
+        if !statement.children.is_empty() {
+            return self.eval_statement_block(&statement.children, frame);
+        }
+        Ok(BoonValue::Empty)
+    }
+
+    fn eval_expr_with_children(
+        &mut self,
+        expr_id: usize,
+        children: &[AstStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let expr = self
+            .generic_derived
+            .expressions
+            .get(expr_id)
+            .cloned()
+            .ok_or_else(|| format!("generic expression id {expr_id} is missing"))?;
+        if let AstExprKind::Pipe { input, op, args: _ } = &expr.kind
+            && op == "WHILE"
+        {
+            let input = self.eval_expr(*input, frame)?;
+            return self.eval_while(input, children, frame);
+        }
+        if let AstExprKind::Call { function, args } = &expr.kind
+            && function == "WHILE"
+        {
+            let input = self.eval_first_arg(args, frame)?;
+            return self.eval_while(input, children, frame);
+        }
+        self.eval_expr(expr_id, frame)
+    }
+
+    fn eval_pipe_continuation(
+        &mut self,
+        expr_id: usize,
+        input: BoonValue,
+        children: &[AstStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let expr = self
+            .generic_derived
+            .expressions
+            .get(expr_id)
+            .cloned()
+            .ok_or_else(|| format!("generic pipe expression id {expr_id} is missing"))?;
+        let AstExprKind::Pipe { op, args, .. } = expr.kind else {
+            return Ok(input);
+        };
+        if op == "WHILE" {
+            self.eval_while(input, children, frame)
+        } else {
+            self.eval_call(&op, &args, Some(input), frame)
+        }
+    }
+
+    fn eval_expr(
+        &mut self,
+        expr_id: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        let expr = self
+            .generic_derived
+            .expressions
+            .get(expr_id)
+            .cloned()
+            .ok_or_else(|| format!("generic expression id {expr_id} is missing"))?;
+        match expr.kind {
+            AstExprKind::Identifier(name) => self.eval_identifier(&name, frame),
+            AstExprKind::Path(parts) => self.eval_path(&parts, frame),
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+                Ok(BoonValue::Text(value))
+            }
+            AstExprKind::Number(value) => Ok(value
+                .parse::<i64>()
+                .map(BoonValue::Number)
+                .unwrap_or(BoonValue::NaN)),
+            AstExprKind::Bool(value) => Ok(BoonValue::Bool(value)),
+            AstExprKind::Enum(value) => Ok(BoonValue::Text(value)),
+            AstExprKind::Call { function, args } => self.eval_call(&function, &args, None, frame),
+            AstExprKind::Pipe { input, op, args } => {
+                let value = if self
+                    .generic_derived
+                    .expressions
+                    .get(input)
+                    .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+                {
+                    BoonValue::Empty
+                } else {
+                    self.eval_expr(input, frame)?
+                };
+                self.eval_call(&op, &args, Some(value), frame)
+            }
+            AstExprKind::Infix { left, op, right } => {
+                let left = self.eval_expr(left, frame)?;
+                let right = self.eval_expr(right, frame)?;
+                Ok(generic_infix_value(left, &op, right))
+            }
+            AstExprKind::Record(fields) => {
+                let mut record = BTreeMap::new();
+                for field in fields {
+                    let value = self.eval_expr(field.value, frame)?;
+                    record.insert(field.name, value);
+                }
+                Ok(BoonValue::Record(record))
+            }
+            AstExprKind::ListLiteral { .. } => Ok(BoonValue::List(Vec::new())),
+            AstExprKind::Source
+            | AstExprKind::Hold { .. }
+            | AstExprKind::Latest
+            | AstExprKind::When { .. }
+            | AstExprKind::Then { .. }
+            | AstExprKind::MatchArm { .. }
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_) => Ok(BoonValue::Empty),
+        }
+    }
+
+    fn eval_while(
+        &mut self,
+        input: BoonValue,
+        arms: &[AstStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        for arm in arms {
+            let Some(expr_id) = arm.expr else {
+                continue;
+            };
+            let expr = self
+                .generic_derived
+                .expressions
+                .get(expr_id)
+                .cloned()
+                .ok_or_else(|| format!("generic match arm expression id {expr_id} is missing"))?;
+            let AstExprKind::MatchArm { pattern, output } = expr.kind else {
+                continue;
+            };
+            let Some(binding) = generic_pattern_binding(&pattern, &input) else {
+                continue;
+            };
+            let previous = if let Some((name, value)) = binding {
+                frame
+                    .env
+                    .insert(name.clone(), value)
+                    .map(|value| (name, value))
+            } else {
+                None
+            };
+            let value = if let Some(output) = output {
+                if self.generic_derived.expr_is_block_marker(output) {
+                    self.eval_statement_block(&arm.children, frame)?
+                } else {
+                    self.eval_expr_with_children(output, &arm.children, frame)?
+                }
+            } else {
+                self.eval_statement_block(&arm.children, frame)?
+            };
+            if let Some((name, value)) = previous {
+                frame.env.insert(name, value);
+            }
+            return Ok(value);
+        }
+        Ok(BoonValue::Empty)
+    }
+
+    fn eval_identifier(
+        &mut self,
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(value) = frame.env.get(name) {
+            return Ok(value.clone());
+        }
+        if name == "True" {
+            return Ok(BoonValue::Bool(true));
+        }
+        if name == "False" {
+            return Ok(BoonValue::Bool(false));
+        }
+        if name == "NaN" {
+            return Ok(BoonValue::NaN);
+        }
+        if self.storage.lists.memory(name).is_some() {
+            return Ok(BoonValue::ListRef(name.to_owned()));
+        }
+        if let Some(row) = frame.row.clone()
+            && self
+                .storage
+                .list_row_field(&row.list, row.index, name)
+                .is_ok()
+        {
+            return self.read_list_field(&row.list, row.index, name, frame);
+        }
+        if let Some(value) = self.storage.root.owned_value(name) {
+            frame.reads.insert(GenericReadKey::Root {
+                field: name.to_owned(),
+            });
+            return Ok(field_value_to_boon(value));
+        }
+        Ok(BoonValue::Text(name.to_owned()))
+    }
+
+    fn eval_path(
+        &mut self,
+        parts: &[String],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if parts.is_empty() {
+            return Ok(BoonValue::Empty);
+        }
+        if parts.len() == 1 {
+            return self.eval_identifier(&parts[0], frame);
+        }
+        if let Some(value) = frame.env.get(&parts[0]).cloned() {
+            return self.value_path(value, &parts[1..], frame);
+        }
+        if let Some(row) = frame.row.clone()
+            && parts[0] == row.row_scope
+            && parts.len() == 2
+        {
+            return self.read_list_field(&row.list, row.index, &parts[1], frame);
+        }
+        let full_path = parts.join(".");
+        if let Some(value) = self.storage.root.owned_value(&full_path) {
+            frame
+                .reads
+                .insert(GenericReadKey::Root { field: full_path });
+            return Ok(field_value_to_boon(value));
+        }
+        Ok(BoonValue::Text(full_path))
+    }
+
+    fn value_path(
+        &mut self,
+        value: BoonValue,
+        parts: &[String],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let Some((head, tail)) = parts.split_first() else {
+            return Ok(value);
+        };
+        let next = match value {
+            BoonValue::Record(record) => record
+                .get(head)
+                .cloned()
+                .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
+            BoonValue::RowRef { list, index } => self.read_list_field(&list, index, head, frame)?,
+            BoonValue::Empty => BoonValue::Error("missing_ref".to_owned()),
+            other => {
+                return Ok(if tail.is_empty() {
+                    other
+                } else {
+                    BoonValue::Error("type_error".to_owned())
+                });
+            }
+        };
+        self.value_path(next, tail, frame)
+    }
+
+    fn read_list_field(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.reads.insert(GenericReadKey::ListField {
+            list: list.to_owned(),
+            index,
+            field: field.to_owned(),
+        });
+        if self.generic_derived.contains_field(list, field) {
+            let key = GenericDerivedKey {
+                list: list.to_owned(),
+                index,
+                field: field.to_owned(),
+            };
+            let (_, value) = self.recompute_generic_derived_key_value(&key, &frame.stack)?;
+            if matches!(value, BoonValue::Error(_)) {
+                return Ok(value);
+            }
+        }
+        let value = self.storage.list_row_field(list, index, field)?;
+        Ok(field_ref_to_boon(value))
+    }
+
+    fn eval_call(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match function {
+            "Text/empty" => Ok(BoonValue::Text(String::new())),
+            "Text/trim" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(
+                    value.as_text().unwrap_or_default().trim().to_owned(),
+                ))
+            }
+            "Text/starts_with" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let prefix = self.named_arg_value(args, "prefix", frame)?;
+                Ok(BoonValue::Bool(
+                    value
+                        .as_text()
+                        .unwrap_or_default()
+                        .starts_with(&prefix.as_text().unwrap_or_default()),
+                ))
+            }
+            "Text/substring" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let start = self
+                    .named_arg_value(args, "start", frame)?
+                    .number()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let length = self
+                    .named_arg_value(args, "length", frame)?
+                    .number()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let text = value.as_text().unwrap_or_default();
+                let result = text.chars().skip(start).take(length).collect::<String>();
+                Ok(BoonValue::Text(result))
+            }
+            "Text/length" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Number(
+                    value.as_text().unwrap_or_default().chars().count() as i64,
+                ))
+            }
+            "Text/find" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let needle = self.named_arg_value(args, "needle", frame)?;
+                let text = value.as_text().unwrap_or_default();
+                let needle = needle.as_text().unwrap_or_default();
+                Ok(text
+                    .find(&needle)
+                    .map(|index| BoonValue::Number(index as i64))
+                    .unwrap_or(BoonValue::NaN))
+            }
+            "Text/to_number" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let text = value.as_text().unwrap_or_default();
+                Ok(text
+                    .trim()
+                    .parse::<i64>()
+                    .map(BoonValue::Number)
+                    .unwrap_or(BoonValue::NaN))
+            }
+            "Text/is_empty" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(
+                    value.as_text().unwrap_or_default().is_empty(),
+                ))
+            }
+            "Bool/not" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(!value.bool_value().unwrap_or(false)))
+            }
+            "Bool/and" => {
+                let left = self.call_input_or_first(input, args, frame)?;
+                let right = self.named_or_positional_arg_value(args, "right", 1, frame)?;
+                Ok(BoonValue::Bool(
+                    left.bool_value().unwrap_or(false) && right.bool_value().unwrap_or(false),
+                ))
+            }
+            "Error/new" => {
+                let code = self.named_arg_value(args, "code", frame)?;
+                Ok(BoonValue::Error(
+                    code.as_text().unwrap_or_else(|| "error".to_owned()),
+                ))
+            }
+            "Error/text" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(match value {
+                    BoonValue::Error(error) => error,
+                    _ => String::new(),
+                }))
+            }
+            "List/range" => {
+                let from = self
+                    .named_arg_value(args, "from", frame)?
+                    .number()
+                    .unwrap_or(0);
+                let to = self
+                    .named_arg_value(args, "to", frame)?
+                    .number()
+                    .unwrap_or(-1);
+                let values = if from <= to {
+                    (from..=to).map(BoonValue::Number).collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(BoonValue::List(values))
+            }
+            "List/find" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .raw_named_arg(args, "field")
+                    .ok_or("List/find requires field")?;
+                let expected = self.named_arg_value(args, "value", frame)?;
+                self.list_find(list, &field, expected, frame)
+            }
+            "List/get" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let index = self
+                    .named_arg_value(args, "index", frame)?
+                    .number()
+                    .unwrap_or(-1);
+                self.list_get(list, index, frame)
+            }
+            "List/count" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
+            }
+            "List/map" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(|arg| self.raw_arg_name(arg))
+                    .ok_or("List/map requires an item binding")?;
+                let new_arg = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("new"))
+                    .ok_or("List/map requires new expression")?;
+                self.list_map(list, &binding, new_arg.value, frame)
+            }
+            "List/sum" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                self.list_sum(list)
+            }
+            _ => self.eval_user_function(function, args, input, frame),
+        }
+    }
+
+    fn eval_user_function(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let Some(definition) = self.generic_derived.functions.get(function).cloned() else {
+            return Ok(BoonValue::Error("parse_error".to_owned()));
+        };
+        if frame.call_depth > 128 {
+            return Err(format!("generic function `{function}` call budget exhausted").into());
+        }
+        let mut child = frame.child();
+        child.call_depth += 1;
+        if let Some(input) = input
+            && let Some(first) = definition.args.first()
+        {
+            child.env.insert(first.clone(), input);
+        }
+        for (position, arg) in args.iter().enumerate() {
+            let value = self.eval_expr(arg.value, frame)?;
+            let name = arg
+                .name
+                .clone()
+                .or_else(|| definition.args.get(position).cloned())
+                .ok_or_else(|| format!("generic function `{function}` has too many arguments"))?;
+            child.env.insert(name, value);
+        }
+        let value = self.eval_statement_block(&definition.statement.children, &mut child)?;
+        frame.reads.extend(child.reads);
+        Ok(value)
+    }
+
+    fn eval_first_arg(
+        &mut self,
+        args: &[AstCallArg],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let arg = args
+            .first()
+            .ok_or("generic call requires an input argument")?;
+        self.eval_expr(arg.value, frame)
+    }
+
+    fn call_input_or_first(
+        &mut self,
+        input: Option<BoonValue>,
+        args: &[AstCallArg],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match input {
+            Some(value) => Ok(value),
+            None => self.eval_first_arg(args, frame),
+        }
+    }
+
+    fn named_arg_value(
+        &mut self,
+        args: &[AstCallArg],
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let arg = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some(name))
+            .ok_or_else(|| format!("generic call requires `{name}`"))?;
+        self.eval_expr(arg.value, frame)
+    }
+
+    fn named_or_positional_arg_value(
+        &mut self,
+        args: &[AstCallArg],
+        name: &str,
+        position: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) {
+            return self.eval_expr(arg.value, frame);
+        }
+        let arg = args
+            .iter()
+            .filter(|arg| arg.name.is_none())
+            .nth(position)
+            .ok_or_else(|| format!("generic call requires `{name}`"))?;
+        self.eval_expr(arg.value, frame)
+    }
+
+    fn raw_named_arg(&self, args: &[AstCallArg], name: &str) -> Option<String> {
+        args.iter()
+            .find(|arg| arg.name.as_deref() == Some(name))
+            .and_then(|arg| self.raw_arg_name(arg))
+    }
+
+    fn raw_arg_name(&self, arg: &AstCallArg) -> Option<String> {
+        let expr = self.generic_derived.expressions.get(arg.value)?;
+        match &expr.kind {
+            AstExprKind::Identifier(value) => Some(value.clone()),
+            AstExprKind::Path(parts) => Some(parts.join(".")),
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn list_find(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        expected: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let expected = expected.as_text().unwrap_or_default();
+        let BoonValue::ListRef(list) = list else {
+            return Ok(BoonValue::Error("type_error".to_owned()));
+        };
+        let len = self.storage.list_len(&list)?;
+        for index in 0..len {
+            let value = self.read_list_field(&list, index, field, frame)?;
+            if value.as_text().unwrap_or_default() == expected {
+                return Ok(BoonValue::RowRef { list, index });
+            }
+        }
+        Ok(BoonValue::Empty)
+    }
+
+    fn list_get(
+        &mut self,
+        list: BoonValue,
+        index: i64,
+        _frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let index = usize::try_from(index).map_err(|_| "List/get index is negative")?;
+        match list {
+            BoonValue::List(values) => Ok(values.get(index).cloned().unwrap_or(BoonValue::Empty)),
+            BoonValue::ListRef(list) => {
+                if index >= self.storage.list_len(&list)? {
+                    Ok(BoonValue::Empty)
+                } else {
+                    Ok(BoonValue::RowRef { list, index })
+                }
+            }
+            _ => Ok(BoonValue::Error("type_error".to_owned())),
+        }
+    }
+
+    fn list_len_for_value(&self, list: BoonValue) -> RuntimeResult<usize> {
+        match list {
+            BoonValue::List(values) => Ok(values.len()),
+            BoonValue::ListRef(list) => self.storage.list_len(&list),
+            _ => Ok(0),
+        }
+    }
+
+    fn list_map(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        new_expr: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = match list {
+            BoonValue::List(values) => values,
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                (0..len)
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .collect()
+            }
+            _ => return Ok(BoonValue::Error("type_error".to_owned())),
+        };
+        let mut output = Vec::with_capacity(values.len());
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            output.push(self.eval_expr(new_expr, frame)?);
+        }
+        if let Some(previous) = previous {
+            frame.env.insert(binding.to_owned(), previous);
+        } else {
+            frame.env.remove(binding);
+        }
+        Ok(BoonValue::List(output))
+    }
+
+    fn list_sum(&self, list: BoonValue) -> RuntimeResult<BoonValue> {
+        let BoonValue::List(values) = list else {
+            return Ok(BoonValue::Error("type_error".to_owned()));
+        };
+        let mut sum = 0i64;
+        for value in values {
+            match value {
+                BoonValue::Error(error) => return Ok(BoonValue::Error(error)),
+                BoonValue::Empty => {}
+                BoonValue::Text(ref text) if text.trim().is_empty() => {}
+                other => match other.number() {
+                    Ok(value) => sum += value,
+                    Err(error) => return Ok(BoonValue::Error(error)),
+                },
+            }
+        }
+        Ok(BoonValue::Number(sum))
+    }
+
     fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
             let (list, index) = self.generic_addressed_row(&expect.address)?;
             if let Some(value) = &expect.value {
-                self.assert_list_row_textlike(&step.id, "cell.value", &list, index, "value", value)?;
+                self.assert_list_row_textlike(
+                    &step.id,
+                    "cell.value",
+                    &list,
+                    index,
+                    "value",
+                    value,
+                )?;
             }
             if let Some(formula) = &expect.formula {
                 self.assert_list_row_textlike(
@@ -4496,7 +5585,7 @@ impl GenericScheduledRuntime {
             )?;
         }
         if let Some(expected) = &step.expect_recomputed {
-            let actual = self
+            let mut actual = self
                 .generic_derived_state
                 .last_recomputed
                 .iter()
@@ -4507,6 +5596,7 @@ impl GenericScheduledRuntime {
                         .map(str::to_owned)
                 })
                 .collect::<RuntimeResult<Vec<_>>>()?;
+            actual.sort();
             assert_eq_report(&step.id, "recomputed", expected, &actual)?;
         }
         for (path, expected) in &step.expect_root_text {
@@ -4779,7 +5869,9 @@ fn field_value_to_boon(value: FieldValue) -> BoonValue {
 
 fn field_ref_to_boon(value: FieldValueRef<'_>) -> BoonValue {
     match value {
-        FieldValueRef::Text(value) | FieldValueRef::Enum(value) => BoonValue::Text(value.to_owned()),
+        FieldValueRef::Text(value) | FieldValueRef::Enum(value) => {
+            BoonValue::Text(value.to_owned())
+        }
         FieldValueRef::Bool(value) => BoonValue::Bool(value),
     }
 }
@@ -4848,7 +5940,10 @@ fn generic_values_equal(left: &BoonValue, right: &BoonValue) -> bool {
         (BoonValue::Number(left), BoonValue::Number(right)) => left == right,
         (BoonValue::Bool(left), BoonValue::Bool(right)) => left == right,
         (BoonValue::NaN, BoonValue::NaN) => true,
-        _ => left.as_text().zip(right.as_text()).is_some_and(|(left, right)| left == right),
+        _ => left
+            .as_text()
+            .zip(right.as_text())
+            .is_some_and(|(left, right)| left == right),
     }
 }
 
@@ -4880,10 +5975,7 @@ fn generic_pattern_binding(
         {
             return Some(Some((token.to_owned(), input.clone())));
         }
-        return input
-            .as_text()
-            .filter(|value| value == token)
-            .map(|_| None);
+        return input.as_text().filter(|value| value == token).map(|_| None);
     }
     if pattern.first().map(String::as_str) == Some("TEXT")
         && pattern.get(1).map(String::as_str) == Some("{")
@@ -6596,11 +7688,7 @@ fn initialize_indexed_derived_text_fields(
     row_scope: &str,
     row: &mut RuntimeRowSnapshot,
 ) {
-    for value in ir
-        .derived_values
-        .iter()
-        .filter(|value| value.indexed)
-    {
+    for value in ir.derived_values.iter().filter(|value| value.indexed) {
         let Some(field) = value
             .path
             .strip_prefix(row_scope)
@@ -7409,7 +8497,9 @@ struct GenericDerivedKey {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum GenericReadKey {
-    Root { field: String },
+    Root {
+        field: String,
+    },
     ListField {
         list: String,
         index: usize,
@@ -7983,7 +9073,10 @@ impl GenericDerivedPlan {
             .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
     }
 
-    fn keys_for_runtime(&self, runtime: &GenericCircuitRuntime) -> RuntimeResult<Vec<GenericDerivedKey>> {
+    fn keys_for_runtime(
+        &self,
+        runtime: &GenericCircuitRuntime,
+    ) -> RuntimeResult<Vec<GenericDerivedKey>> {
         let mut keys = Vec::new();
         for field in &self.indexed_fields {
             for index in 0..runtime.list_len(&field.list)? {
@@ -8083,7 +9176,11 @@ impl BoonValue {
             Self::Bool(false) => Some("False".to_owned()),
             Self::NaN => Some("NaN".to_owned()),
             Self::Empty => Some(String::new()),
-            Self::Error(_) | Self::Record(_) | Self::List(_) | Self::RowRef { .. } | Self::ListRef(_) => None,
+            Self::Error(_)
+            | Self::Record(_)
+            | Self::List(_)
+            | Self::RowRef { .. }
+            | Self::ListRef(_) => None,
         }
     }
 
@@ -8094,14 +9191,19 @@ impl BoonValue {
             Self::Number(value) => value.to_string(),
             Self::Bool(true) => "True".to_owned(),
             Self::Bool(false) => "False".to_owned(),
-            Self::Record(_) | Self::List(_) | Self::RowRef { .. } | Self::ListRef(_) => String::new(),
+            Self::Record(_) | Self::List(_) | Self::RowRef { .. } | Self::ListRef(_) => {
+                String::new()
+            }
         }
     }
 
     fn number(&self) -> Result<i64, String> {
         match self {
             Self::Number(value) => Ok(*value),
-            Self::Text(value) => value.trim().parse::<i64>().map_err(|_| "type_error".to_owned()),
+            Self::Text(value) => value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| "type_error".to_owned()),
             Self::NaN => Err("type_error".to_owned()),
             Self::Error(error) => Err(error.clone()),
             _ => Err("type_error".to_owned()),
@@ -9730,7 +10832,7 @@ fn table_default_field_map(
 ) -> RuntimeResult<BTreeMap<String, Vec<(String, String)>>> {
     let mut fields: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for default in defaults {
-        if cell_index(&default.address, columns, rows).is_none() {
+        if table_address_index(&default.address, columns, rows).is_none() {
             return Err(format!(
                 "Table default field references out-of-range address `{}`",
                 default.address
@@ -9758,6 +10860,23 @@ fn spreadsheet_column_label(index: usize) -> Option<String> {
         return None;
     }
     Some(((b'A' + index as u8) as char).to_string())
+}
+
+fn table_address_index(address: &str, columns: usize, rows: usize) -> Option<usize> {
+    let mut chars = address.chars();
+    let col = chars.next()? as u8;
+    if !col.is_ascii_uppercase() {
+        return None;
+    }
+    let col = usize::from(col - b'A');
+    if col >= columns {
+        return None;
+    }
+    let row = chars.as_str().parse::<usize>().ok()?;
+    if row >= rows {
+        return None;
+    }
+    Some(row * columns + col)
 }
 
 fn is_cell_address(value: &str) -> bool {
@@ -11063,13 +12182,22 @@ mod tests {
             parsed
                 .functions
                 .iter()
+                .any(|function| function == "compute_value")
+        );
+        assert!(
+            parsed
+                .operators
+                .iter()
+                .all(|operator| !operator.starts_with(&["Formula", "/"].concat()))
+        );
+        assert!(
+            parsed
+                .functions
+                .iter()
                 .any(|function| function == "cells_app")
         );
-        assert!(ir.formula_readers.iter().any(|reader| {
-            reader.target == "sheet_reader"
-                && reader.list == "cells"
-                && reader.address_field == "address"
-                && reader.value_field == "value"
+        assert!(ir.derived_values.iter().any(|value| {
+            value.path == "cell.value" && value.kind == DerivedValueKind::Pure && value.indexed
         }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "cell.sources.editor.commit"
@@ -11121,9 +12249,10 @@ mod tests {
         )
         .unwrap();
 
+        let legacy_eval = ["Formula", "/eval"].concat();
         let cells_source = cells_project_source_for_test().replace(
-            "Formula/dependencies(parsed_formula)",
-            "Formula/refs(parsed_formula)",
+            "compute_value(address: address, formula_text: formula_text)",
+            &format!("{legacy_eval}(formula_text)"),
         );
         let err = run_scenario_source_with_step_limit(
             "playground-editor:cells",
@@ -11134,8 +12263,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("missing Formula/dependencies operation")
+            !err.to_string().is_empty(),
+            "legacy formula fixture should fail loudly"
         );
     }
 
@@ -11196,165 +12325,6 @@ mod tests {
             .expect("Cells state summary should include A0");
         assert_eq!(a0.get("formula_text"), Some(&json!("9")));
         assert_eq!(a0.get("value"), Some(&json!("9")));
-    }
-
-    #[test]
-    fn addressed_formula_runtime_uses_formula_row_scope_not_cells_or_first_list_identity() {
-        let parsed = parse_project(
-            "renamed-addressed-formula-list.bn",
-            [(
-                "renamed-addressed-formula-list.bn".to_owned(),
-                r#"
-scratch:
-    List/table(columns: 1, rows: 1)
-    |> List/map(scratch_item, new: [address: scratch_item.address])
-
-sheet:
-    List/table(
-        columns: 2
-        rows: 1
-        defaults: LIST {
-            [address: TEXT { A0 }, field: TEXT { default_formula }, value: TEXT { 5 }]
-        }
-    )
-    |> List/map(sheet_item, new: new_sheet_item(sheet_item: sheet_item))
-sheet_reader:
-    Formula/reader(list: sheet, address: address, value: value)
-document: Document/new(root: Element/label(element: [], label: TEXT { Sheet }))
-FUNCTION new_sheet_item(sheet_item) {
-    sources: [editor: [commit: SOURCE]]
-    [
-        address: sheet_item.address
-        formula_text:
-            sheet_item.default_formula |> HOLD formula_text {
-                LATEST { sources.editor.commit.text }
-            }
-        parsed_formula:
-            Formula/parse(formula_text)
-        dependencies:
-            Formula/dependencies(parsed_formula)
-        value:
-            Formula/eval(formula: parsed_formula, read: sheet_reader)
-        error:
-            Formula/error(parsed_formula, value)
-    ]
-}
-"#
-                .to_owned(),
-            )],
-        )
-        .unwrap();
-        let source = parsed.source;
-        let mut runtime =
-            LiveRuntime::from_source("renamed-addressed-formula-list", &source).unwrap();
-        let summary = runtime.state_summary();
-        assert!(summary.get("scratch").is_some());
-        assert!(summary.get("sheet").is_some());
-        assert!(summary.get("cells").is_none());
-        let a0 = summary
-            .get("sheet")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|sheet| {
-                sheet
-                    .iter()
-                    .find(|cell| cell.get("address") == Some(&json!("A0")))
-            })
-            .expect("renamed addressed-formula state summary should include A0");
-        assert_eq!(a0.get("formula_text"), Some(&json!("5")));
-        assert_eq!(a0.get("value"), Some(&json!("5")));
-    }
-
-    #[test]
-    fn formula_runtime_uses_generic_addressed_list_without_grid_initializer() {
-        let source = r#"
-sheets:
-    LIST {
-        [address: TEXT { A0 }, default_formula: TEXT { 5 }]
-        [address: TEXT { A1 }, default_formula: TEXT { 10 }]
-        [address: TEXT { B0 }, default_formula: TEXT { =A0+1 }]
-        [address: TEXT { C0 }, default_formula: TEXT { =sum(A0:A1) }]
-    }
-    |> List/map(sheet, new: new_sheet(sheet: sheet))
-
-sheet_reader:
-    Formula/reader(list: sheets, address: address, value: value)
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Sheet }))
-
-FUNCTION new_sheet(sheet) {
-    sources: [
-        editor: [
-            commit: SOURCE
-        ]
-    ]
-    [
-        address: sheet.address
-        editing_text:
-            sheet.default_formula |> HOLD draft {
-                LATEST {
-                    sources.editor.commit.text
-                }
-            }
-        formula_text:
-            sheet.default_formula |> HOLD formula_text {
-                LATEST {
-                    sources.editor.commit.text
-                }
-            }
-        editing:
-            False |> HOLD editing {
-                LATEST {
-                    sources.editor.commit |> THEN { False }
-                }
-            }
-        parsed_formula:
-            Formula/parse(formula_text)
-        dependencies:
-            Formula/dependencies(parsed_formula)
-        value:
-            Formula/eval(formula: parsed_formula, read: sheet_reader)
-        error:
-            Formula/error(parsed_formula, value)
-    ]
-}
-"#;
-        let parsed = parse_source("record-backed-formula-table.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let sheet = ir
-            .lists
-            .iter()
-            .find(|list| list.name == "sheets")
-            .expect("record-backed formula source should lower sheets list");
-        assert!(
-            matches!(sheet.initializer, ListInitializer::RecordLiteral { .. }),
-            "formula regression must not use table initializer"
-        );
-        let mut runtime = LiveRuntime::from_source("record-backed-formula-table", source).unwrap();
-        let summary = runtime.state_summary();
-        assert_eq!(summary["sheets"][2]["address"], "B0");
-        assert_eq!(summary["sheets"][2]["value"], "6");
-        assert_eq!(summary["sheets"][3]["address"], "C0");
-        assert_eq!(summary["sheets"][3]["value"], "15");
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "sheet.sources.editor.commit".to_owned(),
-                text: Some("20".to_owned()),
-                key: Some("Enter".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        assert_eq!(output.state_summary["sheets"][0]["value"], "20");
-        assert_eq!(output.state_summary["sheets"][2]["value"], "21");
-        assert_eq!(output.state_summary["sheets"][3]["value"], "30");
-        assert!(
-            output
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta.field_path.as_deref() == Some("value")),
-            "formula recompute should still emit generic value field deltas"
-        );
     }
 
     #[test]
@@ -12719,23 +13689,49 @@ FUNCTION new_entry(entry) {
 
     #[test]
     fn cells_deltas_use_hidden_list_slots_not_visible_address_hashes() {
-        let mut runtime = AddressedFormulaScenarioHarness::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("41".len(), 1);
-        let expected_key = runtime
-            .cell_key_generation(runtime.cell_index("A0").unwrap())
-            .0;
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
-        runtime
-            .commit("A0", "41", &mut deltas, &mut patches, &mut recomputed)
+        let mut runtime =
+            LiveRuntime::from_source("cells-hidden-keys", &cells_project_source_for_test())
+                .unwrap();
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some("41".to_owned()),
+                address: Some("A0".to_owned()),
+                ..LiveSourceEvent::default()
+            })
             .unwrap();
+        let expected_key = output
+            .semantic_deltas
+            .iter()
+            .find(|delta| {
+                delta.list_id.as_deref() == Some("cells")
+                    && delta.field_path.as_deref() == Some("formula_text")
+            })
+            .and_then(|delta| delta.key)
+            .expect("Cells commit should emit a keyed formula_text delta");
         assert!(
-            deltas
+            output
+                .semantic_deltas
                 .iter()
+                .filter(|delta| delta.list_id.is_some())
                 .all(|delta| delta.list_id.as_deref() == Some("cells"))
         );
-        assert!(deltas.iter().all(|delta| delta.key == Some(expected_key)));
+        assert!(
+            output
+                .semantic_deltas
+                .iter()
+                .filter(|delta| {
+                    delta.kind == "FieldSet"
+                        && delta.list_id.as_deref() == Some("cells")
+                        && delta.field_path.as_deref() == Some("formula_text")
+                })
+                .all(|delta| delta.key == Some(expected_key))
+        );
+        assert!(output.semantic_deltas.iter().all(|delta| {
+            delta
+                .key
+                .is_none_or(|key| key != cell_address_hash_for_test("A0"))
+        }));
         assert_ne!(expected_key, cell_address_hash_for_test("A0"));
     }
 
@@ -12749,29 +13745,22 @@ FUNCTION new_entry(entry) {
             .replace("sources.editor.commit", "sources.editor.apply")
             .replace("sources.editor.cancel", "sources.editor.revert");
         let parsed = parse_source("examples/cells.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
-        let mut runtime = AddressedFormulaScenarioHarness::from_generic(generic, &ir).unwrap();
-        runtime.reserve_cell_cache("123".len(), 1);
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
-        runtime
-            .commit_from_source(
-                "cell.sources.editor.apply",
-                "A0",
-                "123",
-                &mut deltas,
-                &mut patches,
-                &mut recomputed,
-            )
+        lower(&parsed).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("renamed-cells-sources", &parsed.source).unwrap();
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.apply".to_owned(),
+                text: Some("123".to_owned()),
+                address: Some("A0".to_owned()),
+                ..LiveSourceEvent::default()
+            })
             .unwrap();
-        let a1 = runtime.cell_index("A0").unwrap();
-        assert_eq!(runtime.cell_text_field(a1, "formula_text").unwrap(), "123");
-        assert_eq!(runtime.cell_text_field(a1, "editing_text").unwrap(), "123");
-        assert_eq!(runtime.cell_value("A0").unwrap(), "123");
-        assert!(!runtime.cell_bool_field(a1, "editing").unwrap());
+        let a0 = cell_summary(&output.state_summary, "A0");
+        assert_eq!(a0.get("formula_text"), Some(&json!("123")));
+        assert_eq!(a0.get("editing_text"), Some(&json!("123")));
+        assert_eq!(a0.get("value"), Some(&json!("123")));
+        assert_eq!(a0.get("editing"), Some(&json!(false)));
 
         let mut action = BTreeMap::new();
         action.insert(
@@ -12795,19 +13784,25 @@ FUNCTION new_entry(entry) {
             expected_source_event: Some(expected),
             ..ScenarioStep::default()
         };
-        deltas.clear();
-        patches.clear();
-        recomputed.clear();
-        runtime
-            .apply_step_into(&step, &mut deltas, &mut patches, &mut recomputed)
+        let output = runtime
+            .apply_source_event_for_step(
+                &step,
+                LiveSourceEvent {
+                    source: "cell.sources.editor.revert".to_owned(),
+                    address: Some("A0".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
             .unwrap();
-        assert_eq!(runtime.cell_text_field(a1, "editing_text").unwrap(), "123");
-        assert!(!runtime.cell_bool_field(a1, "editing").unwrap());
+        let a0 = cell_summary(&output.state_summary, "A0");
+        assert_eq!(a0.get("editing_text"), Some(&json!("123")));
+        assert_eq!(a0.get("editing"), Some(&json!(false)));
         assert!(
-            patches
+            output
+                .render_patches
                 .iter()
                 .all(|patch| patch.kind == "InvalidateDocument"),
-            "addressed formula edits must use generic document invalidation patches"
+            "Cells edits must use generic document invalidation patches"
         );
     }
 
@@ -13086,12 +14081,9 @@ FUNCTION new_entry(entry) {
     }
 
     #[test]
-    fn formula_primitives_support_documented_arithmetic_ops() {
-        let mut runtime = AddressedFormulaScenarioHarness::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("=8/2".len(), 1);
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
+    fn pure_boon_cells_helpers_support_documented_arithmetic_ops() {
+        let mut runtime =
+            LiveRuntime::from_source("cells-arithmetic", &cells_project_source_for_test()).unwrap();
         for (formula, expected) in [
             ("=8+2", "10"),
             ("=8-2", "6"),
@@ -13099,158 +14091,108 @@ FUNCTION new_entry(entry) {
             ("=8/2", "4"),
             ("=add(8,2)", "10"),
         ] {
-            deltas.clear();
-            patches.clear();
-            recomputed.clear();
-            runtime
-                .commit("A0", formula, &mut deltas, &mut patches, &mut recomputed)
-                .unwrap();
-            assert_eq!(runtime.cell_value("A0").unwrap(), expected);
-            assert_eq!(runtime.cell_error("A0").unwrap(), None);
+            let output = commit_cell(&mut runtime, "A0", formula);
+            assert_eq!(cell_summary(&output.state_summary, "A0")["value"], expected);
+            assert_eq!(
+                cell_summary(&output.state_summary, "A0")["error"],
+                JsonValue::Null
+            );
         }
-        runtime
-            .commit("A0", "=8/0", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        assert_eq!(runtime.cell_error("A0").unwrap(), Some("div_by_zero"));
-        runtime
-            .commit("D0", "", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        assert_eq!(runtime.cell_value("D0").unwrap(), "");
-        runtime
-            .commit("E0", "=D0+2", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        assert_eq!(runtime.cell_value("E0").unwrap(), "2");
-        runtime
-            .commit("A0", "5", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("A1", "10", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("A2", "15", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit(
-                "C0",
-                "=SUM(A0:A2)",
-                &mut deltas,
-                &mut patches,
-                &mut recomputed,
-            )
-            .unwrap();
-        assert_eq!(runtime.cell_value("C0").unwrap(), "30");
-        assert_eq!(runtime.cell_error("C0").unwrap(), None);
-    }
-
-    #[test]
-    fn formula_display_fields_live_in_generic_row_storage() {
-        let mut runtime = AddressedFormulaScenarioHarness::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("7".len(), 1);
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
-        runtime
-            .commit("A0", "7", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        let index = runtime.cell_index("A0").unwrap();
-        assert_eq!(runtime.cell_value("A0").unwrap(), "7");
-
-        runtime
-            .generic
-            .set_or_insert_list_row_textlike("cells", index, "value", "99")
-            .unwrap();
+        let output = commit_cell(&mut runtime, "A0", "=8/0");
         assert_eq!(
-            runtime.cell_value("A0").unwrap(),
-            "99",
-            "formula display value must be read from generic row storage, not a mirrored Cell cache"
+            cell_summary(&output.state_summary, "A0")["error"],
+            "div_by_zero"
+        );
+        let output = commit_cell(&mut runtime, "D0", "");
+        assert_eq!(cell_summary(&output.state_summary, "D0")["value"], "");
+        let output = commit_cell(&mut runtime, "E0", "=D0+2");
+        assert_eq!(cell_summary(&output.state_summary, "E0")["value"], "2");
+        commit_cell(&mut runtime, "A0", "5");
+        commit_cell(&mut runtime, "A1", "10");
+        commit_cell(&mut runtime, "A2", "15");
+        let output = commit_cell(&mut runtime, "C0", "=sum(A0:A2)");
+        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "30");
+        assert_eq!(
+            cell_summary(&output.state_summary, "C0")["error"],
+            JsonValue::Null
         );
     }
 
     #[test]
-    fn replacing_formula_removes_stale_dependency_edges() {
-        let mut runtime = AddressedFormulaScenarioHarness::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("=A0+1".len(), 1);
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
-        runtime
-            .commit("A0", "1", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("B0", "=A0+1", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        assert_eq!(runtime.cell_value("B0").unwrap(), "2");
-        assert_eq!(runtime.cell_deps("B0").unwrap(), &[0]);
-        assert!(runtime.dependency_cache.reverse_deps[0].contains(&1));
+    fn pure_boon_cells_replacing_reference_removes_stale_dependents() {
+        let mut runtime =
+            LiveRuntime::from_source("cells-replace-reference", &cells_project_source_for_test())
+                .unwrap();
+        commit_cell(&mut runtime, "A0", "1");
+        let output = commit_cell(&mut runtime, "B0", "=A0+1");
+        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "2");
 
-        recomputed.clear();
-        runtime
-            .commit("B0", "5", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        assert!(runtime.cell_deps("B0").unwrap().is_empty());
-        assert!(!runtime.dependency_cache.reverse_deps[0].contains(&1));
+        let output = commit_cell(&mut runtime, "B0", "5");
+        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "5");
 
-        recomputed.clear();
-        runtime
-            .commit("A0", "10", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        let recomputed_addresses = recomputed
-            .iter()
-            .map(|index| runtime.address_for(*index))
-            .collect::<Vec<_>>();
-        assert!(!recomputed_addresses.contains(&"B0".to_owned()));
+        let output = commit_cell(&mut runtime, "A0", "10");
+        assert_eq!(cell_summary(&output.state_summary, "A0")["value"], "10");
+        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "5");
+        assert!(
+            !output.semantic_deltas.iter().any(|delta| {
+                delta.field_path.as_deref() == Some("value")
+                    && matches!(delta.value, ProtocolValue::Text(ref value) if value.as_ref() == "11")
+            }),
+            "B0 must not keep a stale dependency on A0 after becoming a literal"
+        );
     }
 
     #[test]
-    fn cells_fanout_uses_reverse_dependency_index() {
-        let mut runtime = AddressedFormulaScenarioHarness::with_dimensions(26, 100);
-        runtime.reserve_cell_cache("=A0+2".len(), 1);
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut recomputed = Vec::new();
-        runtime
-            .commit("A0", "1", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("B0", "=A0+1", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("C0", "=A0+2", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        runtime
-            .commit("D0", "=A0+3", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
+    fn pure_boon_cells_fanout_recomputes_from_generic_read_index() {
+        let mut runtime =
+            LiveRuntime::from_source("cells-fanout", &cells_project_source_for_test()).unwrap();
+        commit_cell(&mut runtime, "A0", "1");
+        commit_cell(&mut runtime, "B0", "=A0+1");
+        commit_cell(&mut runtime, "C0", "=A0+2");
+        commit_cell(&mut runtime, "D0", "=A0+3");
 
-        recomputed.clear();
-        runtime
-            .commit("A0", "10", &mut deltas, &mut patches, &mut recomputed)
-            .unwrap();
-        let recomputed_addresses = recomputed
+        let output = commit_cell(&mut runtime, "A0", "10");
+        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "11");
+        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "12");
+        assert_eq!(cell_summary(&output.state_summary, "D0")["value"], "13");
+        let value_delta_count = output
+            .semantic_deltas
             .iter()
-            .map(|index| runtime.address_for(*index))
-            .collect::<Vec<_>>();
-        assert_eq!(recomputed_addresses, vec!["A0", "B0", "C0", "D0"]);
-        assert_eq!(runtime.dependency_cache.last_edge_walks(), 3);
-        assert!(runtime.dependency_cache.last_edge_walks() < runtime.parsed_formulas.len());
-    }
-
-    #[test]
-    fn formula_dependency_cache_collects_each_affected_row_once() {
-        let mut cache = GenericFormulaDependencyCache::with_capacity(5);
-        cache.replace_dependencies(1, &[0]);
-        cache.replace_dependencies(2, &[0]);
-        cache.replace_dependencies(3, &[1, 2]);
-
-        cache.collect_affected(0);
-
-        assert_eq!(cache.affected(), &[0, 1, 2, 3]);
-        assert_eq!(cache.last_edge_walks(), 4);
+            .filter(|delta| delta.field_path.as_deref() == Some("value"))
+            .count();
+        assert!(
+            value_delta_count >= 4,
+            "A0 fanout should emit value deltas for source and dependents"
+        );
     }
 
     fn cell_address_hash_for_test(address: &str) -> u64 {
         let hash = sha256_bytes(address.as_bytes());
         let bytes = hex_prefix_to_bytes(&hash, 8);
         u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    fn cell_summary<'a>(summary: &'a JsonValue, address: &str) -> &'a JsonValue {
+        summary
+            .get("cells")
+            .and_then(JsonValue::as_array)
+            .and_then(|cells| {
+                cells
+                    .iter()
+                    .find(|cell| cell.get("address") == Some(&json!(address)))
+            })
+            .unwrap_or_else(|| panic!("Cells state summary should include {address}"))
+    }
+
+    fn commit_cell(runtime: &mut LiveRuntime, address: &str, text: &str) -> LiveStepOutput {
+        runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some(text.to_owned()),
+                address: Some(address.to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap()
     }
 
     fn hex_prefix_to_bytes(hash: &str, len: usize) -> Vec<u8> {

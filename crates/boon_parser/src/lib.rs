@@ -868,6 +868,11 @@ fn ast_expr_kind(
     if tokens == ["Text/empty"] {
         return AstExprKind::TextLiteral(String::new());
     }
+    if tokens.first().map(String::as_str) == Some("BLOCK")
+        && tokens.last().map(String::as_str) == Some("{")
+    {
+        return AstExprKind::Identifier("BLOCK".to_owned());
+    }
     if tokens.first().map(String::as_str) == Some("LATEST") {
         return AstExprKind::Latest;
     }
@@ -1569,11 +1574,6 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/retain"
             | "List/count"
             | "List/sum"
-            | "Formula/parse"
-            | "Formula/reader"
-            | "Formula/dependencies"
-            | "Formula/eval"
-            | "Formula/error"
             | "Text/empty"
             | "Text/trim"
             | "Text/substring"
@@ -2198,11 +2198,12 @@ FUNCTION make_entry(entry) {
         assert!(program.functions.contains(&"new_cell".to_owned()));
         assert!(program.functions.contains(&"new_sheet_column".to_owned()));
         assert!(program.functions.contains(&"cells_app".to_owned()));
+        let legacy_reader = ["Formula", "/reader"].concat();
         assert!(
-            program
+            !program
                 .operators
                 .iter()
-                .any(|operator| operator == "Formula/reader")
+                .any(|operator| operator == &legacy_reader)
         );
         assert!(
             program

@@ -23,8 +23,6 @@ pub struct TypedProgram {
     pub possible_causes: Vec<PossibleCause>,
     pub update_branches: Vec<UpdateBranch>,
     pub list_operations: Vec<ListOperation>,
-    pub formula_operations: Vec<FormulaOperation>,
-    pub formula_readers: Vec<FormulaReader>,
     pub list_projections: Vec<ListProjection>,
     pub functions: Vec<FunctionDefinition>,
     pub view_bindings: Vec<ViewBinding>,
@@ -367,7 +365,6 @@ pub enum DerivedValueKind {
     SourceEventTransform,
     ListView,
     Aggregate,
-    Formula,
     Pure,
     Unknown,
 }
@@ -470,28 +467,6 @@ pub enum ListPredicate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FormulaOperation {
-    pub target: String,
-    pub kind: FormulaOperationKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FormulaReader {
-    pub target: String,
-    pub list: String,
-    pub address_field: String,
-    pub value_field: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FormulaOperationKind {
-    Parse { input: String },
-    Dependencies { input: String },
-    Eval { formula: String, read: String },
-    Error { formula: String, value: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ViewBinding {
     pub id: ViewBindingId,
     pub node_kind: String,
@@ -571,8 +546,6 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let possible_causes = possible_causes(program, &state_cells);
     let update_branches = update_branches(program, &state_cells);
     let list_operations = list_operations(program);
-    let formula_operations = formula_operations(program);
-    let formula_readers = formula_readers(program);
     let list_projections = list_projections(program);
     let functions = function_definitions(program);
     let derived_values = derived_values(program, &row_scopes, &fields, &state_cells);
@@ -599,8 +572,6 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
         possible_causes,
         update_branches,
         list_operations,
-        formula_operations,
-        formula_readers,
         list_projections,
         functions,
         view_bindings,
@@ -887,28 +858,6 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             ));
         }
         verify_scheduled_list_operation(&operation.kind, &source_paths, &known_symbols)?;
-    }
-    for reader in &program.formula_readers {
-        require_known_symbol("formula reader target", &reader.target, &known_symbols)?;
-        if !list_names.contains(reader.list.as_str()) {
-            return Err(format!(
-                "formula reader `{}` references unknown list `{}`",
-                reader.target, reader.list
-            ));
-        }
-    }
-    let formula_reader_targets = program
-        .formula_readers
-        .iter()
-        .map(|reader| reader.target.as_str())
-        .collect::<BTreeSet<_>>();
-    for operation in &program.formula_operations {
-        require_known_symbol("formula target", &operation.target, &known_symbols)?;
-        verify_scheduled_formula_operation(
-            &operation.kind,
-            &known_symbols,
-            &formula_reader_targets,
-        )?;
     }
     Ok(())
 }
@@ -1763,33 +1712,6 @@ fn verify_scheduled_list_predicate(
     }
 }
 
-fn verify_scheduled_formula_operation(
-    value: &FormulaOperationKind,
-    known_symbols: &BTreeSet<&str>,
-    formula_reader_targets: &BTreeSet<&str>,
-) -> Result<(), String> {
-    match value {
-        FormulaOperationKind::Parse { input } | FormulaOperationKind::Dependencies { input } => {
-            require_known_symbol("formula input", input, known_symbols)
-        }
-        FormulaOperationKind::Eval { formula, read } => {
-            require_known_symbol("formula eval input", formula, known_symbols)?;
-            require_known_symbol("formula reader", read, known_symbols)?;
-            if formula_reader_targets.contains(read.as_str()) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Formula/eval reader `{read}` is not declared with Formula/reader"
-                ))
-            }
-        }
-        FormulaOperationKind::Error { formula, value } => {
-            require_known_symbol("formula error input", formula, known_symbols)?;
-            require_known_symbol("formula error value", value, known_symbols)
-        }
-    }
-}
-
 fn verify_combinational_field_cycles(
     fields: &[FieldDef],
     state_cells: &[StateCell],
@@ -1881,16 +1803,6 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
     for operation in &program.list_operations {
         reject_hidden_identity_identifier("list operation", &operation.list)?;
         reject_list_operation_identity(&operation.kind)?;
-    }
-    for operation in &program.formula_operations {
-        reject_hidden_identity_identifier("formula target", &operation.target)?;
-        reject_formula_operation_identity(&operation.kind)?;
-    }
-    for reader in &program.formula_readers {
-        reject_hidden_identity_identifier("formula reader target", &reader.target)?;
-        reject_hidden_identity_identifier("formula reader list", &reader.list)?;
-        reject_hidden_identity_identifier("formula reader address field", &reader.address_field)?;
-        reject_hidden_identity_identifier("formula reader value field", &reader.value_field)?;
     }
     for projection in &program.list_projections {
         reject_hidden_identity_identifier("list projection target", &projection.target)?;
@@ -2011,22 +1923,6 @@ fn reject_list_predicate_identity(value: &ListPredicate) -> Result<(), String> {
     }
 }
 
-fn reject_formula_operation_identity(value: &FormulaOperationKind) -> Result<(), String> {
-    match value {
-        FormulaOperationKind::Parse { input } | FormulaOperationKind::Dependencies { input } => {
-            reject_hidden_identity_identifier("formula input", input)
-        }
-        FormulaOperationKind::Eval { formula, read } => {
-            reject_hidden_identity_identifier("formula eval input", formula)?;
-            reject_hidden_identity_identifier("formula reader", read)
-        }
-        FormulaOperationKind::Error { formula, value } => {
-            reject_hidden_identity_identifier("formula error input", formula)?;
-            reject_hidden_identity_identifier("formula error value", value)
-        }
-    }
-}
-
 fn reject_hidden_identity_identifier(context: &str, value: &str) -> Result<(), String> {
     if let Some(token) = hidden_identity_token(value) {
         Err(format!(
@@ -2075,8 +1971,6 @@ pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
         "possible_causes": program.possible_causes,
         "update_branches": program.update_branches,
         "list_operations": program.list_operations,
-        "formula_operations": program.formula_operations,
-        "formula_readers": program.formula_readers,
         "list_projections": program.list_projections,
         "functions": program.functions,
         "view_bindings": program.view_bindings,
@@ -2216,13 +2110,6 @@ fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
             node
         })
         .collect::<Vec<_>>();
-    if program
-        .operators
-        .iter()
-        .any(|operator| operator == "Formula/dependencies")
-    {
-        push_generated(&mut nodes, "dependency_index", IrNodeKind::Aggregate, true);
-    }
     for list in &program.list_memories {
         push_generated(
             &mut nodes,
@@ -2294,11 +2181,10 @@ fn expression_operator_node_kind(operators: &[String]) -> Option<IrNodeKind> {
         Some(IrNodeKind::Then)
     } else if operators.iter().any(|operator| operator == "WHEN") {
         Some(IrNodeKind::When)
-    } else if operators.iter().any(|operator| {
-        operator.starts_with("Formula/")
-            || operator.starts_with("Text/")
-            || operator.starts_with("Bool/")
-    }) {
+    } else if operators
+        .iter()
+        .any(|operator| operator.starts_with("Text/") || operator.starts_with("Bool/"))
+    {
         Some(IrNodeKind::PureCall)
     } else {
         None
@@ -2499,63 +2385,6 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
     operations
 }
 
-fn formula_operations(program: &ParsedProgram) -> Vec<FormulaOperation> {
-    typed_field_defs(program)
-        .into_iter()
-        .filter_map(|field| {
-            if let Some(argument) = ast_call_argument(&field, "Formula/parse") {
-                return Some(FormulaOperation {
-                    target: field.path.clone(),
-                    kind: FormulaOperationKind::Parse { input: argument },
-                });
-            }
-            if let Some(argument) = ast_call_argument(&field, "Formula/dependencies") {
-                return Some(FormulaOperation {
-                    target: field.path.clone(),
-                    kind: FormulaOperationKind::Dependencies { input: argument },
-                });
-            }
-            if field.has_operator("Formula/eval") {
-                return Some(FormulaOperation {
-                    target: field.path.clone(),
-                    kind: FormulaOperationKind::Eval {
-                        formula: ast_named_call_argument(&field, "Formula/eval", "formula")?,
-                        read: ast_named_call_argument(&field, "Formula/eval", "read")?,
-                    },
-                });
-            }
-            if field.has_operator("Formula/error") {
-                let args = ast_call_arguments(&field, "Formula/error");
-                return Some(FormulaOperation {
-                    target: field.path.clone(),
-                    kind: FormulaOperationKind::Error {
-                        formula: args.first().cloned()?,
-                        value: args.get(1).cloned()?,
-                    },
-                });
-            }
-            None
-        })
-        .collect()
-}
-
-fn formula_readers(program: &ParsedProgram) -> Vec<FormulaReader> {
-    typed_field_defs(program)
-        .into_iter()
-        .filter_map(|field| {
-            if !field.has_operator("Formula/reader") {
-                return None;
-            }
-            Some(FormulaReader {
-                target: field.path.clone(),
-                list: ast_named_call_argument(&field, "Formula/reader", "list")?,
-                address_field: ast_named_call_argument(&field, "Formula/reader", "address")?,
-                value_field: ast_named_call_argument(&field, "Formula/reader", "value")?,
-            })
-        })
-        .collect()
-}
-
 fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
     typed_field_defs(program)
         .into_iter()
@@ -2645,15 +2474,7 @@ fn collect_function_definitions(
 }
 
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
-    if field.has_any_operator(&[
-        "Formula/parse",
-        "Formula/reader",
-        "Formula/dependencies",
-        "Formula/eval",
-        "Formula/error",
-    ]) {
-        DerivedValueKind::Formula
-    } else if field.has_operator("List/count") {
+    if field.has_operator("List/count") {
         DerivedValueKind::Aggregate
     } else if field.has_any_operator(&["List/retain", "List/map", "List/chunk", "List/find"]) {
         DerivedValueKind::ListView
@@ -3942,9 +3763,7 @@ fn gather_field_defs_from_statements(
                 }
             }
             AstStatementKind::Field { name } => {
-                if should_record_field_statement(name, scope, program)
-                    || statement_has_operator(statement, program, "Formula/reader")
-                {
+                if should_record_field_statement(name, scope, program) {
                     let parent_path = scope.join(".");
                     let path = if parent_path.is_empty() {
                         name.clone()
@@ -4582,7 +4401,7 @@ store: [
         click: SOURCE
     ]
     note:
-        TEXT { Formula/eval List/count List/retain WHEN THEN }
+        TEXT { List/count List/retain WHEN THEN }
     todos:
         LIST {}
         |> List/map(todo, new: new_todo(todo: todo))
@@ -4875,7 +4694,6 @@ FUNCTION new_todo(todo) {
                 && binding.path == "cell.address"
                 && binding.scope_id.is_some()
         }));
-        assert!(ir.nodes.iter().any(|node| node.name == "dependency_index"));
         assert!(ir.nodes.iter().any(|node| {
             matches!(node.kind, IrNodeKind::RenderLowering) && node.name == "render_cells_template"
         }));
@@ -4892,7 +4710,10 @@ FUNCTION new_todo(todo) {
                     }
         }));
         assert!(ir.derived_values.iter().any(|value| {
-            value.path == "cell.value" && value.kind == DerivedValueKind::Formula && value.indexed
+            value.path == "cell.value" && value.kind == DerivedValueKind::Pure && value.indexed
+        }));
+        assert!(ir.derived_values.iter().any(|value| {
+            value.path == "cell.error" && value.kind == DerivedValueKind::Pure && value.indexed
         }));
         assert!(ir.dependencies.iter().any(|edge| {
             edge.from == "cell.sources.editor.commit" && edge.to == "cell.formula_text"
@@ -4911,42 +4732,6 @@ FUNCTION new_todo(todo) {
                 && branch.expression
                     == UpdateExpression::Const {
                         value: "True".to_owned(),
-                    }
-        }));
-        assert!(ir.formula_operations.iter().any(|operation| {
-            operation.target == "cell.parsed_formula"
-                && operation.kind
-                    == FormulaOperationKind::Parse {
-                        input: "formula_text".to_owned(),
-                    }
-        }));
-        assert!(ir.formula_operations.iter().any(|operation| {
-            operation.target == "cell.dependencies"
-                && operation.kind
-                    == FormulaOperationKind::Dependencies {
-                        input: "parsed_formula".to_owned(),
-                    }
-        }));
-        assert!(ir.formula_operations.iter().any(|operation| {
-            operation.target == "cell.value"
-                && operation.kind
-                    == FormulaOperationKind::Eval {
-                        formula: "parsed_formula".to_owned(),
-                        read: "sheet_reader".to_owned(),
-                    }
-        }));
-        assert!(ir.formula_readers.iter().any(|reader| {
-            reader.target == "sheet_reader"
-                && reader.list == "cells"
-                && reader.address_field == "address"
-                && reader.value_field == "value"
-        }));
-        assert!(ir.formula_operations.iter().any(|operation| {
-            operation.target == "cell.error"
-                && operation.kind
-                    == FormulaOperationKind::Error {
-                        formula: "parsed_formula".to_owned(),
-                        value: "value".to_owned(),
                     }
         }));
         assert!(
@@ -5025,82 +4810,6 @@ FUNCTION row(item) {
         assert!(
             !ir.lists.iter().any(|list| list.name == "legacy"),
             "List/grid must not lower to a table initializer"
-        );
-    }
-
-    #[test]
-    fn formula_operations_do_not_invent_cells_defaults() {
-        let source = r#"
-store: [
-    sources: [
-        noop: [press: SOURCE]
-    ]
-    formula_text:
-        TEXT { 1 } |> HOLD formula_text { LATEST {} }
-    parsed_formula:
-        Formula/parse(formula_text)
-    value:
-        Formula/eval(parsed_formula)
-    error:
-        Formula/error(parsed_formula)
-]
-"#;
-        let parsed = boon_parser::parse_source("formula-missing-args.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        assert!(ir.formula_operations.iter().any(|operation| {
-            operation.target == "store.parsed_formula"
-                && operation.kind
-                    == FormulaOperationKind::Parse {
-                        input: "formula_text".to_owned(),
-                    }
-        }));
-        assert!(
-            !ir.formula_operations
-                .iter()
-                .any(|operation| operation.target == "store.value"),
-            "Formula/eval without explicit formula/read must not invent a reader"
-        );
-        assert!(
-            !ir.formula_operations
-                .iter()
-                .any(|operation| operation.target == "store.error"),
-            "Formula/error without explicit formula/value must not default to parsed_formula/value"
-        );
-    }
-
-    #[test]
-    fn formula_eval_requires_reader_declared_in_boon_source() {
-        let source = r#"
-cells:
-    LIST {
-        [address: TEXT { A0 }, default_formula: TEXT { 1 }]
-    }
-    |> List/map(cell, new: new_cell(cell: cell))
-store: [
-    sheet_reader: Text/empty()
-]
-FUNCTION new_cell(cell) {
-    sources: [editor: [commit: SOURCE]]
-    [
-        address: cell.address
-        formula_text:
-            cell.default_formula |> HOLD formula_text { LATEST {} }
-        parsed_formula:
-            Formula/parse(formula_text)
-        dependencies:
-            Formula/dependencies(parsed_formula)
-        value:
-            Formula/eval(formula: parsed_formula, read: store.sheet_reader)
-        error:
-            Formula/error(parsed_formula, value)
-    ]
-}
-"#;
-        let parsed = boon_parser::parse_source("formula-reader-must-be-source.bn", source).unwrap();
-        let err = lower(&parsed).unwrap_err();
-        assert!(
-            err.contains("not declared with Formula/reader"),
-            "unexpected error: {err}"
         );
     }
 

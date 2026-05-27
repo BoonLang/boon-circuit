@@ -851,7 +851,7 @@ pub fn require_generic_runtime_slice_flags(
             "generic_formula_edit_state_holds_from_ir",
             "generic_hold_storage_authoritative",
             "generic_summary_reads_authoritative_storage",
-            "generic_hidden_grid_keys_from_generic_storage",
+            "generic_hidden_list_keys_from_generic_storage",
             "generic_formula_pipeline_from_ir",
         ][..],
         "generic" => &[][..],
@@ -1459,8 +1459,7 @@ fn verify_render_patch_protocol_identity(
             .get("target")
             .and_then(JsonValue::as_str)
             .unwrap_or_default();
-        let keyed_patch =
-            target.starts_with("todos:") || matches!(kind, "SetCellEditor" | "SetCellText");
+        let keyed_patch = target.starts_with("todos:");
         if keyed_patch {
             for key in ["list_id", "key", "generation"] {
                 if patch.get(key).is_none_or(JsonValue::is_null) {
@@ -2330,15 +2329,20 @@ fn verify_report_file_hash(
     path_key: &str,
     hash_key: &str,
 ) -> RuntimeResult<()> {
-    let Some(file_path) = report.get(path_key).and_then(JsonValue::as_str) else {
-        return Ok(());
-    };
     let Some(expected) = report.get(hash_key).and_then(JsonValue::as_str) else {
         return Ok(());
     };
     if matches!(expected, "n/a" | "missing" | "missing-budget") {
         return Ok(());
     }
+    if path_key == "source_path" && hash_key == "source_hash" {
+        if verify_report_source_files_hash(report, report_path, expected)? {
+            return Ok(());
+        }
+    }
+    let Some(file_path) = report.get(path_key).and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
     let actual = sha256_file(Path::new(file_path))?;
     if actual != expected {
         return Err(format!(
@@ -2348,6 +2352,55 @@ fn verify_report_file_hash(
         .into());
     }
     Ok(())
+}
+
+fn verify_report_source_files_hash(
+    report: &JsonValue,
+    report_path: &Path,
+    expected: &str,
+) -> RuntimeResult<bool> {
+    let Some(files) = report.get("source_files").and_then(JsonValue::as_array) else {
+        return Ok(false);
+    };
+    let paths = files
+        .iter()
+        .filter_map(|file| {
+            file.as_str().or_else(|| {
+                file.get("path")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| file.get("source").and_then(JsonValue::as_str))
+            })
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let actual = sha256_combined_source_files(&paths)?;
+    if actual != expected {
+        return Err(format!(
+            "{} has stale `source_hash` for manifest source_files",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(true)
+}
+
+fn sha256_combined_source_files(paths: &[&str]) -> RuntimeResult<String> {
+    let mut combined = String::new();
+    for path in paths {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str("-- file: ");
+        combined.push_str(path);
+        combined.push('\n');
+        combined.push_str(&fs::read_to_string(path)?);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    Ok(sha256_bytes(combined.as_bytes()))
 }
 
 fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {

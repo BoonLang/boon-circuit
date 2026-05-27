@@ -1,0 +1,197 @@
+-- Cells document view module.
+
+FUNCTION cells_app() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [
+            width: Fill
+            height: Fill
+            padding: 8
+            background: [color: Oklch[lightness:0.98]]
+            border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
+            font: [size: 10, color: Oklch[lightness:0.12]]
+        ]
+        items: LIST {
+            formula_bar()
+            column_headers()
+            sheet_row_views()
+        }
+    )
+}
+
+FUNCTION formula_bar() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 4
+        style: [
+            width: Fill
+            height: 34
+            background: [color: Oklch[lightness:0.98]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [
+                    width: 40
+                    height: 30
+                    background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                    font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                ]
+                label: store.selected_input.address
+            )
+            Element/label(
+                element: []
+                style: [
+                    width: 24
+                    height: 30
+                    background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                    font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                ]
+                label: TEXT { fx }
+            )
+            Element/text_input(
+                element: [
+                    event: [
+                        change: cell.sources.editor.change
+                        key_down: cell.sources.editor.commit
+                        escape: cell.sources.editor.cancel
+                        blur: cell.sources.editor.blur
+                    ]
+                ]
+                style: [
+                    width: Fill
+                    height: 30
+                    background: [color: Oklch[lightness:1]]
+                    border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
+                    font: [size: 12, color: Oklch[lightness:0.12]]
+                ]
+                label: TEXT { Formula }
+                text: store.selected_input.editing_text
+                placeholder: [text: Text/empty()]
+                address: store.selected_input.address
+            )
+        }
+    )
+}
+
+FUNCTION column_headers() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 1
+        style: [
+            width: Fill
+            height: 26
+            background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+            scroll_x: True
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [
+                    width: 40
+                    height: 24
+                    background: [color: Oklch[lightness:0.89,chroma:0.02,hue:250]]
+                ]
+                label: Text/empty()
+            )
+            Element/repeat(
+                element: []
+                list: sheet_columns
+                item: column
+                child: Element/label(
+                    element: []
+                    style: [
+                        width: 80
+                        height: 24
+                        background: [color: Oklch[lightness:0.89,chroma:0.02,hue:250]]
+                        font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                    ]
+                    label: column.label
+                )
+            )
+        }
+    )
+}
+
+FUNCTION sheet_row_views() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 1
+        style: [
+            width: Fill
+            height: 620
+            background: [color: Oklch[lightness:1]]
+            scroll: True
+            scrollbars: True
+        ]
+        items: LIST {
+            Element/repeat(
+                element: []
+                list: store.sheet_rows
+                item: sheet_row
+                child: sheet_row_view(sheet_row: sheet_row)
+            )
+        }
+    )
+}
+
+FUNCTION sheet_row_view(sheet_row) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 1
+        style: [
+            width: Fill
+            height: 26
+            background: [color: Oklch[lightness:1]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [
+                    width: 40
+                    height: 24
+                    background: [color: Oklch[lightness:0.96,chroma:0.01,hue:250]]
+                    font: [size: 10, color: Oklch[lightness:0.46,chroma:0.04,hue:250]]
+                ]
+                label: sheet_row.row_number
+            )
+            Element/repeat(
+                element: []
+                list: sheet_row.cells
+                item: cell
+                child: cell_input(cell: cell)
+            )
+        }
+    )
+}
+
+FUNCTION cell_input(cell) {
+    Element/text_input(
+        element: [
+            event: [
+                change: cell.sources.editor.change
+                key_down: cell.sources.editor.commit
+                escape: cell.sources.editor.cancel
+                blur: cell.sources.editor.blur
+            ]
+        ]
+        style: [
+            width: 80
+            height: 24
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.91,chroma:0.02,hue:250]]
+            font: [size: 10, color: Oklch[lightness:0.12]]
+        ]
+        label: cell.address
+        text: cell.value
+        placeholder: [text: Text/empty()]
+        key: cell.address
+        address: cell.address
+    )
+}

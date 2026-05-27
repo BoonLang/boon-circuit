@@ -2,6 +2,16 @@
 id = "cells"
 label = "Cells"
 source = "examples/cells.bn"
+source_files = [
+  "examples/cells/defaults.bn",
+  "examples/cells/formula.bn",
+  "examples/cells/cell.bn",
+  "examples/cells/model.bn",
+  "examples/cells/columns.bn",
+  "examples/cells/store.bn",
+  "examples/cells/view.bn",
+  "examples/cells.bn",
+]
 scenario = "examples/cells.scn"
 budget = "examples/cells.budget.toml"
 category = "7gui"

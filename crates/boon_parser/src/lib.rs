@@ -19,6 +19,7 @@ impl ProgramKind {
 pub struct ParsedProgram {
     pub path: String,
     pub source: String,
+    pub files: Vec<ParsedSourceFile>,
     pub kind: ProgramKind,
     pub ast: AstProgram,
     pub expressions: Vec<AstExpr>,
@@ -31,6 +32,13 @@ pub struct ParsedProgram {
     pub row_scope_functions: Vec<ParsedRowScopeFunction>,
     pub functions: Vec<String>,
     pub operators: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParsedSourceFile {
+    pub path: String,
+    pub source: String,
+    pub start_line: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,7 +107,6 @@ pub struct ParserItem {
     pub hold: Option<String>,
     pub list_capacity: Option<usize>,
     pub is_list: bool,
-    pub is_grid_list: bool,
     pub opens_scope: bool,
     pub closes_scope: bool,
     pub operators: Vec<String>,
@@ -154,7 +161,6 @@ pub enum AstStatementKind {
     List {
         field: Option<String>,
         capacity: Option<usize>,
-        grid: bool,
     },
     Block,
     Expression,
@@ -306,6 +312,57 @@ pub fn parse_source(
 ) -> Result<ParsedProgram, ParseError> {
     let path = path.into();
     let source = source.into();
+    let files = vec![ParsedSourceFile {
+        path: path.clone(),
+        source: source.clone(),
+        start_line: 1,
+    }];
+    parse_combined_source(path, source, files)
+}
+
+pub fn parse_project(
+    path: impl Into<String>,
+    files: impl IntoIterator<Item = (String, String)>,
+) -> Result<ParsedProgram, ParseError> {
+    let path = path.into();
+    let mut parsed_files = Vec::new();
+    let mut source = String::new();
+    let mut next_line = 1usize;
+    for (file_path, file_source) in files {
+        if !source.is_empty() && !source.ends_with('\n') {
+            source.push('\n');
+            next_line += 1;
+        }
+        source.push_str("-- file: ");
+        source.push_str(&file_path);
+        source.push('\n');
+        next_line += 1;
+        let start_line = next_line;
+        source.push_str(&file_source);
+        if !file_source.ends_with('\n') {
+            source.push('\n');
+        }
+        next_line += file_source.lines().count().max(1);
+        parsed_files.push(ParsedSourceFile {
+            path: file_path,
+            source: file_source,
+            start_line,
+        });
+    }
+    if parsed_files.is_empty() {
+        return Err(ParseError {
+            path,
+            message: "project has no source files".to_owned(),
+        });
+    }
+    parse_combined_source(path, source, parsed_files)
+}
+
+fn parse_combined_source(
+    path: String,
+    source: String,
+    files: Vec<ParsedSourceFile>,
+) -> Result<ParsedProgram, ParseError> {
     let ast = parse_ast(&path, &source)?;
     validate_source_syntax(&path, &ast)?;
     validate_balanced_brackets(&path, &ast)?;
@@ -329,6 +386,7 @@ pub fn parse_source(
         operators: collect_operators(&ast),
         path,
         source,
+        files,
         kind,
         ast,
     })
@@ -485,7 +543,7 @@ fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), E
         just(">=").ignored(),
         just("<=").ignored(),
         just("!=").ignored(),
-        one_of("><=|+-").ignored(),
+        one_of("><=|+-%*").ignored(),
     ))
     .to(AstTokenKind::Operator);
     let symbol = one_of("[]{}():,.$#").to(AstTokenKind::Symbol);
@@ -601,8 +659,7 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         .flatten();
     let source_event = ast_insource_slice_event(&symbols).map(ToOwned::to_owned);
     let operators = ast_expression_operators(&symbols);
-    let is_list = symbols.iter().any(|lexeme| lexeme == "LIST");
-    let is_grid_list = symbols.iter().any(|lexeme| lexeme == "Grid/cells");
+    let is_list = symbols.iter().any(|lexeme| is_list_constructor(lexeme));
     ParserItem {
         line: line.line,
         indent: line.indent,
@@ -621,8 +678,11 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         example: None,
         function,
         is_list,
-        is_grid_list,
     }
+}
+
+fn is_list_constructor(lexeme: &str) -> bool {
+    matches!(lexeme, "LIST" | "List/range" | "List/table")
 }
 
 fn ast_statement_tree(
@@ -685,11 +745,10 @@ fn ast_statement(
         AstStatementKind::Hold {
             name: item.hold.clone(),
         }
-    } else if item.is_list || item.is_grid_list {
+    } else if item.is_list {
         AstStatementKind::List {
             field: item.field.clone(),
             capacity: item.list_capacity,
-            grid: item.is_grid_list,
         }
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
@@ -1013,7 +1072,7 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
-            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-"
+            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" | "*" | "%"
                 if depth == 0 && index > 0 && index + 1 < tokens.len() =>
             {
                 return Some((&tokens[..index], token, &tokens[index + 1..]));
@@ -1484,15 +1543,26 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "LIST"
             | "List/map"
             | "List/append"
+            | "List/range"
+            | "List/table"
+            | "List/get"
             | "List/remove"
             | "List/retain"
             | "List/count"
+            | "List/sum"
             | "Formula/parse"
+            | "Formula/reader"
             | "Formula/dependencies"
             | "Formula/eval"
             | "Formula/error"
             | "Text/empty"
             | "Text/trim"
+            | "Text/substring"
+            | "Text/length"
+            | "Text/find"
+            | "Text/starts_with"
+            | "Text/to_number"
+            | "Text/is_empty"
             | "Bool/not"
     )
 }
@@ -1599,11 +1669,7 @@ fn derive_structure_from_statements(
                 });
                 derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
             }
-            AstStatementKind::List {
-                field,
-                capacity,
-                grid: _,
-            } => {
+            AstStatementKind::List { field, capacity } => {
                 let name = field
                     .clone()
                     .or_else(|| scope.last().cloned())
@@ -1959,7 +2025,7 @@ FUNCTION new_todo(todo) {
 -- LATEST { fake |> THEN { bad } }
 label: "fake |> WHEN { SOURCE }"
 cells:
-    Grid/cells(columns: 1, rows: 1)
+    List/table(columns: 1, rows: 1)
     |> List/map(cell, new: new_cell(cell: cell))
 FUNCTION new_cell(cell) {
     sources: [editor: [commit: SOURCE]]
@@ -2062,8 +2128,44 @@ FUNCTION make_entry(entry) {
 
     #[test]
     fn parses_cells_marker_and_constructs() {
-        let source = include_str!("../../../examples/cells.bn");
-        let program = parse_source("examples/cells.bn", source).unwrap();
+        let program = parse_project(
+            "examples/cells.bn",
+            [
+                (
+                    "examples/cells/defaults.bn".to_owned(),
+                    include_str!("../../../examples/cells/defaults.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/formula.bn".to_owned(),
+                    include_str!("../../../examples/cells/formula.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/cell.bn".to_owned(),
+                    include_str!("../../../examples/cells/cell.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/model.bn".to_owned(),
+                    include_str!("../../../examples/cells/model.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/columns.bn".to_owned(),
+                    include_str!("../../../examples/cells/columns.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/store.bn".to_owned(),
+                    include_str!("../../../examples/cells/store.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/view.bn".to_owned(),
+                    include_str!("../../../examples/cells/view.bn").to_owned(),
+                ),
+                (
+                    "examples/cells.bn".to_owned(),
+                    include_str!("../../../examples/cells.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
         assert_eq!(program.kind, ProgramKind::Generic);
         assert!(
             program
@@ -2072,6 +2174,14 @@ FUNCTION make_entry(entry) {
                 .any(|expr| matches!(expr.kind, AstExprKind::Source))
         );
         assert!(program.functions.contains(&"new_cell".to_owned()));
+        assert!(program.functions.contains(&"new_sheet_column".to_owned()));
+        assert!(program.functions.contains(&"cells_app".to_owned()));
+        assert!(
+            program
+                .operators
+                .iter()
+                .any(|operator| operator == "Formula/reader")
+        );
         assert!(
             program
                 .source_ports
@@ -2091,10 +2201,86 @@ FUNCTION make_entry(entry) {
                 .any(|list| list.name == "cells")
         );
         assert!(
+            program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "sheet_columns")
+        );
+        assert!(
             !program
                 .expressions
                 .iter()
                 .any(|expr| matches!(expr.kind, AstExprKind::Unknown(_)))
+        );
+    }
+
+    #[test]
+    fn grid_prefixed_symbols_do_not_create_list_memories() {
+        let source = r#"
+items:
+    LIST {}
+    |> List/map(item, new: row(item: item))
+legacy:
+    Grid/table(columns: 1, rows: 1)
+store:
+    sources:
+        noop: SOURCE
+    noop:
+        TEXT {} |> HOLD noop {
+            LATEST {}
+        }
+FUNCTION row(item) {
+    [value: item.value]
+}
+"#;
+        let program = parse_source("legacy-grid-prefix.bn", source).unwrap();
+        assert!(
+            program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "items")
+        );
+        assert!(
+            !program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "legacy"),
+            "Grid/table must not be a source-facing list constructor"
+        );
+    }
+
+    #[test]
+    fn list_grid_alias_does_not_create_list_memories() {
+        let source = r#"
+items:
+    LIST {}
+    |> List/map(item, new: row(item: item))
+legacy:
+    List/grid(columns: 1, rows: 1)
+store:
+    sources:
+        noop: SOURCE
+    noop:
+        TEXT {} |> HOLD noop {
+            LATEST {}
+        }
+FUNCTION row(item) {
+    [value: item.value]
+}
+"#;
+        let program = parse_source("legacy-list-grid-alias.bn", source).unwrap();
+        assert!(
+            program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "items")
+        );
+        assert!(
+            !program
+                .list_memories
+                .iter()
+                .any(|list| list.name == "legacy"),
+            "List/grid must not be a source-facing table constructor"
         );
     }
 
@@ -2111,7 +2297,7 @@ FUNCTION make_entry(entry) {
         let source = r#"
 -- label: "EXAMPLE TodoMVC"
 cells:
-    Grid/cells(columns: 1, rows: 1)
+    List/table(columns: 1, rows: 1)
     |> List/map(cell, new: new_cell(cell: cell))
 SOURCE
 HOLD
@@ -2355,7 +2541,7 @@ List/map
     fn unclosed_bracket_reports_opening_position() {
         let source = r#"
 cells:
-    Grid/cells(columns: 26, rows: 100
+    List/table(columns: 26, rows: 100
 SOURCE
 HOLD
 LATEST
@@ -2364,6 +2550,70 @@ List/map
         let err = parse_source("bad-unclosed.bn", source).unwrap_err();
         assert!(err.message.contains("unclosed `(`"));
         assert!(err.message.contains("line 3, column 15"));
+    }
+
+    #[test]
+    fn parse_project_keeps_manifest_files_and_generic_cells_operators() {
+        let program = parse_project(
+            "examples/cells.bn",
+            [
+                (
+                    "examples/cells/formula.bn".to_owned(),
+                    r#"
+FUNCTION compute_value(text) {
+    text |> Text/starts_with(prefix: TEXT { = }) |> WHEN {
+        True => text |> Text/substring(start: 1, length: text |> Text/length())
+        __ => text |> Text/trim()
+    }
+}
+"#
+                    .to_owned(),
+                ),
+                (
+                    "examples/cells.bn".to_owned(),
+                    r#"
+store: [
+    sources: [editor: [change: SOURCE]]
+    value: Text/empty() |> HOLD value { LATEST { sources.editor.change.text } }
+]
+rows:
+    List/range(from: 0, to: 2)
+    |> List/map(row, new: row)
+total:
+    rows |> List/sum()
+document: Document/new(root: Element/label(element: [], label: value))
+"#
+                    .to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(program.files.len(), 2);
+        assert!(
+            program
+                .operators
+                .iter()
+                .any(|operator| operator == "List/range")
+        );
+        assert!(program.list_memories.iter().any(|list| list.name == "rows"));
+        assert!(
+            program
+                .operators
+                .iter()
+                .any(|operator| operator == "List/sum")
+        );
+        assert!(
+            program
+                .operators
+                .iter()
+                .any(|operator| operator == "Text/substring")
+        );
+        assert!(
+            program
+                .source
+                .contains("-- file: examples/cells/formula.bn")
+        );
     }
 
     fn find_statement(

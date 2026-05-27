@@ -1,0 +1,60 @@
+-- Cells row module.
+--
+-- This file is loaded through examples/manifest.toml source_files. Keeping the
+-- row circuit separate is the first step toward moving formula and view helper
+-- code into ordinary Boon modules instead of one large example file.
+
+FUNCTION new_cell(cell) {
+    sources: [
+        editor: [
+            change: SOURCE
+            commit: SOURCE
+            cancel: SOURCE
+            blur: SOURCE
+        ]
+    ]
+
+    [
+        address: cell.address
+
+        editing_text:
+            cell.default_formula |> HOLD draft {
+                LATEST {
+                    sources.editor.change.text
+                    sources.editor.cancel |> THEN { formula_text }
+                    sources.editor.commit.text
+                    sources.editor.blur.text
+                }
+            }
+
+        formula_text:
+            cell.default_formula |> HOLD formula_text {
+                LATEST {
+                    sources.editor.commit.text
+                    sources.editor.blur.text
+                }
+            }
+
+        editing:
+            False |> HOLD editing {
+                LATEST {
+                    sources.editor.change |> THEN { True }
+                    sources.editor.commit |> THEN { False }
+                    sources.editor.cancel |> THEN { False }
+                    sources.editor.blur |> THEN { False }
+                }
+            }
+
+        parsed_formula:
+            Formula/parse(formula_text)
+
+        dependencies:
+            Formula/dependencies(parsed_formula)
+
+        value:
+            Formula/eval(formula: parsed_formula, read: sheet_reader)
+
+        error:
+            Formula/error(parsed_formula, value)
+    ]
+}

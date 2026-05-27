@@ -3184,7 +3184,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let layout_probe_report =
         artifacts_dir.join(format!("preview-e2e-{example}-layout-proof.json"));
     let source_path = PathBuf::from(&entry.source);
-    let source_hash = file_hash(source_path.to_string_lossy().as_ref());
+    let source_text = boon_runtime::source_text_for_entry(&entry)?;
+    let source_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
+    let source_files = manifest_source_files(&entry);
     let scenario_labels = native_preview_e2e_scenario_labels(&entry);
     let mut cosmic_launch_proof = json!({"status": "not-run"});
     let title_token = native_gpu_title_token(&format!("preview-e2e-{example}"));
@@ -3413,6 +3415,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "expected_source_hash": source_hash,
         "program_hash": source_hash,
         "source_path": source_path,
+        "source_files": source_files,
         "launched_binary_path": launched_binary_path,
         "launched_binary_hash": launched_binary_hash,
         "release_build": release_build,
@@ -6114,18 +6117,24 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     ));
     let live_state_report = artifacts_dir.join(format!("scroll-{label}-live-state.json"));
     let mut dev_editor_speed_corpus = json!({"status": "not-applicable"});
-    let (source_path, source_example_id) = if dev_editor {
+    let (source_path, source_example_id, source_text, source_files) = if dev_editor {
         let (path, example_id, corpus) = ensure_dev_editor_speed_corpus(&artifacts_dir)?;
+        let source_text = std::fs::read_to_string(&path)?;
+        let source_files = Vec::new();
         dev_editor_speed_corpus = corpus;
-        (path, example_id)
+        (path, example_id, source_text, source_files)
     } else {
+        let entry = boon_runtime::example_manifest_entry(&label)?;
+        let source_text = boon_runtime::source_text_for_entry(&entry)?;
+        let source_files = manifest_source_files(&entry);
         (
-            PathBuf::from(boon_runtime::example_manifest_entry(&label)?.source),
+            PathBuf::from(entry.source),
             label.clone(),
+            source_text,
+            source_files,
         )
     };
-    let source_hash = file_hash(source_path.to_string_lossy().as_ref());
-    let source_text = std::fs::read_to_string(&source_path)?;
+    let source_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
     let layout_probe_report = artifacts_dir.join(format!("scroll-{label}-layout-proof.json"));
     let mut cosmic_launch_proof = json!({"status": "not-run"});
     let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
@@ -6391,7 +6400,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "graph_rebuild_count": 0,
         "preview_blocked_on_ipc_count": serde_json::Value::Null,
         "source_hash": source_hash,
+        "expected_source_hash": source_hash,
+        "program_hash": source_hash,
         "source_path": source_path,
+        "source_files": source_files,
         "layout_probe_report": layout_probe_report,
         "prelaunch_layout_probe": layout_probe,
         "driver_target_region": driver_target,
@@ -7397,12 +7409,38 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
     };
     let manifest_sources = manifest_entries
         .iter()
-        .map(|entry| entry.source.clone())
+        .flat_map(|entry| {
+            let mut files = if entry.source_files.is_empty() {
+                vec![entry.source.clone()]
+            } else {
+                entry.source_files.clone()
+            };
+            if !files.iter().any(|source| source == &entry.source) {
+                files.push(entry.source.clone());
+            }
+            files
+        })
         .collect::<BTreeSet<_>>();
     for entry in &manifest_entries {
-        let source_path = PathBuf::from(&entry.source);
-        let source_text = fs::read_to_string(&source_path).unwrap_or_default();
-        let parsed = boon_parser::parse_source(source_path.display().to_string(), &source_text);
+        let source_files = if entry.source_files.is_empty() {
+            vec![entry.source.clone()]
+        } else {
+            let mut files = entry.source_files.clone();
+            if !files.iter().any(|source| source == &entry.source) {
+                files.push(entry.source.clone());
+            }
+            files
+        };
+        let source_text = boon_runtime::source_text_for_entry(entry).unwrap_or_default();
+        let file_sources = source_files
+            .iter()
+            .map(|path| (path.clone(), fs::read_to_string(path).unwrap_or_default()))
+            .collect::<Vec<_>>();
+        let parsed = if file_sources.len() <= 1 {
+            boon_parser::parse_source(entry.source.clone(), &source_text)
+        } else {
+            boon_parser::parse_project(entry.source.clone(), file_sources.clone())
+        };
         let parser_ok = parsed.is_ok();
         push_audit_check(
             &mut checks,
@@ -7423,8 +7461,9 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
-        let has_hash_comment = source_text
-            .lines()
+        let has_hash_comment = file_sources
+            .iter()
+            .flat_map(|(_, source)| source.lines())
             .any(|line| line.trim_start().starts_with('#'));
         push_audit_check(
             &mut checks,
@@ -7439,8 +7478,9 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
-        let has_example_keyword = source_text
-            .lines()
+        let has_example_keyword = file_sources
+            .iter()
+            .flat_map(|(_, source)| source.lines())
             .any(|line| line.trim_start().starts_with("EXAMPLE "));
         push_audit_check(
             &mut checks,
@@ -7455,7 +7495,7 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
-        let formatted = boon_parser::format_source(source_path.display().to_string(), &source_text);
+        let formatted = boon_parser::format_source(entry.source.clone(), &source_text);
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -7472,14 +7512,26 @@ fn verify_boon_source_syntax(args: &[String]) -> Result<(), Box<dyn std::error::
                 )
             }),
         );
+        let source_files_report = source_files
+            .iter()
+            .map(|path| {
+                json!({
+                    "path": path,
+                    "source_hash": file_hash(path)
+                })
+            })
+            .collect::<Vec<_>>();
+        let program_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
         checked_examples.push(json!({
             "id": entry.id,
             "label": entry.label,
             "source": entry.source,
+            "source_files": source_files_report,
             "scenario": entry.scenario,
             "budget": entry.budget,
             "required_evidence_tier": entry.required_evidence_tier,
-            "source_hash": file_hash(&entry.source),
+            "source_hash": program_hash,
+            "program_hash": program_hash,
             "parser_status": if parser_ok { "pass" } else { "fail" }
         }));
     }
@@ -7556,7 +7608,9 @@ fn verify_native_visible_launch(args: &[String]) -> Result<(), Box<dyn std::erro
     let entry = boon_runtime::example_manifest_entry(&example)?;
     let existing_report = native_preview_e2e_report_path(&entry.id);
     let existing = read_optional_json(&existing_report)?;
-    let source_hash = file_hash(&entry.source);
+    let source_text = boon_runtime::source_text_for_entry(&entry)?;
+    let source_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
+    let source_files = manifest_source_files(&entry);
     let evidence_tier = existing
         .as_ref()
         .and_then(|report| report.get("evidence_tier"))
@@ -7786,6 +7840,7 @@ fn verify_native_visible_launch(args: &[String]) -> Result<(), Box<dyn std::erro
             "source_hash": source_hash,
             "expected_source_hash": source_hash,
             "program_hash": source_hash,
+            "source_files": source_files,
             "required_evidence_tier": entry.required_evidence_tier,
             "observed_evidence_tier": evidence_tier,
             "strict_visible_testing_contract": "docs/plans/STRICT_EXAMPLE_VISIBLE_TESTING_RULES.md",
@@ -15577,7 +15632,7 @@ fn generic_runtime_execution_fixture(name: &str) -> serde_json::Value {
             "generic_formula_edit_state_holds_from_ir",
             "generic_hold_storage_authoritative",
             "generic_summary_reads_authoritative_storage",
-            "generic_hidden_grid_keys_from_generic_storage",
+            "generic_hidden_list_keys_from_generic_storage",
             "generic_formula_pipeline_from_ir",
         ],
         _ => &[],
@@ -16378,6 +16433,18 @@ fn artifact_hash(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::E
 
 fn file_hash(path: &str) -> String {
     boon_runtime::sha256_file(Path::new(path)).unwrap_or_else(|_| "missing".to_owned())
+}
+
+fn manifest_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+    let mut files = if entry.source_files.is_empty() {
+        vec![entry.source.clone()]
+    } else {
+        entry.source_files.clone()
+    };
+    if !files.iter().any(|source| source == &entry.source) {
+        files.push(entry.source.clone());
+    }
+    files
 }
 
 #[cfg(test)]

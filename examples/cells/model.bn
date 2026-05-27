@@ -1,0 +1,9 @@
+-- Cells table model.
+
+cells:
+    List/table(
+        columns: 26
+        rows: 100
+        defaults: cells_default_values
+    )
+    |> List/map(cell, new: new_cell(cell: cell))

@@ -84,7 +84,7 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file =
         value_arg(args, "--code-file").ok_or("layout-proof role requires --code-file")?;
     let report = value_arg(args, "--report").ok_or("layout-proof role requires --report")?;
-    let source = std::fs::read_to_string(&code_file)?;
+    let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
     let proof = native_document_layout_proof(Path::new(&code_file), &source)?;
     let mut report_value = base_report("boon-native-playground-layout-proof", args, "pass");
     report_value["per_step_pass_fail"] = json!([
@@ -254,7 +254,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
-    let source = std::fs::read_to_string(&code_file)?;
+    let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
     let document_layout_proof = native_document_layout_proof(Path::new(&code_file), &source)
         .unwrap_or_else(|error| {
             json!({
@@ -268,7 +268,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
-    let code_hash = boon_runtime::sha256_file(Path::new(&code_file))?;
+    let code_hash = boon_runtime::sha256_bytes(source.as_bytes());
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
     let scenario_path = Path::new(&code_file).with_extension("scn");
     let live_runtime = if scenario_path.exists() {
@@ -423,7 +423,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let selected_example_id = value_arg(args, "--selected-example");
     let replace_code_expected_hash = replace_code_file
         .as_deref()
-        .map(boon_runtime::sha256_file)
+        .map(source_hash_for_path)
         .transpose()?;
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
@@ -443,7 +443,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "<no-code-file>".to_owned());
     let dev_source_text = editor_code_file
         .as_deref()
-        .map(std::fs::read_to_string)
+        .map(boon_runtime::source_text_for_path)
         .transpose()?
         .unwrap_or_else(|| "document = []".to_owned());
     let dev_shell = Arc::new(Mutex::new(DevWindowShell::new(
@@ -586,8 +586,8 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|entry| PathBuf::from(&entry.source))
         })
         .unwrap_or_else(|| PathBuf::from(format!("examples/{example}.bn")));
-    let source = std::fs::read_to_string(&source_path)?;
-    let source_sha256 = boon_runtime::sha256_file(&source_path)?;
+    let source = boon_runtime::source_text_for_path(&source_path)?;
+    let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
     let document_layout_proof =
         native_document_layout_proof(&source_path, &source).unwrap_or_else(|error| {
             json!({
@@ -965,11 +965,7 @@ fn native_document_layout_proof_with_state(
 
     let artifact_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
     std::fs::create_dir_all(&artifact_dir)?;
-    let source_sha256 = if source_path.exists() {
-        boon_runtime::sha256_file(source_path)?
-    } else {
-        boon_runtime::sha256_bytes(source.as_bytes())
-    };
+    let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
     let artifact_path = artifact_dir.join(format!(
         "{}-{}{}.json",
         source_path
@@ -2247,6 +2243,7 @@ impl ExampleCatalog {
                 id: entry.id,
                 label: entry.label,
                 source: entry.source,
+                source_files: entry.source_files,
                 inline_source: None,
                 category: entry.category,
                 order: entry.default_tab_order,
@@ -2313,6 +2310,19 @@ impl ExampleCatalog {
                 "source".to_owned(),
                 toml::Value::String(entry.source.clone()),
             );
+            if !entry.source_files.is_empty() {
+                item.insert(
+                    "source_files".to_owned(),
+                    toml::Value::Array(
+                        entry
+                            .source_files
+                            .iter()
+                            .cloned()
+                            .map(toml::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
             if let Some(source) = &entry.inline_source {
                 item.insert(
                     "inline_source".to_owned(),
@@ -2367,6 +2377,17 @@ impl ExampleCatalog {
                                 .and_then(toml::Value::as_str)
                                 .unwrap_or("")
                                 .to_owned(),
+                            source_files: item
+                                .get("source_files")
+                                .and_then(toml::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(toml::Value::as_str)
+                                        .map(ToOwned::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                             inline_source: item
                                 .get("inline_source")
                                 .and_then(toml::Value::as_str)
@@ -2396,6 +2417,7 @@ impl ExampleCatalog {
                     "shown_by_default": entry.shown_by_default,
                     "custom": entry.custom,
                     "source_path": entry.source,
+                    "source_files": entry.source_files,
                     "has_inline_source": entry.inline_source.is_some()
                 })
             }).collect::<Vec<_>>()
@@ -2407,6 +2429,7 @@ impl ExampleCatalog {
             id: format!("custom:{id}"),
             label: label.to_owned(),
             source: format!("custom://{id}.bn"),
+            source_files: Vec::new(),
             inline_source: Some(source),
             category: "custom".to_owned(),
             order: 20_000,
@@ -2597,6 +2620,7 @@ struct ExampleCatalogEntry {
     id: String,
     label: String,
     source: String,
+    source_files: Vec<String>,
     inline_source: Option<String>,
     category: String,
     order: u32,
@@ -2608,6 +2632,27 @@ impl ExampleCatalogEntry {
     fn source_text(&self) -> Result<String, Box<dyn std::error::Error>> {
         if let Some(source) = &self.inline_source {
             Ok(source.clone())
+        } else if !self.source_files.is_empty() {
+            let entry = boon_runtime::ExampleManifestEntry {
+                id: self.id.clone(),
+                label: self.label.clone(),
+                source: self.source.clone(),
+                source_files: self.source_files.clone(),
+                scenario: String::new(),
+                budget: String::new(),
+                category: self.category.clone(),
+                order: self.order,
+                default_tab_order: self.order,
+                shown_by_default: self.shown_by_default,
+                required_evidence_tier: String::new(),
+                human_testing_needed: false,
+                initial_visible_assertions: Vec::new(),
+                input_scenarios: Vec::new(),
+                scroll_focus_scenarios: Vec::new(),
+                visual_artifacts: Vec::new(),
+                performance_thresholds: Vec::new(),
+            };
+            boon_runtime::source_text_for_entry(&entry)
         } else {
             Ok(std::fs::read_to_string(&self.source)?)
         }
@@ -2618,9 +2663,23 @@ impl ExampleCatalogEntry {
             .as_ref()
             .map(|source| source.len() as u64)
             .or_else(|| {
-                std::fs::metadata(&self.source)
-                    .ok()
-                    .map(|metadata| metadata.len())
+                if self.source_files.is_empty() {
+                    std::fs::metadata(&self.source)
+                        .ok()
+                        .map(|metadata| metadata.len())
+                } else {
+                    let mut paths = self.source_files.clone();
+                    if !paths.iter().any(|path| path == &self.source) {
+                        paths.push(self.source.clone());
+                    }
+                    Some(
+                        paths
+                            .iter()
+                            .filter_map(|path| std::fs::metadata(path).ok())
+                            .map(|metadata| metadata.len())
+                            .sum(),
+                    )
+                }
             })
             .unwrap_or(u64::MAX)
     }
@@ -10233,35 +10292,44 @@ fn live_source_event_report(event: &boon_runtime::LiveSourceEvent) -> serde_json
 }
 
 fn bounded_state_summary_sample(state_summary: &serde_json::Value) -> serde_json::Value {
-    if let Some(todos) = state_summary
-        .get("todos")
-        .and_then(serde_json::Value::as_array)
-    {
-        return json!({
-            "new_todo_text": state_summary.get("new_todo_text").cloned().unwrap_or_else(|| json!(null)),
-            "todo_count": todos.len(),
-            "last_todo": todos.last().cloned().unwrap_or_else(|| json!(null))
-        });
-    }
-    if let Some(cells) = state_summary
-        .get("cells")
-        .and_then(serde_json::Value::as_array)
-    {
-        return json!({
-            "cell_count": cells.len(),
-            "a0": cells
-                .iter()
-                .find(|cell| cell.get("address") == Some(&json!("A0")))
-                .cloned()
-                .unwrap_or_else(|| json!(null))
-        });
-    }
+    let Some(object) = state_summary.as_object() else {
+        return json!({ "kind": state_summary_type_name(state_summary) });
+    };
+    let arrays = object
+        .iter()
+        .filter_map(|(key, value)| {
+            let rows = value.as_array()?;
+            Some(json!({
+                "key": key,
+                "len": rows.len(),
+                "first": rows.first().cloned().unwrap_or_else(|| json!(null)),
+                "last": rows.last().cloned().unwrap_or_else(|| json!(null)),
+            }))
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+    let scalars = object
+        .iter()
+        .filter(|(_, value)| !value.is_array() && !value.is_object())
+        .take(8)
+        .map(|(key, value)| json!({ "key": key, "value": value }))
+        .collect::<Vec<_>>();
     json!({
-        "top_level_keys": state_summary
-            .as_object()
-            .map(|object| object.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
+        "top_level_keys": object.keys().cloned().collect::<Vec<_>>(),
+        "arrays": arrays,
+        "scalars": scalars
     })
+}
+
+fn state_summary_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn run_dev_ipc_probe(
@@ -10273,7 +10341,7 @@ fn run_dev_ipc_probe(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let replace_code_response = if let Some(path) = replace_code_file {
-        let code = std::fs::read_to_string(path)?;
+        let code = boon_runtime::source_text_for_path(path)?;
         let expected_hash = replace_code_expected_hash
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| boon_runtime::sha256_bytes(code.as_bytes()));
@@ -10292,7 +10360,7 @@ fn run_dev_ipc_probe(
         None
     };
     let operator_host_input_response = if let Some(path) = replace_code_file {
-        let code = std::fs::read_to_string(path)?;
+        let code = boon_runtime::source_text_for_path(path)?;
         let responses = operator_host_input_probe_requests(path, &code)
             .map(|requests| {
                 requests
@@ -10988,6 +11056,11 @@ fn numeric_arg(args: &[String], flag: &str) -> Option<u64> {
     value_arg(args, flag).and_then(|value| value.parse().ok())
 }
 
+fn source_hash_for_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let source = boon_runtime::source_text_for_path(path)?;
+    Ok(boon_runtime::sha256_bytes(source.as_bytes()))
+}
+
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11555,6 +11628,7 @@ mod tests {
                 id: "counter".to_owned(),
                 label: "Counter".to_owned(),
                 source: "examples/counter.bn".to_owned(),
+                source_files: Vec::new(),
                 inline_source: Some(source.to_owned()),
                 category: "test".to_owned(),
                 order: 0,
@@ -12073,6 +12147,7 @@ mod tests {
                 id: "custom:long".to_owned(),
                 label: long_label,
                 source: "custom://long.bn".to_owned(),
+                source_files: Vec::new(),
                 inline_source: Some("document: []\n".to_owned()),
                 category: "custom".to_owned(),
                 order: 20_000,
@@ -12253,6 +12328,7 @@ mod tests {
                 id: "sample".to_owned(),
                 label: "Sample".to_owned(),
                 source: "custom://sample.bn".to_owned(),
+                source_files: Vec::new(),
                 inline_source: Some(
                     "-- sample\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
                 ),
@@ -12338,6 +12414,7 @@ mod tests {
                     id: "counter".to_owned(),
                     label: "Counter".to_owned(),
                     source: "examples/counter.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "basic".to_owned(),
                     order: 10,
@@ -12348,6 +12425,7 @@ mod tests {
                     id: "custom:one".to_owned(),
                     label: "Custom One".to_owned(),
                     source: "custom://one.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "custom".to_owned(),
                     order: 20_000,
@@ -12427,6 +12505,7 @@ mod tests {
                     id: "cells".to_owned(),
                     label: "Cells".to_owned(),
                     source: "examples/cells.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("x".repeat(100)),
                     category: "7gui".to_owned(),
                     order: 10,
@@ -12437,6 +12516,7 @@ mod tests {
                     id: "todomvc".to_owned(),
                     label: "TodoMVC".to_owned(),
                     source: "examples/todomvc.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("x".repeat(50)),
                     category: "main".to_owned(),
                     order: 20,
@@ -12447,6 +12527,7 @@ mod tests {
                     id: "counter".to_owned(),
                     label: "Counter".to_owned(),
                     source: "examples/counter.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("x".repeat(10)),
                     category: "basic".to_owned(),
                     order: 30,
@@ -12457,6 +12538,7 @@ mod tests {
                     id: "custom:one".to_owned(),
                     label: "Custom One".to_owned(),
                     source: "custom://one.bn".to_owned(),
+                    source_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "custom".to_owned(),
                     order: 20_000,
@@ -12567,6 +12649,33 @@ mod tests {
     }
 
     #[test]
+    fn replace_code_accepts_manifest_backed_cells_project_source() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let top_level_source = std::fs::read_to_string(&cells_path).unwrap();
+
+        assert!(cells_source.contains("FUNCTION new_cell"));
+        assert_ne!(
+            boon_runtime::sha256_bytes(cells_source.as_bytes()),
+            boon_runtime::sha256_bytes(top_level_source.as_bytes())
+        );
+        let cells_hash = boon_runtime::sha256_bytes(cells_source.as_bytes());
+
+        let response = preview_replace_code_response(&json!({
+            "kind": "replace-code",
+            "source_path": cells_path.display().to_string(),
+            "code": cells_source,
+            "expected_hash": cells_hash
+        }))
+        .unwrap();
+
+        assert_eq!(response["status"], "pass");
+        assert_eq!(response["accepted_for_preview_mutation"], true);
+        assert_eq!(response["document_layout_proof"]["status"], "pass");
+        assert_eq!(response["preview_runtime_summary"]["status"], "pass");
+    }
+
+    #[test]
     fn preview_error_overlay_keeps_frame_renderable() {
         let frame = boon_document::LayoutFrame {
             display_list: Vec::new(),
@@ -12594,5 +12703,35 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Preview input error: line one line two")
         );
+    }
+
+    #[test]
+    fn manifest_backed_catalog_loads_cells_project_source_files() {
+        let catalog = ExampleCatalog::load();
+        let cells = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "cells")
+            .expect("Cells should be present in manifest catalog");
+        assert_eq!(
+            cells.source_files,
+            vec![
+                "examples/cells/defaults.bn".to_owned(),
+                "examples/cells/formula.bn".to_owned(),
+                "examples/cells/cell.bn".to_owned(),
+                "examples/cells/model.bn".to_owned(),
+                "examples/cells/columns.bn".to_owned(),
+                "examples/cells/store.bn".to_owned(),
+                "examples/cells/view.bn".to_owned(),
+                "examples/cells.bn".to_owned()
+            ]
+        );
+        let source = cells.source_text().unwrap();
+        assert!(source.contains("-- file:"));
+        assert!(source.contains("Formula/reader"));
+        assert!(source.contains("FUNCTION new_cell"));
+        assert!(source.contains("FUNCTION new_sheet_column"));
+        assert!(source.contains("FUNCTION cells_app"));
+        assert!(source.contains("Document/new"));
     }
 }

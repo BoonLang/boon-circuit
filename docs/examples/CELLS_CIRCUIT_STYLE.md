@@ -51,8 +51,15 @@ Illustrative target:
 
 ```boon
 cells:
-    Grid/cells(columns: 26, rows: 100)
+    List/table(
+        columns: 26
+        rows: 100
+        defaults: cells_default_values
+    )
     |> List/map(cell, new: new_cell(cell: cell))
+
+sheet_reader:
+    Formula/reader(list: cells, address: address, value: value)
 
 FUNCTION new_cell(cell) {
     sources: [
@@ -100,7 +107,7 @@ FUNCTION new_cell(cell) {
         value:
             Formula/eval(
                 formula: parsed_formula,
-                read: cell_value_reader
+                read: sheet_reader
             )
 
         error:
@@ -119,8 +126,8 @@ checked example uses `change`, `commit`, and `cancel`, but hidden source routing
 should follow parsed `SOURCE` ports rather than a separate Rust list of editor
 event names.
 
-`Grid/cells` produces domain coordinates, display addresses, and initial demo
-formulas, for example:
+`List/table` produces ordinary addressed rows from the Boon declaration and
+applies seeded demo formulas from `cells_default_values`, for example:
 
 ```text
 [row: 0, column: A, address: TEXT { A0 }, default_formula: TEXT { 5 }]
@@ -143,17 +150,18 @@ visible addressed editors: 2600
 required visible samples beyond A0-D0: Z0, A99, and Z99
 ```
 
-The runtime state summary may expose a bounded view projection such as
-`grid_columns`, `grid_rows`, and visible `cells` to feed the generic `document`
-renderer. That projection is UI data derived from the authoritative grid/list
-storage. It is not allowed to replace or shrink the underlying 26x100 runtime
-model.
+The runtime state summary may expose bounded source-declared projections such as
+`sheet_columns`, `store.sheet_rows`, and visible `cells` to feed the generic
+`document` renderer. Those projections are UI data derived from the
+authoritative list/table storage. They are not allowed to replace or shrink the
+underlying 26x100 runtime model.
 
 The Cells source owns the spreadsheet layout declaration. Header rows, row
 labels, compact editors, displayed values, edit-mode formulas, focused cell
-styling, and the scrollable body must be declared in `examples/cells.bn` with
-generic `document` elements. The playground renderer only interprets those
-generic component attributes.
+styling, and the scrollable body must be declared in the manifest-backed
+`examples/cells/*.bn` source files with generic `document` elements. The root
+`examples/cells.bn` is only the executable document entrypoint. The playground
+renderer only interprets those generic component attributes.
 
 ## Formula Primitive Contract
 
@@ -231,24 +239,21 @@ The grid renderer updates only affected cells. It does not diff the whole grid.
 
 ## Verification Contract
 
-Cells must follow the shared contract in
-[../plans/EXAMPLE_VERIFICATION_PLAN.md](../plans/EXAMPLE_VERIFICATION_PLAN.md).
+Cells must follow the native GPU contract in
+[../architecture/NATIVE_GPU_PIPELINE.md](../architecture/NATIVE_GPU_PIPELINE.md).
 It is not accepted by semantic tests alone.
 
 Required commands:
 
 ```bash
-cargo xtask verify-cells-headed-ply
-cargo xtask verify-cells-human
-cargo xtask verify-cells-visible-reality
-cargo xtask verify-cells-semantic
-cargo xtask verify-cells-ply-headless
-cargo xtask verify-cells-speed
-cargo xtask verify-cells-negative
-cargo xtask verify-cells-all
+cargo test -p boon_parser -p boon_ir -p boon_runtime --lib
+cargo test -p boon_native_playground --bin boon_native_playground
+cargo run -q -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/debug/cells-cli-run.json
+cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
+cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
 ```
 
-The headed Ply and manual passes must test real spreadsheet interaction:
+Native GPU and follow-up human passes must test real spreadsheet interaction:
 
 - click a cell.
 - type a literal.

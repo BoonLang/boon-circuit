@@ -1,0 +1,39 @@
+-- Cells column header data.
+
+sheet_columns:
+    LIST {
+        [index: TEXT { 0 }, label: TEXT { A }]
+        [index: TEXT { 1 }, label: TEXT { B }]
+        [index: TEXT { 2 }, label: TEXT { C }]
+        [index: TEXT { 3 }, label: TEXT { D }]
+        [index: TEXT { 4 }, label: TEXT { E }]
+        [index: TEXT { 5 }, label: TEXT { F }]
+        [index: TEXT { 6 }, label: TEXT { G }]
+        [index: TEXT { 7 }, label: TEXT { H }]
+        [index: TEXT { 8 }, label: TEXT { I }]
+        [index: TEXT { 9 }, label: TEXT { J }]
+        [index: TEXT { 10 }, label: TEXT { K }]
+        [index: TEXT { 11 }, label: TEXT { L }]
+        [index: TEXT { 12 }, label: TEXT { M }]
+        [index: TEXT { 13 }, label: TEXT { N }]
+        [index: TEXT { 14 }, label: TEXT { O }]
+        [index: TEXT { 15 }, label: TEXT { P }]
+        [index: TEXT { 16 }, label: TEXT { Q }]
+        [index: TEXT { 17 }, label: TEXT { R }]
+        [index: TEXT { 18 }, label: TEXT { S }]
+        [index: TEXT { 19 }, label: TEXT { T }]
+        [index: TEXT { 20 }, label: TEXT { U }]
+        [index: TEXT { 21 }, label: TEXT { V }]
+        [index: TEXT { 22 }, label: TEXT { W }]
+        [index: TEXT { 23 }, label: TEXT { X }]
+        [index: TEXT { 24 }, label: TEXT { Y }]
+        [index: TEXT { 25 }, label: TEXT { Z }]
+    }
+    |> List/map(column, new: new_sheet_column(column: column))
+
+FUNCTION new_sheet_column(column) {
+    [
+        index: column.index
+        label: column.label
+    ]
+}

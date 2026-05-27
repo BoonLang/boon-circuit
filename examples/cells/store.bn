@@ -1,0 +1,19 @@
+-- Cells derived app store.
+
+store: [
+    selected_address:
+        TEXT { A0 } |> HOLD selected_address {
+            LATEST {
+                cell.sources.editor.change.address
+                cell.sources.editor.commit.address
+                cell.sources.editor.cancel.address
+                cell.sources.editor.blur.address
+            }
+        }
+
+    selected_input:
+        List/find(cells, field: address, value: selected_address)
+
+    sheet_rows:
+        List/chunk(cells, size: 26, items: cells, label: row_number)
+]

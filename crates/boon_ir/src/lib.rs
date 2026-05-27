@@ -23,6 +23,8 @@ pub struct TypedProgram {
     pub update_branches: Vec<UpdateBranch>,
     pub list_operations: Vec<ListOperation>,
     pub formula_operations: Vec<FormulaOperation>,
+    pub formula_readers: Vec<FormulaReader>,
+    pub list_projections: Vec<ListProjection>,
     pub view_bindings: Vec<ViewBinding>,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
@@ -291,10 +293,49 @@ pub enum InitialValue {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ListInitializer {
-    RecordLiteral { rows: Vec<ListInitialRecord> },
-    Grid { columns: usize, rows: usize },
+    RecordLiteral {
+        rows: Vec<ListInitialRecord>,
+    },
+    Range {
+        from: i64,
+        to: i64,
+    },
+    Table {
+        columns: usize,
+        rows: usize,
+        defaults: Vec<TableDefaultField>,
+    },
     Empty,
-    Unknown { summary: String },
+    Unknown {
+        summary: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TableDefaultField {
+    pub address: String,
+    pub field: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListProjection {
+    pub target: String,
+    pub list: String,
+    pub kind: ListProjectionKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListProjectionKind {
+    Chunk {
+        size: Option<usize>,
+        item_field: String,
+        label_field: String,
+    },
+    Find {
+        field: String,
+        value: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -425,6 +466,14 @@ pub struct FormulaOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FormulaReader {
+    pub target: String,
+    pub list: String,
+    pub address_field: String,
+    pub value_field: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FormulaOperationKind {
     Parse { input: String },
     Dependencies { input: String },
@@ -513,6 +562,8 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let update_branches = update_branches(program, &state_cells);
     let list_operations = list_operations(program);
     let formula_operations = formula_operations(program);
+    let formula_readers = formula_readers(program);
+    let list_projections = list_projections(program);
     let derived_values = derived_values(program, &row_scopes, &fields, &state_cells);
     let view_bindings = view_bindings(program, &row_scopes, &sources);
     let expression_coverage = expression_coverage(
@@ -537,6 +588,8 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
         update_branches,
         list_operations,
         formula_operations,
+        formula_readers,
+        list_projections,
         view_bindings,
         derived_values,
         state_cells,
@@ -776,10 +829,12 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         .chain(derived_paths.iter())
         .copied()
         .collect::<BTreeSet<_>>();
+    let list_projection_symbols = list_projection_view_symbols(program);
     for binding in &program.view_bindings {
         if !matches!(binding.kind, ViewBindingKind::Source)
             && binding.scope_id.is_none()
             && !symbol_known(&binding.path, &known_symbols)
+            && !list_projection_symbols.contains(binding.path.as_str())
             && !view_projection_symbol_known(&binding.path)
         {
             require_known_symbol("view binding path", &binding.path, &known_symbols)?;
@@ -820,9 +875,27 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         }
         verify_scheduled_list_operation(&operation.kind, &source_paths, &known_symbols)?;
     }
+    for reader in &program.formula_readers {
+        require_known_symbol("formula reader target", &reader.target, &known_symbols)?;
+        if !list_names.contains(reader.list.as_str()) {
+            return Err(format!(
+                "formula reader `{}` references unknown list `{}`",
+                reader.target, reader.list
+            ));
+        }
+    }
+    let formula_reader_targets = program
+        .formula_readers
+        .iter()
+        .map(|reader| reader.target.as_str())
+        .collect::<BTreeSet<_>>();
     for operation in &program.formula_operations {
         require_known_symbol("formula target", &operation.target, &known_symbols)?;
-        verify_scheduled_formula_operation(&operation.kind, &known_symbols)?;
+        verify_scheduled_formula_operation(
+            &operation.kind,
+            &known_symbols,
+            &formula_reader_targets,
+        )?;
     }
     Ok(())
 }
@@ -910,6 +983,11 @@ fn source_payload_schema(program: &ParsedProgram, source: &str) -> SourcePayload
                 || field.match_arm_destructures_payload("key")
             {
                 payload_fields.insert(SourcePayloadField::Key);
+            }
+            if field.references_payload_path(variant, "address")
+                || field.match_arm_destructures_payload("address")
+            {
+                payload_fields.insert(SourcePayloadField::Address);
             }
         }
     }
@@ -1532,7 +1610,7 @@ fn view_projection_symbol_known(value: &str) -> bool {
         value,
         "column.label"
             | "column.index"
-            | "grid_row.row_number"
+            | "sheet_row.row_number"
             | "focused_input.active"
             | "focused_input.address"
             | "focused_input.display_value"
@@ -1544,19 +1622,51 @@ fn view_projection_symbol_known(value: &str) -> bool {
             | "focused_input.cancel_source"
             | "focused_input.escape_source"
             | "focused_input.blur_source"
-            | "selected_input.active"
-            | "selected_input.id"
-            | "selected_input.address"
-            | "selected_input.display_value"
-            | "selected_input.edit_value"
-            | "selected_input.value"
-            | "selected_input.formula"
-            | "selected_input.change_source"
-            | "selected_input.submit_source"
-            | "selected_input.cancel_source"
-            | "selected_input.escape_source"
-            | "selected_input.blur_source"
     )
+}
+
+fn list_projection_view_symbols(program: &TypedProgram) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    for projection in &program.list_projections {
+        symbols.insert(projection.target.clone());
+        if !matches!(projection.kind, ListProjectionKind::Find { .. }) {
+            continue;
+        }
+        let Some(row_scope) = program
+            .row_scopes
+            .iter()
+            .find(|scope| scope.list == projection.list)
+            .map(|scope| scope.row_scope.as_str())
+        else {
+            continue;
+        };
+        let prefix = format!("{row_scope}.");
+        for field in program
+            .state_cells
+            .iter()
+            .map(|field| field.path.as_str())
+            .chain(
+                program
+                    .derived_values
+                    .iter()
+                    .map(|field| field.path.as_str()),
+            )
+            .filter_map(|path| path.strip_prefix(&prefix))
+        {
+            symbols.insert(format!(
+                "{}.{}",
+                projection.target,
+                projection_field_name(field)
+            ));
+        }
+    }
+    symbols
+}
+
+fn projection_field_name(path: &str) -> &str {
+    path.rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(path)
 }
 
 fn verify_scheduled_update_expression(
@@ -1643,6 +1753,7 @@ fn verify_scheduled_list_predicate(
 fn verify_scheduled_formula_operation(
     value: &FormulaOperationKind,
     known_symbols: &BTreeSet<&str>,
+    formula_reader_targets: &BTreeSet<&str>,
 ) -> Result<(), String> {
     match value {
         FormulaOperationKind::Parse { input } | FormulaOperationKind::Dependencies { input } => {
@@ -1650,10 +1761,13 @@ fn verify_scheduled_formula_operation(
         }
         FormulaOperationKind::Eval { formula, read } => {
             require_known_symbol("formula eval input", formula, known_symbols)?;
-            if read == "cell_value_reader" {
+            require_known_symbol("formula reader", read, known_symbols)?;
+            if formula_reader_targets.contains(read.as_str()) {
                 Ok(())
             } else {
-                require_known_symbol("formula reader", read, known_symbols)
+                Err(format!(
+                    "Formula/eval reader `{read}` is not declared with Formula/reader"
+                ))
             }
         }
         FormulaOperationKind::Error { formula, value } => {
@@ -1759,6 +1873,20 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
         reject_hidden_identity_identifier("formula target", &operation.target)?;
         reject_formula_operation_identity(&operation.kind)?;
     }
+    for reader in &program.formula_readers {
+        reject_hidden_identity_identifier("formula reader target", &reader.target)?;
+        reject_hidden_identity_identifier("formula reader list", &reader.list)?;
+        reject_hidden_identity_identifier("formula reader address field", &reader.address_field)?;
+        reject_hidden_identity_identifier("formula reader value field", &reader.value_field)?;
+    }
+    for projection in &program.list_projections {
+        reject_hidden_identity_identifier("list projection target", &projection.target)?;
+        reject_hidden_identity_identifier("list projection list", &projection.list)?;
+        if let ListProjectionKind::Find { field, value } = &projection.kind {
+            reject_hidden_identity_identifier("list find field", field)?;
+            reject_hidden_identity_identifier("list find value", value)?;
+        }
+    }
     Ok(())
 }
 
@@ -1791,7 +1919,16 @@ fn reject_list_initializer_identity(value: &ListInitializer) -> Result<(), Strin
         ListInitializer::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown list initializer", summary)
         }
-        ListInitializer::Grid { .. } | ListInitializer::Empty => Ok(()),
+        ListInitializer::Table { defaults, .. } => {
+            for default in defaults {
+                reject_hidden_identity_identifier("table default address", &default.address)?;
+                reject_hidden_identity_identifier("table default field", &default.field)?;
+                reject_hidden_identity_identifier("table default value", &default.value)?;
+            }
+            Ok(())
+        }
+        ListInitializer::Range { .. } => Ok(()),
+        ListInitializer::Empty => Ok(()),
     }
 }
 
@@ -1926,6 +2063,8 @@ pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
         "update_branches": program.update_branches,
         "list_operations": program.list_operations,
         "formula_operations": program.formula_operations,
+        "formula_readers": program.formula_readers,
+        "list_projections": program.list_projections,
         "view_bindings": program.view_bindings,
     })
 }
@@ -2004,7 +2143,9 @@ fn expression_coverage(
                     }
                 }
             }
-            ListInitializer::Grid { .. } | ListInitializer::Empty => {}
+            ListInitializer::Table { .. }
+            | ListInitializer::Range { .. }
+            | ListInitializer::Empty => {}
         }
     }
     for branch in update_branches {
@@ -2364,10 +2505,8 @@ fn formula_operations(program: &ParsedProgram) -> Vec<FormulaOperation> {
                 return Some(FormulaOperation {
                     target: field.path.clone(),
                     kind: FormulaOperationKind::Eval {
-                        formula: ast_named_call_argument(&field, "Formula/eval", "formula")
-                            .unwrap_or_else(|| "parsed_formula".to_owned()),
-                        read: ast_named_call_argument(&field, "Formula/eval", "read")
-                            .unwrap_or_else(|| "cell_value_reader".to_owned()),
+                        formula: ast_named_call_argument(&field, "Formula/eval", "formula")?,
+                        read: ast_named_call_argument(&field, "Formula/eval", "read")?,
                     },
                 });
             }
@@ -2376,11 +2515,61 @@ fn formula_operations(program: &ParsedProgram) -> Vec<FormulaOperation> {
                 return Some(FormulaOperation {
                     target: field.path.clone(),
                     kind: FormulaOperationKind::Error {
-                        formula: args
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "parsed_formula".to_owned()),
-                        value: args.get(1).cloned().unwrap_or_else(|| "value".to_owned()),
+                        formula: args.first().cloned()?,
+                        value: args.get(1).cloned()?,
+                    },
+                });
+            }
+            None
+        })
+        .collect()
+}
+
+fn formula_readers(program: &ParsedProgram) -> Vec<FormulaReader> {
+    typed_field_defs(program)
+        .into_iter()
+        .filter_map(|field| {
+            if !field.has_operator("Formula/reader") {
+                return None;
+            }
+            Some(FormulaReader {
+                target: field.path.clone(),
+                list: ast_named_call_argument(&field, "Formula/reader", "list")?,
+                address_field: ast_named_call_argument(&field, "Formula/reader", "address")?,
+                value_field: ast_named_call_argument(&field, "Formula/reader", "value")?,
+            })
+        })
+        .collect()
+}
+
+fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
+    typed_field_defs(program)
+        .into_iter()
+        .filter_map(|field| {
+            if field.has_operator("List/chunk") {
+                return Some(ListProjection {
+                    target: field.path.clone(),
+                    list: ast_call_argument(&field, "List/chunk")?,
+                    kind: ListProjectionKind::Chunk {
+                        size: ast_named_call_argument(&field, "List/chunk", "size")
+                            .and_then(|value| value.parse::<usize>().ok()),
+                        item_field: ast_named_call_argument(&field, "List/chunk", "items")
+                            .unwrap_or_else(|| "items".to_owned()),
+                        label_field: ast_named_call_argument(&field, "List/chunk", "label")
+                            .unwrap_or_else(|| "index".to_owned()),
+                    },
+                });
+            }
+            if field.has_operator("List/find") {
+                return Some(ListProjection {
+                    target: field.path.clone(),
+                    list: ast_call_argument(&field, "List/find")?,
+                    kind: ListProjectionKind::Find {
+                        field: ast_named_call_argument(&field, "List/find", "field")?,
+                        value: canonical_local_path(
+                            &ast_named_call_argument(&field, "List/find", "value")?,
+                            &field.parent_path,
+                        ),
                     },
                 });
             }
@@ -2421,6 +2610,7 @@ fn derived_values(
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
     if field.has_any_operator(&[
         "Formula/parse",
+        "Formula/reader",
         "Formula/dependencies",
         "Formula/eval",
         "Formula/error",
@@ -2428,7 +2618,7 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
         DerivedValueKind::Formula
     } else if field.has_operator("List/count") {
         DerivedValueKind::Aggregate
-    } else if field.has_any_operator(&["List/retain", "List/map"]) {
+    } else if field.has_any_operator(&["List/retain", "List/map", "List/chunk", "List/find"]) {
         DerivedValueKind::ListView
     } else if !sources.is_empty() || field.has_when_or_then_expr() {
         DerivedValueKind::SourceEventTransform
@@ -2514,14 +2704,18 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: "list body not found".to_owned(),
         };
     };
-    let grid_constructor = format!("Grid/{list_name}");
-    if items
-        .iter()
-        .any(|item| item_has_symbol(item, &grid_constructor))
-    {
-        return ListInitializer::Grid {
+    if items.iter().any(item_has_table_constructor) {
+        let defaults = table_default_fields_for_table(program, &items);
+        return ListInitializer::Table {
             columns: extract_usize_arg_from_items(&items, "columns").unwrap_or(26),
             rows: extract_usize_arg_from_items(&items, "rows").unwrap_or(100),
+            defaults,
+        };
+    }
+    if items.iter().any(|item| item_has_symbol(item, "List/range")) {
+        return ListInitializer::Range {
+            from: extract_i64_arg_from_items(&items, "from").unwrap_or(0),
+            to: extract_i64_arg_from_items(&items, "to").unwrap_or(0),
         };
     }
     let rows = list_record_literal_rows(&items);
@@ -2535,6 +2729,57 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: items.first().map(item_summary).unwrap_or_default(),
         }
     }
+}
+
+fn item_has_table_constructor(item: &AstItem) -> bool {
+    item.symbols.iter().any(|symbol| symbol == "List/table")
+}
+
+fn table_default_fields(items: &[AstItem]) -> Vec<TableDefaultField> {
+    list_record_literal_rows(items)
+        .into_iter()
+        .filter_map(|row| {
+            let address = row
+                .fields
+                .iter()
+                .find(|field| field.name == "address")
+                .and_then(initial_text_value)?
+                .to_owned();
+            let field = row
+                .fields
+                .iter()
+                .find(|field| field.name == "field")
+                .and_then(initial_text_value)?
+                .to_owned();
+            let value = row
+                .fields
+                .iter()
+                .find(|field| field.name == "value")
+                .and_then(initial_text_value)?
+                .to_owned();
+            Some(TableDefaultField {
+                address,
+                field,
+                value,
+            })
+        })
+        .collect()
+}
+
+fn table_default_fields_for_table(
+    program: &ParsedProgram,
+    items: &[AstItem],
+) -> Vec<TableDefaultField> {
+    let inline = table_default_fields(items);
+    if !inline.is_empty() {
+        return inline;
+    }
+    let Some(defaults_list) = extract_arg_from_items(items, "defaults") else {
+        return Vec::new();
+    };
+    list_body_items(program, &defaults_list)
+        .map(|items| table_default_fields(&items))
+        .unwrap_or_default()
 }
 
 fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstItem>> {
@@ -2597,6 +2842,9 @@ fn list_record_literal_item(item: &AstItem) -> Option<ListInitialRecord> {
 }
 
 fn literal_initial_value(tokens: &[String]) -> InitialValue {
+    if let Some(value) = string_literal_value(tokens) {
+        return InitialValue::Text { value };
+    }
     if let Some(value) = text_literal_value(tokens) {
         return InitialValue::Text { value };
     }
@@ -2616,6 +2864,21 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
     }
 }
 
+fn initial_text_value(field: &ListRowInitialField) -> Option<&str> {
+    match &field.value {
+        InitialValue::Text { value } => Some(value),
+        _ => None,
+    }
+}
+
+fn string_literal_value(tokens: &[String]) -> Option<String> {
+    let token = tokens.first()?;
+    if tokens.len() != 1 || !token.starts_with('"') || !token.ends_with('"') {
+        return None;
+    }
+    Some(token[1..token.len().saturating_sub(1)].replace("\\\"", "\""))
+}
+
 fn text_literal_value(tokens: &[String]) -> Option<String> {
     if tokens.first().map(String::as_str) != Some("TEXT")
         || tokens.get(1).map(String::as_str) != Some("{")
@@ -2633,6 +2896,24 @@ fn extract_usize_arg_from_items(items: &[AstItem], name: &str) -> Option<usize> 
                 .then(|| window[2].parse().ok())
                 .flatten()
         })
+    })
+}
+
+fn extract_i64_arg_from_items(items: &[AstItem], name: &str) -> Option<i64> {
+    items.iter().find_map(|item| {
+        item.symbols.windows(3).find_map(|window| {
+            (window[0] == name && window[1] == ":")
+                .then(|| window[2].parse().ok())
+                .flatten()
+        })
+    })
+}
+
+fn extract_arg_from_items(items: &[AstItem], name: &str) -> Option<String> {
+    items.iter().find_map(|item| {
+        item.symbols
+            .windows(3)
+            .find_map(|window| (window[0] == name && window[1] == ":").then(|| window[2].clone()))
     })
 }
 
@@ -3074,7 +3355,17 @@ fn item_has_symbol(item: &AstItem, symbol: &str) -> bool {
 fn symbol_is_list_operator(symbol: &str) -> bool {
     matches!(
         symbol,
-        "List/map" | "List/append" | "List/remove" | "List/retain" | "List/count"
+        "List/map"
+            | "List/range"
+            | "List/table"
+            | "List/chunk"
+            | "List/find"
+            | "List/get"
+            | "List/append"
+            | "List/remove"
+            | "List/retain"
+            | "List/count"
+            | "List/sum"
     )
 }
 
@@ -3136,6 +3427,14 @@ fn update_expression_for_source(
     {
         return UpdateExpression::SourcePayload {
             path: "key".to_owned(),
+        };
+    }
+    if variants
+        .iter()
+        .any(|variant| field.references_payload_path(variant, "address"))
+    {
+        return UpdateExpression::SourcePayload {
+            path: "address".to_owned(),
         };
     }
     if !branch.is_empty() {
@@ -3605,7 +3904,9 @@ fn gather_field_defs_from_statements(
                 }
             }
             AstStatementKind::Field { name } => {
-                if should_record_field_statement(name, scope, program) {
+                if should_record_field_statement(name, scope, program)
+                    || statement_has_operator(statement, program, "Formula/reader")
+                {
                     let parent_path = scope.join(".");
                     let path = if parent_path.is_empty() {
                         name.clone()
@@ -3647,6 +3948,20 @@ fn gather_field_defs_from_statements(
             }
         }
     }
+}
+
+fn statement_has_operator(
+    statement: &AstStatement,
+    program: &ParsedProgram,
+    operator: &str,
+) -> bool {
+    collect_statement_ast_exprs(statement, program)
+        .iter()
+        .any(|expr| match &expr.kind {
+            AstExprKind::Call { function, .. } => function == operator,
+            AstExprKind::Pipe { op, .. } => op == operator,
+            _ => false,
+        })
 }
 
 fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
@@ -4388,18 +4703,83 @@ FUNCTION new_todo(todo) {
 
     #[test]
     fn cells_lowering_has_dependency_index() {
-        let parsed = boon_parser::parse_source(
+        let parsed = boon_parser::parse_project(
             "examples/cells.bn",
-            include_str!("../../../examples/cells.bn"),
+            [
+                (
+                    "examples/cells/defaults.bn".to_owned(),
+                    include_str!("../../../examples/cells/defaults.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/formula.bn".to_owned(),
+                    include_str!("../../../examples/cells/formula.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/cell.bn".to_owned(),
+                    include_str!("../../../examples/cells/cell.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/model.bn".to_owned(),
+                    include_str!("../../../examples/cells/model.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/columns.bn".to_owned(),
+                    include_str!("../../../examples/cells/columns.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/store.bn".to_owned(),
+                    include_str!("../../../examples/cells/store.bn").to_owned(),
+                ),
+                (
+                    "examples/cells/view.bn".to_owned(),
+                    include_str!("../../../examples/cells/view.bn").to_owned(),
+                ),
+                (
+                    "examples/cells.bn".to_owned(),
+                    include_str!("../../../examples/cells.bn").to_owned(),
+                ),
+            ],
         )
         .unwrap();
         let ir = lower(&parsed).unwrap();
         assert_eq!(ir.kind, ProgramKind::Generic);
+        let cells_list = ir
+            .lists
+            .iter()
+            .find(|list| list.name == "cells")
+            .expect("Cells source should lower a cells list");
         assert_eq!(
-            ir.lists[0].initializer,
-            ListInitializer::Grid {
+            cells_list.initializer,
+            ListInitializer::Table {
                 columns: 26,
                 rows: 100,
+                defaults: vec![
+                    TableDefaultField {
+                        address: "A0".to_owned(),
+                        field: "default_formula".to_owned(),
+                        value: "5".to_owned()
+                    },
+                    TableDefaultField {
+                        address: "A1".to_owned(),
+                        field: "default_formula".to_owned(),
+                        value: "10".to_owned()
+                    },
+                    TableDefaultField {
+                        address: "A2".to_owned(),
+                        field: "default_formula".to_owned(),
+                        value: "15".to_owned()
+                    },
+                    TableDefaultField {
+                        address: "B0".to_owned(),
+                        field: "default_formula".to_owned(),
+                        value: "=add(A0,A1)".to_owned()
+                    },
+                    TableDefaultField {
+                        address: "C0".to_owned(),
+                        field: "default_formula".to_owned(),
+                        value: "=sum(A0:A2)".to_owned()
+                    },
+                ],
             }
         );
         assert!(ir.sources.iter().any(|source| {
@@ -4417,6 +4797,37 @@ FUNCTION new_todo(todo) {
                 && binding.kind == ViewBindingKind::Source
                 && binding.path == "cell.sources.editor.commit"
                 && binding.source_id.is_some()
+        }));
+        assert!(ir.lists.iter().any(|list| {
+            list.name == "sheet_columns"
+                && matches!(list.initializer, ListInitializer::RecordLiteral { .. })
+        }));
+        assert!(ir.list_projections.iter().any(|projection| {
+            projection.target == "store.sheet_rows"
+                && projection.list == "cells"
+                && projection.kind
+                    == ListProjectionKind::Chunk {
+                        size: Some(26),
+                        item_field: "cells".to_owned(),
+                        label_field: "row_number".to_owned(),
+                    }
+        }));
+        assert!(ir.list_projections.iter().any(|projection| {
+            projection.target == "store.selected_input"
+                && projection.list == "cells"
+                && projection.kind
+                    == ListProjectionKind::Find {
+                        field: "address".to_owned(),
+                        value: "store.selected_address".to_owned(),
+                    }
+        }));
+        assert!(ir.update_branches.iter().any(|branch| {
+            branch.target == "store.selected_address"
+                && branch.source == "cell.sources.editor.commit"
+                && branch.expression
+                    == UpdateExpression::SourcePayload {
+                        path: "address".to_owned(),
+                    }
         }));
         assert!(ir.view_bindings.iter().any(|binding| {
             binding.node_kind == "Input"
@@ -4482,8 +4893,14 @@ FUNCTION new_todo(todo) {
                 && operation.kind
                     == FormulaOperationKind::Eval {
                         formula: "parsed_formula".to_owned(),
-                        read: "cell_value_reader".to_owned(),
+                        read: "sheet_reader".to_owned(),
                     }
+        }));
+        assert!(ir.formula_readers.iter().any(|reader| {
+            reader.target == "sheet_reader"
+                && reader.list == "cells"
+                && reader.address_field == "address"
+                && reader.value_field == "value"
         }));
         assert!(ir.formula_operations.iter().any(|operation| {
             operation.target == "cell.error"
@@ -4500,6 +4917,152 @@ FUNCTION new_todo(todo) {
                 .all(|node| node.expr_id.unwrap().as_usize() < parsed.expressions.len())
         );
         verify_hidden_identity(&ir).unwrap();
+    }
+
+    #[test]
+    fn grid_prefixed_symbols_do_not_lower_as_table_or_projection_shortcuts() {
+        let source = r#"
+items:
+    LIST {}
+    |> List/map(item, new: row(item: item))
+legacy:
+    Grid/table(columns: 1, rows: 1)
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    selected:
+        Grid/selected(items, address: wanted)
+    rows:
+        Grid/rows(items)
+    wanted:
+        TEXT { A0 } |> HOLD wanted {
+            LATEST {}
+        }
+]
+FUNCTION row(item) {
+    [
+        address: item.address
+        value: item.value
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("legacy-grid-prefix-shortcuts.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            !ir.lists.iter().any(|list| list.name == "legacy"),
+            "Grid/table must not lower to a table initializer"
+        );
+        assert!(
+            ir.list_projections.is_empty(),
+            "Grid/selected and Grid/rows must not lower to generic projections"
+        );
+    }
+
+    #[test]
+    fn list_grid_alias_does_not_lower_as_table_shortcut() {
+        let source = r#"
+items:
+    LIST {}
+    |> List/map(item, new: row(item: item))
+legacy:
+    List/grid(columns: 1, rows: 1)
+store:
+    sources:
+        noop: SOURCE
+    noop:
+        TEXT {} |> HOLD noop {
+            LATEST {}
+        }
+FUNCTION row(item) {
+    [
+        address: item.address
+        value: item.value
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("legacy-list-grid-alias.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            !ir.lists.iter().any(|list| list.name == "legacy"),
+            "List/grid must not lower to a table initializer"
+        );
+    }
+
+    #[test]
+    fn formula_operations_do_not_invent_cells_defaults() {
+        let source = r#"
+store: [
+    sources: [
+        noop: [press: SOURCE]
+    ]
+    formula_text:
+        TEXT { 1 } |> HOLD formula_text { LATEST {} }
+    parsed_formula:
+        Formula/parse(formula_text)
+    value:
+        Formula/eval(parsed_formula)
+    error:
+        Formula/error(parsed_formula)
+]
+"#;
+        let parsed = boon_parser::parse_source("formula-missing-args.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.formula_operations.iter().any(|operation| {
+            operation.target == "store.parsed_formula"
+                && operation.kind
+                    == FormulaOperationKind::Parse {
+                        input: "formula_text".to_owned(),
+                    }
+        }));
+        assert!(
+            !ir.formula_operations
+                .iter()
+                .any(|operation| operation.target == "store.value"),
+            "Formula/eval without explicit formula/read must not invent a reader"
+        );
+        assert!(
+            !ir.formula_operations
+                .iter()
+                .any(|operation| operation.target == "store.error"),
+            "Formula/error without explicit formula/value must not default to parsed_formula/value"
+        );
+    }
+
+    #[test]
+    fn formula_eval_requires_reader_declared_in_boon_source() {
+        let source = r#"
+cells:
+    LIST {
+        [address: TEXT { A0 }, default_formula: TEXT { 1 }]
+    }
+    |> List/map(cell, new: new_cell(cell: cell))
+store: [
+    sheet_reader: Text/empty()
+]
+FUNCTION new_cell(cell) {
+    sources: [editor: [commit: SOURCE]]
+    [
+        address: cell.address
+        formula_text:
+            cell.default_formula |> HOLD formula_text { LATEST {} }
+        parsed_formula:
+            Formula/parse(formula_text)
+        dependencies:
+            Formula/dependencies(parsed_formula)
+        value:
+            Formula/eval(formula: parsed_formula, read: store.sheet_reader)
+        error:
+            Formula/error(parsed_formula, value)
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("formula-reader-must-be-source.bn", source).unwrap();
+        let err = lower(&parsed).unwrap_err();
+        assert!(
+            err.contains("not declared with Formula/reader"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

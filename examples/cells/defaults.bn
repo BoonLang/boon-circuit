@@ -1,0 +1,10 @@
+-- Cells seeded demo values.
+
+cells_default_values:
+    LIST {
+        [address: TEXT { A0 }, field: TEXT { default_formula }, value: TEXT { 5 }]
+        [address: TEXT { A1 }, field: TEXT { default_formula }, value: TEXT { 10 }]
+        [address: TEXT { A2 }, field: TEXT { default_formula }, value: TEXT { 15 }]
+        [address: TEXT { B0 }, field: TEXT { default_formula }, value: "=add(A0,A1)"]
+        [address: TEXT { C0 }, field: TEXT { default_formula }, value: "=sum(A0:A2)"]
+    }

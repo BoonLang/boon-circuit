@@ -10,6 +10,7 @@ use std::fmt;
 pub struct TypedProgram {
     pub kind: ProgramKind,
     pub expression_count: usize,
+    pub expressions: Vec<AstExpr>,
     pub expression_coverage: ExpressionCoverage,
     pub graph_node_count: usize,
     pub nodes: Vec<IrNode>,
@@ -25,6 +26,7 @@ pub struct TypedProgram {
     pub formula_operations: Vec<FormulaOperation>,
     pub formula_readers: Vec<FormulaReader>,
     pub list_projections: Vec<ListProjection>,
+    pub functions: Vec<FunctionDefinition>,
     pub view_bindings: Vec<ViewBinding>,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
@@ -357,6 +359,7 @@ pub struct DerivedValue {
     pub sources: Vec<String>,
     pub indexed: bool,
     pub scope_id: Option<ScopeId>,
+    pub statement: AstStatement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -367,6 +370,13 @@ pub enum DerivedValueKind {
     Formula,
     Pure,
     Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub args: Vec<String>,
+    pub statement: AstStatement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -564,6 +574,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let formula_operations = formula_operations(program);
     let formula_readers = formula_readers(program);
     let list_projections = list_projections(program);
+    let functions = function_definitions(program);
     let derived_values = derived_values(program, &row_scopes, &fields, &state_cells);
     let view_bindings = view_bindings(program, &row_scopes, &sources);
     let expression_coverage = expression_coverage(
@@ -578,6 +589,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
+        expressions: program.expressions.clone(),
         expression_coverage,
         graph_node_count: nodes.len(),
         nodes,
@@ -590,6 +602,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
         formula_operations,
         formula_readers,
         list_projections,
+        functions,
         view_bindings,
         derived_values,
         state_cells,
@@ -2065,6 +2078,7 @@ pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
         "formula_operations": program.formula_operations,
         "formula_readers": program.formula_readers,
         "list_projections": program.list_projections,
+        "functions": program.functions,
         "view_bindings": program.view_bindings,
     })
 }
@@ -2602,9 +2616,32 @@ fn derived_values(
                 kind: derived_value_kind(field, &sources),
                 path: field.path.clone(),
                 sources,
+                statement: field.statement.clone(),
             }
         })
         .collect()
+}
+
+fn function_definitions(program: &ParsedProgram) -> Vec<FunctionDefinition> {
+    let mut functions = Vec::new();
+    collect_function_definitions(&program.ast.statements, &mut functions);
+    functions
+}
+
+fn collect_function_definitions(
+    statements: &[AstStatement],
+    functions: &mut Vec<FunctionDefinition>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, args } = &statement.kind {
+            functions.push(FunctionDefinition {
+                name: name.clone(),
+                args: args.clone(),
+                statement: statement.clone(),
+            });
+        }
+        collect_function_definitions(&statement.children, functions);
+    }
 }
 
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
@@ -3552,6 +3589,7 @@ struct FieldDef {
     path: String,
     local_name: String,
     parent_path: String,
+    statement: AstStatement,
     ast_items: Vec<AstItem>,
     ast_exprs: Vec<AstExpr>,
 }
@@ -3917,6 +3955,7 @@ fn gather_field_defs_from_statements(
                         path,
                         local_name: name.clone(),
                         parent_path,
+                        statement: statement.clone(),
                         ast_items: collect_statement_ast_items(statement, items),
                         ast_exprs: collect_statement_ast_exprs(statement, program),
                     });

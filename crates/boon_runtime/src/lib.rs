@@ -3,12 +3,15 @@
 
 use bitvec::prelude::*;
 use boon_ir::{
-    DerivedValueKind, FieldId, FormulaOperationKind, InitialValue, ListId, ListInitializer,
-    ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
-    TableDefaultField, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
-    verify_static_schedule,
+    DerivedValueKind, FieldId, FormulaOperationKind, FunctionDefinition, InitialValue, ListId,
+    ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, SourceId,
+    SourcePayloadField, TableDefaultField, TypedProgram, UpdateExpression, debug_tables, lower,
+    verify_hidden_identity, verify_static_schedule,
 };
-use boon_parser::{DocumentAst, ParsedProgram, parse_project, parse_source};
+use boon_parser::{
+    AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, DocumentAst, ParsedProgram,
+    parse_project, parse_source,
+};
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value as JsonValue, json};
@@ -1758,6 +1761,7 @@ struct CompiledProgram {
     symbols: RuntimeSymbols,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
+    generic_derived: GenericDerivedPlan,
     list_equations: ListEquationPlan,
     formula_operators: FormulaOperatorPlan,
     list_projections: ListProjectionPlan,
@@ -2003,6 +2007,7 @@ impl CompiledProgram {
         }
         let scalar_equations = ScalarEquationPlan::from_ir(ir);
         let derived_equations = DerivedEquationPlan::from_ir(ir);
+        let generic_derived = GenericDerivedPlan::from_ir(ir);
         let derived_text_transform_count = derived_equations.text_transforms.len();
         let list_equations = ListEquationPlan::from_ir(ir);
         let formula_operators = FormulaOperatorPlan::from_ir(ir);
@@ -2035,6 +2040,7 @@ impl CompiledProgram {
             symbols,
             scalar_equations,
             derived_equations,
+            generic_derived,
             list_equations,
             formula_operators,
             list_projections,
@@ -2192,11 +2198,11 @@ impl TypedStorageLayoutCounts {
                 (true, InitialValue::Unknown { .. }) => {}
             }
         }
-        for value in &ir.derived_values {
-            if value.indexed && value.kind == DerivedValueKind::Formula {
-                counts.list_row_text_slot_count += 1;
-            }
-        }
+        counts.list_row_text_slot_count += ir
+            .derived_values
+            .iter()
+            .filter(|value| value.indexed)
+            .count();
         counts
     }
 }
@@ -4555,6 +4561,7 @@ struct GenericScheduledRuntime {
     storage: GenericCircuitRuntime,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
+    generic_derived: GenericDerivedPlan,
     list_equations: ListEquationPlan,
     formula_operators: FormulaOperatorPlan,
     list_projections: ListProjectionPlan,
@@ -4570,6 +4577,7 @@ impl GenericScheduledRuntime {
             storage: GenericCircuitRuntime::new(ir)?,
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
+            generic_derived: compiled.generic_derived.clone(),
             list_equations: compiled.list_equations.clone(),
             formula_operators: compiled.formula_operators.clone(),
             list_projections: compiled.list_projections.clone(),
@@ -5757,7 +5765,7 @@ impl GenericCircuitRuntime {
                     .map(|row| {
                         let initial_fields = list_initial_fields(row)?;
                         let mut row = row_template.materialize(initial_fields)?;
-                        initialize_indexed_formula_fields(ir, &row_scope, &mut row);
+                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
                         Ok(row)
                     })
                     .collect::<RuntimeResult<Vec<_>>>()?,
@@ -5789,7 +5797,7 @@ impl GenericCircuitRuntime {
                                 .insert_value("address".to_owned(), FieldValue::Text(address));
                             row_template.fill_missing_row_initial_fields(&mut initial_fields);
                             let mut row = row_template.materialize(initial_fields)?;
-                            initialize_indexed_formula_fields(ir, &row_scope, &mut row);
+                            initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
                             table_rows.push(row);
                         }
                     }
@@ -5811,7 +5819,7 @@ impl GenericCircuitRuntime {
                         initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
                         row_template.fill_missing_row_initial_fields(&mut initial_fields);
                         let mut row = row_template.materialize(initial_fields)?;
-                        initialize_indexed_formula_fields(ir, &row_scope, &mut row);
+                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
                         range_rows.push(row);
                     }
                     range_rows
@@ -7395,7 +7403,7 @@ fn runtime_value_from_initial(
     }
 }
 
-fn initialize_indexed_formula_fields(
+fn initialize_indexed_derived_text_fields(
     ir: &TypedProgram,
     row_scope: &str,
     row: &mut RuntimeRowSnapshot,
@@ -7403,7 +7411,7 @@ fn initialize_indexed_formula_fields(
     for value in ir
         .derived_values
         .iter()
-        .filter(|value| value.indexed && value.kind == DerivedValueKind::Formula)
+        .filter(|value| value.indexed)
     {
         let Some(field) = value
             .path
@@ -8187,6 +8195,21 @@ struct DerivedEquationPlan {
     text_transforms: Vec<RuntimeDerivedTextTransform>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct GenericDerivedPlan {
+    expressions: Vec<AstExpr>,
+    functions: BTreeMap<String, FunctionDefinition>,
+    indexed_fields: Vec<GenericDerivedIndexedField>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericDerivedIndexedField {
+    list: String,
+    row_scope: String,
+    field: String,
+    statement: AstStatement,
+}
+
 #[derive(Clone, Debug)]
 struct ListProjectionPlan {
     projections: Vec<RuntimeListProjection>,
@@ -8624,6 +8647,51 @@ impl DerivedEquationPlan {
             )
             .into()),
         }
+    }
+}
+
+impl GenericDerivedPlan {
+    fn from_ir(ir: &TypedProgram) -> Self {
+        let functions = ir
+            .functions
+            .iter()
+            .cloned()
+            .map(|function| (function.name.clone(), function))
+            .collect::<BTreeMap<_, _>>();
+        let indexed_fields = ir
+            .derived_values
+            .iter()
+            .filter(|value| {
+                value.indexed
+                    && matches!(
+                        value.kind,
+                        DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
+                    )
+            })
+            .filter_map(|value| {
+                let (row_scope, field) = value.path.split_once('.')?;
+                let list = ir
+                    .row_scopes
+                    .iter()
+                    .find(|scope| scope.row_scope == row_scope)
+                    .map(|scope| scope.list.clone())?;
+                Some(GenericDerivedIndexedField {
+                    list,
+                    row_scope: row_scope.to_owned(),
+                    field: field.to_owned(),
+                    statement: value.statement.clone(),
+                })
+            })
+            .collect();
+        Self {
+            expressions: ir.expressions.clone(),
+            functions,
+            indexed_fields,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.indexed_fields.is_empty()
     }
 }
 

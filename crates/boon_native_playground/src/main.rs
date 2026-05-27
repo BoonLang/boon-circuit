@@ -465,6 +465,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
+    let render_loop_state_report = value_arg(args, "--render-loop-report");
     let code_hash = boon_runtime::sha256_bytes(source.as_bytes());
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
     let scenario_path = Path::new(&code_file).with_extension("scn");
@@ -540,9 +541,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let mut input_state = poll_input_state
                 .lock()
                 .map_err(|_| "preview input state mutex poisoned".to_owned())?;
+            let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
+                .map_err(|error| error.to_string())?;
             if preview_input_has_unhandled_source_events(&context.input_delta, &input_state) {
-                let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
-                    .map_err(|error| error.to_string())?;
                 if let Err(error) = preview_apply_real_window_input(
                     &context.input_delta,
                     &input_context.source_path,
@@ -559,21 +560,18 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     role_dirty_reason =
                         Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
                 }
-            } else {
-                let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
+            }
+            if let Err(error) = preview_apply_scroll_input(
+                &context.input_delta,
+                Some(&input_context.source_path),
+                Some(&input_context.source_text),
+                input_context.live_runtime.as_ref(),
+                &poll_shared_render_state,
+            ) {
+                preview_note_render_error(&poll_shared_render_state, error.to_string())
                     .map_err(|error| error.to_string())?;
-                if let Err(error) = preview_apply_scroll_input(
-                    &context.input_delta,
-                    Some(&input_context.source_path),
-                    Some(&input_context.source_text),
-                    input_context.live_runtime.as_ref(),
-                    &poll_shared_render_state,
-                ) {
-                    preview_note_render_error(&poll_shared_render_state, error.to_string())
-                        .map_err(|error| error.to_string())?;
-                    role_dirty_reason =
-                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
-                }
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
             }
             let focus_changed = preview_apply_focus_overlay(
                 &poll_shared_render_state,
@@ -640,6 +638,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             warmup_frame_count,
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
+            render_loop_state_report,
         },
         hooks,
         wake_handle,
@@ -710,6 +709,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let role_args = args[1..].to_vec();
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
+    let render_loop_state_report = value_arg(args, "--render-loop-report");
     let dev_source_path_label = editor_code_file
         .as_ref()
         .map(|path| path.display().to_string())
@@ -749,14 +749,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 dirty = true;
                 role_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink);
             }
-            if shell.refresh_preview_summary_if_due(context.now) {
-                dirty = true;
-                role_dirty_reason =
-                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
-            }
             let cache_stale = render_state.layout_frame.is_none()
                 || render_state.width != context.width
                 || render_state.height != context.height;
+            let input_hot_path = dev_input_may_change(&context.input_delta, &input_state);
             if cache_stale {
                 let document = shell.document_for_viewport(context.width, context.height);
                 render_state.layout_frame =
@@ -778,9 +774,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
             }
-            if dev_input_may_change(&context.input_delta, &input_state)
-                && let Some(layout_frame) = render_state.layout_frame.clone()
-            {
+            if input_hot_path && let Some(layout_frame) = render_state.layout_frame.clone() {
                 let document = shell.document_for_viewport(context.width, context.height);
                 let layout_changed = dev_apply_real_window_input(
                     &context.input_delta,
@@ -813,19 +807,28 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
                 }
             }
+            if !input_hot_path && shell.refresh_preview_summary_if_due(context.now) {
+                dirty = true;
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
+            }
             if context.forced_frame && render_state.layout_frame.is_some() {
                 dirty = true;
                 role_dirty_reason = role_dirty_reason.or(Some(
                     boon_native_app_window::NativeRoleDirtyReason::VerifierFrame,
                 ));
             }
+            let caret_wake = input_state
+                .editor_focused
+                .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS);
+            let telemetry_wake =
+                (!input_hot_path).then(|| shell.preview_summary_wake_after_ms(context.now));
+            let next_wake_after_ms = [caret_wake, telemetry_wake].into_iter().flatten().min();
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: render_state.revision,
                 role_dirty_reason,
-                next_wake_after_ms: input_state
-                    .editor_focused
-                    .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS),
+                next_wake_after_ms,
                 wants_animation_frame: false,
             })
         });
@@ -860,6 +863,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             warmup_frame_count,
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
+            render_loop_state_report,
         },
         hooks,
         boon_native_app_window::NativeWakeHandle::new(),
@@ -1012,6 +1016,13 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0);
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1);
+    let preview_loop_report = role_dir.join(format!(
+        "preview-loop-{}-{}.json",
+        example,
+        std::process::id()
+    ));
+    let dev_loop_report =
+        role_dir.join(format!("dev-loop-{}-{}.json", example, std::process::id()));
     let mut preview_args = vec![
         "--role".to_owned(),
         "preview".to_owned(),
@@ -1037,6 +1048,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         warmup_frame_count.to_string(),
         "--sample-frame-count".to_owned(),
         sample_frame_count.to_string(),
+        "--render-loop-report".to_owned(),
+        preview_loop_report
+            .to_str()
+            .ok_or("preview loop report path is not UTF-8")?
+            .to_owned(),
     ];
     if probe && !real_window_input_probe {
         preview_args.push("--synthetic-input-probe".to_owned());
@@ -1099,6 +1115,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         warmup_frame_count.to_string(),
         "--sample-frame-count".to_owned(),
         sample_frame_count.to_string(),
+        "--render-loop-report".to_owned(),
+        dev_loop_report
+            .to_str()
+            .ok_or("dev loop report path is not UTF-8")?
+            .to_owned(),
     ]);
     if probe && !real_window_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
@@ -1258,8 +1279,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "cosmic_background_launch_machine_readable_proof": false,
             "preview_role_report": preview_report,
             "dev_role_report": dev_report,
+            "preview_loop_report": preview_loop_report,
+            "dev_loop_report": dev_loop_report,
             "preview_role_report_sha256": boon_runtime::sha256_file(&preview_report).unwrap_or_else(|_| "missing".to_owned()),
             "dev_role_report_sha256": boon_runtime::sha256_file(&dev_report).unwrap_or_else(|_| "missing".to_owned()),
+            "preview_loop_report_sha256": boon_runtime::sha256_file(&preview_loop_report).unwrap_or_else(|_| "missing".to_owned()),
+            "dev_loop_report_sha256": boon_runtime::sha256_file(&dev_loop_report).unwrap_or_else(|_| "missing".to_owned()),
             "note": "desktop supervisor spawns two child roles with app_window/wgpu windows and bounded live IPC; COSMIC launcher proof is owned by the xtask wrapper that invokes cosmic-background-launch"
         });
         details["requested_preview_hold_ms"] = json!(child_hold_ms);
@@ -6256,6 +6281,16 @@ impl DevWindowShell {
         previous_hash != next_hash
     }
 
+    fn preview_summary_wake_after_ms(&self, now: Instant) -> u64 {
+        self.last_preview_summary_refresh
+            .and_then(|last| {
+                let due_at = last + Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS);
+                due_at.checked_duration_since(now)
+            })
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
     fn command_probe(&self) -> serde_json::Value {
         let mut shell = self.clone();
         shell.workspace = shell.initial_workspace.clone();
@@ -9891,13 +9926,6 @@ fn preview_apply_real_window_input(
             }
         }
     }
-    preview_apply_scroll_input(
-        input,
-        Some(source_path),
-        Some(source_text),
-        Some(live_runtime),
-        shared_render_state,
-    )?;
     preview_apply_focus_overlay(shared_render_state, input_state, true)?;
     Ok(())
 }
@@ -11197,7 +11225,7 @@ fn preview_enqueue_source_project(
             wake_handle.wake();
         })?;
 
-    Ok(json!({
+    let mut ack = json!({
         "kind": "replace-source-queued",
         "status": "queued",
         "command_id": payload.command_id,
@@ -11219,7 +11247,17 @@ fn preview_enqueue_source_project(
         "preview_blocked_on_ipc_count": 0,
         "preview_receives_example_name": false,
         "preview_pid": std::process::id()
-    }))
+    });
+    let mut ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
+    loop {
+        ack["ack_payload_bytes"] = json!(ack_payload_bytes);
+        let next = serde_json::to_vec(&ack)?.len() as u64;
+        if next == ack_payload_bytes {
+            break;
+        }
+        ack_payload_bytes = next;
+    }
+    Ok(ack)
 }
 
 fn source_project_payload_from_request(
@@ -14443,6 +14481,11 @@ mod tests {
         assert_eq!(ack["sync_ack_contains_layout_proof"], false);
         assert!(ack.get("preview_runtime_summary").is_none());
         assert!(ack.get("document_layout_proof").is_none());
+        assert_eq!(
+            ack["ack_payload_bytes"],
+            json!(serde_json::to_vec(&ack).unwrap().len() as u64)
+        );
+        assert!(ack["ack_payload_bytes"].as_u64().unwrap() < 16_384);
 
         let start = Instant::now();
         loop {

@@ -3335,6 +3335,14 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
             || combined_cpu_p95 > combined_cpu_budget)
             .then(|| "idle CPU budget exceeded".to_owned()),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:uses-live-native-process-evidence",
+        false,
+        "current implementation still uses a scheduler model; contract requires child PID procfs CPU deltas and app-owned readback artifacts",
+        Some("replace modeled idle/wake proof with live native desktop launch, child PID procfs tick deltas, post-idle input/source replacement, and app-owned readback hash evidence".to_owned()),
+    );
     let extra = json!({
         "example": example,
         "profile": profile,
@@ -3459,6 +3467,14 @@ fn verify_native_dev_editor_scroll_speed(
             || source_replace_count != 0
             || summary_query_count != 0)
             .then(|| "dev editor scroll hot path performed preview/runtime work".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:uses-passive-native-scroll-probe",
+        false,
+        "current implementation still uses deterministic model values; contract requires passive native scroll input and app-owned readback evidence",
+        Some("replace modeled dev-editor scroll report with launched native desktop probe covering sustained vertical and horizontal scroll_column updates, hot-path counters, and readback artifacts".to_owned()),
     );
     let extra = json!({
         "profile": profile,
@@ -3635,6 +3651,14 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         ),
         (!stale_ack_rejected || !stale_result_rejected)
             .then(|| "example switch latest-wins protocol accepted stale work".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:uses-live-async-preview-protocol",
+        false,
+        "current implementation still models ACKs and presentation timing; contract requires live dev-to-preview source/project switching evidence",
+        Some("replace modeled example-switch report with live native desktop protocol probe covering bundled examples, custom single-file examples, multi-file custom projects, rapid A-B-A, invalid source, stale rejection, and last-good-frame preservation".to_owned()),
     );
     let extra = json!({
         "profile": profile,
@@ -11969,6 +11993,23 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             continue;
         }
         let report = read_json(path)?;
+        let schema_file_valid = verify_report_schema(path).is_ok();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:report-schema-file:{label}"),
+            schema_file_valid,
+            format!(
+                "{} verify_report_schema={schema_file_valid}",
+                path.display()
+            ),
+            (!schema_file_valid).then(|| {
+                format!(
+                    "native GPU report `{}` failed verify_report_schema",
+                    path.display()
+                )
+            }),
+        );
         let schema_blockers = validate_native_gpu_child_report_shape(requirement, &report);
         let schema_valid = schema_blockers.is_empty();
         push_audit_check(
@@ -12005,6 +12046,28 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             }),
         );
         let pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let all_steps_pass = report
+            .get("per_step_pass_fail")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| {
+                !steps.is_empty()
+                    && steps.iter().all(|step| {
+                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+            });
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:all-steps-pass:{label}"),
+            all_steps_pass,
+            format!("{} all_steps_pass={all_steps_pass}", path.display()),
+            (!all_steps_pass).then(|| {
+                format!(
+                    "native GPU report `{}` has missing or failing per_step_pass_fail entries",
+                    path.display()
+                )
+            }),
+        );
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -12886,9 +12949,20 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         | "idle-wake-custom-projects" => {
             require_str_field(&mut blockers, report, "render_loop_mode", "demand_driven");
             require_positive_u64(&mut blockers, report, "idle_observation_ms");
-            require_u64_at_most(&mut blockers, report, "preview_child_pid", u64::MAX);
-            require_u64_at_most(&mut blockers, report, "dev_child_pid", u64::MAX);
-            require_nonempty_str_field(&mut blockers, report, "cpu_measurement_source");
+            require_positive_u64(&mut blockers, report, "preview_child_pid");
+            require_positive_u64(&mut blockers, report, "dev_child_pid");
+            require_distinct_u64_fields(
+                &mut blockers,
+                report,
+                "preview_child_pid",
+                "dev_child_pid",
+            );
+            require_str_field(
+                &mut blockers,
+                report,
+                "cpu_measurement_source",
+                "procfs-child-pid-tick-deltas",
+            );
             require_bool_field(
                 &mut blockers,
                 report,
@@ -12908,7 +12982,28 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "post_idle_source_replace_hash_changed",
                 true,
             );
-            require_nonempty_str_field(&mut blockers, report, "visual_capture_method");
+            require_str_field(
+                &mut blockers,
+                report,
+                "visual_capture_method",
+                "app-owned-wgpu-readback",
+            );
+            require_object_field(&mut blockers, report, "readback_artifact_before");
+            require_object_field(&mut blockers, report, "readback_artifact_after");
+            require_hash_field(&mut blockers, report, "post_idle_frame_hash_before");
+            require_hash_field(&mut blockers, report, "post_idle_frame_hash_after");
+            if report
+                .get("post_idle_frame_hash_before")
+                .and_then(serde_json::Value::as_str)
+                == report
+                    .get("post_idle_frame_hash_after")
+                    .and_then(serde_json::Value::as_str)
+            {
+                blockers.push("post-idle input frame hash must actually change".to_owned());
+            }
+            if label == "idle-wake-custom-projects" {
+                require_hash_field(&mut blockers, report, "custom_fixture_hash");
+            }
         }
         "dev-editor-scroll-speed-debug" | "dev-editor-scroll-speed-release" => {
             require_str_field(
@@ -12997,6 +13092,17 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_f64_at_least(&mut blockers, report, "text_cache_hit_rate", 0.90);
             require_u64_at_most(&mut blockers, report, "glyph_atlas_evictions", 0);
             require_u64_at_most(&mut blockers, report, "preview_blocked_on_ipc_count", 0);
+            require_nonempty_array(&mut blockers, report, "app_owned_readback_artifacts");
+            if report
+                .pointer("/operator_real_wheel_input_evidence/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push(
+                    "operator_real_wheel_input_evidence.status must be pass for dev editor scroll"
+                        .to_owned(),
+                );
+            }
         }
         "example-switch-speed-debug" | "example-switch-speed-release" => {
             require_nonempty_str_field(&mut blockers, report, "profile");
@@ -13054,6 +13160,33 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 .unwrap_or(500.0),
             );
             require_object_field(&mut blockers, report, "parse_lower_runtime_layout_timings");
+            require_nonempty_array(&mut blockers, report, "per_switch");
+            let sequence = report
+                .get("switch_sequence")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for required_label in [
+                "counter",
+                "todomvc",
+                "cells",
+                "custom:a",
+                "custom:b",
+                "custom:multi-file",
+                "invalid-custom",
+                "aba:a",
+                "aba:b",
+                "aba:a2",
+            ] {
+                if !sequence
+                    .iter()
+                    .any(|value| value.as_str() == Some(required_label))
+                {
+                    blockers.push(format!(
+                        "switch_sequence missing required scenario `{required_label}`"
+                    ));
+                }
+            }
             require_bool_field(&mut blockers, report, "stale_ack_rejected", true);
             require_bool_field(&mut blockers, report, "stale_result_rejected", true);
             require_bool_field(

@@ -185,6 +185,7 @@ pub struct NativePollContext<'a> {
 pub struct NativePollResult {
     pub dirty: bool,
     pub role_revision: u64,
+    pub scheduler_reason: Option<NativeSchedulerReason>,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub next_wake_at: Option<Instant>,
     pub wants_animation_frame: bool,
@@ -202,6 +203,12 @@ The poll hook owns role mutation:
 The render hook should be WGPU-only: encode an already materialized snapshot,
 return render proof data, and avoid dispatching source events, IPC commands, or
 telemetry requests.
+
+The scheduler reason must be explicit when a poll result dirties the window.
+`boon_native_app_window` must not collapse every dirty poll into `HostInput`.
+Unit tests and native reports must cover at least dirty-with-no-input, due
+timer, caret blink, telemetry hash change, external preview source wake, and
+real host input, each with the expected scheduler reason.
 
 ### Wake Handle
 
@@ -246,6 +253,12 @@ Revisions are two-phase. The role poll hook reports the candidate
 after command submission, `frame.present()`, and any required readback succeed
 for the current surface epoch. A render hook must not claim a revision is
 presented before the surface present has happened.
+
+The compatibility adapter is temporary only. Final gates must fail if a render
+result reports `content_revision == 0`, reports a revision older than the dirty
+revision being presented, marks a revision presented after a failed readback, or
+reuses a first-frame/cached proof after source, scroll, focus, layout, surface
+epoch, or error-overlay changes.
 
 ### Input Deltas
 
@@ -523,7 +536,6 @@ pub struct SourceProjectPayload {
     pub project_hash: String,
     pub entrypoint_unit: String,
     pub units: Vec<SourceProjectUnit>,
-    pub scenario_payload: Option<ScenarioPayload>,
 }
 
 pub struct SourceProjectUnit {
@@ -534,9 +546,11 @@ pub struct SourceProjectUnit {
 ```
 
 `source_identity` and `virtual_uri` are opaque data keys. Filesystem paths,
-display labels, and scenario file paths may appear in dev/verifier diagnostics,
-but preview must not read sibling `.scn` files or branch by path, label, bundled
-example ID, or custom/example origin during switching.
+display labels, scenario labels, scenario hashes, and scenario file paths may
+appear only in dev/verifier diagnostics and reports. Preview-bound IPC must not
+carry scenario payloads or verifier metadata, and preview must not read sibling
+`.scn` files or branch by path, label, bundled example ID, scenario data, or
+custom/example origin during switching.
 
 Protocol messages:
 
@@ -575,6 +589,9 @@ Add a bounded latest-wins source-replace worker:
 - IPC thread validates hashes, enqueues, ACKs, and returns;
 - worker parses/lowers/builds runtime/layout outside state locks;
 - stale queued work is coalesced or cancelled;
+- in-flight replace work is capped; stale large jobs must be cancelled before
+  parse/lower/runtime/layout work whenever a newer command supersedes them;
+- worker threads are bounded and must not leak across rapid switch sequences;
 - committed preview state swaps atomically only after a renderable layout
   succeeds;
 - invalid/deferred/error results keep the last good committed frame and update
@@ -721,6 +738,32 @@ command line, `/proc/<pid>/stat` tick deltas, wall-time sample interval, and raw
 sample values. Do not use compositor state, whole-desktop screenshots, or human
 observation as idle proof.
 
+CPU evidence must be verifier-owned `/proc/<pid>/stat` sampling of the live
+preview and dev child PIDs. The report must include each child PID, cmdline,
+process start time, raw `utime`/`stime` samples, sample count, monotonic
+wall-clock interval, jiffies conversion, and PID-reuse rejection. Self-reported
+CPU samples from the child process are diagnostics only and cannot satisfy the
+idle/wake gate.
+
+All new native GPU reports must include freshness and provenance fields:
+`current_git_commit`, source or fixture hashes, `tested_binary_sha256`,
+`budget_hash`, explicit thresholds plus observed values, report start/end
+timestamps, and artifact path plus artifact sha256 links. Negative fixtures must
+fail stale git/source/binary hashes, future timestamps, missing artifacts, stale
+surface epochs, and copied first-frame artifacts.
+
+App-owned readback evidence must be structured, not just a hash string. Each
+readback artifact must include a closed `capture_method` enum value, artifact
+path, artifact sha256, width, height, surface ID, surface epoch, content
+revision, copy-to-present proof ID, and before/after frame hashes. Hash-only
+proofs and copied first-frame artifacts fail.
+
+Input evidence must include a closed `input_provenance` enum. Operator host
+events from the verifier-owned input path, observed app-window/platform events,
+and any manual/human observation must be distinguishable. `real_os_input: true`
+is allowed only when app_window/platform events were observed and recorded;
+human observation is never verifier evidence.
+
 ## Implementation Steps
 
 1. Add scheduler data types and unit tests in `boon_native_app_window`.
@@ -777,8 +820,13 @@ Add tests for the scheduler:
 - unfocused caret schedules no wake;
 - explicit verifier readback forces a frame;
 - requested animation can request continuous frames through a generic flag;
+- dirty-with-no-input, due timer, caret blink, telemetry hash change, external
+  preview source wake, and real host input each record the expected scheduler
+  reason;
 - dirty revision/presented revision cannot go backwards;
 - two-phase presented revision commits only after successful present;
+- structured render results reject `content_revision == 0`, older revisions,
+  failed readbacks, and stale cached proofs after visible changes;
 - surface lost/outdated/timeout handling does not mark unpresented revisions as
   presented;
 - surface epoch increments invalidate renderer/readback caches;
@@ -826,6 +874,8 @@ Add dev tests:
   runtime summary, parse/lower output, runtime state, or debug summary;
 - source replacement result for an old command ID cannot overwrite a newer tab;
 - latest-wins source replacement coalesces/cancels stale queued work;
+- rapid A-B-A with large payloads keeps replace queue depth <= 1, cancels stale
+  jobs before build work, and does not leak worker threads;
 - rapid A-B-A switching presents only the latest accepted revision;
 - invalid custom source keeps the previous good preview frame and reports a
   pending/error overlay.
@@ -882,7 +932,9 @@ Register all new gates in every enforcement surface:
 - blocker-audit allowlists in `crates/boon_report_schema`;
 - blocker-audit allowlists in `crates/xtask`;
 - report schema required-field validation;
-- `verify-report-schema` report discovery/scan compatibility;
+- `verify-report-schema` report discovery/scan compatibility for schema
+  validation only; it must not be a native GPU handoff gate or substitute for
+  `verify-native-gpu-all`;
 - `budgets/native-gpu.toml`;
 - `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 
@@ -923,7 +975,13 @@ The dev-editor-scroll report must include at least:
 - `upload_bytes_p50_p95_max`;
 - `preview_blocked_on_ipc_count`;
 - app-owned readback artifacts;
-- operator/real wheel input evidence.
+- closed-enum input provenance and operator/real wheel input evidence.
+
+The dev-editor-scroll schema and negative fixtures must reject deterministic or
+model-only evidence such as `measurement_source:
+deterministic-dev-editor-scroll-model`. A passing report must include launched
+binary/process evidence, app-owned before/after readbacks, and
+`operator_real_wheel_input_evidence.status == pass`.
 
 The example-switch-speed report must include at least:
 
@@ -949,6 +1007,11 @@ The example-switch-speed report must include at least:
 - `sync_ack_contains_layout_proof: false`;
 - `last_good_frame_kept_while_pending: true`;
 - before/after app-owned readback hashes.
+
+The example-switch-speed schema and negative fixtures must reject modeled ACKs,
+modeled presentation timing, missing process evidence, missing source revision,
+missing command ID, and any synchronous ACK containing runtime summaries, layout
+proofs, parse/lower output, runtime state, or debug summaries.
 
 Add negative fixtures that fail loudly for:
 
@@ -1026,14 +1089,22 @@ The CPU budgets are intentionally stricter than the immediate observed bug. If
 they are too strict on the current machine, the implementation should report the
 measured baseline and adjust only with evidence in this file.
 
-## Final Gate
+## Implementation Tests
 
-After implementation, run:
+Run these before the native handoff gates to catch local regressions:
 
 ```bash
 cargo test -p boon_native_app_window --lib
 cargo test -p boon_native_playground --bin boon_native_playground
 cargo test -p boon_runtime --lib
+```
+
+## Native GPU Handoff Gates
+
+Only the native GPU xtask reports below, followed by
+`verify-native-gpu-all --check-existing`, count as native handoff evidence:
+
+```bash
 cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
 cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
 cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json

@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::SurfaceTargetUnsafe;
 
@@ -107,6 +106,7 @@ pub struct NativeWindowOptions {
     pub warmup_frame_count: u32,
     pub sample_frame_count: u32,
     pub readback_artifact_dir: Option<String>,
+    pub render_loop_state_report: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -209,6 +209,28 @@ impl NativeRenderLoopState {
     pub fn note_input_poll(&mut self) {
         self.input_poll_count = self.input_poll_count.saturating_add(1);
     }
+
+    pub fn schedule_wake_after(&mut self, now: Instant, delay: Duration) -> Instant {
+        let candidate = now + delay;
+        if self
+            .next_wake_at
+            .is_none_or(|existing| candidate < existing)
+        {
+            self.next_wake_at = Some(candidate);
+        }
+        self.next_wake_at.unwrap_or(candidate)
+    }
+
+    pub fn consume_due_wake(&mut self, now: Instant) -> bool {
+        if self.next_wake_at.is_some_and(|wake_at| now >= wake_at) {
+            self.next_wake_at = None;
+            self.mark_dirty(NativeSchedulerReason::Timer, None);
+            self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,23 +278,46 @@ impl NativeRenderHookResult {
 #[derive(Clone, Debug)]
 pub struct NativeWakeHandle {
     generation: Arc<AtomicU64>,
+    signal: Arc<(Mutex<u64>, Condvar)>,
 }
 
 impl NativeWakeHandle {
     pub fn new() -> Self {
         Self {
             generation: Arc::new(AtomicU64::new(0)),
+            signal: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
 
     pub fn wake(&self) -> u64 {
-        self.generation
+        let generation = self
+            .generation
             .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1)
+            .saturating_add(1);
+        let (lock, condvar) = &*self.signal;
+        if let Ok(mut signaled_generation) = lock.lock() {
+            *signaled_generation = generation;
+            condvar.notify_all();
+        }
+        generation
     }
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn wait_for_wake_after(&self, observed_generation: u64, timeout: Duration) -> u64 {
+        if self.generation() != observed_generation || timeout.is_zero() {
+            return self.generation();
+        }
+        let (lock, condvar) = &*self.signal;
+        let Ok(guard) = lock.lock() else {
+            return self.generation();
+        };
+        let _ = condvar.wait_timeout_while(guard, timeout, |signaled_generation| {
+            *signaled_generation <= observed_generation && self.generation() == observed_generation
+        });
+        self.generation()
     }
 }
 
@@ -1064,6 +1109,8 @@ async fn run_surface_probe_inner(
             surface.configure(&device, &config);
             render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceChanged, None);
         }
+        let poll_started_at = Instant::now();
+        render_loop_state.consume_due_wake(poll_started_at);
         let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
         render_loop_state.note_input_poll();
         let poll_result = poll_native_window_hooks(
@@ -1076,14 +1123,16 @@ async fn run_surface_probe_inner(
                 height,
                 scale: current_scale as f32,
                 input_delta: input.clone(),
-                now: Instant::now(),
+                now: poll_started_at,
                 forced_frame: false,
             },
         )?;
         if let Some(poll_result) = poll_result {
             if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
-                render_loop_state.next_wake_at =
-                    Some(Instant::now() + Duration::from_millis(next_wake_after_ms));
+                render_loop_state.schedule_wake_after(
+                    poll_started_at,
+                    Duration::from_millis(next_wake_after_ms),
+                );
             }
             if poll_result.dirty {
                 render_loop_state.mark_dirty(
@@ -1111,7 +1160,12 @@ async fn run_surface_probe_inner(
         }
         if !render_loop_state.should_render(Instant::now(), false) {
             render_loop_state.note_idle_poll();
-            std::thread::sleep(Duration::from_millis(50));
+            let idle_timeout = render_loop_state
+                .next_wake_at
+                .and_then(|wake_at| wake_at.checked_duration_since(Instant::now()))
+                .unwrap_or_else(|| Duration::from_millis(50))
+                .min(Duration::from_millis(50));
+            let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
             continue;
         }
         if hooks.as_ref().is_none_or(|hooks| hooks.poll.is_none()) {
@@ -1180,6 +1234,19 @@ async fn run_surface_probe_inner(
         };
         std::thread::sleep(Duration::from_millis(frame_sleep_ms));
     }
+    if let Some(report) = options.render_loop_state_report.as_deref() {
+        write_render_loop_state_report(
+            Path::new(report),
+            options.role,
+            std::process::id(),
+            &window_id,
+            &surface_id,
+            1,
+            &render_loop_state,
+            hold_started.elapsed(),
+            wake_handle.generation(),
+        )?;
+    }
     let _ = callback_done_receiver.recv_timeout(Duration::from_secs(30));
     drop(surface);
     drop(app_surface);
@@ -1239,6 +1306,57 @@ fn queue_visible_surface_readback(
         padded_bytes_per_row,
         format,
     })
+}
+
+fn write_render_loop_state_report(
+    path: &Path,
+    role: NativeWindowRole,
+    pid: u32,
+    window_id: &WindowId,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    state: &NativeRenderLoopState,
+    elapsed: Duration,
+    wake_generation: u64,
+) -> Result<(), NativeWindowError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            NativeWindowError::Failed(format!(
+                "create render-loop report dir {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let report = serde_json::json!({
+        "status": "pass",
+        "role": role.as_str(),
+        "pid": pid,
+        "window_id": window_id,
+        "surface_id": surface_id,
+        "surface_epoch": surface_epoch,
+        "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
+        "wake_generation": wake_generation,
+        "render_loop_state": state,
+        "render_loop_mode": state.mode,
+        "dirty_revision": state.dirty_revision,
+        "presented_revision": state.presented_revision,
+        "rendered_frame_count": state.rendered_frame_count,
+        "skipped_idle_poll_count": state.skipped_idle_poll_count,
+        "input_poll_count": state.input_poll_count,
+        "forced_frame_count": state.forced_frame_count,
+        "scheduled_wake_count": state.scheduled_wake_count,
+        "last_scheduler_reason": state.last_scheduler_reason,
+        "last_role_dirty_reason": state.last_role_dirty_reason
+    });
+    let bytes = serde_json::to_vec_pretty(&report)
+        .map_err(|error| NativeWindowError::Failed(format!("serialize loop state: {error}")))?;
+    std::fs::write(path, bytes).map_err(|error| {
+        NativeWindowError::Failed(format!(
+            "write render-loop report {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn finish_visible_surface_readback(
@@ -1836,6 +1954,41 @@ mod tests {
         assert_eq!(wake_handle.generation(), 0);
         assert_eq!(wake_handle.wake(), 1);
         assert_eq!(wake_handle.generation(), 1);
+    }
+
+    #[test]
+    fn wake_handle_interrupts_idle_wait() {
+        let wake_handle = NativeWakeHandle::new();
+        let worker_wake = wake_handle.clone();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            worker_wake.wake();
+        });
+
+        let observed = wake_handle.wait_for_wake_after(0, Duration::from_secs(5));
+
+        assert_eq!(observed, 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn scheduled_wake_is_not_pushed_later_by_repeated_poll_results() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+        let now = Instant::now();
+        let first = state.schedule_wake_after(now, Duration::from_millis(500));
+        let second =
+            state.schedule_wake_after(now + Duration::from_millis(100), Duration::from_millis(500));
+
+        assert_eq!(first, second);
+        assert!(!state.consume_due_wake(now + Duration::from_millis(499)));
+        assert!(state.consume_due_wake(now + Duration::from_millis(500)));
+        assert_eq!(
+            state.last_scheduler_reason,
+            Some(NativeSchedulerReason::Timer)
+        );
+        assert!(state.should_render(now + Duration::from_millis(500), false));
     }
 
     #[test]

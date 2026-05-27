@@ -16,10 +16,14 @@ FUNCTION new_cell(cell) {
     ]
 
     [
-        address: cell.address
+        address:
+            cell_address(index: cell.index)
+
+        default_formula:
+            default_formula_for_address(address: address)
 
         editing_text:
-            cell.default_formula |> HOLD draft {
+            default_formula |> HOLD draft {
                 LATEST {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
@@ -29,7 +33,7 @@ FUNCTION new_cell(cell) {
             }
 
         formula_text:
-            cell.default_formula |> HOLD formula_text {
+            default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
                     sources.editor.blur.text

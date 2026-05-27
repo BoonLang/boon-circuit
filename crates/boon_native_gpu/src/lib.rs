@@ -1006,6 +1006,11 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             let size = style_number(&item.style, "size").unwrap_or(14.0);
             let raw_text = item.text.as_deref().unwrap_or_default();
             let checked = style_bool(&item.style, "checked") == Some(true);
+            let input_wants_caret_layout = matches!(item.kind, DocumentNodeKind::TextInput)
+                && (item.focused
+                    || style_bool(&item.style, "focus") == Some(true)
+                    || style_bool(&item.style, "caret_visible").is_some()
+                    || item.style.contains_key("caret_column"));
             let (text, color) = if raw_text.trim().is_empty() {
                 if checked {
                     (
@@ -1019,6 +1024,11 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                         placeholder.to_owned(),
                         style_color_u8(&item.style, "placeholder_color")
                             .unwrap_or([154, 154, 154, 255]),
+                    )
+                } else if input_wants_caret_layout {
+                    (
+                        String::new(),
+                        style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
                     )
                 } else {
                     return None;
@@ -1283,15 +1293,24 @@ fn text_left_for_width(run: &TextRun, text_width: f32) -> f32 {
 }
 
 fn text_top_for_height(run: &TextRun) -> f32 {
-    let line_height = (run.size.clamp(8.0, 120.0) * 1.25).max(1.0);
-    match run.vertical_align {
-        TextVerticalAlign::Top => run.bounds.y + 1.0,
-        TextVerticalAlign::Center => {
-            run.bounds.y + ((run.bounds.height - line_height) / 2.0).max(0.0)
-        }
-        TextVerticalAlign::Bottom => {
-            run.bounds.y + (run.bounds.height - line_height - run.text_inset).max(0.0)
-        }
+    text_top_for_parts(run.bounds, run.size, run.text_inset, run.vertical_align)
+}
+
+fn text_line_height(font_size: f32) -> f32 {
+    (font_size.clamp(8.0, 120.0) * 1.25).max(1.0)
+}
+
+fn text_top_for_parts(
+    bounds: Rect,
+    font_size: f32,
+    text_inset: f32,
+    vertical_align: TextVerticalAlign,
+) -> f32 {
+    let line_height = text_line_height(font_size);
+    match vertical_align {
+        TextVerticalAlign::Top => bounds.y + 1.0,
+        TextVerticalAlign::Center => bounds.y + ((bounds.height - line_height) / 2.0).max(0.0),
+        TextVerticalAlign::Bottom => bounds.y + (bounds.height - line_height - text_inset).max(0.0),
     }
 }
 
@@ -1363,12 +1382,20 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
     frame
         .display_list
         .iter()
-        .filter(|item| matches!(item.kind, DocumentNodeKind::Text))
+        .filter(|item| {
+            matches!(
+                item.kind,
+                DocumentNodeKind::Text | DocumentNodeKind::TextInput
+            )
+        })
         .filter(|item| {
             item.style.contains_key("editor_selection_start")
                 || item.style.contains_key("editor_selection_end")
                 || item.style.contains_key("editor_bracket_columns")
                 || item.style.contains_key("editor_caret_column")
+                || item.style.contains_key("caret_column")
+                || item.focused
+                || style_bool(&item.style, "focus") == Some(true)
         })
         .map(|item| item.node.clone())
         .collect()
@@ -1397,7 +1424,16 @@ fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVertica
         Some("top") => TextVerticalAlign::Top,
         Some("center") => TextVerticalAlign::Center,
         Some("bottom") => TextVerticalAlign::Bottom,
-        _ if matches!(kind, DocumentNodeKind::Button) => TextVerticalAlign::Center,
+        _ if matches!(
+            kind,
+            DocumentNodeKind::Button
+                | DocumentNodeKind::Text
+                | DocumentNodeKind::TextInput
+                | DocumentNodeKind::TableCell
+        ) =>
+        {
+            TextVerticalAlign::Center
+        }
         _ => TextVerticalAlign::Top,
     }
 }
@@ -1650,18 +1686,29 @@ fn rect_vertices(
         }
         if matches!(item.kind, DocumentNodeKind::TextInput)
             && (item.focused || style_bool(&item.style, "focus") == Some(true))
+            && style_bool(&item.style, "caret_visible").unwrap_or(true)
         {
             let color = style_color_f32(&item.style, "caret_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.22, 0.22, 0.22, 1.0]);
+            let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+            let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
+            let vertical_align = text_vertical_align(&item.kind, &item.style);
+            let line_top = text_top_for_parts(item.bounds, font_size, text_inset, vertical_align);
+            let line_height = text_line_height(font_size).min(item.bounds.height.max(1.0));
+            let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
+            let caret_x = text_layouts
+                .and_then(|layouts| layouts.get(&item.node))
+                .map(|layout| layout.x_for_column(caret_column.max(0.0)))
+                .unwrap_or(item.bounds.x + text_inset);
             push_rect(
                 &mut positions,
                 &mut colors,
                 Rect {
-                    x: item.bounds.x + 12.0,
-                    y: item.bounds.y + 11.0,
+                    x: caret_x,
+                    y: line_top,
                     width: 2.0,
-                    height: (item.bounds.height - 22.0).max(16.0),
+                    height: line_height,
                 },
                 width,
                 height,
@@ -2183,6 +2230,54 @@ mod tests {
         assert_eq!(run.vertical_align, TextVerticalAlign::Top);
         assert_eq!(text_left_for_width(run, 30.0), 14.0);
         assert_eq!(text_top_for_height(run), 21.0);
+    }
+
+    #[test]
+    fn text_inputs_center_text_and_place_caret_from_text_metrics() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(12.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(4.0));
+        style.insert("caret_column".to_owned(), StyleValue::Number(1.0));
+        style.insert("caret_visible".to_owned(), StyleValue::Bool(true));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("input".to_owned()),
+                kind: DocumentNodeKind::TextInput,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 90.0,
+                    height: 24.0,
+                },
+                text: Some("30".to_owned()),
+                style,
+                focused: true,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 320, 120);
+        let run = runs.first().expect("focused input text should render");
+        assert_eq!(run.vertical_align, TextVerticalAlign::Center);
+        assert!(
+            (text_top_for_height(run) - 24.5).abs() <= 0.5,
+            "input text top should be vertically centered"
+        );
+        let text_layouts = test_text_layouts(&frame, 320, 120);
+        let expected_caret_x = text_layouts
+            .get(&DocumentNodeId("input".to_owned()))
+            .unwrap()
+            .x_for_column(1.0);
+        let (positions, _, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let caret_rect = 2usize;
+        let caret_x = ((positions[caret_rect * 12] + 1.0) * 0.5) * 320.0;
+        assert!(
+            (caret_x - expected_caret_x).abs() <= 0.5,
+            "input caret should use measured glyph edges"
+        );
     }
 
     fn test_text_layouts(frame: &LayoutFrame, width: u32, height: u32) -> TextRunLayoutMap {

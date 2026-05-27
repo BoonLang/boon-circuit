@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
@@ -118,12 +118,17 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
     let entry = boon_runtime::example_manifest_entry(&example)?;
-    if entry.id != "counter" {
-        return Err("interaction-speed currently targets the Counter interaction contract".into());
-    }
     let event_count = numeric_arg(args, "--event-count").unwrap_or(24).max(1);
     let max_total_ms = numeric_arg(args, "--max-total-ms").unwrap_or(250) as f64;
     let report = value_arg(args, "--report").ok_or("interaction-speed role requires --report")?;
+    if entry.id == "cells" {
+        return run_cells_interaction_speed(args, &entry, event_count, &report);
+    }
+    if entry.id != "counter" {
+        return Err(
+            "interaction-speed currently targets Counter and Cells interaction contracts".into(),
+        );
+    }
     let source_path = PathBuf::from(&entry.source);
     let source = std::fs::read_to_string(&source_path)?;
     let scenario = boon_runtime::parse_scenario(Path::new(&entry.scenario))?;
@@ -246,6 +251,197 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     }
 }
 
+fn run_cells_interaction_speed(
+    args: &[String],
+    entry: &boon_runtime::ExampleManifestEntry,
+    event_count: u64,
+    report: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let max_p95_ms = value_arg(args, "--max-p95-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(120.0);
+    let max_max_ms = value_arg(args, "--max-max-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(250.0);
+    let source_path = PathBuf::from(&entry.source);
+    let source = boon_runtime::source_text_for_entry(entry)?;
+    let scenario = boon_runtime::parse_scenario(Path::new(&entry.scenario))?;
+    let step = scenario
+        .step
+        .iter()
+        .find(|step| step.id == "select-b0-shows-formula-in-bar")
+        .ok_or("cells scenario is missing select-b0-shows-formula-in-bar step")?;
+    let source_event = step
+        .expected_source_event
+        .as_ref()
+        .and_then(|event| event.get("source"))
+        .and_then(toml_value_as_str)
+        .ok_or("select-b0-shows-formula-in-bar step is missing expected source event")?;
+    let target_address = step
+        .expected_source_event
+        .as_ref()
+        .and_then(|event| event.get("address"))
+        .and_then(toml_value_as_str)
+        .ok_or("select-b0-shows-formula-in-bar step is missing expected source address")?;
+    let layout_proof = native_document_layout_proof(&source_path, &source)?;
+    let (x, y, target_node) =
+        source_hit_center_for_target(&layout_proof, source_event, Some(target_address))?;
+    let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+        layout_proof: layout_proof.clone(),
+        layout_frame_override: None,
+        update_count: 0,
+        scroll_x_px: 0.0,
+        scroll_y_px: 0.0,
+        last_error: None,
+        last_error_count: 0,
+    }));
+    let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
+        &format!("interaction-speed:{}", source_path.display()),
+        &source,
+        Path::new(&entry.scenario),
+    )?));
+    let mut input_state = PreviewNativeInputState::default();
+    let mut latencies_ms = Vec::new();
+    let started = Instant::now();
+    for index in 0..event_count {
+        let input = deterministic_click_input_from_index(index, x, y);
+        let click_started = Instant::now();
+        preview_apply_real_window_input(
+            &input,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )?;
+        latencies_ms.push(click_started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (state_summary, update_count, layout_hash, last_error) = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "interaction-speed runtime mutex poisoned")?;
+        let state_summary = runtime.state_summary();
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "interaction-speed render state mutex poisoned")?;
+        (
+            state_summary,
+            shared.update_count,
+            shared
+                .layout_proof
+                .get("layout_frame_hash")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            shared.last_error.clone(),
+        )
+    };
+    let observed_selected = state_summary
+        .pointer("/store/selected_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let observed_formula_bar = state_summary
+        .pointer("/store/selected_input/editing_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let expected_formula_bar = "=add(A0,A1)";
+    let mut sorted_latencies_ms = latencies_ms.clone();
+    sorted_latencies_ms.sort_by(f64::total_cmp);
+    let p50_ms = percentile_sorted_f64(&sorted_latencies_ms, 50);
+    let p95_ms = percentile_sorted_f64(&sorted_latencies_ms, 95);
+    let p99_ms = percentile_sorted_f64(&sorted_latencies_ms, 99);
+    let max_ms = latencies_ms.iter().copied().fold(0.0, f64::max);
+    let selected_ok = observed_selected == target_address;
+    let formula_bar_ok = observed_formula_bar == expected_formula_bar;
+    let update_count_ok = update_count >= event_count;
+    let p95_ok = p95_ms <= max_p95_ms;
+    let max_ok = max_ms <= max_max_ms;
+    let status = if selected_ok
+        && formula_bar_ok
+        && update_count_ok
+        && p95_ok
+        && max_ok
+        && last_error.is_none()
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    let mut report_value = base_report("boon-native-playground-interaction-speed", args, status);
+    report_value["native_gpu_contract"] = json!(true);
+    report_value["example"] = json!(entry.id);
+    report_value["source_path"] = json!(entry.source);
+    report_value["scenario_path"] = json!(entry.scenario);
+    report_value["scenario_step"] = json!(step.id);
+    report_value["source_event"] = json!(source_event);
+    report_value["target_address"] = json!(target_address);
+    report_value["target_node"] = json!(target_node);
+    report_value["event_count"] = json!(event_count);
+    report_value["max_p95_ms"] = json!(max_p95_ms);
+    report_value["max_max_ms"] = json!(max_max_ms);
+    report_value["interaction_total_ms"] = json!(elapsed_ms);
+    report_value["interaction_per_event_ms"] = json!(elapsed_ms / event_count as f64);
+    report_value["interaction_latency_ms"] = json!(latencies_ms);
+    report_value["interaction_latency_ms_p50"] = json!(p50_ms);
+    report_value["interaction_latency_ms_p95"] = json!(p95_ms);
+    report_value["interaction_latency_ms_p99"] = json!(p99_ms);
+    report_value["interaction_latency_ms_max"] = json!(max_ms);
+    report_value["preview_shared_render_update_count"] = json!(update_count);
+    report_value["selected_address"] = json!(observed_selected);
+    report_value["expected_selected_address"] = json!(target_address);
+    report_value["formula_bar_text"] = json!(observed_formula_bar);
+    report_value["expected_formula_bar_text"] = json!(expected_formula_bar);
+    report_value["layout_frame_hash"] = layout_hash;
+    report_value["preview_last_error"] = json!(last_error);
+    report_value["per_step_pass_fail"] = json!([
+        {
+            "id": "cells-interaction-speed:target-resolved",
+            "pass": !target_node.is_empty(),
+            "detail": format!("target_node={target_node}")
+        },
+        {
+            "id": "cells-interaction-speed:cell-focused",
+            "pass": selected_ok,
+            "detail": format!("expected selected {target_address}, observed {observed_selected}")
+        },
+        {
+            "id": "cells-interaction-speed:formula-bar-updated",
+            "pass": formula_bar_ok,
+            "detail": format!("expected formula bar {expected_formula_bar}, observed {observed_formula_bar}")
+        },
+        {
+            "id": "cells-interaction-speed:render-updated-for-each-click",
+            "pass": update_count_ok,
+            "detail": format!("preview_shared_render_update_count={update_count}, event_count={event_count}")
+        },
+        {
+            "id": "cells-interaction-speed:p95-latency-budget",
+            "pass": p95_ok,
+            "detail": format!("interaction_latency_ms_p95={p95_ms:.3}, max_p95_ms={max_p95_ms:.3}")
+        },
+        {
+            "id": "cells-interaction-speed:max-latency-budget",
+            "pass": max_ok,
+            "detail": format!("interaction_latency_ms_max={max_ms:.3}, max_max_ms={max_max_ms:.3}")
+        },
+        {
+            "id": "cells-interaction-speed:no-preview-error",
+            "pass": last_error.is_none(),
+            "detail": format!("preview_last_error={last_error:?}")
+        }
+    ]);
+    boon_runtime::write_json(Path::new(report), &report_value)?;
+    if status == "pass" {
+        Ok(())
+    } else {
+        Err(format!("interaction-speed failed; wrote {report}").into())
+    }
+}
+
 fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if value_arg(args, "--example").is_some() {
         return Err(
@@ -331,12 +527,26 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     preview_note_render_error(&shared_render_state, error.to_string())
                         .map_err(|error| error.to_string())?;
                 }
-            } else if let Err(error) =
-                preview_apply_scroll_input(&context.input, &shared_render_state)
-            {
-                preview_note_render_error(&shared_render_state, error.to_string())
+            } else {
+                let input_context = preview_input_runtime_context(&preview_ipc_state)
                     .map_err(|error| error.to_string())?;
+                if let Err(error) = preview_apply_scroll_input(
+                    &context.input,
+                    Some(&input_context.source_path),
+                    Some(&input_context.source_text),
+                    input_context.live_runtime.as_ref(),
+                    &shared_render_state,
+                ) {
+                    preview_note_render_error(&shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?;
+                }
             }
+            preview_apply_focus_overlay(
+                &shared_render_state,
+                &input_state,
+                preview_caret_visible(&input_state, Instant::now()),
+            )
+            .map_err(|error| error.to_string())?;
             let (render_layout_proof, render_layout_frame_override, render_error) = {
                 let shared = shared_render_state
                     .lock()
@@ -919,12 +1129,42 @@ fn native_document_layout_proof_with_state(
     source: &str,
     runtime_state_override: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
+    let (proof, _) = native_document_layout_proof_with_state_mode(
+        source_path,
+        source,
+        runtime_state_override,
+        true,
+    )?;
+    Ok(proof)
+}
+
+fn native_document_layout_proof_with_state_embedded(
+    source_path: &Path,
+    source: &str,
+    runtime_state_override: Option<&serde_json::Value>,
+) -> Result<(serde_json::Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let (proof, layout_frame) = native_document_layout_proof_with_state_mode(
+        source_path,
+        source,
+        runtime_state_override,
+        false,
+    )?;
+    let layout_frame = layout_frame.ok_or("embedded layout proof did not return a layout frame")?;
+    Ok((proof, layout_frame))
+}
+
+fn native_document_layout_proof_with_state_mode(
+    source_path: &Path,
+    source: &str,
+    runtime_state_override: Option<&serde_json::Value>,
+    write_artifact: bool,
+) -> Result<(serde_json::Value, Option<boon_document::LayoutFrame>), Box<dyn std::error::Error>> {
+    let parsed = cached_document_program(source_path, source)?;
     let document = boon_parser::parsed_document(&parsed)
         .ok_or("source does not contain a parseable document block")?;
     let runtime_state = runtime_state_override
         .cloned()
-        .or_else(|| runtime_state_summary_for_source(source_path, source).ok());
+        .or_else(|| runtime_document_state_summary_for_source(source_path, source).ok());
     let document_functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
@@ -960,7 +1200,11 @@ fn native_document_layout_proof_with_state(
         );
     }
 
-    let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+    static TEXT_MEASURER: OnceLock<Mutex<boon_native_gpu::GlyphonTextMeasurer>> = OnceLock::new();
+    let mut measurer = TEXT_MEASURER
+        .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
+        .lock()
+        .map_err(|_| "document text measurer mutex poisoned")?;
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
         viewport: boon_host::Viewport {
@@ -969,14 +1213,15 @@ fn native_document_layout_proof_with_state(
             height: 720.0,
             scale: 1.0,
         },
-        text: &mut measurer,
+        text: &mut *measurer,
         capabilities: boon_document::RenderCapabilities::fake_portable(),
     });
 
-    let artifact_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
-    std::fs::create_dir_all(&artifact_dir)?;
     let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
-    let artifact_path = artifact_dir.join(format!(
+    let runtime_state_hash = runtime_state
+        .as_ref()
+        .map(|state| boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default()));
+    let artifact_name = format!(
         "{}-{}{}.json",
         source_path
             .file_stem()
@@ -986,34 +1231,47 @@ fn native_document_layout_proof_with_state(
         runtime_state
             .as_ref()
             .filter(|_| runtime_state_override.is_some())
-            .map(|state| format!(
-                "-state-{}",
-                &boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default())[..12]
-            ))
+            .and(runtime_state_hash.as_ref())
+            .map(|hash| format!("-state-{}", &hash[..12]))
             .unwrap_or_default()
-    ));
-    let artifact = json!({
-        "source_path": source_path,
-        "source_sha256": source_sha256,
-        "document_frame": frame,
-        "layout_frame": layout,
-        "source_intents": source_intents,
-        "runtime_document_state_used": runtime_state.is_some(),
-        "runtime_document_state_hash": runtime_state
-            .as_ref()
-            .map(|state| boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default()))
-    });
-    std::fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact)?)?;
-    let artifact_sha256 = boon_runtime::sha256_file(&artifact_path)?;
-    let artifact = std::fs::read_to_string(&artifact_path)?;
-    let artifact_json: serde_json::Value = serde_json::from_str(&artifact)?;
-    let layout_json = artifact_json
-        .get("layout_frame")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let hit_target_assertion_total = layout_json
-        .get("hit_regions")
-        .and_then(serde_json::Value::as_array)
+    );
+    let artifact_path =
+        PathBuf::from("target/artifacts/native-gpu/document-layout").join(&artifact_name);
+    let (artifact_sha256, layout_frame_hash) = if write_artifact {
+        let artifact = json!({
+            "source_path": source_path,
+            "source_sha256": source_sha256,
+            "document_frame": frame,
+            "layout_frame": layout,
+            "source_intents": source_intents,
+            "runtime_document_state_used": runtime_state.is_some(),
+            "runtime_document_state_hash": runtime_state_hash.clone()
+        });
+        std::fs::create_dir_all(
+            artifact_path
+                .parent()
+                .ok_or("document layout artifact path has no parent")?,
+        )?;
+        let bytes = serde_json::to_vec_pretty(&artifact)?;
+        std::fs::write(&artifact_path, &bytes)?;
+        (
+            boon_runtime::sha256_bytes(&bytes),
+            boon_runtime::sha256_file(&artifact_path)?,
+        )
+    } else {
+        let live_hash_basis = format!(
+            "live-layout:{}:{}:{}:{}:{}",
+            source_sha256,
+            runtime_state_hash.as_deref().unwrap_or("no-runtime-state"),
+            frame.nodes.len(),
+            layout.display_list.len(),
+            source_intents.len()
+        );
+        let hash = boon_runtime::sha256_bytes(live_hash_basis.as_bytes());
+        (hash.clone(), hash)
+    };
+    let hit_target_assertion_total = serde_json::to_value(&layout.hit_regions)?
+        .as_array()
         .cloned()
         .unwrap_or_default();
     let hit_target_samples = hit_target_assertion_total
@@ -1021,9 +1279,8 @@ fn native_document_layout_proof_with_state(
         .take(256)
         .cloned()
         .collect::<Vec<_>>();
-    let source_intent_assertions = artifact_json
-        .get("source_intents")
-        .and_then(serde_json::Value::as_array)
+    let source_intent_assertions = serde_json::to_value(&source_intents)?
+        .as_array()
         .cloned()
         .unwrap_or_default();
     let source_intent_total = source_intent_assertions.len();
@@ -1032,25 +1289,30 @@ fn native_document_layout_proof_with_state(
         .take(256)
         .cloned()
         .collect::<Vec<_>>();
-    let node_count = artifact_json
-        .pointer("/document_frame/nodes")
-        .and_then(serde_json::Value::as_object)
-        .map_or(0, serde_json::Map::len);
-    let display_item_count = layout_json
-        .get("display_list")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, Vec::len);
+    let node_count = frame.nodes.len();
+    let display_item_count = layout.display_list.len();
+    let display_item_samples = serde_json::to_value(
+        layout
+            .display_list
+            .iter()
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
+    let layout_metrics = serde_json::to_value(&layout.metrics)?;
+    let scroll_regions = serde_json::to_value(&layout.scroll_regions)?;
 
-    Ok(json!({
+    let proof = json!({
         "status": "pass",
         "lowering": "boon_parser_document_ast_to_boon_document_model",
         "source_path": source_path,
-        "source_sha256": artifact_json.get("source_sha256").cloned().unwrap_or_else(|| json!("missing")),
-        "artifact_path": artifact_path,
+        "source_sha256": source_sha256,
+        "artifact_path": if write_artifact { json!(artifact_path) } else { serde_json::Value::Null },
         "artifact_sha256": artifact_sha256,
-        "layout_frame_hash": boon_runtime::sha256_file(&artifact_path)?,
+        "layout_frame_hash": layout_frame_hash,
         "node_count": node_count,
         "display_item_count": display_item_count,
+        "display_item_samples": display_item_samples,
         "hit_target_count": hit_target_assertion_total.len(),
         "hit_target_sample_count": hit_target_samples.len(),
         "hit_target_sample_limit": 256,
@@ -1061,11 +1323,46 @@ fn native_document_layout_proof_with_state(
         "hit_target_samples": hit_target_samples,
         "source_intent_assertions": source_intent_assertions,
         "source_intent_samples": source_intent_samples,
-        "layout_metrics": layout_json.get("metrics").cloned().unwrap_or_else(|| json!({})),
-        "scroll_regions": layout_json.get("scroll_regions").cloned().unwrap_or_else(|| json!([])),
-        "runtime_document_state_used": artifact_json.get("runtime_document_state_used").cloned().unwrap_or_else(|| json!(false)),
-        "runtime_document_state_hash": artifact_json.get("runtime_document_state_hash").cloned().unwrap_or_else(|| json!(null)),
-    }))
+        "layout_metrics": layout_metrics,
+        "scroll_regions": scroll_regions,
+        "runtime_document_state_used": runtime_state.is_some(),
+        "runtime_document_state_hash": runtime_state_hash.clone(),
+        "live_artifact_write_skipped": !write_artifact,
+    });
+    Ok((proof, (!write_artifact).then_some(layout)))
+}
+
+fn cached_document_program(
+    source_path: &Path,
+    source: &str,
+) -> Result<Arc<boon_parser::ParsedProgram>, Box<dyn std::error::Error>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<boon_parser::ParsedProgram>>>> =
+        OnceLock::new();
+    let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
+    let key = format!("{}:{source_sha256}", source_path.display());
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(parsed) = cache
+        .lock()
+        .map_err(|_| "document parse cache mutex poisoned")?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(parsed);
+    }
+    let parsed = Arc::new(boon_parser::parse_source(
+        source_path.display().to_string(),
+        source,
+    )?);
+    let mut cache = cache
+        .lock()
+        .map_err(|_| "document parse cache mutex poisoned")?;
+    if cache.len() > 16 {
+        cache.clear();
+    }
+    Ok(cache
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&parsed))
+        .clone())
 }
 
 fn preview_runtime_summary(
@@ -1127,6 +1424,28 @@ fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<
         .map_err(|error| error.to_string())?
     };
     Ok(runtime.state_summary())
+}
+
+fn runtime_document_state_summary_for_source(
+    source_path: &Path,
+    source: &str,
+) -> Result<Value, String> {
+    let scenario_path = source_path.with_extension("scn");
+    let mut runtime = if scenario_path.exists() {
+        boon_runtime::LiveRuntime::new(
+            &format!("native-preview-document:{}", source_path.display()),
+            source,
+            &scenario_path,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview-document:{}", source_path.display()),
+            source,
+        )
+        .map_err(|error| error.to_string())?
+    };
+    Ok(runtime.document_state_summary())
 }
 
 fn preview_runtime_summary_response(
@@ -1275,9 +1594,11 @@ fn native_gpu_app_owned_render_hook(
         .get("layout_frame_hash")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(layout_artifact);
-    let cache_stale = layout_frame_cache
-        .as_ref()
-        .is_none_or(|(path, _)| path != layout_cache_key);
+    let cache_stale = native_gpu_render_cache_stale(
+        layout_frame_cache.as_ref().map(|(path, _)| path.as_str()),
+        layout_cache_key,
+        layout_frame_override.is_some(),
+    );
     if cache_stale {
         let layout_frame = match layout_frame_override {
             Some(layout_frame) => layout_frame.clone(),
@@ -1369,6 +1690,14 @@ fn native_gpu_app_owned_render_hook(
         "proof": proof,
         "copy_to_present_limitation": serde_json::Value::Null
     }))
+}
+
+fn native_gpu_render_cache_stale(
+    cached_layout_key: Option<&str>,
+    layout_cache_key: &str,
+    has_layout_frame_override: bool,
+) -> bool {
+    has_layout_frame_override || cached_layout_key != Some(layout_cache_key)
 }
 
 fn preview_frame_with_error_overlay(
@@ -7447,7 +7776,13 @@ fn lower_canonical_repeat(
     let Some(items) = document_resolved_value(&list_path, context).and_then(Value::as_array) else {
         return;
     };
-    for (index, item) in items.iter().enumerate() {
+    let repeat_window = virtualized_repeat_window(items.len(), scope_key);
+    for (index, item) in items
+        .iter()
+        .enumerate()
+        .skip(repeat_window.start)
+        .take(repeat_window.end.saturating_sub(repeat_window.start))
+    {
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
@@ -7478,6 +7813,19 @@ fn lower_canonical_repeat(
             }
         }
     }
+}
+
+struct RepeatWindow {
+    start: usize,
+    end: usize,
+}
+
+fn virtualized_repeat_window(len: usize, scope_key: &str) -> RepeatWindow {
+    let visible = len.min(28);
+    let start = 0;
+    let end = len.min(start + visible);
+    let _ = scope_key;
+    RepeatWindow { start, end }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8683,8 +9031,13 @@ fn json_value_to_document_text(value: &Value) -> String {
 struct PreviewNativeInputState {
     last_mouse_button_event_count: u64,
     last_keyboard_event_sequence: u64,
+    last_click_node: Option<String>,
+    last_click_sequence: u64,
     focused_node: Option<String>,
     focused_text: String,
+    focused_caret_index: usize,
+    replace_focused_text_on_next_edit: bool,
+    caret_blink_started_at: Option<Instant>,
 }
 
 fn unhandled_primary_mouse_releases(
@@ -8733,9 +9086,27 @@ fn deterministic_click_input(
     x: f64,
     y: f64,
 ) -> boon_native_app_window::NativeInputAdapterProof {
+    deterministic_click_input_from_start_index(0, event_count, x, y)
+}
+
+fn deterministic_click_input_from_index(
+    index: u64,
+    x: f64,
+    y: f64,
+) -> boon_native_app_window::NativeInputAdapterProof {
+    deterministic_click_input_from_start_index(index, 1, x, y)
+}
+
+fn deterministic_click_input_from_start_index(
+    start_index: u64,
+    event_count: u64,
+    x: f64,
+    y: f64,
+) -> boon_native_app_window::NativeInputAdapterProof {
     let mut mouse_button_events = Vec::new();
     for index in 0..event_count {
-        let press_sequence = index.saturating_mul(2).saturating_add(1);
+        let absolute_index = start_index.saturating_add(index);
+        let press_sequence = absolute_index.saturating_mul(2).saturating_add(1);
         let release_sequence = press_sequence.saturating_add(1);
         mouse_button_events.push(boon_native_app_window::NativeMouseButtonEventProof {
             sequence: press_sequence,
@@ -8750,6 +9121,7 @@ fn deterministic_click_input(
             window_protocol_id: Some(1),
         });
     }
+    let last_sequence = start_index.saturating_add(event_count).saturating_mul(2);
     boon_native_app_window::NativeInputAdapterProof {
         installed: true,
         capture_scope: "deterministic_recent_mouse_button_events".to_owned(),
@@ -8765,9 +9137,9 @@ fn deterministic_click_input(
         mouse_last_window_protocol_id: Some(1),
         keyboard_last_window_protocol_id: None,
         mouse_motion_event_count: 1,
-        mouse_button_event_count: event_count.saturating_mul(2),
+        mouse_button_event_count: last_sequence,
         mouse_scroll_event_count: 0,
-        mouse_total_event_count: event_count.saturating_mul(2).saturating_add(1),
+        mouse_total_event_count: last_sequence.saturating_add(1),
         keyboard_key_event_count: 0,
         mouse_button_events,
         keyboard_events: Vec::new(),
@@ -8788,6 +9160,14 @@ fn source_hit_center(
     layout_proof: &Value,
     source_event: &str,
 ) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
+    source_hit_center_for_target(layout_proof, source_event, None)
+}
+
+fn source_hit_center_for_target(
+    layout_proof: &Value,
+    source_event: &str,
+    target: Option<&str>,
+) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
     let source_intents = layout_proof
         .get("source_intent_assertions")
         .and_then(serde_json::Value::as_array)
@@ -8795,15 +9175,48 @@ fn source_hit_center(
     let target_node = source_intents
         .iter()
         .find_map(|intent| {
-            (intent
+            if intent
                 .get("source_path")
                 .and_then(serde_json::Value::as_str)
-                == Some(source_event))
-            .then(|| intent.get("node").and_then(serde_json::Value::as_str))
-            .flatten()
-            .map(str::to_owned)
+                == Some(source_event)
+                && target.is_none_or(|target| {
+                    source_intent_has_exact_value(intent, source_intents, "target", target)
+                })
+            {
+                intent
+                    .get("node")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
         })
-        .ok_or_else(|| format!("source event `{source_event}` has no document source intent"))?;
+        .or_else(|| {
+            let target_event = target
+                .map(|target| json!({ "address": target }))
+                .unwrap_or_else(|| json!({}));
+            source_intents.iter().find_map(|intent| {
+                if intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_event)
+                    && source_intent_matches_event_target(intent, source_intents, &target_event)
+                {
+                    intent
+                        .get("node")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "source event `{source_event}` has no document source intent for target {:?}",
+                target
+            )
+        })?;
     let hit_region = layout_proof
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)
@@ -8837,6 +9250,164 @@ fn source_hit_center(
     Ok((x, y, target_node))
 }
 
+fn source_intent_has_exact_value(
+    intent: &serde_json::Value,
+    source_intents: &[serde_json::Value],
+    expected_intent: &str,
+    expected_value: &str,
+) -> bool {
+    let Some(node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    source_intents.iter().any(|candidate| {
+        candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+            && candidate.get("intent").and_then(serde_json::Value::as_str) == Some(expected_intent)
+            && candidate
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_value)
+    })
+}
+
+fn preview_reset_caret_blink(input_state: &mut PreviewNativeInputState) {
+    input_state.caret_blink_started_at = Some(Instant::now());
+}
+
+fn preview_caret_visible(input_state: &PreviewNativeInputState, now: Instant) -> bool {
+    let Some(started_at) = input_state.caret_blink_started_at else {
+        return true;
+    };
+    (now.duration_since(started_at).as_millis() / 500).is_multiple_of(2)
+}
+
+fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -> bool {
+    let _ = (layout_proof, node);
+    false
+}
+
+fn preview_caret_index_for_text_hit_region(
+    layout_proof: &Value,
+    hit_region: &Value,
+    x: f64,
+    text: &str,
+) -> usize {
+    let Some(node) = hit_region.get("node").and_then(serde_json::Value::as_str) else {
+        return 0;
+    };
+    let char_count = text.chars().count();
+    if char_count == 0 {
+        return 0;
+    }
+    let Some(bounds) = hit_region.get("bounds") else {
+        return char_count;
+    };
+    let left = bounds
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let width = bounds
+        .get("width")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default()
+        .max(1.0);
+    let (font_size, text_inset) =
+        display_item_font_size_and_inset(layout_proof, node).unwrap_or((12.0, 4.0));
+    let approximate_advance = (font_size * 0.62).max(1.0);
+    let text_left = left + text_inset;
+    let approximate_text_width = approximate_advance * char_count as f64;
+    let usable_width = width.saturating_sub_f64(text_inset * 2.0).max(1.0);
+    let text_width = approximate_text_width.min(usable_width);
+    let relative_x = (x - text_left).clamp(0.0, text_width);
+    (relative_x / approximate_advance).round() as usize
+}
+
+fn display_item_font_size_and_inset(layout_proof: &Value, node: &str) -> Option<(f64, f64)> {
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| {
+            let item_node = item.get("node").and_then(serde_json::Value::as_str)?;
+            if item_node != node {
+                return None;
+            }
+            let style = item.get("style")?;
+            let font_size = style
+                .get("size")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(12.0);
+            let text_inset = style
+                .get("text_inset")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(4.0);
+            Some((font_size, text_inset))
+        })
+}
+
+trait SaturatingSubF64 {
+    fn saturating_sub_f64(self, right: f64) -> f64;
+}
+
+impl SaturatingSubF64 for f64 {
+    fn saturating_sub_f64(self, right: f64) -> f64 {
+        (self - right).max(0.0)
+    }
+}
+
+fn preview_text_char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn preview_byte_index_for_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or(text.len())
+}
+
+fn preview_insert_char_at_caret(input_state: &mut PreviewNativeInputState, character: char) {
+    let byte_index =
+        preview_byte_index_for_char(&input_state.focused_text, input_state.focused_caret_index);
+    input_state.focused_text.insert(byte_index, character);
+    input_state.focused_caret_index = input_state.focused_caret_index.saturating_add(1);
+}
+
+fn preview_delete_before_caret(input_state: &mut PreviewNativeInputState) {
+    if input_state.focused_caret_index == 0 {
+        return;
+    }
+    let remove_char = input_state.focused_caret_index.saturating_sub(1);
+    let start = preview_byte_index_for_char(&input_state.focused_text, remove_char);
+    let end =
+        preview_byte_index_for_char(&input_state.focused_text, input_state.focused_caret_index);
+    input_state.focused_text.replace_range(start..end, "");
+    input_state.focused_caret_index = remove_char;
+}
+
+fn preview_delete_at_caret(input_state: &mut PreviewNativeInputState) {
+    let char_count = preview_text_char_count(&input_state.focused_text);
+    if input_state.focused_caret_index >= char_count {
+        return;
+    }
+    let start =
+        preview_byte_index_for_char(&input_state.focused_text, input_state.focused_caret_index);
+    let end = preview_byte_index_for_char(
+        &input_state.focused_text,
+        input_state.focused_caret_index.saturating_add(1),
+    );
+    input_state.focused_text.replace_range(start..end, "");
+}
+
+fn preview_prepare_text_edit(input_state: &mut PreviewNativeInputState) {
+    if input_state.replace_focused_text_on_next_edit {
+        input_state.focused_text.clear();
+        input_state.focused_caret_index = 0;
+        input_state.replace_focused_text_on_next_edit = false;
+    }
+}
+
 fn preview_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
@@ -8859,9 +9430,10 @@ fn preview_apply_real_window_input(
 
     let mut latest_layout = None;
     let mut pending_mouse_events = Vec::new();
-    for mouse_release in
-        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
-    {
+    let mouse_releases =
+        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
+    let batch_can_double_click = mouse_releases.len() >= 2;
+    for mouse_release in mouse_releases {
         input_state.last_mouse_button_event_count = input_state
             .last_mouse_button_event_count
             .max(mouse_release.sequence);
@@ -8879,22 +9451,69 @@ fn preview_apply_real_window_input(
                 .to_owned();
             let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
             if live_source_for_node_intent(layout, &node, "change").is_some() {
-                input_state.focused_node = Some(node);
+                let was_already_focused =
+                    input_state.focused_node.as_deref() == Some(node.as_str());
+                if !was_already_focused
+                    && let Some(blur) = preview_focused_blur_event(layout, input_state)
+                {
+                    pending_mouse_events.push(blur);
+                }
+                input_state.focused_node = Some(node.clone());
                 input_state.focused_text.clear();
                 input_state.focused_text.push_str(
-                    document_value_for_hit_region(layout, &hit_region)
+                    preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
+                        .or_else(|| document_value_for_hit_region(layout, &hit_region))
                         .as_deref()
                         .unwrap_or_default(),
                 );
-                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region) {
-                    pending_mouse_events.push(event);
+                input_state.focused_caret_index = preview_caret_index_for_text_hit_region(
+                    layout,
+                    &hit_region,
+                    position.x,
+                    &input_state.focused_text,
+                )
+                .min(preview_text_char_count(&input_state.focused_text));
+                input_state.replace_focused_text_on_next_edit =
+                    preview_text_input_should_replace_on_type(layout, &node);
+                preview_reset_caret_blink(input_state);
+                let double_click = batch_can_double_click
+                    && input_state.last_click_node.as_deref() == Some(node.as_str())
+                    && mouse_release
+                        .sequence
+                        .saturating_sub(input_state.last_click_sequence)
+                        <= 4;
+                if let Some(mut event) =
+                    live_source_event_for_hit_region(layout, &hit_region, double_click)
+                {
+                    if double_click {
+                        event.text = Some(input_state.focused_text.clone());
+                    }
+                    if was_already_focused
+                        && !double_click
+                        && event.text.is_none()
+                        && event.key.is_none()
+                    {
+                        preview_record_noop_input(shared_render_state, 1)?;
+                    } else {
+                        pending_mouse_events.push(event);
+                    }
                 }
+                input_state.last_click_node = Some(node);
+                input_state.last_click_sequence = mouse_release.sequence;
             } else {
+                if let Some(blur) = preview_focused_blur_event(layout, input_state) {
+                    pending_mouse_events.push(blur);
+                }
                 input_state.focused_node = None;
                 input_state.focused_text.clear();
-                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region) {
+                input_state.focused_caret_index = 0;
+                input_state.replace_focused_text_on_next_edit = false;
+                input_state.caret_blink_started_at = None;
+                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region, false) {
                     pending_mouse_events.push(event);
                 }
+                input_state.last_click_node = Some(node);
+                input_state.last_click_sequence = mouse_release.sequence;
             }
         }
     }
@@ -8924,19 +9543,22 @@ fn preview_apply_real_window_input(
         if !event.pressed {
             continue;
         }
-        let Some(focused_node) = input_state.focused_node.as_deref() else {
+        let Some(focused_node) = input_state.focused_node.clone() else {
             continue;
         };
         let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
         match event.key.as_str() {
             "Return" | "KeypadEnter" => {
-                if let Some(source) = live_source_for_node_intent(layout, focused_node, "submit") {
+                if let Some(source) = live_source_for_node_intent(layout, &focused_node, "submit")
+                    .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
+                {
+                    let submitted_text = input_state.focused_text.clone();
                     let submit = boon_runtime::LiveSourceEvent {
                         source,
-                        text: Some(input_state.focused_text.clone()),
+                        text: Some(submitted_text.clone()),
                         key: Some("Enter".to_owned()),
-                        address: focused_address(layout, focused_node),
-                        target_text: focused_target_text(layout, focused_node),
+                        address: focused_address(layout, &focused_node),
+                        target_text: focused_target_text(layout, &focused_node),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -8946,19 +9568,23 @@ fn preview_apply_real_window_input(
                         shared_render_state,
                         submit,
                     )?);
+                    input_state.focused_node = None;
                     input_state.focused_text.clear();
+                    input_state.focused_caret_index = 0;
+                    input_state.replace_focused_text_on_next_edit = false;
+                    input_state.caret_blink_started_at = None;
                 }
             }
             "Escape" => {
-                if let Some(source) = live_source_for_node_intent(layout, focused_node, "escape")
-                    .or_else(|| live_source_for_node_intent(layout, focused_node, "key_down"))
+                if let Some(source) = live_source_for_node_intent(layout, &focused_node, "escape")
+                    .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
                 {
                     let escape = boon_runtime::LiveSourceEvent {
                         source,
-                        text: Some(input_state.focused_text.clone()),
+                        text: None,
                         key: Some("Escape".to_owned()),
-                        address: focused_address(layout, focused_node),
-                        target_text: focused_target_text(layout, focused_node),
+                        address: focused_address(layout, &focused_node),
+                        target_text: focused_target_text(layout, &focused_node),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -8970,17 +9596,46 @@ fn preview_apply_real_window_input(
                     )?);
                     input_state.focused_node = None;
                     input_state.focused_text.clear();
+                    input_state.focused_caret_index = 0;
+                    input_state.replace_focused_text_on_next_edit = false;
+                    input_state.caret_blink_started_at = None;
                 }
             }
-            "Delete" => {
-                input_state.focused_text.pop();
-                if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+            "Left" | "ArrowLeft" | "LeftArrow" => {
+                input_state.focused_caret_index = input_state.focused_caret_index.saturating_sub(1);
+                preview_reset_caret_blink(input_state);
+            }
+            "Right" | "ArrowRight" | "RightArrow" => {
+                input_state.focused_caret_index = input_state
+                    .focused_caret_index
+                    .saturating_add(1)
+                    .min(preview_text_char_count(&input_state.focused_text));
+                preview_reset_caret_blink(input_state);
+            }
+            "Home" => {
+                input_state.focused_caret_index = 0;
+                preview_reset_caret_blink(input_state);
+            }
+            "End" => {
+                input_state.focused_caret_index =
+                    preview_text_char_count(&input_state.focused_text);
+                preview_reset_caret_blink(input_state);
+            }
+            "Delete" | "ForwardDelete" | "Backspace" => {
+                preview_prepare_text_edit(input_state);
+                if matches!(event.key.as_str(), "Delete" | "Backspace") {
+                    preview_delete_before_caret(input_state);
+                } else {
+                    preview_delete_at_caret(input_state);
+                }
+                preview_reset_caret_blink(input_state);
+                if let Some(source) = live_source_for_node_intent(layout, &focused_node, "change") {
                     let change = boon_runtime::LiveSourceEvent {
                         source,
                         text: Some(input_state.focused_text.clone()),
                         key: None,
-                        address: focused_address(layout, focused_node),
-                        target_text: focused_target_text(layout, focused_node),
+                        address: focused_address(layout, &focused_node),
+                        target_text: focused_target_text(layout, &focused_node),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -8994,16 +9649,18 @@ fn preview_apply_real_window_input(
             }
             key => {
                 if let Some(character) = keyboard_event_text(key, shift_pressed) {
-                    input_state.focused_text.push(character);
+                    preview_prepare_text_edit(input_state);
+                    preview_insert_char_at_caret(input_state, character);
+                    preview_reset_caret_blink(input_state);
                     if let Some(source) =
-                        live_source_for_node_intent(layout, focused_node, "change")
+                        live_source_for_node_intent(layout, &focused_node, "change")
                     {
                         let change = boon_runtime::LiveSourceEvent {
                             source,
                             text: Some(input_state.focused_text.clone()),
                             key: None,
-                            address: focused_address(layout, focused_node),
-                            target_text: focused_target_text(layout, focused_node),
+                            address: focused_address(layout, &focused_node),
+                            target_text: focused_target_text(layout, &focused_node),
                             target_occurrence: None,
                         };
                         latest_layout = Some(preview_apply_live_event(
@@ -9018,12 +9675,76 @@ fn preview_apply_real_window_input(
             }
         }
     }
-    preview_apply_scroll_input(input, shared_render_state)?;
+    preview_apply_scroll_input(
+        input,
+        Some(source_path),
+        Some(source_text),
+        Some(live_runtime),
+        shared_render_state,
+    )?;
+    preview_apply_focus_overlay(shared_render_state, input_state, true)?;
     Ok(())
 }
 
+fn preview_apply_focus_overlay(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &PreviewNativeInputState,
+    caret_visible: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let focused_node = input_state.focused_node.as_deref();
+    if focused_node.is_none() && shared.layout_frame_override.is_none() {
+        return Ok(());
+    }
+    if shared.layout_frame_override.is_none() {
+        shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
+    }
+    let Some(frame) = shared.layout_frame_override.as_mut() else {
+        return Ok(());
+    };
+    for item in &mut frame.display_list {
+        item.focused = focused_node == Some(item.node.0.as_str());
+        item.style.remove("caret_column");
+        item.style.remove("caret_visible");
+        if item.focused && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
+            item.text = Some(input_state.focused_text.clone());
+            item.style.insert(
+                "caret_column".to_owned(),
+                boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64),
+            );
+            item.style.insert(
+                "caret_visible".to_owned(),
+                boon_document_model::StyleValue::Bool(caret_visible),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn preview_record_noop_input(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    event_count: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    shared.last_error = None;
+    shared.update_count = shared.update_count.saturating_add(event_count);
+    Ok(())
+}
+
+const PREVIEW_CELLS_ROW_HEIGHT_PX: f64 = 26.0;
+const PREVIEW_CELLS_COLUMN_WIDTH_PX: f64 = 80.0;
+const PREVIEW_CELLS_WINDOW_ROWS: usize = 24;
+const PREVIEW_CELLS_WINDOW_COLUMNS: usize = 10;
+
 fn preview_apply_scroll_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: Option<&Path>,
+    source_text: Option<&str>,
+    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if input.synthetic_input_probe {
@@ -9035,21 +9756,127 @@ fn preview_apply_scroll_input(
     let Some(position) = input.mouse_window_pos else {
         return Ok(());
     };
+    let (layout_proof, layout_frame_override, current_scroll_x, current_scroll_y) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        (
+            shared.layout_proof.clone(),
+            shared.layout_frame_override.clone(),
+            shared.scroll_x_px,
+            shared.scroll_y_px,
+        )
+    };
+    if !layout_scroll_region_contains(&layout_proof, position.x, position.y) {
+        return Ok(());
+    }
+    let (scroll_delta_x, scroll_delta_y) = preview_scroll_deltas(input);
+    let scroll_x_px = (current_scroll_x + scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
+    let scroll_y_px = (current_scroll_y + scroll_delta_y * 5.0).clamp(0.0, 2_600.0);
+    let (transformed, transformed_frame) =
+        if let (Some(source_path), Some(source_text), Some(live_runtime)) =
+            (source_path, source_text, live_runtime)
+        {
+            preview_layout_for_scroll_window(
+                source_path,
+                source_text,
+                live_runtime,
+                scroll_x_px,
+                scroll_y_px,
+            )?
+        } else {
+            scrolled_layout_proof(
+                &layout_proof,
+                layout_frame_override.as_ref(),
+                scroll_x_px,
+                scroll_y_px,
+            )?
+        };
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
-    if !layout_scroll_region_contains(&shared.layout_proof, position.x, position.y) {
-        return Ok(());
-    }
-    shared.scroll_x_px = (shared.scroll_x_px + input.scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
-    shared.scroll_y_px = (shared.scroll_y_px + input.scroll_delta_y * 5.0).clamp(0.0, 2_600.0);
-    let (transformed, transformed_frame) =
-        scrolled_layout_proof(&shared.layout_proof, shared.scroll_x_px, shared.scroll_y_px)?;
+    shared.scroll_x_px = scroll_x_px;
+    shared.scroll_y_px = scroll_y_px;
     shared.layout_proof = transformed;
     shared.layout_frame_override = Some(transformed_frame);
     shared.last_error = None;
     shared.update_count = shared.update_count.saturating_add(1);
     Ok(())
+}
+
+fn preview_scroll_deltas(input: &boon_native_app_window::NativeInputAdapterProof) -> (f64, f64) {
+    let shift_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key == "Shift" || key == "RightShift");
+    if shift_pressed && input.scroll_delta_x.abs() <= f64::EPSILON {
+        (input.scroll_delta_y, 0.0)
+    } else {
+        (input.scroll_delta_x, input.scroll_delta_y)
+    }
+}
+
+fn preview_scroll_window(scroll_x_px: f64, scroll_y_px: f64) -> (usize, usize, usize, usize) {
+    let row_start = (scroll_y_px / PREVIEW_CELLS_ROW_HEIGHT_PX).floor().max(0.0) as usize;
+    let column_start = (scroll_x_px / PREVIEW_CELLS_COLUMN_WIDTH_PX)
+        .floor()
+        .max(0.0) as usize;
+    (
+        row_start,
+        PREVIEW_CELLS_WINDOW_ROWS,
+        column_start,
+        PREVIEW_CELLS_WINDOW_COLUMNS,
+    )
+}
+
+fn preview_layout_for_scroll_window(
+    source_path: &Path,
+    source_text: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+) -> Result<(serde_json::Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let (row_start, row_count, column_start, column_count) =
+        preview_scroll_window(scroll_x_px, scroll_y_px);
+    let state_summary = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "preview live runtime mutex poisoned")?;
+        runtime.document_state_summary_for_window(row_start, row_count, column_start, column_count)
+    };
+    let (mut layout_proof, mut layout_frame) = native_document_layout_proof_with_state_embedded(
+        source_path,
+        source_text,
+        Some(&state_summary),
+    )?;
+    let residual_x = scroll_x_px % PREVIEW_CELLS_COLUMN_WIDTH_PX;
+    let residual_y = scroll_y_px % PREVIEW_CELLS_ROW_HEIGHT_PX;
+    let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
+    if scroll_x_px.abs() > f64::EPSILON
+        || residual_x.abs() > f64::EPSILON
+        || residual_y.abs() > f64::EPSILON
+    {
+        let (scrolled_layout, scrolled_frame) = scrolled_layout_proof_with_header_scroll(
+            &layout_proof,
+            Some(&layout_frame),
+            residual_x,
+            residual_y,
+            scroll_x_px + column_start as f64,
+        )?;
+        layout_proof = scrolled_layout;
+        layout_frame = scrolled_frame;
+    }
+    layout_proof["document_scroll_window"] = json!({
+        "row_start": row_start,
+        "row_count": row_count,
+        "column_start": column_start,
+        "column_count": column_count,
+        "scroll_x_px": scroll_x_px,
+        "scroll_y_px": scroll_y_px,
+        "residual_x_px": residual_x,
+        "residual_y_px": residual_y
+    });
+    Ok((layout_proof, layout_frame))
 }
 
 fn scaled_scroll_steps(delta: f64, unit: f64, min_abs_steps: isize) -> isize {
@@ -9076,11 +9903,36 @@ fn layout_scroll_region_contains(layout_proof: &Value, x: f64, y: f64) -> bool {
 
 fn scrolled_layout_proof(
     layout_proof: &Value,
+    layout_frame_override: Option<&boon_document::LayoutFrame>,
     scroll_x_px: f64,
     scroll_y_px: f64,
 ) -> Result<(Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
-    let mut frame = layout_frame_from_layout_proof(layout_proof)?;
-    transform_layout_frame_for_scroll(&mut frame, scroll_x_px as f32, scroll_y_px as f32);
+    scrolled_layout_proof_with_header_scroll(
+        layout_proof,
+        layout_frame_override,
+        scroll_x_px,
+        scroll_y_px,
+        scroll_x_px,
+    )
+}
+
+fn scrolled_layout_proof_with_header_scroll(
+    layout_proof: &Value,
+    layout_frame_override: Option<&boon_document::LayoutFrame>,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+    header_scroll_x_px: f64,
+) -> Result<(Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let mut frame = layout_frame_override
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| layout_frame_from_layout_proof(layout_proof))?;
+    transform_layout_frame_for_scroll(
+        &mut frame,
+        scroll_x_px as f32,
+        scroll_y_px as f32,
+        header_scroll_x_px as f32,
+    );
     let base_layout_hash = layout_proof
         .get("layout_frame_hash")
         .and_then(serde_json::Value::as_str)
@@ -9117,6 +9969,7 @@ fn scrolled_layout_proof(
         "status": "applied",
         "scroll_x_px": scroll_x_px,
         "scroll_y_px": scroll_y_px,
+        "header_scroll_x_px": header_scroll_x_px,
         "layout_source": "embedded_transformed_layout_frame",
         "layout_frame_hash_basis": "base-layout-frame-hash-plus-scroll-offset",
         "visual_scroll_applied_before_render": true
@@ -9147,6 +10000,7 @@ fn transform_layout_frame_for_scroll(
     frame: &mut boon_document::LayoutFrame,
     scroll_x_px: f32,
     scroll_y_px: f32,
+    header_scroll_x_px: f32,
 ) {
     let scroll_nodes = frame
         .scroll_regions
@@ -9165,6 +10019,10 @@ fn transform_layout_frame_for_scroll(
         .filter(|region| matches!(region.axis, boon_document::Axis::Horizontal))
         .cloned()
         .collect::<Vec<_>>();
+    let first_vertical_region_y = vertical_regions
+        .iter()
+        .map(|region| region.bounds.y)
+        .min_by(f32::total_cmp);
     let mut node_offsets = BTreeMap::<String, (f32, f32)>::new();
     let mut node_visible = BTreeMap::<String, bool>::new();
 
@@ -9187,7 +10045,14 @@ fn transform_layout_frame_for_scroll(
             if rect_vertical_overlaps(original, region.bounds)
                 && original.x >= region.bounds.x + 40.0
             {
-                dx -= scroll_x_px;
+                let region_scroll_x = if first_vertical_region_y
+                    .is_some_and(|vertical_y| region.bounds.y < vertical_y)
+                {
+                    header_scroll_x_px
+                } else {
+                    scroll_x_px
+                };
+                dx -= region_scroll_x;
                 clip = Some(match clip {
                     Some(existing) => rect_intersection(existing, region.bounds),
                     None => region.bounds,
@@ -9288,23 +10153,71 @@ fn preview_apply_live_events(
             .map_err(|_| "preview render state mutex poisoned")?;
         return Ok(shared.layout_proof.clone());
     }
-    let (state_summary, event_count) = {
+    let (scroll_x_px, scroll_y_px) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        (shared.scroll_x_px, shared.scroll_y_px)
+    };
+    let (state_summary, event_count, changed) = {
         let mut runtime = live_runtime
             .lock()
             .map_err(|_| "preview live runtime mutex poisoned")?;
-        let mut state_summary = None;
         let event_count = events.len() as u64;
+        let (row_start, row_count, column_start, column_count) =
+            preview_scroll_window(scroll_x_px, scroll_y_px);
+        let mut state_summary = None;
+        let mut changed = false;
         for event in events {
-            let output = runtime.apply_source_event(event)?;
-            state_summary = Some(output.state_summary);
+            let output = runtime.apply_source_event_for_document_window(
+                event,
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )?;
+            changed |= !output.semantic_deltas.is_empty() || !output.render_patches.is_empty();
+            state_summary = Some(output);
         }
         (
-            state_summary.ok_or("preview live event batch produced no state summary")?,
+            state_summary
+                .map(|output| output.state_summary)
+                .ok_or("preview live event batch produced no state summary")?,
             event_count,
+            changed,
         )
     };
-    let post_input_layout =
-        native_document_layout_proof_with_state(source_path, source_text, Some(&state_summary))?;
+    if !changed {
+        let mut shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        shared.last_error = None;
+        shared.update_count = shared.update_count.saturating_add(event_count);
+        return Ok(shared.layout_proof.clone());
+    }
+    let (mut post_input_layout, mut post_input_frame) =
+        native_document_layout_proof_with_state_embedded(
+            source_path,
+            source_text,
+            Some(&state_summary),
+        )?;
+    let residual_x = scroll_x_px % PREVIEW_CELLS_COLUMN_WIDTH_PX;
+    let residual_y = scroll_y_px % PREVIEW_CELLS_ROW_HEIGHT_PX;
+    let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
+    if scroll_x_px.abs() > f64::EPSILON
+        || residual_x.abs() > f64::EPSILON
+        || residual_y.abs() > f64::EPSILON
+    {
+        let (scrolled_layout, scrolled_frame) = scrolled_layout_proof_with_header_scroll(
+            &post_input_layout,
+            Some(&post_input_frame),
+            residual_x,
+            residual_y,
+            scroll_x_px + column_start as f64,
+        )?;
+        post_input_layout = scrolled_layout;
+        post_input_frame = scrolled_frame;
+    }
     if post_input_layout
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -9314,7 +10227,7 @@ fn preview_apply_live_events(
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
         shared_render_state.layout_proof = post_input_layout.clone();
-        shared_render_state.layout_frame_override = None;
+        shared_render_state.layout_frame_override = Some(post_input_frame);
         shared_render_state.last_error = None;
         shared_render_state.update_count =
             shared_render_state.update_count.saturating_add(event_count);
@@ -9370,17 +10283,40 @@ fn document_bounds_area(bounds: Option<&Value>) -> Option<f64> {
 fn live_source_event_for_hit_region(
     layout_proof: &Value,
     hit_region: &Value,
+    prefer_double_click: bool,
 ) -> Option<boon_runtime::LiveSourceEvent> {
     let node = hit_region.get("node")?.as_str()?;
-    let source = ["source", "click", "press", "double_click"]
+    let source_intents = if prefer_double_click {
+        ["double_click", "change", "source", "click", "press"]
+    } else {
+        ["source", "click", "press", "double_click", "change"]
+    };
+    let source = source_intents
         .into_iter()
         .find_map(|intent| live_source_for_node_intent(layout_proof, node, intent))?;
     Some(boon_runtime::LiveSourceEvent {
         source,
-        text: None,
+        text: prefer_double_click
+            .then(|| document_value_for_hit_region(layout_proof, hit_region).unwrap_or_default()),
         key: None,
         address: focused_address(layout_proof, node),
         target_text: focused_target_text(layout_proof, node),
+        target_occurrence: None,
+    })
+}
+
+fn preview_focused_blur_event(
+    layout_proof: &Value,
+    input_state: &PreviewNativeInputState,
+) -> Option<boon_runtime::LiveSourceEvent> {
+    let focused_node = input_state.focused_node.as_deref()?;
+    let source = live_source_for_node_intent(layout_proof, focused_node, "blur")?;
+    Some(boon_runtime::LiveSourceEvent {
+        source,
+        text: Some(input_state.focused_text.clone()),
+        key: None,
+        address: focused_address(layout_proof, focused_node),
+        target_text: focused_target_text(layout_proof, focused_node),
         target_occurrence: None,
     })
 }
@@ -9434,6 +10370,44 @@ fn focused_source_intent_value(layout_proof: &Value, node: &str, expected: &str)
 
 fn document_value_for_hit_region(layout_proof: &Value, hit_region: &Value) -> Option<String> {
     let node = hit_region.get("node")?.as_str()?;
+    document_value_for_node(layout_proof, node)
+}
+
+fn preview_focused_text_for_hit_region(
+    layout_proof: &Value,
+    hit_region: &Value,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+) -> Option<String> {
+    let node = hit_region.get("node")?.as_str()?;
+    preview_focused_text_for_node(layout_proof, node, live_runtime)
+}
+
+fn preview_focused_text_for_node(
+    layout_proof: &Value,
+    node: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+) -> Option<String> {
+    let address = focused_address(layout_proof, node)?;
+    let mut runtime = live_runtime.lock().ok()?;
+    let summary = runtime.document_state_summary();
+    focused_cell_editing_text_for_address(&summary, &address)
+}
+
+fn focused_cell_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
+    summary
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|cell| cell.get("address").and_then(serde_json::Value::as_str) == Some(address))
+        .and_then(|cell| {
+            cell.get("editing_text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn document_value_for_node(layout_proof: &Value, node: &str) -> Option<String> {
     layout_proof
         .get("display_item_samples")
         .or_else(|| layout_proof.get("display_list"))
@@ -10046,11 +11020,13 @@ fn preview_operator_host_input_response(
         let mut post_input_layout_artifact = serde_json::Value::Null;
         let mut post_input_layout_hash = serde_json::Value::Null;
         if !output.render_patches.is_empty() || !output.semantic_deltas.is_empty() {
-            if let Ok(post_input_layout) = native_document_layout_proof_with_state(
-                &state.source_path,
-                &state.source_text,
-                Some(&output.state_summary),
-            ) {
+            if let Ok((post_input_layout, post_input_frame)) =
+                native_document_layout_proof_with_state_embedded(
+                    &state.source_path,
+                    &state.source_text,
+                    Some(&output.state_summary),
+                )
+            {
                 if post_input_layout
                     .get("status")
                     .and_then(serde_json::Value::as_str)
@@ -10058,6 +11034,7 @@ fn preview_operator_host_input_response(
                 {
                     if let Ok(mut shared_render_state) = state.shared_render_state.lock() {
                         shared_render_state.layout_proof = post_input_layout.clone();
+                        shared_render_state.layout_frame_override = Some(post_input_frame);
                         shared_render_state.update_count =
                             shared_render_state.update_count.saturating_add(1);
                         shared_render_update_count = shared_render_state.update_count;
@@ -12820,6 +13797,1109 @@ mod tests {
             }),
             "formula bar should display the selected cell formula text"
         );
+    }
+
+    fn layout_has_visible_address(layout: &serde_json::Value, address: &str) -> bool {
+        let intents = layout["source_intent_assertions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let address_nodes = intents
+            .iter()
+            .filter(|intent| {
+                intent.get("intent").and_then(serde_json::Value::as_str) == Some("address")
+                    && intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(address)
+            })
+            .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
+            .filter(|node| {
+                intents.iter().any(|intent| {
+                    intent.get("node").and_then(serde_json::Value::as_str) == Some(*node)
+                        && intent.get("intent").and_then(serde_json::Value::as_str)
+                            == Some("target")
+                        && intent
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(address)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        layout["hit_target_assertions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|hit| hit.get("node").and_then(serde_json::Value::as_str))
+            .any(|node| address_nodes.contains(node))
+    }
+
+    fn first_scroll_region_center(layout: &serde_json::Value) -> (f64, f64) {
+        let bounds = layout["scroll_regions"][0]["bounds"].as_object().unwrap();
+        let x = bounds["x"].as_f64().unwrap() + bounds["width"].as_f64().unwrap() / 2.0;
+        let y = bounds["y"].as_f64().unwrap() + bounds["height"].as_f64().unwrap() / 2.0;
+        (x, y)
+    }
+
+    fn formula_bar_input_center(layout: &serde_json::Value) -> (f64, f64, String) {
+        let display_items = layout["display_item_samples"].as_array().unwrap();
+        let item = display_items
+            .iter()
+            .find(|item| {
+                item.get("kind").and_then(serde_json::Value::as_str) == Some("text_input")
+                    && item
+                        .pointer("/bounds/y")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some_and(|y| y < 50.0)
+                    && item
+                        .pointer("/bounds/width")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some_and(|width| width > 200.0)
+            })
+            .expect("formula bar text input should be present");
+        let node = item
+            .get("node")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned();
+        let hit = layout["hit_target_assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit.get("node").and_then(serde_json::Value::as_str) == Some(&node))
+            .expect("formula bar input should have a hit target");
+        let bounds = hit.get("bounds").unwrap();
+        (
+            bounds.get("x").and_then(serde_json::Value::as_f64).unwrap()
+                + bounds
+                    .get("width")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap()
+                    / 2.0,
+            bounds.get("y").and_then(serde_json::Value::as_f64).unwrap()
+                + bounds
+                    .get("height")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap()
+                    / 2.0,
+            node,
+        )
+    }
+
+    fn display_item_bounds_by_text<F>(
+        layout: &serde_json::Value,
+        text: &str,
+        predicate: F,
+    ) -> serde_json::Value
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        layout["display_item_samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item.get("text").and_then(serde_json::Value::as_str) == Some(text)
+                    && predicate(item)
+            })
+            .and_then(|item| item.get("bounds").cloned())
+            .unwrap_or_else(|| panic!("missing display item text `{text}`"))
+    }
+
+    fn hit_bounds_for_address(layout: &serde_json::Value, address: &str) -> serde_json::Value {
+        let intents = layout["source_intent_assertions"].as_array().unwrap();
+        let node = intents
+            .iter()
+            .find_map(|intent| {
+                if intent.get("intent").and_then(serde_json::Value::as_str) == Some("address")
+                    && intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(address)
+                {
+                    intent.get("node").and_then(serde_json::Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .expect("address should have a document node");
+        layout["hit_target_assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit.get("node").and_then(serde_json::Value::as_str) == Some(node))
+            .and_then(|hit| hit.get("bounds").cloned())
+            .expect("address should have hit bounds")
+    }
+
+    fn bounds_x(bounds: &serde_json::Value) -> f64 {
+        bounds.get("x").and_then(serde_json::Value::as_f64).unwrap()
+    }
+
+    fn bounds_y(bounds: &serde_json::Value) -> f64 {
+        bounds.get("y").and_then(serde_json::Value::as_f64).unwrap()
+    }
+
+    fn frame_text_for_node(frame: &boon_document::LayoutFrame, node: &str) -> Option<String> {
+        frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == node)
+            .and_then(|item| item.text.clone())
+    }
+
+    fn frame_caret_column_for_node(frame: &boon_document::LayoutFrame, node: &str) -> Option<f64> {
+        frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == node)
+            .and_then(|item| item.style.get("caret_column"))
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Number(value) => Some(*value),
+                _ => None,
+            })
+    }
+
+    fn latest_preview_frame(
+        shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    ) -> boon_document::LayoutFrame {
+        shared_render_state
+            .lock()
+            .unwrap()
+            .layout_frame_override
+            .as_ref()
+            .expect("preview should have a visible frame override")
+            .clone()
+    }
+
+    fn test_key_press(
+        sequence: u64,
+        key: &str,
+    ) -> boon_native_app_window::NativeKeyboardEventProof {
+        boon_native_app_window::NativeKeyboardEventProof {
+            sequence,
+            key: key.to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        }
+    }
+
+    #[test]
+    fn cells_scroll_materializes_later_window_and_can_return_to_origin() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-scroll-window", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, _) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+
+        assert!(layout_has_visible_address(&initial_layout, "A0"));
+        assert!(
+            layout_has_visible_address(&initial_layout, "A20"),
+            "initial Cells viewport should materialize the rows that fit in the visible sheet area"
+        );
+        assert!(
+            !layout_has_visible_address(&initial_layout, "Z40"),
+            "Z40 should require a scrolled Cells document window, not the initial frame"
+        );
+
+        let (scrolled_layout, _) = preview_layout_for_scroll_window(
+            &cells_path,
+            &cells_source,
+            &live_runtime,
+            25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX,
+            40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX,
+        )
+        .unwrap();
+        assert!(
+            layout_has_visible_address(&scrolled_layout, "Z40"),
+            "scrolling down/right should materialize a real Z40 hit target"
+        );
+
+        let (returned_layout, _) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        assert!(
+            layout_has_visible_address(&returned_layout, "A0"),
+            "scrolling back to origin should restore a real A0 hit target"
+        );
+        assert!(
+            !layout_has_visible_address(&returned_layout, "Z40"),
+            "origin should not keep stale far-window cell hit targets"
+        );
+    }
+
+    #[test]
+    fn cells_preview_scroll_input_moves_window_forward_and_back() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-scroll-input", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (mouse_x, mouse_y) = first_scroll_region_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+
+        let mut scroll_forward = test_keyboard_input(Vec::new(), Vec::new());
+        scroll_forward.mouse_scroll_event_count = 1;
+        scroll_forward.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: mouse_x,
+            y: mouse_y,
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        scroll_forward.scroll_delta_x = 25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
+        scroll_forward.scroll_delta_y = 40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX / 5.0;
+        preview_apply_scroll_input(
+            &scroll_forward,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert!(layout_has_visible_address(&shared.layout_proof, "Z40"));
+            assert!(!layout_has_visible_address(&shared.layout_proof, "A0"));
+        }
+
+        let mut scroll_back = test_keyboard_input(Vec::new(), Vec::new());
+        scroll_back.mouse_scroll_event_count = 2;
+        scroll_back.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: mouse_x,
+            y: mouse_y,
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        scroll_back.scroll_delta_x = -25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
+        scroll_back.scroll_delta_y = -40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX / 5.0;
+        preview_apply_scroll_input(
+            &scroll_back,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+        let shared = shared_render_state.lock().unwrap();
+        assert!(layout_has_visible_address(&shared.layout_proof, "A0"));
+        assert!(!layout_has_visible_address(&shared.layout_proof, "Z40"));
+        assert_eq!(shared.scroll_x_px, 0.0);
+        assert_eq!(shared.scroll_y_px, 0.0);
+    }
+
+    #[test]
+    fn cells_shift_wheel_scrolls_horizontally() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-shift-wheel", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (mouse_x, mouse_y) = first_scroll_region_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+
+        let mut shift_wheel = test_keyboard_input(Vec::new(), vec!["Shift"]);
+        shift_wheel.mouse_scroll_event_count = 1;
+        shift_wheel.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: mouse_x,
+            y: mouse_y,
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        shift_wheel.scroll_delta_y = 18.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
+        preview_apply_scroll_input(
+            &shift_wheel,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+        let shared = shared_render_state.lock().unwrap();
+        assert!(layout_has_visible_address(&shared.layout_proof, "S0"));
+        assert!(!layout_has_visible_address(&shared.layout_proof, "A0"));
+        assert!(shared.scroll_x_px > 0.0);
+        assert_eq!(shared.scroll_y_px, 0.0);
+    }
+
+    #[test]
+    fn cells_horizontal_scroll_keeps_row_gutter_fixed_and_headers_synced() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-scroll-sidebars", &cells_source)
+                .unwrap(),
+        ));
+        let (layout, _) = preview_layout_for_scroll_window(
+            &cells_path,
+            &cells_source,
+            &live_runtime,
+            18.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX,
+            0.0,
+        )
+        .unwrap();
+
+        assert!(layout_has_visible_address(&layout, "S0"));
+        assert!(!layout_has_visible_address(&layout, "A0"));
+        let row_zero = display_item_bounds_by_text(&layout, "0", |item| {
+            item.pointer("/bounds/x")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|x| x < 45.0)
+                && item
+                    .pointer("/bounds/y")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some_and(|y| y > 65.0)
+        });
+        let column_s = display_item_bounds_by_text(&layout, "S", |item| {
+            item.pointer("/bounds/y")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|y| y < 70.0)
+        });
+        let cell_s0 = hit_bounds_for_address(&layout, "S0");
+        assert!(
+            bounds_x(&row_zero) < 45.0,
+            "row gutter should stay fixed during horizontal scroll"
+        );
+        assert!(
+            (bounds_x(&column_s) - bounds_x(&cell_s0)).abs() <= 1.0,
+            "column header S should stay horizontally aligned with cell S0; header_x={}, cell_x={}",
+            bounds_x(&column_s),
+            bounds_x(&cell_s0)
+        );
+    }
+
+    #[test]
+    fn cells_vertical_scroll_keeps_column_header_fixed_and_rows_synced() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source(
+                "native-cells-scroll-vertical-sidebars",
+                &cells_source,
+            )
+            .unwrap(),
+        ));
+        let (layout, _) = preview_layout_for_scroll_window(
+            &cells_path,
+            &cells_source,
+            &live_runtime,
+            0.0,
+            10.0 * PREVIEW_CELLS_ROW_HEIGHT_PX,
+        )
+        .unwrap();
+
+        assert!(layout_has_visible_address(&layout, "A10"));
+        assert!(!layout_has_visible_address(&layout, "A0"));
+        let column_a = display_item_bounds_by_text(&layout, "A", |item| {
+            item.pointer("/bounds/y")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|y| y < 70.0)
+        });
+        let row_ten = display_item_bounds_by_text(&layout, "10", |item| {
+            item.pointer("/bounds/x")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|x| x < 45.0)
+        });
+        let cell_a10 = hit_bounds_for_address(&layout, "A10");
+        assert!(
+            bounds_y(&column_a) < 70.0,
+            "column header should stay fixed during vertical scroll"
+        );
+        assert!(
+            (bounds_y(&row_ten) - bounds_y(&cell_a10)).abs() <= 1.0,
+            "row label 10 should stay vertically aligned with cell A10"
+        );
+    }
+
+    #[test]
+    fn cells_formula_bar_click_accepts_text_edit() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-formula-bar-edit", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (x, y, formula_node) = formula_bar_input_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let click = deterministic_click_input_from_index(0, x, y);
+        preview_apply_real_window_input(
+            &click,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let keys = test_keyboard_input(
+            vec![
+                test_key_press(1, "Backspace"),
+                test_key_press(2, "Num4"),
+                test_key_press(3, "Num2"),
+            ],
+            Vec::new(),
+        );
+        preview_apply_real_window_input(
+            &keys,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "A0");
+        assert_eq!(summary["store"]["selected_input"]["editing_text"], "42");
+        assert_eq!(summary["store"]["selected_input"]["editing"], true);
+        let shared = shared_render_state.lock().unwrap();
+        let formula_item = shared
+            .layout_frame_override
+            .as_ref()
+            .unwrap()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == formula_node)
+            .expect("formula bar should remain in the frame");
+        assert!(formula_item.focused);
+        assert_eq!(formula_item.text.as_deref(), Some("42"));
+        assert_eq!(
+            formula_item
+                .style
+                .get("caret_column")
+                .and_then(|value| match value {
+                    boon_document_model::StyleValue::Number(value) => Some(*value),
+                    _ => None,
+                }),
+            Some(2.0)
+        );
+
+        let enter = test_keyboard_input(vec![test_key_press(4, "Return")], Vec::new());
+        drop(shared);
+        preview_apply_real_window_input(
+            &enter,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_input"]["formula_text"], "42");
+        assert_eq!(summary["store"]["selected_input"]["value"], "42");
+        assert_eq!(summary["store"]["selected_input"]["editing"], false);
+        assert!(
+            input_state.focused_node.is_none(),
+            "Enter should commit and blur the focused cell editor"
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &formula_node),
+            None,
+            "committed formula bar should not keep a focused caret after Enter"
+        );
+    }
+
+    #[test]
+    fn cells_clicking_another_cell_blurs_and_saves_current_draft() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-click-away-blur", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (formula_x, formula_y, _) = formula_bar_input_center(&initial_layout);
+        let (b0_x, b0_y, b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, formula_x, formula_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![
+                    test_key_press(1, "Delete"),
+                    test_key_press(2, "Num4"),
+                    test_key_press(3, "Num2"),
+                ],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert_eq!(input_state.focused_text, "42");
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, b0_x, b0_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["cells"][0]["formula_text"], "42");
+        assert_eq!(summary["cells"][0]["value"], "42");
+        assert_eq!(summary["store"]["selected_address"], "B0");
+        assert_eq!(
+            summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+        assert_eq!(input_state.focused_node.as_deref(), Some(b0_node.as_str()));
+    }
+
+    #[test]
+    fn cells_escape_cancels_draft_without_saving() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-escape-cancel", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (formula_x, formula_y, _) = formula_bar_input_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, formula_x, formula_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![
+                    test_key_press(1, "Delete"),
+                    test_key_press(2, "Num4"),
+                    test_key_press(3, "Num2"),
+                    test_key_press(4, "Escape"),
+                ],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["cells"][0]["formula_text"], "5");
+        assert_eq!(summary["cells"][0]["value"], "5");
+        assert_eq!(summary["cells"][0]["editing_text"], "5");
+        assert_eq!(input_state.focused_node, None);
+    }
+
+    #[test]
+    fn cells_formula_cell_focus_uses_formula_text_and_arrow_aliases_move_caret() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source(
+                "native-cells-formula-cell-caret",
+                &cells_source,
+            )
+            .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (x, y, cell_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, x, y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let formula = "=add(A0,A1)";
+        assert_eq!(input_state.focused_text, formula);
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &cell_node).as_deref(),
+            Some(formula),
+            "a selected formula cell should expose the formula text in its focused editor overlay"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![test_key_press(1, "End"), test_key_press(2, "LeftArrow")],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &cell_node),
+            Some((formula.chars().count() - 1) as f64),
+            "LeftArrow should move the focused cell caret one character left"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(3, "RightArrow")], Vec::new()),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &cell_node),
+            Some(formula.chars().count() as f64),
+            "RightArrow should move the focused cell caret right"
+        );
+    }
+
+    #[test]
+    fn cells_native_delete_key_deletes_backward_and_forward_delete_deletes_forward() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source(
+                "native-cells-backspace-forward-delete",
+                &cells_source,
+            )
+            .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (x, y, cell_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, x, y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![
+                    test_key_press(1, "End"),
+                    test_key_press(2, "LeftArrow"),
+                    test_key_press(3, "Delete"),
+                ],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            input_state.focused_text, "=add(A0,A)",
+            "native Delete key is Backspace and should remove the character before the caret"
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &cell_node).as_deref(),
+            Some("=add(A0,A)")
+        );
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &cell_node),
+            Some(9.0),
+            "backward delete should move the caret left"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(4, "ForwardDelete")], Vec::new()),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert_eq!(
+            input_state.focused_text, "=add(A0,A",
+            "ForwardDelete should remove the character at the caret"
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &cell_node).as_deref(),
+            Some("=add(A0,A")
+        );
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &cell_node),
+            Some(9.0),
+            "forward delete should keep the caret at the same text index"
+        );
+    }
+
+    #[test]
+    fn cells_double_click_enters_grid_edit_mode() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-double-click-edit", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (x, y, _) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let double_click = deterministic_click_input(2, x, y);
+        preview_apply_real_window_input(
+            &double_click,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "B0");
+        assert_eq!(summary["store"]["selected_input"]["editing"], true);
+        assert_eq!(
+            summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+        let shared = shared_render_state.lock().unwrap();
+        assert!(layout_has_visible_address(&shared.layout_proof, "B0"));
+    }
+
+    #[test]
+    fn cells_single_click_then_typing_inserts_into_grid_cell_draft() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-type-to-edit", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (x, y, grid_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("A0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, x, y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(1, "Num7")], Vec::new()),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "A0");
+        assert_eq!(summary["store"]["selected_input"]["editing_text"], "57");
+        assert_eq!(summary["store"]["selected_input"]["editing"], true);
+        let shared = shared_render_state.lock().unwrap();
+        let grid_item = shared
+            .layout_frame_override
+            .as_ref()
+            .unwrap()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == grid_node)
+            .expect("focused grid cell should be present");
+        assert!(grid_item.focused);
+        assert_eq!(grid_item.text.as_deref(), Some("57"));
+    }
+
+    #[test]
+    fn cells_native_editing_scenario_updates_cell_and_formula_with_keyboard_navigation() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-editing-scenario", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (a3_x, a3_y, a3_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("A3"))
+                .unwrap();
+        let (c0_x, c0_y, c0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("C0"))
+                .unwrap();
+        let (formula_x, formula_y, formula_node) = formula_bar_input_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, a3_x, a3_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![
+                    test_key_press(1, "Num2"),
+                    test_key_press(2, "Num0"),
+                    test_key_press(3, "Return"),
+                ],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "A3");
+        assert_eq!(summary["store"]["selected_input"]["formula_text"], "20");
+        assert_eq!(summary["store"]["selected_input"]["value"], "20");
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(frame_text_for_node(&frame, &a3_node).as_deref(), Some("20"));
+        assert_eq!(
+            frame_text_for_node(&frame, &formula_node).as_deref(),
+            Some("20"),
+            "formula bar should show the committed A3 value after Enter"
+        );
+        assert_eq!(
+            live_runtime.lock().unwrap().document_state_summary()["cells"][2]["value"],
+            "30",
+            "C0 should not include A3 before its formula is updated"
+        );
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, c0_x, c0_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(2, formula_x, formula_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &test_keyboard_input(
+                vec![
+                    test_key_press(4, "End"),
+                    test_key_press(5, "LeftArrow"),
+                    test_key_press(6, "Backspace"),
+                    test_key_press(7, "Num3"),
+                    test_key_press(8, "Return"),
+                ],
+                Vec::new(),
+            ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "C0");
+        assert_eq!(
+            summary["store"]["selected_input"]["formula_text"],
+            "=sum(A0:A3)"
+        );
+        assert_eq!(summary["store"]["selected_input"]["value"], "50");
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(frame_text_for_node(&frame, &c0_node).as_deref(), Some("50"));
+        assert_eq!(
+            frame_text_for_node(&frame, &formula_node).as_deref(),
+            Some("=sum(A0:A3)"),
+            "formula bar should show the committed C0 formula after Enter"
+        );
+    }
+
+    #[test]
+    fn native_gpu_render_cache_refreshes_focused_overlay_even_with_same_layout_hash() {
+        assert!(!native_gpu_render_cache_stale(
+            Some("layout-a"),
+            "layout-a",
+            false
+        ));
+        assert!(native_gpu_render_cache_stale(
+            Some("layout-a"),
+            "layout-a",
+            true
+        ));
+        assert!(native_gpu_render_cache_stale(
+            Some("layout-a"),
+            "layout-b",
+            false
+        ));
     }
 
     #[test]

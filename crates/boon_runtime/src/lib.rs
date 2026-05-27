@@ -737,6 +737,34 @@ impl LiveRuntime {
         self.apply_checked_step(&step)
     }
 
+    pub fn apply_source_event_for_document(
+        &mut self,
+        event: LiveSourceEvent,
+    ) -> RuntimeResult<LiveStepOutput> {
+        let step = event.into_step(self.next_step);
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step_with_document_summary(&step)
+    }
+
+    pub fn apply_source_event_for_document_window(
+        &mut self,
+        event: LiveSourceEvent,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
+        let step = event.into_step(self.next_step);
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step_with_document_window(
+            &step,
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
+    }
+
     pub fn apply_source_event_for_step(
         &mut self,
         step: &ScenarioStep,
@@ -751,24 +779,93 @@ impl LiveRuntime {
     }
 
     fn apply_checked_step(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveStepOutput> {
+        self.apply_checked_step_with_summary_mode(step, false)
+    }
+
+    fn apply_checked_step_with_document_summary(
+        &mut self,
+        step: &ScenarioStep,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.apply_checked_step_with_summary_mode(step, true)
+    }
+
+    fn apply_checked_step_with_document_window(
+        &mut self,
+        step: &ScenarioStep,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         self.runtime
             .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
         self.runtime.assert_step_after_measurement(step)?;
+        let state_summary = self.runtime.document_state_summary_for_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        );
         Ok(LiveStepOutput {
             semantic_deltas: semantic_deltas
                 .iter()
                 .map(SemanticDelta::to_static)
                 .collect(),
             render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
-            state_summary: self.runtime.state_summary(),
+            state_summary,
+        })
+    }
+
+    fn apply_checked_step_with_summary_mode(
+        &mut self,
+        step: &ScenarioStep,
+        document_summary: bool,
+    ) -> RuntimeResult<LiveStepOutput> {
+        let mut semantic_deltas = Vec::new();
+        let mut render_patches = Vec::new();
+        self.runtime
+            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+        self.runtime.assert_step_after_measurement(step)?;
+        let state_summary = if document_summary {
+            self.runtime.document_state_summary()
+        } else {
+            self.runtime.state_summary()
+        };
+        Ok(LiveStepOutput {
+            semantic_deltas: semantic_deltas
+                .iter()
+                .map(SemanticDelta::to_static)
+                .collect(),
+            render_patches: render_patches.iter().map(RenderPatch::to_static).collect(),
+            state_summary,
         })
     }
 
     pub fn state_summary(&mut self) -> JsonValue {
         self.runtime.state_summary()
+    }
+
+    pub fn document_state_summary(&mut self) -> JsonValue {
+        self.runtime.document_state_summary()
+    }
+
+    pub fn document_state_summary_for_window(
+        &mut self,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> JsonValue {
+        self.runtime.document_state_summary_for_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
     }
 }
 
@@ -1155,6 +1252,26 @@ impl LoadedRuntime {
         let mut summary = generic.generic_summary();
         generic.insert_list_projection_summary(&mut summary);
         summary
+    }
+
+    fn document_state_summary(&self) -> JsonValue {
+        let Some(generic) = self.generic.as_ref() else {
+            return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
+        };
+        generic.document_summary()
+    }
+
+    fn document_state_summary_for_window(
+        &self,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> JsonValue {
+        let Some(generic) = self.generic.as_ref() else {
+            return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
+        };
+        generic.document_summary_for_window(row_start, row_count, column_start, column_count)
     }
 
     fn apply_generic_step<'a>(
@@ -3970,6 +4087,52 @@ struct GenericScheduledRuntime {
     list_summary_fields: Vec<ListSummaryFields>,
 }
 
+#[derive(Clone, Copy)]
+struct SummaryLimits {
+    list_rows: Option<usize>,
+    chunk_row_start: usize,
+    chunk_rows: Option<usize>,
+    chunk_column_start: usize,
+    chunk_columns: Option<usize>,
+}
+
+impl SummaryLimits {
+    fn unlimited() -> Self {
+        Self {
+            list_rows: None,
+            chunk_row_start: 0,
+            chunk_rows: None,
+            chunk_column_start: 0,
+            chunk_columns: None,
+        }
+    }
+
+    fn document_preview() -> Self {
+        Self {
+            list_rows: Some(64),
+            chunk_row_start: 0,
+            chunk_rows: Some(24),
+            chunk_column_start: 0,
+            chunk_columns: Some(10),
+        }
+    }
+
+    fn document_preview_window(
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> Self {
+        Self {
+            list_rows: Some(row_start.saturating_add(row_count).max(64)),
+            chunk_row_start: row_start,
+            chunk_rows: Some(row_count),
+            chunk_column_start: column_start,
+            chunk_columns: Some(column_count),
+        }
+    }
+}
+
 impl GenericScheduledRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
         let mut runtime = Self {
@@ -3987,7 +4150,45 @@ impl GenericScheduledRuntime {
         };
         runtime.bind_initial_list_sources()?;
         runtime.initialize_generic_derived_fields()?;
+        runtime.reset_indexed_holds_from_row_initial_fields(ir)?;
+        runtime.initialize_generic_derived_fields()?;
         Ok(runtime)
+    }
+
+    fn reset_indexed_holds_from_row_initial_fields(
+        &mut self,
+        ir: &TypedProgram,
+    ) -> RuntimeResult<()> {
+        for cell in ir.state_cells.iter().filter(|cell| cell.indexed) {
+            let InitialValue::RowInitialField { path } = &cell.initial_value else {
+                continue;
+            };
+            let Some(scope_id) = cell.scope_id else {
+                continue;
+            };
+            let Some(row_scope) = ir.row_scopes.iter().find(|scope| scope.id == scope_id) else {
+                continue;
+            };
+            let Some(target_field) = cell.path.strip_prefix(&format!("{}.", row_scope.row_scope))
+            else {
+                continue;
+            };
+            let len = self.storage.list_len(&row_scope.list)?;
+            for index in 0..len {
+                let value = self
+                    .storage
+                    .list_row_textlike_opt(&row_scope.list, index, path)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.storage.set_or_insert_list_row_textlike(
+                    &row_scope.list,
+                    index,
+                    target_field,
+                    &value,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn bind_initial_list_sources(&mut self) -> RuntimeResult<()> {
@@ -5337,6 +5538,20 @@ impl GenericScheduledRuntime {
                 let expected = self.named_arg_value(args, "value", frame)?;
                 self.list_find(list, &field, expected, frame)
             }
+            "List/find_value" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let field = self
+                    .raw_named_arg(args, "field")
+                    .ok_or("List/find_value requires field")?;
+                let expected = self.named_arg_value(args, "value", frame)?;
+                let target = self
+                    .raw_named_arg(args, "target")
+                    .ok_or("List/find_value requires target")?;
+                let fallback = self
+                    .named_arg_value(args, "fallback", frame)
+                    .unwrap_or(BoonValue::Empty);
+                self.list_find_value(list, &field, expected, &target, fallback, frame)
+            }
             "List/get" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let index = self
@@ -5497,6 +5712,22 @@ impl GenericScheduledRuntime {
         Ok(BoonValue::Empty)
     }
 
+    fn list_find_value(
+        &mut self,
+        list: BoonValue,
+        field: &str,
+        expected: BoonValue,
+        target: &str,
+        fallback: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match self.list_find(list, field, expected, frame)? {
+            BoonValue::RowRef { list, index } => self.read_list_field(&list, index, target, frame),
+            BoonValue::Empty => Ok(fallback),
+            other => Ok(other),
+        }
+    }
+
     fn list_get(
         &mut self,
         list: BoonValue,
@@ -5580,7 +5811,21 @@ impl GenericScheduledRuntime {
 
     fn assert_generic_step_expectations(&self, step: &ScenarioStep) -> RuntimeResult<()> {
         if let Some(expect) = &step.expect_cell {
-            let (list, index) = self.generic_addressed_row(&expect.address)?;
+            let mut required_fields = vec!["formula_text"];
+            if expect.value.is_some() {
+                required_fields.push("value");
+            }
+            if expect.formula.is_some() {
+                required_fields.push("formula_text");
+            }
+            if expect.editing_text.is_some() {
+                required_fields.push("editing_text");
+            }
+            if expect.editing.is_some() {
+                required_fields.push("editing");
+            }
+            let (list, index) =
+                self.generic_addressed_row_with_fields(&expect.address, &required_fields)?;
             if let Some(value) = &expect.value {
                 self.assert_list_row_textlike(
                     &step.id,
@@ -5617,7 +5862,8 @@ impl GenericScheduledRuntime {
             }
         }
         if let Some(expect) = &step.expect_error {
-            let (list, index) = self.generic_addressed_row(&expect.address)?;
+            let (list, index) =
+                self.generic_addressed_row_with_fields(&expect.address, &["error"])?;
             let actual = self
                 .storage
                 .list_row_textlike_opt(&list, index, "error")
@@ -5651,12 +5897,26 @@ impl GenericScheduledRuntime {
     }
 
     fn generic_addressed_row(&self, address: &str) -> RuntimeResult<(String, usize)> {
+        self.generic_addressed_row_with_fields(address, &[])
+    }
+
+    fn generic_addressed_row_with_fields(
+        &self,
+        address: &str,
+        required_fields: &[&str],
+    ) -> RuntimeResult<(String, usize)> {
         for slot in &self.storage.lists.list_slots {
             let list = &slot.name;
             if self
                 .storage
                 .list_row_textlike_opt(list, 0, "address")
                 .is_none()
+            {
+                continue;
+            }
+            if required_fields
+                .iter()
+                .any(|field| self.storage.list_row_field(list, 0, field).is_err())
             {
                 continue;
             }
@@ -5681,6 +5941,37 @@ impl GenericScheduledRuntime {
     }
 
     fn generic_summary(&self) -> JsonValue {
+        self.generic_summary_with_limits(SummaryLimits::unlimited())
+    }
+
+    fn document_summary(&self) -> JsonValue {
+        let mut summary = self.generic_summary_with_limits(SummaryLimits::document_preview());
+        self.insert_list_projection_summary_with_limits(
+            &mut summary,
+            SummaryLimits::document_preview(),
+        );
+        summary
+    }
+
+    fn document_summary_for_window(
+        &self,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> JsonValue {
+        let limits = SummaryLimits::document_preview_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        );
+        let mut summary = self.generic_summary_with_limits(limits);
+        self.insert_list_projection_summary_with_limits(&mut summary, limits);
+        summary
+    }
+
+    fn generic_summary_with_limits(&self, limits: SummaryLimits) -> JsonValue {
         let mut root = serde_json::Map::new();
         let mut flat_root = serde_json::Map::new();
         for path in &self.root_state_paths {
@@ -5717,8 +6008,9 @@ impl GenericScheduledRuntime {
                 continue;
             }
             let len = self.storage.list_len(list).unwrap_or_default();
-            let mut rows = Vec::with_capacity(len);
-            for index in 0..len {
+            let row_limit = limits.list_rows.map_or(len, |limit| len.min(limit));
+            let mut rows = Vec::with_capacity(row_limit);
+            for index in 0..row_limit {
                 if self
                     .storage
                     .list_row_matches_predicate(list, index, &predicate)
@@ -5737,8 +6029,9 @@ impl GenericScheduledRuntime {
         }
         for summary in &self.list_summary_fields {
             let len = self.storage.list_len(&summary.list).unwrap_or_default();
-            let mut rows = Vec::with_capacity(len);
-            for index in 0..len {
+            let row_limit = limits.list_rows.map_or(len, |limit| len.min(limit));
+            let mut rows = Vec::with_capacity(row_limit);
+            for index in 0..row_limit {
                 rows.push(JsonValue::Object(
                     self.summary_row_json(summary, index)
                         .unwrap_or_else(|_| serde_json::Map::new()),
@@ -5754,6 +6047,14 @@ impl GenericScheduledRuntime {
     }
 
     fn insert_list_projection_summary(&self, summary: &mut JsonValue) {
+        self.insert_list_projection_summary_with_limits(summary, SummaryLimits::unlimited());
+    }
+
+    fn insert_list_projection_summary_with_limits(
+        &self,
+        summary: &mut JsonValue,
+        limits: SummaryLimits,
+    ) {
         let Some(root) = summary.as_object_mut() else {
             return;
         };
@@ -5769,6 +6070,7 @@ impl GenericScheduledRuntime {
                         projection.rows,
                         item_field,
                         label_field,
+                        limits,
                     );
                     insert_nested_json(root, &projection.target, JsonValue::Array(value));
                 }
@@ -5798,6 +6100,7 @@ impl GenericScheduledRuntime {
         rows: usize,
         item_field: &str,
         label_field: &str,
+        limits: SummaryLimits,
     ) -> Vec<JsonValue> {
         let list_summary = self
             .list_summary_fields
@@ -5811,13 +6114,22 @@ impl GenericScheduledRuntime {
         } else {
             len.div_ceil(columns)
         };
-        let mut projected_rows = Vec::with_capacity(row_count);
-        for row in 0..row_count {
+        let projected_row_count = limits.chunk_rows.map_or(row_count, |limit| {
+            row_count.saturating_sub(limits.chunk_row_start).min(limit)
+        });
+        let projected_columns = limits.chunk_columns.map_or_else(
+            || columns.saturating_sub(limits.chunk_column_start),
+            |limit| columns.saturating_sub(limits.chunk_column_start).min(limit),
+        );
+        let mut projected_rows = Vec::with_capacity(projected_row_count);
+        for row_offset in 0..projected_row_count {
+            let row = limits.chunk_row_start.saturating_add(row_offset);
             let mut row_object = serde_json::Map::new();
             row_object.insert(label_field.to_owned(), json!(row.to_string()));
             row_object.insert("index".to_owned(), json!(row));
-            let mut cells = Vec::with_capacity(columns);
-            for column in 0..columns {
+            let mut cells = Vec::with_capacity(projected_columns);
+            for column_offset in 0..projected_columns {
+                let column = limits.chunk_column_start.saturating_add(column_offset);
                 let index = row * columns + column;
                 if index >= len {
                     break;
@@ -8681,6 +8993,7 @@ struct ListSourceBindingPlan {
 #[derive(Clone, Debug)]
 struct ListSourceBindingSlot {
     list: String,
+    row_scope: String,
     source_paths: Vec<String>,
 }
 
@@ -9514,7 +9827,13 @@ impl ListSourceBindingPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
         let mut list_slots = Vec::new();
         for list in &ir.lists {
-            let row_scope = row_scope_name(&list.name);
+            let Some(scope_id) = list.row_scope_id else {
+                continue;
+            };
+            let Some(row_scope) = ir.row_scopes.iter().find(|scope| scope.id == scope_id) else {
+                continue;
+            };
+            let row_scope = row_scope.row_scope.clone();
             let prefix = format!("{row_scope}.sources.");
             let source_paths = ir
                 .sources
@@ -9525,6 +9844,7 @@ impl ListSourceBindingPlan {
             if !source_paths.is_empty() {
                 list_slots.push(ListSourceBindingSlot {
                     list: list.name.clone(),
+                    row_scope,
                     source_paths,
                 });
             }
@@ -9548,9 +9868,9 @@ impl ListSourceBindingPlan {
     }
 
     fn list_for_row_scope(&self, scope: &str) -> Option<&str> {
-        self.list_slots.iter().find_map(|binding| {
-            row_scope_matches_list(&binding.list, scope).then_some(binding.list.as_str())
-        })
+        self.list_slots
+            .iter()
+            .find_map(|binding| (binding.row_scope == scope).then_some(binding.list.as_str()))
     }
 }
 
@@ -10853,21 +11173,17 @@ fn cells_project_source_for_test() -> String {
 }
 
 #[cfg(test)]
-fn cells_project_source_with_dimensions_for_test(columns: usize, rows: usize) -> String {
-    cells_project_source_for_test().replace(
-        "columns: 26\n        rows: 100",
-        &format!("columns: {columns}\n        rows: {rows}"),
-    )
-}
-#[cfg(test)]
-fn cells_table_dimensions_from_ir(ir: &TypedProgram) -> Option<(usize, usize)> {
-    ir.lists.iter().find_map(|list| match list.initializer {
-        ListInitializer::Table { columns, rows, .. } => Some((columns, rows)),
-        ListInitializer::RecordLiteral { .. }
-        | ListInitializer::Range { .. }
-        | ListInitializer::Empty
-        | ListInitializer::Unknown { .. } => None,
-    })
+fn cells_range_from_ir(ir: &TypedProgram) -> Option<(i64, i64)> {
+    ir.lists
+        .iter()
+        .find(|list| list.name == "cells")
+        .and_then(|list| match list.initializer {
+            ListInitializer::Range { from, to } => Some((from, to)),
+            ListInitializer::RecordLiteral { .. }
+            | ListInitializer::Table { .. }
+            | ListInitializer::Empty
+            | ListInitializer::Unknown { .. } => None,
+        })
 }
 
 fn table_default_field_map(
@@ -11249,6 +11565,37 @@ mod tests {
                 "{path} must express cell calculation in ordinary Boon source"
             );
         }
+    }
+
+    #[test]
+    fn cells_manifest_source_is_generic_boon_without_spreadsheet_shortcuts() {
+        let source = cells_project_source_for_test();
+        for forbidden in ["Formula", "Grid", "List/table", "EXAMPLE", "#"] {
+            assert!(
+                !source.contains(forbidden),
+                "Cells manifest-backed source must not contain `{forbidden}`"
+            );
+        }
+        assert!(
+            source.contains("List/range(from: 0, to: 2599)"),
+            "Cells should generate its official 26x100 model from a generic range"
+        );
+        assert!(
+            source.contains("List/chunk(cells, size: 26"),
+            "Cells should derive sheet rows with generic List/chunk"
+        );
+        let parsed = parse_source("examples/cells.bn", &source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert_eq!(cells_range_from_ir(&ir), Some((0, 2599)));
+        assert!(
+            parsed.operators.iter().all(|operator| {
+                !matches!(
+                    operator.as_str(),
+                    "Formula/eval" | "Grid/cells" | "List/table"
+                )
+            }),
+            "Cells should not lower through spreadsheet-specific operators"
+        );
     }
 
     #[test]
@@ -11803,7 +12150,7 @@ mod tests {
             &cells_source,
             Path::new("../../examples/cells.scn"),
             VerificationLayer::Semantic,
-            Some(7),
+            Some(8),
         )
         .unwrap();
         let formula = cells_output
@@ -12358,12 +12705,12 @@ mod tests {
         );
 
         let cells_source = cells_project_source_for_test().replace(
-            "columns: 26\n        rows: 100",
-            "columns: 3\n        rows: 4",
+            "List/range(from: 0, to: 2599)",
+            "List/range(from: 0, to: 11)",
         );
         let parsed = parse_source("examples/cells.bn", &cells_source).unwrap();
         let ir = lower(&parsed).unwrap();
-        assert_eq!(cells_table_dimensions_from_ir(&ir), Some((3, 4)));
+        assert_eq!(cells_range_from_ir(&ir), Some((0, 11)));
 
         let cells_source = cells_project_source_for_test().replace(
             "[address: TEXT { A0 }, field: TEXT { default_formula }, value: TEXT { 5 }]",
@@ -12374,14 +12721,20 @@ mod tests {
         let cells_list = ir
             .lists
             .iter()
-            .find(|list| list.name == "cells")
-            .expect("Cells source should lower a cells list");
+            .find(|list| list.name == "cells_default_values")
+            .expect("Cells source should lower generic default values");
         let defaults = match &cells_list.initializer {
-            ListInitializer::Table { defaults, .. } => defaults,
-            initializer => panic!("unexpected Cells initializer: {initializer:?}"),
+            ListInitializer::RecordLiteral { rows } => rows,
+            initializer => panic!("unexpected Cells default initializer: {initializer:?}"),
         };
-        assert!(defaults.iter().any(|default| {
-            default.address == "A0" && default.field == "default_formula" && default.value == "9"
+        assert!(defaults.iter().any(|row| {
+            row.fields.iter().any(|field| {
+                field.name == "address"
+                    && matches!(&field.value, InitialValue::Text { value } if value == "A0")
+            }) && row.fields.iter().any(|field| {
+                field.name == "value"
+                    && matches!(&field.value, InitialValue::Text { value } if value == "9")
+            })
         }));
         let mut runtime =
             LiveRuntime::from_source("cells-defaults-from-boon", &cells_source).unwrap();

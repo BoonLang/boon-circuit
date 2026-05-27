@@ -32,6 +32,11 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
+  "select-a3-for-literal-entry",
+  "type-a3-literal-20",
+  "commit-a3-literal-20",
+  "select-c0-for-formula-update",
+  "commit-c0-formula-bar-sum-through-a3",
   "edit-a0-literal",
   "commit-a0-literal",
   "edit-a0-cancel-draft",

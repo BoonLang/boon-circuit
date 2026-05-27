@@ -2505,10 +2505,18 @@ fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValu
             summary: "missing initial value".to_owned(),
         };
     };
-    ast_initial_value(expr, row_scopes)
+    let current_row_scope = row_scopes
+        .iter()
+        .find(|scope| field.path.starts_with(&format!("{}.", scope.row_scope)))
+        .map(|scope| scope.row_scope.as_str());
+    ast_initial_value(expr, row_scopes, current_row_scope)
 }
 
-fn ast_initial_value(expr: &AstExpr, row_scopes: &[RowScope]) -> InitialValue {
+fn ast_initial_value(
+    expr: &AstExpr,
+    row_scopes: &[RowScope],
+    current_row_scope: Option<&str>,
+) -> InitialValue {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
             value: value.clone(),
@@ -2543,6 +2551,13 @@ fn ast_initial_value(expr: &AstExpr, row_scopes: &[RowScope]) -> InitialValue {
         {
             InitialValue::Enum {
                 value: parts[0].clone(),
+            }
+        }
+        AstExprKind::Identifier(value)
+            if current_row_scope.is_some() && !value_starts_uppercase_identifier(value) =>
+        {
+            InitialValue::RowInitialField {
+                path: value.clone(),
             }
         }
         AstExprKind::Identifier(value) if value_starts_uppercase_identifier(value) => {
@@ -3218,6 +3233,7 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
             | "List/table"
             | "List/chunk"
             | "List/find"
+            | "List/find_value"
             | "List/get"
             | "List/append"
             | "List/remove"
@@ -3587,7 +3603,7 @@ impl FieldDef {
                     .iter()
                     .find(|candidate| candidate.id == output)
                     .is_some_and(|output| {
-                        ast_initial_value(output, &[])
+                        ast_initial_value(output, &[], None)
                             == InitialValue::Text {
                                 value: String::new(),
                             }
@@ -3932,11 +3948,7 @@ fn collect_field_ast_items(items: &[&AstItem], start: usize, indent: usize) -> V
     let mut body = Vec::new();
     for item in &items[start..] {
         let current_indent = item.indent;
-        if current_indent <= indent
-            && !body.is_empty()
-            && item.field.is_some()
-            && !item_has_symbol(item, "=>")
-        {
+        if current_indent <= indent && !body.is_empty() && item.line != items[start].line {
             break;
         }
         body.push((*item).clone());
@@ -4594,38 +4606,29 @@ FUNCTION new_todo(todo) {
             .expect("Cells source should lower a cells list");
         assert_eq!(
             cells_list.initializer,
-            ListInitializer::Table {
-                columns: 26,
-                rows: 100,
-                defaults: vec![
-                    TableDefaultField {
-                        address: "A0".to_owned(),
-                        field: "default_formula".to_owned(),
-                        value: "5".to_owned()
-                    },
-                    TableDefaultField {
-                        address: "A1".to_owned(),
-                        field: "default_formula".to_owned(),
-                        value: "10".to_owned()
-                    },
-                    TableDefaultField {
-                        address: "A2".to_owned(),
-                        field: "default_formula".to_owned(),
-                        value: "15".to_owned()
-                    },
-                    TableDefaultField {
-                        address: "B0".to_owned(),
-                        field: "default_formula".to_owned(),
-                        value: "=add(A0,A1)".to_owned()
-                    },
-                    TableDefaultField {
-                        address: "C0".to_owned(),
-                        field: "default_formula".to_owned(),
-                        value: "=sum(A0:A2)".to_owned()
-                    },
-                ],
-            }
+            ListInitializer::Range { from: 0, to: 2599 }
         );
+        let defaults_list = ir
+            .lists
+            .iter()
+            .find(|list| list.name == "cells_default_values")
+            .expect("Cells source should lower generic default values");
+        let ListInitializer::RecordLiteral { rows } = &defaults_list.initializer else {
+            panic!(
+                "Cells defaults should be a generic record literal, got {:?}",
+                defaults_list.initializer
+            );
+        };
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|row| {
+            row.fields.iter().any(|field| {
+                field.name == "address"
+                    && matches!(&field.value, InitialValue::Text { value } if value == "B0")
+            }) && row.fields.iter().any(|field| {
+                field.name == "value"
+                    && matches!(&field.value, InitialValue::Text { value } if value == "=add(A0,A1)")
+            })
+        }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "cell.sources.editor.commit"
                 && source.payload_schema.fields

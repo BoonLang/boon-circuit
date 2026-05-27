@@ -1,9 +1,5 @@
--- Cells table model.
+-- Cells table model generated from generic list operations.
 
 cells:
-    List/table(
-        columns: 26
-        rows: 100
-        defaults: cells_default_values
-    )
+    List/range(from: 0, to: 2599)
     |> List/map(cell, new: new_cell(cell: cell))

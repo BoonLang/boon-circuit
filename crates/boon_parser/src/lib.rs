@@ -1569,6 +1569,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/table"
             | "List/get"
             | "List/find"
+            | "List/find_value"
             | "List/chunk"
             | "List/remove"
             | "List/retain"

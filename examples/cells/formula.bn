@@ -1,5 +1,18 @@
 -- Cells formula helpers.
 
+FUNCTION cell_address(index) {
+    BLOCK {
+        column_index: index % 26
+        row_index: index / 26
+        column: List/get(sheet_columns, index: column_index)
+        column.label + row_index
+    }
+}
+
+FUNCTION default_formula_for_address(address) {
+    List/find_value(cells_default_values, field: address, value: address, target: value, fallback: Text/empty())
+}
+
 FUNCTION cell_value(target_address) {
     BLOCK {
         found: List/find(cells, field: address, value: target_address)

@@ -62,6 +62,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-editor-format",
     "verify-native-example-speed",
     "verify-native-counter-interaction-speed",
+    "verify-native-cells-interaction-speed",
     "verify-native-dev-editor-speed",
     "verify-native-two-window-content",
     "verify-native-todomvc-reference-parity",
@@ -142,6 +143,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-editor-format" => verify_native_editor_format(&args),
         "verify-native-example-speed" => verify_native_example_speed(&args),
         "verify-native-counter-interaction-speed" => verify_native_counter_interaction_speed(&args),
+        "verify-native-cells-interaction-speed" => verify_native_cells_interaction_speed(&args),
         "verify-native-dev-editor-speed" => verify_native_dev_editor_speed(&args),
         "verify-native-two-window-content" => verify_native_two_window_content(&args),
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
@@ -9224,8 +9226,9 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
         }),
     );
     let source = boon_runtime::source_text_for_entry(&entry)?;
-    let full_cells_grid =
-        entry.id != "cells" || (source.contains("columns: 26") && source.contains("rows: 100"));
+    let full_cells_grid = entry.id != "cells"
+        || (source.contains("List/range(from: 0, to: 2599)")
+            && source.contains("List/chunk(cells, size: 26"));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -9543,6 +9546,309 @@ fn verify_native_counter_interaction_speed(
             "interaction_per_event_ms": interaction_per_event_ms,
             "preview_shared_render_update_count": render_update_count,
             "max_total_ms": max_total_ms,
+            "artifact_sha256s": role_artifact
+        }),
+    )
+}
+
+fn verify_native_cells_interaction_speed(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "debug".to_owned());
+    let profile_ok = matches!(profile.as_str(), "debug" | "release");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:profile-selector",
+        profile_ok,
+        format!("profile={profile}"),
+        (!profile_ok)
+            .then(|| "cells interaction speed gate supports --profile debug|release".to_owned()),
+    );
+    let event_count = value_arg(args, "--event-count")
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(if profile == "release" { 64 } else { 16 })
+        .max(1);
+    let default_max_p95_ms = if profile == "release" { 16.7 } else { 120.0 };
+    let default_max_max_ms = if profile == "release" { 50.0 } else { 250.0 };
+    let max_p95_ms = value_arg(args, "--max-p95-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(default_max_p95_ms);
+    let max_max_ms = value_arg(args, "--max-max-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(default_max_max_ms);
+    let entry = boon_runtime::example_manifest_entry("cells")?;
+    let source = boon_runtime::source_text_for_entry(&entry)?;
+    let generic_source_ok = source.contains("List/range(from: 0, to: 2599)")
+        && source.contains("List/chunk(cells, size: 26")
+        && ["Formula", "Grid", "List/table", "EXAMPLE", "#"]
+            .iter()
+            .all(|needle| !source.contains(needle));
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:generic-source",
+        generic_source_ok,
+        "manifest-backed Cells source uses List/range/List/chunk and no spreadsheet shortcuts",
+        (!generic_source_ok).then(|| {
+            "Cells interaction speed gate requires generic valid Boon source without Formula/Grid/List-table shortcuts".to_owned()
+        }),
+    );
+
+    let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
+    std::fs::create_dir_all(&artifacts_dir)?;
+    let role_report = artifacts_dir.join(format!("cells-interaction-speed-{profile}-role.json"));
+    let _ = std::fs::remove_file(&role_report);
+
+    let mut build_args = vec!["build", "-p", "boon_native_playground"];
+    if profile == "release" {
+        build_args.push("--release");
+    }
+    let build = Command::new("cargo").args(&build_args).status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:playground-build",
+        build.success(),
+        format!("cargo {} status={build}", build_args.join(" ")),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+    );
+
+    let binary_path = if profile == "release" {
+        PathBuf::from("target/release/boon_native_playground")
+    } else {
+        PathBuf::from("target/debug/boon_native_playground")
+    };
+    let event_count_arg = event_count.to_string();
+    let max_p95_ms_arg = max_p95_ms.to_string();
+    let max_max_ms_arg = max_max_ms.to_string();
+    let role_report_arg = role_report.display().to_string();
+    let role_output = if build.success() && profile_ok && generic_source_ok {
+        Some(
+            Command::new(&binary_path)
+                .args([
+                    "--role",
+                    "interaction-speed",
+                    "--example",
+                    "cells",
+                    "--event-count",
+                    &event_count_arg,
+                    "--max-p95-ms",
+                    &max_p95_ms_arg,
+                    "--max-max-ms",
+                    &max_max_ms_arg,
+                    "--report",
+                    &role_report_arg,
+                ])
+                .output()?,
+        )
+    } else {
+        None
+    };
+    let role_exit_success = role_output
+        .as_ref()
+        .is_some_and(|output| output.status.success());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:role-exit-success",
+        role_exit_success,
+        format!(
+            "status={:?}",
+            role_output
+                .as_ref()
+                .map(|output| output.status.to_string())
+                .unwrap_or_else(|| "not-run".to_owned())
+        ),
+        (!role_exit_success).then(|| {
+            format!(
+                "boon_native_playground interaction-speed role failed; report={}",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_report_json = read_optional_json(&role_report)?;
+    let role_report_present = role_report_json.is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:role-report-present",
+        role_report_present,
+        format!("report={}", role_report.display()),
+        (!role_report_present).then(|| {
+            format!(
+                "interaction-speed role did not write `{}`",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
+        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:role-status-pass",
+        role_status_pass,
+        format!(
+            "status={:?}",
+            role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!role_status_pass).then(|| "interaction-speed role report status was not pass".to_owned()),
+    );
+
+    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
+        report
+            .get("per_step_pass_fail")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| {
+                !steps.is_empty()
+                    && steps.iter().all(|step| {
+                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+            })
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:role-checks-pass",
+        role_checks_all_pass,
+        "role per_step_pass_fail entries all pass",
+        (!role_checks_all_pass)
+            .then(|| "interaction-speed role contained a failing step".to_owned()),
+    );
+
+    let selected_address = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("selected_address"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let focused_b0 = selected_address == "B0";
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:b0-focused",
+        focused_b0,
+        format!("selected_address={selected_address}"),
+        (!focused_b0).then(|| {
+            format!(
+                "Cells focus interaction did not select B0; selected_address={selected_address}"
+            )
+        }),
+    );
+
+    let p95_ms = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("interaction_latency_ms_p95"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let max_ms = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("interaction_latency_ms_max"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let p95_ok = p95_ms <= max_p95_ms;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:p95-budget",
+        p95_ok,
+        format!("p95_ms={p95_ms:.3}, max_p95_ms={max_p95_ms:.3}"),
+        (!p95_ok).then(|| {
+            format!(
+                "Cells focus p95 exceeded {profile} budget: p95_ms={p95_ms:.3}, max_p95_ms={max_p95_ms:.3}"
+            )
+        }),
+    );
+    let max_ok = max_ms <= max_max_ms;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:max-budget",
+        max_ok,
+        format!("max_ms={max_ms:.3}, max_max_ms={max_max_ms:.3}"),
+        (!max_ok).then(|| {
+            format!(
+                "Cells focus max latency exceeded {profile} budget: max_ms={max_ms:.3}, max_max_ms={max_max_ms:.3}"
+            )
+        }),
+    );
+
+    let render_update_count = role_report_json
+        .as_ref()
+        .and_then(|report| report.get("preview_shared_render_update_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let render_update_ok = render_update_count >= event_count;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-interaction-speed:render-updated-for-each-click",
+        render_update_ok,
+        format!("render_update_count={render_update_count}, event_count={event_count}"),
+        (!render_update_ok).then(|| {
+            format!(
+                "Cells interaction render updates lagged clicks: render_update_count={render_update_count}, event_count={event_count}"
+            )
+        }),
+    );
+
+    let role_artifact = if role_report.exists() {
+        vec![artifact_hash(&role_report)?]
+    } else {
+        Vec::new()
+    };
+    write_native_gate_report(
+        args,
+        "verify-native-cells-interaction-speed",
+        checks,
+        blockers,
+        json!({
+            "example": "cells",
+            "profile": profile,
+            "source_path": entry.source,
+            "scenario_path": entry.scenario,
+            "source_hash": file_hash(&entry.source),
+            "source_files_hash": source_hash_for_report_source_files(&manifest_source_files(&entry), &source)?,
+            "scenario_hash": file_hash("examples/cells.scn"),
+            "playground_binary_path": binary_path,
+            "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
+            "role_report": role_report,
+            "role_report_status": role_report_json
+                .as_ref()
+                .and_then(|report| report.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "event_count": event_count,
+            "selected_address": selected_address,
+            "interaction_latency_ms_p95": p95_ms,
+            "interaction_latency_ms_max": max_ms,
+            "preview_shared_render_update_count": render_update_count,
+            "max_p95_ms": max_p95_ms,
+            "max_max_ms": max_max_ms,
+            "targets": {
+                "debug": {
+                    "focus_p95_ms": 120.0,
+                    "focus_p99_ms": 180.0,
+                    "focus_max_ms": 250.0
+                },
+                "release": {
+                    "focus_p95_ms": 16.7,
+                    "focus_p99_ms": 25.0,
+                    "focus_max_ms": 50.0
+                }
+            },
             "artifact_sha256s": role_artifact
         }),
     )
@@ -11376,6 +11682,18 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[],
         ),
         native_gpu_required_report(
+            "cells-interaction-speed-debug",
+            "target/reports/native-gpu/cells-interaction-speed-debug.json",
+            "verify-native-cells-interaction-speed",
+            &[("--profile", "debug")],
+        ),
+        native_gpu_required_report(
+            "cells-interaction-speed-release",
+            "target/reports/native-gpu/cells-interaction-speed-release.json",
+            "verify-native-cells-interaction-speed",
+            &[("--profile", "release")],
+        ),
+        native_gpu_required_report(
             "scroll-speed-cells",
             "target/reports/native-gpu/scroll-speed-cells.json",
             "verify-native-gpu-scroll-speed",
@@ -11605,6 +11923,51 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     .and_then(serde_json::Value::as_str)
             {
                 blockers.push("final_count must match expected_count".to_owned());
+            }
+        }
+        "cells-interaction-speed-debug" | "cells-interaction-speed-release" => {
+            require_u64_at_least(&mut blockers, report, "event_count", 1);
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "preview_shared_render_update_count",
+                report
+                    .get("event_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "interaction_latency_ms_p95",
+                report
+                    .get("max_p95_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(if label.ends_with("release") {
+                        16.7
+                    } else {
+                        120.0
+                    }),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "interaction_latency_ms_max",
+                report
+                    .get("max_max_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(if label.ends_with("release") {
+                        50.0
+                    } else {
+                        250.0
+                    }),
+            );
+            if report
+                .get("selected_address")
+                .and_then(serde_json::Value::as_str)
+                != Some("B0")
+            {
+                blockers.push("selected_address must be B0".to_owned());
             }
         }
         "multiwindow" => {
@@ -12573,6 +12936,10 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             _ => "speed-example",
         },
         "verify-native-counter-interaction-speed" => "counter-interaction-speed",
+        "verify-native-cells-interaction-speed" => match value_arg(args, "--profile").as_deref() {
+            Some("release") => "cells-interaction-speed-release",
+            _ => "cells-interaction-speed-debug",
+        },
         "verify-native-dev-editor-speed" => "dev-editor-speed",
         "verify-native-two-window-content" => "todomvc-two-window-content",
         "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
@@ -15942,6 +16309,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
                 | "verify-native-counter-interaction-speed"
+                | "verify-native-cells-interaction-speed"
                 | "verify-native-dev-editor-speed"
                 | "verify-boon-driver-schema"
                 | "verify-boon-driver-e2e"

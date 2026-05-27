@@ -55,11 +55,11 @@ FUNCTION formula_bar() {
             Element/text_input(
                 element: [
                     event: [
-                        click: cell.sources.editor.select
-                        change: cell.sources.editor.change
-                        key_down: cell.sources.editor.commit
-                        escape: cell.sources.editor.cancel
-                        blur: cell.sources.editor.blur
+                        click: store.selected_input.sources.editor.select
+                        change: store.selected_input.sources.editor.change
+                        key_down: store.selected_input.sources.editor.commit
+                        escape: store.selected_input.sources.editor.cancel
+                        blur: store.selected_input.sources.editor.blur
                     ]
                 ]
                 style: [
@@ -177,6 +177,7 @@ FUNCTION cell_input(cell) {
         element: [
             event: [
                 click: cell.sources.editor.select
+                double_click: cell.sources.editor.change
                 change: cell.sources.editor.change
                 key_down: cell.sources.editor.commit
                 escape: cell.sources.editor.cancel

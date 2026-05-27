@@ -4314,8 +4314,11 @@ impl GenericScheduledRuntime {
         read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
         mut observe: impl FnMut(GenericSourceMutation<'a>) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
-        let actions = self.source_routes.actions_for_source_id(input.source_id)?;
-        for action in actions {
+        let actions = self
+            .source_routes
+            .actions_for_source_id(input.source_id)?
+            .to_vec();
+        for action in &actions {
             match action {
                 SourceAction::RootScalar => {
                     if let Some(commit) = self.storage.apply_root_text_action_source(
@@ -4365,6 +4368,11 @@ impl GenericScheduledRuntime {
                         .collect::<Vec<_>>();
                     for binding in bindings {
                         observe(GenericSourceMutation::SourceBind(binding))?;
+                    }
+                    for commit in
+                        self.recompute_generic_derived_for_row(list, insert.key, insert.generation)?
+                    {
+                        observe(GenericSourceMutation::ValueField(commit))?;
                     }
                 }
                 SourceAction::ListRemove { list } => {
@@ -4494,6 +4502,36 @@ impl GenericScheduledRuntime {
         Ok(())
     }
 
+    fn recompute_generic_derived_for_row(
+        &mut self,
+        list: &str,
+        key: u64,
+        generation: u64,
+    ) -> RuntimeResult<Vec<GenericValueFieldCommit<'static>>> {
+        let Some(index) = self.storage.bound_index(list, key, generation)? else {
+            return Ok(Vec::new());
+        };
+        let fields = self
+            .generic_derived
+            .indexed_fields
+            .iter()
+            .filter(|field| field.list == list)
+            .map(|field| field.field.clone())
+            .collect::<Vec<_>>();
+        let mut commits = Vec::new();
+        for field in fields {
+            let key = GenericDerivedKey {
+                list: list.to_owned(),
+                index,
+                field,
+            };
+            if let (Some(commit), _) = self.recompute_generic_derived_key_value(&key, &[])? {
+                commits.push(commit);
+            }
+        }
+        Ok(commits)
+    }
+
     fn apply_source_actions_to_batch<'a>(
         &mut self,
         input: GenericSourceActionInput<'a>,
@@ -4517,16 +4555,22 @@ impl GenericScheduledRuntime {
         text: Option<&'a str>,
     ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
         let source_paths = self.list_source_bindings.source_paths(list)?;
-        self.storage.append_text_row_source_action_and_bind_sources(
-            &self.source_routes,
-            &self.derived_equations,
-            &self.list_equations,
-            list,
-            source,
-            key,
-            text,
-            source_paths,
-        )
+        self.storage
+            .append_text_row_source_action_and_bind_sources(
+                &self.source_routes,
+                &self.derived_equations,
+                &self.list_equations,
+                list,
+                source,
+                key,
+                text,
+                source_paths,
+            )?
+            .map(|insert| {
+                self.recompute_generic_derived_for_row(list, insert.key, insert.generation)?;
+                Ok(insert)
+            })
+            .transpose()
     }
 
     fn resolve_bound_source_index(
@@ -12573,9 +12617,17 @@ FUNCTION new_entry(entry) {
                 &mut patches,
             )
             .unwrap();
+        let appended_index = runtime.list_len_for_test() - 1;
         let (key, generation) = runtime
-            .list_row_identity_for_test(runtime.list_len_for_test() - 1)
+            .list_row_identity_for_test(appended_index)
             .expect("appended row exists");
+        assert_eq!(
+            runtime
+                .generic
+                .list_row_textlike("todos", appended_index, "not_editing")
+                .unwrap(),
+            "True"
+        );
         assert_eq!(
             runtime
                 .generic
@@ -13154,6 +13206,13 @@ FUNCTION new_entry(entry) {
         assert_eq!(
             runtime.list_title_for_test(runtime.list_len_for_test() - 1),
             "Derived append"
+        );
+        assert_eq!(
+            runtime
+                .generic
+                .list_row_textlike("todos", runtime.list_len_for_test() - 1, "not_editing")
+                .unwrap(),
+            "True"
         );
 
         deltas.clear();

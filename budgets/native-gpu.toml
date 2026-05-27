@@ -28,3 +28,55 @@ materialized_cell_overscan_multiplier = 2
 min_lines = 10000
 min_longest_line_bytes = 2000
 preview_frame_ms_p95_while_scrolling = 16.7
+
+[idle_wake.debug]
+idle_preview_cpu_percent_p95 = 3.0
+idle_dev_cpu_percent_p95 = 5.0
+combined_idle_cpu_percent_p95 = 8.0
+preview_idle_rendered_frame_delta_per_5s = 2
+dev_idle_rendered_frame_delta_focused_per_5s = 10
+dev_idle_rendered_frame_delta_unfocused_per_5s = 2
+post_idle_input_to_present_ms_p95 = 120.0
+post_idle_source_replace_to_present_ms_p95 = 250.0
+
+[idle_wake.release]
+idle_preview_cpu_percent_p95 = 1.0
+idle_dev_cpu_percent_p95 = 2.0
+combined_idle_cpu_percent_p95 = 3.0
+preview_idle_rendered_frame_delta_per_5s = 1
+dev_idle_rendered_frame_delta_focused_per_5s = 6
+dev_idle_rendered_frame_delta_unfocused_per_5s = 1
+post_idle_input_to_present_ms_p95 = 33.0
+post_idle_source_replace_to_present_ms_p95 = 75.0
+
+[dev_editor_scroll.debug]
+wheel_to_visible_ms_p95 = 50.0
+wheel_to_visible_ms_max = 120.0
+runtime_dispatch_count_for_passive_scroll = 0
+graph_rebuild_count = 0
+source_replace_count_for_passive_scroll = 0
+preview_runtime_summary_query_count_for_passive_scroll = 0
+
+[dev_editor_scroll.release]
+wheel_to_visible_ms_p95 = 16.7
+wheel_to_visible_ms_max = 33.4
+runtime_dispatch_count_for_passive_scroll = 0
+graph_rebuild_count = 0
+source_replace_count_for_passive_scroll = 0
+preview_runtime_summary_query_count_for_passive_scroll = 0
+
+[example_switch.debug]
+click_to_dev_tab_visual_update_ms_p95 = 50.0
+sync_ack_ms_p95 = 50.0
+sync_ack_ms_max = 120.0
+click_to_preview_new_frame_presented_ms_p95_bundled = 350.0
+click_to_preview_new_frame_presented_ms_p95_large_custom = 500.0
+sync_ack_payload_bytes_max = 16384
+
+[example_switch.release]
+click_to_dev_tab_visual_update_ms_p95 = 16.7
+sync_ack_ms_p95 = 16.7
+sync_ack_ms_max = 50.0
+click_to_preview_new_frame_presented_ms_p95_bundled = 120.0
+click_to_preview_new_frame_presented_ms_p95_large_custom = 200.0
+sync_ack_payload_bytes_max = 16384

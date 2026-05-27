@@ -612,6 +612,7 @@ dependencies = [
  "boon_native_gpu",
  "boon_parser",
  "boon_runtime",
+ "serde",
  "serde_json",
  "toml",
 ]

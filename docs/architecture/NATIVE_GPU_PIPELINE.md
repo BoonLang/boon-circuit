@@ -1005,10 +1005,18 @@ cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu
 cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
 cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
 cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
+cargo xtask verify-native-gpu-idle-wake --example counter --report target/reports/native-gpu/idle-wake-counter.json
+cargo xtask verify-native-gpu-idle-wake --example todomvc --report target/reports/native-gpu/idle-wake-todomvc.json
+cargo xtask verify-native-gpu-idle-wake --example cells --report target/reports/native-gpu/idle-wake-cells.json
+cargo xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --report target/reports/native-gpu/idle-wake-custom-projects.json
 cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
 cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
 cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
 cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
+cargo xtask verify-native-dev-editor-scroll-speed --profile debug --report target/reports/native-gpu/dev-editor-scroll-speed-debug.json
+cargo xtask verify-native-dev-editor-scroll-speed --profile release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json
+cargo xtask verify-native-example-switch-speed --profile debug --report target/reports/native-gpu/example-switch-speed-debug.json
+cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
 cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
@@ -1146,6 +1154,37 @@ sustained vertical and horizontal operator host wheel scroll. Reports must inclu
 `preview_frame_ms_p95`, and `preview_blocked_on_ipc_count` during the editor
 scroll. Hard gates: no full-file widget tree, no full-file reshaping,
 `preview_blocked_on_ipc_count = 0`, and preview frame p95 remains `<= 16.7 ms`.
+
+`verify-native-gpu-idle-wake` must prove the preview and dev child processes use
+the demand-driven render loop in an idle desktop launch. Reports must use child
+PID procfs tick deltas for CPU, include skipped idle polls, dirty/presented
+revisions, last scheduler/role dirty reasons, app-owned readback hashes before
+and after post-idle input and source replacement, and reject copied first-frame
+hashes, stale PIDs, fake CPU samples, COSMIC/Ply/desktop screenshots, human
+observation, and any wake branch selected by example name, visible label,
+filesystem path, scenario name, or custom-example origin. The same verifier must
+cover Counter, TodoMVC, Cells, and a table-driven custom-project fixture.
+
+`verify-native-dev-editor-scroll-speed` supersedes the old dev-code-editor
+surface scroll report for the manual user-facing editor path. It must run in
+both debug and release profiles, use a passive scroll-only probe, cover vertical
+and horizontal `scroll_column` updates, include a selected custom-example buffer,
+and fail if `command_probe`, source replacement, preview runtime summaries,
+graph rebuilds, full-file materialization, full-file reshaping, or footer
+telemetry polling occur in the scroll hot path. The older
+`verify-native-gpu-scroll-speed --surface dev-code-editor` command may remain
+only as a compatibility alias to the release report, with duplicate reports
+hash-linked or removed from the aggregate.
+
+`verify-native-example-switch-speed` must prove source switching uses the
+generic async source/project payload path. Reports must cover Counter, TodoMVC,
+Cells, two single-file custom examples, one multi-file custom project, rapid
+A-B-A switching, duplicate/renamed labels, changed logical paths, and an invalid
+custom source that preserves the last good preview frame. The synchronous ACK is
+limited to command/source revision, hashes, queue status, byte counts, and
+timing; it must not contain full source text, layout proof, runtime state,
+runtime summary, parse/lower output, or debug summaries. Dev tab visuals must
+update before preview parse/lower/runtime/layout work or preview ACK completion.
 
 `verify-native-gpu-negative` must mutate or fabricate reports for stale
 git/source/binary hashes, missing artifacts, future timestamps, Xvfb/headless

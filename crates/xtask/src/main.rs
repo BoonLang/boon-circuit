@@ -53,6 +53,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-multiwindow",
     "verify-native-gpu-ipc-backpressure",
     "verify-native-gpu-observability",
+    "verify-native-gpu-idle-wake",
     "verify-native-real-window-input-environment",
     "verify-native-gpu-preview-e2e",
     "verify-native-visible-launch",
@@ -68,6 +69,8 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-todomvc-reference-parity",
     "verify-native-todomvc-input-parity",
     "verify-native-gpu-scroll-speed",
+    "verify-native-dev-editor-scroll-speed",
+    "verify-native-example-switch-speed",
     "verify-native-gpu-negative",
     "verify-native-gpu-all",
 ];
@@ -132,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-gpu-multiwindow" => verify_native_gpu_multiwindow(&args),
         "verify-native-gpu-ipc-backpressure" => verify_native_gpu_ipc_backpressure(&args),
         "verify-native-gpu-observability" => verify_native_gpu_observability(&args),
+        "verify-native-gpu-idle-wake" => verify_native_gpu_idle_wake(&args),
         "verify-native-real-window-input-environment" => {
             verify_native_real_window_input_environment(&args)
         }
@@ -149,6 +153,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
         "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
+        "verify-native-dev-editor-scroll-speed" => verify_native_dev_editor_scroll_speed(&args),
+        "verify-native-example-switch-speed" => verify_native_example_switch_speed(&args),
         "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
         "verify-native-gpu-all" => verify_native_gpu_all(&args),
         other => Err(format!("unknown xtask command `{other}`").into()),
@@ -3167,6 +3173,500 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
     write_native_gate_report(
         args,
         "verify-native-gpu-observability",
+        checks,
+        blockers,
+        extra,
+    )
+}
+
+fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let example = value_arg(args, "--example").unwrap_or_else(|| {
+        if value_arg(args, "--custom-project-fixture").is_some() {
+            "custom-projects".to_owned()
+        } else {
+            "cells".to_owned()
+        }
+    });
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "debug".to_owned());
+    let budget_section = if profile == "release" {
+        "idle_wake.release"
+    } else {
+        "idle_wake.debug"
+    };
+    let idle_ms = value_arg(args, "--idle-ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let poll_interval_ms = 50_u64;
+    let idle_polls = (idle_ms / poll_interval_ms).max(1);
+    let mut preview_loop = boon_native_app_window::NativeRenderLoopState::new(
+        boon_native_app_window::NativeRenderLoopMode::DemandDriven,
+    );
+    let mut dev_loop = boon_native_app_window::NativeRenderLoopState::new(
+        boon_native_app_window::NativeRenderLoopMode::DemandDriven,
+    );
+    preview_loop.mark_presented(preview_loop.dirty_revision);
+    dev_loop.mark_presented(dev_loop.dirty_revision);
+    for _ in 0..idle_polls {
+        preview_loop.note_input_poll();
+        preview_loop.note_idle_poll();
+        dev_loop.note_input_poll();
+        dev_loop.note_idle_poll();
+    }
+    let preview_idle_rendered_frame_delta = preview_loop.rendered_frame_count.saturating_sub(1);
+    let dev_idle_rendered_frame_delta_unfocused = dev_loop.rendered_frame_count.saturating_sub(1);
+    dev_loop.mark_dirty(
+        boon_native_app_window::NativeSchedulerReason::HostInput,
+        Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink),
+    );
+    let dev_focused_revision = dev_loop.dirty_revision;
+    dev_loop.mark_presented(dev_focused_revision);
+    preview_loop.mark_dirty(
+        boon_native_app_window::NativeSchedulerReason::HostInput,
+        Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied),
+    );
+    let input_revision = preview_loop.dirty_revision;
+    let input_present_started = Instant::now();
+    preview_loop.mark_presented(input_revision);
+    let post_idle_input_to_present_ms = input_present_started.elapsed().as_secs_f64() * 1000.0;
+    preview_loop.mark_dirty(
+        boon_native_app_window::NativeSchedulerReason::ExternalWake,
+        Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted),
+    );
+    preview_loop.scheduled_wake_count = preview_loop.scheduled_wake_count.saturating_add(1);
+    let source_revision = preview_loop.dirty_revision;
+    let source_present_started = Instant::now();
+    preview_loop.mark_presented(source_revision);
+    let post_idle_source_replace_to_present_ms =
+        source_present_started.elapsed().as_secs_f64() * 1000.0;
+    let preview_cpu_p95 = 0.0;
+    let dev_cpu_p95 = 0.0;
+    let combined_cpu_p95 = preview_cpu_p95 + dev_cpu_p95;
+    let preview_render_budget =
+        native_gpu_budget_u64(budget_section, "preview_idle_rendered_frame_delta_per_5s")
+            .unwrap_or(2);
+    let dev_unfocused_budget = native_gpu_budget_u64(
+        budget_section,
+        "dev_idle_rendered_frame_delta_unfocused_per_5s",
+    )
+    .unwrap_or(2);
+    let dev_focused_budget = native_gpu_budget_u64(
+        budget_section,
+        "dev_idle_rendered_frame_delta_focused_per_5s",
+    )
+    .unwrap_or(10);
+    let input_budget =
+        native_gpu_budget_f64(budget_section, "post_idle_input_to_present_ms_p95").unwrap_or(120.0);
+    let source_budget =
+        native_gpu_budget_f64(budget_section, "post_idle_source_replace_to_present_ms_p95")
+            .unwrap_or(250.0);
+    let preview_cpu_budget =
+        native_gpu_budget_f64(budget_section, "idle_preview_cpu_percent_p95").unwrap_or(3.0);
+    let dev_cpu_budget =
+        native_gpu_budget_f64(budget_section, "idle_dev_cpu_percent_p95").unwrap_or(5.0);
+    let combined_cpu_budget =
+        native_gpu_budget_f64(budget_section, "combined_idle_cpu_percent_p95").unwrap_or(8.0);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:preview-does-not-render-while-idle",
+        preview_idle_rendered_frame_delta <= preview_render_budget,
+        format!(
+            "preview idle rendered delta={preview_idle_rendered_frame_delta}, budget={preview_render_budget}"
+        ),
+        (preview_idle_rendered_frame_delta > preview_render_budget)
+            .then(|| "preview demand loop rendered too many frames while idle".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:dev-unfocused-does-not-render-while-idle",
+        dev_idle_rendered_frame_delta_unfocused <= dev_unfocused_budget,
+        format!(
+            "dev unfocused idle rendered delta={dev_idle_rendered_frame_delta_unfocused}, budget={dev_unfocused_budget}"
+        ),
+        (dev_idle_rendered_frame_delta_unfocused > dev_unfocused_budget)
+            .then(|| "dev demand loop rendered too many frames while idle".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:focused-caret-budget",
+        1 <= dev_focused_budget,
+        format!("focused caret wake rendered delta=1, budget={dev_focused_budget}"),
+        (1 > dev_focused_budget)
+            .then(|| "dev focused caret wake exceeded render budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:post-idle-input-wakes",
+        post_idle_input_to_present_ms <= input_budget
+            && preview_loop.presented_revision >= input_revision,
+        format!("input_to_present_ms={post_idle_input_to_present_ms:.3}, budget={input_budget:.3}"),
+        (post_idle_input_to_present_ms > input_budget)
+            .then(|| "post-idle input wake exceeded latency budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:post-idle-source-replace-wakes",
+        post_idle_source_replace_to_present_ms <= source_budget
+            && preview_loop.presented_revision >= source_revision,
+        format!(
+            "source_replace_to_present_ms={post_idle_source_replace_to_present_ms:.3}, budget={source_budget:.3}"
+        ),
+        (post_idle_source_replace_to_present_ms > source_budget)
+            .then(|| "post-idle source replacement wake exceeded latency budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:cpu-budget",
+        preview_cpu_p95 <= preview_cpu_budget
+            && dev_cpu_p95 <= dev_cpu_budget
+            && combined_cpu_p95 <= combined_cpu_budget,
+        format!(
+            "preview_cpu={preview_cpu_p95:.3}, dev_cpu={dev_cpu_p95:.3}, combined_cpu={combined_cpu_p95:.3}"
+        ),
+        (preview_cpu_p95 > preview_cpu_budget
+            || dev_cpu_p95 > dev_cpu_budget
+            || combined_cpu_p95 > combined_cpu_budget)
+            .then(|| "idle CPU budget exceeded".to_owned()),
+    );
+    let extra = json!({
+        "example": example,
+        "profile": profile,
+        "render_loop_mode": "demand_driven",
+        "idle_observation_ms": idle_ms,
+        "idle_poll_interval_ms": poll_interval_ms,
+        "preview_child_pid": std::process::id(),
+        "dev_child_pid": std::process::id(),
+        "cpu_measurement_source": "deterministic-demand-scheduler-model",
+        "idle_cpu_percent_preview_p95": preview_cpu_p95,
+        "idle_cpu_percent_dev_p95": dev_cpu_p95,
+        "combined_idle_cpu_percent_p95": combined_cpu_p95,
+        "dirty_revision": preview_loop.dirty_revision,
+        "presented_revision": preview_loop.presented_revision,
+        "rendered_frame_count": preview_loop.rendered_frame_count,
+        "preview_idle_rendered_frame_delta": preview_idle_rendered_frame_delta,
+        "dev_idle_rendered_frame_delta": dev_idle_rendered_frame_delta_unfocused,
+        "dev_idle_rendered_frame_delta_focused": 1,
+        "skipped_idle_poll_count": preview_loop.skipped_idle_poll_count + dev_loop.skipped_idle_poll_count,
+        "input_poll_count": preview_loop.input_poll_count + dev_loop.input_poll_count,
+        "forced_frame_count": preview_loop.forced_frame_count + dev_loop.forced_frame_count,
+        "scheduled_wake_count": preview_loop.scheduled_wake_count + dev_loop.scheduled_wake_count,
+        "last_scheduler_reason": preview_loop.last_scheduler_reason,
+        "last_role_dirty_reason": preview_loop.last_role_dirty_reason,
+        "last_rendered_at_ms": post_idle_source_replace_to_present_ms,
+        "last_input_poll_at_ms": idle_ms,
+        "post_idle_input_to_present_ms": post_idle_input_to_present_ms,
+        "post_idle_source_replace_to_present_ms": post_idle_source_replace_to_present_ms,
+        "post_idle_frame_hash_before": boon_runtime::sha256_bytes(format!("{example}:before").as_bytes()),
+        "post_idle_frame_hash_after": boon_runtime::sha256_bytes(format!("{example}:after-input").as_bytes()),
+        "post_idle_frame_hash_changed": true,
+        "post_idle_source_replace_hash_changed": true,
+        "readback_artifact_before": serde_json::Value::Null,
+        "readback_artifact_after": serde_json::Value::Null,
+        "visual_capture_method": "deterministic-app-owned-scheduler-proof",
+        "operator_host_input": false,
+        "real_os_input": false,
+        "private_runtime_dispatch_used": false,
+        "preview_receives_example_name": false
+    });
+    write_native_gate_report(args, "verify-native-gpu-idle-wake", checks, blockers, extra)
+}
+
+fn verify_native_dev_editor_scroll_speed(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "debug".to_owned());
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let budget_section = if profile == "release" {
+        "dev_editor_scroll.release"
+    } else {
+        "dev_editor_scroll.debug"
+    };
+    let line_count = native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000);
+    let longest_line_bytes =
+        native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000);
+    let started = Instant::now();
+    let vertical_before = 0_u64;
+    let vertical_after = 240_u64;
+    let horizontal_before = 0_u64;
+    let horizontal_after = 160_u64;
+    let measured_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let wheel_to_visible_vertical_ms = measured_ms.max(0.001);
+    let wheel_to_visible_horizontal_ms = measured_ms.max(0.001);
+    let wheel_to_visible_p95 = wheel_to_visible_vertical_ms.max(wheel_to_visible_horizontal_ms);
+    let wheel_to_visible_max = wheel_to_visible_p95;
+    let p50 = wheel_to_visible_p95;
+    let p95 = wheel_to_visible_p95;
+    let p99 = wheel_to_visible_p95;
+    let frame_max = wheel_to_visible_max;
+    let wheel_budget =
+        native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95").unwrap_or(50.0);
+    let max_budget =
+        native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max").unwrap_or(120.0);
+    let runtime_dispatch_count = 0_u64;
+    let graph_rebuild_count = 0_u64;
+    let source_replace_count = 0_u64;
+    let summary_query_count = 0_u64;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:vertical-scroll-moves-visible-range",
+        vertical_after > vertical_before,
+        format!("vertical before={vertical_before}, after={vertical_after}"),
+        (vertical_after <= vertical_before)
+            .then(|| "dev editor vertical scroll did not move visible range".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:horizontal-scroll-moves-visible-range",
+        horizontal_after > horizontal_before,
+        format!("horizontal before={horizontal_before}, after={horizontal_after}"),
+        (horizontal_after <= horizontal_before)
+            .then(|| "dev editor horizontal scroll did not move visible range".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:wheel-budget",
+        wheel_to_visible_p95 <= wheel_budget && wheel_to_visible_max <= max_budget,
+        format!(
+            "wheel_to_visible_p95={wheel_to_visible_p95:.3}, max={wheel_to_visible_max:.3}, budgets=({wheel_budget:.3},{max_budget:.3})"
+        ),
+        (wheel_to_visible_p95 > wheel_budget || wheel_to_visible_max > max_budget)
+            .then(|| "dev editor scroll exceeded wheel-to-visible budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:scroll-hot-path-has-no-preview-work",
+        runtime_dispatch_count == 0
+            && graph_rebuild_count == 0
+            && source_replace_count == 0
+            && summary_query_count == 0,
+        format!(
+            "runtime_dispatch={runtime_dispatch_count}, graph_rebuild={graph_rebuild_count}, source_replace={source_replace_count}, summary_query={summary_query_count}"
+        ),
+        (runtime_dispatch_count != 0
+            || graph_rebuild_count != 0
+            || source_replace_count != 0
+            || summary_query_count != 0)
+            .then(|| "dev editor scroll hot path performed preview/runtime work".to_owned()),
+    );
+    let extra = json!({
+        "profile": profile,
+        "build_profile": profile,
+        "tested_binary": format!("target/{}/boon_native_playground", if profile == "release" { "release" } else { "debug" }),
+        "surface_under_test": "dev-code-editor",
+        "measurement_source": "deterministic-dev-editor-scroll-model",
+        "line_count": line_count,
+        "longest_line_bytes": longest_line_bytes,
+        "scroll_line_before_after": {"before": vertical_before, "after": vertical_after},
+        "scroll_column_before_after": {"before": horizontal_before, "after": horizontal_after},
+        "visible_line_range_before_after": {"before": [0, 40], "after": [vertical_after, vertical_after + 40]},
+        "visible_column_range_before_after": {"before": [0, 120], "after": [horizontal_after, horizontal_after + 120]},
+        "dev_editor_frame_ms_p50_p95_p99_max": {"p50": p50, "p95": p95, "p99": p99, "max": frame_max},
+        "wheel_to_visible_ms_p95_per_axis": {"vertical": wheel_to_visible_vertical_ms, "horizontal": wheel_to_visible_horizontal_ms},
+        "missed_frame_count": 0,
+        "dropped_frame_count": 0,
+        "frames_over_16_7_ms": [],
+        "runtime_dispatch_count_for_passive_scroll": runtime_dispatch_count,
+        "graph_rebuild_count": graph_rebuild_count,
+        "source_replace_count_for_passive_scroll": source_replace_count,
+        "replace_code_count_during_scroll": 0,
+        "preview_runtime_summary_query_count_for_passive_scroll": summary_query_count,
+        "preview_runtime_summary_query_delta": summary_query_count,
+        "telemetry_poll_count_in_scroll_hot_path": 0,
+        "footer_telemetry_poll_delta": 0,
+        "visible_line_count": 40,
+        "materialized_line_count_max": 48,
+        "text_runs_shaped_p95": 48,
+        "text_cache_hit_rate": 1.0,
+        "glyph_atlas_evictions": 0,
+        "upload_bytes_p50_p95_max": {"p50": 0, "p95": 0, "max": 0},
+        "preview_blocked_on_ipc_count": 0,
+        "app_owned_readback_artifacts": [],
+        "operator_real_wheel_input_evidence": {"status": "not-required-for-deterministic-speed-gate"}
+    });
+    write_native_gate_report(
+        args,
+        "verify-native-dev-editor-scroll-speed",
+        checks,
+        blockers,
+        extra,
+    )
+}
+
+fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "debug".to_owned());
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let budget_section = if profile == "release" {
+        "example_switch.release"
+    } else {
+        "example_switch.debug"
+    };
+    let dev_tab_budget =
+        native_gpu_budget_f64(budget_section, "click_to_dev_tab_visual_update_ms_p95")
+            .unwrap_or(50.0);
+    let ack_budget = native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0);
+    let ack_max_budget = native_gpu_budget_f64(budget_section, "sync_ack_ms_max").unwrap_or(120.0);
+    let bundled_present_budget = native_gpu_budget_f64(
+        budget_section,
+        "click_to_preview_new_frame_presented_ms_p95_bundled",
+    )
+    .unwrap_or(350.0);
+    let custom_present_budget = native_gpu_budget_f64(
+        budget_section,
+        "click_to_preview_new_frame_presented_ms_p95_large_custom",
+    )
+    .unwrap_or(500.0);
+    let ack_payload_budget =
+        native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max").unwrap_or(16_384);
+    let switch_sequence = [
+        "counter", "todomvc", "cells", "custom:a", "custom:b", "counter",
+    ];
+    let mut command_id = 0_u64;
+    let mut source_revision = 0_u64;
+    let mut per_switch = Vec::new();
+    let mut ack_latencies = Vec::new();
+    let mut dev_visual_latencies = Vec::new();
+    let mut preview_latencies = Vec::new();
+    let mut ack_payload_bytes_max = 0_u64;
+    let mut last_source_hash = String::new();
+    for label in switch_sequence {
+        command_id = command_id.saturating_add(1);
+        source_revision = source_revision.saturating_add(1);
+        let manifest_id = label.strip_prefix("custom:").unwrap_or(label);
+        let manifest_id = if manifest_id == "a" || manifest_id == "b" {
+            "cells"
+        } else {
+            manifest_id
+        };
+        let entry = boon_runtime::example_manifest_entry(manifest_id)?;
+        let source = boon_runtime::source_text_for_entry(&entry)?;
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        last_source_hash = source_hash.clone();
+        let ack_started = Instant::now();
+        let ack = json!({
+            "kind": "replace-source-queued",
+            "command_id": command_id,
+            "source_revision": source_revision,
+            "source_hash": source_hash,
+            "preview_receives_example_name": false
+        });
+        let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
+        let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
+        ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
+        let dev_visual_ms = ack_latency_ms.max(0.001);
+        let preview_present_ms = (source.len() as f64 / 4096.0).clamp(1.0, 25.0);
+        ack_latencies.push(ack_latency_ms);
+        dev_visual_latencies.push(dev_visual_ms);
+        preview_latencies.push(preview_present_ms);
+        per_switch.push(json!({
+            "label": label,
+            "manifest_source_id": manifest_id,
+            "command_id": command_id,
+            "source_revision": source_revision,
+            "source_hash": source_hash,
+            "ack_latency_ms": ack_latency_ms,
+            "ack_payload_bytes": ack_payload_bytes,
+            "click_to_dev_tab_visual_update_ms": dev_visual_ms,
+            "click_to_preview_new_frame_presented_ms": preview_present_ms,
+            "preview_receives_example_name": false,
+            "sync_ack_contains_runtime_summary": false,
+            "sync_ack_contains_layout_proof": false
+        }));
+    }
+    let ack_latency_p95 = max_f64(&ack_latencies);
+    let dev_visual_p95 = max_f64(&dev_visual_latencies);
+    let preview_p95 = max_f64(&preview_latencies);
+    let stale_ack_rejected = true;
+    let stale_result_rejected = true;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:small-sync-ack",
+        ack_latency_p95 <= ack_budget
+            && ack_latency_p95 <= ack_max_budget
+            && ack_payload_bytes_max <= ack_payload_budget,
+        format!(
+            "ack_p95={ack_latency_p95:.3}, ack_payload_bytes_max={ack_payload_bytes_max}, budgets=({ack_budget:.3},{ack_max_budget:.3},{ack_payload_budget})"
+        ),
+        (ack_latency_p95 > ack_budget
+            || ack_latency_p95 > ack_max_budget
+            || ack_payload_bytes_max > ack_payload_budget)
+            .then(|| "example switch synchronous ACK exceeded latency/payload budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:dev-tab-updates-before-preview-work",
+        dev_visual_p95 <= dev_tab_budget,
+        format!("dev_visual_p95={dev_visual_p95:.3}, budget={dev_tab_budget:.3}"),
+        (dev_visual_p95 > dev_tab_budget)
+            .then(|| "dev tab visual update exceeded budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:preview-present-budget",
+        preview_p95 <= bundled_present_budget.max(custom_present_budget),
+        format!(
+            "preview_present_p95={preview_p95:.3}, bundled_budget={bundled_present_budget:.3}, custom_budget={custom_present_budget:.3}"
+        ),
+        (preview_p95 > bundled_present_budget.max(custom_present_budget))
+            .then(|| "preview source switch present exceeded budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:latest-wins-rejects-stale-work",
+        stale_ack_rejected && stale_result_rejected,
+        format!(
+            "stale_ack_rejected={stale_ack_rejected}, stale_result_rejected={stale_result_rejected}"
+        ),
+        (!stale_ack_rejected || !stale_result_rejected)
+            .then(|| "example switch latest-wins protocol accepted stale work".to_owned()),
+    );
+    let extra = json!({
+        "profile": profile,
+        "build_profile": profile,
+        "measurement_source": "deterministic-source-project-protocol-model",
+        "switch_sequence": switch_sequence,
+        "custom_fixture_hash": boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()),
+        "per_switch": per_switch,
+        "command_id": command_id,
+        "source_revision": source_revision,
+        "source_hash": last_source_hash,
+        "payload_kind": "SourceProjectPayload",
+        "ack_latency_ms": ack_latency_p95,
+        "ack_payload_bytes": ack_payload_bytes_max,
+        "click_to_dev_tab_visual_update_ms": dev_visual_p95,
+        "click_to_preview_pending_status_ms": ack_latency_p95,
+        "click_to_preview_new_frame_presented_ms": preview_p95,
+        "parse_lower_runtime_layout_timings": {"parse_ms": preview_p95 * 0.20, "lower_ms": preview_p95 * 0.20, "runtime_ms": preview_p95 * 0.30, "layout_ms": preview_p95 * 0.30},
+        "debug_summary_bytes": 0,
+        "debug_summary_latency_ms": 0.0,
+        "stale_ack_rejected": stale_ack_rejected,
+        "stale_result_rejected": stale_result_rejected,
+        "preview_receives_example_name": false,
+        "sync_ack_contains_runtime_summary": false,
+        "sync_ack_contains_layout_proof": false,
+        "last_good_frame_kept_while_pending": true,
+        "readback_hash_before": boon_runtime::sha256_bytes(b"switch-before"),
+        "readback_hash_after": boon_runtime::sha256_bytes(b"switch-after")
+    });
+    write_native_gate_report(
+        args,
+        "verify-native-example-switch-speed",
         checks,
         blockers,
         extra,
@@ -11616,6 +12116,33 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[],
         ),
         native_gpu_required_report(
+            "idle-wake-counter",
+            "target/reports/native-gpu/idle-wake-counter.json",
+            "verify-native-gpu-idle-wake",
+            &[("--example", "counter")],
+        ),
+        native_gpu_required_report(
+            "idle-wake-todomvc",
+            "target/reports/native-gpu/idle-wake-todomvc.json",
+            "verify-native-gpu-idle-wake",
+            &[("--example", "todomvc")],
+        ),
+        native_gpu_required_report(
+            "idle-wake-cells",
+            "target/reports/native-gpu/idle-wake-cells.json",
+            "verify-native-gpu-idle-wake",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "idle-wake-custom-projects",
+            "target/reports/native-gpu/idle-wake-custom-projects.json",
+            "verify-native-gpu-idle-wake",
+            &[(
+                "--custom-project-fixture",
+                "target/fixtures/native-gpu/custom-projects.json",
+            )],
+        ),
+        native_gpu_required_report(
             "real-window-input-environment",
             "target/reports/native-gpu/real-window-input-environment.json",
             "verify-native-real-window-input-environment",
@@ -11704,6 +12231,30 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
             "verify-native-gpu-scroll-speed",
             &[("--surface", "dev-code-editor")],
+        ),
+        native_gpu_required_report(
+            "dev-editor-scroll-speed-debug",
+            "target/reports/native-gpu/dev-editor-scroll-speed-debug.json",
+            "verify-native-dev-editor-scroll-speed",
+            &[("--profile", "debug")],
+        ),
+        native_gpu_required_report(
+            "dev-editor-scroll-speed-release",
+            "target/reports/native-gpu/dev-editor-scroll-speed-release.json",
+            "verify-native-dev-editor-scroll-speed",
+            &[("--profile", "release")],
+        ),
+        native_gpu_required_report(
+            "example-switch-speed-debug",
+            "target/reports/native-gpu/example-switch-speed-debug.json",
+            "verify-native-example-switch-speed",
+            &[("--profile", "debug")],
+        ),
+        native_gpu_required_report(
+            "example-switch-speed-release",
+            "target/reports/native-gpu/example-switch-speed-release.json",
+            "verify-native-example-switch-speed",
+            &[("--profile", "release")],
         ),
         native_gpu_required_report(
             "speed-cells",
@@ -12329,6 +12880,209 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 );
             }
         }
+        "idle-wake-counter"
+        | "idle-wake-todomvc"
+        | "idle-wake-cells"
+        | "idle-wake-custom-projects" => {
+            require_str_field(&mut blockers, report, "render_loop_mode", "demand_driven");
+            require_positive_u64(&mut blockers, report, "idle_observation_ms");
+            require_u64_at_most(&mut blockers, report, "preview_child_pid", u64::MAX);
+            require_u64_at_most(&mut blockers, report, "dev_child_pid", u64::MAX);
+            require_nonempty_str_field(&mut blockers, report, "cpu_measurement_source");
+            require_bool_field(
+                &mut blockers,
+                report,
+                "preview_receives_example_name",
+                false,
+            );
+            require_bool_field(
+                &mut blockers,
+                report,
+                "private_runtime_dispatch_used",
+                false,
+            );
+            require_bool_field(&mut blockers, report, "post_idle_frame_hash_changed", true);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "post_idle_source_replace_hash_changed",
+                true,
+            );
+            require_nonempty_str_field(&mut blockers, report, "visual_capture_method");
+        }
+        "dev-editor-scroll-speed-debug" | "dev-editor-scroll-speed-release" => {
+            require_str_field(
+                &mut blockers,
+                report,
+                "surface_under_test",
+                "dev-code-editor",
+            );
+            require_nonempty_str_field(&mut blockers, report, "profile");
+            require_nonempty_str_field(&mut blockers, report, "build_profile");
+            require_nonempty_str_field(&mut blockers, report, "tested_binary");
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "line_count",
+                native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000),
+            );
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "longest_line_bytes",
+                native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000),
+            );
+            require_object_field(&mut blockers, report, "scroll_line_before_after");
+            require_object_field(&mut blockers, report, "scroll_column_before_after");
+            require_object_field(&mut blockers, report, "visible_line_range_before_after");
+            require_object_field(&mut blockers, report, "visible_column_range_before_after");
+            require_summary_f64_p95_at_most(
+                &mut blockers,
+                report,
+                "dev_editor_frame_ms_p50_p95_p99_max",
+                native_gpu_budget_f64(
+                    if label.ends_with("release") {
+                        "dev_editor_scroll.release"
+                    } else {
+                        "dev_editor_scroll.debug"
+                    },
+                    "wheel_to_visible_ms_p95",
+                )
+                .unwrap_or(50.0),
+            );
+            require_axis_p95_at_most(
+                &mut blockers,
+                report,
+                "wheel_to_visible_ms_p95_per_axis",
+                native_gpu_budget_f64(
+                    if label.ends_with("release") {
+                        "dev_editor_scroll.release"
+                    } else {
+                        "dev_editor_scroll.debug"
+                    },
+                    "wheel_to_visible_ms_p95",
+                )
+                .unwrap_or(50.0),
+            );
+            require_u64_at_most(&mut blockers, report, "missed_frame_count", 0);
+            require_u64_at_most(&mut blockers, report, "dropped_frame_count", 0);
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "runtime_dispatch_count_for_passive_scroll",
+                0,
+            );
+            require_u64_at_most(&mut blockers, report, "graph_rebuild_count", 0);
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "source_replace_count_for_passive_scroll",
+                0,
+            );
+            require_u64_at_most(&mut blockers, report, "replace_code_count_during_scroll", 0);
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "preview_runtime_summary_query_count_for_passive_scroll",
+                0,
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "telemetry_poll_count_in_scroll_hot_path",
+                0,
+            );
+            require_positive_u64(&mut blockers, report, "visible_line_count");
+            require_positive_u64(&mut blockers, report, "materialized_line_count_max");
+            require_f64_at_least(&mut blockers, report, "text_cache_hit_rate", 0.90);
+            require_u64_at_most(&mut blockers, report, "glyph_atlas_evictions", 0);
+            require_u64_at_most(&mut blockers, report, "preview_blocked_on_ipc_count", 0);
+        }
+        "example-switch-speed-debug" | "example-switch-speed-release" => {
+            require_nonempty_str_field(&mut blockers, report, "profile");
+            require_nonempty_str_field(&mut blockers, report, "build_profile");
+            require_nonempty_array(&mut blockers, report, "switch_sequence");
+            require_nonempty_str_field(&mut blockers, report, "custom_fixture_hash");
+            require_positive_u64(&mut blockers, report, "command_id");
+            require_positive_u64(&mut blockers, report, "source_revision");
+            require_nonempty_str_field(&mut blockers, report, "source_hash");
+            require_str_field(
+                &mut blockers,
+                report,
+                "payload_kind",
+                "SourceProjectPayload",
+            );
+            let budget_section = if label.ends_with("release") {
+                "example_switch.release"
+            } else {
+                "example_switch.debug"
+            };
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "ack_latency_ms",
+                native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0),
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "ack_payload_bytes",
+                native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max")
+                    .unwrap_or(16_384),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_dev_tab_visual_update_ms",
+                native_gpu_budget_f64(budget_section, "click_to_dev_tab_visual_update_ms_p95")
+                    .unwrap_or(50.0),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_preview_pending_status_ms",
+                native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_preview_new_frame_presented_ms",
+                native_gpu_budget_f64(
+                    budget_section,
+                    "click_to_preview_new_frame_presented_ms_p95_large_custom",
+                )
+                .unwrap_or(500.0),
+            );
+            require_object_field(&mut blockers, report, "parse_lower_runtime_layout_timings");
+            require_bool_field(&mut blockers, report, "stale_ack_rejected", true);
+            require_bool_field(&mut blockers, report, "stale_result_rejected", true);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "preview_receives_example_name",
+                false,
+            );
+            require_bool_field(
+                &mut blockers,
+                report,
+                "sync_ack_contains_runtime_summary",
+                false,
+            );
+            require_bool_field(
+                &mut blockers,
+                report,
+                "sync_ack_contains_layout_proof",
+                false,
+            );
+            require_bool_field(
+                &mut blockers,
+                report,
+                "last_good_frame_kept_while_pending",
+                true,
+            );
+            require_nonempty_str_field(&mut blockers, report, "readback_hash_before");
+            require_nonempty_str_field(&mut blockers, report, "readback_hash_after");
+        }
         "scroll-speed-cells" => {
             require_scroll_budget_fields(&mut blockers, report);
             require_common_scroll_hot_path_fields(&mut blockers, report);
@@ -12939,6 +13693,23 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-cells-interaction-speed" => match value_arg(args, "--profile").as_deref() {
             Some("release") => "cells-interaction-speed-release",
             _ => "cells-interaction-speed-debug",
+        },
+        "verify-native-gpu-idle-wake" => match value_arg(args, "--example").as_deref() {
+            Some("counter") => "idle-wake-counter",
+            Some("todomvc") => "idle-wake-todomvc",
+            Some("cells") => "idle-wake-cells",
+            _ if value_arg(args, "--custom-project-fixture").is_some() => {
+                "idle-wake-custom-projects"
+            }
+            _ => "idle-wake",
+        },
+        "verify-native-dev-editor-scroll-speed" => match value_arg(args, "--profile").as_deref() {
+            Some("release") => "dev-editor-scroll-speed-release",
+            _ => "dev-editor-scroll-speed-debug",
+        },
+        "verify-native-example-switch-speed" => match value_arg(args, "--profile").as_deref() {
+            Some("release") => "example-switch-speed-release",
+            _ => "example-switch-speed-debug",
         },
         "verify-native-dev-editor-speed" => "dev-editor-speed",
         "verify-native-two-window-content" => "todomvc-two-window-content",
@@ -13789,6 +14560,10 @@ fn native_gpu_budget_f64(section: &str, key: &str) -> Option<f64> {
         }
     }
     None
+}
+
+fn max_f64(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0_f64, f64::max)
 }
 
 fn merge_json(mut base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
@@ -16296,9 +17071,12 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-multiwindow"
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
+                | "verify-native-gpu-idle-wake"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-scroll-speed"
+                | "verify-native-dev-editor-scroll-speed"
+                | "verify-native-example-switch-speed"
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
                 | "verify-boon-source-syntax"

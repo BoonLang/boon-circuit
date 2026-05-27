@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use wgpu::SurfaceTargetUnsafe;
@@ -107,6 +109,179 @@ pub struct NativeWindowOptions {
     pub readback_artifact_dir: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRenderLoopMode {
+    ContinuousProbe,
+    DemandDriven,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSchedulerReason {
+    FirstFrame,
+    SurfaceChanged,
+    HostInput,
+    Timer,
+    ExternalWake,
+    VerifierFrame,
+    RequestedAnimation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRoleDirtyReason {
+    SourcePayloadAccepted,
+    WorkspaceSelectionChanged,
+    RuntimeTurnApplied,
+    DocumentPatchApplied,
+    LayoutChanged,
+    ScrollChanged,
+    FocusChanged,
+    TelemetrySummaryChanged,
+    CaretBlink,
+    VerifierFrame,
+    ErrorOverlayChanged,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeRenderLoopState {
+    pub mode: NativeRenderLoopMode,
+    pub dirty_revision: u64,
+    pub presented_revision: u64,
+    pub rendered_frame_count: u64,
+    pub skipped_idle_poll_count: u64,
+    pub input_poll_count: u64,
+    pub forced_frame_count: u64,
+    pub scheduled_wake_count: u64,
+    pub last_scheduler_reason: Option<NativeSchedulerReason>,
+    pub last_role_dirty_reason: Option<NativeRoleDirtyReason>,
+    #[serde(skip)]
+    pub next_wake_at: Option<Instant>,
+}
+
+impl NativeRenderLoopState {
+    pub fn new(mode: NativeRenderLoopMode) -> Self {
+        Self {
+            mode,
+            dirty_revision: 1,
+            presented_revision: 0,
+            rendered_frame_count: 0,
+            skipped_idle_poll_count: 0,
+            input_poll_count: 0,
+            forced_frame_count: 0,
+            scheduled_wake_count: 0,
+            last_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
+            last_role_dirty_reason: None,
+            next_wake_at: None,
+        }
+    }
+
+    pub fn mark_dirty(
+        &mut self,
+        scheduler_reason: NativeSchedulerReason,
+        role_dirty_reason: Option<NativeRoleDirtyReason>,
+    ) -> u64 {
+        self.dirty_revision = self.dirty_revision.saturating_add(1);
+        self.last_scheduler_reason = Some(scheduler_reason);
+        self.last_role_dirty_reason = role_dirty_reason;
+        self.dirty_revision
+    }
+
+    pub fn mark_presented(&mut self, revision: u64) {
+        self.presented_revision = self.presented_revision.max(revision);
+        self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
+    }
+
+    pub fn should_render(&self, now: Instant, wake_generation_changed: bool) -> bool {
+        if self.mode == NativeRenderLoopMode::ContinuousProbe {
+            return true;
+        }
+        self.dirty_revision != self.presented_revision
+            || wake_generation_changed
+            || self.next_wake_at.is_some_and(|wake_at| now >= wake_at)
+    }
+
+    pub fn note_idle_poll(&mut self) {
+        self.skipped_idle_poll_count = self.skipped_idle_poll_count.saturating_add(1);
+    }
+
+    pub fn note_input_poll(&mut self) {
+        self.input_poll_count = self.input_poll_count.saturating_add(1);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativePollResult {
+    pub dirty: bool,
+    pub role_revision: u64,
+    pub role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub next_wake_after_ms: Option<u64>,
+    pub wants_animation_frame: bool,
+}
+
+impl NativePollResult {
+    pub fn clean(role_revision: u64) -> Self {
+        Self {
+            dirty: false,
+            role_revision,
+            role_dirty_reason: None,
+            next_wake_after_ms: None,
+            wants_animation_frame: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeRenderHookResult {
+    pub proof: serde_json::Value,
+    pub content_revision: u64,
+    pub rendered: bool,
+    pub content_changed: bool,
+    pub role_dirty_reason: Option<NativeRoleDirtyReason>,
+}
+
+impl NativeRenderHookResult {
+    pub fn rendered_with_proof(proof: serde_json::Value) -> Self {
+        Self {
+            proof,
+            content_revision: 0,
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeWakeHandle {
+    generation: Arc<AtomicU64>,
+}
+
+impl NativeWakeHandle {
+    pub fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn wake(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for NativeWakeHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppWindowSurfaceProof {
     pub role: String,
@@ -141,6 +316,8 @@ pub struct AppWindowSurfaceProof {
     pub readback_ms: Option<f64>,
     pub first_frame_ms: f64,
     pub interactive_frame_loop: bool,
+    pub render_loop_mode: NativeRenderLoopMode,
+    pub render_loop_state_at_ready: NativeRenderLoopState,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
     pub post_input_frame_timing: Option<NativeFrameTimingProof>,
@@ -188,6 +365,37 @@ pub struct NativeInputAdapterProof {
     pub pressed_keys: Vec<String>,
     pub scroll_delta_x: f64,
     pub scroll_delta_y: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NativeInputCursor {
+    pub last_mouse_button_sequence: u64,
+    pub last_keyboard_sequence: u64,
+    pub last_mouse_scroll_event_count: u64,
+}
+
+impl NativeInputCursor {
+    pub fn accept(&mut self, input: &NativeInputAdapterProof) {
+        self.last_mouse_button_sequence = self.last_mouse_button_sequence.max(
+            input
+                .mouse_button_events
+                .iter()
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or(0),
+        );
+        self.last_keyboard_sequence = self.last_keyboard_sequence.max(
+            input
+                .keyboard_events
+                .iter()
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or(0),
+        );
+        self.last_mouse_scroll_event_count = self
+            .last_mouse_scroll_event_count
+            .max(input.mouse_scroll_event_count);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,9 +459,50 @@ pub struct NativeRenderFrameContext<'a> {
     pub input: NativeInputAdapterProof,
 }
 
+#[derive(Clone, Debug)]
+pub struct NativePollContext {
+    pub window_id: WindowId,
+    pub surface_id: SurfaceId,
+    pub surface_epoch: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    pub input_delta: NativeInputAdapterProof,
+    pub now: Instant,
+    pub forced_frame: bool,
+}
+
 pub type NativeRenderHook = Box<
     dyn for<'a> FnMut(NativeRenderFrameContext<'a>) -> Result<serde_json::Value, String> + Send,
 >;
+
+pub type NativePollHook =
+    Box<dyn FnMut(NativePollContext) -> Result<NativePollResult, String> + Send>;
+
+pub struct NativeWindowHooks {
+    pub poll: Option<NativePollHook>,
+    pub render: NativeRenderHook,
+}
+
+impl NativeWindowHooks {
+    pub fn from_render_hook(render: NativeRenderHook) -> Self {
+        Self { poll: None, render }
+    }
+}
+
+fn poll_native_window_hooks(
+    hooks: &mut Option<NativeWindowHooks>,
+    context: NativePollContext,
+) -> Result<Option<NativePollResult>, NativeWindowError> {
+    hooks
+        .as_mut()
+        .and_then(|hooks| hooks.poll.as_mut())
+        .map(|poll| {
+            poll(context)
+                .map_err(|error| NativeWindowError::Failed(format!("role poll hook: {error}")))
+        })
+        .transpose()
+}
 
 #[derive(Debug)]
 pub enum NativeWindowError {
@@ -289,6 +538,36 @@ pub fn run_visible_surface_probe_with_render_hook<F>(
 where
     F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
 {
+    run_visible_surface_probe_with_render_hook_and_wake(
+        options,
+        render_hook,
+        NativeWakeHandle::new(),
+        on_ready,
+    )
+}
+
+pub fn run_visible_surface_probe_with_render_hook_and_wake<F>(
+    options: NativeWindowOptions,
+    render_hook: Option<NativeRenderHook>,
+    wake_handle: NativeWakeHandle,
+    on_ready: F,
+) -> !
+where
+    F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
+{
+    let hooks = render_hook.map(NativeWindowHooks::from_render_hook);
+    run_visible_surface_probe_with_hooks_and_wake(options, hooks, wake_handle, on_ready)
+}
+
+pub fn run_visible_surface_probe_with_hooks_and_wake<F>(
+    options: NativeWindowOptions,
+    hooks: Option<NativeWindowHooks>,
+    wake_handle: NativeWakeHandle,
+    on_ready: F,
+) -> !
+where
+    F: FnOnce(Result<AppWindowSurfaceProof, NativeWindowError>) + Send + 'static,
+{
     let main_thread_id = thread_id_string();
     app_window::application::main(move || {
         let (sender, receiver) =
@@ -302,7 +581,8 @@ where
                 move || {
                     futures::executor::block_on(run_surface_probe_async(
                         options,
-                        render_hook,
+                        hooks,
+                        wake_handle,
                         main_thread_id,
                         sender,
                         callback_done_receiver,
@@ -324,14 +604,16 @@ where
 
 async fn run_surface_probe_async(
     options: NativeWindowOptions,
-    render_hook: Option<NativeRenderHook>,
+    hooks: Option<NativeWindowHooks>,
+    wake_handle: NativeWakeHandle,
     main_thread_id: String,
     ready_sender: mpsc::SyncSender<Result<AppWindowSurfaceProof, NativeWindowError>>,
     callback_done_receiver: mpsc::Receiver<()>,
 ) {
     if let Err(error) = run_surface_probe_inner(
         options,
-        render_hook,
+        hooks,
+        wake_handle,
         main_thread_id,
         ready_sender.clone(),
         callback_done_receiver,
@@ -344,7 +626,8 @@ async fn run_surface_probe_async(
 
 async fn run_surface_probe_inner(
     options: NativeWindowOptions,
-    mut render_hook: Option<NativeRenderHook>,
+    mut hooks: Option<NativeWindowHooks>,
+    wake_handle: NativeWakeHandle,
     main_thread_id: String,
     ready_sender: mpsc::SyncSender<Result<AppWindowSurfaceProof, NativeWindowError>>,
     callback_done_receiver: mpsc::Receiver<()>,
@@ -451,6 +734,21 @@ async fn run_surface_probe_inner(
     let mut pending_readback = None;
 
     for frame_index in 0..total_frame_count {
+        let input = empty_input_adapter_proof(false);
+        let _ = poll_native_window_hooks(
+            &mut hooks,
+            NativePollContext {
+                window_id: window_id.clone(),
+                surface_id: surface_id.clone(),
+                surface_epoch: 1,
+                width,
+                height,
+                scale: scale as f32,
+                input_delta: input.clone(),
+                now: Instant::now(),
+                forced_frame: true,
+            },
+        )?;
         let acquire_start = Instant::now();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -469,11 +767,10 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-probe-encoder"),
         });
-        let input = empty_input_adapter_proof(false);
-        let render_hook_ms = match render_hook.as_mut() {
-            Some(render_hook) => {
+        let render_hook_ms = match hooks.as_mut() {
+            Some(hooks) => {
                 let render_start = Instant::now();
-                let proof = render_hook(NativeRenderFrameContext {
+                let proof = (hooks.render)(NativeRenderFrameContext {
                     device: &device,
                     queue: &queue,
                     encoder: &mut encoder,
@@ -577,13 +874,32 @@ async fn run_surface_probe_inner(
     }
     let input_adapter = sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
     let mut post_input_frame_timing = None;
-    if input_adapter.real_os_events_observed && render_hook.is_some() {
+    if input_adapter.real_os_events_observed && hooks.is_some() {
         let post_input_sample_count = sample_frame_count.max(1);
         let mut post_input_presented_frame_samples = Vec::new();
         let mut post_input_render_hook_samples = Vec::new();
         let mut post_input_first_frame_ms = 0.0;
         let mut post_input_readback = None;
         for frame_index in 0..post_input_sample_count {
+            let frame_input = if frame_index == 0 {
+                input_adapter.clone()
+            } else {
+                sample_input_adapter(&mut mouse, &keyboard, false)
+            };
+            let _ = poll_native_window_hooks(
+                &mut hooks,
+                NativePollContext {
+                    window_id: window_id.clone(),
+                    surface_id: surface_id.clone(),
+                    surface_epoch: 1,
+                    width,
+                    height,
+                    scale: scale as f32,
+                    input_delta: frame_input.clone(),
+                    now: Instant::now(),
+                    forced_frame: true,
+                },
+            )?;
             let acquire_start = Instant::now();
             let frame = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(frame)
@@ -602,15 +918,10 @@ async fn run_surface_probe_inner(
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("boon-native-app-window-input-sample-encoder"),
             });
-            let frame_input = if frame_index == 0 {
-                input_adapter.clone()
-            } else {
-                sample_input_adapter(&mut mouse, &keyboard, false)
-            };
-            if let Some(render_hook) = render_hook.as_mut() {
+            if let Some(hooks) = hooks.as_mut() {
                 let render_start = Instant::now();
                 external_render_proof = Some(
-                    render_hook(NativeRenderFrameContext {
+                    (hooks.render)(NativeRenderFrameContext {
                         device: &device,
                         queue: &queue,
                         encoder: &mut encoder,
@@ -680,6 +991,13 @@ async fn run_surface_probe_inner(
         }
     }
 
+    let loop_mode = if options.hold_ms == 0 {
+        NativeRenderLoopMode::DemandDriven
+    } else {
+        NativeRenderLoopMode::ContinuousProbe
+    };
+    let mut render_loop_state = NativeRenderLoopState::new(loop_mode);
+    render_loop_state.mark_presented(1);
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
         pid: std::process::id(),
@@ -689,7 +1007,7 @@ async fn run_surface_probe_inner(
         display_connection: display_connection(),
         window_backend: "app_window-wayland".to_owned(),
         window_title: options.title,
-        window_id,
+        window_id: window_id.clone(),
         surface_id: surface_id.clone(),
         surface_epoch: 1,
         wgpu_strategy: format!("{:?}", app_window::WGPU_STRATEGY),
@@ -718,6 +1036,8 @@ async fn run_surface_probe_inner(
         readback_ms,
         first_frame_ms: surface_acquire_ms + present_submit_ms + readback_ms.unwrap_or(0.0),
         interactive_frame_loop: true,
+        render_loop_mode: loop_mode,
+        render_loop_state_at_ready: render_loop_state.clone(),
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
         post_input_frame_timing,
@@ -727,6 +1047,8 @@ async fn run_surface_probe_inner(
     };
     let _ = ready_sender.send(Ok(proof));
     let hold_started = Instant::now();
+    let mut input_cursor = NativeInputCursor::default();
+    let mut last_wake_generation = 0;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             break;
@@ -740,7 +1062,62 @@ async fn run_surface_probe_inner(
             config.width = width;
             config.height = height;
             surface.configure(&device, &config);
+            render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceChanged, None);
         }
+        let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        render_loop_state.note_input_poll();
+        let poll_result = poll_native_window_hooks(
+            &mut hooks,
+            NativePollContext {
+                window_id: window_id.clone(),
+                surface_id: surface_id.clone(),
+                surface_epoch: 1,
+                width,
+                height,
+                scale: current_scale as f32,
+                input_delta: input.clone(),
+                now: Instant::now(),
+                forced_frame: false,
+            },
+        )?;
+        if let Some(poll_result) = poll_result {
+            if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
+                render_loop_state.next_wake_at =
+                    Some(Instant::now() + Duration::from_millis(next_wake_after_ms));
+            }
+            if poll_result.dirty {
+                render_loop_state.mark_dirty(
+                    NativeSchedulerReason::HostInput,
+                    poll_result.role_dirty_reason,
+                );
+                render_loop_state.dirty_revision = render_loop_state
+                    .dirty_revision
+                    .max(poll_result.role_revision);
+            }
+            if poll_result.wants_animation_frame {
+                render_loop_state.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
+            }
+            accept_input_cursor(&mut mouse, &mut input_cursor, &input);
+        } else if input.real_os_events_observed {
+            render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
+        }
+        let wake_generation = wake_handle.generation();
+        let wake_generation_changed = wake_generation != last_wake_generation;
+        if wake_generation_changed {
+            last_wake_generation = wake_generation;
+            render_loop_state.mark_dirty(NativeSchedulerReason::ExternalWake, None);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+        }
+        if !render_loop_state.should_render(Instant::now(), false) {
+            render_loop_state.note_idle_poll();
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        if hooks.as_ref().is_none_or(|hooks| hooks.poll.is_none()) {
+            accept_input_cursor(&mut mouse, &mut input_cursor, &input);
+        }
+        let rendered_revision = render_loop_state.dirty_revision;
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -756,10 +1133,9 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-interactive-encoder"),
         });
-        let input = sample_input_adapter(&mut mouse, &keyboard, false);
-        match render_hook.as_mut() {
-            Some(render_hook) => {
-                render_hook(NativeRenderFrameContext {
+        match hooks.as_mut() {
+            Some(hooks) => {
+                (hooks.render)(NativeRenderFrameContext {
                     device: &device,
                     queue: &queue,
                     encoder: &mut encoder,
@@ -770,7 +1146,7 @@ async fn run_surface_probe_inner(
                     surface_format: surface_format.clone(),
                     width,
                     height,
-                    input,
+                    input: input.clone(),
                 })
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
@@ -797,7 +1173,12 @@ async fn run_surface_probe_inner(
         }
         queue.submit(Some(encoder.finish()));
         frame.present();
-        std::thread::sleep(Duration::from_millis(16));
+        render_loop_state.mark_presented(rendered_revision);
+        let frame_sleep_ms = match loop_mode {
+            NativeRenderLoopMode::ContinuousProbe => 16,
+            NativeRenderLoopMode::DemandDriven => 5,
+        };
+        std::thread::sleep(Duration::from_millis(frame_sleep_ms));
     }
     let _ = callback_done_receiver.recv_timeout(Duration::from_secs(30));
     drop(surface);
@@ -1131,6 +1512,169 @@ fn sample_input_adapter(
     }
 }
 
+fn sample_input_adapter_delta(
+    mouse: &Mouse,
+    keyboard: &Keyboard,
+    cursor: &NativeInputCursor,
+    synthetic_input_probe: bool,
+) -> NativeInputAdapterProof {
+    let mouse_window_pos = mouse
+        .window_pos()
+        .map(|position| NativeMouseWindowPosition {
+            x: position.pos_x(),
+            y: position.pos_y(),
+            window_width: position.window_width(),
+            window_height: position.window_height(),
+        });
+    let mouse_buttons_down = [
+        (MOUSE_BUTTON_LEFT, "left"),
+        (MOUSE_BUTTON_RIGHT, "right"),
+        (MOUSE_BUTTON_MIDDLE, "middle"),
+    ]
+    .into_iter()
+    .filter_map(|(button, label)| mouse.button_state(button).then(|| label.to_owned()))
+    .collect::<Vec<_>>();
+    let pressed_keys = [
+        KeyboardKey::A,
+        KeyboardKey::B,
+        KeyboardKey::C,
+        KeyboardKey::D,
+        KeyboardKey::E,
+        KeyboardKey::F,
+        KeyboardKey::G,
+        KeyboardKey::H,
+        KeyboardKey::I,
+        KeyboardKey::J,
+        KeyboardKey::K,
+        KeyboardKey::L,
+        KeyboardKey::M,
+        KeyboardKey::N,
+        KeyboardKey::O,
+        KeyboardKey::P,
+        KeyboardKey::Q,
+        KeyboardKey::R,
+        KeyboardKey::S,
+        KeyboardKey::T,
+        KeyboardKey::U,
+        KeyboardKey::V,
+        KeyboardKey::W,
+        KeyboardKey::X,
+        KeyboardKey::Y,
+        KeyboardKey::Z,
+        KeyboardKey::Space,
+        KeyboardKey::Delete,
+        KeyboardKey::ForwardDelete,
+        KeyboardKey::Tab,
+        KeyboardKey::Home,
+        KeyboardKey::End,
+        KeyboardKey::PageUp,
+        KeyboardKey::PageDown,
+        KeyboardKey::LeftArrow,
+        KeyboardKey::RightArrow,
+        KeyboardKey::UpArrow,
+        KeyboardKey::DownArrow,
+        KeyboardKey::Return,
+        KeyboardKey::Escape,
+        KeyboardKey::Shift,
+        KeyboardKey::RightShift,
+        KeyboardKey::Control,
+        KeyboardKey::RightControl,
+        KeyboardKey::Option,
+        KeyboardKey::RightOption,
+        KeyboardKey::Command,
+        KeyboardKey::RightCommand,
+    ]
+    .into_iter()
+    .filter_map(|key| keyboard.is_pressed(key).then(|| format!("{key:?}")))
+    .collect::<Vec<_>>();
+    let (scroll_delta_x, scroll_delta_y) = mouse.scroll_delta();
+    let mouse_provenance = mouse.event_provenance();
+    let keyboard_provenance = keyboard.event_provenance();
+    let keyboard_events = keyboard_provenance
+        .recent_events
+        .iter()
+        .filter(|event| event.sequence > cursor.last_keyboard_sequence)
+        .map(|event| NativeKeyboardEventProof {
+            sequence: event.sequence,
+            key: format!("{:?}", event.key),
+            pressed: event.pressed,
+            window_protocol_id: event.window_protocol_id,
+        })
+        .collect::<Vec<_>>();
+    let mouse_button_events = mouse_provenance
+        .recent_button_events
+        .iter()
+        .filter(|event| event.sequence > cursor.last_mouse_button_sequence)
+        .map(|event| NativeMouseButtonEventProof {
+            sequence: event.sequence,
+            button: mouse_button_label(event.button).to_owned(),
+            pressed: event.pressed,
+            window_protocol_id: event.window_protocol_id,
+        })
+        .collect::<Vec<_>>();
+    let new_scroll_observed = mouse_provenance.scroll_event_count
+        > cursor.last_mouse_scroll_event_count
+        && (scroll_delta_x != 0.0 || scroll_delta_y != 0.0);
+    let real_os_events_observed = !mouse_button_events.is_empty()
+        || !keyboard_events.is_empty()
+        || new_scroll_observed
+        || !mouse_buttons_down.is_empty()
+        || !pressed_keys.is_empty();
+
+    NativeInputAdapterProof {
+        installed: true,
+        capture_scope: "app_window_coalesced_input_delta_with_per_window_event_provenance"
+            .to_owned(),
+        keyboard_api: "app_window::input::keyboard::Keyboard::coalesced".to_owned(),
+        mouse_api: "app_window::input::mouse::Mouse::coalesced".to_owned(),
+        wheel_api: "app_window::input::mouse::Mouse::{scroll_delta,load_clear_scroll_delta}"
+            .to_owned(),
+        per_window_event_provenance_api: "app_window::input::{mouse,keyboard}::event_provenance"
+            .to_owned(),
+        sampled_after_visible_window: true,
+        real_os_events_observed,
+        input_injection_method: if synthetic_input_probe {
+            "app_window_per_window_synthetic_input_harness".to_owned()
+        } else {
+            "none-observation-only".to_owned()
+        },
+        synthetic_input_probe,
+        mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
+        keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
+        mouse_motion_event_count: mouse_provenance.motion_event_count,
+        mouse_button_event_count: mouse_provenance.button_event_count,
+        mouse_scroll_event_count: mouse_provenance.scroll_event_count,
+        mouse_total_event_count: mouse_provenance.total_event_count,
+        keyboard_key_event_count: keyboard_provenance.key_event_count,
+        mouse_button_events,
+        keyboard_events,
+        mouse_window_pos,
+        mouse_buttons_down,
+        pressed_keys,
+        scroll_delta_x: if new_scroll_observed {
+            scroll_delta_x
+        } else {
+            0.0
+        },
+        scroll_delta_y: if new_scroll_observed {
+            scroll_delta_y
+        } else {
+            0.0
+        },
+    }
+}
+
+fn accept_input_cursor(
+    mouse: &mut Mouse,
+    cursor: &mut NativeInputCursor,
+    input: &NativeInputAdapterProof,
+) {
+    if input.scroll_delta_x != 0.0 || input.scroll_delta_y != 0.0 {
+        let _ = mouse.load_clear_scroll_delta();
+    }
+    cursor.accept(input);
+}
+
 fn mouse_button_label(button: u8) -> &'static str {
     match button {
         MOUSE_BUTTON_LEFT => "left",
@@ -1222,4 +1766,105 @@ fn stable_debug_hash<T: std::fmt::Debug>(value: &T) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{value:?}").hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demand_driven_scheduler_renders_first_dirty_revision_once() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+
+        assert!(state.should_render(now, false));
+        state.mark_presented(state.dirty_revision);
+
+        assert!(!state.should_render(now, false));
+        state.note_idle_poll();
+        assert_eq!(state.rendered_frame_count, 1);
+        assert_eq!(state.skipped_idle_poll_count, 1);
+    }
+
+    #[test]
+    fn demand_driven_scheduler_wakes_for_surface_change() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+
+        let dirty = state.mark_dirty(NativeSchedulerReason::SurfaceChanged, None);
+
+        assert_eq!(dirty, 2);
+        assert!(state.should_render(Instant::now(), false));
+        state.mark_presented(dirty);
+        assert_eq!(state.presented_revision, dirty);
+        assert_eq!(
+            state.last_scheduler_reason,
+            Some(NativeSchedulerReason::SurfaceChanged)
+        );
+    }
+
+    #[test]
+    fn demand_driven_scheduler_wakes_for_role_dirty_reason_without_branching_on_it() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+
+        let dirty = state.mark_dirty(
+            NativeSchedulerReason::ExternalWake,
+            Some(NativeRoleDirtyReason::SourcePayloadAccepted),
+        );
+
+        assert!(state.should_render(Instant::now(), false));
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::SourcePayloadAccepted)
+        );
+        state.mark_presented(dirty);
+        assert!(!state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn continuous_probe_scheduler_always_renders() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::ContinuousProbe);
+        state.mark_presented(state.dirty_revision);
+
+        assert!(state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn wake_handle_changes_generation() {
+        let wake_handle = NativeWakeHandle::new();
+        assert_eq!(wake_handle.generation(), 0);
+        assert_eq!(wake_handle.wake(), 1);
+        assert_eq!(wake_handle.generation(), 1);
+    }
+
+    #[test]
+    fn input_cursor_accepts_events_only_after_role_update() {
+        let mut cursor = NativeInputCursor::default();
+        let input = NativeInputAdapterProof {
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+            }],
+            keyboard_events: vec![NativeKeyboardEventProof {
+                sequence: 11,
+                key: "A".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+            }],
+            mouse_scroll_event_count: 3,
+            scroll_delta_x: 4.0,
+            scroll_delta_y: 8.0,
+            ..empty_input_adapter_proof(false)
+        };
+
+        assert_eq!(cursor.last_mouse_button_sequence, 0);
+        cursor.accept(&input);
+
+        assert_eq!(cursor.last_mouse_button_sequence, 7);
+        assert_eq!(cursor.last_keyboard_sequence, 11);
+        assert_eq!(cursor.last_mouse_scroll_event_count, 3);
+    }
 }

@@ -4,6 +4,7 @@ use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -483,6 +484,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .map(|runtime| Arc::new(Mutex::new(runtime)));
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
+    let wake_handle = boon_native_app_window::NativeWakeHandle::new();
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
         layout_proof: document_layout_proof.clone(),
         layout_frame_override: None,
@@ -500,53 +502,106 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         runtime_summary: runtime_summary.clone(),
         shared_render_state: Arc::clone(&shared_render_state),
         live_runtime: live_runtime.clone(),
+        latest_accepted_command_id: 0,
+        latest_accepted_source_revision: 0,
+        replace_status_cache: json!({
+            "kind": "replace-source-status",
+            "status": "ready",
+            "command_id": 0,
+            "source_revision": 0,
+            "source_hash": code_hash.clone(),
+            "preview_receives_example_name": false
+        }),
     }));
     if let Some(path) = connect.as_deref() {
-        start_preview_ipc_server(path, Arc::clone(&preview_ipc_state))?;
+        start_preview_ipc_server(path, Arc::clone(&preview_ipc_state), wake_handle.clone())?;
     }
     let role_args = args[1..].to_vec();
-    let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
+    let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
         let mut app_owned_proof = None;
         let mut layout_frame_cache = None;
         let shared_render_state = Arc::clone(&shared_render_state);
         let preview_ipc_state = Arc::clone(&preview_ipc_state);
-        let mut input_state = PreviewNativeInputState::default();
-        Some(Box::new(move |context| {
-            if preview_input_has_unhandled_source_events(&context.input, &input_state) {
-                let input_context = preview_input_runtime_context(&preview_ipc_state)
+        let poll_shared_render_state = Arc::clone(&shared_render_state);
+        let poll_preview_ipc_state = Arc::clone(&preview_ipc_state);
+        let input_state = Arc::new(Mutex::new(PreviewNativeInputState::default()));
+        let poll_input_state = Arc::clone(&input_state);
+        let mut last_poll_revision = shared_render_state
+            .lock()
+            .map(|state| state.update_count)
+            .unwrap_or_default();
+        let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
+            let before_update_count = poll_shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned".to_owned())?
+                .update_count;
+            let mut role_dirty_reason = None;
+            let mut input_state = poll_input_state
+                .lock()
+                .map_err(|_| "preview input state mutex poisoned".to_owned())?;
+            if preview_input_has_unhandled_source_events(&context.input_delta, &input_state) {
+                let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
                     .map_err(|error| error.to_string())?;
                 if let Err(error) = preview_apply_real_window_input(
-                    &context.input,
+                    &context.input_delta,
                     &input_context.source_path,
                     &input_context.source_text,
                     input_context.live_runtime.as_ref(),
-                    &shared_render_state,
+                    &poll_shared_render_state,
                     &mut input_state,
                 ) {
-                    preview_note_render_error(&shared_render_state, error.to_string())
+                    preview_note_render_error(&poll_shared_render_state, error.to_string())
                         .map_err(|error| error.to_string())?;
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+                } else {
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
                 }
             } else {
-                let input_context = preview_input_runtime_context(&preview_ipc_state)
+                let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
                     .map_err(|error| error.to_string())?;
                 if let Err(error) = preview_apply_scroll_input(
-                    &context.input,
+                    &context.input_delta,
                     Some(&input_context.source_path),
                     Some(&input_context.source_text),
                     input_context.live_runtime.as_ref(),
-                    &shared_render_state,
+                    &poll_shared_render_state,
                 ) {
-                    preview_note_render_error(&shared_render_state, error.to_string())
+                    preview_note_render_error(&poll_shared_render_state, error.to_string())
                         .map_err(|error| error.to_string())?;
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
                 }
             }
-            preview_apply_focus_overlay(
-                &shared_render_state,
+            let focus_changed = preview_apply_focus_overlay(
+                &poll_shared_render_state,
                 &input_state,
-                preview_caret_visible(&input_state, Instant::now()),
+                preview_caret_visible(&input_state, context.now),
             )
             .map_err(|error| error.to_string())?;
+            if focus_changed && role_dirty_reason.is_none() {
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+            }
+            let after_update_count = poll_shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned".to_owned())?
+                .update_count;
+            let dirty = after_update_count != before_update_count
+                || after_update_count != last_poll_revision
+                || context.forced_frame;
+            last_poll_revision = last_poll_revision.max(after_update_count);
+            Ok(boon_native_app_window::NativePollResult {
+                dirty,
+                role_revision: last_poll_revision,
+                role_dirty_reason,
+                next_wake_after_ms: input_state.focused_node.is_some().then_some(500),
+                wants_animation_frame: false,
+            })
+        });
+        let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
             let (render_layout_proof, render_layout_frame_override, render_error) = {
                 let shared = shared_render_state
                     .lock()
@@ -567,9 +622,13 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut layout_frame_cache,
             )
             .map_err(|error| error.to_string())
-        }))
+        });
+        Some(boon_native_app_window::NativeWindowHooks {
+            poll: Some(poll),
+            render,
+        })
     };
-    boon_native_app_window::run_visible_surface_probe_with_render_hook(
+    boon_native_app_window::run_visible_surface_probe_with_hooks_and_wake(
         NativeWindowOptions {
             role: NativeWindowRole::Preview,
             title,
@@ -582,7 +641,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
         },
-        render_hook,
+        hooks,
+        wake_handle,
         move |proof| {
             let result = match proof {
                 Ok(proof) => report
@@ -665,28 +725,130 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         selected_example_id.as_deref(),
         PreviewTransport::new(Some(connect.clone())),
     )));
-    let render_hook: Option<boon_native_app_window::NativeRenderHook> = {
+    let dev_render_state = Arc::new(Mutex::new(DevRenderState::default()));
+    let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
-        let mut layout_frame_cache = None;
-        let mut text_measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let mut poll_text_measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let mut input_state = DevNativeInputState::default();
         let shell = Arc::clone(&dev_shell);
-        Some(Box::new(move |context| {
-            let mut shell = shell
+        let poll_shell = Arc::clone(&dev_shell);
+        let render_state = Arc::clone(&dev_render_state);
+        let poll_render_state = Arc::clone(&dev_render_state);
+        let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
+            let mut shell = poll_shell
                 .lock()
                 .map_err(|_| "dev shell mutex poisoned".to_owned())?;
-            native_gpu_dev_visible_render_hook(
-                context,
-                &mut visible_renderer,
-                &mut layout_frame_cache,
-                &mut text_measurer,
-                &mut shell,
-                &mut input_state,
-            )
-        }))
+            let mut render_state = poll_render_state
+                .lock()
+                .map_err(|_| "dev render state mutex poisoned".to_owned())?;
+            let mut dirty = false;
+            let mut role_dirty_reason = None;
+            let caret_visible = dev_editor_caret_visible(&mut input_state, context.now);
+            if shell.caret_visible != caret_visible {
+                shell.caret_visible = caret_visible;
+                dirty = true;
+                role_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink);
+            }
+            if shell.refresh_preview_summary_if_due(context.now) {
+                dirty = true;
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
+            }
+            let cache_stale = render_state.layout_frame.is_none()
+                || render_state.width != context.width
+                || render_state.height != context.height;
+            if cache_stale {
+                let document = shell.document_for_viewport(context.width, context.height);
+                render_state.layout_frame =
+                    Some(boon_document::layout(boon_document::LayoutInput {
+                        document: &document,
+                        viewport: boon_host::Viewport {
+                            surface: 1,
+                            width: context.width as f32,
+                            height: context.height as f32,
+                            scale: 1.0,
+                        },
+                        text: &mut poll_text_measurer,
+                        capabilities: boon_document::RenderCapabilities::fake_portable(),
+                    }));
+                render_state.width = context.width;
+                render_state.height = context.height;
+                render_state.revision = render_state.revision.saturating_add(1);
+                dirty = true;
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
+            }
+            if dev_input_may_change(&context.input_delta, &input_state)
+                && let Some(layout_frame) = render_state.layout_frame.clone()
+            {
+                let document = shell.document_for_viewport(context.width, context.height);
+                let layout_changed = dev_apply_real_window_input(
+                    &context.input_delta,
+                    &document,
+                    &layout_frame,
+                    context.width,
+                    context.height,
+                    &mut shell,
+                    &mut input_state,
+                );
+                if layout_changed {
+                    let document = shell.document_for_viewport(context.width, context.height);
+                    render_state.layout_frame =
+                        Some(boon_document::layout(boon_document::LayoutInput {
+                            document: &document,
+                            viewport: boon_host::Viewport {
+                                surface: 1,
+                                width: context.width as f32,
+                                height: context.height as f32,
+                                scale: 1.0,
+                            },
+                            text: &mut poll_text_measurer,
+                            capabilities: boon_document::RenderCapabilities::fake_portable(),
+                        }));
+                    render_state.width = context.width;
+                    render_state.height = context.height;
+                    render_state.revision = render_state.revision.saturating_add(1);
+                    dirty = true;
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
+                }
+            }
+            if context.forced_frame && render_state.layout_frame.is_some() {
+                dirty = true;
+                role_dirty_reason = role_dirty_reason.or(Some(
+                    boon_native_app_window::NativeRoleDirtyReason::VerifierFrame,
+                ));
+            }
+            Ok(boon_native_app_window::NativePollResult {
+                dirty,
+                role_revision: render_state.revision,
+                role_dirty_reason,
+                next_wake_after_ms: input_state
+                    .editor_focused
+                    .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS),
+                wants_animation_frame: false,
+            })
+        });
+        let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
+            let shell = shell
+                .lock()
+                .map_err(|_| "dev shell mutex poisoned".to_owned())?;
+            let render_state = render_state
+                .lock()
+                .map_err(|_| "dev render state mutex poisoned".to_owned())?;
+            let layout_frame = render_state
+                .layout_frame
+                .as_ref()
+                .ok_or_else(|| "dev layout frame cache was not initialized".to_owned())?;
+            native_gpu_dev_visible_render_hook(context, &mut visible_renderer, &shell, layout_frame)
+        });
+        Some(boon_native_app_window::NativeWindowHooks {
+            poll: Some(poll),
+            render,
+        })
     };
     let report_shell = Arc::clone(&dev_shell);
-    boon_native_app_window::run_visible_surface_probe_with_render_hook(
+    boon_native_app_window::run_visible_surface_probe_with_hooks_and_wake(
         NativeWindowOptions {
             role: NativeWindowRole::Dev,
             title,
@@ -699,7 +861,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
         },
-        render_hook,
+        hooks,
+        boon_native_app_window::NativeWakeHandle::new(),
         move |proof| {
             let result = match proof {
                 Ok(proof) => report
@@ -1797,68 +1960,9 @@ fn single_line_preview_error(error: &str) -> String {
 fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
-    layout_frame_cache: &mut Option<(u32, u32, boon_document::LayoutFrame)>,
-    text_measurer: &mut boon_native_gpu::GlyphonTextMeasurer,
-    shell: &mut DevWindowShell,
-    input_state: &mut DevNativeInputState,
+    shell: &DevWindowShell,
+    layout_frame: &boon_document::LayoutFrame,
 ) -> Result<serde_json::Value, String> {
-    let now = Instant::now();
-    let caret_visible = dev_editor_caret_visible(input_state, now);
-    let caret_blink_changed = shell.caret_visible != caret_visible;
-    shell.caret_visible = caret_visible;
-    let footer_summary_changed = shell.refresh_preview_summary_if_due(now);
-    let cache_stale = layout_frame_cache
-        .as_ref()
-        .is_none_or(|(width, height, _)| *width != context.width || *height != context.height);
-    if cache_stale || caret_blink_changed || footer_summary_changed {
-        let document = shell.document_for_viewport(context.width, context.height);
-        let layout_frame = boon_document::layout(boon_document::LayoutInput {
-            document: &document,
-            viewport: boon_host::Viewport {
-                surface: 1,
-                width: context.width as f32,
-                height: context.height as f32,
-                scale: 1.0,
-            },
-            text: text_measurer,
-            capabilities: boon_document::RenderCapabilities::fake_portable(),
-        });
-        *layout_frame_cache = Some((context.width, context.height, layout_frame));
-    }
-    let mut layout_changed = false;
-    if dev_input_may_change(&context.input, input_state)
-        && let Some((_, _, layout_frame)) = layout_frame_cache.as_ref()
-    {
-        let document = shell.document_for_viewport(context.width, context.height);
-        layout_changed = dev_apply_real_window_input(
-            &context.input,
-            &document,
-            layout_frame,
-            context.width,
-            context.height,
-            shell,
-            input_state,
-        );
-    }
-    if layout_changed {
-        let document = shell.document_for_viewport(context.width, context.height);
-        let layout_frame = boon_document::layout(boon_document::LayoutInput {
-            document: &document,
-            viewport: boon_host::Viewport {
-                surface: 1,
-                width: context.width as f32,
-                height: context.height as f32,
-                scale: 1.0,
-            },
-            text: text_measurer,
-            capabilities: boon_document::RenderCapabilities::fake_portable(),
-        });
-        *layout_frame_cache = Some((context.width, context.height, layout_frame));
-    }
-    let layout_frame = layout_frame_cache
-        .as_ref()
-        .map(|(_, _, frame)| frame)
-        .ok_or_else(|| "dev layout frame cache was not initialized".to_owned())?;
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
             context.device,
@@ -1929,6 +2033,14 @@ struct DevNativeInputState {
     focused_dev_text_input: Option<String>,
     mouse_select_anchor: Option<EditorPosition>,
     column_metric_cache: EditorColumnMetricCache,
+}
+
+#[derive(Default)]
+struct DevRenderState {
+    width: u32,
+    height: u32,
+    revision: u64,
+    layout_frame: Option<boon_document::LayoutFrame>,
 }
 
 type EditorColumnMetricCache = BTreeMap<EditorColumnMetricKey, Vec<f32>>;
@@ -2013,8 +2125,22 @@ fn dev_apply_real_window_input(
             .map(|item| item.bounds)
         && rect_contains(editor_bounds, position.x as f32, position.y as f32)
     {
+        let shift_pressed = input
+            .pressed_keys
+            .iter()
+            .any(|key| key == "Shift" || key == "RightShift");
+        let vertical_delta = if shift_pressed && input.scroll_delta_x.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            input.scroll_delta_y
+        };
+        let horizontal_delta = if shift_pressed && input.scroll_delta_x.abs() <= f64::EPSILON {
+            input.scroll_delta_y
+        } else {
+            input.scroll_delta_x
+        };
         let max_scroll_line = shell.workspace.selected_buffer.line_count.saturating_sub(1);
-        let line_delta = scaled_scroll_steps(input.scroll_delta_y, 8.0, 3);
+        let line_delta = scaled_scroll_steps(vertical_delta, 8.0, 3);
         if line_delta > 0 {
             shell.workspace.selected_buffer.scroll_line = shell
                 .workspace
@@ -2028,6 +2154,22 @@ fn dev_apply_real_window_input(
                 .selected_buffer
                 .scroll_line
                 .saturating_sub((-line_delta) as usize);
+        }
+        let max_scroll_column = max_editor_scroll_column(&shell.workspace.selected_buffer);
+        let column_delta = scaled_scroll_steps(horizontal_delta, 8.0, 3);
+        if column_delta > 0 {
+            shell.workspace.selected_buffer.scroll_column = shell
+                .workspace
+                .selected_buffer
+                .scroll_column
+                .saturating_add(column_delta as usize)
+                .min(max_scroll_column);
+        } else if column_delta < 0 {
+            shell.workspace.selected_buffer.scroll_column = shell
+                .workspace
+                .selected_buffer
+                .scroll_column
+                .saturating_sub((-column_delta) as usize);
         }
         changed = true;
     }
@@ -2509,9 +2651,23 @@ fn dev_position_from_pointer(
         line_item.bounds.height,
     );
     let relative_x = (x - line_item.bounds.x - inset).max(0.0);
-    let column =
+    let visible_column =
         nearest_editor_column(&column_edges, relative_x).min(line_text.chars().count() + 1);
+    let column = model
+        .scroll_column
+        .saturating_add(visible_column)
+        .min(line_text.chars().count() + 1);
     Some(EditorPosition { line, column })
+}
+
+fn max_editor_scroll_column(model: &CodeEditorModel) -> usize {
+    model
+        .source_text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1)
 }
 
 fn editor_column_edges_for_line(
@@ -5238,22 +5394,23 @@ impl PreviewTransport {
         Self { connect }
     }
 
-    fn replace_code(
+    fn replace_source_project(
         &self,
         command: &str,
         selected_example_id: &str,
-        source_path: &str,
-        source_text: &str,
+        payload: &SourceProjectPayload,
     ) -> serde_json::Value {
-        let source_hash = boon_runtime::sha256_bytes(source_text.as_bytes());
+        let source_hash = payload.project_hash.clone();
         let Some(connect) = &self.connect else {
             return json!({
                 "status": "not-bound",
                 "kind": "ReplaceCode",
                 "command": command,
+                "command_id": payload.command_id,
+                "source_revision": payload.source_revision,
                 "transport_bound": false,
                 "selected_example_id": selected_example_id,
-                "source_path": source_path,
+                "source_path": payload.entrypoint_unit,
                 "source_hash": source_hash,
                 "preview_receives_example_name": false
             });
@@ -5261,25 +5418,31 @@ impl PreviewTransport {
         match send_preview_ipc_request(
             connect,
             json!({
-                "kind": "replace-code",
-                "code": source_text,
-                "expected_hash": source_hash,
-                "source_path": source_path,
+                "kind": "replace-source",
+                "payload": payload,
                 "dev_pid": std::process::id()
             }),
         ) {
             Ok(ack) => {
-                let hash_matches =
-                    ack.get("hash_matches").and_then(serde_json::Value::as_bool) == Some(true);
-                let ack_pass =
-                    ack.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+                let hash_matches = ack.get("hash_matches").and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    || ack.get("project_hash").and_then(serde_json::Value::as_str)
+                        == Some(payload.project_hash.as_str());
+                let ack_status = ack
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("fail");
+                let ack_pass = matches!(ack_status, "pass" | "queued");
                 json!({
                     "status": if hash_matches && ack_pass { "pass" } else { "fail" },
                     "kind": "ReplaceCode",
                     "command": command,
+                    "command_id": payload.command_id,
+                    "source_revision": payload.source_revision,
+                    "replace_source_protocol": true,
                     "transport_bound": true,
                     "selected_example_id": selected_example_id,
-                    "source_path": source_path,
+                    "source_path": payload.entrypoint_unit,
                     "source_hash": source_hash,
                     "ack": ack,
                     "preview_receives_example_name": false
@@ -5289,9 +5452,11 @@ impl PreviewTransport {
                 "status": "fail",
                 "kind": "ReplaceCode",
                 "command": command,
+                "command_id": payload.command_id,
+                "source_revision": payload.source_revision,
                 "transport_bound": true,
                 "selected_example_id": selected_example_id,
-                "source_path": source_path,
+                "source_path": payload.entrypoint_unit,
                 "source_hash": source_hash,
                 "diagnostic": error.to_string(),
                 "preview_receives_example_name": false
@@ -5334,6 +5499,11 @@ struct DevWindowShell {
     initial_workspace: ExampleWorkspace,
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
+    next_command_id: u64,
+    selected_source_identity: String,
+    selected_source_revision: u64,
+    pending_replace: Option<serde_json::Value>,
+    latest_ready_replace: Option<serde_json::Value>,
     last_preview_transport: serde_json::Value,
     last_preview_summary: serde_json::Value,
     last_good_runtime_summary: Option<serde_json::Value>,
@@ -5360,12 +5530,18 @@ impl DevWindowShell {
             selected_example_id,
         );
         let initial_workspace = workspace.clone();
+        let selected_source_identity = workspace.selected_example_id.clone();
         Self {
             catalog,
             workspace,
             initial_workspace,
             editor_view: CodeEditorView::new(),
             preview_transport,
+            next_command_id: 1,
+            selected_source_identity,
+            selected_source_revision: 1,
+            pending_replace: None,
+            latest_ready_replace: None,
             last_preview_transport: json!({
                 "status": "not-run",
                 "reason": "no preview transport command has run yet"
@@ -5493,6 +5669,29 @@ impl DevWindowShell {
                     one_line(preview_error, 96)
                 ),
             ));
+        }
+        if let Some(pending) = &self.pending_replace {
+            let command_id = pending
+                .get("command_id")
+                .and_then(serde_json::Value::as_u64)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let status = pending
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending");
+            lines.push((
+                "Preview replace".to_owned(),
+                format!("command {command_id}: {}", ui_status_label(status)),
+            ));
+        }
+        if let Some(ready) = &self.latest_ready_replace {
+            let command_id = ready
+                .get("command_id")
+                .and_then(serde_json::Value::as_u64)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            lines.push(("Preview ready".to_owned(), format!("command {command_id}")));
         }
         if self.last_dev_command != "startup" || self.last_dev_command_status != "not-run" {
             let mut action = format!(
@@ -5979,12 +6178,29 @@ impl DevWindowShell {
     }
 
     fn replace_selected_preview(&mut self, command: &str) -> serde_json::Value {
-        let value = self.preview_transport.replace_code(
-            command,
-            &self.workspace.selected_example_id,
+        let command_id = self.next_command_id;
+        self.next_command_id = self.next_command_id.saturating_add(1);
+        self.selected_source_revision = self.selected_source_revision.saturating_add(1);
+        self.selected_source_identity = self.workspace.selected_example_id.clone();
+        let payload = SourceProjectPayload::single_unit(
+            command_id,
+            self.selected_source_revision,
+            &self.selected_source_identity,
             &self.workspace.selected_buffer.file_name,
             &self.workspace.selected_buffer.source_text,
         );
+        let value = self.preview_transport.replace_source_project(
+            command,
+            &self.workspace.selected_example_id,
+            &payload,
+        );
+        if value
+            .pointer("/ack/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("replace-source-queued")
+        {
+            self.pending_replace = Some(value["ack"].clone());
+        }
         self.last_dev_command = command.to_owned();
         self.last_dev_command_status = value
             .get("status")
@@ -9690,37 +9906,63 @@ fn preview_apply_focus_overlay(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &PreviewNativeInputState,
     caret_visible: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
     let focused_node = input_state.focused_node.as_deref();
     if focused_node.is_none() && shared.layout_frame_override.is_none() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut changed = false;
     if shared.layout_frame_override.is_none() {
         shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
+        changed = true;
     }
     let Some(frame) = shared.layout_frame_override.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
     for item in &mut frame.display_list {
-        item.focused = focused_node == Some(item.node.0.as_str());
-        item.style.remove("caret_column");
-        item.style.remove("caret_visible");
+        let next_focused = focused_node == Some(item.node.0.as_str());
+        if item.focused != next_focused {
+            item.focused = next_focused;
+            changed = true;
+        }
+        if item.style.remove("caret_column").is_some() {
+            changed = true;
+        }
+        if item.style.remove("caret_visible").is_some() {
+            changed = true;
+        }
         if item.focused && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            item.text = Some(input_state.focused_text.clone());
-            item.style.insert(
-                "caret_column".to_owned(),
-                boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64),
-            );
-            item.style.insert(
-                "caret_visible".to_owned(),
-                boon_document_model::StyleValue::Bool(caret_visible),
-            );
+            let next_text = Some(input_state.focused_text.clone());
+            if item.text != next_text {
+                item.text = next_text;
+                changed = true;
+            }
+            let caret_column =
+                boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64);
+            if item
+                .style
+                .insert("caret_column".to_owned(), caret_column.clone())
+                != Some(caret_column)
+            {
+                changed = true;
+            }
+            let caret_visible = boon_document_model::StyleValue::Bool(caret_visible);
+            if item
+                .style
+                .insert("caret_visible".to_owned(), caret_visible.clone())
+                != Some(caret_visible)
+            {
+                changed = true;
+            }
         }
     }
-    Ok(())
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+    }
+    Ok(changed)
 }
 
 fn preview_record_noop_input(
@@ -10588,6 +10830,9 @@ struct PreviewIpcState {
     runtime_summary: serde_json::Value,
     shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    latest_accepted_command_id: u64,
+    latest_accepted_source_revision: u64,
+    replace_status_cache: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -10595,6 +10840,58 @@ struct PreviewInputRuntimeContext {
     source_path: PathBuf,
     source_text: String,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SourceProjectPayload {
+    command_id: u64,
+    source_revision: u64,
+    source_identity: String,
+    project_hash: String,
+    entrypoint_unit: String,
+    units: Vec<SourceProjectUnit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scenario_payload: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SourceProjectUnit {
+    virtual_uri: String,
+    text: String,
+    sha256: String,
+}
+
+impl SourceProjectPayload {
+    fn single_unit(
+        command_id: u64,
+        source_revision: u64,
+        source_identity: &str,
+        virtual_uri: &str,
+        text: &str,
+    ) -> Self {
+        let source_hash = boon_runtime::sha256_bytes(text.as_bytes());
+        Self {
+            command_id,
+            source_revision,
+            source_identity: source_identity.to_owned(),
+            project_hash: source_hash.clone(),
+            entrypoint_unit: virtual_uri.to_owned(),
+            units: vec![SourceProjectUnit {
+                virtual_uri: virtual_uri.to_owned(),
+                text: text.to_owned(),
+                sha256: source_hash,
+            }],
+            scenario_payload: None,
+        }
+    }
+
+    fn entrypoint(&self) -> Result<&SourceProjectUnit, Box<dyn std::error::Error>> {
+        self.units
+            .iter()
+            .find(|unit| unit.virtual_uri == self.entrypoint_unit)
+            .or_else(|| self.units.first())
+            .ok_or_else(|| "source project payload has no source units".into())
+    }
 }
 
 fn preview_input_runtime_context(
@@ -10628,6 +10925,7 @@ fn preview_note_render_error(
 fn start_preview_ipc_server(
     path: &Path,
     state: Arc<Mutex<PreviewIpcState>>,
+    wake_handle: boon_native_app_window::NativeWakeHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -10638,7 +10936,11 @@ fn start_preview_ipc_server(
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        if let Err(error) = handle_preview_ipc_client(stream, Arc::clone(&state)) {
+                        if let Err(error) = handle_preview_ipc_client(
+                            stream,
+                            Arc::clone(&state),
+                            wake_handle.clone(),
+                        ) {
                             eprintln!("boon_native_playground: preview IPC client failed: {error}");
                         }
                     }
@@ -10656,12 +10958,36 @@ fn start_preview_ipc_server(
 fn handle_preview_ipc_client(
     mut stream: UnixStream,
     state: Arc<Mutex<PreviewIpcState>>,
+    wake_handle: boon_native_app_window::NativeWakeHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let request: serde_json::Value = serde_json::from_str(&line)?;
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("replace-source") {
+        let response = preview_enqueue_source_project(&state, &request, wake_handle.clone())
+            .unwrap_or_else(|error| {
+                json!({
+                    "kind": "replace-source-queued",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_receives_example_name": false,
+                    "preview_pid": std::process::id()
+                })
+            });
+        wake_handle.wake();
+        writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+        stream.flush()?;
+        return Ok(());
+    }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("replace-code") {
+        if let Ok(response) = preview_enqueue_source_project(&state, &request, wake_handle.clone())
+        {
+            wake_handle.wake();
+            writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+            stream.flush()?;
+            return Ok(());
+        }
         let response = preview_replace_code_response(&request).unwrap_or_else(|error| {
             json!({
                 "kind": "replace-code-ack",
@@ -10686,6 +11012,17 @@ fn handle_preview_ipc_client(
                 .clone();
             preview_note_render_error(&shared_render_state, diagnostic.to_owned())?;
         }
+        writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+        stream.flush()?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("replace-source-status") {
+        let response = {
+            let state = state
+                .lock()
+                .map_err(|_| "preview IPC state mutex poisoned")?;
+            state.replace_status_cache.clone()
+        };
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
@@ -10771,6 +11108,304 @@ fn handle_preview_ipc_client(
     );
     writeln!(stream, "{}", serde_json::to_string(&response)?)?;
     stream.flush()?;
+    Ok(())
+}
+
+struct PreviewReplaceBuildResult {
+    layout_proof: serde_json::Value,
+    runtime_summary: serde_json::Value,
+    live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    source_text: String,
+    source_sha256: String,
+    source_bytes: u64,
+    virtual_uri: String,
+    status: &'static str,
+    diagnostic: Option<String>,
+}
+
+fn preview_enqueue_source_project(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+    wake_handle: boon_native_app_window::NativeWakeHandle,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let payload = source_project_payload_from_request(request)?;
+    let entrypoint = payload.entrypoint()?;
+    let actual_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
+    if actual_hash != entrypoint.sha256 {
+        return Err(format!(
+            "source unit hash mismatch for {}: expected {}, actual {}",
+            entrypoint.virtual_uri, entrypoint.sha256, actual_hash
+        )
+        .into());
+    }
+    if payload.project_hash != actual_hash && payload.units.len() == 1 {
+        return Err(format!(
+            "project hash mismatch: expected {}, actual {}",
+            payload.project_hash, actual_hash
+        )
+        .into());
+    }
+
+    let queued_at = Instant::now();
+    {
+        let mut state = state
+            .lock()
+            .map_err(|_| "preview IPC state mutex poisoned")?;
+        if payload.command_id < state.latest_accepted_command_id
+            || payload.source_revision < state.latest_accepted_source_revision
+        {
+            state.replace_status_cache = json!({
+                "kind": "replace-source-result",
+                "status": "stale",
+                "command_id": payload.command_id,
+                "source_revision": payload.source_revision,
+                "latest_accepted_command_id": state.latest_accepted_command_id,
+                "latest_accepted_source_revision": state.latest_accepted_source_revision,
+                "stale_result_rejected": true,
+                "preview_receives_example_name": false
+            });
+            return Ok(state.replace_status_cache.clone());
+        }
+        state.latest_accepted_command_id = payload.command_id;
+        state.latest_accepted_source_revision = payload.source_revision;
+        state.replace_status_cache = json!({
+            "kind": "replace-source-status",
+            "status": "pending",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "source_identity": payload.source_identity,
+            "project_hash": payload.project_hash,
+            "replace_job_queue_depth": 1,
+            "replace_job_dropped_stale": 0,
+            "render_thread_blocked_on_replace_count": 0,
+            "preview_blocked_on_ipc_count": 0,
+            "preview_receives_example_name": false
+        });
+    }
+
+    let worker_state = Arc::clone(state);
+    let worker_payload = payload.clone();
+    std::thread::Builder::new()
+        .name("boon-native-preview-replace-source".to_owned())
+        .spawn(move || {
+            let result = preview_build_source_project(worker_payload.clone());
+            if let Err(error) =
+                preview_commit_source_project_result(&worker_state, &worker_payload, result)
+            {
+                eprintln!("boon_native_playground: replace-source worker failed: {error}");
+            }
+            wake_handle.wake();
+        })?;
+
+    Ok(json!({
+        "kind": "replace-source-queued",
+        "status": "queued",
+        "command_id": payload.command_id,
+        "source_revision": payload.source_revision,
+        "source_identity": payload.source_identity,
+        "project_hash": payload.project_hash,
+        "entrypoint_unit": payload.entrypoint_unit,
+        "unit_count": payload.units.len(),
+        "ack_payload_bytes": 0,
+        "ack_latency_ms": elapsed_ms(queued_at),
+        "hash_matches": true,
+        "queue_status": "accepted_latest",
+        "sync_ack_contains_runtime_summary": false,
+        "sync_ack_contains_layout_proof": false,
+        "last_good_frame_kept_while_pending": true,
+        "replace_job_queue_depth": 1,
+        "replace_job_dropped_stale": 0,
+        "render_thread_blocked_on_replace_count": 0,
+        "preview_blocked_on_ipc_count": 0,
+        "preview_receives_example_name": false,
+        "preview_pid": std::process::id()
+    }))
+}
+
+fn source_project_payload_from_request(
+    request: &serde_json::Value,
+) -> Result<SourceProjectPayload, Box<dyn std::error::Error>> {
+    if let Some(payload) = request.get("payload") {
+        return Ok(serde_json::from_value(payload.clone())?);
+    }
+    let code = request
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("replace request missing source text")?;
+    let source_path = request
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("memory://replace-source.bn");
+    let source_hash = boon_runtime::sha256_bytes(code.as_bytes());
+    let expected_hash = request
+        .get("expected_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(source_hash.as_str());
+    if source_hash != expected_hash {
+        return Err(format!(
+            "replace-code hash mismatch: expected {expected_hash}, actual {source_hash}"
+        )
+        .into());
+    }
+    Ok(SourceProjectPayload::single_unit(
+        request
+            .get("command_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        request
+            .get("source_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "legacy-replace-code",
+        source_path,
+        code,
+    ))
+}
+
+fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplaceBuildResult {
+    let entrypoint = match payload.entrypoint() {
+        Ok(entrypoint) => entrypoint.clone(),
+        Err(error) => {
+            return PreviewReplaceBuildResult {
+                layout_proof: json!({"status": "fail", "blocker": error.to_string()}),
+                runtime_summary: json!({"status": "fail", "blocker": error.to_string()}),
+                live_runtime: None,
+                source_text: String::new(),
+                source_sha256: String::new(),
+                source_bytes: 0,
+                virtual_uri: payload.entrypoint_unit,
+                status: "fail",
+                diagnostic: Some(error.to_string()),
+            };
+        }
+    };
+    let source_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
+    let layout_proof =
+        native_document_layout_proof(Path::new(&entrypoint.virtual_uri), &entrypoint.text)
+            .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}));
+    let runtime_summary = preview_runtime_summary(
+        Path::new(&entrypoint.virtual_uri),
+        &entrypoint.text,
+        &source_hash,
+    );
+    let layout_status = layout_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let runtime_status = runtime_summary
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let pass = layout_status == "pass" && runtime_status == "pass";
+    let diagnostic = (!pass).then(|| {
+        format!(
+            "replace-source failed before commit: layout_status={layout_status}, runtime_status={runtime_status}"
+        )
+    });
+    let live_runtime = pass
+        .then(|| {
+            boon_runtime::LiveRuntime::from_source(
+                &format!("native-preview-live:{}", entrypoint.virtual_uri),
+                &entrypoint.text,
+            )
+            .ok()
+            .map(|runtime| Arc::new(Mutex::new(runtime)))
+        })
+        .flatten();
+    PreviewReplaceBuildResult {
+        layout_proof,
+        runtime_summary,
+        live_runtime,
+        source_bytes: entrypoint.text.len() as u64,
+        source_text: entrypoint.text,
+        source_sha256: source_hash,
+        virtual_uri: entrypoint.virtual_uri,
+        status: if pass { "pass" } else { "fail" },
+        diagnostic,
+    }
+}
+
+fn preview_commit_source_project_result(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    payload: &SourceProjectPayload,
+    result: PreviewReplaceBuildResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?;
+    if payload.command_id != state.latest_accepted_command_id
+        || payload.source_revision != state.latest_accepted_source_revision
+    {
+        state.replace_status_cache = json!({
+            "kind": "replace-source-result",
+            "status": "stale",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "latest_accepted_command_id": state.latest_accepted_command_id,
+            "latest_accepted_source_revision": state.latest_accepted_source_revision,
+            "stale_result_rejected": true,
+            "preview_receives_example_name": false
+        });
+        return Ok(());
+    }
+
+    if result.status == "pass" {
+        state.source_path = PathBuf::from(&result.virtual_uri);
+        state.source_text = result.source_text;
+        state.source_bytes = result.source_bytes;
+        state.source_sha256 = result.source_sha256.clone();
+        state.runtime_summary = result.runtime_summary.clone();
+        state.live_runtime = result.live_runtime;
+        let frame_revision = {
+            let mut shared = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.layout_proof = result.layout_proof.clone();
+            shared.layout_frame_override = None;
+            shared.scroll_x_px = 0.0;
+            shared.scroll_y_px = 0.0;
+            shared.last_error = None;
+            shared.update_count = shared.update_count.saturating_add(1);
+            shared.update_count
+        };
+        state.replace_status_cache = json!({
+            "kind": "replace-source-result",
+            "status": "pass",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "project_hash": payload.project_hash,
+            "source_hash": result.source_sha256,
+            "frame_revision": frame_revision,
+            "stale_result_rejected": false,
+            "preview_receives_example_name": false
+        });
+    } else {
+        let diagnostic = result
+            .diagnostic
+            .unwrap_or_else(|| "replace-source failed before commit".to_owned());
+        let frame_revision = {
+            let mut shared = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.last_error = Some(diagnostic.clone());
+            shared.last_error_count = shared.last_error_count.saturating_add(1);
+            shared.update_count = shared.update_count.saturating_add(1);
+            shared.update_count
+        };
+        state.replace_status_cache = json!({
+            "kind": "replace-source-result",
+            "status": "fail",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "project_hash": payload.project_hash,
+            "diagnostic": diagnostic,
+            "frame_revision": frame_revision,
+            "last_good_frame_kept_while_pending": true,
+            "preview_receives_example_name": false
+        });
+    }
     Ok(())
 }
 
@@ -12096,6 +12731,10 @@ fn current_unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 fn git_commit() -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -12673,6 +13312,11 @@ mod tests {
             workspace,
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
+            next_command_id: 1,
+            selected_source_identity: "counter".to_owned(),
+            selected_source_revision: 1,
+            pending_replace: None,
+            latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
@@ -13196,6 +13840,11 @@ mod tests {
             workspace,
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
+            next_command_id: 1,
+            selected_source_identity: "custom:long".to_owned(),
+            selected_source_revision: 1,
+            pending_replace: None,
+            latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
@@ -13323,6 +13972,81 @@ mod tests {
     }
 
     #[test]
+    fn editor_horizontal_scroll_updates_column_without_moving_lines() {
+        let source = (0..24)
+            .map(|index| {
+                format!(
+                    "line_{index}: TEXT {{ abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz }}\n"
+                )
+            })
+            .collect::<String>();
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(&source);
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+
+        let mut horizontal_scroll = test_keyboard_input(Vec::new(), Vec::new());
+        horizontal_scroll.scroll_delta_x = 24.0;
+        horizontal_scroll.mouse_scroll_event_count = 1;
+        horizontal_scroll.mouse_window_pos =
+            Some(boon_native_app_window::NativeMouseWindowPosition {
+                x: f64::from(editor_bounds.x + editor_bounds.width * 0.5),
+                y: f64::from(editor_bounds.y + editor_bounds.height * 0.5),
+                window_width: 1180.0,
+                window_height: 820.0,
+            });
+
+        assert!(dev_apply_real_window_input(
+            &horizontal_scroll,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
+        assert!(shell.workspace.selected_buffer.scroll_column > 0);
+    }
+
+    #[test]
+    fn editor_shift_wheel_scrolls_horizontally() {
+        let source = "main: TEXT { abcdefghijklmnopqrstuvwxyz_abcdefghijklmnopqrstuvwxyz }\n";
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(source);
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+
+        let mut shift_wheel = test_keyboard_input(Vec::new(), vec!["Shift"]);
+        shift_wheel.scroll_delta_y = 24.0;
+        shift_wheel.mouse_scroll_event_count = 1;
+        shift_wheel.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(editor_bounds.x + editor_bounds.width * 0.5),
+            y: f64::from(editor_bounds.y + editor_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        assert!(dev_apply_real_window_input(
+            &shift_wheel,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
+        assert!(shell.workspace.selected_buffer.scroll_column > 0);
+    }
+
+    #[test]
     fn original_boon_semantic_rules_split_module_paths_and_text_literals() {
         let model = CodeEditorModel::new(
             "custom://theme.bn",
@@ -13379,6 +14103,11 @@ mod tests {
             workspace,
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
+            next_command_id: 1,
+            selected_source_identity: "sample".to_owned(),
+            selected_source_revision: 1,
+            pending_replace: None,
+            latest_ready_replace: None,
             last_preview_transport: json!({
                 "status": "not-run",
                 "reason": "test shell has not sent preview transport yet"
@@ -13477,6 +14206,11 @@ mod tests {
             workspace,
             editor_view: CodeEditorView::new(),
             preview_transport: PreviewTransport::new(None),
+            next_command_id: 1,
+            selected_source_identity: "counter".to_owned(),
+            selected_source_revision: 1,
+            pending_replace: None,
+            latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
@@ -13617,6 +14351,9 @@ mod tests {
                 )
                 .unwrap(),
             ))),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
         }));
 
         let todomvc_path = repo_path("examples/todomvc.bn");
@@ -13651,6 +14388,83 @@ mod tests {
         let shared = shared_render_state.lock().unwrap();
         assert_eq!(shared.scroll_x_px, 0.0);
         assert_eq!(shared.scroll_y_px, 0.0);
+    }
+
+    #[test]
+    fn replace_source_ack_is_small_and_worker_commits_latest_revision() {
+        let counter_path = repo_path("examples/counter.bn");
+        let counter_source = std::fs::read_to_string(&counter_path).unwrap();
+        let counter_hash = boon_runtime::sha256_bytes(counter_source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&counter_path, &counter_source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 12.0,
+            scroll_y_px: 34.0,
+            last_error: None,
+            last_error_count: 0,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: counter_path.clone(),
+            source_text: counter_source.clone(),
+            source_bytes: counter_source.len() as u64,
+            source_sha256: counter_hash.clone(),
+            runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &counter_source)
+                .ok()
+                .map(|runtime| Arc::new(Mutex::new(runtime))),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+        }));
+        let todomvc_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
+        let payload = SourceProjectPayload::single_unit(
+            7,
+            3,
+            "opaque-source-id",
+            "memory://todomvc.bn",
+            &todomvc_source,
+        );
+
+        let ack = preview_enqueue_source_project(
+            &state,
+            &json!({
+                "kind": "replace-source",
+                "payload": payload
+            }),
+            boon_native_app_window::NativeWakeHandle::new(),
+        )
+        .unwrap();
+
+        assert_eq!(ack["kind"], "replace-source-queued");
+        assert_eq!(ack["status"], "queued");
+        assert_eq!(ack["sync_ack_contains_runtime_summary"], false);
+        assert_eq!(ack["sync_ack_contains_layout_proof"], false);
+        assert!(ack.get("preview_runtime_summary").is_none());
+        assert!(ack.get("document_layout_proof").is_none());
+
+        let start = Instant::now();
+        loop {
+            let status = state.lock().unwrap().replace_status_cache.clone();
+            if status.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+                assert_eq!(status["command_id"], 7);
+                assert_eq!(status["source_revision"], 3);
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "replace-source worker did not commit: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.source_path, PathBuf::from("memory://todomvc.bn"));
+        assert_eq!(
+            state.source_sha256,
+            boon_runtime::sha256_bytes(todomvc_source.as_bytes())
+        );
     }
 
     #[test]

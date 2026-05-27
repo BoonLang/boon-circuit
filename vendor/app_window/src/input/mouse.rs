@@ -445,6 +445,19 @@ impl Mouse {
         (x, y)
     }
 
+    /// Returns the accumulated scroll delta without resetting it.
+    ///
+    /// Demand-driven render loops use this to decide whether a frame is needed
+    /// before handing the delta to application logic. Call
+    /// [`Mouse::load_clear_scroll_delta`] only after the application accepts the
+    /// event.
+    pub fn scroll_delta(&self) -> (f64, f64) {
+        (
+            self.shared.scroll_delta_x.load(Ordering::Relaxed),
+            self.shared.scroll_delta_y.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn event_provenance(&self) -> MouseEventProvenance {
         let last_window_protocol_id = self.shared.last_window_protocol_id.load(Ordering::Relaxed);
         MouseEventProvenance {

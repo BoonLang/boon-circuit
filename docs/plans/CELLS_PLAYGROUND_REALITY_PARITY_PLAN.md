@@ -11,7 +11,7 @@ playground may provide generic UI components and generic interpretation of
 component attributes, but it must not add a Cells-specific widget, renderer
 branch, hardcoded formula bar, or hardcoded spreadsheet preview.
 
-The current source declares `Grid/cells(columns: 26, rows: 100)` and a generic
+The current source declares `List/table(columns: 26, rows: 100)` and a generic
 `ForEach cells as cell` view, but the visible playground renders only four long
 rows because `cells_summary()` exposes only `A0`, `B0`, `C0`, and `D0` to the
 renderer. This plan fixes that product/reality gap and adds verification that
@@ -36,7 +36,7 @@ projection and verification-coverage issue.
 ## Key Changes
 
 - Replace the four-cell `cells_summary()` projection with a visible grid
-  viewport projection derived from the real `Grid/cells` dimensions and generic
+  viewport projection derived from the real `List/table` dimensions and generic
   keyed storage.
   - The summary must expose enough structured data for the renderer to draw a
     spreadsheet viewport, not four hand-picked scenario cells.
@@ -46,7 +46,7 @@ projection and verification-coverage issue.
     renderable cells.
 
 - Render Cells as a spreadsheet viewport through generic renderer primitives.
-  - Add generic `Grid`/viewport support only if existing `Row`/`Column`/`ForEach`
+  - Add generic table viewport support only if existing `Row`/`Column`/`ForEach`
     primitives cannot produce a stable spreadsheet layout.
   - The renderer must show column headers, row addresses, and cell editors/values
     in a compact grid, not full-width row cards.
@@ -56,7 +56,7 @@ projection and verification-coverage issue.
   - Editing, commit, cancel, formula display, error display, and selection/focus
     must still route through the existing Boon `SOURCE` bindings.
 
-- Initialize the Cells example with spreadsheet demo data through `Grid/cells` initial
+- Initialize the Cells example with spreadsheet demo data through `List/table` initial
   fields, not through a renderer special case.
   - A0, A1, and A2 should start with literal demo numbers.
   - B0 should demonstrate a function formula such as `=add(A0,A1)`.
@@ -166,7 +166,7 @@ and formulas through Boon source events.
 ## Acceptance Criteria
 
 - `target/reports/cells-visible-reality.json` passes and proves the visible
-  viewport is derived from the 26x100 `Grid/cells` model.
+  viewport is derived from the 26x100 `List/table` model.
 - `target/reports/cells-headed-ply.json` still passes with full OS pointer and
   keyboard input and no missing scenario steps.
 - `target/reports/cells-all.json`, `target/reports/examples-all.json`, and
@@ -180,7 +180,7 @@ and formulas through Boon source events.
 ## Copy-Paste `/goal` Prompt
 
 ```text
-/goal In /home/martinkavik/repos/boon-circuit, implement docs/plans/CELLS_PLAYGROUND_REALITY_PARITY_PLAN.md. Fix the Cells playground reality gap: examples/cells.bn declares Grid/cells(columns: 26, rows: 100), but the visible playground currently renders only four long cells because cells_summary exposes only A0-D0. Do not weaken the docs to match the four-cell UI. Make the visible native Cells playground render a spreadsheet-like viewport derived from the real 26x100 model, with compact cells, visible addresses/headers, and existing edit/commit/cancel/formula behavior still routed through Boon SOURCE bindings.
+/goal In /home/martinkavik/repos/boon-circuit, implement docs/plans/CELLS_PLAYGROUND_REALITY_PARITY_PLAN.md. Fix the Cells playground reality gap: examples/cells.bn declares List/table(columns: 26, rows: 100), but the visible playground currently renders only four long cells because cells_summary exposes only A0-D0. Do not weaken the docs to match the four-cell UI. Make the visible native Cells playground render a spreadsheet-like viewport derived from the real 26x100 model, with compact cells, visible addresses/headers, and existing edit/commit/cancel/formula behavior still routed through Boon SOURCE bindings.
 
 Add automated verification so this mismatch cannot recur. Create or extend an xtask report at target/reports/cells-visible-reality.json that proves source grid dimensions, viewport dimensions, rendered cell count, visible address samples beyond A0-D0, screenshot/hash/nonblank evidence, and pass/fail checks. Wire that report into verify-cells-all, verify-examples-all, audit-manual-readiness, audit-goal-readiness, verify-report-schema, and genericity/finality scans as appropriate. Extend Cells scenarios/headed checks with at least one non-A-D visible interaction or scroll/focus proof so the headed/operator gates cannot pass by exercising only A0-D0.
 

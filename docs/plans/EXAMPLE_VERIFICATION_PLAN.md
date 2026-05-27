@@ -179,7 +179,7 @@ proof that the editor path interprets Boon text instead of replaying hardcoded
 example behavior.
 
 The same report must include per-example proofs for TodoMVC and Cells. TodoMVC
-uses changed initial row data. Cells uses changed `Grid/cells` dimensions and
+uses changed initial row data. Cells uses changed `List/table` dimensions and
 records that the original full scenario rejects the smaller grid. The readiness
 audit rejects a custom-source report that only proves one accepted example.
 

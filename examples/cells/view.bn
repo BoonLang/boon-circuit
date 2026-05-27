@@ -55,6 +55,7 @@ FUNCTION formula_bar() {
             Element/text_input(
                 element: [
                     event: [
+                        click: cell.sources.editor.select
                         change: cell.sources.editor.change
                         key_down: cell.sources.editor.commit
                         escape: cell.sources.editor.cancel
@@ -68,7 +69,7 @@ FUNCTION formula_bar() {
                     border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
                     font: [size: 12, color: Oklch[lightness:0.12]]
                 ]
-                label: TEXT { Formula }
+                label: TEXT { fx input }
                 text: store.selected_input.editing_text
                 placeholder: [text: Text/empty()]
                 address: store.selected_input.address
@@ -175,6 +176,7 @@ FUNCTION cell_input(cell) {
     Element/text_input(
         element: [
             event: [
+                click: cell.sources.editor.select
                 change: cell.sources.editor.change
                 key_down: cell.sources.editor.commit
                 escape: cell.sources.editor.cancel
@@ -186,11 +188,14 @@ FUNCTION cell_input(cell) {
             height: 24
             background: [color: Oklch[lightness:1]]
             border: [color: Oklch[lightness:0.91,chroma:0.02,hue:250]]
+            selected: cell.address == store.selected_address
+            selected_border: [color: Oklch[lightness:0.58,chroma:0.18,hue:250]]
             font: [size: 10, color: Oklch[lightness:0.12]]
         ]
         label: cell.address
         text: cell.value
         placeholder: [text: Text/empty()]
+        target: cell.address
         key: cell.address
         address: cell.address
     )

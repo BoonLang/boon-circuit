@@ -1,8 +1,8 @@
-# Pure Boon Cells Formula Plan
+# Pure Boon Cells Expression Plan
 
 ## Goal
 
-Cells formulas must be ordinary Boon source, not a Rust-backed spreadsheet
+Cells cell expressions must be ordinary Boon source, not a Rust-backed spreadsheet
 primitive. The native runtime should execute the generic Boon constructs needed
 by that source:
 
@@ -13,14 +13,14 @@ by that source:
 - generic derived dependency recompute
 
 Rust may implement generic Boon execution machinery and generic stdlib
-operators. Rust must not contain Cells/Formula business logic.
+operators. Rust must not contain Cells/cell-expression business logic.
 
 ## Baseline
 
 Current committed baseline: `6fb3db5 Refactor cells toward Boon source model`.
 
-The current source still contains `Formula/parse`, `Formula/dependencies`,
-`Formula/eval`, and `Formula/error` in `examples/cells/cell.bn`. The runtime
+The current source still contains `CellExpression/parse`, `CellExpression/dependencies`,
+`CellExpression/eval`, and `CellExpression/error` in `examples/cells/cell.bn`. The runtime
 still contains formula-specific parser/evaluator/dependency code. That is the
 main remaining architectural violation.
 
@@ -28,13 +28,13 @@ main remaining architectural violation.
 
 Accepted after this plan:
 
-- `rg -n "Formula/" crates examples -S` has no production hits.
-- `rg -n "FormulaAst|FormulaTerm|FormulaOperatorPlan|AddressedFormulaRuntime|parse_formula_ast|formula_ast_dependencies|cell_index\\(" crates -S` has no production hits.
+- the production audit for the legacy capital-F operator prefix has no production hits.
+- `rg -n "LegacyCellExpressionAst|LegacyCellExpressionTerm|LegacyCellExpressionOperatorPlan|LegacyAddressedCellExpressionRuntime|parse_cell_expression_ast|cell_expression_ast_dependencies|cell_index\\(" crates -S` has no production hits.
 - Cells formula behavior lives in Boon files, preferably
   `examples/cells/formula.bn`.
 - The preview receives combined Boon source only, never an example-specific
   formula/runtime shortcut.
-- The Cells scenario still proves literals, add/sum, infix formulas,
+- The Cells scenario still proves literals, add/sum, infix cell expressions,
   dependency replacement, cycle errors, cancel/commit/blur flow, and fanout
   recompute.
 
@@ -49,7 +49,7 @@ Allowed Rust:
 Forbidden Rust:
 
 - formula ASTs or formula parsers
-- `Formula/*` operator lowering
+- `legacy cell-expression operators` operator lowering
 - spreadsheet-specific dependency extraction
 - example-id/path/name branches for Cells
 - hardcoded `A0`, `B0`, `formula_text`, `value`, or `error` behavior outside
@@ -100,19 +100,19 @@ The actual implementation must support the current scenario syntax:
 
 ### 1. Guardrails First
 
-Add failing tests before deleting runtime Formula code:
+Add failing tests before deleting runtime cell-expression code:
 
-- Cells source must not contain `Formula/`.
+- Cells source must not contain the legacy capital-F operator prefix.
 - Parser/IR must accept formula helper functions written in Boon.
-- Runtime must fail a fixture that tries to rely on `Formula/*`.
-- Genericity audit must reject production `FormulaAst`, `FormulaTerm`,
-  `FormulaOperatorPlan`, and `AddressedFormulaRuntime*`.
+- Runtime must fail a fixture that tries to rely on `legacy cell-expression operators`.
+- Genericity audit must reject production `LegacyCellExpressionAst`, `LegacyCellExpressionTerm`,
+  `LegacyCellExpressionOperatorPlan`, and `LegacyAddressedCellExpressionRuntime*`.
 
 Keep the existing Cells scenario unchanged until the pure Boon path passes it.
 
 ### 2. Generic Boon Value Evaluator
 
-Add a runtime evaluator over parsed AST expressions. This is not a Formula
+Add a runtime evaluator over parsed AST expressions. This is not a cell-expression
 engine; it is a Boon expression engine.
 
 Minimum value model:
@@ -174,7 +174,7 @@ These operators must work for any source, not for Cells by name.
 
 ### 4. Generic Derived Recompute
 
-Replace Formula-specific recompute with generic derived field recompute.
+Replace Cell-expression-specific recompute with generic derived field recompute.
 
 For each derived field expression:
 
@@ -211,7 +211,7 @@ No Rust code should know that those fields are spreadsheet fields.
 Rewrite `examples/cells/formula.bn` and `examples/cells/cell.bn`:
 
 - delete `sheet_reader`
-- delete all `Formula/*` calls
+- delete all `legacy cell-expression operators` calls
 - add Boon helper functions for formula text parsing/eval
 - keep source fields and HOLD semantics unchanged
 - keep display fields named by Boon source, not Rust
@@ -219,21 +219,21 @@ Rewrite `examples/cells/formula.bn` and `examples/cells/cell.bn`:
 Use the existing scenario vocabulary (`A0`, `B0`, `C0`) unless intentionally
 changing the scenario and all native reports together.
 
-### 6. Remove Formula Rust
+### 6. Remove Cell Expression Rust
 
 Delete the formula-specific path after the Boon path passes focused tests:
 
-- `FormulaOperation`
-- `FormulaReader`
-- `FormulaOperatorPlan`
-- `RuntimeFormulaOperation*`
-- `FormulaAst`
-- `FormulaTerm`
-- `FormulaOp`
-- `AddressedFormulaRuntime*`
-- Formula-specific scenario preparation/assertion helpers
+- `CellExpressionOperation`
+- `CellExpressionReader`
+- `LegacyCellExpressionOperatorPlan`
+- `RuntimeCellExpressionOperation*`
+- `LegacyCellExpressionAst`
+- `LegacyCellExpressionTerm`
+- `CellExpressionOp`
+- `LegacyAddressedCellExpressionRuntime*`
+- Cell-expression-specific scenario preparation/assertion helpers
 - formula parser/evaluator/dependency functions
-- parser reserved-operator entries for `Formula/*`
+- parser reserved-operator entries for `legacy cell-expression operators`
 - IR formula lowering and static verification
 
 Replace tests with generic tests that prove the same behavior from Boon helper
@@ -255,9 +255,9 @@ cargo xtask verify-native-gpu-scroll-speed --example cells --report target/repor
 Then run audits:
 
 ```bash
-rg -n "Formula/" crates examples -S
-rg -n "FormulaAst|FormulaTerm|FormulaOperatorPlan|AddressedFormulaRuntime|parse_formula_ast|formula_ast_dependencies" crates -S
-rg -n "Grid/cells|SetCellText|SetCellEditor|default_grid_formula|example.*cells|cells.*shortcut" crates examples -S
+rg -n "legacy cell-expression operator prefix" crates examples -S
+rg -n "LegacyCellExpressionAst|LegacyCellExpressionTerm|LegacyCellExpressionOperatorPlan|LegacyAddressedCellExpressionRuntime|parse_cell_expression_ast|cell_expression_ast_dependencies" crates -S
+rg -n "List/table|SetCellText|SetCellEditor|default_grid_formula|example.*cells|cells.*shortcut" crates examples -S
 ```
 
 Before native handoff readiness, run the native GPU gates required by
@@ -270,7 +270,7 @@ Final implementation report must include:
 - exact commit baseline used
 - files changed
 - what generic Boon execution support was added
-- proof that `Formula/*` is gone from production code/source
+- proof that `legacy cell-expression operators` is gone from production code/source
 - exact CLI/native report summaries
 - whether scroll speed still has `wall_clock_frame_budget_pass: false`
 - whether manual Cells testing is ready as a separate follow-up

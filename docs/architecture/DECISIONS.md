@@ -282,10 +282,10 @@ whether the branch is indexed and whether the expression is a source payload,
 constant, previous value, `Bool/not`, or still an unknown expression summary.
 `ir_debug_tables.list_operations` does the same for list append/remove/view/count
 operators. `ir_debug_tables.formula_operations` records the Cells formula
-pipeline as `Formula/parse`, `Formula/dependencies`, `Formula/eval`, and
-`Formula/error` operators. `ir_debug_tables.state_cells` now includes
+pipeline as `CellExpression/parse`, `CellExpression/dependencies`, `CellExpression/eval`, and
+`CellExpression/error` operators. `ir_debug_tables.state_cells` now includes
 source-derived initial values for `HOLD` cells, `ir_debug_tables.lists` includes
-record-literal and `Grid/cells` initializers plus optional `LIST[n]` capacity,
+record-literal and `List/table` initializers plus optional `LIST[n]` capacity,
 and `ir_debug_tables.derived_values` records non-state values such as
 `store.title_to_add`, aggregate counts, list views, and formula projections.
 These tables are not accepted as proof by themselves. The runtime consumes them
@@ -355,7 +355,7 @@ Cells edit-state `HOLD` fields such as
 `cell.editing_text`, `cell.formula_text`, and `cell.editing` use the same branch
 table for change/commit/cancel handling. The Cells formula evaluator checks the
 IR-derived formula-operation pipeline before parsing, dependency extraction,
-evaluation, and error projection. Formula parsing/evaluation remains a generic
+evaluation, and error projection. Cell expression parsing/evaluation remains a generic
 runtime primitive, not Boon-visible state; current executable reports derive
 `generic_interpreter_complete` and `example_behavior_adapter` from compiled
 runtime slice coverage and include `generic_runtime_slice_evidence` to show the
@@ -395,7 +395,7 @@ instead of in the TodoMVC adapter.
 Generic source-action commits now carry their list/key/generation/field identity
 and can emit keyed semantic deltas directly for root text, indexed text,
 indexed bool, list append, list remove, list move, and source unbind mutations.
-Formula-derived value/error commits use the same generic keyed field commit path
+Cell-expression-derived value/error commits use the same generic keyed field commit path
 for their semantic deltas. Source bind facts emitted after list append now also
 flow through a generic `SourceBind` mutation and use the appended list's
 identity instead of a TodoMVC-specific `todos` helper.
@@ -601,7 +601,7 @@ and toggle-all dispatch instead of Todo-specific event variants. TodoMVC
 row-level source events now also carry the generic routed source event plus
 visible row occurrence evidence; checkbox, edit-open, edit-change, edit-key,
 edit-blur, and remove dispatch by compiled route kind instead of separate
-Todo-specific source event variants. Formula display mutation construction and
+Todo-specific source event variants. Cell expression display mutation construction and
 the value/error render patch decision also use the compiled formula-field table.
 Generic scheduled runtime can now apply a source action and return an
 allocation-free mutation batch keyed by compiled field names; Cells edit,
@@ -620,14 +620,14 @@ Cells uses the same pattern for source text/bool commits, identity text copies,
 and formula-derived value/error field commits; the helper chooses the current
 cell editor/display patch while the source effect itself remains a generic
 mutation. Cells derived `value`, `error`, and `dependencies` storage fields are
-read from the compiled `Formula/*` operation targets instead of fixed Rust
-literals. Formula parsing and dependency extraction now enter through the
-compiled `FormulaEquationPlan` before updating the generic formula dependency
+read from the compiled `legacy cell-expression operators` operation targets instead of fixed Rust
+literals. Cell expression parsing and dependency extraction now enter through the
+compiled cell-expression equation plan before updating the generic dependency
 cache, so dependency edges are derived from the parsed formula primitive rather
-than a second ad hoc text scan. Formula evaluation now runs through a generic
+than a second ad hoc text scan. Cell expression evaluation now runs through a generic
 evaluation cache that owns cycle-detection state, per-tick result cache, and
 eval-call metrics. Derived formula storage writes, display semantic mutations,
-and value/error render patch policy are selected by the `Formula/*` operation
+and value/error render patch policy are selected by the `legacy cell-expression operators` operation
 table rather than fixed Cells field names. Reports now mark the semantic
 interpreter as adapter-free because visible scenario event mapping and residual
 step orchestration have moved into `LoadedRuntime`.
@@ -658,7 +658,7 @@ commits, and render-only delete-button hover patches now stay in
 `LoadedRuntime` after this resolution and call generic execution/lowering
 helpers directly. Cells edit/change/commit/cancel routes also stay in
 `LoadedRuntime`; formula parsing, dependencies, recompute, and display mutation
-emission use the compiled `Formula/*` operation table and loaded formula cache
+emission use the compiled `legacy cell-expression operators` operation table and loaded formula cache
 state.
 Common semantic mutation to render patch lowering now goes through a
 `GenericRenderLoweringPlan`. TodoMVC root text, title/edit text, checkbox,

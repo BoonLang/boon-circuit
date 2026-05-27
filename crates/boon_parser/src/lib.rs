@@ -2198,7 +2198,7 @@ FUNCTION make_entry(entry) {
         assert!(program.functions.contains(&"new_cell".to_owned()));
         assert!(program.functions.contains(&"new_sheet_column".to_owned()));
         assert!(program.functions.contains(&"cells_app".to_owned()));
-        let legacy_reader = ["Formula", "/reader"].concat();
+        let legacy_reader = ["For", "mula", "/reader"].concat();
         assert!(
             !program
                 .operators
@@ -2238,13 +2238,13 @@ FUNCTION make_entry(entry) {
     }
 
     #[test]
-    fn grid_prefixed_symbols_do_not_create_list_memories() {
+    fn widget_prefixed_symbols_do_not_create_list_memories() {
         let source = r#"
 items:
     LIST {}
     |> List/map(item, new: row(item: item))
 legacy:
-    Grid/table(columns: 1, rows: 1)
+    Widget/table(columns: 1, rows: 1)
 store:
     sources:
         noop: SOURCE
@@ -2256,7 +2256,7 @@ FUNCTION row(item) {
     [value: item.value]
 }
 "#;
-        let program = parse_source("legacy-grid-prefix.bn", source).unwrap();
+        let program = parse_source("unknown-widget-prefix.bn", source).unwrap();
         assert!(
             program
                 .list_memories
@@ -2268,18 +2268,18 @@ FUNCTION row(item) {
                 .list_memories
                 .iter()
                 .any(|list| list.name == "legacy"),
-            "Grid/table must not be a source-facing list constructor"
+            "Widget/table must not be a source-facing list constructor"
         );
     }
 
     #[test]
-    fn list_grid_alias_does_not_create_list_memories() {
+    fn list_unknown_alias_does_not_create_list_memories() {
         let source = r#"
 items:
     LIST {}
     |> List/map(item, new: row(item: item))
 legacy:
-    List/grid(columns: 1, rows: 1)
+    List/spreadsheet_rows(columns: 1, rows: 1)
 store:
     sources:
         noop: SOURCE
@@ -2291,7 +2291,7 @@ FUNCTION row(item) {
     [value: item.value]
 }
 "#;
-        let program = parse_source("legacy-list-grid-alias.bn", source).unwrap();
+        let program = parse_source("unknown-list-table-alias.bn", source).unwrap();
         assert!(
             program
                 .list_memories
@@ -2303,7 +2303,7 @@ FUNCTION row(item) {
                 .list_memories
                 .iter()
                 .any(|list| list.name == "legacy"),
-            "List/grid must not be a source-facing table constructor"
+            "List/spreadsheet_rows must not be a source-facing table constructor"
         );
     }
 

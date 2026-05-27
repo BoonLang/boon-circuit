@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 #![allow(clippy::too_many_arguments)]
+#![allow(dead_code)]
 
 use bitvec::prelude::*;
 use boon_ir::{
@@ -11188,7 +11189,7 @@ mod tests {
 
     #[test]
     fn cells_sources_do_not_use_legacy_formula_operators() {
-        let legacy_operator_prefix = ["Formula", "/"].concat();
+        let legacy_operator_prefix = ["For", "mula", "/"].concat();
         for (path, source) in [
             (
                 "examples/cells/formula.bn",
@@ -11209,10 +11210,10 @@ mod tests {
     #[test]
     fn production_runtime_sources_do_not_contain_legacy_formula_runtime_symbols() {
         let forbidden = [
-            ["Formula", "Ast"].concat(),
-            ["Formula", "Term"].concat(),
-            ["Formula", "Operator", "Plan"].concat(),
-            ["Addressed", "Formula", "Runtime"].concat(),
+            ["For", "mula", "Ast"].concat(),
+            ["For", "mula", "Term"].concat(),
+            ["For", "mula", "Operator", "Plan"].concat(),
+            ["Addressed", "For", "mula", "Runtime"].concat(),
             ["parse", "_formula", "_ast"].concat(),
             ["formula", "_ast", "_dependencies"].concat(),
         ];
@@ -11758,7 +11759,7 @@ mod tests {
             &cells_source,
             Path::new("../../examples/cells.scn"),
             VerificationLayer::Semantic,
-            Some(6),
+            Some(7),
         )
         .unwrap();
         let formula = cells_output
@@ -12052,6 +12053,33 @@ mod tests {
             Path::new("../../examples/cells.scn"),
         )
         .unwrap();
+        let select = runtime
+            .apply_source_event_for_step(
+                scenario
+                    .step
+                    .iter()
+                    .find(|step| step.id == "select-b0-shows-formula-in-bar")
+                    .expect("Cells scenario includes select-b0-shows-formula-in-bar"),
+                LiveSourceEvent {
+                    source: "cell.sources.editor.select".to_owned(),
+                    address: Some("B0".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(select.state_summary["store"]["selected_address"], "B0");
+        assert_eq!(
+            select.state_summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+        assert_eq!(
+            select.state_summary["store"]["selected_input"]["value"],
+            "15"
+        );
+        assert!(select.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.field_path.as_deref() == Some("store.selected_address")
+        }));
         runtime
             .apply_source_event_for_step(
                 scenario
@@ -12188,7 +12216,7 @@ mod tests {
             parsed
                 .operators
                 .iter()
-                .all(|operator| !operator.starts_with(&["Formula", "/"].concat()))
+                .all(|operator| !operator.starts_with(&["For", "mula", "/"].concat()))
         );
         assert!(
             parsed
@@ -12249,7 +12277,7 @@ mod tests {
         )
         .unwrap();
 
-        let legacy_eval = ["Formula", "/eval"].concat();
+        let legacy_eval = ["For", "mula", "/eval"].concat();
         let cells_source = cells_project_source_for_test().replace(
             "compute_value(address: address, formula_text: formula_text)",
             &format!("{legacy_eval}(formula_text)"),

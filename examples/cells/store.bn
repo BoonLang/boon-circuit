@@ -4,6 +4,7 @@ store: [
     selected_address:
         TEXT { A0 } |> HOLD selected_address {
             LATEST {
+                cell.sources.editor.select.address
                 cell.sources.editor.change.address
                 cell.sources.editor.commit.address
                 cell.sources.editor.cancel.address

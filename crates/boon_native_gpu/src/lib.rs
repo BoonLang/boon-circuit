@@ -1761,7 +1761,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
         }
         DocumentNodeKind::TextInput => [1.0, 1.0, 1.0, 1.0],
         DocumentNodeKind::Button => [0.92, 0.95, 0.97, 1.0],
-        DocumentNodeKind::Grid | DocumentNodeKind::GridCell => [1.0, 1.0, 1.0, 1.0],
+        DocumentNodeKind::Table | DocumentNodeKind::TableCell => [1.0, 1.0, 1.0, 1.0],
         DocumentNodeKind::Text => [0.965, 0.972, 0.982, 1.0],
     }
 }

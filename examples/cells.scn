@@ -10,6 +10,16 @@ id = "initial-add-function"
 expect_cell = { address = "B0", value = "15", formula = "=add(A0,A1)" }
 
 [[step]]
+id = "select-b0-shows-formula-in-bar"
+user_action = { kind = "click", target = "B0 editor" }
+expected_source_event = { source = "cell.sources.editor.select", address = "B0" }
+expect_cell = { address = "B0", value = "15", formula = "=add(A0,A1)", editing_text = "=add(A0,A1)", editing = false }
+expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
+expect_render_delta_contains = ["InvalidateDocument"]
+  [step.expect_root_text]
+  "store.selected_address" = "B0"
+
+[[step]]
 id = "initial-sum-function"
 expect_cell = { address = "C0", value = "30", formula = "=sum(A0:A2)" }
 

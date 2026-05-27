@@ -6,8 +6,8 @@ actor per cell.
 
 ## Goals
 
-- Formulas live in Boon source, not hardcoded Rust.
-- The engine handles arbitrary supported formulas from the editor.
+- Cell expressions live in Boon source, not hardcoded Rust.
+- The engine handles arbitrary supported cell expressions from the editor.
 - Dependencies between cells are explicit runtime data.
 - Only affected cells recompute after an edit.
 - Cycles are detected and reported deterministically.
@@ -59,7 +59,7 @@ cells:
     |> List/map(cell, new: new_cell(cell: cell))
 
 sheet_reader:
-    Formula/reader(list: cells, address: address, value: value)
+    CellExpression/reader(list: cells, address: address, value: value)
 
 FUNCTION new_cell(cell) {
     sources: [
@@ -99,19 +99,19 @@ FUNCTION new_cell(cell) {
             }
 
         parsed_formula:
-            Formula/parse(formula_text)
+            CellExpression/parse(formula_text)
 
         dependencies:
-            Formula/dependencies(parsed_formula)
+            CellExpression/dependencies(parsed_formula)
 
         value:
-            Formula/eval(
+            CellExpression/eval(
                 formula: parsed_formula,
                 read: sheet_reader
             )
 
         error:
-            Formula/error(parsed_formula, value)
+            CellExpression/error(parsed_formula, value)
     ]
 }
 ```
@@ -127,7 +127,7 @@ should follow parsed `SOURCE` ports rather than a separate Rust list of editor
 event names.
 
 `List/table` produces ordinary addressed rows from the Boon declaration and
-applies seeded demo formulas from `cells_default_values`, for example:
+applies seeded demo cell expressions from `cells_default_values`, for example:
 
 ```text
 [row: 0, column: A, address: TEXT { A0 }, default_formula: TEXT { 5 }]
@@ -157,15 +157,15 @@ authoritative list/table storage. They are not allowed to replace or shrink the
 underlying 26x100 runtime model.
 
 The Cells source owns the spreadsheet layout declaration. Header rows, row
-labels, compact editors, displayed values, edit-mode formulas, focused cell
+labels, compact editors, displayed values, edit-mode cell expressions, focused cell
 styling, and the scrollable body must be declared in the manifest-backed
 `examples/cells/*.bn` source files with generic `document` elements. The root
 `examples/cells.bn` is only the executable document entrypoint. The playground
 renderer only interprets those generic component attributes.
 
-## Formula Primitive Contract
+## Cell Expression Helper Contract
 
-`Formula/parse`, `Formula/dependencies`, and `Formula/eval` are generic
+`CellExpression/parse`, `CellExpression/dependencies`, and `CellExpression/eval` are generic
 spreadsheet primitives, not a hardcoded Cells app.
 
 Minimum supported formula contract:
@@ -183,8 +183,8 @@ Current implementation note: numeric literals, A0 references, single binary
 dependency-edge replacement, `parse_error`, `cycle_error`, and `div_by_zero` are
 covered by runtime tests.
 
-`Formula/parse(text)` returns a small formula AST or a deterministic error.
-`Formula/dependencies(ast)` returns a set of domain cell addresses. `Formula/eval`
+`CellExpression/parse(text)` returns a small formula AST or a deterministic error.
+`CellExpression/dependencies(ast)` returns a set of domain cell addresses. `CellExpression/eval`
 reads values by domain address through the runtime's dependency-aware reader and
 records which addresses were read. The reader must not expose hidden runtime
 keys.

@@ -3808,20 +3808,6 @@ fn gather_field_defs_from_statements(
     }
 }
 
-fn statement_has_operator(
-    statement: &AstStatement,
-    program: &ParsedProgram,
-    operator: &str,
-) -> bool {
-    collect_statement_ast_exprs(statement, program)
-        .iter()
-        .any(|expr| match &expr.kind {
-            AstExprKind::Call { function, .. } => function == operator,
-            AstExprKind::Pipe { op, .. } => op == operator,
-            _ => false,
-        })
-}
-
 fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
     let mut expr_ids = Vec::new();
     collect_statement_expr_ids(statement, program, &mut Vec::new(), &mut expr_ids);
@@ -4744,21 +4730,21 @@ FUNCTION new_todo(todo) {
     }
 
     #[test]
-    fn grid_prefixed_symbols_do_not_lower_as_table_or_projection_shortcuts() {
+    fn widget_prefixed_symbols_do_not_lower_as_table_or_projection_shortcuts() {
         let source = r#"
 items:
     LIST {}
     |> List/map(item, new: row(item: item))
 legacy:
-    Grid/table(columns: 1, rows: 1)
+    Widget/table(columns: 1, rows: 1)
 store: [
     sources: [
         noop: SOURCE
     ]
     selected:
-        Grid/selected(items, address: wanted)
+        Widget/selected(items, address: wanted)
     rows:
-        Grid/rows(items)
+        Widget/rows(items)
     wanted:
         TEXT { A0 } |> HOLD wanted {
             LATEST {}
@@ -4771,26 +4757,27 @@ FUNCTION row(item) {
     ]
 }
 "#;
-        let parsed = boon_parser::parse_source("legacy-grid-prefix-shortcuts.bn", source).unwrap();
+        let parsed =
+            boon_parser::parse_source("unknown-widget-prefix-shortcuts.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert!(
             !ir.lists.iter().any(|list| list.name == "legacy"),
-            "Grid/table must not lower to a table initializer"
+            "Widget/table must not lower to a table initializer"
         );
         assert!(
             ir.list_projections.is_empty(),
-            "Grid/selected and Grid/rows must not lower to generic projections"
+            "Widget/selected and Widget/rows must not lower to generic projections"
         );
     }
 
     #[test]
-    fn list_grid_alias_does_not_lower_as_table_shortcut() {
+    fn list_unknown_alias_does_not_lower_as_table_shortcut() {
         let source = r#"
 items:
     LIST {}
     |> List/map(item, new: row(item: item))
 legacy:
-    List/grid(columns: 1, rows: 1)
+    List/spreadsheet_rows(columns: 1, rows: 1)
 store:
     sources:
         noop: SOURCE
@@ -4805,11 +4792,11 @@ FUNCTION row(item) {
     ]
 }
 "#;
-        let parsed = boon_parser::parse_source("legacy-list-grid-alias.bn", source).unwrap();
+        let parsed = boon_parser::parse_source("unknown-list-table-alias.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         assert!(
             !ir.lists.iter().any(|list| list.name == "legacy"),
-            "List/grid must not lower to a table initializer"
+            "List/spreadsheet_rows must not lower to a table initializer"
         );
     }
 

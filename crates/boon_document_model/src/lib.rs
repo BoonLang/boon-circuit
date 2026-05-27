@@ -20,8 +20,8 @@ pub enum DocumentNodeKind {
     Text,
     Button,
     TextInput,
-    Grid,
-    GridCell,
+    Table,
+    TableCell,
     ScrollRoot,
 }
 

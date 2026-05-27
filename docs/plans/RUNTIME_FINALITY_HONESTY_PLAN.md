@@ -184,7 +184,7 @@ by `docs/architecture/RUNTIME_MODEL.md` and
 
 Implement completely:
 
-1. Replace the current text/line parser with a real chumsky AST parser. Parse existing TodoMVC and Cells syntax including SOURCE, HOLD, LATEST, WHEN, THEN, WHILE, LIST, List/map, List/append, List/retain, List/count, Formula/* calls, function calls, pipe calls, records, literals, and VIEW. Semantics must not depend on ParsedExpression.text, contains checks, comments, file path names, or substring markers.
+1. Replace the current text/line parser with a real chumsky AST parser. Parse existing TodoMVC and Cells syntax including SOURCE, HOLD, LATEST, WHEN, THEN, WHILE, LIST, List/map, List/append, List/retain, List/count, legacy cell-expression operators calls, function calls, pipe calls, records, literals, and VIEW. Semantics must not depend on ParsedExpression.text, contains checks, comments, file path names, or substring markers.
 
 2. Replace heuristic IR lowering with typed AST lowering. Remove expression_node_kind and all semantic lowering based on field.body.contains, branch_text_for_source, source-body scans, hardcoded todo/cell substring checks, and path-substring indexed detection. Lower into typed IR tables with NodeId, ExprId, ScopeId, SourceId, StateId, ListId, FieldId, operator kinds, source payload schemas, dependencies, update branches, list operations, formula operations, and VIEW bindings.
 

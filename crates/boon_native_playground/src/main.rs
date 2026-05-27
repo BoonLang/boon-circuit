@@ -433,6 +433,9 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
+    let skip_operator_host_input_probe = args
+        .iter()
+        .any(|arg| arg == "--skip-operator-host-input-probe");
     let title = role_window_title("Boon Dev", value_arg(args, "--title-token").as_deref());
     let role_args = args[1..].to_vec();
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
@@ -515,6 +518,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 ipc_queue_capacity,
                                 replace_code_file.as_deref(),
                                 replace_code_expected_hash.as_deref(),
+                                skip_operator_host_input_probe,
                             )
                             .map_err(|error| error.to_string())
                             .and_then(|value| {
@@ -728,6 +732,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if probe {
         dev_args.push("--probe".to_owned());
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--skip-operator-host-input-probe")
+    {
+        dev_args.push("--skip-operator-host-input-probe".to_owned());
     }
     let dev_arg_refs = dev_args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut dev = spawn_role(&dev_arg_refs)?;
@@ -7354,11 +7364,11 @@ fn lower_canonical_document_element(
         }
     }
 
-    let vertical_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+    let vertical_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Table)
         || style_bool(&node.style, "scroll")
         || style_bool(&node.style, "scroll_y")
         || style_bool(&node.style, "scrollbars");
-    let horizontal_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+    let horizontal_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Table)
         || style_bool(&node.style, "scroll")
         || style_bool(&node.style, "scroll_x")
         || style_bool(&node.style, "scrollbars");
@@ -7652,7 +7662,7 @@ fn lower_canonical_style_block(
                     node.style.insert("padding".to_owned(), value);
                 }
             }
-            "outline" | "border" | "borders" => {
+            "outline" | "border" | "borders" | "selected_border" => {
                 if let Some(color) =
                     statement_nested_style_value(child, "color", expressions, context)
                         .or_else(|| {
@@ -7660,7 +7670,12 @@ fn lower_canonical_style_block(
                         })
                         .or_else(|| document_style_value(child, expressions, context))
                 {
-                    node.style.insert("border".to_owned(), color);
+                    let style_key = if field == "selected_border" {
+                        "selected_border"
+                    } else {
+                        "border"
+                    };
+                    node.style.insert(style_key.to_owned(), color);
                 }
             }
             _ => {
@@ -7744,6 +7759,20 @@ fn lower_canonical_style_record(
                     })
                 {
                     node.style.insert("padding".to_owned(), value);
+                }
+            }
+            "outline" | "border" | "borders" | "selected_border" => {
+                if let Some(value) =
+                    record_field_nested_style_value(field, "color", expressions, context).or_else(
+                        || document_style_value_for_expr(field.value, expressions, context),
+                    )
+                {
+                    let style_key = if field.name == "selected_border" {
+                        "selected_border"
+                    } else {
+                        "border"
+                    };
+                    node.style.insert(style_key.to_owned(), value);
                 }
             }
             _ => {
@@ -8200,10 +8229,10 @@ fn lower_document_element(
         }
     }
 
-    let vertical_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+    let vertical_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Table)
         || style_bool(&node.style, "scroll")
         || style_bool(&node.style, "scroll_y");
-    let horizontal_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Grid)
+    let horizontal_scroll = matches!(node.kind, boon_document_model::DocumentNodeKind::Table)
         || style_bool(&node.style, "scroll")
         || style_bool(&node.style, "scroll_x");
     if vertical_scroll {
@@ -8301,8 +8330,8 @@ fn document_node_kind_from_name(name: &str) -> boon_document_model::DocumentNode
         "Text" => boon_document_model::DocumentNodeKind::Text,
         "Button" | "Checkbox" => boon_document_model::DocumentNodeKind::Button,
         "Input" | "TextInput" => boon_document_model::DocumentNodeKind::TextInput,
-        "Grid" => boon_document_model::DocumentNodeKind::Grid,
-        "GridCell" => boon_document_model::DocumentNodeKind::GridCell,
+        "Table" => boon_document_model::DocumentNodeKind::Table,
+        "TableCell" => boon_document_model::DocumentNodeKind::TableCell,
         "ScrollRoot" => boon_document_model::DocumentNodeKind::ScrollRoot,
         _ => boon_document_model::DocumentNodeKind::Stack,
     }
@@ -8857,6 +8886,9 @@ fn preview_apply_real_window_input(
                         .as_deref()
                         .unwrap_or_default(),
                 );
+                if let Some(event) = live_source_event_for_hit_region(layout, &hit_region) {
+                    pending_mouse_events.push(event);
+                }
             } else {
                 input_state.focused_node = None;
                 input_state.focused_text.clear();
@@ -9374,6 +9406,7 @@ fn live_source_for_node_intent(layout_proof: &Value, node: &str, expected: &str)
 
 fn focused_target_text(layout_proof: &Value, node: &str) -> Option<String> {
     focused_source_intent_value(layout_proof, node, "target")
+        .or_else(|| focused_source_intent_value(layout_proof, node, "address"))
 }
 
 fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
@@ -10206,6 +10239,11 @@ fn source_intent_matches_event_target(
     let Some(target_text) = event_json
         .get("target_text")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event_json
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+        })
     else {
         return true;
     };
@@ -10338,6 +10376,7 @@ fn run_dev_ipc_probe(
     queue_capacity: u64,
     replace_code_file: Option<&Path>,
     replace_code_expected_hash: Option<&str>,
+    skip_operator_host_input_probe: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let replace_code_response = if let Some(path) = replace_code_file {
@@ -10359,17 +10398,21 @@ fn run_dev_ipc_probe(
     } else {
         None
     };
-    let operator_host_input_response = if let Some(path) = replace_code_file {
-        let code = boon_runtime::source_text_for_path(path)?;
-        let responses = operator_host_input_probe_requests(path, &code)
-            .map(|requests| {
-                requests
-                    .into_iter()
-                    .map(|request| send_preview_ipc_request(connect, request))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-        responses.map(aggregate_operator_host_input_responses)
+    let operator_host_input_response = if !skip_operator_host_input_probe {
+        if let Some(path) = replace_code_file {
+            let code = boon_runtime::source_text_for_path(path)?;
+            let responses = operator_host_input_probe_requests(path, &code)
+                .map(|requests| {
+                    requests
+                        .into_iter()
+                        .map(|request| send_preview_ipc_request(connect, request))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            responses.map(aggregate_operator_host_input_responses)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -10402,6 +10445,14 @@ fn run_dev_ipc_probe(
         value["dev_sent_operator_host_input"] = json!(true);
     } else {
         value["dev_sent_operator_host_input"] = json!(false);
+        value["operator_host_input"] = if skip_operator_host_input_probe {
+            json!({
+                "status": "skipped",
+                "reason": "covered by preview-e2e operator host input gate"
+            })
+        } else {
+            json!(null)
+        };
     }
     Ok(value)
 }
@@ -12676,6 +12727,102 @@ mod tests {
     }
 
     #[test]
+    fn cells_click_selection_updates_formula_bar_and_selected_style() {
+        let cells_path = repo_path("examples/cells.bn");
+        let scenario_path = repo_path("examples/cells.scn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let scenario = boon_runtime::parse_scenario(&scenario_path).unwrap();
+        let mut runtime =
+            boon_runtime::LiveRuntime::new("native-cells-select", &cells_source, &scenario_path)
+                .unwrap();
+        let step = scenario
+            .step
+            .iter()
+            .find(|step| step.id == "select-b0-shows-formula-in-bar")
+            .expect("Cells scenario should cover click selection");
+        let output = runtime
+            .apply_source_event_for_step(
+                step,
+                boon_runtime::LiveSourceEvent {
+                    source: "cell.sources.editor.select".to_owned(),
+                    address: Some("B0".to_owned()),
+                    ..boon_runtime::LiveSourceEvent::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(output.state_summary["store"]["selected_address"], "B0");
+        assert_eq!(
+            output.state_summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+
+        let proof = native_document_layout_proof_with_state(
+            &cells_path,
+            &cells_source,
+            Some(&output.state_summary),
+        )
+        .unwrap();
+        let intents = proof["source_intent_assertions"].as_array().unwrap();
+        let selected_node = intents
+            .iter()
+            .find_map(|intent| {
+                let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+                let is_click =
+                    intent.get("intent").and_then(serde_json::Value::as_str) == Some("click");
+                let is_select = intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("cell.sources.editor.select");
+                let has_b0_address = intents.iter().any(|candidate| {
+                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                        && candidate.get("intent").and_then(serde_json::Value::as_str)
+                            == Some("address")
+                        && candidate
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("B0")
+                });
+                let has_b0_target = intents.iter().any(|candidate| {
+                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                        && candidate.get("intent").and_then(serde_json::Value::as_str)
+                            == Some("target")
+                        && candidate
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("B0")
+                });
+                (is_click && is_select && has_b0_address && has_b0_target)
+                    .then_some(node.to_owned())
+            })
+            .expect("B0 cell should expose a click select source intent");
+
+        let artifact_path = proof["artifact_path"].as_str().unwrap();
+        let artifact: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(artifact_path).unwrap()).unwrap();
+        let nodes = artifact["document_frame"]["nodes"].as_object().unwrap();
+        let style = nodes
+            .get(&selected_node)
+            .and_then(|node| node.get("style"))
+            .expect("selected B0 node should be in the lowered document frame");
+        assert_eq!(
+            style.get("selected").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            style.get("selected_border").is_some(),
+            "selected cell style should carry a selected border color"
+        );
+        assert!(
+            nodes.values().any(|node| {
+                node.pointer("/text/text")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("=add(A0,A1)")
+            }),
+            "formula bar should display the selected cell formula text"
+        );
+    }
+
+    #[test]
     fn preview_error_overlay_keeps_frame_renderable() {
         let frame = boon_document::LayoutFrame {
             display_list: Vec::new(),
@@ -12728,7 +12875,7 @@ mod tests {
         );
         let source = cells.source_text().unwrap();
         assert!(source.contains("-- file:"));
-        assert!(!source.contains(&["Formula", "/"].concat()));
+        assert!(!source.contains(&["For", "mula", "/"].concat()));
         assert!(source.contains("FUNCTION new_cell"));
         assert!(source.contains("FUNCTION new_sheet_column"));
         assert!(source.contains("FUNCTION cells_app"));

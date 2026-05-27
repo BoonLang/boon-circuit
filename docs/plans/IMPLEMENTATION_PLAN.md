@@ -313,7 +313,7 @@ scenario's initial-state assertions. That prevents the playground from passing
 only because bundled example files were hardcoded.
 
 The editor-path proof also writes a modified Cells source/scenario pair. The
-Cells variant changes `Grid/cells` dimensions, runs the custom source through the
+Cells variant changes `List/table` dimensions, runs the custom source through the
 same source-text entry point, and proves the original full Cells scenario rejects
 the smaller grid. `audit-goal-readiness` requires both examples in
 `target/reports/playground-custom-source.json`.
@@ -333,7 +333,7 @@ Cells has an additional visible-reality gate because its semantic scenario can
 exercise only a small subset of a much larger spreadsheet.
 `verify-cells-visible-reality` writes
 `target/reports/cells-visible-reality.json` and must prove a visible spreadsheet
-viewport derived from `Grid/cells(columns: 26, rows: 100)`, including at least
+viewport derived from `List/table(columns: 26, rows: 100)`, including at least
 26 columns, 100 rows, 2600 rendered addressed editors, non-A-D address samples,
 and nonblank screenshot evidence. Semantic/stress evidence for the 26x100
 runtime model is not by itself visible playground parity.
@@ -396,10 +396,10 @@ Write Cells in Boon source.
 Generic Rust primitives allowed:
 
 ```text
-Formula/parse
-Formula/dependencies
-Formula/eval
-Grid/cells
+CellExpression/parse
+CellExpression/dependencies
+CellExpression/eval
+List/table
 ```
 
 Hardcoded Rust app behavior is not allowed.

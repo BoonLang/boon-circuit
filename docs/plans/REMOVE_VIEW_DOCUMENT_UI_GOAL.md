@@ -74,7 +74,7 @@ and the actual `boon-circuit` parser. Do not assume they match.
 - Cells formula bar editing.
 - Focused-cell styling.
 - Blank display for empty cells.
-- Formula result display, including real `0` when the formula result is zero.
+- Cell expression result display, including real `0` when the formula result is zero.
 - Header horizontal scroll sync.
 - Vertical wheel scrolling and Shift+wheel horizontal scrolling.
 - Code/source editor scrolling.
@@ -94,7 +94,7 @@ Prefer real performance fixes:
 - avoid repeated string parsing/splitting on hot input paths;
 - avoid O(2600) text-control updates per keypress unless there is evidence it is
   necessary;
-- preserve correctness of dependencies, formulas, focus, and source events.
+- preserve correctness of dependencies, cell expressions, focus, and source events.
 
 Also make the source/code editor scroll fast. Use the generic scroll/input path
 where possible instead of only tuning the Cells grid.

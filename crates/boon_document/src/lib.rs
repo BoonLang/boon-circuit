@@ -220,7 +220,7 @@ impl LayoutBuilder<'_, '_> {
         let control_size = style_spacing(&node.style, "size").filter(|_| {
             matches!(
                 node.kind,
-                DocumentNodeKind::Button | DocumentNodeKind::GridCell
+                DocumentNodeKind::Button | DocumentNodeKind::TableCell
             ) && node.text.is_none()
         });
         let auto_width = style_text(&node.style, "width")
@@ -387,27 +387,30 @@ impl TextMeasurer for SimpleTextMeasurer {
     }
 }
 
-pub fn fixture_frame_with_virtualized_grid() -> DocumentFrame {
+pub fn fixture_frame_with_virtualized_table() -> DocumentFrame {
     let mut frame = DocumentFrame::empty("root");
-    let mut grid = DocumentNode::new("virtual-grid", boon_document_model::DocumentNodeKind::Grid);
-    grid.parent = Some(frame.root.clone());
-    grid.text = Some(TextValue {
-        text: "Virtualized logical grid".to_owned(),
+    let mut table = DocumentNode::new(
+        "virtual-table",
+        boon_document_model::DocumentNodeKind::Table,
+    );
+    table.parent = Some(frame.root.clone());
+    table.text = Some(TextValue {
+        text: "Virtualized logical table".to_owned(),
     });
-    grid.materialized.push(MaterializedRange {
+    table.materialized.push(MaterializedRange {
         axis: Axis::Vertical,
         visible: 0..20,
         overscan: 0..28,
     });
-    grid.materialized.push(MaterializedRange {
+    table.materialized.push(MaterializedRange {
         axis: Axis::Horizontal,
         visible: 0..8,
         overscan: 0..12,
     });
     if let Some(root) = frame.nodes.get_mut(&frame.root) {
-        root.children.push(grid.id.clone());
+        root.children.push(table.id.clone());
     }
-    frame.nodes.insert(grid.id.clone(), grid);
+    frame.nodes.insert(table.id.clone(), table);
     frame
 }
 

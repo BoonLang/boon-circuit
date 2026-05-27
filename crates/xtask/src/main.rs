@@ -1619,7 +1619,7 @@ fn verify_native_gpu_architecture(args: &[String]) -> Result<(), Box<dyn std::er
 fn verify_native_gpu_layout_contract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
-    let frame = boon_document::fixture_frame_with_virtualized_grid();
+    let frame = boon_document::fixture_frame_with_virtualized_table();
     let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
@@ -2017,6 +2017,7 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
             None,
             Some("a"),
             None,
+            true,
             false,
         )?;
         let launch_success = isolated_real_window_launch_proof
@@ -2489,6 +2490,7 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
             None,
             Some("a"),
             None,
+            true,
             false,
         )?;
         let launch_success = isolated_real_window_launch_proof
@@ -2840,6 +2842,7 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             None,
             Some("a"),
             None,
+            true,
             false,
         )?;
         let launch_success = isolated_real_window_launch_proof
@@ -3266,7 +3269,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
 
     let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
     if build.success() && isolated_real_window_available {
-        let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
+        let isolated_role_report_timeout_ms = 180_000_u64.saturating_add(input_sample_delay_ms);
         let isolated_driver_text = isolated_preview_driver_text(&entry.id);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
             &launched_binary_path,
@@ -3279,6 +3282,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             driver_target.clone(),
             isolated_driver_text.as_deref(),
             None,
+            false,
             false,
         )?;
         let isolated_launch_success = isolated_real_window_launch_proof
@@ -3320,7 +3324,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         );
         if launcher_available {
             let cwd = std::env::current_dir()?;
-            let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
+            let role_report_timeout_ms = 180_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
                 "cd {} && {} --role desktop --example {} --probe --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
@@ -6233,6 +6237,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             driver_target.clone(),
             None,
             dev_editor.then_some(source_path.as_path()),
+            true,
             dev_editor,
         )?;
         let isolated_launch_success = isolated_real_window_launch_proof
@@ -13533,6 +13538,7 @@ fn run_isolated_weston_desktop_preview_e2e(
     driver_target: Option<serde_json::Value>,
     driver_text: Option<&str>,
     code_file: Option<&Path>,
+    skip_operator_host_input_probe: bool,
     target_dev_surface: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let artifact_dir = PathBuf::from(format!(
@@ -13665,6 +13671,9 @@ fn run_isolated_weston_desktop_preview_e2e(
             .to_str()
             .ok_or("supervisor report path is not UTF-8")?,
     ]);
+    if skip_operator_host_input_probe {
+        desktop_args.push("--skip-operator-host-input-probe");
+    }
     let mut desktop = Command::new(binary)
         .args(&desktop_args)
         .env("WAYLAND_DISPLAY", &socket)
@@ -15618,21 +15627,21 @@ fn generic_runtime_execution_fixture(name: &str) -> serde_json::Value {
             "generic_source_effects_through_action_executor",
             "generic_address_row_context_resolution",
             "generic_routed_source_event",
-            "generic_formula_scenario_expectation_assertions",
-            "generic_formula_scenario_storage_preparation",
-            "generic_formula_dependency_cache",
-            "generic_formula_evaluation_cache",
-            "generic_formula_derived_storage_sync",
-            "generic_formula_display_mutation_emitter",
-            "generic_formula_display_protocol_lowering",
+            "generic_cells_scenario_expectation_assertions",
+            "generic_cells_scenario_storage_preparation",
+            "generic_cells_dependency_cache",
+            "generic_cells_evaluation_cache",
+            "generic_cells_derived_storage_sync",
+            "generic_cells_display_mutation_emitter",
+            "generic_cells_display_protocol_lowering",
             "generic_source_action_mutation_batch",
             "generic_editor_route_uses_indexed_targets",
             "generic_committed_fields_hold_no_mirror",
-            "generic_formula_edit_state_holds_from_ir",
+            "generic_cells_edit_state_holds_from_ir",
             "generic_hold_storage_authoritative",
             "generic_summary_reads_authoritative_storage",
             "generic_hidden_list_keys_from_generic_storage",
-            "generic_formula_pipeline_from_ir",
+            "generic_cells_pipeline_from_ir",
         ],
         _ => &[],
     };

@@ -3182,8 +3182,9 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
 fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
+    let custom_project_fixture = value_arg(args, "--custom-project-fixture");
     let example = value_arg(args, "--example").unwrap_or_else(|| {
-        if value_arg(args, "--custom-project-fixture").is_some() {
+        if custom_project_fixture.is_some() {
             "custom-projects".to_owned()
         } else {
             "cells".to_owned()
@@ -3198,51 +3199,136 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
     let idle_ms = value_arg(args, "--idle-ms")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(5_000);
-    let poll_interval_ms = 50_u64;
-    let idle_polls = (idle_ms / poll_interval_ms).max(1);
-    let mut preview_loop = boon_native_app_window::NativeRenderLoopState::new(
-        boon_native_app_window::NativeRenderLoopMode::DemandDriven,
-    );
-    let mut dev_loop = boon_native_app_window::NativeRenderLoopState::new(
-        boon_native_app_window::NativeRenderLoopMode::DemandDriven,
-    );
-    preview_loop.mark_presented(preview_loop.dirty_revision);
-    dev_loop.mark_presented(dev_loop.dirty_revision);
-    for _ in 0..idle_polls {
-        preview_loop.note_input_poll();
-        preview_loop.note_idle_poll();
-        dev_loop.note_input_poll();
-        dev_loop.note_idle_poll();
+    let mut build_args = vec!["build", "-p", "boon_native_playground"];
+    if profile == "release" {
+        build_args.push("--release");
     }
-    let preview_idle_rendered_frame_delta = preview_loop.rendered_frame_count.saturating_sub(1);
-    let dev_idle_rendered_frame_delta_unfocused = dev_loop.rendered_frame_count.saturating_sub(1);
-    dev_loop.mark_dirty(
-        boon_native_app_window::NativeSchedulerReason::HostInput,
-        Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink),
+    let build = Command::new("cargo").args(&build_args).status()?;
+    let binary_path = if profile == "release" {
+        PathBuf::from("target/release/boon_native_playground")
+    } else {
+        PathBuf::from("target/debug/boon_native_playground")
+    };
+    let binary_sha256 = if build.success() {
+        file_hash(binary_path.to_string_lossy().as_ref())
+    } else {
+        "missing".to_owned()
+    };
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:playground-build",
+        build.success(),
+        format!("cargo {} status={build}", build_args.join(" ")),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
-    let dev_focused_revision = dev_loop.dirty_revision;
-    dev_loop.mark_presented(dev_focused_revision);
-    preview_loop.mark_dirty(
-        boon_native_app_window::NativeSchedulerReason::HostInput,
-        Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied),
+
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:isolated-native-window-environment",
+        isolated_real_window_available,
+        format!("isolated_real_window_available={isolated_real_window_available}"),
+        (!isolated_real_window_available).then(|| {
+            "native idle/wake verification requires isolated Weston with weston_test control helpers"
+                .to_owned()
+        }),
     );
-    let input_revision = preview_loop.dirty_revision;
-    let input_present_started = Instant::now();
-    preview_loop.mark_presented(input_revision);
-    let post_idle_input_to_present_ms = input_present_started.elapsed().as_secs_f64() * 1000.0;
-    preview_loop.mark_dirty(
-        boon_native_app_window::NativeSchedulerReason::ExternalWake,
-        Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted),
+
+    let live_observation =
+        if build.success() && isolated_real_window_available && custom_project_fixture.is_none() {
+            run_isolated_weston_idle_wake_observation(&binary_path, &example, idle_ms)?
+        } else {
+            json!({
+                "status": "not-run",
+                "reason": if custom_project_fixture.is_some() {
+                    "custom project idle/wake fixture launch is not wired yet"
+                } else {
+                    "build or isolated native window environment was unavailable"
+                }
+            })
+        };
+    let observation_pass = live_observation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:uses-live-native-process-evidence",
+        observation_pass,
+        format!(
+            "observation_status={:?}, method={:?}",
+            live_observation
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            live_observation
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!observation_pass).then(|| {
+            "idle/wake proof did not produce live child PID procfs and loop-report evidence"
+                .to_owned()
+        }),
     );
-    preview_loop.scheduled_wake_count = preview_loop.scheduled_wake_count.saturating_add(1);
-    let source_revision = preview_loop.dirty_revision;
-    let source_present_started = Instant::now();
-    preview_loop.mark_presented(source_revision);
-    let post_idle_source_replace_to_present_ms =
-        source_present_started.elapsed().as_secs_f64() * 1000.0;
-    let preview_cpu_p95 = 0.0;
-    let dev_cpu_p95 = 0.0;
+
+    let preview_child_pid = live_observation
+        .get("preview_child_pid")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let dev_child_pid = live_observation
+        .get("dev_child_pid")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_cpu_p95 = live_observation
+        .get("idle_cpu_percent_preview_p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let dev_cpu_p95 = live_observation
+        .get("idle_cpu_percent_dev_p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
     let combined_cpu_p95 = preview_cpu_p95 + dev_cpu_p95;
+    let preview_idle_rendered_frame_delta = live_observation
+        .get("preview_idle_rendered_frame_delta")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let dev_idle_rendered_frame_delta_unfocused = live_observation
+        .get("dev_idle_rendered_frame_delta")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let skipped_idle_poll_count = live_observation
+        .get("skipped_idle_poll_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let input_poll_count = live_observation
+        .get("input_poll_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let forced_frame_count = live_observation
+        .get("forced_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let scheduled_wake_count = live_observation
+        .get("scheduled_wake_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let dirty_revision = live_observation
+        .get("dirty_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let presented_revision = live_observation
+        .get("presented_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let rendered_frame_count = live_observation
+        .get("rendered_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let preview_render_budget =
         native_gpu_budget_u64(budget_section, "preview_idle_rendered_frame_delta_per_5s")
             .unwrap_or(2);
@@ -3270,6 +3356,16 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
     push_audit_check(
         &mut checks,
         &mut blockers,
+        "native-gpu-idle-wake:live-child-pids",
+        preview_child_pid > 0 && dev_child_pid > 0 && preview_child_pid != dev_child_pid,
+        format!("preview_pid={preview_child_pid}, dev_pid={dev_child_pid}"),
+        (!(preview_child_pid > 0 && dev_child_pid > 0 && preview_child_pid != dev_child_pid)).then(
+            || "idle/wake report did not prove distinct live preview/dev child PIDs".to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         "native-gpu-idle-wake:preview-does-not-render-while-idle",
         preview_idle_rendered_frame_delta <= preview_render_budget,
         format!(
@@ -3293,32 +3389,37 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         &mut checks,
         &mut blockers,
         "native-gpu-idle-wake:focused-caret-budget",
-        1 <= dev_focused_budget,
-        format!("focused caret wake rendered delta=1, budget={dev_focused_budget}"),
-        (1 > dev_focused_budget)
+        scheduled_wake_count <= dev_focused_budget,
+        format!(
+            "scheduled wake count={scheduled_wake_count}, focused caret budget={dev_focused_budget}"
+        ),
+        (scheduled_wake_count > dev_focused_budget)
             .then(|| "dev focused caret wake exceeded render budget".to_owned()),
     );
     push_audit_check(
         &mut checks,
         &mut blockers,
         "native-gpu-idle-wake:post-idle-input-wakes",
-        post_idle_input_to_present_ms <= input_budget
-            && preview_loop.presented_revision >= input_revision,
-        format!("input_to_present_ms={post_idle_input_to_present_ms:.3}, budget={input_budget:.3}"),
-        (post_idle_input_to_present_ms > input_budget)
-            .then(|| "post-idle input wake exceeded latency budget".to_owned()),
+        false,
+        format!(
+            "budget={input_budget:.3}; post-idle input readback wake probe is not implemented yet"
+        ),
+        Some(
+            "post-idle native input-to-present readback evidence is not implemented yet".to_owned(),
+        ),
     );
     push_audit_check(
         &mut checks,
         &mut blockers,
         "native-gpu-idle-wake:post-idle-source-replace-wakes",
-        post_idle_source_replace_to_present_ms <= source_budget
-            && preview_loop.presented_revision >= source_revision,
+        false,
         format!(
-            "source_replace_to_present_ms={post_idle_source_replace_to_present_ms:.3}, budget={source_budget:.3}"
+            "budget={source_budget:.3}; post-idle source replace readback wake probe is not implemented yet"
         ),
-        (post_idle_source_replace_to_present_ms > source_budget)
-            .then(|| "post-idle source replacement wake exceeded latency budget".to_owned()),
+        Some(
+            "post-idle source replacement-to-present readback evidence is not implemented yet"
+                .to_owned(),
+        ),
     );
     push_audit_check(
         &mut checks,
@@ -3335,55 +3436,576 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
             || combined_cpu_p95 > combined_cpu_budget)
             .then(|| "idle CPU budget exceeded".to_owned()),
     );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-idle-wake:uses-live-native-process-evidence",
-        false,
-        "current implementation still uses a scheduler model; contract requires child PID procfs CPU deltas and app-owned readback artifacts",
-        Some("replace modeled idle/wake proof with live native desktop launch, child PID procfs tick deltas, post-idle input/source replacement, and app-owned readback hash evidence".to_owned()),
-    );
     let extra = json!({
         "example": example,
         "profile": profile,
+        "custom_project_fixture": custom_project_fixture,
+        "tested_binary": binary_path,
+        "tested_binary_sha256": binary_sha256,
         "render_loop_mode": "demand_driven",
         "idle_observation_ms": idle_ms,
-        "idle_poll_interval_ms": poll_interval_ms,
-        "preview_child_pid": std::process::id(),
-        "dev_child_pid": std::process::id(),
-        "cpu_measurement_source": "deterministic-demand-scheduler-model",
+        "preview_child_pid": preview_child_pid,
+        "dev_child_pid": dev_child_pid,
+        "cpu_measurement_source": "procfs-child-pid-tick-deltas",
         "idle_cpu_percent_preview_p95": preview_cpu_p95,
         "idle_cpu_percent_dev_p95": dev_cpu_p95,
         "combined_idle_cpu_percent_p95": combined_cpu_p95,
-        "dirty_revision": preview_loop.dirty_revision,
-        "presented_revision": preview_loop.presented_revision,
-        "rendered_frame_count": preview_loop.rendered_frame_count,
+        "dirty_revision": dirty_revision,
+        "presented_revision": presented_revision,
+        "rendered_frame_count": rendered_frame_count,
         "preview_idle_rendered_frame_delta": preview_idle_rendered_frame_delta,
         "dev_idle_rendered_frame_delta": dev_idle_rendered_frame_delta_unfocused,
-        "dev_idle_rendered_frame_delta_focused": 1,
-        "skipped_idle_poll_count": preview_loop.skipped_idle_poll_count + dev_loop.skipped_idle_poll_count,
-        "input_poll_count": preview_loop.input_poll_count + dev_loop.input_poll_count,
-        "forced_frame_count": preview_loop.forced_frame_count + dev_loop.forced_frame_count,
-        "scheduled_wake_count": preview_loop.scheduled_wake_count + dev_loop.scheduled_wake_count,
-        "last_scheduler_reason": preview_loop.last_scheduler_reason,
-        "last_role_dirty_reason": preview_loop.last_role_dirty_reason,
-        "last_rendered_at_ms": post_idle_source_replace_to_present_ms,
+        "dev_idle_rendered_frame_delta_focused": scheduled_wake_count,
+        "skipped_idle_poll_count": skipped_idle_poll_count,
+        "input_poll_count": input_poll_count,
+        "forced_frame_count": forced_frame_count,
+        "scheduled_wake_count": scheduled_wake_count,
+        "last_scheduler_reason": live_observation.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "last_role_dirty_reason": live_observation.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "last_rendered_at_ms": live_observation.get("elapsed_ms").and_then(numeric_value_as_f64).unwrap_or(0.0),
         "last_input_poll_at_ms": idle_ms,
-        "post_idle_input_to_present_ms": post_idle_input_to_present_ms,
-        "post_idle_source_replace_to_present_ms": post_idle_source_replace_to_present_ms,
-        "post_idle_frame_hash_before": boon_runtime::sha256_bytes(format!("{example}:before").as_bytes()),
-        "post_idle_frame_hash_after": boon_runtime::sha256_bytes(format!("{example}:after-input").as_bytes()),
-        "post_idle_frame_hash_changed": true,
-        "post_idle_source_replace_hash_changed": true,
-        "readback_artifact_before": serde_json::Value::Null,
-        "readback_artifact_after": serde_json::Value::Null,
-        "visual_capture_method": "deterministic-app-owned-scheduler-proof",
+        "post_idle_input_to_present_ms": serde_json::Value::Null,
+        "post_idle_source_replace_to_present_ms": serde_json::Value::Null,
+        "post_idle_frame_hash_before": live_observation.get("post_idle_frame_hash_before").cloned().unwrap_or(serde_json::Value::Null),
+        "post_idle_frame_hash_after": live_observation.get("post_idle_frame_hash_after").cloned().unwrap_or(serde_json::Value::Null),
+        "post_idle_frame_hash_changed": false,
+        "post_idle_source_replace_hash_changed": false,
+        "readback_artifact_before": live_observation.get("readback_artifact_before").cloned().unwrap_or_else(|| json!({})),
+        "readback_artifact_after": live_observation.get("readback_artifact_after").cloned().unwrap_or_else(|| json!({})),
+        "visual_capture_method": "app-owned-wgpu-readback",
+        "live_observation": live_observation,
         "operator_host_input": false,
         "real_os_input": false,
         "private_runtime_dispatch_used": false,
         "preview_receives_example_name": false
     });
     write_native_gate_report(args, "verify-native-gpu-idle-wake", checks, blockers, extra)
+}
+
+#[derive(Clone, Debug)]
+struct ProcCpuSample {
+    pid: u64,
+    cmdline: String,
+    start_time_ticks: u64,
+    total_cpu_ticks: u64,
+    sampled_at: Instant,
+}
+
+fn read_proc_cpu_sample(pid: u64) -> Result<ProcCpuSample, Box<dyn std::error::Error>> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close_paren = stat
+        .rfind(')')
+        .ok_or_else(|| format!("malformed /proc/{pid}/stat: missing comm terminator"))?;
+    let fields = stat[close_paren + 1..]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let parse_field = |field_index: usize, name: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        fields
+            .get(field_index.saturating_sub(3))
+            .ok_or_else(|| format!("missing /proc/{pid}/stat field {field_index} ({name})"))?
+            .parse::<u64>()
+            .map_err(|error| {
+                format!("parse /proc/{pid}/stat field {field_index} ({name}): {error}").into()
+            })
+    };
+    let utime = parse_field(14, "utime")?;
+    let stime = parse_field(15, "stime")?;
+    let start_time_ticks = parse_field(22, "starttime")?;
+    Ok(ProcCpuSample {
+        pid,
+        cmdline: playground_pid_cmdline(pid),
+        start_time_ticks,
+        total_cpu_ticks: utime.saturating_add(stime),
+        sampled_at: Instant::now(),
+    })
+}
+
+fn procfs_cpu_percent(
+    before: &ProcCpuSample,
+    after: &ProcCpuSample,
+    clock_ticks_per_second: f64,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    if before.pid != after.pid {
+        return Err(format!(
+            "procfs sample PID mismatch: before={}, after={}",
+            before.pid, after.pid
+        )
+        .into());
+    }
+    if before.start_time_ticks != after.start_time_ticks {
+        return Err(format!(
+            "procfs sample PID reuse detected for pid {}: starttime {} -> {}",
+            before.pid, before.start_time_ticks, after.start_time_ticks
+        )
+        .into());
+    }
+    let elapsed = after
+        .sampled_at
+        .checked_duration_since(before.sampled_at)
+        .ok_or("procfs CPU sample monotonic clock went backwards")?;
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= f64::EPSILON || clock_ticks_per_second <= f64::EPSILON {
+        return Err("invalid procfs CPU sample interval or clock tick rate".into());
+    }
+    let cpu_ticks = after.total_cpu_ticks.saturating_sub(before.total_cpu_ticks);
+    Ok((cpu_ticks as f64 / clock_ticks_per_second) / elapsed_secs * 100.0)
+}
+
+fn clock_ticks_per_second() -> f64 {
+    Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(100.0)
+}
+
+fn proc_cpu_sample_json(sample: &ProcCpuSample) -> serde_json::Value {
+    json!({
+        "pid": sample.pid,
+        "cmdline": sample.cmdline,
+        "start_time_ticks": sample.start_time_ticks,
+        "total_cpu_ticks": sample.total_cpu_ticks
+    })
+}
+
+fn rendered_delta_per_5s(loop_report: &serde_json::Value, rendered_frame_count: u64) -> u64 {
+    let delta = rendered_frame_count.saturating_sub(1);
+    let elapsed_ms = loop_report
+        .get("elapsed_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(5_000.0)
+        .max(1.0);
+    ((delta as f64) * 5_000.0 / elapsed_ms).ceil() as u64
+}
+
+fn scheduled_wake_count_per_5s(loop_report: &serde_json::Value) -> u64 {
+    let wake_count = loop_report
+        .get("scheduled_wake_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let elapsed_ms = loop_report
+        .get("elapsed_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(5_000.0)
+        .max(1.0);
+    ((wake_count as f64) * 5_000.0 / elapsed_ms).ceil() as u64
+}
+
+fn wait_for_desktop_role_child_pids(desktop_pid: u32, timeout: Duration) -> Option<(u64, u64)> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let mut pids = Vec::new();
+        collect_playground_pid_tree(u64::from(desktop_pid), &mut pids);
+        let mut preview_pid = None;
+        let mut dev_pid = None;
+        for pid in pids {
+            let cmdline = playground_pid_cmdline(pid);
+            if cmdline.contains("--role preview") {
+                preview_pid = Some(pid);
+            } else if cmdline.contains("--role dev") {
+                dev_pid = Some(pid);
+            }
+        }
+        if let (Some(preview), Some(dev)) = (preview_pid, dev_pid)
+            && preview != dev
+        {
+            return Some((preview, dev));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn run_isolated_weston_idle_wake_observation(
+    binary: &Path,
+    example: &str,
+    idle_ms: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/native-gpu/idle-wake-{}-{}-{}",
+        example,
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "Weston test control plugin missing",
+            "artifact_dir": artifact_dir
+        }));
+    };
+    let socket = format!(
+        "boon-native-idle-wake-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let desktop_stdout_path = artifact_dir.join("desktop.stdout.txt");
+    let desktop_stderr_path = artifact_dir.join("desktop.stderr.txt");
+    let supervisor_report = artifact_dir.join("desktop-supervisor.json");
+    let live_state_report = artifact_dir.join("desktop-live-state.json");
+    let title_token = native_gpu_title_token(&format!("idle-wake-{example}"));
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
+        ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "isolated Weston did not become ready",
+            "artifact_dir": artifact_dir,
+            "socket": socket,
+            "weston_log_path": weston_log_path
+        }));
+    }
+
+    let idle_settle_ms = 2_000_u64;
+    let dev_hold_ms = idle_ms
+        .saturating_add(idle_settle_ms)
+        .saturating_add(15_000)
+        .max(18_000);
+    let child_hold_ms = dev_hold_ms.saturating_add(6_000);
+    let role_report_timeout_ms = idle_ms.saturating_add(15_000).max(16_000);
+    let mut desktop = Command::new(binary)
+        .args([
+            "--role",
+            "desktop",
+            "--example",
+            example,
+            "--probe",
+            "--real-window-input-probe",
+            "--demand-driven-loop",
+            "--skip-preview-shutdown",
+            "--skip-dev-ipc-probe",
+            "--skip-operator-host-input-probe",
+            "--child-hold-ms",
+            &child_hold_ms.to_string(),
+            "--dev-hold-ms",
+            &dev_hold_ms.to_string(),
+            "--title-token",
+            &title_token,
+            "--input-sample-delay-ms",
+            "0",
+            "--warmup-frame-count",
+            "1",
+            "--sample-frame-count",
+            "1",
+            "--role-report-timeout-ms",
+            &role_report_timeout_ms.to_string(),
+            "--live-state-report",
+            live_state_report
+                .to_str()
+                .ok_or("live state report path is not UTF-8")?,
+            "--report",
+            supervisor_report
+                .to_str()
+                .ok_or("supervisor report path is not UTF-8")?,
+        ])
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
+        .spawn()?;
+
+    let role_pids = wait_for_desktop_role_child_pids(desktop.id(), Duration::from_millis(15_000));
+    let mut sample_error = None;
+    let mut preview_before = None;
+    let mut preview_after = None;
+    let mut dev_before = None;
+    let mut dev_after = None;
+    let mut preview_cpu = f64::INFINITY;
+    let mut dev_cpu = f64::INFINITY;
+
+    let live_state_ready = wait_for_json_report(
+        &live_state_report,
+        Duration::from_millis(role_report_timeout_ms),
+    );
+    let mut live_state = json!({"status": "missing"});
+    if live_state_ready {
+        match read_json(&live_state_report) {
+            Ok(value) => {
+                live_state = value;
+            }
+            Err(error) => {
+                sample_error = Some(format!("failed to read live state report: {error}"));
+            }
+        }
+    }
+    let sample_pids = role_pids.or_else(|| {
+        live_state
+            .get("preview_child_pid")
+            .and_then(serde_json::Value::as_u64)
+            .zip(
+                live_state
+                    .get("dev_child_pid")
+                    .and_then(serde_json::Value::as_u64),
+            )
+    });
+    if let Some((preview_pid, dev_pid)) = sample_pids {
+        let tick_rate = clock_ticks_per_second();
+        thread::sleep(Duration::from_millis(idle_settle_ms));
+        match (
+            read_proc_cpu_sample(preview_pid),
+            read_proc_cpu_sample(dev_pid),
+        ) {
+            (Ok(preview_start), Ok(dev_start)) => {
+                thread::sleep(Duration::from_millis(idle_ms));
+                match (
+                    read_proc_cpu_sample(preview_pid),
+                    read_proc_cpu_sample(dev_pid),
+                ) {
+                    (Ok(preview_end), Ok(dev_end)) => {
+                        preview_cpu = procfs_cpu_percent(&preview_start, &preview_end, tick_rate)?;
+                        dev_cpu = procfs_cpu_percent(&dev_start, &dev_end, tick_rate)?;
+                        preview_before = Some(preview_start);
+                        preview_after = Some(preview_end);
+                        dev_before = Some(dev_start);
+                        dev_after = Some(dev_end);
+                    }
+                    (preview_result, dev_result) => {
+                        sample_error = Some(format!(
+                            "failed to read ending procfs samples: preview={:?}, dev={:?}",
+                            preview_result.err().map(|error| error.to_string()),
+                            dev_result.err().map(|error| error.to_string())
+                        ));
+                    }
+                }
+            }
+            (preview_result, dev_result) => {
+                sample_error = Some(format!(
+                    "failed to read starting procfs samples: preview={:?}, dev={:?}",
+                    preview_result.err().map(|error| error.to_string()),
+                    dev_result.err().map(|error| error.to_string())
+                ));
+            }
+        }
+    } else if sample_error.is_none() {
+        sample_error = Some("timed out waiting for preview/dev child PIDs".to_owned());
+    }
+
+    let desktop_status = wait_child_exit_with_timeout(
+        &mut desktop,
+        Duration::from_millis(role_report_timeout_ms.saturating_add(20_000)),
+    );
+    if desktop_status.is_none() {
+        terminate_child_process(&mut desktop);
+    }
+    terminate_child_process(&mut weston);
+    let _ = weston.wait();
+
+    let supervisor = if supervisor_report.exists() {
+        read_json(&supervisor_report).unwrap_or_else(|error| {
+            json!({
+                "status": "fail",
+                "reason": format!("failed to read supervisor report: {error}")
+            })
+        })
+    } else {
+        json!({"status": "missing"})
+    };
+    let preview_loop_report = live_state
+        .get("preview_loop_report")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            supervisor
+                .get("preview_loop_report")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+    let dev_loop_report = live_state
+        .get("dev_loop_report")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            supervisor
+                .get("dev_loop_report")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+    let preview_loop = preview_loop_report
+        .as_deref()
+        .filter(|path| path.exists())
+        .map(read_json)
+        .transpose()?
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let dev_loop = dev_loop_report
+        .as_deref()
+        .filter(|path| path.exists())
+        .map(read_json)
+        .transpose()?
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let preview_rendered_frame_count = preview_loop
+        .get("rendered_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let dev_rendered_frame_count = dev_loop
+        .get("rendered_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_render_delta_per_5s =
+        rendered_delta_per_5s(&preview_loop, preview_rendered_frame_count);
+    let dev_render_delta_per_5s = rendered_delta_per_5s(&dev_loop, dev_rendered_frame_count);
+    let scheduled_wake_per_5s = scheduled_wake_count_per_5s(&preview_loop)
+        .saturating_add(scheduled_wake_count_per_5s(&dev_loop));
+    let readback_before = supervisor
+        .pointer("/preview_surface_proof/readback_artifact")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let frame_hash_before = readback_before
+        .get("sha256")
+        .or_else(|| readback_before.get("artifact_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| "missing".to_owned());
+    let live_pids_ok = live_state
+        .get("preview_child_pid")
+        .and_then(serde_json::Value::as_u64)
+        .zip(
+            live_state
+                .get("dev_child_pid")
+                .and_then(serde_json::Value::as_u64),
+        )
+        .is_some_and(|(preview, dev)| preview > 0 && dev > 0 && preview != dev);
+    let procfs_ok = sample_error.is_none()
+        && preview_before
+            .as_ref()
+            .zip(preview_after.as_ref())
+            .is_some_and(|(before, after)| before.start_time_ticks == after.start_time_ticks)
+        && dev_before
+            .as_ref()
+            .zip(dev_after.as_ref())
+            .is_some_and(|(before, after)| before.start_time_ticks == after.start_time_ticks);
+    let loop_reports_ok = preview_loop
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_loop.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let desktop_pass = desktop_status
+        .as_ref()
+        .is_some_and(std::process::ExitStatus::success);
+    let supervisor_pass =
+        supervisor.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let pass = live_state_ready
+        && live_pids_ok
+        && procfs_ok
+        && loop_reports_ok
+        && desktop_pass
+        && supervisor_pass;
+
+    Ok(json!({
+        "status": if pass { "pass" } else { "fail" },
+        "method": "verifier-owned-isolated-weston-procfs-child-pid-tick-deltas",
+        "example": example,
+        "artifact_dir": artifact_dir,
+        "socket": socket,
+        "weston_control_plugin_path": plugin_path,
+        "weston_log_path": weston_log_path,
+        "weston_stdout_path": weston_stdout_path,
+        "weston_stderr_path": weston_stderr_path,
+        "wayland_info_stdout_path": wayland_info_stdout_path,
+        "wayland_info_stderr_path": wayland_info_stderr_path,
+        "desktop_stdout_path": desktop_stdout_path,
+        "desktop_stderr_path": desktop_stderr_path,
+        "desktop_exit_status": desktop_status
+            .as_ref()
+            .map(std::process::ExitStatus::to_string)
+            .unwrap_or_else(|| "timeout".to_owned()),
+        "desktop_pass": desktop_pass,
+        "supervisor_pass": supervisor_pass,
+        "role_pids_from_supervisor_tree": role_pids.map(|(preview, dev)| json!({
+            "preview_child_pid": preview,
+            "dev_child_pid": dev
+        })),
+        "supervisor_report": supervisor_report,
+        "live_state_report": live_state_report,
+        "live_state_ready": live_state_ready,
+        "live_state": live_state,
+        "idle_settle_ms": idle_settle_ms,
+        "preview_loop_report": preview_loop_report,
+        "dev_loop_report": dev_loop_report,
+        "preview_loop_report_sha256": preview_loop_report.as_deref().map(|path| file_hash(path.to_string_lossy().as_ref())),
+        "dev_loop_report_sha256": dev_loop_report.as_deref().map(|path| file_hash(path.to_string_lossy().as_ref())),
+        "preview_loop": preview_loop,
+        "dev_loop": dev_loop,
+        "preview_child_pid": preview_before.as_ref().map(|sample| sample.pid).or_else(|| live_state.get("preview_child_pid").and_then(serde_json::Value::as_u64)).unwrap_or(0),
+        "dev_child_pid": dev_before.as_ref().map(|sample| sample.pid).or_else(|| live_state.get("dev_child_pid").and_then(serde_json::Value::as_u64)).unwrap_or(0),
+        "preview_child_cmdline": preview_before.as_ref().map(|sample| sample.cmdline.clone()).unwrap_or_default(),
+        "dev_child_cmdline": dev_before.as_ref().map(|sample| sample.cmdline.clone()).unwrap_or_default(),
+        "clock_ticks_per_second": clock_ticks_per_second(),
+        "procfs_sample_error": sample_error,
+        "procfs_samples": {
+            "preview_before": preview_before.as_ref().map(proc_cpu_sample_json),
+            "preview_after": preview_after.as_ref().map(proc_cpu_sample_json),
+            "dev_before": dev_before.as_ref().map(proc_cpu_sample_json),
+            "dev_after": dev_after.as_ref().map(proc_cpu_sample_json)
+        },
+        "idle_cpu_percent_preview_p95": preview_cpu,
+        "idle_cpu_percent_dev_p95": dev_cpu,
+        "preview_idle_rendered_frame_delta": preview_render_delta_per_5s,
+        "dev_idle_rendered_frame_delta": dev_render_delta_per_5s,
+        "preview_idle_rendered_frame_count_total": preview_rendered_frame_count,
+        "dev_idle_rendered_frame_count_total": dev_rendered_frame_count,
+        "skipped_idle_poll_count": preview_loop.get("skipped_idle_poll_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+            + dev_loop.get("skipped_idle_poll_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "input_poll_count": preview_loop.get("input_poll_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+            + dev_loop.get("input_poll_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "forced_frame_count": preview_loop.get("forced_frame_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+            + dev_loop.get("forced_frame_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "scheduled_wake_count": scheduled_wake_per_5s,
+        "scheduled_wake_count_total": preview_loop.get("scheduled_wake_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+            + dev_loop.get("scheduled_wake_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "dirty_revision": preview_loop.get("dirty_revision").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "presented_revision": preview_loop.get("presented_revision").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "rendered_frame_count": preview_rendered_frame_count,
+        "elapsed_ms": preview_loop.get("elapsed_ms").and_then(numeric_value_as_f64).unwrap_or(0.0),
+        "last_scheduler_reason": preview_loop.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "last_role_dirty_reason": preview_loop.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "readback_artifact_before": readback_before,
+        "readback_artifact_after": serde_json::Value::Null,
+        "post_idle_frame_hash_before": frame_hash_before,
+        "post_idle_frame_hash_after": serde_json::Value::Null,
+        "input_provenance": "verifier_owned_isolated_weston_no_post_idle_input"
+    }))
 }
 
 fn verify_native_dev_editor_scroll_speed(

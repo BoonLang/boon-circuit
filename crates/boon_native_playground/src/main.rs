@@ -53,7 +53,7 @@ const DEV_FAIL: &str = "#e63946";
 const DEV_DIRTY: &str = "#fcbf49";
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
-const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 1_000;
+const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 5_000;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 
 fn main() {
@@ -466,6 +466,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
+    let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let code_hash = boon_runtime::sha256_bytes(source.as_bytes());
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
     let scenario_path = Path::new(&code_file).with_extension("scn");
@@ -591,9 +592,24 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 || after_update_count != last_poll_revision
                 || context.forced_frame;
             last_poll_revision = last_poll_revision.max(after_update_count);
+            let scheduler_reason = if context.forced_frame {
+                Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
+            } else if context.input_delta.real_os_events_observed {
+                Some(boon_native_app_window::NativeSchedulerReason::HostInput)
+            } else if dirty
+                && role_dirty_reason
+                    == Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged)
+            {
+                Some(boon_native_app_window::NativeSchedulerReason::Timer)
+            } else if dirty {
+                Some(boon_native_app_window::NativeSchedulerReason::ExternalWake)
+            } else {
+                None
+            };
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_poll_revision,
+                scheduler_reason,
                 role_dirty_reason,
                 next_wake_after_ms: input_state.focused_node.is_some().then_some(500),
                 wants_animation_frame: false,
@@ -639,6 +655,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
+            demand_driven_loop,
         },
         hooks,
         wake_handle,
@@ -698,7 +715,9 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
     let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let probe = args.iter().any(|arg| arg == "--probe");
+    let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
@@ -824,9 +843,29 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let telemetry_wake =
                 (!input_hot_path).then(|| shell.preview_summary_wake_after_ms(context.now));
             let next_wake_after_ms = [caret_wake, telemetry_wake].into_iter().flatten().min();
+            let scheduler_reason = if context.forced_frame {
+                Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
+            } else if input_hot_path {
+                Some(boon_native_app_window::NativeSchedulerReason::HostInput)
+            } else {
+                match role_dirty_reason {
+                    Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink)
+                    | Some(
+                        boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged,
+                    ) => Some(boon_native_app_window::NativeSchedulerReason::Timer),
+                    Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged) => {
+                        Some(boon_native_app_window::NativeSchedulerReason::SurfaceChanged)
+                    }
+                    Some(_) if dirty => {
+                        Some(boon_native_app_window::NativeSchedulerReason::ExternalWake)
+                    }
+                    _ => None,
+                }
+            };
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: render_state.revision,
+                scheduler_reason,
                 role_dirty_reason,
                 next_wake_after_ms,
                 wants_animation_frame: false,
@@ -864,6 +903,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             sample_frame_count,
             readback_artifact_dir: Some("target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
+            demand_driven_loop,
         },
         hooks,
         boon_native_app_window::NativeWakeHandle::new(),
@@ -887,7 +927,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     "diagnostic": "dev shell mutex poisoned"
                                 })
                             });
-                        let ipc_probe = if probe {
+                        let ipc_probe = if probe && !skip_ipc_probe {
                             let ipc_start = Instant::now();
                             run_dev_ipc_probe(
                                 &connect,
@@ -911,7 +951,11 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             Ok(json!({
                                 "status": "not-run",
-                                "reason": "visible app launch does not run verification IPC probes or mutate preview state",
+                                "reason": if skip_ipc_probe {
+                                    "dev IPC probe skipped by verifier mode"
+                                } else {
+                                    "visible app launch does not run verification IPC probes or mutate preview state"
+                                },
                                 "preview_mutation_allowed": false
                             }))
                         };
@@ -984,6 +1028,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
+    let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
+    let skip_preview_shutdown = args.iter().any(|arg| arg == "--skip-preview-shutdown");
+    let skip_dev_ipc_probe = args.iter().any(|arg| arg == "--skip-dev-ipc-probe");
     let title_token = value_arg(args, "--title-token")
         .unwrap_or_else(|| format!("{}-{}", std::process::id(), current_unix_seconds()));
     let preview_title = role_window_title("Boon Preview", Some(&title_token));
@@ -1057,6 +1104,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if probe && !real_window_input_probe {
         preview_args.push("--synthetic-input-probe".to_owned());
     }
+    if demand_driven_loop {
+        preview_args.push("--demand-driven-loop".to_owned());
+    }
     let preview_arg_refs = preview_args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut preview = spawn_role(&preview_arg_refs)?;
     let preview_pid = preview.id();
@@ -1124,8 +1174,14 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if probe && !real_window_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
     }
+    if demand_driven_loop {
+        dev_args.push("--demand-driven-loop".to_owned());
+    }
     if probe {
         dev_args.push("--probe".to_owned());
+    }
+    if skip_dev_ipc_probe {
+        dev_args.push("--skip-ipc-probe".to_owned());
     }
     if args
         .iter()
@@ -1163,11 +1219,13 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             dev_pid,
             &preview_report,
             &dev_report,
+            &preview_loop_report,
+            &dev_loop_report,
         )?;
     }
     let dev_status = dev.wait()?;
     let preview_survives_dev_exit = dev_status.success() && child_running(&mut preview)?;
-    let preview_shutdown_ack = if preview_survives_dev_exit {
+    let preview_shutdown_ack = if preview_survives_dev_exit && !skip_preview_shutdown {
         send_preview_ipc_request(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
             json!({
@@ -1185,7 +1243,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         json!({
             "status": "not-run",
-            "reason": "preview did not survive dev exit"
+            "reason": if skip_preview_shutdown {
+                "preview shutdown skipped so hold timer can write loop report"
+            } else {
+                "preview did not survive dev exit"
+            }
         })
     };
     let preview_clean_exit_after_dev_exit = wait_child_exit(
@@ -1292,6 +1354,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["dev_hold_ms"] = json!(dev_hold_ms);
         details["dev_start_delay_ms"] = json!(dev_start_delay_ms);
         details["role_report_timeout_ms"] = json!(role_report_timeout_ms);
+        details["demand_driven_loop"] = json!(demand_driven_loop);
+        details["skip_preview_shutdown"] = json!(skip_preview_shutdown);
+        details["skip_dev_ipc_probe"] = json!(skip_dev_ipc_probe);
         details["preview_document_layout_proof"] = document_layout_proof;
         details["preview_surface_proof"] = preview_proof;
         details["dev_surface_proof"] = dev_proof;
@@ -10814,6 +10879,8 @@ fn write_live_state_report(
     dev_pid: u32,
     preview_report: &Path,
     dev_report: &Path,
+    preview_loop_report: &Path,
+    dev_loop_report: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     boon_runtime::write_json(
         path,
@@ -10830,6 +10897,8 @@ fn write_live_state_report(
             "dev_child_cmdline": proc_cmdline(dev_pid),
             "preview_role_report": preview_report,
             "dev_role_report": dev_report,
+            "preview_loop_report": preview_loop_report,
+            "dev_loop_report": dev_loop_report,
             "display_server": display_server(),
             "display_connection": display_connection(),
             "note": "written after both native child role reports exist and before either child window is intentionally closed"

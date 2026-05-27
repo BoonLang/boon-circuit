@@ -107,6 +107,7 @@ pub struct NativeWindowOptions {
     pub sample_frame_count: u32,
     pub readback_artifact_dir: Option<String>,
     pub render_loop_state_report: Option<String>,
+    pub demand_driven_loop: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,12 +194,11 @@ impl NativeRenderLoopState {
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
     }
 
-    pub fn should_render(&self, now: Instant, wake_generation_changed: bool) -> bool {
+    pub fn should_render(&self, now: Instant, _wake_generation_changed: bool) -> bool {
         if self.mode == NativeRenderLoopMode::ContinuousProbe {
             return true;
         }
         self.dirty_revision != self.presented_revision
-            || wake_generation_changed
             || self.next_wake_at.is_some_and(|wake_at| now >= wake_at)
     }
 
@@ -224,7 +224,7 @@ impl NativeRenderLoopState {
     pub fn consume_due_wake(&mut self, now: Instant) -> bool {
         if self.next_wake_at.is_some_and(|wake_at| now >= wake_at) {
             self.next_wake_at = None;
-            self.mark_dirty(NativeSchedulerReason::Timer, None);
+            self.last_scheduler_reason = Some(NativeSchedulerReason::Timer);
             self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
             true
         } else {
@@ -237,6 +237,7 @@ impl NativeRenderLoopState {
 pub struct NativePollResult {
     pub dirty: bool,
     pub role_revision: u64,
+    pub scheduler_reason: Option<NativeSchedulerReason>,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub next_wake_after_ms: Option<u64>,
     pub wants_animation_frame: bool,
@@ -247,6 +248,7 @@ impl NativePollResult {
         Self {
             dirty: false,
             role_revision,
+            scheduler_reason: None,
             role_dirty_reason: None,
             next_wake_after_ms: None,
             wants_animation_frame: false,
@@ -1036,7 +1038,7 @@ async fn run_surface_probe_inner(
         }
     }
 
-    let loop_mode = if options.hold_ms == 0 {
+    let loop_mode = if options.hold_ms == 0 || options.demand_driven_loop {
         NativeRenderLoopMode::DemandDriven
     } else {
         NativeRenderLoopMode::ContinuousProbe
@@ -1135,10 +1137,14 @@ async fn run_surface_probe_inner(
                 );
             }
             if poll_result.dirty {
-                render_loop_state.mark_dirty(
-                    NativeSchedulerReason::HostInput,
-                    poll_result.role_dirty_reason,
-                );
+                let scheduler_reason = poll_result.scheduler_reason.unwrap_or_else(|| {
+                    if input.real_os_events_observed {
+                        NativeSchedulerReason::HostInput
+                    } else {
+                        NativeSchedulerReason::ExternalWake
+                    }
+                });
+                render_loop_state.mark_dirty(scheduler_reason, poll_result.role_dirty_reason);
                 render_loop_state.dirty_revision = render_loop_state
                     .dirty_revision
                     .max(poll_result.role_revision);
@@ -1154,7 +1160,7 @@ async fn run_surface_probe_inner(
         let wake_generation_changed = wake_generation != last_wake_generation;
         if wake_generation_changed {
             last_wake_generation = wake_generation;
-            render_loop_state.mark_dirty(NativeSchedulerReason::ExternalWake, None);
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::ExternalWake);
             render_loop_state.scheduled_wake_count =
                 render_loop_state.scheduled_wake_count.saturating_add(1);
         }
@@ -1163,8 +1169,8 @@ async fn run_surface_probe_inner(
             let idle_timeout = render_loop_state
                 .next_wake_at
                 .and_then(|wake_at| wake_at.checked_duration_since(Instant::now()))
-                .unwrap_or_else(|| Duration::from_millis(50))
-                .min(Duration::from_millis(50));
+                .unwrap_or_else(|| Duration::from_millis(1_000))
+                .min(Duration::from_millis(1_000));
             let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
             continue;
         }
@@ -1988,7 +1994,7 @@ mod tests {
             state.last_scheduler_reason,
             Some(NativeSchedulerReason::Timer)
         );
-        assert!(state.should_render(now + Duration::from_millis(500), false));
+        assert!(!state.should_render(now + Duration::from_millis(500), false));
     }
 
     #[test]

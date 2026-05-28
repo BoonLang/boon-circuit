@@ -53,7 +53,7 @@ const DEV_FAIL: &str = "#e63946";
 const DEV_DIRTY: &str = "#fcbf49";
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
-const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 5_000;
+const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 
 fn main() {
@@ -2096,6 +2096,8 @@ fn native_gpu_dev_visible_render_hook(
         "code_editor_model": {
             "full_buffer_bytes": shell.workspace.selected_buffer.source_text.len(),
             "full_buffer_lines": shell.workspace.selected_buffer.line_count,
+            "scroll_line": shell.workspace.selected_buffer.scroll_line,
+            "scroll_column": shell.workspace.selected_buffer.scroll_column,
             "syntax_backend": shell.workspace.selected_buffer.syntax_backend(),
             "syntax_parser_backed": shell.workspace.selected_buffer.syntax_parser_backed(),
             "syntax_token_count": shell.workspace.selected_buffer.syntax_token_count(),
@@ -11181,6 +11183,9 @@ fn handle_preview_ipc_client(
                     "preview_pid": std::process::id()
                 })
             });
+        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            wake_handle.wake();
+        }
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());

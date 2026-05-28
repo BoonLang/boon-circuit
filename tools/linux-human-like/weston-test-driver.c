@@ -128,7 +128,9 @@ int main(int argc, char **argv)
     int x = argc > 1 ? atoi(argv[1]) : 240;
     int y = argc > 2 ? atoi(argv[2]) : 220;
     const char *text = argc > 3 ? argv[3] : NULL;
-    int send_enter = argc > 4 && strcmp(argv[4], "enter") == 0;
+    const char *mode = argc > 4 ? argv[4] : "";
+    int send_enter = strcmp(mode, "enter") == 0;
+    int scroll_only = strcmp(mode, "scroll-only") == 0;
     struct state state = {0};
     struct wl_display *display = wl_display_connect(NULL);
     if (!display) {
@@ -150,12 +152,14 @@ int main(int argc, char **argv)
     weston_test_move_pointer(state.test, hi, lo, ns, x, y);
     wl_display_roundtrip(display);
 
-    stamp(&hi, &lo, &ns);
-    weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-    wl_display_roundtrip(display);
-    stamp(&hi, &lo, &ns);
-    weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-    wl_display_roundtrip(display);
+    if (!scroll_only) {
+        stamp(&hi, &lo, &ns);
+        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+        wl_display_roundtrip(display);
+        stamp(&hi, &lo, &ns);
+        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+        wl_display_roundtrip(display);
+    }
 
     stamp(&hi, &lo, &ns);
     weston_test_send_axis(
@@ -175,7 +179,7 @@ int main(int argc, char **argv)
         wl_fixed_from_double(90.0));
     wl_display_roundtrip(display);
 
-    if (text) {
+    if (text && !scroll_only) {
         for (const char *cursor = text; *cursor; cursor++) {
             int key = key_code_for_char(*cursor);
             if (key)
@@ -183,7 +187,7 @@ int main(int argc, char **argv)
         }
         if (send_enter)
             send_key_press(state.test, KEY_ENTER);
-    } else {
+    } else if (!scroll_only) {
         send_key_press(state.test, KEY_A);
     }
     wl_display_roundtrip(display);
@@ -192,14 +196,15 @@ int main(int argc, char **argv)
         stdout,
         "{\"status\":\"pass\",\"x\":%d,\"y\":%d,\"pointer_events\":%u,"
         "\"last_pointer_x\":%d,\"last_pointer_y\":%d,\"typed_text\":\"%s\","
-        "\"sent_enter\":%s}\n",
+        "\"sent_enter\":%s,\"scroll_only\":%s}\n",
         x,
         y,
         state.pointer_events,
         state.pointer_x,
         state.pointer_y,
         text ? text : "",
-        send_enter ? "true" : "false");
+        send_enter ? "true" : "false",
+        scroll_only ? "true" : "false");
 
     weston_test_destroy(state.test);
     wl_registry_destroy(registry);

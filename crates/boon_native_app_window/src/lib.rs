@@ -1053,7 +1053,7 @@ async fn run_surface_probe_inner(
         display_server: display_server(),
         display_connection: display_connection(),
         window_backend: "app_window-wayland".to_owned(),
-        window_title: options.title,
+        window_title: options.title.clone(),
         window_id: window_id.clone(),
         surface_id: surface_id.clone(),
         surface_epoch: 1,
@@ -1096,6 +1096,7 @@ async fn run_surface_probe_inner(
     let hold_started = Instant::now();
     let mut input_cursor = NativeInputCursor::default();
     let mut last_wake_generation = 0;
+    let mut last_interactive_readback_artifact: Option<AppWindowReadbackArtifact> = None;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             break;
@@ -1163,14 +1164,15 @@ async fn run_surface_probe_inner(
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::ExternalWake);
             render_loop_state.scheduled_wake_count =
                 render_loop_state.scheduled_wake_count.saturating_add(1);
+            continue;
         }
         if !render_loop_state.should_render(Instant::now(), false) {
             render_loop_state.note_idle_poll();
             let idle_timeout = render_loop_state
                 .next_wake_at
                 .and_then(|wake_at| wake_at.checked_duration_since(Instant::now()))
-                .unwrap_or_else(|| Duration::from_millis(1_000))
-                .min(Duration::from_millis(1_000));
+                .unwrap_or_else(|| Duration::from_millis(50))
+                .min(Duration::from_millis(50));
             let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
             continue;
         }
@@ -1231,9 +1233,51 @@ async fn run_surface_probe_inner(
                 });
             }
         }
+        let interactive_readback = if options.role == NativeWindowRole::Preview {
+            if let Some(artifact_dir) = options.readback_artifact_dir.as_deref() {
+                Some((
+                    artifact_dir.to_owned(),
+                    queue_visible_surface_readback(
+                        &device,
+                        &mut encoder,
+                        &frame.texture,
+                        options.role,
+                        width.min(480),
+                        height.min(260),
+                        config.format,
+                        &options.title,
+                    )?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         queue.submit(Some(encoder.finish()));
         frame.present();
+        if let Some((artifact_dir, pending)) = interactive_readback {
+            last_interactive_readback_artifact = Some(finish_visible_surface_readback(
+                &device,
+                pending,
+                &artifact_dir,
+            )?);
+        }
         render_loop_state.mark_presented(rendered_revision);
+        if let Some(report) = options.render_loop_state_report.as_deref() {
+            write_render_loop_state_report(
+                Path::new(report),
+                options.role,
+                std::process::id(),
+                &window_id,
+                &surface_id,
+                1,
+                &render_loop_state,
+                hold_started.elapsed(),
+                wake_handle.generation(),
+                last_interactive_readback_artifact.as_ref(),
+            )?;
+        }
         let frame_sleep_ms = match loop_mode {
             NativeRenderLoopMode::ContinuousProbe => 16,
             NativeRenderLoopMode::DemandDriven => 5,
@@ -1251,6 +1295,7 @@ async fn run_surface_probe_inner(
             &render_loop_state,
             hold_started.elapsed(),
             wake_handle.generation(),
+            last_interactive_readback_artifact.as_ref(),
         )?;
     }
     let _ = callback_done_receiver.recv_timeout(Duration::from_secs(30));
@@ -1324,6 +1369,7 @@ fn write_render_loop_state_report(
     state: &NativeRenderLoopState,
     elapsed: Duration,
     wake_generation: u64,
+    last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
 ) -> Result<(), NativeWindowError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -1352,7 +1398,8 @@ fn write_render_loop_state_report(
         "forced_frame_count": state.forced_frame_count,
         "scheduled_wake_count": state.scheduled_wake_count,
         "last_scheduler_reason": state.last_scheduler_reason,
-        "last_role_dirty_reason": state.last_role_dirty_reason
+        "last_role_dirty_reason": state.last_role_dirty_reason,
+        "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
     let bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| NativeWindowError::Failed(format!("serialize loop state: {error}")))?;

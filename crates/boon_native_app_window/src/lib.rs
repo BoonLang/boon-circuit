@@ -13,6 +13,8 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::SurfaceTargetUnsafe;
 
+static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceDeviceBinding {
     pub adapter_id: String,
@@ -779,6 +781,12 @@ async fn run_surface_probe_inner(
     let mut presented_frame_samples = Vec::new();
     let mut render_hook_samples = Vec::new();
     let mut pending_readback = None;
+    let loop_mode = if options.hold_ms == 0 || options.demand_driven_loop {
+        NativeRenderLoopMode::DemandDriven
+    } else {
+        NativeRenderLoopMode::ContinuousProbe
+    };
+    let mut render_loop_state = NativeRenderLoopState::new(loop_mode);
 
     for frame_index in 0..total_frame_count {
         let input = empty_input_adapter_proof(false);
@@ -870,6 +878,21 @@ async fn run_surface_probe_inner(
         }
         queue.submit(Some(encoder.finish()));
         frame.present();
+        render_loop_state.mark_presented(1);
+        if let Some(report) = options.render_loop_state_report.as_deref() {
+            write_render_loop_state_report(
+                Path::new(report),
+                options.role,
+                std::process::id(),
+                &window_id,
+                &surface_id,
+                1,
+                &render_loop_state,
+                Duration::ZERO,
+                wake_handle.generation(),
+                None,
+            )?;
+        }
         let current_present_submit_ms = elapsed_ms(present_start);
         if frame_index == 0 {
             surface_acquire_ms = current_surface_acquire_ms;
@@ -1038,13 +1061,6 @@ async fn run_surface_probe_inner(
         }
     }
 
-    let loop_mode = if options.hold_ms == 0 || options.demand_driven_loop {
-        NativeRenderLoopMode::DemandDriven
-    } else {
-        NativeRenderLoopMode::ContinuousProbe
-    };
-    let mut render_loop_state = NativeRenderLoopState::new(loop_mode);
-    render_loop_state.mark_presented(1);
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
         pid: std::process::id(),
@@ -1171,8 +1187,8 @@ async fn run_surface_probe_inner(
             let idle_timeout = render_loop_state
                 .next_wake_at
                 .and_then(|wake_at| wake_at.checked_duration_since(Instant::now()))
-                .unwrap_or_else(|| Duration::from_millis(50))
-                .min(Duration::from_millis(50));
+                .unwrap_or_else(|| Duration::from_millis(20))
+                .min(Duration::from_millis(20));
             let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
             continue;
         }
@@ -1466,10 +1482,11 @@ fn finish_visible_surface_readback(
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     let path = artifact_dir.join(format!(
-        "{}-{}-{}.png",
+        "{}-{}-{}-{}.png",
         std::process::id(),
         pending.role.as_str(),
-        stable_debug_hash(&pending.title)
+        stable_debug_hash(&pending.title),
+        READBACK_ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     image::save_buffer(
         &path,

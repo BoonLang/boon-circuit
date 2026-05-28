@@ -2232,7 +2232,7 @@ fn dev_apply_real_window_input(
             input.scroll_delta_x
         };
         let max_scroll_line = shell.workspace.selected_buffer.line_count.saturating_sub(1);
-        let line_delta = scaled_scroll_steps(vertical_delta, 8.0, 3);
+        let line_delta = scaled_scroll_steps(vertical_delta, 24.0, 1);
         if line_delta > 0 {
             shell.workspace.selected_buffer.scroll_line = shell
                 .workspace
@@ -2248,7 +2248,7 @@ fn dev_apply_real_window_input(
                 .saturating_sub((-line_delta) as usize);
         }
         let max_scroll_column = max_editor_scroll_column(&shell.workspace.selected_buffer);
-        let column_delta = scaled_scroll_steps(horizontal_delta, 8.0, 3);
+        let column_delta = scaled_scroll_steps(horizontal_delta, 24.0, 1);
         if column_delta > 0 {
             shell.workspace.selected_buffer.scroll_column = shell
                 .workspace
@@ -11080,7 +11080,9 @@ fn handle_preview_ipc_client(
         return Ok(());
     }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("replace-code") {
-        if let Ok(response) = preview_enqueue_source_project(&state, &request, wake_handle.clone())
+        if request.get("payload").is_some()
+            && let Ok(response) =
+                preview_enqueue_source_project(&state, &request, wake_handle.clone())
         {
             wake_handle.wake();
             writeln!(stream, "{}", serde_json::to_string(&response)?)?;

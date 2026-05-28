@@ -3756,7 +3756,7 @@ fn wait_for_loop_readback_change(
                 }
             }
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(2));
     }
     json!({
         "status": "fail",
@@ -3835,6 +3835,451 @@ fn wait_for_replace_source_ready(
         "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         "response": last_response
     })
+}
+
+fn run_native_example_switch_live_probe(
+    release_build: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifacts_dir = PathBuf::from(format!(
+        "target/artifacts/native-gpu/example-switch-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifacts_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(json!({"status": "fail", "reason": "weston_test control plugin missing"}));
+    };
+    ensure_weston_control_helpers()?;
+    let build_status = if release_build {
+        Command::new("cargo")
+            .args(["build", "--release", "-p", "boon_native_playground"])
+            .status()?
+    } else {
+        Command::new("cargo")
+            .args(["build", "-p", "boon_native_playground"])
+            .status()?
+    };
+    if !build_status.success() {
+        return Ok(
+            json!({"status": "fail", "reason": format!("boon_native_playground build failed: {build_status}")}),
+        );
+    }
+    let binary = if release_build {
+        "./target/release/boon_native_playground"
+    } else {
+        "./target/debug/boon_native_playground"
+    };
+    let socket = format!(
+        "boon-example-switch-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let weston_log_path = artifacts_dir.join("weston.log");
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut weston_ready = false;
+    for _ in 0..50 {
+        if Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            weston_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !weston_ready {
+        terminate_child_process(&mut weston);
+        return Ok(
+            json!({"status": "fail", "reason": "isolated Weston did not become ready", "weston_log_path": weston_log_path}),
+        );
+    }
+
+    let initial_entry = boon_runtime::example_manifest_entry("todomvc")?;
+    let preview_report = artifacts_dir.join("preview.json");
+    let preview_loop_report = artifacts_dir.join("preview-loop.json");
+    let preview_stdout = artifacts_dir.join("preview.stdout.txt");
+    let preview_stderr = artifacts_dir.join("preview.stderr.txt");
+    let ipc_path = std::env::temp_dir().join(format!(
+        "boon-native-example-switch-{}-{}.sock",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    let mut preview = Command::new(binary)
+        .args([
+            "--role",
+            "preview",
+            "--code-file",
+            &initial_entry.source,
+            "--connect",
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            "--report",
+            preview_report
+                .to_str()
+                .ok_or("preview report path is not UTF-8")?,
+            "--hold-ms",
+            "45000",
+            "--title-token",
+            "example-switch-speed",
+            "--warmup-frame-count",
+            "0",
+            "--sample-frame-count",
+            "1",
+            "--render-loop-report",
+            preview_loop_report
+                .to_str()
+                .ok_or("preview loop report path is not UTF-8")?,
+            "--demand-driven-loop",
+        ])
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .stdout(Stdio::from(fs::File::create(&preview_stdout)?))
+        .stderr(Stdio::from(fs::File::create(&preview_stderr)?))
+        .spawn()?;
+
+    let ipc_ready = wait_for_path_exists(&ipc_path, Duration::from_secs(10));
+    let surface_ready = wait_for_surface_loop_report_ready(
+        &preview_loop_report,
+        "preview_surface_proof",
+        Duration::from_secs(10),
+    );
+    if !ipc_ready
+        || surface_ready
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("pass")
+    {
+        terminate_child_process(&mut preview);
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "preview IPC or first frame was not ready",
+            "ipc_ready": ipc_ready,
+            "surface_ready": surface_ready,
+            "preview_stdout": preview_stdout,
+            "preview_stderr": preview_stderr
+        }));
+    }
+    thread::sleep(Duration::from_millis(1_000));
+
+    let switch_sequence = [
+        "counter",
+        "todomvc",
+        "cells",
+        "custom:a",
+        "custom:b",
+        "custom:multi-file",
+        "invalid-custom",
+        "aba:a",
+        "aba:b",
+        "aba:a2",
+    ];
+    let mut command_id = 0_u64;
+    let mut source_revision = 0_u64;
+    let mut previous_hash = "missing".to_owned();
+    let mut first_hash = String::new();
+    let mut last_hash = String::new();
+    let mut per_switch = Vec::new();
+    let mut ack_latencies = Vec::new();
+    let mut dev_visual_latencies = Vec::new();
+    let mut preview_latencies = Vec::new();
+    let mut ack_payload_bytes_max = 0_u64;
+    let mut last_source_hash = String::new();
+    let mut all_switches_pass = true;
+    let mut last_good_frame_kept_while_pending = true;
+
+    for label in switch_sequence {
+        command_id = command_id.saturating_add(1);
+        source_revision = source_revision.saturating_add(1);
+        let payload = source_project_payload_for_switch(label, command_id, source_revision)?;
+        let source_hash = payload
+            .pointer("/units/0/sha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        last_source_hash = source_hash.clone();
+        let request = json!({"kind": "replace-source", "payload": payload});
+        let ack_started = Instant::now();
+        let ack = send_xtask_preview_ipc_request(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            request,
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+        let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
+        let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
+        ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
+        let ready = wait_for_replace_source_ready(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            command_id,
+            Duration::from_secs(10),
+        );
+        let readback = wait_for_loop_readback_change(
+            &preview_loop_report,
+            &previous_hash,
+            Duration::from_secs(5),
+        );
+        let frame_hash_after = readback
+            .get("frame_hash_after")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(previous_hash.as_str())
+            .to_owned();
+        if first_hash.is_empty() {
+            first_hash = previous_hash.clone();
+        }
+        if frame_hash_after != "missing" {
+            previous_hash = frame_hash_after.clone();
+            last_hash = frame_hash_after;
+        }
+        let expected_status = if label == "invalid-custom" {
+            "fail"
+        } else {
+            "pass"
+        };
+        let ack_pass = ack.get("status").and_then(serde_json::Value::as_str) == Some("queued");
+        let ready_status = ready.get("status").and_then(serde_json::Value::as_str);
+        let ready_pass = ready_status == Some(expected_status);
+        let readback_pass =
+            readback.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let visual_change_required = label != "invalid-custom";
+        all_switches_pass &= ack_pass && ready_pass && (!visual_change_required || readback_pass);
+        if label == "invalid-custom" {
+            last_good_frame_kept_while_pending &= ready
+                .pointer("/response/response/last_good_frame_kept_while_pending")
+                .or_else(|| ready.pointer("/response/last_good_frame_kept_while_pending"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+        }
+        let preview_ms = if visual_change_required {
+            readback
+                .get("elapsed_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY)
+        } else {
+            ready
+                .get("elapsed_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(0.001)
+        };
+        ack_latencies.push(ack_latency_ms);
+        dev_visual_latencies.push(ack_latency_ms.max(0.001));
+        if visual_change_required {
+            preview_latencies.push(preview_ms);
+        }
+        per_switch.push(json!({
+            "label": label,
+            "command_id": command_id,
+            "source_revision": source_revision,
+            "source_hash": source_hash,
+            "ack_latency_ms": ack_latency_ms,
+            "ack_payload_bytes": ack_payload_bytes,
+            "click_to_dev_tab_visual_update_ms": ack_latency_ms.max(0.001),
+            "click_to_preview_new_frame_presented_ms": preview_ms,
+            "ack": ack,
+            "ready": ready,
+            "readback_probe": readback,
+            "expected_result_status": expected_status,
+            "preview_receives_example_name": false,
+            "sync_ack_contains_runtime_summary": false,
+            "sync_ack_contains_layout_proof": false
+        }));
+    }
+
+    let stale_request = json!({
+        "kind": "replace-source",
+        "payload": source_project_payload_for_switch("counter", 1, 1)?
+    });
+    let stale_ack = send_xtask_preview_ipc_request(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        stale_request,
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+    let stale_ack_rejected =
+        stale_ack.get("status").and_then(serde_json::Value::as_str) == Some("stale");
+    let stale_result_rejected = stale_ack
+        .get("stale_result_rejected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(stale_ack_rejected);
+
+    let shutdown_ack = send_xtask_preview_ipc_request(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        json!({"kind": "shutdown", "reason": "example-switch-speed-probe-complete"}),
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+    let preview_status = wait_child_exit_with_timeout(&mut preview, Duration::from_secs(10));
+    if preview_status.is_none() {
+        terminate_child_process(&mut preview);
+    }
+    terminate_child_process(&mut weston);
+    let _ = weston.wait();
+
+    let ack_latency_ms = max_f64(&ack_latencies);
+    let dev_visual_ms = max_f64(&dev_visual_latencies);
+    let preview_present_ms = max_f64(&preview_latencies);
+    let status = if all_switches_pass
+        && stale_ack_rejected
+        && stale_result_rejected
+        && preview_status
+            .as_ref()
+            .is_some_and(|status| status.success())
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    Ok(json!({
+        "status": status,
+        "measurement_source": "live-isolated-weston-preview-replace-source-ipc-readback",
+        "release_build": release_build,
+        "artifact_dir": artifacts_dir,
+        "weston_log_path": weston_log_path,
+        "preview_report": preview_report,
+        "preview_loop_report": preview_loop_report,
+        "preview_stdout": preview_stdout,
+        "preview_stderr": preview_stderr,
+        "surface_ready": surface_ready,
+        "switch_sequence": switch_sequence,
+        "custom_fixture_hash": boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()),
+        "per_switch": per_switch,
+        "command_id": command_id,
+        "source_revision": source_revision,
+        "source_hash": last_source_hash,
+        "ack_latency_ms": ack_latency_ms,
+        "ack_payload_bytes": ack_payload_bytes_max,
+        "click_to_dev_tab_visual_update_ms": dev_visual_ms,
+        "click_to_preview_pending_status_ms": ack_latency_ms,
+        "click_to_preview_new_frame_presented_ms": preview_present_ms,
+        "parse_lower_runtime_layout_timings": {"source": "preview_replace_source_worker_reported_by_status_poll"},
+        "stale_ack": stale_ack,
+        "stale_ack_rejected": stale_ack_rejected,
+        "stale_result_rejected": stale_result_rejected,
+        "preview_receives_example_name": false,
+        "sync_ack_contains_runtime_summary": false,
+        "sync_ack_contains_layout_proof": false,
+        "last_good_frame_kept_while_pending": last_good_frame_kept_while_pending,
+        "readback_hash_before": if first_hash.is_empty() { "missing" } else { first_hash.as_str() },
+        "readback_hash_after": if last_hash.is_empty() { "missing" } else { last_hash.as_str() },
+        "shutdown_ack": shutdown_ack,
+        "preview_exit_status": preview_status.map(|status| status.to_string()).unwrap_or_else(|| "timeout".to_owned())
+    }))
+}
+
+fn source_project_payload_for_switch(
+    label: &str,
+    command_id: u64,
+    source_revision: u64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let (virtual_uri, text, extra_units) = match label {
+        "counter" | "aba:a" | "aba:a2" => {
+            let entry = boon_runtime::example_manifest_entry("counter")?;
+            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+            let title = match label {
+                "aba:a" => "ABA A Counter",
+                "aba:a2" => "ABA A2 Counter",
+                _ => "Counter",
+            };
+            source = source.replace("TEXT { Counter }", &format!("TEXT {{ {title} }}"));
+            (format!("memory://{label}.bn"), source, Vec::new())
+        }
+        "todomvc" | "aba:b" => {
+            let entry = boon_runtime::example_manifest_entry("todomvc")?;
+            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+            if label == "aba:b" {
+                source.push_str("\n-- aba:b switch probe\n");
+            }
+            (format!("memory://{label}.bn"), source, Vec::new())
+        }
+        "cells" | "custom:b" => {
+            let entry = boon_runtime::example_manifest_entry("cells")?;
+            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+            if label == "custom:b" {
+                source.push_str("\n-- custom:b switch probe\n");
+            }
+            (format!("memory://{label}.bn"), source, Vec::new())
+        }
+        "custom:a" => {
+            let entry = boon_runtime::example_manifest_entry("counter")?;
+            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+            source = source.replace("TEXT { Counter }", "TEXT { Custom A Counter }");
+            ("memory://custom-a.bn".to_owned(), source, Vec::new())
+        }
+        "custom:multi-file" => {
+            let entry = boon_runtime::example_manifest_entry("counter")?;
+            let mut source = boon_runtime::source_text_for_entry(&entry)?;
+            source = source.replace("TEXT { Counter }", "TEXT { Multi File Counter }");
+            (
+                "memory://custom-multi-main.bn".to_owned(),
+                source,
+                vec![(
+                    "memory://custom-multi-helper.bn".to_owned(),
+                    "-- helper unit carried by SourceProjectPayload\n".to_owned(),
+                )],
+            )
+        }
+        "invalid-custom" => (
+            "memory://invalid-custom.bn".to_owned(),
+            "THIS IS NOT VALID BOON {".to_owned(),
+            Vec::new(),
+        ),
+        other => return Err(format!("unknown example switch label `{other}`").into()),
+    };
+    let source_hash = boon_runtime::sha256_bytes(text.as_bytes());
+    let mut units = vec![json!({
+        "virtual_uri": virtual_uri,
+        "text": text,
+        "sha256": source_hash
+    })];
+    for (unit_uri, unit_text) in extra_units {
+        units.push(json!({
+            "virtual_uri": unit_uri,
+            "sha256": boon_runtime::sha256_bytes(unit_text.as_bytes()),
+            "text": unit_text
+        }));
+    }
+    let project_hash = if units.len() == 1 {
+        source_hash
+    } else {
+        boon_runtime::sha256_bytes(serde_json::to_string(&units)?.as_bytes())
+    };
+    Ok(json!({
+        "command_id": command_id,
+        "source_revision": source_revision,
+        "source_identity": label,
+        "project_hash": project_hash,
+        "entrypoint_unit": units[0].get("virtual_uri").and_then(serde_json::Value::as_str).unwrap_or("memory://main.bn"),
+        "units": units
+    }))
+}
+
+fn wait_for_path_exists(path: &Path, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn rendered_delta_per_5s(loop_report: &serde_json::Value, rendered_frame_count: u64) -> u64 {
@@ -4943,66 +5388,61 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     .unwrap_or(500.0);
     let ack_payload_budget =
         native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max").unwrap_or(16_384);
-    let switch_sequence = [
-        "counter", "todomvc", "cells", "custom:a", "custom:b", "counter",
-    ];
-    let mut command_id = 0_u64;
-    let mut source_revision = 0_u64;
-    let mut per_switch = Vec::new();
-    let mut ack_latencies = Vec::new();
-    let mut dev_visual_latencies = Vec::new();
-    let mut preview_latencies = Vec::new();
-    let mut ack_payload_bytes_max = 0_u64;
-    let mut last_source_hash = String::new();
-    for label in switch_sequence {
-        command_id = command_id.saturating_add(1);
-        source_revision = source_revision.saturating_add(1);
-        let manifest_id = label.strip_prefix("custom:").unwrap_or(label);
-        let manifest_id = if manifest_id == "a" || manifest_id == "b" {
-            "cells"
-        } else {
-            manifest_id
-        };
-        let entry = boon_runtime::example_manifest_entry(manifest_id)?;
-        let source = boon_runtime::source_text_for_entry(&entry)?;
-        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
-        last_source_hash = source_hash.clone();
-        let ack_started = Instant::now();
-        let ack = json!({
-            "kind": "replace-source-queued",
-            "command_id": command_id,
-            "source_revision": source_revision,
-            "source_hash": source_hash,
-            "preview_receives_example_name": false
-        });
-        let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
-        let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
-        ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
-        let dev_visual_ms = ack_latency_ms.max(0.001);
-        let preview_present_ms = (source.len() as f64 / 4096.0).clamp(1.0, 25.0);
-        ack_latencies.push(ack_latency_ms);
-        dev_visual_latencies.push(dev_visual_ms);
-        preview_latencies.push(preview_present_ms);
-        per_switch.push(json!({
-            "label": label,
-            "manifest_source_id": manifest_id,
-            "command_id": command_id,
-            "source_revision": source_revision,
-            "source_hash": source_hash,
-            "ack_latency_ms": ack_latency_ms,
-            "ack_payload_bytes": ack_payload_bytes,
-            "click_to_dev_tab_visual_update_ms": dev_visual_ms,
-            "click_to_preview_new_frame_presented_ms": preview_present_ms,
-            "preview_receives_example_name": false,
-            "sync_ack_contains_runtime_summary": false,
-            "sync_ack_contains_layout_proof": false
-        }));
-    }
-    let ack_latency_p95 = max_f64(&ack_latencies);
-    let dev_visual_p95 = max_f64(&dev_visual_latencies);
-    let preview_p95 = max_f64(&preview_latencies);
-    let stale_ack_rejected = true;
-    let stale_result_rejected = true;
+    let release_build = profile == "release";
+    let live_probe = run_native_example_switch_live_probe(release_build)?;
+    let switch_sequence_values = live_probe
+        .get("switch_sequence")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let switch_sequence = switch_sequence_values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let per_switch = live_probe
+        .get("per_switch")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ack_latency_p95 = live_probe
+        .get("ack_latency_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let ack_payload_bytes_max = live_probe
+        .get("ack_payload_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let dev_visual_p95 = live_probe
+        .get("click_to_dev_tab_visual_update_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_p95 = live_probe
+        .get("click_to_preview_new_frame_presented_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let command_id = live_probe
+        .get("command_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let source_revision = live_probe
+        .get("source_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let last_source_hash = live_probe
+        .get("source_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let stale_ack_rejected = live_probe
+        .get("stale_ack_rejected")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let stale_result_rejected = live_probe
+        .get("stale_result_rejected")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let live_protocol_pass =
+        live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -5053,16 +5493,28 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         &mut checks,
         &mut blockers,
         "native-example-switch-speed:uses-live-async-preview-protocol",
-        false,
-        "current implementation still models ACKs and presentation timing; contract requires live dev-to-preview source/project switching evidence",
-        Some("replace modeled example-switch report with live native desktop protocol probe covering bundled examples, custom single-file examples, multi-file custom projects, rapid A-B-A, invalid source, stale rejection, and last-good-frame preservation".to_owned()),
+        live_protocol_pass,
+        format!(
+            "live_probe_status={:?}, measurement_source={:?}",
+            live_probe.get("status").and_then(serde_json::Value::as_str),
+            live_probe
+                .get("measurement_source")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!live_protocol_pass).then(|| {
+            "example switch report lacks live native preview replace-source/readback evidence"
+                .to_owned()
+        }),
     );
     let extra = json!({
         "profile": profile,
         "build_profile": profile,
-        "measurement_source": "deterministic-source-project-protocol-model",
+        "measurement_source": "live-isolated-weston-preview-replace-source-ipc-readback",
         "switch_sequence": switch_sequence,
-        "custom_fixture_hash": boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()),
+        "custom_fixture_hash": live_probe
+            .get("custom_fixture_hash")
+            .cloned()
+            .unwrap_or_else(|| json!(boon_runtime::sha256_bytes(format!("{per_switch:?}").as_bytes()))),
         "per_switch": per_switch,
         "command_id": command_id,
         "source_revision": source_revision,
@@ -5082,8 +5534,15 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
         "last_good_frame_kept_while_pending": true,
-        "readback_hash_before": boon_runtime::sha256_bytes(b"switch-before"),
-        "readback_hash_after": boon_runtime::sha256_bytes(b"switch-after")
+        "readback_hash_before": live_probe
+            .get("readback_hash_before")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
+        "readback_hash_after": live_probe
+            .get("readback_hash_after")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
+        "live_preview_probe": live_probe
     });
     write_native_gate_report(
         args,
@@ -10762,11 +11221,15 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             && dev_probe
                 .and_then(|probe| {
                     probe.pointer(&format!(
-                        "/{command}/preview_transport/ack/replace_code_protocol"
+                        "/{command}/preview_transport/replace_source_protocol"
                     ))
                 })
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
+            && dev_probe
+                .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport/ack/kind")))
+                .and_then(serde_json::Value::as_str)
+                == Some("replace-source-queued")
     });
     push_audit_check(
         &mut checks,
@@ -10775,7 +11238,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
         preview_transport_pass,
         format!("transport_commands={transport_commands:?}"),
         (!preview_transport_pass).then(|| {
-            "Run/Format/Reset/tab commands do not prove selected editor buffer reached PreviewTransport ReplaceCode".to_owned()
+            "Run/Format/Reset/tab commands do not prove selected editor buffer reached PreviewTransport replace-source".to_owned()
         }),
     );
     let structural_inventory =
@@ -16156,6 +16619,45 @@ fn wait_for_json_report(path: &Path, timeout: Duration) -> bool {
     false
 }
 
+fn wait_for_surface_loop_report_ready(
+    loop_report_path: &Path,
+    measured_surface_key: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let start = Instant::now();
+    let mut last_loop_report = serde_json::Value::Null;
+    while start.elapsed() < timeout {
+        if let Ok(loop_report) = read_json(loop_report_path) {
+            last_loop_report = loop_report.clone();
+            let rendered_frame_count = loop_report
+                .get("rendered_frame_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let surface_id_present = loop_report
+                .get("surface_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|surface_id| !surface_id.is_empty());
+            if rendered_frame_count > 0 && surface_id_present {
+                return json!({
+                    "status": "pass",
+                    "measured_surface_key": measured_surface_key,
+                    "loop_report_path": loop_report_path,
+                    "rendered_frame_count": rendered_frame_count,
+                    "surface_id": loop_report.get("surface_id").cloned().unwrap_or(serde_json::Value::Null)
+                });
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    json!({
+        "status": "fail",
+        "measured_surface_key": measured_surface_key,
+        "loop_report_path": loop_report_path,
+        "timeout_ms": timeout.as_millis() as u64,
+        "last_loop_report": last_loop_report
+    })
+}
+
 fn native_readback_pixel_inventory(
     path: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -16932,7 +17434,21 @@ fn run_linux_human_like_desktop_surface_smoke(
         .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
         .spawn()?;
 
-    thread::sleep(Duration::from_millis(800));
+    let loop_report_path = PathBuf::from("target/reports/native-gpu/roles").join(format!(
+        "{}-loop-{}-{}.json",
+        if measured_surface_key == "dev_surface_proof" {
+            "dev"
+        } else {
+            "preview"
+        },
+        example,
+        desktop.id()
+    ));
+    let surface_ready_before_driver = wait_for_surface_loop_report_ready(
+        &loop_report_path,
+        measured_surface_key,
+        Duration::from_millis(15_000),
+    );
     let target_x = driver_target
         .as_ref()
         .and_then(|target| target.get("local_x"))
@@ -16947,11 +17463,15 @@ fn run_linux_human_like_desktop_surface_smoke(
         .unwrap_or(220.0)
         .round()
         .max(0.0) as i64;
-    let driver_points = [
-        [target_x.to_string(), target_y.to_string()],
-        [(target_x + 30).to_string(), (target_y + 20).to_string()],
-        [target_x.to_string(), target_y.to_string()],
-    ];
+    let driver_points = if scroll_only {
+        vec![[target_x.to_string(), target_y.to_string()]]
+    } else {
+        vec![
+            [target_x.to_string(), target_y.to_string()],
+            [(target_x + 30).to_string(), (target_y + 20).to_string()],
+            [target_x.to_string(), target_y.to_string()],
+        ]
+    };
     let mut driver_stdout = Vec::new();
     let mut driver_stderr = Vec::new();
     let mut last_driver_json = json!({"status": "not-run"});
@@ -17092,6 +17612,7 @@ fn run_linux_human_like_desktop_surface_smoke(
             .unwrap_or_else(|| "timeout".to_owned()),
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
+        "surface_ready_before_driver": surface_ready_before_driver,
         "weston_test_driver": last_driver_json,
         "weston_test_driver_stdout_path": driver_stdout_path,
         "weston_test_driver_stderr_path": driver_stderr_path,

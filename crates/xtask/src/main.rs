@@ -4448,19 +4448,54 @@ fn source_project_payload_for_switch(
             "text": unit_text
         }));
     }
-    let project_hash = if units.len() == 1 {
-        source_hash
-    } else {
-        boon_runtime::sha256_bytes(serde_json::to_string(&units)?.as_bytes())
-    };
+    let project_hash = source_project_payload_units_hash(&units)?;
+    let source_identity_hash = boon_runtime::sha256_bytes(
+        format!("{command_id}:{source_revision}:{project_hash}").as_bytes(),
+    );
+    let source_identity = format!("source:{}", &source_identity_hash[..16]);
     Ok(json!({
         "command_id": command_id,
         "source_revision": source_revision,
-        "source_identity": label,
+        "source_identity": source_identity,
         "project_hash": project_hash,
         "entrypoint_unit": units[0].get("virtual_uri").and_then(serde_json::Value::as_str).unwrap_or("memory://main.bn"),
         "units": units
     }))
+}
+
+fn source_project_payload_units_hash(
+    units: &[serde_json::Value],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if units.len() == 1 {
+        return Ok(units
+            .first()
+            .and_then(|unit| unit.get("sha256"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned());
+    }
+    let mut canonical = String::new();
+    for unit in units {
+        let virtual_uri = unit
+            .get("virtual_uri")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("source project unit missing virtual_uri")?;
+        let sha256 = unit
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("source project unit missing sha256")?;
+        let text = unit
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("source project unit missing text")?;
+        canonical.push_str(virtual_uri);
+        canonical.push('\0');
+        canonical.push_str(sha256);
+        canonical.push('\0');
+        canonical.push_str(&boon_runtime::sha256_bytes(text.as_bytes()));
+        canonical.push('\n');
+    }
+    Ok(boon_runtime::sha256_bytes(canonical.as_bytes()))
 }
 
 fn wait_for_path_exists(path: &Path, timeout: Duration) -> bool {
@@ -5094,8 +5129,12 @@ fn run_isolated_weston_idle_wake_observation(
             .unwrap_or(initial_frame_hash.as_str())
             .to_owned();
         if let Some(connect) = preview_connect.as_deref() {
-            let replacement_source = boon_runtime::example_manifest_entry(example)
-                .and_then(|entry| boon_runtime::source_text_for_entry(&entry))
+            let replacement_source = source_override
+                .map(boon_runtime::source_text_for_path)
+                .unwrap_or_else(|| {
+                    boon_runtime::example_manifest_entry(example)
+                        .and_then(|entry| boon_runtime::source_text_for_entry(&entry))
+                })
                 .map(|source| visibly_mutated_boon_source(&source));
             match replacement_source {
                 Ok(source) => {
@@ -5185,10 +5224,11 @@ fn run_isolated_weston_idle_wake_observation(
         });
     }
 
-    let desktop_status = wait_child_exit_with_timeout(
-        &mut desktop,
-        Duration::from_millis(role_report_timeout_ms.saturating_add(20_000)),
-    );
+    let desktop_exit_timeout_ms = child_hold_ms
+        .saturating_add(45_000)
+        .max(role_report_timeout_ms.saturating_add(20_000));
+    let desktop_status =
+        wait_child_exit_with_timeout(&mut desktop, Duration::from_millis(desktop_exit_timeout_ms));
     if desktop_status.is_none() {
         terminate_child_process(&mut desktop);
     }
@@ -5370,6 +5410,7 @@ fn run_isolated_weston_idle_wake_observation(
         "live_state_ready": live_state_ready,
         "live_state": live_state,
         "idle_settle_ms": idle_settle_ms,
+        "desktop_exit_timeout_ms": desktop_exit_timeout_ms,
         "preview_loop_report": preview_loop_report,
         "dev_loop_report": dev_loop_report,
         "preview_loop_report_sha256": preview_loop_report.as_deref().map(|path| file_hash(path.to_string_lossy().as_ref())),
@@ -14003,6 +14044,7 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
         json!({
             "command": "verify-native-gpu-preview-e2e",
             "git_commit": git_commit(),
+            "worktree_fingerprint": worktree_fingerprint(),
             "generated_at_utc": current_unix_seconds().to_string(),
             "native_gpu_contract": true
         })
@@ -14082,6 +14124,16 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 json!({
                     "command": "verify-native-gpu-layout-contract",
                     "git_commit": "stale"
+                }),
+            ),
+        ),
+        (
+            "stale-worktree-fingerprint",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-layout-contract",
+                    "worktree_fingerprint": "stale-worktree-fixture"
                 }),
             ),
         ),
@@ -14468,6 +14520,10 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         );
         let commit_fresh = report.get("git_commit").and_then(serde_json::Value::as_str)
             == Some(git_commit().as_str());
+        let worktree_fresh = report
+            .get("worktree_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            == Some(worktree_fingerprint().as_str());
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -14477,6 +14533,19 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             (!commit_fresh).then(|| {
                 format!(
                     "native GPU report `{}` is stale for current git commit",
+                    path.display()
+                )
+            }),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-all:worktree-fresh:{label}"),
+            worktree_fresh,
+            format!("{} worktree_fresh={worktree_fresh}", path.display()),
+            (!worktree_fresh).then(|| {
+                format!(
+                    "native GPU report `{}` is stale for current worktree fingerprint",
                     path.display()
                 )
             }),
@@ -16190,6 +16259,7 @@ fn write_native_gate_report(
         json!(if blockers.is_empty() { 0 } else { 1 }),
     );
     object.insert("git_commit".to_owned(), json!(git_commit()));
+    object.insert("worktree_fingerprint".to_owned(), json!(worktree_fingerprint()));
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
@@ -16248,6 +16318,7 @@ fn write_static_gate_report(
         json!(if blockers.is_empty() { 0 } else { 1 }),
     );
     object.insert("git_commit".to_owned(), json!(git_commit()));
+    object.insert("worktree_fingerprint".to_owned(), json!(worktree_fingerprint()));
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
@@ -16438,6 +16509,13 @@ fn native_gpu_report_integrity_reasons(
         .is_some_and(|commit| commit != git_commit())
     {
         reasons.push("git_commit is stale for current checkout".to_owned());
+    }
+    if report
+        .get("worktree_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|fingerprint| fingerprint != worktree_fingerprint())
+    {
+        reasons.push("worktree_fingerprint is stale for current checkout".to_owned());
     }
     if report
         .get("binary_hash")
@@ -20675,6 +20753,27 @@ fn git_commit() -> String {
                 .map(|text| text.trim().to_owned())
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "unknown".to_owned())
+        })
+        .clone()
+}
+
+fn worktree_fingerprint() -> String {
+    static WORKTREE_FINGERPRINT: OnceLock<String> = OnceLock::new();
+    WORKTREE_FINGERPRINT
+        .get_or_init(|| {
+            let status = Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .output()
+                .ok()
+                .map(|output| output.stdout)
+                .unwrap_or_default();
+            let diff = Command::new("git")
+                .args(["diff", "--binary", "HEAD", "--"])
+                .output()
+                .ok()
+                .map(|output| output.stdout)
+                .unwrap_or_default();
+            boon_runtime::sha256_bytes(&[status, diff].concat())
         })
         .clone()
 }

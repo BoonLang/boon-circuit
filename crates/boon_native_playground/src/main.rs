@@ -1043,6 +1043,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             })
         });
     let report = value_arg(args, "--report").map(PathBuf::from);
+    let supervisor_progress_report = report
+        .as_ref()
+        .map(|path| path.with_extension("progress.json"));
     let live_state_report = value_arg(args, "--live-state-report").map(PathBuf::from);
     let dev_editor_code_file = value_arg(args, "--dev-editor-code-file")
         .map(PathBuf::from)
@@ -1135,6 +1138,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let preview_arg_refs = preview_args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut preview = spawn_role(&preview_arg_refs)?;
     let preview_pid = preview.id();
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "preview-spawned",
+        json!({"preview_child_pid": preview_pid}),
+    );
     let preview_cmdline = wait_for_proc_cmdline(preview_pid, "--role", "preview");
     let role_report_timeout = Duration::from_millis(role_report_timeout_ms);
     if probe {
@@ -1220,6 +1228,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_arg_refs = dev_args.iter().map(String::as_str).collect::<Vec<_>>();
     let mut dev = spawn_role(&dev_arg_refs)?;
     let dev_pid = dev.id();
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "dev-spawned",
+        json!({"preview_child_pid": preview_pid, "dev_child_pid": dev_pid}),
+    );
     let dev_cmdline = wait_for_proc_cmdline(dev_pid, "--role", "dev");
 
     if !probe {
@@ -1236,6 +1249,16 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     wait_for_report(&dev_report, role_report_timeout)?;
     wait_for_report(&preview_report, role_report_timeout)?;
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "role-reports-ready",
+        json!({
+            "preview_child_pid": preview_pid,
+            "dev_child_pid": dev_pid,
+            "preview_report": preview_report,
+            "dev_report": dev_report
+        }),
+    );
     if let Some(path) = live_state_report.as_deref() {
         write_live_state_report(
             path,
@@ -1251,7 +1274,21 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             &dev_loop_report,
         )?;
     }
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "waiting-dev-exit",
+        json!({"preview_child_pid": preview_pid, "dev_child_pid": dev_pid}),
+    );
     let dev_status = dev.wait()?;
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "dev-exited",
+        json!({
+            "preview_child_pid": preview_pid,
+            "dev_child_pid": dev_pid,
+            "dev_exit_status": dev_status.to_string()
+        }),
+    );
     let preview_survives_dev_exit = dev_status.success() && child_running(&mut preview)?;
     let preview_shutdown_ack = if preview_survives_dev_exit && !skip_preview_shutdown {
         send_preview_ipc_request(
@@ -1281,7 +1318,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let preview_exit_wait_after_dev_ms = if skip_preview_shutdown {
         effective_preview_hold_ms
             .saturating_sub(dev_start_delay_ms.saturating_add(dev_hold_ms))
-            .saturating_add(1_500)
+            .saturating_add(15_000)
     } else {
         effective_preview_hold_ms.saturating_add(500)
     };
@@ -1289,6 +1326,19 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &mut preview,
         Duration::from_millis(preview_exit_wait_after_dev_ms),
     )?;
+    write_desktop_progress(
+        supervisor_progress_report.as_deref(),
+        "preview-exit-wait-finished",
+        json!({
+            "preview_child_pid": preview_pid,
+            "dev_child_pid": dev_pid,
+            "preview_exit_status_after_dev_exit": preview_clean_exit_after_dev_exit
+                .as_ref()
+                .map(std::process::ExitStatus::to_string)
+                .unwrap_or_else(|| "still-running-after-timeout".to_owned()),
+            "preview_exit_wait_after_dev_ms": preview_exit_wait_after_dev_ms
+        }),
+    );
     let preview_exit_status_after_dev_exit = preview_clean_exit_after_dev_exit
         .as_ref()
         .map(std::process::ExitStatus::to_string)
@@ -5669,7 +5719,7 @@ impl DevWindowShell {
             selected_example_id,
         );
         let initial_workspace = workspace.clone();
-        let selected_source_identity = workspace.selected_example_id.clone();
+        let selected_source_identity = opaque_source_identity(source_path_label, source_text, 1);
         Self {
             catalog,
             workspace,
@@ -6324,7 +6374,11 @@ impl DevWindowShell {
         let command_id = self.next_command_id;
         self.next_command_id = self.next_command_id.saturating_add(1);
         self.selected_source_revision = self.selected_source_revision.saturating_add(1);
-        self.selected_source_identity = self.workspace.selected_example_id.clone();
+        self.selected_source_identity = opaque_source_identity(
+            &self.workspace.selected_buffer.file_name,
+            &self.workspace.selected_buffer.source_text,
+            self.selected_source_revision,
+        );
         let payload = SourceProjectPayload::single_unit(
             command_id,
             self.selected_source_revision,
@@ -11215,6 +11269,27 @@ impl SourceProjectPayload {
     }
 }
 
+fn source_project_payload_hash(
+    units: &[SourceProjectUnit],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if units.len() == 1 {
+        return Ok(units
+            .first()
+            .map(|unit| unit.sha256.clone())
+            .unwrap_or_else(|| boon_runtime::sha256_bytes(b"")));
+    }
+    let mut canonical = String::new();
+    for unit in units {
+        canonical.push_str(&unit.virtual_uri);
+        canonical.push('\0');
+        canonical.push_str(&unit.sha256);
+        canonical.push('\0');
+        canonical.push_str(&boon_runtime::sha256_bytes(unit.text.as_bytes()));
+        canonical.push('\n');
+    }
+    Ok(boon_runtime::sha256_bytes(canonical.as_bytes()))
+}
+
 fn preview_input_runtime_context(
     state: &Arc<Mutex<PreviewIpcState>>,
 ) -> Result<PreviewInputRuntimeContext, Box<dyn std::error::Error>> {
@@ -11455,19 +11530,21 @@ fn preview_enqueue_source_project(
     wake_handle: boon_native_app_window::NativeWakeHandle,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let payload = source_project_payload_from_request(request)?;
-    let entrypoint = payload.entrypoint()?;
-    let actual_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
-    if actual_hash != entrypoint.sha256 {
-        return Err(format!(
-            "source unit hash mismatch for {}: expected {}, actual {}",
-            entrypoint.virtual_uri, entrypoint.sha256, actual_hash
-        )
-        .into());
+    for unit in &payload.units {
+        let actual_hash = boon_runtime::sha256_bytes(unit.text.as_bytes());
+        if actual_hash != unit.sha256 {
+            return Err(format!(
+                "source unit hash mismatch for {}: expected {}, actual {}",
+                unit.virtual_uri, unit.sha256, actual_hash
+            )
+            .into());
+        }
     }
-    if payload.project_hash != actual_hash && payload.units.len() == 1 {
+    let actual_project_hash = source_project_payload_hash(&payload.units)?;
+    if payload.project_hash != actual_project_hash {
         return Err(format!(
             "project hash mismatch: expected {}, actual {}",
-            payload.project_hash, actual_hash
+            payload.project_hash, actual_project_hash
         )
         .into());
     }
@@ -11532,6 +11609,7 @@ fn preview_enqueue_source_project(
         "project_hash": payload.project_hash,
         "entrypoint_unit": payload.entrypoint_unit,
         "unit_count": payload.units.len(),
+        "multi_unit_project_hash_validated": payload.units.len() > 1,
         "ack_payload_bytes": 0,
         "ack_latency_ms": elapsed_ms(queued_at),
         "hash_matches": true,
@@ -13011,6 +13089,22 @@ fn write_role_failure_report(
     Ok(())
 }
 
+fn write_desktop_progress(path: Option<&Path>, stage: &str, details: serde_json::Value) {
+    let Some(path) = path else {
+        return;
+    };
+    let _ = boon_runtime::write_json(
+        path,
+        &json!({
+            "status": "running",
+            "stage": stage,
+            "pid": std::process::id(),
+            "generated_at_utc": current_unix_seconds(),
+            "details": details
+        }),
+    );
+}
+
 fn write_desktop_report(
     path: &Path,
     args: &[String],
@@ -13106,6 +13200,7 @@ fn base_report(command: &str, args: &[String], status: &str) -> serde_json::Valu
         "command_argv": args,
         "exit_status": if status == "pass" { 0 } else { 1 },
         "git_commit": git_commit,
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": binary_hash,
         "source_hash": "n/a",
         "scenario_hash": "n/a",
@@ -13223,6 +13318,14 @@ fn source_hash_for_path(path: &Path) -> Result<String, Box<dyn std::error::Error
     Ok(boon_runtime::sha256_bytes(source.as_bytes()))
 }
 
+fn opaque_source_identity(virtual_uri: &str, source: &str, revision: u64) -> String {
+    let hash = boon_runtime::sha256_bytes(
+        format!("{virtual_uri}\n{revision}\n{}", boon_runtime::sha256_bytes(source.as_bytes()))
+            .as_bytes(),
+    );
+    format!("source:{}", &hash[..16])
+}
+
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13243,6 +13346,22 @@ fn git_commit() -> String {
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn worktree_fingerprint() -> String {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    boon_runtime::sha256_bytes(&[status, diff].concat())
 }
 
 fn display_server() -> String {

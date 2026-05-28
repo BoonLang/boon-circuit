@@ -685,7 +685,8 @@ where
                         sender,
                         callback_done_receiver,
                     ));
-                    let _ = render_done_sender.send(());
+                    let _ = render_done_sender.try_send(());
+                    std::process::exit(0);
                 }
             })
             .expect("failed to spawn app_window render thread");
@@ -696,6 +697,7 @@ where
         }
         let _ = callback_done_sender.send(());
         let _ = render_done_receiver.recv();
+        std::process::exit(0);
     });
     std::process::exit(0);
 }
@@ -718,7 +720,7 @@ async fn run_surface_probe_async(
     )
     .await
     {
-        let _ = ready_sender.send(Err(error));
+        let _ = ready_sender.try_send(Err(error));
     }
 }
 
@@ -1401,7 +1403,7 @@ async fn run_surface_probe_inner(
             last_interactive_readback_artifact.as_ref(),
         )?;
     }
-    let _ = callback_done_receiver.recv_timeout(Duration::from_secs(30));
+    let _ = callback_done_receiver.recv_timeout(Duration::from_secs(2));
     drop(surface);
     drop(app_surface);
     drop(window);

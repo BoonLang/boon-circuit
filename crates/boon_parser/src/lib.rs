@@ -682,7 +682,7 @@ fn parser_item(line: &ParserLine) -> ParserItem {
 }
 
 fn is_list_constructor(lexeme: &str) -> bool {
-    matches!(lexeme, "LIST" | "List/range" | "List/table")
+    matches!(lexeme, "LIST" | "List/range")
 }
 
 fn ast_statement_tree(
@@ -1566,7 +1566,6 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/map"
             | "List/append"
             | "List/range"
-            | "List/table"
             | "List/get"
             | "List/find"
             | "List/find_value"
@@ -2048,7 +2047,7 @@ FUNCTION new_todo(todo) {
 -- LATEST { fake |> THEN { bad } }
 label: "fake |> WHEN { SOURCE }"
 cells:
-    List/table(columns: 1, rows: 1)
+    List/range(from: 0, to: 0)
     |> List/map(cell, new: new_cell(cell: cell))
 FUNCTION new_cell(cell) {
     sources: [editor: [commit: SOURCE]]
@@ -2321,7 +2320,7 @@ FUNCTION row(item) {
         let source = r#"
 -- label: "EXAMPLE TodoMVC"
 cells:
-    List/table(columns: 1, rows: 1)
+    List/range(from: 0, to: 0)
     |> List/map(cell, new: new_cell(cell: cell))
 SOURCE
 HOLD
@@ -2565,7 +2564,7 @@ List/map
     fn unclosed_bracket_reports_opening_position() {
         let source = r#"
 cells:
-    List/table(columns: 26, rows: 100
+    List/range(from: 0, to: 2599
 SOURCE
 HOLD
 LATEST

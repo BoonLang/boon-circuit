@@ -51,15 +51,8 @@ Illustrative target:
 
 ```boon
 cells:
-    List/table(
-        columns: 26
-        rows: 100
-        defaults: cells_default_values
-    )
+    List/range(from: 0, to: 2599)
     |> List/map(cell, new: new_cell(cell: cell))
-
-sheet_reader:
-    CellExpression/reader(list: cells, address: address, value: value)
 
 FUNCTION new_cell(cell) {
     sources: [
@@ -71,10 +64,14 @@ FUNCTION new_cell(cell) {
     ]
 
     [
-        address: cell.address
+        address:
+            cell_address(index: cell.index)
+
+        default_formula:
+            default_formula_for_address(address: address)
 
         editing_text:
-            cell.default_formula |> HOLD draft {
+            default_formula |> HOLD draft {
                 LATEST {
                     sources.editor.change.text
                     sources.editor.cancel |> THEN { formula_text }
@@ -83,7 +80,7 @@ FUNCTION new_cell(cell) {
             }
 
         formula_text:
-            cell.default_formula |> HOLD formula_text {
+            default_formula |> HOLD formula_text {
                 LATEST {
                     sources.editor.commit.text
                 }
@@ -98,20 +95,11 @@ FUNCTION new_cell(cell) {
                 }
             }
 
-        parsed_formula:
-            CellExpression/parse(formula_text)
-
-        dependencies:
-            CellExpression/dependencies(parsed_formula)
-
         value:
-            CellExpression/eval(
-                formula: parsed_formula,
-                read: sheet_reader
-            )
+            compute_value(address: address, formula_text: formula_text)
 
         error:
-            CellExpression/error(parsed_formula, value)
+            Error/text(compute_value(address: address, formula_text: formula_text))
     ]
 }
 ```
@@ -126,8 +114,10 @@ checked example uses `change`, `commit`, and `cancel`, but hidden source routing
 should follow parsed `SOURCE` ports rather than a separate Rust list of editor
 event names.
 
-`List/table` produces ordinary addressed rows from the Boon declaration and
-applies seeded demo cell expressions from `cells_default_values`, for example:
+`List/range` produces ordinary indexed rows. The row template derives visible
+addresses with `cell_address(index: cell.index)`, and seeded demo cell
+expressions come from generic lookup helpers such as
+`default_formula_for_address(address: address)`, for example:
 
 ```text
 [row: 0, column: A, address: TEXT { A0 }, default_formula: TEXT { 5 }]
@@ -153,7 +143,7 @@ required visible samples beyond A0-D0: Z0, A99, and Z99
 The runtime state summary may expose bounded source-declared projections such as
 `sheet_columns`, `store.sheet_rows`, and visible `cells` to feed the generic
 `document` renderer. Those projections are UI data derived from the
-authoritative list/table storage. They are not allowed to replace or shrink the
+authoritative list storage. They are not allowed to replace or shrink the
 underlying 26x100 runtime model.
 
 The Cells source owns the spreadsheet layout declaration. Header rows, row

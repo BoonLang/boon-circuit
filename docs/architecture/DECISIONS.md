@@ -285,7 +285,7 @@ operators. `ir_debug_tables.formula_operations` records the Cells formula
 pipeline as `CellExpression/parse`, `CellExpression/dependencies`, `CellExpression/eval`, and
 `CellExpression/error` operators. `ir_debug_tables.state_cells` now includes
 source-derived initial values for `HOLD` cells, `ir_debug_tables.lists` includes
-record-literal and `List/table` initializers plus optional `LIST[n]` capacity,
+record-literal and `List/range` initializers plus optional `LIST[n]` capacity,
 and `ir_debug_tables.derived_values` records non-state values such as
 `store.title_to_add`, aggregate counts, list views, and formula projections.
 These tables are not accepted as proof by themselves. The runtime consumes them

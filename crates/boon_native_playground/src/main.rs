@@ -460,7 +460,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
-    start_preview_source_project_prewarm();
     let (document_layout_proof, document_layout_frame) =
         native_document_layout_proof_with_state_mode(Path::new(&code_file), &source, None, true)
             .unwrap_or_else(|error| {
@@ -12110,12 +12109,9 @@ impl PreviewReplaceWorkerQueue {
             .spawn(move || {
                 loop {
                     let payload = queue.wait_for_latest_payload();
-                    let result =
-                        preview_take_prebuilt_source_project(&payload).unwrap_or_else(|| {
-                            preview_build_source_project(payload.clone(), || {
-                                preview_source_project_payload_is_latest(&state, &payload)
-                            })
-                        });
+                    let result = preview_build_source_project(payload.clone(), || {
+                        preview_source_project_payload_is_latest(&state, &payload)
+                    });
                     if let Err(error) =
                         preview_commit_source_project_result(&state, &payload, result)
                     {
@@ -12475,66 +12471,6 @@ struct PreviewReplaceBuildResult {
     virtual_uri: String,
     status: &'static str,
     diagnostic: Option<String>,
-}
-
-fn preview_prebuilt_source_project_cache()
--> &'static Mutex<BTreeMap<String, PreviewReplaceBuildResult>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, PreviewReplaceBuildResult>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn start_preview_source_project_prewarm() {
-    let _ = std::thread::Builder::new()
-        .name("boon-native-preview-source-prewarm".to_owned())
-        .spawn(|| {
-            for example in ["cells"] {
-                if let Err(error) = prewarm_manifest_source_project(example) {
-                    eprintln!(
-                        "boon_native_playground: preview source prewarm for {example} failed: {error}"
-                    );
-                }
-            }
-        });
-}
-
-fn prewarm_manifest_source_project(example: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let entry = boon_runtime::example_manifest_entry(example)?;
-    let source = boon_runtime::source_text_for_entry(&entry)?;
-    let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
-    if preview_prebuilt_source_project_cache()
-        .lock()
-        .is_ok_and(|cache| cache.contains_key(&source_hash))
-    {
-        return Ok(());
-    }
-    let payload = SourceProjectPayload::single_unit(
-        0,
-        0,
-        &format!("prewarm:{example}:{source_hash}"),
-        &entry.source,
-        &source,
-    );
-    let result = preview_build_source_project(payload, || true);
-    if result.status == "pass"
-        && let Ok(mut cache) = preview_prebuilt_source_project_cache().lock()
-    {
-        cache.insert(source_hash, result);
-    }
-    Ok(())
-}
-
-fn preview_take_prebuilt_source_project(
-    payload: &SourceProjectPayload,
-) -> Option<PreviewReplaceBuildResult> {
-    let mut result = preview_prebuilt_source_project_cache()
-        .lock()
-        .ok()?
-        .remove(&payload.project_hash)?;
-    result.virtual_uri = payload.entrypoint_unit.clone();
-    if result.timings.is_object() {
-        result.timings["prebuilt_source_project_cache_hit"] = json!(true);
-    }
-    Some(result)
 }
 
 fn preview_source_project_payload_is_latest(

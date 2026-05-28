@@ -249,6 +249,7 @@ pub struct RowScope {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
+    pub address_lookup_field: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -293,29 +294,10 @@ pub enum InitialValue {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ListInitializer {
-    RecordLiteral {
-        rows: Vec<ListInitialRecord>,
-    },
-    Range {
-        from: i64,
-        to: i64,
-    },
-    Table {
-        columns: usize,
-        rows: usize,
-        defaults: Vec<TableDefaultField>,
-    },
+    RecordLiteral { rows: Vec<ListInitialRecord> },
+    Range { from: i64, to: i64 },
     Empty,
-    Unknown {
-        summary: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TableDefaultField {
-    pub address: String,
-    pub field: String,
-    pub value: String,
+    Unknown { summary: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -953,27 +935,40 @@ fn source_payload_schema(program: &ParsedProgram, source: &str) -> SourcePayload
             }
         }
     }
-    if source_is_in_address_scope(program, source) {
+    let address_lookup_field = source_address_lookup_field(program, source);
+    if address_lookup_field.is_some() {
         payload_fields.insert(SourcePayloadField::Address);
     }
     SourcePayloadSchema {
         fields: payload_fields.into_iter().collect(),
+        address_lookup_field,
     }
 }
 
-fn source_is_in_address_scope(program: &ParsedProgram, source: &str) -> bool {
+fn source_address_lookup_field(program: &ParsedProgram, source: &str) -> Option<String> {
     let Some(source_scope) = source.split('.').next() else {
-        return false;
+        return None;
     };
-    program.row_scope_functions.iter().any(|scope| {
-        scope.row_scope == source_scope
-            && typed_field_defs(program).iter().any(|field| {
-                field.path == format!("{}.address", scope.row_scope)
-                    || field
-                        .path
-                        .ends_with(&format!(".{}.address", scope.row_scope))
+    let fields = typed_field_defs(program);
+    program
+        .row_scope_functions
+        .iter()
+        .find(|scope| scope.row_scope == source_scope)
+        .and_then(|scope| {
+            fields.iter().find_map(|field| {
+                field
+                    .path
+                    .strip_prefix(&format!("{}.", scope.row_scope))
+                    .filter(|lookup| *lookup == "address")
+                    .or_else(|| {
+                        field
+                            .path
+                            .rsplit_once(&format!(".{}.", scope.row_scope))
+                            .and_then(|(_, lookup)| (lookup == "address").then_some(lookup))
+                    })
+                    .map(str::to_owned)
             })
-    })
+        })
 }
 
 fn view_bindings(
@@ -1844,14 +1839,6 @@ fn reject_list_initializer_identity(value: &ListInitializer) -> Result<(), Strin
         ListInitializer::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown list initializer", summary)
         }
-        ListInitializer::Table { defaults, .. } => {
-            for default in defaults {
-                reject_hidden_identity_identifier("table default address", &default.address)?;
-                reject_hidden_identity_identifier("table default field", &default.field)?;
-                reject_hidden_identity_identifier("table default value", &default.value)?;
-            }
-            Ok(())
-        }
         ListInitializer::Range { .. } => Ok(()),
         ListInitializer::Empty => Ok(()),
     }
@@ -2051,9 +2038,7 @@ fn expression_coverage(
                     }
                 }
             }
-            ListInitializer::Table { .. }
-            | ListInitializer::Range { .. }
-            | ListInitializer::Empty => {}
+            ListInitializer::Range { .. } | ListInitializer::Empty => {}
         }
     }
     for branch in update_branches {
@@ -2577,14 +2562,6 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: "list body not found".to_owned(),
         };
     };
-    if items.iter().any(item_has_table_constructor) {
-        let defaults = table_default_fields_for_table(program, &items);
-        return ListInitializer::Table {
-            columns: extract_usize_arg_from_items(&items, "columns").unwrap_or(26),
-            rows: extract_usize_arg_from_items(&items, "rows").unwrap_or(100),
-            defaults,
-        };
-    }
     if items.iter().any(|item| item_has_symbol(item, "List/range")) {
         return ListInitializer::Range {
             from: extract_i64_arg_from_items(&items, "from").unwrap_or(0),
@@ -2602,57 +2579,6 @@ fn list_initializer(program: &ParsedProgram, list_name: &str) -> ListInitializer
             summary: items.first().map(item_summary).unwrap_or_default(),
         }
     }
-}
-
-fn item_has_table_constructor(item: &AstItem) -> bool {
-    item.symbols.iter().any(|symbol| symbol == "List/table")
-}
-
-fn table_default_fields(items: &[AstItem]) -> Vec<TableDefaultField> {
-    list_record_literal_rows(items)
-        .into_iter()
-        .filter_map(|row| {
-            let address = row
-                .fields
-                .iter()
-                .find(|field| field.name == "address")
-                .and_then(initial_text_value)?
-                .to_owned();
-            let field = row
-                .fields
-                .iter()
-                .find(|field| field.name == "field")
-                .and_then(initial_text_value)?
-                .to_owned();
-            let value = row
-                .fields
-                .iter()
-                .find(|field| field.name == "value")
-                .and_then(initial_text_value)?
-                .to_owned();
-            Some(TableDefaultField {
-                address,
-                field,
-                value,
-            })
-        })
-        .collect()
-}
-
-fn table_default_fields_for_table(
-    program: &ParsedProgram,
-    items: &[AstItem],
-) -> Vec<TableDefaultField> {
-    let inline = table_default_fields(items);
-    if !inline.is_empty() {
-        return inline;
-    }
-    let Some(defaults_list) = extract_arg_from_items(items, "defaults") else {
-        return Vec::new();
-    };
-    list_body_items(program, &defaults_list)
-        .map(|items| table_default_fields(&items))
-        .unwrap_or_default()
 }
 
 fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstItem>> {
@@ -2737,13 +2663,6 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
     }
 }
 
-fn initial_text_value(field: &ListRowInitialField) -> Option<&str> {
-    match &field.value {
-        InitialValue::Text { value } => Some(value),
-        _ => None,
-    }
-}
-
 fn string_literal_value(tokens: &[String]) -> Option<String> {
     let token = tokens.first()?;
     if tokens.len() != 1 || !token.starts_with('"') || !token.ends_with('"') {
@@ -2762,16 +2681,6 @@ fn text_literal_value(tokens: &[String]) -> Option<String> {
     Some(tokens[2..close].join(" "))
 }
 
-fn extract_usize_arg_from_items(items: &[AstItem], name: &str) -> Option<usize> {
-    items.iter().find_map(|item| {
-        item.symbols.windows(3).find_map(|window| {
-            (window[0] == name && window[1] == ":")
-                .then(|| window[2].parse().ok())
-                .flatten()
-        })
-    })
-}
-
 fn extract_i64_arg_from_items(items: &[AstItem], name: &str) -> Option<i64> {
     items.iter().find_map(|item| {
         item.symbols.windows(3).find_map(|window| {
@@ -2779,14 +2688,6 @@ fn extract_i64_arg_from_items(items: &[AstItem], name: &str) -> Option<i64> {
                 .then(|| window[2].parse().ok())
                 .flatten()
         })
-    })
-}
-
-fn extract_arg_from_items(items: &[AstItem], name: &str) -> Option<String> {
-    items.iter().find_map(|item| {
-        item.symbols
-            .windows(3)
-            .find_map(|window| (window[0] == name && window[1] == ":").then(|| window[2].clone()))
     })
 }
 
@@ -3230,7 +3131,6 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
         symbol,
         "List/map"
             | "List/range"
-            | "List/table"
             | "List/chunk"
             | "List/find"
             | "List/find_value"
@@ -4633,10 +4533,12 @@ FUNCTION new_todo(todo) {
             source.path == "cell.sources.editor.commit"
                 && source.payload_schema.fields
                     == vec![SourcePayloadField::Address, SourcePayloadField::Text]
+                && source.payload_schema.address_lookup_field.as_deref() == Some("address")
         }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "cell.sources.editor.cancel"
                 && source.payload_schema.fields == vec![SourcePayloadField::Address]
+                && source.payload_schema.address_lookup_field.as_deref() == Some("address")
         }));
         assert!(ir.view_bindings.iter().any(|binding| {
             binding.node_kind == "Input"

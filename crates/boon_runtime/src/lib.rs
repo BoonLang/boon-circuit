@@ -6,7 +6,7 @@ use bitvec::prelude::*;
 use boon_ir::{
     DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListId, ListInitializer,
     ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
-    TableDefaultField, TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
+    TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
     verify_static_schedule,
 };
 use boon_parser::{
@@ -19,7 +19,6 @@ use serde_json::{Value as JsonValue, json};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -2795,7 +2794,6 @@ impl RuntimeProfile {
 
 fn list_effective_capacity(list: &boon_ir::ListMemory) -> Option<usize> {
     list.capacity.or_else(|| match list.initializer {
-        ListInitializer::Table { columns, rows, .. } => Some(columns.saturating_mul(rows)),
         ListInitializer::Range { from, to } if from <= to => {
             usize::try_from(to.saturating_sub(from).saturating_add(1)).ok()
         }
@@ -2807,8 +2805,6 @@ fn list_effective_capacity(list: &boon_ir::ListMemory) -> Option<usize> {
 fn list_capacity_source(list: &boon_ir::ListMemory) -> &'static str {
     if list.capacity.is_some() {
         "list_capacity_syntax"
-    } else if matches!(list.initializer, ListInitializer::Table { .. }) {
-        "fixed_table_initializer"
     } else if matches!(list.initializer, ListInitializer::Range { .. }) {
         "range_initializer"
     } else {
@@ -4930,9 +4926,19 @@ impl GenericScheduledRuntime {
         source_event: GenericSourceEvent<'_>,
     ) -> RuntimeResult<Option<usize>> {
         if let Some(address) = source_event.address {
-            if let Some(index) = self
-                .storage
-                .find_list_index_by_textlike(list, "address", address)?
+            let source_id = self.source_routes.require_source_id(source_event.source)?;
+            let lookup_field = self
+                .source_routes
+                .address_lookup_field_for_source_id(source_id)
+                .ok_or_else(|| {
+                    format!(
+                        "source `{}` carries an address payload but has no typed row lookup field",
+                        source_event.source
+                    )
+                })?;
+            if let Some(index) =
+                self.storage
+                    .find_list_index_by_textlike(list, lookup_field, address)?
             {
                 return Ok(Some(index));
             }
@@ -5961,9 +5967,12 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<(String, usize)> {
         for slot in &self.storage.lists.list_slots {
             let list = &slot.name;
+            let Some(lookup_field) = self.address_lookup_field_for_list(list) else {
+                continue;
+            };
             if self
                 .storage
-                .list_row_textlike_opt(list, 0, "address")
+                .list_row_textlike_opt(list, 0, lookup_field)
                 .is_none()
             {
                 continue;
@@ -5974,15 +5983,28 @@ impl GenericScheduledRuntime {
             {
                 continue;
             }
-            if let Some(index) = self
-                .storage
-                .find_list_index_by_textlike(list, "address", address)?
+            if let Some(index) =
+                self.storage
+                    .find_list_index_by_textlike(list, lookup_field, address)?
             {
                 return Ok((list.clone(), index));
             }
         }
         Err(format!("cell `{address}` not found in any addressed generic list").into())
     }
+
+    fn address_lookup_field_for_list(&self, list: &str) -> Option<&str> {
+        self.list_source_bindings
+            .source_paths(list)
+            .ok()?
+            .iter()
+            .filter_map(|source| self.source_routes.source_id(source))
+            .find_map(|source_id| {
+                self.source_routes
+                    .address_lookup_field_for_source_id(source_id)
+            })
+    }
+
     #[cfg(test)]
     fn list_all_completed_by_count_targets(&self) -> bool {
         let active_count = self
@@ -6134,12 +6156,9 @@ impl GenericScheduledRuntime {
                         .root_textlike_ref(value)
                         .map(str::to_owned)
                         .unwrap_or_else(|_| value.clone());
-                    if let Some(value) = self.list_find_projection(
-                        &projection.list,
-                        projection.columns,
-                        field,
-                        &selected_address,
-                    ) {
+                    if let Some(value) =
+                        self.list_find_projection(&projection.list, field, &selected_address)
+                    {
                         insert_nested_json(root, &projection.target, JsonValue::Object(value));
                     }
                 }
@@ -6190,7 +6209,7 @@ impl GenericScheduledRuntime {
                 }
                 let cell = list_summary
                     .and_then(|summary| self.summary_row_json(summary, index).ok())
-                    .unwrap_or_else(|| self.table_address_fallback(columns, index));
+                    .unwrap_or_default();
                 cells.push(JsonValue::Object(cell));
             }
             row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
@@ -6202,7 +6221,6 @@ impl GenericScheduledRuntime {
     fn list_find_projection(
         &self,
         list: &str,
-        columns: usize,
         field: &str,
         address: &str,
     ) -> Option<serde_json::Map<String, JsonValue>> {
@@ -6215,19 +6233,6 @@ impl GenericScheduledRuntime {
             .iter()
             .find(|summary| summary.list == list)
             .and_then(|summary| self.summary_row_json(summary, index).ok())
-            .or_else(|| Some(self.table_address_fallback(columns, index)))
-    }
-
-    fn table_address_fallback(
-        &self,
-        columns: usize,
-        index: usize,
-    ) -> serde_json::Map<String, JsonValue> {
-        let mut fallback = serde_json::Map::new();
-        let mut address = String::new();
-        push_cell_address(columns, index, &mut address);
-        fallback.insert("address".to_owned(), json!(address));
-        fallback
     }
 
     fn summary_row_json(
@@ -6460,40 +6465,6 @@ impl GenericCircuitRuntime {
                         Ok(row)
                     })
                     .collect::<RuntimeResult<Vec<_>>>()?,
-                ListInitializer::Table {
-                    columns,
-                    rows,
-                    defaults,
-                } => {
-                    let defaults = table_default_field_map(*columns, *rows, defaults)?;
-                    let mut table_rows = Vec::with_capacity(columns.saturating_mul(*rows));
-                    for row in 0..*rows {
-                        for column in 0..*columns {
-                            let address = format!(
-                                "{}{}",
-                                spreadsheet_column_label(column)
-                                    .ok_or("table column label is out of range")?,
-                                row
-                            );
-                            let mut initial_fields = ValueColumns::default();
-                            if let Some(fields) = defaults.get(&address) {
-                                for (field, value) in fields {
-                                    initial_fields.insert_value(
-                                        field.clone(),
-                                        FieldValue::Text(value.clone()),
-                                    );
-                                }
-                            }
-                            initial_fields
-                                .insert_value("address".to_owned(), FieldValue::Text(address));
-                            row_template.fill_missing_row_initial_fields(&mut initial_fields);
-                            let mut row = row_template.materialize(initial_fields)?;
-                            initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
-                            table_rows.push(row);
-                        }
-                    }
-                    table_rows
-                }
                 ListInitializer::Range { from, to } => {
                     let count = if from <= to {
                         usize::try_from(to.saturating_sub(*from).saturating_add(1))
@@ -9055,6 +9026,7 @@ struct ListSourceBindingSlot {
 struct SourceRoute {
     source_id: SourceId,
     source: String,
+    address_lookup_field: Option<String>,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
@@ -9639,25 +9611,12 @@ impl ListProjectionPlan {
             .list_projections
             .iter()
             .filter_map(|projection| {
-                let table_dimensions = ir.lists.iter().find_map(|list| {
-                    match (list.name == projection.list, &list.initializer) {
-                        (true, ListInitializer::Table { columns, rows, .. }) => {
-                            Some((*columns, *rows))
-                        }
-                        _ => None,
-                    }
-                });
                 let (columns, rows) = match &projection.kind {
                     ListProjectionKind::Chunk { size, .. } => {
-                        let columns =
-                            size.or_else(|| table_dimensions.map(|(columns, _)| columns))?;
-                        let rows = table_dimensions
-                            .filter(|(table_columns, _)| *table_columns == columns)
-                            .map(|(_, rows)| rows)
-                            .unwrap_or_default();
-                        (columns, rows)
+                        let columns = (*size)?;
+                        (columns, 0)
                     }
-                    ListProjectionKind::Find { .. } => table_dimensions.unwrap_or((0, 0)),
+                    ListProjectionKind::Find { .. } => (0, 0),
                 };
                 Some(RuntimeListProjection {
                     target: projection.target.clone(),
@@ -9746,6 +9705,7 @@ impl SourceRoutePlan {
                 | RuntimeListOperationKind::Count { .. } => {}
             }
         }
+        routes.set_address_lookup_fields(ir);
         for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
@@ -9824,6 +9784,11 @@ impl SourceRoutePlan {
         self.require_source(source)?.list_append_trigger(list)
     }
 
+    fn address_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
+        self.for_source_id(source_id)
+            .and_then(|route| route.address_lookup_field.as_deref())
+    }
+
     fn route_mut(&mut self, source: &str, source_id: SourceId) -> &mut SourceRoute {
         let source_slot = source_id.as_usize();
         if self.id_slots.len() <= source_slot {
@@ -9847,6 +9812,7 @@ impl SourceRoutePlan {
         self.route_slots.push(SourceRoute {
             source_id,
             source: source.to_owned(),
+            address_lookup_field: None,
             root_scalar_targets: Vec::new(),
             indexed_text_targets: Vec::new(),
             indexed_bool_targets: Vec::new(),
@@ -9865,6 +9831,15 @@ impl SourceRoutePlan {
         for route in &self.route_slots {
             self.action_table
                 .set(route.source_id, route.actions.clone());
+        }
+    }
+
+    fn set_address_lookup_fields(&mut self, ir: &TypedProgram) {
+        for route in &mut self.route_slots {
+            route.address_lookup_field = ir
+                .sources
+                .get(route.source_id.as_usize())
+                .and_then(|source| source.payload_schema.address_lookup_field.clone());
         }
     }
 }
@@ -11133,27 +11108,6 @@ impl ScenarioExecutor for LoadedRuntime {
         Ok(None)
     }
 }
-fn push_cell_address(columns: usize, index: usize, output: &mut String) {
-    let col = index % columns;
-    let row = index / columns;
-    push_spreadsheet_column_label(col, output);
-    write!(output, "{row}").expect("writing to String cannot fail");
-}
-
-fn push_spreadsheet_column_label(mut index: usize, output: &mut String) {
-    let mut buffer = [0u8; 8];
-    let mut len = 0usize;
-    index += 1;
-    while index > 0 && len < buffer.len() {
-        let rem = (index - 1) % 26;
-        buffer[len] = b'A' + rem as u8;
-        len += 1;
-        index = (index - 1) / 26;
-    }
-    for byte in buffer[..len].iter().rev() {
-        output.push(*byte as char);
-    }
-}
 #[cfg(test)]
 fn todomvc_initial_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> {
     let list = ir
@@ -11234,64 +11188,9 @@ fn cells_range_from_ir(ir: &TypedProgram) -> Option<(i64, i64)> {
         .and_then(|list| match list.initializer {
             ListInitializer::Range { from, to } => Some((from, to)),
             ListInitializer::RecordLiteral { .. }
-            | ListInitializer::Table { .. }
             | ListInitializer::Empty
             | ListInitializer::Unknown { .. } => None,
         })
-}
-
-fn table_default_field_map(
-    columns: usize,
-    rows: usize,
-    defaults: &[TableDefaultField],
-) -> RuntimeResult<BTreeMap<String, Vec<(String, String)>>> {
-    let mut fields: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for default in defaults {
-        if table_address_index(&default.address, columns, rows).is_none() {
-            return Err(format!(
-                "Table default field references out-of-range address `{}`",
-                default.address
-            )
-            .into());
-        }
-        let address_fields = fields.entry(default.address.clone()).or_default();
-        if address_fields
-            .iter()
-            .any(|(field, _)| field == &default.field)
-        {
-            return Err(format!(
-                "Table default field duplicates `{}` for address `{}`",
-                default.field, default.address
-            )
-            .into());
-        }
-        address_fields.push((default.field.clone(), default.value.clone()));
-    }
-    Ok(fields)
-}
-
-fn spreadsheet_column_label(index: usize) -> Option<String> {
-    if index >= 26 {
-        return None;
-    }
-    Some(((b'A' + index as u8) as char).to_string())
-}
-
-fn table_address_index(address: &str, columns: usize, rows: usize) -> Option<usize> {
-    let mut chars = address.chars();
-    let col = chars.next()? as u8;
-    if !col.is_ascii_uppercase() {
-        return None;
-    }
-    let col = usize::from(col - b'A');
-    if col >= columns {
-        return None;
-    }
-    let row = chars.as_str().parse::<usize>().ok()?;
-    if row >= rows {
-        return None;
-    }
-    Some(row * columns + col)
 }
 
 fn is_cell_address(value: &str) -> bool {
@@ -12251,19 +12150,31 @@ mod tests {
         let cells_ir = lower(&cells_parsed).unwrap();
         let cells_compiled = CompiledProgram::from_ir(&cells_ir).unwrap();
         let cells_runtime = GenericScheduledRuntime::new(&cells_ir, &cells_compiled).unwrap();
+        let commit_source = cells_ir
+            .sources
+            .iter()
+            .find(|source| source.path == "cell.sources.editor.commit")
+            .unwrap();
+        assert_eq!(
+            cells_compiled
+                .source_routes
+                .address_lookup_field_for_source_id(commit_source.id),
+            Some("address")
+        );
+        let cells_event = GenericSourceEvent {
+            source: "cell.sources.editor.commit",
+            text: Some("41"),
+            key: Some("Enter"),
+            target_text: None,
+            address: Some("A0"),
+        };
+        let default_step = ScenarioStep::default();
         let cells_input = cells_runtime
-            .source_action_input_for_event_by_row_field(
+            .source_action_input_for_event(
                 "cells-a1-commit",
-                GenericSourceEvent {
-                    source: "cell.sources.editor.commit",
-                    text: Some("41"),
-                    key: Some("Enter"),
-                    target_text: None,
-                    address: Some("A0"),
-                },
+                cells_event,
                 TickSeq(3),
-                "address",
-                Some("A0"),
+                |list, event| cells_runtime.resolve_generic_step_index(list, &default_step, event),
             )
             .unwrap();
         assert_eq!(cells_input.source, "cell.sources.editor.commit");

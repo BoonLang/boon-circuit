@@ -452,13 +452,17 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
-    let document_layout_proof = native_document_layout_proof(Path::new(&code_file), &source)
-        .unwrap_or_else(|error| {
-            json!({
-                "status": "fail",
-                "blocker": error.to_string()
-            })
-        });
+    let (document_layout_proof, document_layout_frame) =
+        native_document_layout_proof_with_state_mode(Path::new(&code_file), &source, None, true)
+            .unwrap_or_else(|error| {
+                (
+                    json!({
+                        "status": "fail",
+                        "blocker": error.to_string()
+                    }),
+                    None,
+                )
+            });
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
@@ -489,7 +493,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let wake_handle = boon_native_app_window::NativeWakeHandle::new();
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
         layout_proof: document_layout_proof.clone(),
-        layout_frame_override: None,
+        layout_frame_override: document_layout_frame,
         update_count: 0,
         scroll_x_px: 0.0,
         scroll_y_px: 0.0,
@@ -718,6 +722,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let probe = args.iter().any(|arg| arg == "--probe");
     let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
+    let skip_visible_input_probe = args.iter().any(|arg| arg == "--skip-visible-input-probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
@@ -915,7 +920,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         let dev_shell_interaction_probe = report_shell
                             .lock()
                             .map(|shell| {
-                                if probe {
+                                if probe && !skip_visible_input_probe {
                                     shell.visible_input_probe(&proof)
                                 } else {
                                     shell.passive_visible_probe(&proof)
@@ -1031,6 +1036,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let skip_preview_shutdown = args.iter().any(|arg| arg == "--skip-preview-shutdown");
     let skip_dev_ipc_probe = args.iter().any(|arg| arg == "--skip-dev-ipc-probe");
+    let skip_dev_visible_input_probe = args
+        .iter()
+        .any(|arg| arg == "--skip-dev-visible-input-probe");
     let title_token = value_arg(args, "--title-token")
         .unwrap_or_else(|| format!("{}-{}", std::process::id(), current_unix_seconds()));
     let preview_title = role_window_title("Boon Preview", Some(&title_token));
@@ -1182,6 +1190,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if skip_dev_ipc_probe {
         dev_args.push("--skip-ipc-probe".to_owned());
+    }
+    if skip_dev_visible_input_probe {
+        dev_args.push("--skip-visible-input-probe".to_owned());
     }
     if args
         .iter()
@@ -1582,7 +1593,7 @@ fn native_document_layout_proof_with_state_mode(
         "runtime_document_state_hash": runtime_state_hash.clone(),
         "live_artifact_write_skipped": !write_artifact,
     });
-    Ok((proof, (!write_artifact).then_some(layout)))
+    Ok((proof, Some(layout)))
 }
 
 fn cached_document_program(
@@ -9356,6 +9367,7 @@ struct PreviewNativeInputState {
     focused_caret_index: usize,
     replace_focused_text_on_next_edit: bool,
     caret_blink_started_at: Option<Instant>,
+    pending_live_events: Vec<boon_runtime::LiveSourceEvent>,
 }
 
 fn unhandled_primary_mouse_releases(
@@ -9600,7 +9612,7 @@ fn preview_caret_visible(input_state: &PreviewNativeInputState, now: Instant) ->
 
 fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -> bool {
     let _ = (layout_proof, node);
-    false
+    true
 }
 
 fn preview_caret_index_for_text_hit_region(
@@ -9740,14 +9752,29 @@ fn preview_apply_real_window_input(
     let Some(live_runtime) = live_runtime else {
         return Ok(());
     };
+    if input.scroll_delta_x.abs() > f64::EPSILON || input.scroll_delta_y.abs() > f64::EPSILON {
+        return Ok(());
+    }
     let layout_proof = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?
         .layout_proof
         .clone();
 
-    let mut latest_layout = None;
+    let mut latest_layout = if input_state.pending_live_events.is_empty() {
+        None
+    } else {
+        let pending = std::mem::take(&mut input_state.pending_live_events);
+        Some(preview_apply_live_events(
+            source_path,
+            source_text,
+            live_runtime,
+            shared_render_state,
+            pending,
+        )?)
+    };
     let mut pending_mouse_events = Vec::new();
+    let mut defer_focusable_mouse_events = false;
     let mouse_releases =
         unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
     let batch_can_double_click = mouse_releases.len() >= 2;
@@ -9776,14 +9803,22 @@ fn preview_apply_real_window_input(
                 {
                     pending_mouse_events.push(blur);
                 }
+                let double_click = batch_can_double_click
+                    && input_state.last_click_node.as_deref() == Some(node.as_str())
+                    && mouse_release
+                        .sequence
+                        .saturating_sub(input_state.last_click_sequence)
+                        <= 4;
                 input_state.focused_node = Some(node.clone());
                 input_state.focused_text.clear();
-                input_state.focused_text.push_str(
-                    preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
-                        .or_else(|| document_value_for_hit_region(layout, &hit_region))
-                        .as_deref()
-                        .unwrap_or_default(),
-                );
+                if double_click || was_already_focused {
+                    input_state.focused_text.push_str(
+                        preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
+                            .or_else(|| document_value_for_hit_region(layout, &hit_region))
+                            .as_deref()
+                            .unwrap_or_default(),
+                    );
+                }
                 input_state.focused_caret_index = preview_caret_index_for_text_hit_region(
                     layout,
                     &hit_region,
@@ -9794,12 +9829,6 @@ fn preview_apply_real_window_input(
                 input_state.replace_focused_text_on_next_edit =
                     preview_text_input_should_replace_on_type(layout, &node);
                 preview_reset_caret_blink(input_state);
-                let double_click = batch_can_double_click
-                    && input_state.last_click_node.as_deref() == Some(node.as_str())
-                    && mouse_release
-                        .sequence
-                        .saturating_sub(input_state.last_click_sequence)
-                        <= 4;
                 if let Some(mut event) =
                     live_source_event_for_hit_region(layout, &hit_region, double_click)
                 {
@@ -9814,6 +9843,7 @@ fn preview_apply_real_window_input(
                         preview_record_noop_input(shared_render_state, 1)?;
                     } else {
                         pending_mouse_events.push(event);
+                        defer_focusable_mouse_events = true;
                     }
                 }
                 input_state.last_click_node = Some(node);
@@ -9835,7 +9865,10 @@ fn preview_apply_real_window_input(
             }
         }
     }
-    if !pending_mouse_events.is_empty() {
+    if !pending_mouse_events.is_empty() && defer_focusable_mouse_events {
+        input_state.pending_live_events.extend(pending_mouse_events);
+        preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    } else if !pending_mouse_events.is_empty() {
         latest_layout = Some(preview_apply_live_events(
             source_path,
             source_text,
@@ -10030,10 +10063,12 @@ fn preview_apply_focus_overlay(
             changed = true;
         }
         if item.focused && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            let next_text = Some(input_state.focused_text.clone());
-            if item.text != next_text {
-                item.text = next_text;
-                changed = true;
+            if !input_state.replace_focused_text_on_next_edit {
+                let next_text = Some(input_state.focused_text.clone());
+                if item.text != next_text {
+                    item.text = next_text;
+                    changed = true;
+                }
             }
             let caret_column =
                 boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64);
@@ -10074,7 +10109,7 @@ fn preview_record_noop_input(
 
 const PREVIEW_CELLS_ROW_HEIGHT_PX: f64 = 26.0;
 const PREVIEW_CELLS_COLUMN_WIDTH_PX: f64 = 80.0;
-const PREVIEW_CELLS_WINDOW_ROWS: usize = 24;
+const PREVIEW_CELLS_WINDOW_ROWS: usize = 8;
 const PREVIEW_CELLS_WINDOW_COLUMNS: usize = 10;
 
 fn preview_apply_scroll_input(
@@ -11700,17 +11735,35 @@ fn preview_operator_host_input_response(
     };
     let mut current_layout_proof =
         native_document_layout_proof(&state.source_path, &state.source_text).ok();
-    let mut runtime = if scenario_path.exists() {
-        boon_runtime::LiveRuntime::new(
-            &format!("native-preview-ipc:{}", state.source_path.display()),
-            &state.source_text,
-            &scenario_path,
-        )?
+    let runtime_arc = state.live_runtime.clone();
+    let mut runtime_guard = runtime_arc
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .lock()
+                .map_err(|_| "preview live runtime mutex poisoned")
+        })
+        .transpose()?;
+    let mut owned_runtime = if runtime_guard.is_none() {
+        Some(if scenario_path.exists() {
+            boon_runtime::LiveRuntime::new(
+                &format!("native-preview-ipc:{}", state.source_path.display()),
+                &state.source_text,
+                &scenario_path,
+            )?
+        } else {
+            boon_runtime::LiveRuntime::from_source(
+                &format!("native-preview-ipc:{}", state.source_path.display()),
+                &state.source_text,
+            )?
+        })
     } else {
-        boon_runtime::LiveRuntime::from_source(
-            &format!("native-preview-ipc:{}", state.source_path.display()),
-            &state.source_text,
-        )?
+        None
+    };
+    let runtime_origin = if runtime_guard.is_some() {
+        "preview-shared-live-runtime"
+    } else {
+        "request-local-live-runtime"
     };
     let mut outputs = Vec::new();
     let mut assertions = Vec::new();
@@ -11718,6 +11771,13 @@ fn preview_operator_host_input_response(
     let mut shared_render_update_count = 0_u64;
     for (index, input_json) in inputs.iter().enumerate() {
         let event_json = input_json.get("source_event").unwrap_or(input_json);
+        let runtime = if let Some(runtime) = runtime_guard.as_mut() {
+            &mut **runtime
+        } else {
+            owned_runtime
+                .as_mut()
+                .ok_or("operator-host-input runtime missing")?
+        };
         let before_state = runtime.state_summary();
         let host_route =
             preview_host_input_route_proof(input_json, event_json, current_layout_proof.as_ref());
@@ -11853,6 +11913,7 @@ fn preview_operator_host_input_response(
         "operator_host_input": true,
         "real_os_input": false,
         "input_injection_method": "operator_host_event_harness",
+        "runtime_origin": runtime_origin,
         "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
         "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event",
         "private_runtime_dispatch_used": false,

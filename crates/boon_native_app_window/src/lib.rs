@@ -1272,13 +1272,6 @@ async fn run_surface_probe_inner(
         };
         queue.submit(Some(encoder.finish()));
         frame.present();
-        if let Some((artifact_dir, pending)) = interactive_readback {
-            last_interactive_readback_artifact = Some(finish_visible_surface_readback(
-                &device,
-                pending,
-                &artifact_dir,
-            )?);
-        }
         render_loop_state.mark_presented(rendered_revision);
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
@@ -1293,6 +1286,27 @@ async fn run_surface_probe_inner(
                 wake_handle.generation(),
                 last_interactive_readback_artifact.as_ref(),
             )?;
+        }
+        if let Some((artifact_dir, pending)) = interactive_readback {
+            last_interactive_readback_artifact = Some(finish_visible_surface_readback(
+                &device,
+                pending,
+                &artifact_dir,
+            )?);
+            if let Some(report) = options.render_loop_state_report.as_deref() {
+                write_render_loop_state_report(
+                    Path::new(report),
+                    options.role,
+                    std::process::id(),
+                    &window_id,
+                    &surface_id,
+                    1,
+                    &render_loop_state,
+                    hold_started.elapsed(),
+                    wake_handle.generation(),
+                    last_interactive_readback_artifact.as_ref(),
+                )?;
+            }
         }
         let frame_sleep_ms = match loop_mode {
             NativeRenderLoopMode::ContinuousProbe => 16,

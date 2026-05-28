@@ -778,6 +778,29 @@ impl LiveRuntime {
         self.apply_checked_step(&live_step)
     }
 
+    pub fn apply_source_event_for_step_with_document_window(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
+        event.assert_matches_step(step)?;
+        let mut live_step = step.clone();
+        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+        live_step.expected_source_event = Some(event.into_expected_source_event());
+        self.next_step = self.next_step.saturating_add(1);
+        self.apply_checked_step_with_document_window(
+            &live_step,
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
+    }
+
     fn apply_checked_step(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveStepOutput> {
         self.apply_checked_step_with_summary_mode(step, false)
     }
@@ -4124,7 +4147,7 @@ impl SummaryLimits {
         column_count: usize,
     ) -> Self {
         Self {
-            list_rows: Some(row_start.saturating_add(row_count).max(64)),
+            list_rows: Some(row_start.saturating_add(row_count)),
             chunk_row_start: row_start,
             chunk_rows: Some(row_count),
             chunk_column_start: column_start,

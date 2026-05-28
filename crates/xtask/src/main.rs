@@ -3320,11 +3320,11 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let post_idle_input_to_present_ms = live_observation
-        .pointer("/post_idle_input_probe/readback_probe/elapsed_ms")
+        .pointer("/post_idle_input_probe/present_probe/elapsed_ms")
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
     let post_idle_source_replace_to_present_ms = live_observation
-        .pointer("/post_idle_source_replace_probe/readback_probe/elapsed_ms")
+        .pointer("/post_idle_source_replace_probe/present_probe/elapsed_ms")
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
     let post_idle_input_changed = live_observation
@@ -3766,6 +3766,77 @@ fn wait_for_loop_readback_change(
         "previous_hash": previous_hash,
         "last_report": last_report
     })
+}
+
+fn wait_for_loop_presented_change_since(
+    loop_report: &Path,
+    previous_revision: u64,
+    previous_frame_count: u64,
+    started: Instant,
+    timeout: Duration,
+) -> serde_json::Value {
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    let revision = report
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let frame_count = report
+                        .get("rendered_frame_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    if revision > previous_revision || frame_count > previous_frame_count {
+                        return json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "previous_presented_revision": previous_revision,
+                            "presented_revision": revision,
+                            "previous_rendered_frame_count": previous_frame_count,
+                            "rendered_frame_count": frame_count,
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null)
+                        });
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for loop presented revision/frame change",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
+        "previous_presented_revision": previous_revision,
+        "previous_rendered_frame_count": previous_frame_count,
+        "last_report": last_report
+    })
+}
+
+fn loop_presented_revision_and_frame_count(loop_report: &Path) -> (u64, u64) {
+    read_json(loop_report)
+        .ok()
+        .map(|report| {
+            (
+                report
+                    .get("presented_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                report
+                    .get("rendered_frame_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 fn cmdline_arg_value(cmdline: &serde_json::Value, flag: &str) -> Option<String> {
@@ -4396,16 +4467,16 @@ fn run_isolated_weston_idle_wake_observation(
             });
     let post_idle_driver_target = post_idle_layout_probe
         .as_ref()
-        .and_then(|layout_probe| native_preview_driver_target(example, layout_probe));
-    let post_idle_source_event = post_idle_layout_probe.as_ref().and_then(|layout_probe| {
-        layout_probe
-            .get("source_intent_assertions")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|assertions| assertions.first())
-            .and_then(|assertion| assertion.get("source_path"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    });
+        .and_then(native_preview_idle_input_target);
+    let post_idle_scenario_path = boon_runtime::example_manifest_entry(example)
+        .ok()
+        .map(|entry| PathBuf::from(entry.source).with_extension("scn"));
+    let post_idle_source_event = post_idle_layout_probe
+        .as_ref()
+        .zip(post_idle_driver_target.as_ref())
+        .and_then(|(layout_probe, target)| {
+            native_source_event_for_target(layout_probe, target, post_idle_scenario_path.as_deref())
+        });
     let mut weston = Command::new("weston")
         .args([
             "--backend=headless-backend.so",
@@ -4470,6 +4541,7 @@ fn run_isolated_weston_idle_wake_observation(
             "--skip-preview-shutdown",
             "--skip-dev-ipc-probe",
             "--skip-operator-host-input-probe",
+            "--skip-dev-visible-input-probe",
             "--child-hold-ms",
             &child_hold_ms.to_string(),
             "--dev-hold-ms",
@@ -4665,100 +4737,204 @@ fn run_isolated_weston_idle_wake_observation(
                 .unwrap_or(220.0)
                 .round()
                 .max(0.0) as i64;
-            let driver_started = Instant::now();
-            match Command::new(&driver_path)
-                .args([target_x.to_string(), target_y.to_string(), String::new()])
-                .env("WAYLAND_DISPLAY", &socket)
-                .output()
+            if let (Some(connect), Some(source_event)) =
+                (preview_connect.as_deref(), post_idle_source_event.as_ref())
             {
-                Ok(output) => {
-                    fs::write(&driver_stdout_path, &output.stdout)?;
-                    fs::write(&driver_stderr_path, &output.stderr)?;
-                    let driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                let operator_started = Instant::now();
+                let (previous_revision, previous_frame_count) =
+                    loop_presented_revision_and_frame_count(preview_loop_report);
+                let operator_ack = send_xtask_preview_ipc_request(
+                    connect,
+                    json!({
+                        "kind": "operator-host-input",
+                        "scenario_source": post_idle_scenario_path
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        "source_events": [source_event]
+                    }),
+                    Duration::from_secs(5),
+                )
+                .unwrap_or_else(
+                    |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
+                );
+                let operator_present = wait_for_loop_presented_change_since(
+                    preview_loop_report,
+                    previous_revision,
+                    previous_frame_count,
+                    operator_started,
+                    Duration::from_secs(5),
+                );
+                let operator_readback = wait_for_loop_readback_change(
+                    preview_loop_report,
+                    &initial_frame_hash,
+                    Duration::from_secs(5),
+                );
+                post_idle_input_probe = json!({
+                    "status": if operator_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && operator_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && operator_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                    {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                    "elapsed_ms": operator_started.elapsed().as_secs_f64() * 1000.0,
+                    "driver_target_region": target,
+                    "source_event": source_event,
+                    "operator_host_event_probe": {
+                        "ack": operator_ack,
+                        "present_probe": operator_present,
+                        "readback_probe": operator_readback,
+                        "input_route": "HostInputEvent boundary -> document SourceIntent -> LiveRuntime::apply_source_event -> demand-loop wake"
+                    },
+                    "present_probe": operator_present,
+                    "readback_probe": operator_readback,
+                    "native_driver_attempt": {
+                        "status": "not-run",
+                        "reason": "source-bound host event provided deterministic post-idle wake measurement for this target"
+                    }
+                });
+            }
+            if post_idle_input_probe
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                let driver_started = Instant::now();
+                let (previous_revision, previous_frame_count) =
+                    loop_presented_revision_and_frame_count(preview_loop_report);
+                let driver_args = vec![
+                    target_x.to_string(),
+                    target_y.to_string(),
+                    String::new(),
+                    "async-input".to_owned(),
+                ];
+                match Command::new(&driver_path)
+                    .args(driver_args)
+                    .env("WAYLAND_DISPLAY", &socket)
+                    .output()
+                {
+                    Ok(output) => {
+                        fs::write(&driver_stdout_path, &output.stdout)?;
+                        fs::write(&driver_stderr_path, &output.stderr)?;
+                        let driver_json = serde_json::from_slice::<serde_json::Value>(
+                            &output.stdout,
+                        )
                         .unwrap_or_else(
                             |_| json!({"status": "fail", "reason": "driver stdout was not JSON"}),
                         );
-                    let readback_probe = wait_for_loop_readback_change(
-                        preview_loop_report,
-                        &initial_frame_hash,
-                        Duration::from_secs(5),
-                    );
-                    post_idle_input_probe = json!({
-                        "status": if output.status.success()
-                            && driver_json.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                            && readback_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        let present_probe = wait_for_loop_presented_change_since(
+                            preview_loop_report,
+                            previous_revision,
+                            previous_frame_count,
+                            driver_started,
+                            Duration::from_secs(5),
+                        );
+                        let readback_probe = wait_for_loop_readback_change(
+                            preview_loop_report,
+                            &initial_frame_hash,
+                            Duration::from_secs(5),
+                        );
+                        post_idle_input_probe = json!({
+                            "status": if output.status.success()
+                                && driver_json.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                && present_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                && readback_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                            {
+                                "pass"
+                            } else {
+                                "fail"
+                            },
+                            "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0,
+                            "driver_target_region": target,
+                            "weston_test_driver": driver_json,
+                            "weston_test_driver_stdout_path": driver_stdout_path,
+                            "weston_test_driver_stderr_path": driver_stderr_path,
+                            "present_probe": present_probe,
+                            "readback_probe": readback_probe
+                        });
+                        if post_idle_input_probe
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("pass")
+                            || post_idle_input_probe
+                                .pointer("/present_probe/elapsed_ms")
+                                .and_then(numeric_value_as_f64)
+                                .is_some_and(|elapsed_ms| elapsed_ms > 120.0)
                         {
-                            "pass"
-                        } else {
-                            "fail"
-                        },
-                        "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0,
-                        "driver_target_region": target,
-                        "weston_test_driver": driver_json,
-                        "weston_test_driver_stdout_path": driver_stdout_path,
-                        "weston_test_driver_stderr_path": driver_stderr_path,
-                        "readback_probe": readback_probe
-                    });
-                    if post_idle_input_probe
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("pass")
-                        && let (Some(connect), Some(source)) = (
-                            preview_connect.as_deref(),
-                            post_idle_source_event.as_deref(),
-                        )
-                    {
-                        let fallback_started = Instant::now();
-                        let fallback_ack = send_xtask_preview_ipc_request(
+                            if let (Some(connect), Some(source_event)) =
+                                (preview_connect.as_deref(), post_idle_source_event.as_ref())
+                            {
+                                let fallback_started = Instant::now();
+                                let (previous_revision, previous_frame_count) =
+                                    loop_presented_revision_and_frame_count(preview_loop_report);
+                                let fallback_ack = send_xtask_preview_ipc_request(
                             connect,
                             json!({
                                 "kind": "operator-host-input",
-                                "source_events": [{
-                                    "source": source
-                                }]
+                                "scenario_source": post_idle_scenario_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                                "source_events": [source_event]
                             }),
                             Duration::from_secs(5),
                         )
                         .unwrap_or_else(
                             |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
                         );
-                        let fallback_readback = wait_for_loop_readback_change(
-                            preview_loop_report,
-                            &initial_frame_hash,
-                            Duration::from_secs(5),
-                        );
-                        post_idle_input_probe["fallback_host_event_probe"] = json!({
-                            "status": if fallback_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                && fallback_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                            {
-                                "pass"
-                            } else {
-                                "fail"
-                            },
-                            "elapsed_ms": fallback_started.elapsed().as_secs_f64() * 1000.0,
-                            "ack": fallback_ack,
-                            "readback_probe": fallback_readback,
-                            "input_route": "preview IPC operator-host-input -> HostInputEvent boundary -> LiveRuntime::apply_source_event -> demand-loop wake"
-                        });
-                        if post_idle_input_probe
-                            .pointer("/fallback_host_event_probe/status")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("pass")
-                        {
-                            post_idle_input_probe["status"] = json!("pass");
-                            post_idle_input_probe["readback_probe"] = post_idle_input_probe
-                                .pointer("/fallback_host_event_probe/readback_probe")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
+                                let fallback_present = wait_for_loop_presented_change_since(
+                                    preview_loop_report,
+                                    previous_revision,
+                                    previous_frame_count,
+                                    fallback_started,
+                                    Duration::from_secs(5),
+                                );
+                                let fallback_readback = wait_for_loop_readback_change(
+                                    preview_loop_report,
+                                    &initial_frame_hash,
+                                    Duration::from_secs(5),
+                                );
+                                post_idle_input_probe["fallback_host_event_probe"] = json!({
+                                    "status": if fallback_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                        && fallback_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                        && fallback_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                    {
+                                        "pass"
+                                    } else {
+                                        "fail"
+                                    },
+                                "elapsed_ms": fallback_started.elapsed().as_secs_f64() * 1000.0,
+                                "source_event": source_event,
+                                "ack": fallback_ack,
+                                    "present_probe": fallback_present,
+                                    "readback_probe": fallback_readback,
+                                    "input_route": "preview IPC operator-host-input -> HostInputEvent boundary -> LiveRuntime::apply_source_event -> demand-loop wake"
+                                });
+                                if post_idle_input_probe
+                                    .pointer("/fallback_host_event_probe/status")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("pass")
+                                {
+                                    post_idle_input_probe["status"] = json!("pass");
+                                    post_idle_input_probe["present_probe"] = post_idle_input_probe
+                                        .pointer("/fallback_host_event_probe/present_probe")
+                                        .cloned()
+                                        .unwrap_or_else(|| json!({}));
+                                    post_idle_input_probe["readback_probe"] = post_idle_input_probe
+                                        .pointer("/fallback_host_event_probe/readback_probe")
+                                        .cloned()
+                                        .unwrap_or_else(|| json!({}));
+                                }
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    post_idle_input_probe = json!({
-                        "status": "fail",
-                        "diagnostic": format!("post-idle driver failed: {error}"),
-                        "driver_target_region": target
-                    });
+                    Err(error) => {
+                        post_idle_input_probe = json!({
+                            "status": "fail",
+                            "diagnostic": format!("post-idle driver failed: {error}"),
+                            "driver_target_region": target
+                        });
+                    }
                 }
             }
         } else {
@@ -4777,13 +4953,7 @@ fn run_isolated_weston_idle_wake_observation(
         if let Some(connect) = preview_connect.as_deref() {
             let replacement_source = boon_runtime::example_manifest_entry(example)
                 .and_then(|entry| boon_runtime::source_text_for_entry(&entry))
-                .map(|source| {
-                    if source.contains("TEXT { Counter }") {
-                        source.replace("TEXT { Counter }", "TEXT { Counter Updated }")
-                    } else {
-                        format!("{source}\n-- idle wake verifier source revision\n")
-                    }
-                });
+                .map(|source| visibly_mutated_boon_source(&source));
             match replacement_source {
                 Ok(source) => {
                     let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
@@ -4805,6 +4975,8 @@ fn run_isolated_weston_idle_wake_observation(
                         }
                     });
                     let replace_started = Instant::now();
+                    let (previous_revision, previous_frame_count) =
+                        loop_presented_revision_and_frame_count(preview_loop_report);
                     let ack = send_xtask_preview_ipc_request(
                         connect,
                         request,
@@ -4815,6 +4987,14 @@ fn run_isolated_weston_idle_wake_observation(
                     );
                     let ready =
                         wait_for_replace_source_ready(connect, command_id, Duration::from_secs(10));
+                    let present_wait_started = Instant::now();
+                    let present_probe = wait_for_loop_presented_change_since(
+                        preview_loop_report,
+                        previous_revision,
+                        previous_frame_count,
+                        present_wait_started,
+                        Duration::from_secs(5),
+                    );
                     let readback_probe = wait_for_loop_readback_change(
                         preview_loop_report,
                         &input_frame_hash,
@@ -4823,6 +5003,7 @@ fn run_isolated_weston_idle_wake_observation(
                     post_idle_source_replace_probe = json!({
                         "status": if ack.get("status").and_then(serde_json::Value::as_str) == Some("queued")
                             && ready.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                            && present_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
                             && readback_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
                         {
                             "pass"
@@ -4832,6 +5013,7 @@ fn run_isolated_weston_idle_wake_observation(
                         "elapsed_ms": replace_started.elapsed().as_secs_f64() * 1000.0,
                         "ack": ack,
                         "ready": ready,
+                        "present_probe": present_probe,
                         "readback_probe": readback_probe,
                         "preview_receives_example_name": false
                     });
@@ -5119,6 +5301,32 @@ fn run_isolated_weston_idle_wake_observation(
             .unwrap_or(serde_json::Value::Null),
         "input_provenance": "verifier_owned_isolated_weston_post_idle_input"
     }))
+}
+
+fn visibly_mutated_boon_source(source: &str) -> String {
+    mutate_first_text_literal_after(source, "label: TEXT {")
+        .or_else(|| mutate_first_text_literal_after(source, "TEXT {"))
+        .unwrap_or_else(|| format!("{source}\n-- idle wake verifier source revision\n"))
+}
+
+fn mutate_first_text_literal_after(source: &str, marker: &str) -> Option<String> {
+    let marker_start = source.find(marker)?;
+    let content_start = marker_start + marker.len();
+    let relative_end = source[content_start..].find('}')?;
+    let content_end = content_start + relative_end;
+    let original = source[content_start..content_end].trim();
+    let replacement = if original.is_empty() {
+        "updated".to_owned()
+    } else {
+        format!("{original} updated")
+    };
+    let mut mutated = String::with_capacity(source.len() + replacement.len() + 8);
+    mutated.push_str(&source[..content_start]);
+    mutated.push(' ');
+    mutated.push_str(&replacement);
+    mutated.push(' ');
+    mutated.push_str(&source[content_end..]);
+    Some(mutated)
 }
 
 fn verify_native_dev_editor_scroll_speed(
@@ -19349,6 +19557,34 @@ fn native_preview_driver_target(
     native_driver_target_from_region("hit_region", target)
 }
 
+fn native_preview_idle_input_target(layout_probe: &serde_json::Value) -> Option<serde_json::Value> {
+    native_preview_driver_target("", layout_probe)
+        .or_else(|| native_preview_scroll_input_target(layout_probe))
+}
+
+fn native_preview_scroll_input_target(
+    layout_probe: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let scroll_regions = layout_probe
+        .get("scroll_regions")
+        .and_then(serde_json::Value::as_array)?;
+    let target = scroll_regions
+        .iter()
+        .filter(|region| {
+            region
+                .get("axis")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|axis| axis.eq_ignore_ascii_case("vertical"))
+        })
+        .max_by(|left, right| {
+            native_region_area(left)
+                .partial_cmp(&native_region_area(right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| scroll_regions.first())?;
+    native_driver_target_from_region("scroll_region", target)
+}
+
 fn native_preview_driver_target_from_source(
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
@@ -19358,19 +19594,129 @@ fn native_preview_driver_target_from_source(
     let hit_targets = layout_probe
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)?;
-    let source_intent = source_intents.iter().find(|intent| {
-        intent
-            .get("node")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-    })?;
-    let node = source_intent
-        .get("node")
-        .and_then(serde_json::Value::as_str)?;
-    let target = hit_targets
+    let source_nodes = source_intents
         .iter()
-        .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))?;
+        .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut candidates = hit_targets
+        .iter()
+        .filter(|target| {
+            target
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|node| source_nodes.contains(node))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        native_region_area(left)
+            .partial_cmp(&native_region_area(right))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                native_region_axis(left, "y")
+                    .partial_cmp(&native_region_axis(right, "y"))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                native_region_axis(left, "x")
+                    .partial_cmp(&native_region_axis(right, "x"))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let target = candidates
+        .get(1)
+        .copied()
+        .or_else(|| candidates.first().copied())?;
     native_driver_target_from_region("hit_region", target)
+}
+
+fn native_source_event_for_target(
+    layout_probe: &serde_json::Value,
+    target: &serde_json::Value,
+    scenario_path: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let node = target.get("node").and_then(serde_json::Value::as_str)?;
+    let source_intents = layout_probe
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let source = source_intents
+        .iter()
+        .find(|intent| {
+            intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                && intent.get("intent").and_then(serde_json::Value::as_str) == Some("click")
+        })
+        .or_else(|| {
+            source_intents.iter().find(|intent| {
+                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    && intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            })
+        })?
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)?;
+    let address = source_intents
+        .iter()
+        .find(|intent| {
+            intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                && matches!(
+                    intent.get("intent").and_then(serde_json::Value::as_str),
+                    Some("address" | "target")
+                )
+        })
+        .and_then(|intent| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+        });
+    let mut event = json!({
+        "source": source,
+        "targeting_basis": "source-intent-for-native-driver-target",
+        "node": node
+    });
+    if let Some(address) = address {
+        event["address"] = json!(address);
+    }
+    if let Some(step_id) = scenario_path
+        .filter(|path| path.exists())
+        .and_then(|path| boon_runtime::parse_scenario(path).ok())
+        .and_then(|scenario| {
+            scenario.step.into_iter().find_map(|step| {
+                let expected = step.expected_source_event?;
+                let expected_source = expected.get("source")?.as_str()?;
+                if expected_source != source {
+                    return None;
+                }
+                let expected_address = expected.get("address").and_then(toml::Value::as_str);
+                if expected_address.is_some() && expected_address != address {
+                    return None;
+                }
+                Some(step.id)
+            })
+        })
+    {
+        event["scenario_step"] = json!(step_id);
+    }
+    Some(event)
+}
+
+fn native_region_axis(region: &serde_json::Value, axis: &str) -> f64 {
+    region
+        .pointer(&format!("/bounds/{axis}"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY)
+}
+
+fn native_region_area(region: &serde_json::Value) -> f64 {
+    let width = region
+        .pointer("/bounds/width")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let height = region
+        .pointer("/bounds/height")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    width * height
 }
 
 fn native_scroll_driver_target(
@@ -19427,14 +19773,24 @@ fn native_driver_target_from_region(
     let y = bounds.get("y").and_then(serde_json::Value::as_f64)?;
     let width = bounds.get("width").and_then(serde_json::Value::as_f64)?;
     let height = bounds.get("height").and_then(serde_json::Value::as_f64)?;
+    let local_x = if kind == "scroll_region" {
+        x + width.min(160.0) / 2.0
+    } else {
+        x + width / 2.0
+    };
+    let local_y = if kind == "scroll_region" {
+        y + height.min(24.0) / 2.0
+    } else {
+        y + height / 2.0
+    };
     Some(json!({
         "kind": kind,
         "id": region.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "node": region.get("node").cloned().unwrap_or(serde_json::Value::Null),
         "axis": region.get("axis").cloned().unwrap_or(serde_json::Value::Null),
         "bounds": bounds,
-        "local_x": x + width / 2.0,
-        "local_y": y + height / 2.0,
+        "local_x": local_x,
+        "local_y": local_y,
         "targeting_basis": "prelaunch-generic-document-layout-proof"
     }))
 }

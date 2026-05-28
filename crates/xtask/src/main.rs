@@ -3241,19 +3241,28 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         }),
     );
 
-    let live_observation =
-        if build.success() && isolated_real_window_available && custom_project_fixture.is_none() {
-            run_isolated_weston_idle_wake_observation(&binary_path, &example, idle_ms)?
+    let custom_fixture_paths = custom_project_fixture
+        .as_deref()
+        .map(ensure_custom_idle_wake_fixture)
+        .transpose()?;
+    let live_observation = if build.success() && isolated_real_window_available {
+        if let Some((source_path, scenario_path)) = custom_fixture_paths.as_ref() {
+            run_isolated_weston_idle_wake_observation(
+                &binary_path,
+                "counter",
+                idle_ms,
+                Some(source_path.as_path()),
+                Some(scenario_path.as_path()),
+            )?
         } else {
-            json!({
-                "status": "not-run",
-                "reason": if custom_project_fixture.is_some() {
-                    "custom project idle/wake fixture launch is not wired yet"
-                } else {
-                    "build or isolated native window environment was unavailable"
-                }
-            })
-        };
+            run_isolated_weston_idle_wake_observation(&binary_path, &example, idle_ms, None, None)?
+        }
+    } else {
+        json!({
+            "status": "not-run",
+            "reason": "build or isolated native window environment was unavailable"
+        })
+    };
     let observation_pass = live_observation
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -3456,6 +3465,10 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         "example": example,
         "profile": profile,
         "custom_project_fixture": custom_project_fixture,
+        "custom_fixture_hash": custom_project_fixture
+            .as_deref()
+            .and_then(|path| boon_runtime::sha256_file(Path::new(path)).ok())
+            .unwrap_or_else(|| "not-applicable".to_owned()),
         "tested_binary": binary_path,
         "tested_binary_sha256": binary_sha256,
         "render_loop_mode": "demand_driven",
@@ -3496,6 +3509,37 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         "preview_receives_example_name": false
     });
     write_native_gate_report(args, "verify-native-gpu-idle-wake", checks, blockers, extra)
+}
+
+fn ensure_custom_idle_wake_fixture(
+    fixture_path: &str,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let fixture_path = PathBuf::from(fixture_path);
+    if let Some(parent) = fixture_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let fixture_dir = fixture_path
+        .parent()
+        .ok_or("custom idle-wake fixture path has no parent")?;
+    let source_path = fixture_dir.join("custom-idle-wake-counter.bn");
+    let scenario_path = fixture_dir.join("custom-idle-wake-counter.scn");
+    fs::write(
+        &source_path,
+        boon_runtime::source_text_for_path(Path::new("examples/counter.bn"))?,
+    )?;
+    fs::write(&scenario_path, fs::read_to_string("examples/counter.scn")?)?;
+    fs::write(
+        &fixture_path,
+        serde_json::to_vec_pretty(&json!({
+            "status": "pass",
+            "kind": "native-gpu-custom-project-fixture",
+            "source_path": source_path,
+            "scenario_path": scenario_path,
+            "source_identity": "custom-idle-wake-counter",
+            "preview_receives_example_name": false
+        }))?,
+    )?;
+    Ok((source_path, scenario_path))
 }
 
 #[derive(Clone, Debug)]
@@ -4417,6 +4461,8 @@ fn run_isolated_weston_idle_wake_observation(
     binary: &Path,
     example: &str,
     idle_ms: u64,
+    source_override: Option<&Path>,
+    scenario_override: Option<&Path>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let artifact_dir = PathBuf::from(format!(
         "target/artifacts/native-gpu/idle-wake-{}-{}-{}",
@@ -4458,19 +4504,27 @@ fn run_isolated_weston_idle_wake_observation(
     let supervisor_report = artifact_dir.join("desktop-supervisor.json");
     let live_state_report = artifact_dir.join("desktop-live-state.json");
     let title_token = native_gpu_title_token(&format!("idle-wake-{example}"));
-    let post_idle_layout_probe =
+    let post_idle_source_path = source_override.map(PathBuf::from).or_else(|| {
         boon_runtime::example_manifest_entry(example)
             .ok()
-            .and_then(|entry| {
-                let source_path = PathBuf::from(entry.source);
-                run_native_layout_probe(binary, &source_path, &layout_probe_report).ok()
-            });
-    let post_idle_driver_target = post_idle_layout_probe
-        .as_ref()
-        .and_then(native_preview_idle_input_target);
-    let post_idle_scenario_path = boon_runtime::example_manifest_entry(example)
-        .ok()
-        .map(|entry| PathBuf::from(entry.source).with_extension("scn"));
+            .map(|entry| PathBuf::from(entry.source))
+    });
+    let post_idle_layout_probe = post_idle_source_path.as_ref().and_then(|source_path| {
+        run_native_layout_probe(binary, source_path, &layout_probe_report).ok()
+    });
+    let post_idle_scenario_path = scenario_override.map(PathBuf::from).or_else(|| {
+        boon_runtime::example_manifest_entry(example)
+            .ok()
+            .map(|entry| PathBuf::from(entry.scenario))
+    });
+    let post_idle_driver_target = post_idle_layout_probe.as_ref().and_then(|layout_probe| {
+        post_idle_scenario_path
+            .as_deref()
+            .and_then(|scenario_path| {
+                native_preview_driver_target_from_scenario(layout_probe, scenario_path)
+            })
+            .or_else(|| native_preview_idle_input_target(layout_probe))
+    });
     let post_idle_source_event = post_idle_layout_probe
         .as_ref()
         .zip(post_idle_driver_target.as_ref())
@@ -4529,42 +4583,54 @@ fn run_isolated_weston_idle_wake_observation(
         .max(18_000);
     let child_hold_ms = dev_hold_ms.saturating_add(6_000);
     let role_report_timeout_ms = idle_ms.saturating_add(15_000).max(16_000);
+    let mut desktop_args = vec![
+        "--role".to_owned(),
+        "desktop".to_owned(),
+        "--example".to_owned(),
+        example.to_owned(),
+        "--probe".to_owned(),
+        "--real-window-input-probe".to_owned(),
+        "--demand-driven-loop".to_owned(),
+        "--skip-preview-shutdown".to_owned(),
+        "--skip-dev-ipc-probe".to_owned(),
+        "--skip-operator-host-input-probe".to_owned(),
+        "--skip-dev-visible-input-probe".to_owned(),
+        "--child-hold-ms".to_owned(),
+        child_hold_ms.to_string(),
+        "--dev-hold-ms".to_owned(),
+        dev_hold_ms.to_string(),
+        "--title-token".to_owned(),
+        title_token.clone(),
+        "--input-sample-delay-ms".to_owned(),
+        "0".to_owned(),
+        "--warmup-frame-count".to_owned(),
+        "1".to_owned(),
+        "--sample-frame-count".to_owned(),
+        "1".to_owned(),
+        "--role-report-timeout-ms".to_owned(),
+        role_report_timeout_ms.to_string(),
+        "--live-state-report".to_owned(),
+        live_state_report
+            .to_str()
+            .ok_or("live state report path is not UTF-8")?
+            .to_owned(),
+        "--report".to_owned(),
+        supervisor_report
+            .to_str()
+            .ok_or("supervisor report path is not UTF-8")?
+            .to_owned(),
+    ];
+    if let Some(source_path) = source_override {
+        desktop_args.push("--code-file".to_owned());
+        desktop_args.push(
+            source_path
+                .to_str()
+                .ok_or("custom idle-wake source path is not UTF-8")?
+                .to_owned(),
+        );
+    }
     let mut desktop = Command::new(binary)
-        .args([
-            "--role",
-            "desktop",
-            "--example",
-            example,
-            "--probe",
-            "--real-window-input-probe",
-            "--demand-driven-loop",
-            "--skip-preview-shutdown",
-            "--skip-dev-ipc-probe",
-            "--skip-operator-host-input-probe",
-            "--skip-dev-visible-input-probe",
-            "--child-hold-ms",
-            &child_hold_ms.to_string(),
-            "--dev-hold-ms",
-            &dev_hold_ms.to_string(),
-            "--title-token",
-            &title_token,
-            "--input-sample-delay-ms",
-            "0",
-            "--warmup-frame-count",
-            "1",
-            "--sample-frame-count",
-            "1",
-            "--role-report-timeout-ms",
-            &role_report_timeout_ms.to_string(),
-            "--live-state-report",
-            live_state_report
-                .to_str()
-                .ok_or("live state report path is not UTF-8")?,
-            "--report",
-            supervisor_report
-                .to_str()
-                .ok_or("supervisor report path is not UTF-8")?,
-        ])
+        .args(desktop_args)
         .env("WAYLAND_DISPLAY", &socket)
         .env("XDG_SESSION_TYPE", "wayland")
         .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
@@ -18282,6 +18348,9 @@ fn native_artifact_freshness_summary(
         if let Some(items) = report.get(key).and_then(serde_json::Value::as_array) {
             for item in items {
                 if let Some(path) = item.get("path").and_then(serde_json::Value::as_str) {
+                    if path.starts_with('<') && path.ends_with('>') {
+                        continue;
+                    }
                     paths.insert(path.to_owned());
                 }
             }
@@ -19629,6 +19698,63 @@ fn native_preview_driver_target_from_source(
     native_driver_target_from_region("hit_region", target)
 }
 
+fn native_preview_driver_target_from_scenario(
+    layout_probe: &serde_json::Value,
+    scenario_path: &Path,
+) -> Option<serde_json::Value> {
+    let scenario = boon_runtime::parse_scenario(scenario_path).ok()?;
+    let source_intents = layout_probe
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let hit_targets = layout_probe
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    for step in scenario.step {
+        let Some(expected) = step.expected_source_event else {
+            continue;
+        };
+        let expected_source = expected.get("source")?.as_str()?;
+        let expected_target = expected
+            .get("target_text")
+            .and_then(toml::Value::as_str)
+            .or_else(|| expected.get("address").and_then(toml::Value::as_str));
+        let Some(node) = source_intents.iter().find_map(|intent| {
+            if intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_source)
+            {
+                return None;
+            }
+            let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            let target_matches = expected_target.is_none_or(|target| {
+                source_intents.iter().any(|candidate| {
+                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                        && matches!(
+                            candidate.get("intent").and_then(serde_json::Value::as_str),
+                            Some("address" | "target")
+                        )
+                        && candidate
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(target)
+                })
+            });
+            target_matches.then_some(node)
+        }) else {
+            continue;
+        };
+        let Some(hit_target) = hit_targets
+            .iter()
+            .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))
+        else {
+            continue;
+        };
+        return native_driver_target_from_region("hit_region", hit_target);
+    }
+    None
+}
+
 fn native_source_event_for_target(
     layout_probe: &serde_json::Value,
     target: &serde_json::Value,
@@ -19676,13 +19802,14 @@ fn native_source_event_for_target(
     });
     if let Some(address) = address {
         event["address"] = json!(address);
+        event["target_text"] = json!(address);
     }
-    if let Some(step_id) = scenario_path
+    if let Some((step_id, expected)) = scenario_path
         .filter(|path| path.exists())
         .and_then(|path| boon_runtime::parse_scenario(path).ok())
         .and_then(|scenario| {
             scenario.step.into_iter().find_map(|step| {
-                let expected = step.expected_source_event?;
+                let expected = step.expected_source_event.clone()?;
                 let expected_source = expected.get("source")?.as_str()?;
                 if expected_source != source {
                     return None;
@@ -19691,11 +19818,21 @@ fn native_source_event_for_target(
                 if expected_address.is_some() && expected_address != address {
                     return None;
                 }
-                Some(step.id)
+                let expected_target_text =
+                    expected.get("target_text").and_then(toml::Value::as_str);
+                if expected_target_text.is_some() && expected_target_text != address {
+                    return None;
+                }
+                Some((step.id, expected))
             })
         })
     {
         event["scenario_step"] = json!(step_id);
+        for key in ["text", "key", "address", "target_text"] {
+            if let Some(value) = expected.get(key).and_then(toml::Value::as_str) {
+                event[key] = json!(value);
+            }
+        }
     }
     Some(event)
 }
@@ -19779,7 +19916,11 @@ fn native_driver_target_from_region(
         x + width / 2.0
     };
     let local_y = if kind == "scroll_region" {
-        y + height.min(24.0) / 2.0
+        y + if height > 100.0 {
+            height / 2.0
+        } else {
+            height.min(24.0) / 2.0
+        }
     } else {
         y + height / 2.0
     };

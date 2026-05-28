@@ -9612,7 +9612,7 @@ fn preview_caret_visible(input_state: &PreviewNativeInputState, now: Instant) ->
 
 fn preview_text_input_should_replace_on_type(layout_proof: &Value, node: &str) -> bool {
     let _ = (layout_proof, node);
-    true
+    false
 }
 
 fn preview_caret_index_for_text_hit_region(
@@ -9810,15 +9810,10 @@ fn preview_apply_real_window_input(
                         .saturating_sub(input_state.last_click_sequence)
                         <= 4;
                 input_state.focused_node = Some(node.clone());
-                input_state.focused_text.clear();
-                if double_click || was_already_focused {
-                    input_state.focused_text.push_str(
-                        preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
-                            .or_else(|| document_value_for_hit_region(layout, &hit_region))
-                            .as_deref()
-                            .unwrap_or_default(),
-                    );
-                }
+                input_state.focused_text =
+                    preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
+                        .or_else(|| document_value_for_hit_region(layout, &hit_region))
+                        .unwrap_or_default();
                 input_state.focused_caret_index = preview_caret_index_for_text_hit_region(
                     layout,
                     &hit_region,
@@ -9868,6 +9863,14 @@ fn preview_apply_real_window_input(
     if !pending_mouse_events.is_empty() && defer_focusable_mouse_events {
         input_state.pending_live_events.extend(pending_mouse_events);
         preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+        let pending = std::mem::take(&mut input_state.pending_live_events);
+        latest_layout = Some(preview_apply_live_events(
+            source_path,
+            source_text,
+            live_runtime,
+            shared_render_state,
+            pending,
+        )?);
     } else if !pending_mouse_events.is_empty() {
         latest_layout = Some(preview_apply_live_events(
             source_path,
@@ -10109,7 +10112,7 @@ fn preview_record_noop_input(
 
 const PREVIEW_CELLS_ROW_HEIGHT_PX: f64 = 26.0;
 const PREVIEW_CELLS_COLUMN_WIDTH_PX: f64 = 80.0;
-const PREVIEW_CELLS_WINDOW_ROWS: usize = 8;
+const PREVIEW_CELLS_WINDOW_ROWS: usize = 21;
 const PREVIEW_CELLS_WINDOW_COLUMNS: usize = 10;
 
 fn preview_apply_scroll_input(
@@ -11733,8 +11736,11 @@ fn preview_operator_host_input_response(
     } else {
         None
     };
-    let mut current_layout_proof =
-        native_document_layout_proof(&state.source_path, &state.source_text).ok();
+    let mut current_layout_proof = state
+        .shared_render_state
+        .lock()
+        .ok()
+        .map(|shared| shared.layout_proof.clone());
     let runtime_arc = state.live_runtime.clone();
     let mut runtime_guard = runtime_arc
         .as_ref()
@@ -11769,7 +11775,9 @@ fn preview_operator_host_input_response(
     let mut assertions = Vec::new();
     let mut route_assertions = Vec::new();
     let mut shared_render_update_count = 0_u64;
+    let mut stage_timings = Vec::new();
     for (index, input_json) in inputs.iter().enumerate() {
+        let input_started = Instant::now();
         let event_json = input_json.get("source_event").unwrap_or(input_json);
         let runtime = if let Some(runtime) = runtime_guard.as_mut() {
             &mut **runtime
@@ -11778,9 +11786,26 @@ fn preview_operator_host_input_response(
                 .as_mut()
                 .ok_or("operator-host-input runtime missing")?
         };
-        let before_state = runtime.state_summary();
+        let (row_start, row_count, column_start, column_count) = {
+            let shared = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            preview_scroll_window(shared.scroll_x_px, shared.scroll_y_px)
+        };
+        let window_ms = input_started.elapsed().as_secs_f64() * 1000.0;
+        let before_started = Instant::now();
+        let before_state = runtime.document_state_summary_for_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        );
+        let before_summary_ms = before_started.elapsed().as_secs_f64() * 1000.0;
+        let route_started = Instant::now();
         let host_route =
             preview_host_input_route_proof(input_json, event_json, current_layout_proof.as_ref());
+        let route_ms = route_started.elapsed().as_secs_f64() * 1000.0;
         let source = event_json
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -11809,6 +11834,7 @@ fn preview_operator_host_input_response(
                 .map(|value| value as usize),
         };
         let before_state_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&before_state)?);
+        let runtime_started = Instant::now();
         let output = if let Some(step_id) = event_json
             .get("scenario_step")
             .and_then(serde_json::Value::as_str)
@@ -11821,15 +11847,50 @@ fn preview_operator_host_input_response(
                 .iter()
                 .find(|step| step.id == step_id)
                 .ok_or_else(|| format!("scenario step `{step_id}` not found"))?;
-            runtime.apply_source_event_for_step(step, event.clone())?
+            runtime.apply_source_event_for_step_with_document_window(
+                step,
+                event.clone(),
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )?
         } else {
-            runtime.apply_source_event(event.clone())?
+            runtime.apply_source_event_for_document_window(
+                event.clone(),
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )?
         };
+        let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
         let mut preview_shared_render_state_updated = false;
         let mut post_input_layout_artifact = serde_json::Value::Null;
         let mut post_input_layout_hash = serde_json::Value::Null;
+        let mut post_input_frame_method = "no-render-patch-or-layout-update";
+        let layout_started = Instant::now();
         if !output.render_patches.is_empty() || !output.semantic_deltas.is_empty() {
-            if let Ok((post_input_layout, post_input_frame)) =
+            let focus_only_updated =
+                if event.address.is_some() && event.text.is_none() && event.key.is_none() {
+                    preview_update_shared_focus_node_from_runtime_state(
+                        &state.shared_render_state,
+                        &host_route,
+                        &event,
+                        &output.state_summary,
+                    )?
+                } else {
+                    false
+                };
+            if focus_only_updated {
+                preview_shared_render_state_updated = true;
+                shared_render_update_count = state
+                    .shared_render_state
+                    .lock()
+                    .map_err(|_| "preview render state mutex poisoned")?
+                    .update_count;
+                post_input_frame_method = "runtime-state-focused-node-overlay";
+            } else if let Ok((post_input_layout, post_input_frame)) =
                 native_document_layout_proof_with_state_embedded(
                     &state.source_path,
                     &state.source_text,
@@ -11858,12 +11919,24 @@ fn preview_operator_host_input_response(
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     current_layout_proof = Some(post_input_layout);
+                    post_input_frame_method =
+                        "render-patch-state-delta-and-runtime-backed-layout-recompute";
                 }
             }
         }
+        let layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
         let assertion =
             preview_operator_host_input_assertion(index, event_json, &event, &output.state_summary);
         route_assertions.push(host_route.clone());
+        stage_timings.push(json!({
+            "input_index": index,
+            "window_ms": window_ms,
+            "before_summary_ms": before_summary_ms,
+            "route_ms": route_ms,
+            "runtime_ms": runtime_ms,
+            "layout_ms": layout_ms,
+            "total_ms": input_started.elapsed().as_secs_f64() * 1000.0
+        }));
         outputs.push(json!({
             "scenario": event_json.get("scenario").cloned().unwrap_or_else(|| json!(null)),
             "scenario_step": event_json.get("scenario_step").cloned().unwrap_or_else(|| json!(null)),
@@ -11881,11 +11954,7 @@ fn preview_operator_host_input_response(
                 "preview_shared_render_update_count": shared_render_update_count,
                 "post_input_layout_artifact": post_input_layout_artifact,
                 "post_input_layout_artifact_sha256": post_input_layout_hash,
-                "post_input_frame_method": if preview_shared_render_state_updated {
-                    "render-patch-state-delta-and-runtime-backed-layout-recompute"
-                } else {
-                    "no-render-patch-or-layout-update"
-                }
+                "post_input_frame_method": post_input_frame_method
             },
             "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
             "bounded_state_summary_sample": bounded_state_summary_sample(&output.state_summary)
@@ -11915,17 +11984,86 @@ fn preview_operator_host_input_response(
         "input_injection_method": "operator_host_event_harness",
         "runtime_origin": runtime_origin,
         "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
-        "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event",
+        "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event_for_document_window",
         "private_runtime_dispatch_used": false,
         "source_event_only_ipc_shortcut": host_inputs.is_none(),
         "preview_side_layout_recomputed": current_layout_proof.is_some(),
         "preview_shared_render_update_count": shared_render_update_count,
+        "stage_timings": stage_timings,
         "host_route_assertions": route_assertions,
         "assertions": assertions,
         "outputs": outputs,
         "full_state_mirroring_observed": false,
         "preview_blocked_on_ipc_count": 0
     }))
+}
+
+fn preview_update_shared_focus_node_from_runtime_state(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    host_route: &serde_json::Value,
+    event: &boon_runtime::LiveSourceEvent,
+    state_summary: &serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(target_node) = host_route
+        .get("target_node")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let focused_text = event
+        .address
+        .as_deref()
+        .and_then(|address| focused_cell_editing_text_for_address(state_summary, address))
+        .or_else(|| event.target_text.clone())
+        .or_else(|| event.text.clone())
+        .unwrap_or_default();
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let Some(frame) = shared.layout_frame_override.as_mut() else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for item in &mut frame.display_list {
+        let is_target = item.node.0 == target_node;
+        if item.focused != is_target {
+            item.focused = is_target;
+            changed = true;
+        }
+        if is_target && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
+            if item.text.as_deref() != Some(focused_text.as_str()) {
+                item.text = Some(focused_text.clone());
+                changed = true;
+            }
+            let caret_column =
+                boon_document_model::StyleValue::Number(focused_text.chars().count() as f64);
+            if item
+                .style
+                .insert("caret_column".to_owned(), caret_column.clone())
+                != Some(caret_column)
+            {
+                changed = true;
+            }
+            let caret_visible = boon_document_model::StyleValue::Bool(true);
+            if item
+                .style
+                .insert("caret_visible".to_owned(), caret_visible.clone())
+                != Some(caret_visible)
+            {
+                changed = true;
+            }
+        } else if !is_target
+            && (item.style.remove("caret_column").is_some()
+                || item.style.remove("caret_visible").is_some())
+        {
+            changed = true;
+        }
+    }
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_error = None;
+    }
+    Ok(changed)
 }
 
 fn preview_host_input_route_proof(
@@ -11980,6 +12118,16 @@ fn preview_host_input_route_proof(
                     intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
                 })
                 && source_intent_matches_event_target(intent, &source_intents, event_json)
+        })
+        .or_else(|| {
+            dynamic_layout.then(|| {
+                source_intents.iter().find(|intent| {
+                    intent
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(source_path)
+                })
+            })?
         })
         .or(input_source_intent);
     let matched_node = matched_source_intent

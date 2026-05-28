@@ -254,10 +254,6 @@ impl Shared {
     }
 
     fn set_window_location(&self, location: MouseWindowLocation) {
-        logwise::debuginternal_sync!(
-            "Set mouse window location {location}",
-            location = logwise::privacy::LogIt(&location)
-        );
         *self.window.lock().unwrap() = Some(location);
         self.record_window_event(
             location.window.map(|e| e.0.as_ptr()).unwrap_or_default(),
@@ -265,7 +261,6 @@ impl Shared {
         )
     }
     fn set_key_state(&self, key: u8, down: bool, window: *mut c_void) {
-        logwise::debuginternal_sync!("Set mouse key {key} state {down}", key = key, down = down);
         self.buttons[key as usize].store(down, std::sync::atomic::Ordering::Relaxed);
         self.last_window.store(window, Ordering::Relaxed);
         let window_protocol_id = window as usize as u64;
@@ -289,11 +284,6 @@ impl Shared {
     }
 
     fn add_scroll_delta(&self, delta_x: f64, delta_y: f64, window: *mut c_void) {
-        logwise::debuginternal_sync!(
-            "Add mouse scroll delta {delta_x},{delta_y}",
-            delta_x = delta_x,
-            delta_y = delta_y
-        );
         self.scroll_delta_x
             .fetch_add(delta_x, std::sync::atomic::Ordering::Relaxed);
         self.scroll_delta_y

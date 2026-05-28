@@ -39,7 +39,6 @@ const BOON_EDITOR_KEY_REPEAT_INTERVAL_MS: u64 = 30;
 const BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP: usize = 8;
 const DEV_EDITOR_WHEEL_UNIT: f64 = 8.0;
 const DEV_EDITOR_WHEEL_MIN_STEPS: isize = 3;
-const PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX: usize = 16 * 1024;
 
 const DEV_BG: &str = "#0f1724";
 const DEV_PANEL: &str = "#141b2a";
@@ -459,6 +458,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
+    start_preview_source_project_prewarm();
     let (document_layout_proof, document_layout_frame) =
         native_document_layout_proof_with_state_mode(Path::new(&code_file), &source, None, true)
             .unwrap_or_else(|error| {
@@ -849,6 +849,13 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         layout_refreshed = true;
                         role_dirty_reason =
                             Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                    } else if before_input.editor_visual_only(&after_input)
+                        && patch_dev_render_editor_visual_state(&shell, &mut render_state)
+                    {
+                        layout_refreshed = true;
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                        );
                     } else {
                         needs_layout_refresh = true;
                         role_dirty_reason = Some(
@@ -936,6 +943,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut visible_renderer,
                 &shell,
                 layout_frame,
+                &render_state.code_editor_model_report,
                 render_state.full_layout_refresh_count,
                 render_state.fast_frame_patch_count,
             )?;
@@ -2202,6 +2210,7 @@ fn native_gpu_dev_visible_render_hook(
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     shell: &DevWindowShell,
     layout_frame: &boon_document::LayoutFrame,
+    code_editor_model_report: &serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
 ) -> Result<serde_json::Value, String> {
@@ -2245,23 +2254,8 @@ fn native_gpu_dev_visible_render_hook(
         "dev_window_tabs_visible": true,
         "dev_window_toolbar_visible": true,
         "dev_window_controls": ["Run", "Format", "Reset"],
-        "code_editor_model": {
-            "full_buffer_bytes": shell.workspace.selected_buffer.source_text.len(),
-            "full_buffer_lines": shell.workspace.selected_buffer.line_count,
-            "scroll_line": shell.workspace.selected_buffer.scroll_line,
-            "scroll_column": shell.workspace.selected_buffer.scroll_column,
-            "syntax_backend": shell.workspace.selected_buffer.syntax_backend(),
-            "syntax_parser_backed": shell.workspace.selected_buffer.syntax_parser_backed(),
-            "syntax_token_count": shell.workspace.selected_buffer.syntax_token_count(),
-            "syntax_categories": shell.workspace.selected_buffer.syntax_categories(),
-            "syntax_render_categories": shell.workspace.selected_buffer.syntax_render_categories(),
-            "syntax_render_segment_samples": shell.workspace.selected_buffer.syntax_render_segment_samples(),
-            "syntax_render_segment_count": shell.workspace.selected_buffer.syntax_render_segments_for_visible_lines(40).len(),
-            "syntax_theme": shell.workspace.selected_buffer.syntax_theme_report(),
-            "diagnostic_count": shell.workspace.selected_buffer.diagnostics.len(),
-            "font_family": shell.editor_view.font_family,
-            "native_rust_editor_model": true
-        },
+        "code_editor_model": code_editor_model_report,
+        "code_editor_visible_style": dev_code_editor_visible_style_report(layout_frame),
         "dev_hot_path_counters": {
             "preview_replace_result_poll_count": shell.preview_replace_result_poll_count,
             "preview_summary_query_count": shell.preview_summary_query_count,
@@ -2276,6 +2270,116 @@ fn native_gpu_dev_visible_render_hook(
         },
         "layout_metrics": layout_frame.metrics
     }))
+}
+
+fn dev_code_editor_visible_style_report(
+    layout_frame: &boon_document::LayoutFrame,
+) -> serde_json::Value {
+    let mut line_text_count = 0_u64;
+    let mut non_empty_line_count = 0_u64;
+    let mut rich_text_line_count = 0_u64;
+    let mut syntax_span_line_count = 0_u64;
+    let mut non_empty_syntax_span_line_count = 0_u64;
+    let mut font_family_line_count = 0_u64;
+    let mut font_feature_line_count = 0_u64;
+    let mut missing_samples = Vec::new();
+
+    for item in &layout_frame.display_list {
+        if !item.node.0.starts_with("dev-code-editor-line-text-") {
+            continue;
+        }
+        line_text_count = line_text_count.saturating_add(1);
+        let non_empty_text = item.text.as_ref().is_some_and(|text| !text.is_empty());
+        if non_empty_text {
+            non_empty_line_count = non_empty_line_count.saturating_add(1);
+        }
+        let rich_text =
+            item.style.get("rich_text") == Some(&boon_document_model::StyleValue::Bool(true));
+        let syntax_spans = item
+            .style
+            .get("syntax_spans_json")
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Text(text) => Some(text.as_str()),
+                _ => None,
+            });
+        let has_syntax_spans = syntax_spans.is_some();
+        let has_non_empty_syntax_spans = syntax_spans.is_some_and(|text| text != "[]");
+        let has_font_family = item.style.get("font").is_some();
+        let has_font_features = item.style.get("font_features").is_some();
+
+        if rich_text {
+            rich_text_line_count = rich_text_line_count.saturating_add(1);
+        }
+        if has_syntax_spans {
+            syntax_span_line_count = syntax_span_line_count.saturating_add(1);
+        }
+        if non_empty_text && has_non_empty_syntax_spans {
+            non_empty_syntax_span_line_count = non_empty_syntax_span_line_count.saturating_add(1);
+        }
+        if has_font_family {
+            font_family_line_count = font_family_line_count.saturating_add(1);
+        }
+        if has_font_features {
+            font_feature_line_count = font_feature_line_count.saturating_add(1);
+        }
+
+        if missing_samples.len() < 8
+            && (!rich_text
+                || !has_syntax_spans
+                || (non_empty_text && !has_non_empty_syntax_spans)
+                || !has_font_family
+                || !has_font_features)
+        {
+            missing_samples.push(json!({
+                "node": item.node.0,
+                "text": item.text.as_deref().unwrap_or_default().chars().take(80).collect::<String>(),
+                "rich_text": rich_text,
+                "syntax_spans_json": has_syntax_spans,
+                "non_empty_syntax_spans_json": has_non_empty_syntax_spans,
+                "font": has_font_family,
+                "font_features": has_font_features
+            }));
+        }
+    }
+
+    let pass = line_text_count > 0
+        && rich_text_line_count == line_text_count
+        && syntax_span_line_count == line_text_count
+        && non_empty_syntax_span_line_count == non_empty_line_count
+        && font_family_line_count == line_text_count
+        && font_feature_line_count == line_text_count;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "line_text_count": line_text_count,
+        "non_empty_line_count": non_empty_line_count,
+        "rich_text_line_count": rich_text_line_count,
+        "syntax_span_line_count": syntax_span_line_count,
+        "non_empty_syntax_span_line_count": non_empty_syntax_span_line_count,
+        "font_family_line_count": font_family_line_count,
+        "font_feature_line_count": font_feature_line_count,
+        "missing_style_samples": missing_samples
+    })
+}
+
+fn dev_code_editor_model_report(shell: &DevWindowShell) -> serde_json::Value {
+    let model = &shell.workspace.selected_buffer;
+    json!({
+        "full_buffer_bytes": model.source_text.len(),
+        "full_buffer_lines": model.line_count,
+        "scroll_line": model.scroll_line,
+        "scroll_column": model.scroll_column,
+        "syntax_backend": model.syntax_backend(),
+        "syntax_parser_backed": model.syntax_parser_backed(),
+        "syntax_token_count": model.syntax_token_count(),
+        "syntax_categories": model.syntax_categories(),
+        "syntax_render_categories": model.syntax_render_categories(),
+        "syntax_render_segment_samples": model.syntax_render_segment_samples(),
+        "syntax_render_segment_count": model.syntax_render_segments_for_visible_lines(40).len(),
+        "syntax_theme": model.syntax_theme_report(),
+        "diagnostic_count": model.diagnostics.len(),
+        "font_family": shell.editor_view.font_family,
+        "native_rust_editor_model": true
+    })
 }
 
 #[derive(Default)]
@@ -2297,12 +2401,14 @@ struct DevRenderState {
     height: u32,
     revision: u64,
     layout_frame: Option<boon_document::LayoutFrame>,
+    code_editor_model_report: serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DevEditorSnapshot {
+    source_hash: String,
     source_len: usize,
     line_count: usize,
     selection_start: usize,
@@ -2316,6 +2422,9 @@ impl DevEditorSnapshot {
     fn from_shell(shell: &DevWindowShell) -> Self {
         let (selection_start, selection_end) = shell.workspace.selected_buffer.selection_offsets();
         Self {
+            source_hash: boon_runtime::sha256_bytes(
+                shell.workspace.selected_buffer.source_text.as_bytes(),
+            ),
             source_len: shell.workspace.selected_buffer.source_text.len(),
             line_count: shell.workspace.selected_buffer.line_count,
             selection_start,
@@ -2327,12 +2436,22 @@ impl DevEditorSnapshot {
     }
 
     fn editor_scroll_only(&self, after: &Self) -> bool {
-        self.source_len == after.source_len
+        self.source_hash == after.source_hash
+            && self.source_len == after.source_len
             && self.line_count == after.line_count
             && self.selection_start == after.selection_start
             && self.selection_end == after.selection_end
             && self.footer_scroll_line == after.footer_scroll_line
             && (self.scroll_line != after.scroll_line || self.scroll_column != after.scroll_column)
+    }
+
+    fn editor_visual_only(&self, after: &Self) -> bool {
+        self.source_hash == after.source_hash
+            && self.source_len == after.source_len
+            && self.line_count == after.line_count
+            && self.scroll_line == after.scroll_line
+            && self.scroll_column == after.scroll_column
+            && self.footer_scroll_line == after.footer_scroll_line
     }
 }
 
@@ -2363,6 +2482,7 @@ fn refresh_dev_render_layout(
     }));
     render_state.width = width;
     render_state.height = height;
+    render_state.code_editor_model_report = dev_code_editor_model_report(shell);
     render_state.revision = render_state.revision.saturating_add(1);
     render_state.full_layout_refresh_count =
         render_state.full_layout_refresh_count.saturating_add(1);
@@ -2386,6 +2506,120 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
     }
     render_state.revision = render_state.revision.saturating_add(1);
     render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+}
+
+fn editor_line_number_from_node_id(node_id: &str, prefix: &str) -> Option<usize> {
+    node_id.strip_prefix(prefix)?.parse::<usize>().ok()
+}
+
+fn dev_editor_row_bg(model: &CodeEditorModel, line_number: usize) -> &'static str {
+    if line_number == model.caret().line {
+        BOON_EDITOR_HIGHLIGHT_BACKGROUND
+    } else {
+        BOON_EDITOR_BACKGROUND
+    }
+}
+
+fn apply_dev_editor_visual_style(
+    style: &mut BTreeMap<String, boon_document_model::StyleValue>,
+    model: &CodeEditorModel,
+    bracket_columns_by_line: &BTreeMap<usize, Vec<usize>>,
+    line_number: usize,
+    caret_visible: bool,
+) {
+    for key in [
+        "editor_selection_start",
+        "editor_selection_end",
+        "editor_caret_column",
+        "editor_caret_visible",
+        "editor_bracket_columns",
+    ] {
+        style.remove(key);
+    }
+    if let Some((start, end)) = model.selection_columns_for_line(line_number) {
+        style.insert(
+            "editor_selection_start".to_owned(),
+            boon_document_model::StyleValue::Number(start as f64),
+        );
+        style.insert(
+            "editor_selection_end".to_owned(),
+            boon_document_model::StyleValue::Number(end as f64),
+        );
+    }
+    if model.caret().line == line_number {
+        style.insert(
+            "editor_caret_column".to_owned(),
+            boon_document_model::StyleValue::Number(model.caret().column.saturating_sub(1) as f64),
+        );
+        style.insert(
+            "editor_caret_visible".to_owned(),
+            boon_document_model::StyleValue::Bool(caret_visible),
+        );
+    }
+    let bracket_columns = bracket_columns_by_line
+        .get(&line_number)
+        .into_iter()
+        .flatten()
+        .map(|column| column.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !bracket_columns.is_empty() {
+        style.insert(
+            "editor_bracket_columns".to_owned(),
+            boon_document_model::StyleValue::Text(bracket_columns),
+        );
+    }
+}
+
+fn patch_dev_render_editor_visual_state(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return false;
+    };
+    let model = &shell.workspace.selected_buffer;
+    let bracket_columns_by_line = model.bracket_columns_by_line();
+    let mut patched = false;
+    for item in &mut frame.display_list {
+        if let Some(line_number) =
+            editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-text-")
+        {
+            apply_dev_editor_visual_style(
+                &mut item.style,
+                model,
+                &bracket_columns_by_line,
+                line_number,
+                shell.caret_visible,
+            );
+            patched = true;
+        } else if let Some(line_number) =
+            editor_line_number_from_node_id(&item.node.0, "dev-code-editor-line-")
+                .or_else(|| {
+                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-gutter-")
+                })
+                .or_else(|| {
+                    editor_line_number_from_node_id(&item.node.0, "dev-code-editor-code-row-")
+                })
+        {
+            item.style.insert(
+                "bg".to_owned(),
+                boon_document_model::StyleValue::Text(
+                    dev_editor_row_bg(model, line_number).to_owned(),
+                ),
+            );
+            patched = true;
+        }
+    }
+    if patched {
+        render_state.revision = render_state.revision.saturating_add(1);
+        render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+        if render_state.code_editor_model_report.is_object() {
+            render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
+            render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
+        }
+    }
+    patched
 }
 
 fn patch_dev_render_editor_scroll(
@@ -2417,73 +2651,29 @@ fn patch_dev_render_editor_scroll(
             .total_cmp(&frame.display_list[*right].bounds.y)
     });
     let visible_lines = model.visible_lines(text_indices.len());
-    let defer_rich_syntax = model.uses_deferred_large_buffer_syntax();
+    let bracket_columns_by_line = model.bracket_columns_by_line();
     for (item_index, (line_number, line)) in text_indices.into_iter().zip(visible_lines.iter()) {
         let item = &mut frame.display_list[item_index];
         item.node =
             boon_document_model::DocumentNodeId(format!("dev-code-editor-line-text-{line_number}"));
         item.text = Some(line.clone());
-        if defer_rich_syntax {
-            item.style.remove("syntax_spans_json");
-            item.style.insert(
-                "rich_text".to_owned(),
-                boon_document_model::StyleValue::Bool(false),
-            );
-        } else {
-            item.style.insert(
-                "syntax_spans_json".to_owned(),
-                boon_document_model::StyleValue::Text(syntax_spans_json(
-                    &model.highlighted_line_segments(*line_number, line),
-                )),
-            );
-            item.style.insert(
-                "rich_text".to_owned(),
-                boon_document_model::StyleValue::Bool(true),
-            );
-        }
-        for key in [
-            "editor_selection_start",
-            "editor_selection_end",
-            "editor_caret_column",
-            "editor_caret_visible",
-            "editor_bracket_columns",
-        ] {
-            item.style.remove(key);
-        }
-        if let Some((start, end)) = model.selection_columns_for_line(*line_number) {
-            item.style.insert(
-                "editor_selection_start".to_owned(),
-                boon_document_model::StyleValue::Number(start as f64),
-            );
-            item.style.insert(
-                "editor_selection_end".to_owned(),
-                boon_document_model::StyleValue::Number(end as f64),
-            );
-        }
-        if model.caret().line == *line_number {
-            item.style.insert(
-                "editor_caret_column".to_owned(),
-                boon_document_model::StyleValue::Number(
-                    model.caret().column.saturating_sub(1) as f64
-                ),
-            );
-            item.style.insert(
-                "editor_caret_visible".to_owned(),
-                boon_document_model::StyleValue::Bool(shell.caret_visible),
-            );
-        }
-        let bracket_columns = model
-            .bracket_columns_for_line(*line_number)
-            .into_iter()
-            .map(|column| column.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if !bracket_columns.is_empty() {
-            item.style.insert(
-                "editor_bracket_columns".to_owned(),
-                boon_document_model::StyleValue::Text(bracket_columns),
-            );
-        }
+        item.style.insert(
+            "syntax_spans_json".to_owned(),
+            boon_document_model::StyleValue::Text(syntax_spans_json(
+                &model.highlighted_line_segments(*line_number, line),
+            )),
+        );
+        item.style.insert(
+            "rich_text".to_owned(),
+            boon_document_model::StyleValue::Bool(true),
+        );
+        apply_dev_editor_visual_style(
+            &mut item.style,
+            model,
+            &bracket_columns_by_line,
+            *line_number,
+            shell.caret_visible,
+        );
     }
 
     let mut gutter_indices = frame
@@ -2512,6 +2702,10 @@ fn patch_dev_render_editor_scroll(
 
     render_state.revision = render_state.revision.saturating_add(1);
     render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+    if render_state.code_editor_model_report.is_object() {
+        render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
+        render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
+    }
     true
 }
 
@@ -4221,6 +4415,14 @@ impl BoonLanguageService {
         Self::syntax_tokens_fallback(&source[..end.min(source.len())])
     }
 
+    fn syntax_tokens_for_visible_line(line_number: usize, line: &str) -> Vec<SyntaxToken> {
+        let mut tokens = Self::syntax_tokens_fallback(line);
+        for token in &mut tokens {
+            token.line = line_number;
+        }
+        tokens
+    }
+
     fn syntax_token_from_ast_token(
         source: &str,
         token: &boon_parser::AstToken,
@@ -5061,10 +5263,6 @@ impl CodeEditorModel {
             .collect()
     }
 
-    fn uses_deferred_large_buffer_syntax(&self) -> bool {
-        self.syntax_backend == "editor-fallback-tokenizer-deferred-large-buffer"
-    }
-
     fn syntax_render_categories(&self) -> Vec<&'static str> {
         self.syntax_render_segments_for_visible_lines(40)
             .into_iter()
@@ -5125,10 +5323,18 @@ impl CodeEditorModel {
         let mut cursor = 0usize;
         let mut segments = Vec::new();
         let empty_tokens = Vec::new();
-        let tokens = self
-            .syntax_tokens_by_line
-            .get(&line_number)
-            .unwrap_or(&empty_tokens);
+        let fallback_tokens;
+        let tokens = if let Some(tokens) = self.syntax_tokens_by_line.get(&line_number) {
+            tokens
+        } else if self.syntax_backend == "editor-fallback-tokenizer-deferred-large-buffer"
+            && !line.is_empty()
+        {
+            fallback_tokens =
+                BoonLanguageService::syntax_tokens_for_visible_line(line_number, line);
+            &fallback_tokens
+        } else {
+            &empty_tokens
+        };
         for token in tokens {
             let token_start = token.column.saturating_sub(1).min(line_len);
             let token_end = token_start.saturating_add(token.len).min(line_len);
@@ -5252,16 +5458,29 @@ impl CodeEditorModel {
         (end_col > start_col).then_some((start_col, end_col))
     }
 
+    #[cfg(test)]
     fn bracket_columns_for_line(&self, line: usize) -> Vec<usize> {
+        self.bracket_columns_by_line()
+            .remove(&line)
+            .unwrap_or_default()
+    }
+
+    fn bracket_columns_by_line(&self) -> BTreeMap<usize, Vec<usize>> {
         let ignored_ranges = self.bracket_ignored_ranges();
-        self.buffer
+        let mut by_line = BTreeMap::<usize, Vec<usize>>::new();
+        for position in self
+            .buffer
             .bracket_match(&ignored_ranges)
             .into_iter()
             .flat_map(|pair| [pair.open_byte, pair.close_byte])
             .map(|byte| self.position_for_offset(byte))
-            .filter(|position| position.line == line)
-            .map(|position| position.column.saturating_sub(1))
-            .collect()
+        {
+            by_line
+                .entry(position.line)
+                .or_default()
+                .push(position.column.saturating_sub(1));
+        }
+        by_line
     }
 
     fn bracket_ignored_ranges(&self) -> Vec<(usize, usize)> {
@@ -5615,13 +5834,10 @@ impl CodeEditorView {
         let visible_line_count = (editor_height.saturating_sub(BOON_EDITOR_PADDING * 2)
             / BOON_EDITOR_LINE_HEIGHT)
             .max(1) as usize;
+        let bracket_columns_by_line = model.bracket_columns_by_line();
         for (line_number, line) in model.visible_lines(visible_line_count) {
             let row_id = format!("dev-code-editor-line-{line_number}");
-            let row_bg = if line_number == model.caret().line {
-                BOON_EDITOR_HIGHLIGHT_BACKGROUND
-            } else {
-                BOON_EDITOR_BACKGROUND
-            };
+            let row_bg = dev_editor_row_bg(model, line_number);
             let row = dev_node(
                 &row_id,
                 boon_document_model::DocumentNodeKind::Row,
@@ -5669,6 +5885,7 @@ impl CodeEditorView {
                 frame,
                 code_row_parent,
                 model,
+                &bracket_columns_by_line,
                 line_number,
                 &line,
                 caret_visible,
@@ -5681,6 +5898,7 @@ impl CodeEditorView {
         frame: &mut boon_document_model::DocumentFrame,
         parent: boon_document_model::DocumentNodeId,
         model: &CodeEditorModel,
+        bracket_columns_by_line: &BTreeMap<usize, Vec<usize>>,
         line_number: usize,
         line: &str,
         caret_visible: bool,
@@ -5689,7 +5907,14 @@ impl CodeEditorView {
         append_child(
             frame,
             parent,
-            self.editor_line_node(line_number, line, &segments, model, caret_visible),
+            self.editor_line_node(
+                line_number,
+                line,
+                &segments,
+                model,
+                bracket_columns_by_line,
+                caret_visible,
+            ),
         );
     }
 
@@ -5699,6 +5924,7 @@ impl CodeEditorView {
         line: &str,
         segments: &[SyntaxLineSegment],
         model: &CodeEditorModel,
+        bracket_columns_by_line: &BTreeMap<usize, Vec<usize>>,
         caret_visible: bool,
     ) -> boon_document_model::DocumentNode {
         let syntax_spans_json = syntax_spans_json(segments);
@@ -5723,40 +5949,13 @@ impl CodeEditorView {
                 ("editor_selection_match_color", BOON_EDITOR_SELECTION_MATCH),
             ],
         );
-        if let Some((start, end)) = model.selection_columns_for_line(line_number) {
-            node.style.insert(
-                "editor_selection_start".to_owned(),
-                boon_document_model::StyleValue::Number(start as f64),
-            );
-            node.style.insert(
-                "editor_selection_end".to_owned(),
-                boon_document_model::StyleValue::Number(end as f64),
-            );
-        }
-        if model.caret().line == line_number {
-            node.style.insert(
-                "editor_caret_column".to_owned(),
-                boon_document_model::StyleValue::Number(
-                    model.caret().column.saturating_sub(1) as f64
-                ),
-            );
-            node.style.insert(
-                "editor_caret_visible".to_owned(),
-                boon_document_model::StyleValue::Bool(caret_visible),
-            );
-        }
-        let bracket_columns = model
-            .bracket_columns_for_line(line_number)
-            .into_iter()
-            .map(|column| column.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if !bracket_columns.is_empty() {
-            node.style.insert(
-                "editor_bracket_columns".to_owned(),
-                boon_document_model::StyleValue::Text(bracket_columns),
-            );
-        }
+        apply_dev_editor_visual_style(
+            &mut node.style,
+            model,
+            bracket_columns_by_line,
+            line_number,
+            caret_visible,
+        );
         node.style.insert(
             "rich_text".to_owned(),
             boon_document_model::StyleValue::Bool(true),
@@ -11679,9 +11878,12 @@ impl PreviewReplaceWorkerQueue {
             .spawn(move || {
                 loop {
                     let payload = queue.wait_for_latest_payload();
-                    let result = preview_build_source_project(payload.clone(), || {
-                        preview_source_project_payload_is_latest(&state, &payload)
-                    });
+                    let result =
+                        preview_take_prebuilt_source_project(&payload).unwrap_or_else(|| {
+                            preview_build_source_project(payload.clone(), || {
+                                preview_source_project_payload_is_latest(&state, &payload)
+                            })
+                        });
                     if let Err(error) =
                         preview_commit_source_project_result(&state, &payload, result)
                     {
@@ -12043,6 +12245,66 @@ struct PreviewReplaceBuildResult {
     diagnostic: Option<String>,
 }
 
+fn preview_prebuilt_source_project_cache()
+-> &'static Mutex<BTreeMap<String, PreviewReplaceBuildResult>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, PreviewReplaceBuildResult>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn start_preview_source_project_prewarm() {
+    let _ = std::thread::Builder::new()
+        .name("boon-native-preview-source-prewarm".to_owned())
+        .spawn(|| {
+            for example in ["cells"] {
+                if let Err(error) = prewarm_manifest_source_project(example) {
+                    eprintln!(
+                        "boon_native_playground: preview source prewarm for {example} failed: {error}"
+                    );
+                }
+            }
+        });
+}
+
+fn prewarm_manifest_source_project(example: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = boon_runtime::example_manifest_entry(example)?;
+    let source = boon_runtime::source_text_for_entry(&entry)?;
+    let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+    if preview_prebuilt_source_project_cache()
+        .lock()
+        .is_ok_and(|cache| cache.contains_key(&source_hash))
+    {
+        return Ok(());
+    }
+    let payload = SourceProjectPayload::single_unit(
+        0,
+        0,
+        &format!("prewarm:{example}:{source_hash}"),
+        &entry.source,
+        &source,
+    );
+    let result = preview_build_source_project(payload, || true);
+    if result.status == "pass"
+        && let Ok(mut cache) = preview_prebuilt_source_project_cache().lock()
+    {
+        cache.insert(source_hash, result);
+    }
+    Ok(())
+}
+
+fn preview_take_prebuilt_source_project(
+    payload: &SourceProjectPayload,
+) -> Option<PreviewReplaceBuildResult> {
+    let mut result = preview_prebuilt_source_project_cache()
+        .lock()
+        .ok()?
+        .remove(&payload.project_hash)?;
+    result.virtual_uri = payload.entrypoint_unit.clone();
+    if result.timings.is_object() {
+        result.timings["prebuilt_source_project_cache_hit"] = json!(true);
+    }
+    Some(result)
+}
+
 fn preview_source_project_payload_is_latest(
     state: &Arc<Mutex<PreviewIpcState>>,
     payload: &SourceProjectPayload,
@@ -12299,84 +12561,55 @@ where
         }
     };
     let source_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
-    let defer_runtime = entrypoint.text.len() > PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX;
-    let mut live_runtime_ms = 0.0;
-    let mut runtime_summary_ms = 0.0;
-    let (runtime_summary, document_state_summary, live_runtime) = if defer_runtime {
-        (
+    if !is_latest() {
+        return preview_stale_source_project_result(payload, build_started, "before-live-runtime");
+    }
+    let live_runtime_started = Instant::now();
+    let live_runtime_result = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview-live:{}", entrypoint.virtual_uri),
+        &entrypoint.text,
+    );
+    let live_runtime_ms = elapsed_ms(live_runtime_started);
+    if !is_latest() {
+        return preview_stale_source_project_result(payload, build_started, "after-live-runtime");
+    }
+    let runtime_summary_started = Instant::now();
+    let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
+        Ok(mut runtime) => {
+            let state_summary = runtime.state_summary();
+            let document_state_summary = runtime.document_state_summary();
+            let summary = preview_runtime_summary_from_state_summary(
+                Path::new(&entrypoint.virtual_uri),
+                &source_hash,
+                state_summary,
+            );
+            (
+                summary,
+                Some(document_state_summary),
+                Some(Arc::new(Mutex::new(runtime))),
+            )
+        }
+        Err(error) => (
             json!({
-                "status": "deferred",
+                "status": "fail",
                 "owns_live_runtime": false,
-                "reason": "source exceeds synchronous preview switch runtime budget",
-                "sync_runtime_budget_bytes": PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX,
+                "reason": error.to_string(),
                 "source_path": entrypoint.virtual_uri,
                 "source_sha256": source_hash.clone(),
-                "source_bytes": entrypoint.text.len(),
                 "full_state_mirroring_allowed": false
             }),
-            Some(json!({})),
             None,
-        )
-    } else {
-        if !is_latest() {
-            return preview_stale_source_project_result(
-                payload,
-                build_started,
-                "before-live-runtime",
-            );
-        }
-        let live_runtime_started = Instant::now();
-        let live_runtime_result = boon_runtime::LiveRuntime::from_source(
-            &format!("native-preview-live:{}", entrypoint.virtual_uri),
-            &entrypoint.text,
-        );
-        live_runtime_ms = elapsed_ms(live_runtime_started);
-        if !is_latest() {
-            return preview_stale_source_project_result(
-                payload,
-                build_started,
-                "after-live-runtime",
-            );
-        }
-        let runtime_summary_started = Instant::now();
-        let result = match live_runtime_result {
-            Ok(mut runtime) => {
-                let state_summary = runtime.state_summary();
-                let document_state_summary = runtime.document_state_summary();
-                let summary = preview_runtime_summary_from_state_summary(
-                    Path::new(&entrypoint.virtual_uri),
-                    &source_hash,
-                    state_summary,
-                );
-                (
-                    summary,
-                    Some(document_state_summary),
-                    Some(Arc::new(Mutex::new(runtime))),
-                )
-            }
-            Err(error) => (
-                json!({
-                    "status": "fail",
-                    "owns_live_runtime": false,
-                    "reason": error.to_string(),
-                    "source_path": entrypoint.virtual_uri,
-                    "source_sha256": source_hash.clone(),
-                    "full_state_mirroring_allowed": false
-                }),
-                None,
-                None,
-            ),
-        };
-        runtime_summary_ms = elapsed_ms(runtime_summary_started);
-        if !is_latest() {
-            return preview_stale_source_project_result(
-                payload,
-                build_started,
-                "after-runtime-summary",
-            );
-        }
-        result
+            None,
+        ),
     };
+    let runtime_summary_ms = elapsed_ms(runtime_summary_started);
+    if !is_latest() {
+        return preview_stale_source_project_result(
+            payload,
+            build_started,
+            "after-runtime-summary",
+        );
+    }
     let layout_started = Instant::now();
     let layout_proof = native_document_layout_proof_with_state(
         Path::new(&entrypoint.virtual_uri),
@@ -12396,7 +12629,7 @@ where
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("missing");
-    let pass = layout_status == "pass" && matches!(runtime_status, "pass" | "deferred");
+    let pass = layout_status == "pass" && runtime_status == "pass" && live_runtime.is_some();
     let diagnostic = (!pass).then(|| {
         format!(
             "replace-source failed before commit: layout_status={layout_status}, runtime_status={runtime_status}"
@@ -12412,8 +12645,7 @@ where
             "layout_ms": layout_ms,
             "runtime_summary_ms": runtime_summary_ms,
             "live_runtime_ms": live_runtime_ms,
-            "runtime_deferred": defer_runtime,
-            "sync_runtime_budget_bytes": PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX,
+            "runtime_deferred": false,
             "total_ms": total_ms
         }),
         source_bytes: entrypoint.text.len() as u64,
@@ -15019,7 +15251,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_render_scroll_patch_defers_rich_spans_for_large_buffers() {
+    fn dev_render_scroll_patch_preserves_rich_spans_for_large_buffers() {
         let mut source = String::new();
         for index in 0..12_000 {
             source.push_str(&format!("-- large buffer scroll line {index:05}\n"));
@@ -15030,9 +15262,11 @@ mod tests {
         let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
 
         refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
-        shell.workspace.selected_buffer.scroll_line = 15;
+        shell.workspace.selected_buffer.scroll_line = BOON_EDITOR_DEFERRED_SYNTAX_LINES + 8;
 
         assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
+        let expected_line = BOON_EDITOR_DEFERRED_SYNTAX_LINES + 9;
+        let expected_node = format!("dev-code-editor-line-text-{expected_line}");
         let line = render_state
             .layout_frame
             .as_ref()
@@ -15040,16 +15274,106 @@ mod tests {
                 frame
                     .display_list
                     .iter()
-                    .find(|item| item.node.0 == "dev-code-editor-line-text-16")
+                    .find(|item| item.node.0 == expected_node.as_str())
             })
             .expect("patched line should be visible");
         assert_eq!(
             line.style.get("rich_text"),
-            Some(&boon_document_model::StyleValue::Bool(false))
+            Some(&boon_document_model::StyleValue::Bool(true))
         );
+        let syntax_spans = line
+            .style
+            .get("syntax_spans_json")
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("large-buffer scroll patch should keep syntax spans on visible lines");
+        let syntax_spans_json: serde_json::Value =
+            serde_json::from_str(syntax_spans).expect("syntax spans should be valid JSON");
         assert!(
-            !line.style.contains_key("syntax_spans_json"),
-            "large-buffer scroll patch should keep the fast plain-text render path"
+            syntax_spans_json
+                .as_array()
+                .is_some_and(|spans| spans.iter().any(|span| span
+                    .get("font_style")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("italic"))),
+            "visible-range fallback highlighting should style deep large-buffer lines: {syntax_spans}"
+        );
+        let style_report = dev_code_editor_visible_style_report(
+            render_state
+                .layout_frame
+                .as_ref()
+                .expect("patched frame should exist"),
+        );
+        assert_eq!(style_report["status"], "pass");
+    }
+
+    #[test]
+    fn editor_caret_click_uses_visual_patch_without_full_layout_refresh() {
+        let (mut shell, mut input_state, document, layout) =
+            test_dev_editor_context("value: [count]\nnext: {}\n");
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        let initial_full_refresh_count = render_state.full_layout_refresh_count;
+
+        let line = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor-line-text-1")
+            .expect("line text should be laid out");
+        let mut click = test_keyboard_input(Vec::new(), Vec::new());
+        click.mouse_button_event_count = 1;
+        click.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 1,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        }];
+        click.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(line.bounds.x + 72.0),
+            y: f64::from(line.bounds.y + line.bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        let before = DevEditorSnapshot::from_shell(&shell);
+        assert!(dev_apply_real_window_input(
+            &click,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        let after = DevEditorSnapshot::from_shell(&shell);
+        assert!(before.editor_visual_only(&after));
+        assert!(patch_dev_render_editor_visual_state(
+            &shell,
+            &mut render_state
+        ));
+
+        assert_eq!(
+            render_state.full_layout_refresh_count, initial_full_refresh_count,
+            "caret-only editor clicks must not rebuild the whole dev layout"
+        );
+        assert_eq!(render_state.fast_frame_patch_count, 1);
+        let patched_line = render_state
+            .layout_frame
+            .as_ref()
+            .and_then(|frame| {
+                frame
+                    .display_list
+                    .iter()
+                    .find(|item| item.node.0 == "dev-code-editor-line-text-1")
+            })
+            .expect("patched line should remain visible");
+        assert!(patched_line.style.contains_key("editor_caret_column"));
+        assert!(
+            patched_line.style.contains_key("editor_bracket_columns"),
+            "bracket highlight should be patched with the caret"
         );
     }
 
@@ -15443,6 +15767,56 @@ mod tests {
     }
 
     #[test]
+    fn editor_wheel_scrolls_down_and_back_up() {
+        let source = (0..160)
+            .map(|index| format!("line_{index}: TEXT {{ value }}\n"))
+            .collect::<String>();
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(&source);
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+        let editor_position = boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(editor_bounds.x + editor_bounds.width * 0.5),
+            y: f64::from(editor_bounds.y + editor_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        };
+
+        let mut scroll_down = test_keyboard_input(Vec::new(), Vec::new());
+        scroll_down.scroll_delta_y = 24.0;
+        scroll_down.mouse_scroll_event_count = 1;
+        scroll_down.mouse_window_pos = Some(editor_position);
+        assert!(dev_apply_real_window_input(
+            &scroll_down,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 3);
+
+        let mut scroll_up = test_keyboard_input(Vec::new(), Vec::new());
+        scroll_up.scroll_delta_y = -24.0;
+        scroll_up.mouse_scroll_event_count = 2;
+        scroll_up.mouse_window_pos = Some(editor_position);
+        assert!(dev_apply_real_window_input(
+            &scroll_up,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
+    }
+
+    #[test]
     fn original_boon_semantic_rules_split_module_paths_and_text_literals() {
         let model = CodeEditorModel::new(
             "custom://theme.bn",
@@ -15728,6 +16102,73 @@ mod tests {
     }
 
     #[test]
+    fn cells_manifest_tab_loads_all_source_files_for_preview() {
+        let catalog = ExampleCatalog {
+            entries: vec![
+                ExampleCatalogEntry {
+                    id: "counter".to_owned(),
+                    label: "Counter".to_owned(),
+                    source: repo_path("examples/counter.bn").display().to_string(),
+                    source_files: Vec::new(),
+                    inline_source: None,
+                    category: "basic".to_owned(),
+                    order: 1,
+                    shown_by_default: true,
+                    custom: false,
+                },
+                ExampleCatalogEntry {
+                    id: "cells".to_owned(),
+                    label: "Cells".to_owned(),
+                    source: repo_path("examples/cells.bn").display().to_string(),
+                    source_files: [
+                        "examples/cells/defaults.bn",
+                        "examples/cells/formula.bn",
+                        "examples/cells/cell.bn",
+                        "examples/cells/model.bn",
+                        "examples/cells/columns.bn",
+                        "examples/cells/store.bn",
+                        "examples/cells/view.bn",
+                        "examples/cells.bn",
+                    ]
+                    .into_iter()
+                    .map(|path| repo_path(path).display().to_string())
+                    .collect(),
+                    inline_source: None,
+                    category: "7gui".to_owned(),
+                    order: 2,
+                    shown_by_default: true,
+                    custom: false,
+                },
+            ],
+            custom_store_path: repo_path("target/artifacts/native-gpu/tests/cells-tab.toml"),
+        };
+        let counter = catalog.entries.first().unwrap();
+        let counter_source = counter.source_text().unwrap();
+        let mut workspace =
+            ExampleWorkspace::new(&catalog, &counter.source, &counter_source, Some("counter"));
+
+        workspace.select_example(&catalog, "cells").unwrap();
+
+        assert_eq!(workspace.selected_example_id, "cells");
+        assert!(
+            workspace
+                .selected_buffer
+                .source_text
+                .contains("examples/cells/view.bn")
+        );
+        assert!(
+            workspace
+                .selected_buffer
+                .source_text
+                .contains("FUNCTION cells_app")
+        );
+        assert!(
+            workspace.selected_buffer.source_text.len() > 10_000,
+            "cells tab must send the combined manifest project, not only examples/cells.bn"
+        );
+    }
+
+    #[test]
     fn replace_code_updates_preview_input_runtime_context() {
         let counter_path = repo_path("examples/counter.bn");
         let counter_scenario_path = repo_path("examples/counter.scn");
@@ -15890,6 +16331,39 @@ mod tests {
             state.source_sha256,
             boon_runtime::sha256_bytes(todomvc_source.as_bytes())
         );
+    }
+
+    #[test]
+    fn switching_to_cells_builds_runtime_state_before_preview_commit() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        assert!(cells_source.len() > 16 * 1024);
+        assert!(cells_source.contains("FUNCTION cells_app"));
+
+        let payload = SourceProjectPayload::single_unit(
+            17,
+            4,
+            "opaque-cells-source-id",
+            &cells_path.display().to_string(),
+            &cells_source,
+        );
+        let result = preview_build_source_project(payload, || true);
+
+        assert_eq!(result.status, "pass");
+        assert_eq!(result.runtime_summary["status"], "pass");
+        assert_eq!(result.runtime_summary["owns_live_runtime"], true);
+        assert!(
+            result
+                .runtime_summary
+                .get("state_summary_top_level_keys")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("cells"))),
+            "Cells preview switch must build the real runtime state before committing"
+        );
+        assert!(result.live_runtime.is_some());
+        assert_eq!(result.layout_proof["status"], "pass");
+        assert_eq!(result.layout_proof["runtime_document_state_used"], true);
+        assert_eq!(result.timings["runtime_deferred"], false);
     }
 
     #[test]

@@ -418,10 +418,6 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        logwise::debuginternal_sync!(
-            "Got WlPointer event {event}",
-            event = logwise::privacy::LogIt(&event)
-        );
         let mut data = data.as_ref().lock().unwrap();
         match event {
             wayland_client::protocol::wl_pointer::Event::Enter {

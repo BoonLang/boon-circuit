@@ -5993,6 +5993,14 @@ fn verify_native_dev_editor_scroll_speed(
         .get("code_editor_model")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let vertical_visible_style = vertical_surface_proof
+        .get("code_editor_visible_style")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let horizontal_visible_style = horizontal_surface_proof
+        .get("code_editor_visible_style")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
     let scroll_line_after = vertical_code_editor_model
         .get("scroll_line")
         .and_then(serde_json::Value::as_u64)
@@ -6195,6 +6203,57 @@ fn verify_native_dev_editor_scroll_speed(
             || full_layout_refresh_count_for_passive_scroll > 1)
             .then(|| "dev editor passive scroll did not stay on the scroll fast path".to_owned()),
     );
+    let visible_style_preserved = [
+        vertical_visible_style.clone(),
+        horizontal_visible_style.clone(),
+    ]
+    .into_iter()
+    .all(|style| {
+        style.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+            && style
+                .get("line_text_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            && style
+                .get("rich_text_line_count")
+                .and_then(serde_json::Value::as_u64)
+                == style
+                    .get("line_text_count")
+                    .and_then(serde_json::Value::as_u64)
+            && style
+                .get("syntax_span_line_count")
+                .and_then(serde_json::Value::as_u64)
+                == style
+                    .get("line_text_count")
+                    .and_then(serde_json::Value::as_u64)
+            && style
+                .get("font_family_line_count")
+                .and_then(serde_json::Value::as_u64)
+                == style
+                    .get("line_text_count")
+                    .and_then(serde_json::Value::as_u64)
+    });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:visible-style-preserved-after-scroll",
+        visible_style_preserved,
+        format!(
+            "vertical_style={}, horizontal_style={}",
+            vertical_visible_style
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing"),
+            horizontal_visible_style
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing")
+        ),
+        (!visible_style_preserved).then(|| {
+            "dev editor passive scroll dropped rich text, syntax spans, or font metadata".to_owned()
+        }),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -6290,6 +6349,10 @@ fn verify_native_dev_editor_scroll_speed(
             "method": "isolated-weston-test-control-axis-specific-scroll-only",
             "vertical_observation": vertical_observation,
             "horizontal_observation": horizontal_observation
+        },
+        "visible_style_after_scroll_per_axis": {
+            "vertical": vertical_visible_style,
+            "horizontal": horizontal_visible_style
         },
         "dev_editor_speed_corpus": corpus,
         "prelaunch_layout_probe": layout_probe
@@ -18768,6 +18831,68 @@ fn run_isolated_weston_desktop_preview_e2e(
     } else {
         json!({"status": "missing"})
     };
+    let measured_loop_report_key = if target_dev_surface {
+        "dev_loop_report"
+    } else {
+        "preview_loop_report"
+    };
+    let measured_loop_report_path = supervisor
+        .get(measured_loop_report_key)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let measured_loop_report = measured_loop_report_path
+        .as_ref()
+        .map(|path| {
+            read_json(path).unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "reason": format!("failed to read measured loop report: {error}"),
+                    "path": path
+                })
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "missing",
+                "reason": format!("supervisor missing `{measured_loop_report_key}`")
+            })
+        });
+    let measured_loop_status_pass = measured_loop_report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && measured_loop_report
+            .get("loop_error")
+            .is_none_or(serde_json::Value::is_null);
+    let measured_loop_dirty_revision = measured_loop_report
+        .get("dirty_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let measured_loop_presented_revision = measured_loop_report
+        .get("presented_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let measured_loop_content_revision = measured_loop_report
+        .get("last_render_content_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let measured_loop_role_dirty_reason = measured_loop_report
+        .get("current_role_dirty_reason")
+        .or_else(|| measured_loop_report.get("last_role_dirty_reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let measured_loop_presented_fresh =
+        measured_loop_presented_revision >= measured_loop_dirty_revision;
+    let measured_loop_content_fresh = !matches!(
+        measured_loop_role_dirty_reason,
+        "scroll_changed"
+            | "runtime_turn_applied"
+            | "document_patch_applied"
+            | "source_payload_accepted"
+    ) || measured_loop_content_revision
+        >= measured_loop_dirty_revision;
+    let measured_loop_pass =
+        measured_loop_status_pass && measured_loop_presented_fresh && measured_loop_content_fresh;
     let measured_surface_pointer = if target_dev_surface {
         "/dev_surface_proof"
     } else {
@@ -18814,7 +18939,8 @@ fn run_isolated_weston_desktop_preview_e2e(
         && desktop_pass
         && supervisor_report_written
         && real_os_events_observed
-        && driver_effect_observed;
+        && driver_effect_observed
+        && measured_loop_pass;
 
     Ok(json!({
         "status": if pass { "pass" } else { "fail" },
@@ -18845,6 +18971,13 @@ fn run_isolated_weston_desktop_preview_e2e(
         "supervisor_report_written": supervisor_report_written,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
+        "measured_loop_report_key": measured_loop_report_key,
+        "measured_loop_report_path": measured_loop_report_path,
+        "measured_loop_report": measured_loop_report,
+        "measured_loop_pass": measured_loop_pass,
+        "measured_loop_status_pass": measured_loop_status_pass,
+        "measured_loop_presented_fresh": measured_loop_presented_fresh,
+        "measured_loop_content_fresh": measured_loop_content_fresh,
         "preview_input_adapter": input_adapter,
         "real_os_events_observed": real_os_events_observed,
         "driver_effect_observed": driver_effect_observed,
@@ -19375,6 +19508,68 @@ fn run_linux_human_like_desktop_surface_smoke(
     } else {
         "preview_role_status"
     };
+    let measured_loop_report_key = if measured_surface_key == "dev_surface_proof" {
+        "dev_loop_report"
+    } else {
+        "preview_loop_report"
+    };
+    let measured_loop_report_path = supervisor
+        .get(measured_loop_report_key)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let measured_loop_report = measured_loop_report_path
+        .as_ref()
+        .map(|path| {
+            read_json(path).unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "reason": format!("failed to read measured loop report: {error}"),
+                    "path": path
+                })
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "missing",
+                "reason": format!("supervisor missing `{measured_loop_report_key}`")
+            })
+        });
+    let measured_loop_status_pass = measured_loop_report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && measured_loop_report
+            .get("loop_error")
+            .is_none_or(serde_json::Value::is_null);
+    let measured_loop_dirty_revision = measured_loop_report
+        .get("dirty_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let measured_loop_presented_revision = measured_loop_report
+        .get("presented_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let measured_loop_content_revision = measured_loop_report
+        .get("last_render_content_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let measured_loop_role_dirty_reason = measured_loop_report
+        .get("current_role_dirty_reason")
+        .or_else(|| measured_loop_report.get("last_role_dirty_reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let measured_loop_presented_fresh =
+        measured_loop_presented_revision >= measured_loop_dirty_revision;
+    let measured_loop_content_fresh = !matches!(
+        measured_loop_role_dirty_reason,
+        "scroll_changed"
+            | "runtime_turn_applied"
+            | "document_patch_applied"
+            | "source_payload_accepted"
+    ) || measured_loop_content_revision
+        >= measured_loop_dirty_revision;
+    let measured_loop_pass =
+        measured_loop_status_pass && measured_loop_presented_fresh && measured_loop_content_fresh;
     let measured_role_pass = supervisor
         .get(measured_role_status_key)
         .and_then(serde_json::Value::as_str)
@@ -19392,7 +19587,8 @@ fn run_linux_human_like_desktop_surface_smoke(
         && supervisor_pass
         && readback_pass
         && real_os_events_observed
-        && wheel_input_observed;
+        && wheel_input_observed
+        && measured_loop_pass;
 
     Ok(json!({
         "status": if pass { "pass" } else { "fail" },
@@ -19453,6 +19649,13 @@ fn run_linux_human_like_desktop_surface_smoke(
         "supervisor_pass": supervisor_pass,
         "measured_role_status_key": measured_role_status_key,
         "measured_role_pass": measured_role_pass,
+        "measured_loop_report_key": measured_loop_report_key,
+        "measured_loop_report_path": measured_loop_report_path,
+        "measured_loop_report": measured_loop_report,
+        "measured_loop_pass": measured_loop_pass,
+        "measured_loop_status_pass": measured_loop_status_pass,
+        "measured_loop_presented_fresh": measured_loop_presented_fresh,
+        "measured_loop_content_fresh": measured_loop_content_fresh,
         "readback_pass": readback_pass,
         "wheel_input_observed": wheel_input_observed,
         "real_os_events_observed": real_os_events_observed,

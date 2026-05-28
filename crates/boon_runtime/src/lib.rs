@@ -23,8 +23,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -702,15 +702,50 @@ pub struct LiveRuntime {
     next_step: usize,
 }
 
+#[derive(Clone)]
+struct CachedRuntimePlan {
+    ir: Arc<TypedProgram>,
+    compiled: Arc<CompiledProgram>,
+}
+
+fn runtime_plan_cache() -> &'static Mutex<BTreeMap<String, CachedRuntimePlan>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, CachedRuntimePlan>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn cached_runtime_plan_from_source(
+    source_label: &str,
+    source_text: &str,
+) -> RuntimeResult<CachedRuntimePlan> {
+    let key = sha256_bytes(source_text.as_bytes());
+    if let Some(plan) = runtime_plan_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok(plan);
+    }
+
+    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+    let ir = lower(&parsed)?;
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    let plan = CachedRuntimePlan {
+        ir: Arc::new(ir),
+        compiled: Arc::new(compiled),
+    };
+    if let Ok(mut cache) = runtime_plan_cache().lock() {
+        cache.insert(key, plan.clone());
+    }
+    Ok(plan)
+}
+
 impl LiveRuntime {
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
-        let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
-        let ir = lower(&parsed)?;
-        verify_hidden_identity(&ir)?;
-        verify_static_schedule(&ir)?;
+        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let scenario = parse_scenario(scenario_path)?;
-        let compiled = CompiledProgram::from_ir(&ir)?;
-        let mut runtime = LoadedRuntime::new(&ir, &compiled)?;
+        let mut runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
             runtime,
@@ -719,12 +754,8 @@ impl LiveRuntime {
     }
 
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
-        let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
-        let ir = lower(&parsed)?;
-        verify_hidden_identity(&ir)?;
-        verify_static_schedule(&ir)?;
-        let compiled = CompiledProgram::from_ir(&ir)?;
-        let runtime = LoadedRuntime::new(&ir, &compiled)?;
+        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
+        let runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
         Ok(Self {
             runtime,
             next_step: 1,

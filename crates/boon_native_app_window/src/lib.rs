@@ -373,12 +373,16 @@ impl NativeRenderLoopState {
             if poll_result.role_dirty_reason.is_some() {
                 self.last_role_dirty_reason = poll_result.role_dirty_reason;
             }
+            let scheduler_only_repaint = poll_result.role_dirty_reason.is_none()
+                && self.last_scheduler_reason == Some(NativeSchedulerReason::HostInput);
             if poll_result.role_revision > self.presented_revision {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             } else if self.last_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame) {
                 self.dirty_revision = self.dirty_revision.max(self.presented_revision);
-            } else {
+            } else if scheduler_only_repaint {
                 self.dirty_revision = self.dirty_revision.saturating_add(1);
+            } else {
+                self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             }
         }
         if poll_result.wants_animation_frame {
@@ -2564,8 +2568,33 @@ mod tests {
         state.mark_presented(1);
         state.apply_poll_result(&poll, false);
 
-        assert_eq!(state.dirty_revision, 2);
-        assert!(state.should_render(Instant::now(), false));
+        assert_eq!(state.dirty_revision, 1);
+        assert!(!state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn stale_role_dirty_poll_does_not_invent_unrenderable_content_revision() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision,
+                scheduler_reason: Some(NativeSchedulerReason::HostInput),
+                role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+                next_wake_after_ms: None,
+                wants_animation_frame: false,
+            },
+            true,
+        );
+
+        assert_eq!(state.dirty_revision, state.presented_revision);
+        assert!(!state.should_render(Instant::now(), false));
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::ScrollChanged)
+        );
     }
 
     #[test]

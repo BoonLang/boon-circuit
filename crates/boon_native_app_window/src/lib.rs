@@ -152,6 +152,7 @@ pub struct NativeRenderLoopState {
     pub mode: NativeRenderLoopMode,
     pub dirty_revision: u64,
     pub presented_revision: u64,
+    pub last_render_content_revision: u64,
     pub rendered_frame_count: u64,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
@@ -169,6 +170,7 @@ impl NativeRenderLoopState {
             mode,
             dirty_revision: 1,
             presented_revision: 0,
+            last_render_content_revision: 0,
             rendered_frame_count: 0,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
@@ -193,6 +195,13 @@ impl NativeRenderLoopState {
 
     pub fn mark_presented(&mut self, revision: u64) {
         self.presented_revision = self.presented_revision.max(revision);
+        self.last_render_content_revision = self.last_render_content_revision.max(revision);
+        self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
+    }
+
+    pub fn mark_presented_with_content(&mut self, revision: u64, content_revision: u64) {
+        self.presented_revision = self.presented_revision.max(revision);
+        self.last_render_content_revision = content_revision;
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
     }
 
@@ -231,6 +240,29 @@ impl NativeRenderLoopState {
             true
         } else {
             false
+        }
+    }
+
+    pub fn apply_poll_result(&mut self, poll_result: &NativePollResult, real_os_input: bool) {
+        if poll_result.dirty {
+            self.last_scheduler_reason = poll_result.scheduler_reason.or_else(|| {
+                if real_os_input {
+                    Some(NativeSchedulerReason::HostInput)
+                } else {
+                    Some(NativeSchedulerReason::ExternalWake)
+                }
+            });
+            self.last_role_dirty_reason = poll_result.role_dirty_reason;
+            if poll_result.role_revision > self.presented_revision {
+                self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
+            } else if self.last_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame) {
+                self.dirty_revision = self.dirty_revision.max(self.presented_revision);
+            } else {
+                self.dirty_revision = self.dirty_revision.saturating_add(1);
+            }
+        }
+        if poll_result.wants_animation_frame {
+            self.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
         }
     }
 }
@@ -276,6 +308,22 @@ impl NativeRenderHookResult {
             content_changed: true,
             role_dirty_reason: None,
         }
+    }
+
+    pub fn validate_for_presented_revision(&self, dirty_revision: u64) -> Result<(), String> {
+        if !self.rendered {
+            return Err("render hook result did not render a frame".to_owned());
+        }
+        if self.content_revision == 0 {
+            return Err("render hook result content_revision must be nonzero".to_owned());
+        }
+        if self.content_revision < dirty_revision {
+            return Err(format!(
+                "render hook result content_revision {} is older than dirty_revision {}",
+                self.content_revision, dirty_revision
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -522,7 +570,8 @@ pub struct NativePollContext {
 }
 
 pub type NativeRenderHook = Box<
-    dyn for<'a> FnMut(NativeRenderFrameContext<'a>) -> Result<serde_json::Value, String> + Send,
+    dyn for<'a> FnMut(NativeRenderFrameContext<'a>) -> Result<NativeRenderHookResult, String>
+        + Send,
 >;
 
 pub type NativePollHook =
@@ -790,7 +839,7 @@ async fn run_surface_probe_inner(
 
     for frame_index in 0..total_frame_count {
         let input = empty_input_adapter_proof(false);
-        let _ = poll_native_window_hooks(
+        if let Some(poll_result) = poll_native_window_hooks(
             &mut hooks,
             NativePollContext {
                 window_id: window_id.clone(),
@@ -803,7 +852,14 @@ async fn run_surface_probe_inner(
                 now: Instant::now(),
                 forced_frame: true,
             },
-        )?;
+        )? {
+            if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
+                render_loop_state
+                    .schedule_wake_after(Instant::now(), Duration::from_millis(next_wake_after_ms));
+            }
+            render_loop_state.apply_poll_result(&poll_result, false);
+        }
+        let rendered_revision = render_loop_state.dirty_revision;
         let acquire_start = Instant::now();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -822,10 +878,11 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-probe-encoder"),
         });
+        let mut rendered_content_revision = rendered_revision;
         let render_hook_ms = match hooks.as_mut() {
             Some(hooks) => {
                 let render_start = Instant::now();
-                let proof = (hooks.render)(NativeRenderFrameContext {
+                let render_result = (hooks.render)(NativeRenderFrameContext {
                     device: &device,
                     queue: &queue,
                     encoder: &mut encoder,
@@ -841,7 +898,13 @@ async fn run_surface_probe_inner(
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
-                external_render_proof = Some(proof);
+                render_result
+                    .validate_for_presented_revision(rendered_revision)
+                    .map_err(|error| {
+                        NativeWindowError::Failed(format!("external render hook: {error}"))
+                    })?;
+                rendered_content_revision = render_result.content_revision;
+                external_render_proof = Some(render_result.proof);
                 Some(elapsed_ms(render_start))
             }
             None => {
@@ -878,7 +941,7 @@ async fn run_surface_probe_inner(
         }
         queue.submit(Some(encoder.finish()));
         frame.present();
-        render_loop_state.mark_presented(1);
+        render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
                 Path::new(report),
@@ -956,7 +1019,7 @@ async fn run_surface_probe_inner(
             } else {
                 sample_input_adapter(&mut mouse, &keyboard, false)
             };
-            let _ = poll_native_window_hooks(
+            if let Some(poll_result) = poll_native_window_hooks(
                 &mut hooks,
                 NativePollContext {
                     window_id: window_id.clone(),
@@ -969,7 +1032,17 @@ async fn run_surface_probe_inner(
                     now: Instant::now(),
                     forced_frame: true,
                 },
-            )?;
+            )? {
+                if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
+                    render_loop_state.schedule_wake_after(
+                        Instant::now(),
+                        Duration::from_millis(next_wake_after_ms),
+                    );
+                }
+                render_loop_state
+                    .apply_poll_result(&poll_result, frame_input.real_os_events_observed);
+            }
+            let rendered_revision = render_loop_state.dirty_revision;
             let acquire_start = Instant::now();
             let frame = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(frame)
@@ -988,28 +1061,34 @@ async fn run_surface_probe_inner(
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("boon-native-app-window-input-sample-encoder"),
             });
+            let mut rendered_content_revision = rendered_revision;
             if let Some(hooks) = hooks.as_mut() {
                 let render_start = Instant::now();
-                external_render_proof = Some(
-                    (hooks.render)(NativeRenderFrameContext {
-                        device: &device,
-                        queue: &queue,
-                        encoder: &mut encoder,
-                        surface_view: &view,
-                        surface_texture_format: config.format,
-                        surface_id: surface_id.clone(),
-                        surface_epoch: 1,
-                        surface_format: surface_format.clone(),
-                        width,
-                        height,
-                        input: frame_input,
-                    })
+                let render_result = (hooks.render)(NativeRenderFrameContext {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut encoder,
+                    surface_view: &view,
+                    surface_texture_format: config.format,
+                    surface_id: surface_id.clone(),
+                    surface_epoch: 1,
+                    surface_format: surface_format.clone(),
+                    width,
+                    height,
+                    input: frame_input,
+                })
+                .map_err(|error| {
+                    NativeWindowError::Failed(format!("external render hook after input: {error}"))
+                })?;
+                render_result
+                    .validate_for_presented_revision(rendered_revision)
                     .map_err(|error| {
                         NativeWindowError::Failed(format!(
                             "external render hook after input: {error}"
                         ))
-                    })?,
-                );
+                    })?;
+                rendered_content_revision = render_result.content_revision;
+                external_render_proof = Some(render_result.proof);
                 post_input_render_hook_samples.push(elapsed_ms(render_start));
             }
             if frame_index + 1 == post_input_sample_count && options.readback_artifact_dir.is_some()
@@ -1027,6 +1106,8 @@ async fn run_surface_probe_inner(
             }
             queue.submit(Some(encoder.finish()));
             frame.present();
+            render_loop_state
+                .mark_presented_with_content(rendered_revision, rendered_content_revision);
             let current_present_submit_ms = elapsed_ms(present_start);
             let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
             if frame_index == 0 {
@@ -1153,22 +1234,7 @@ async fn run_surface_probe_inner(
                     Duration::from_millis(next_wake_after_ms),
                 );
             }
-            if poll_result.dirty {
-                let scheduler_reason = poll_result.scheduler_reason.unwrap_or_else(|| {
-                    if input.real_os_events_observed {
-                        NativeSchedulerReason::HostInput
-                    } else {
-                        NativeSchedulerReason::ExternalWake
-                    }
-                });
-                render_loop_state.mark_dirty(scheduler_reason, poll_result.role_dirty_reason);
-                render_loop_state.dirty_revision = render_loop_state
-                    .dirty_revision
-                    .max(poll_result.role_revision);
-            }
-            if poll_result.wants_animation_frame {
-                render_loop_state.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
-            }
+            render_loop_state.apply_poll_result(&poll_result, input.real_os_events_observed);
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         } else if input.real_os_events_observed {
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
@@ -1211,9 +1277,10 @@ async fn run_surface_probe_inner(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-interactive-encoder"),
         });
+        let mut rendered_content_revision = rendered_revision;
         match hooks.as_mut() {
             Some(hooks) => {
-                (hooks.render)(NativeRenderFrameContext {
+                let render_result = (hooks.render)(NativeRenderFrameContext {
                     device: &device,
                     queue: &queue,
                     encoder: &mut encoder,
@@ -1229,6 +1296,12 @@ async fn run_surface_probe_inner(
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
+                render_result
+                    .validate_for_presented_revision(rendered_revision)
+                    .map_err(|error| {
+                        NativeWindowError::Failed(format!("external render hook: {error}"))
+                    })?;
+                rendered_content_revision = render_result.content_revision;
             }
             None => {
                 let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1272,7 +1345,7 @@ async fn run_surface_probe_inner(
         };
         queue.submit(Some(encoder.finish()));
         frame.present();
-        render_loop_state.mark_presented(rendered_revision);
+        render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
                 Path::new(report),
@@ -1422,6 +1495,7 @@ fn write_render_loop_state_report(
         "render_loop_mode": state.mode,
         "dirty_revision": state.dirty_revision,
         "presented_revision": state.presented_revision,
+        "last_render_content_revision": state.last_render_content_revision,
         "rendered_frame_count": state.rendered_frame_count,
         "skipped_idle_poll_count": state.skipped_idle_poll_count,
         "input_poll_count": state.input_poll_count,
@@ -2073,6 +2147,88 @@ mod tests {
             Some(NativeSchedulerReason::Timer)
         );
         assert!(!state.should_render(now + Duration::from_millis(500), false));
+    }
+
+    #[test]
+    fn poll_result_uses_role_revision_as_presentable_dirty_revision() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let poll = NativePollResult {
+            dirty: true,
+            role_revision: 1,
+            scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
+            role_dirty_reason: Some(NativeRoleDirtyReason::DocumentPatchApplied),
+            next_wake_after_ms: None,
+            wants_animation_frame: false,
+        };
+
+        state.apply_poll_result(&poll, false);
+
+        assert_eq!(state.dirty_revision, 1);
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::DocumentPatchApplied)
+        );
+
+        state.mark_presented(1);
+        state.apply_poll_result(&poll, false);
+
+        assert_eq!(state.dirty_revision, 2);
+        assert!(state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn verifier_frame_does_not_invent_new_content_revision() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let poll = NativePollResult {
+            dirty: true,
+            role_revision: 0,
+            scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
+            role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            next_wake_after_ms: None,
+            wants_animation_frame: false,
+        };
+
+        state.apply_poll_result(&poll, false);
+
+        assert_eq!(state.dirty_revision, 1);
+        assert!(
+            NativeRenderHookResult {
+                proof: serde_json::json!({}),
+                content_revision: 1,
+                rendered: true,
+                content_changed: false,
+                role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            }
+            .validate_for_presented_revision(state.dirty_revision)
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn structured_render_result_rejects_stale_or_missing_revisions() {
+        let mut zero = NativeRenderHookResult::rendered_with_proof(serde_json::json!({}));
+        assert!(zero.validate_for_presented_revision(1).is_err());
+
+        zero.content_revision = 1;
+        assert!(zero.validate_for_presented_revision(2).is_err());
+
+        zero.content_revision = 2;
+        zero.rendered = false;
+        assert!(zero.validate_for_presented_revision(2).is_err());
+
+        zero.rendered = true;
+        assert!(zero.validate_for_presented_revision(2).is_ok());
+    }
+
+    #[test]
+    fn presented_state_records_render_content_revision() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+
+        state.mark_presented_with_content(1, 3);
+
+        assert_eq!(state.presented_revision, 1);
+        assert_eq!(state.last_render_content_revision, 3);
+        assert_eq!(state.rendered_frame_count, 1);
     }
 
     #[test]

@@ -3355,14 +3355,16 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         .get("presented_revision")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let last_render_content_revision = live_observation
+        .get("last_render_content_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let rendered_frame_count = live_observation
         .get("rendered_frame_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let preview_render_budget = required_native_gpu_budget_u64(
-        budget_section,
-        "preview_idle_rendered_frame_delta_per_5s",
-    )?;
+    let preview_render_budget =
+        required_native_gpu_budget_u64(budget_section, "preview_idle_rendered_frame_delta_per_5s")?;
     let dev_unfocused_budget = required_native_gpu_budget_u64(
         budget_section,
         "dev_idle_rendered_frame_delta_unfocused_per_5s",
@@ -3373,11 +3375,14 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
     )?;
     let input_budget =
         required_native_gpu_budget_f64(budget_section, "post_idle_input_to_present_ms_p95")?;
-    let source_budget =
-        required_native_gpu_budget_f64(budget_section, "post_idle_source_replace_to_present_ms_p95")?;
+    let source_budget = required_native_gpu_budget_f64(
+        budget_section,
+        "post_idle_source_replace_to_present_ms_p95",
+    )?;
     let preview_cpu_budget =
         required_native_gpu_budget_f64(budget_section, "idle_preview_cpu_percent_p95")?;
-    let dev_cpu_budget = required_native_gpu_budget_f64(budget_section, "idle_dev_cpu_percent_p95")?;
+    let dev_cpu_budget =
+        required_native_gpu_budget_f64(budget_section, "idle_dev_cpu_percent_p95")?;
     let combined_cpu_budget =
         required_native_gpu_budget_f64(budget_section, "combined_idle_cpu_percent_p95")?;
     push_audit_check(
@@ -3389,6 +3394,20 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         (!(preview_child_pid > 0 && dev_child_pid > 0 && preview_child_pid != dev_child_pid)).then(
             || "idle/wake report did not prove distinct live preview/dev child PIDs".to_owned(),
         ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-idle-wake:render-content-revision-presented",
+        last_render_content_revision >= presented_revision && presented_revision >= dirty_revision,
+        format!(
+            "dirty_revision={dirty_revision}, presented_revision={presented_revision}, last_render_content_revision={last_render_content_revision}"
+        ),
+        (!(last_render_content_revision >= presented_revision
+            && presented_revision >= dirty_revision))
+            .then(|| {
+                "render content revision did not cover the presented dirty revision".to_owned()
+            }),
     );
     push_audit_check(
         &mut checks,
@@ -3487,6 +3506,7 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         "combined_idle_cpu_percent_p95": combined_cpu_p95,
         "dirty_revision": dirty_revision,
         "presented_revision": presented_revision,
+        "last_render_content_revision": last_render_content_revision,
         "rendered_frame_count": rendered_frame_count,
         "preview_idle_rendered_frame_delta": preview_idle_rendered_frame_delta,
         "dev_idle_rendered_frame_delta": dev_idle_rendered_frame_delta_unfocused,
@@ -4120,23 +4140,23 @@ fn run_native_example_switch_live_probe(
         }));
     }
     thread::sleep(Duration::from_millis(1_000));
-    let initial_readback = wait_for_loop_readback_change(
-        &preview_loop_report,
-        "missing",
-        Duration::from_secs(5),
-    );
+    let initial_readback =
+        wait_for_loop_readback_change(&preview_loop_report, "missing", Duration::from_secs(5));
     let initial_frame_hash = initial_readback
         .get("frame_hash_after")
         .and_then(serde_json::Value::as_str)
         .filter(|hash| hash.len() == 64)
         .map(ToOwned::to_owned)
         .or_else(|| {
-            read_optional_json(&preview_loop_report).ok().flatten().and_then(|report| {
-                report
-                    .pointer("/last_interactive_readback_artifact/sha256")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
+            read_optional_json(&preview_loop_report)
+                .ok()
+                .flatten()
+                .and_then(|report| {
+                    report
+                        .pointer("/last_interactive_readback_artifact/sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
         })
         .filter(|hash| hash.len() == 64)
         .unwrap_or_else(|| "missing".to_owned());
@@ -5403,6 +5423,7 @@ fn run_isolated_weston_idle_wake_observation(
             + dev_loop.get("scheduled_wake_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "dirty_revision": preview_loop.get("dirty_revision").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "presented_revision": preview_loop.get("presented_revision").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "last_render_content_revision": preview_loop.get("last_render_content_revision").and_then(serde_json::Value::as_u64).unwrap_or(0),
         "rendered_frame_count": preview_rendered_frame_count,
         "elapsed_ms": preview_loop.get("elapsed_ms").and_then(numeric_value_as_f64).unwrap_or(0.0),
         "last_scheduler_reason": preview_loop.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
@@ -5642,6 +5663,15 @@ fn verify_native_dev_editor_scroll_speed(
         "tested_binary": format!("target/{}/boon_native_playground", if release_build { "release" } else { "debug" }),
         "surface_under_test": "dev-code-editor",
         "measurement_source": "isolated-weston-passive-dev-editor-scroll-probe",
+        "input_provenance": "isolated_weston_real_wheel",
+        "input_injection_method": "isolated-weston-test-control-real-wheel",
+        "launched_process_evidence": {
+            "desktop_pid": observation.get("desktop_pid").cloned().unwrap_or_else(|| json!(0)),
+            "preview_child_pid": observation.get("preview_child_pid").cloned().unwrap_or_else(|| json!(0)),
+            "dev_child_pid": observation.get("dev_child_pid").cloned().unwrap_or_else(|| json!(0)),
+            "desktop_exit_status": observation.get("desktop_exit_status").cloned().unwrap_or_else(|| json!("missing")),
+            "supervisor_report": observation.get("supervisor_report").cloned().unwrap_or_else(|| json!(null))
+        },
         "line_count": line_count,
         "longest_line_bytes": longest_line_bytes,
         "scroll_line_before_after": {"before": 0, "after": scroll_line_after},
@@ -5700,10 +5730,8 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     } else {
         "example_switch.debug"
     };
-    let dev_tab_budget = required_native_gpu_budget_f64(
-        budget_section,
-        "click_to_dev_tab_visual_update_ms_p95",
-    )?;
+    let dev_tab_budget =
+        required_native_gpu_budget_f64(budget_section, "click_to_dev_tab_visual_update_ms_p95")?;
     let ack_budget = required_native_gpu_budget_f64(budget_section, "sync_ack_ms_p95")?;
     let ack_max_budget = required_native_gpu_budget_f64(budget_section, "sync_ack_ms_max")?;
     let bundled_present_budget = required_native_gpu_budget_f64(
@@ -5853,8 +5881,9 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         format!(
             "readback_hash_before={readback_hash_before}, readback_hash_after={readback_hash_after}"
         ),
-        (!readback_hashes_valid)
-            .then(|| "example switch readback hashes must be real sha256 values and change".to_owned()),
+        (!readback_hashes_valid).then(|| {
+            "example switch readback hashes must be real sha256 values and change".to_owned()
+        }),
     );
     let extra = json!({
         "profile": profile,
@@ -11566,32 +11595,34 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
     );
     let transport_commands = ["tab_switch", "run", "format", "reset"];
     let preview_transport_pass = transport_commands.iter().all(|command| {
-        let local = dev_probe.and_then(|probe| probe.pointer(&format!("/{command}/preview_transport")));
+        let local =
+            dev_probe.and_then(|probe| probe.pointer(&format!("/{command}/preview_transport")));
         let result = dev_probe
             .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport_result")));
         local.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
             == Some("pass")
-            && local
-                .and_then(|probe| probe.get("transport_bound").and_then(serde_json::Value::as_bool))
-                == Some(true)
-            && local
-                .and_then(|probe| {
-                    probe.get("replace_source_protocol")
-                        .and_then(serde_json::Value::as_bool)
-                })
-                == Some(true)
-            && local
-                .and_then(|probe| {
-                    probe
-                        .get("dev_visual_update_before_preview_ack")
-                        .and_then(serde_json::Value::as_bool)
-                })
-                == Some(true)
+            && local.and_then(|probe| {
+                probe
+                    .get("transport_bound")
+                    .and_then(serde_json::Value::as_bool)
+            }) == Some(true)
+            && local.and_then(|probe| {
+                probe
+                    .get("replace_source_protocol")
+                    .and_then(serde_json::Value::as_bool)
+            }) == Some(true)
+            && local.and_then(|probe| {
+                probe
+                    .get("dev_visual_update_before_preview_ack")
+                    .and_then(serde_json::Value::as_bool)
+            }) == Some(true)
             && result.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
                 == Some("pass")
-            && result
-                .and_then(|probe| probe.pointer("/ack/kind").and_then(serde_json::Value::as_str))
-                == Some("replace-source-queued")
+            && result.and_then(|probe| {
+                probe
+                    .pointer("/ack/kind")
+                    .and_then(serde_json::Value::as_str)
+            }) == Some("replace-source-queued")
     });
     push_audit_check(
         &mut checks,
@@ -14190,6 +14221,18 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "stale-render-content-revision",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-idle-wake",
+                    "dirty_revision": 4,
+                    "presented_revision": 4,
+                    "last_render_content_revision": 3
+                }),
+            ),
+        ),
+        (
             "fake-cpu-samples",
             merge_json(
                 base(),
@@ -14249,6 +14292,17 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 json!({
                     "command": "verify-native-dev-editor-scroll-speed",
                     "missing_horizontal_scroll_evidence": true
+                }),
+            ),
+        ),
+        (
+            "deterministic-dev-editor-scroll-model",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "measurement_source": "deterministic-dev-editor-scroll-model",
+                    "input_provenance": "model_only"
                 }),
             ),
         ),
@@ -15328,6 +15382,27 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_object_field(&mut blockers, report, "readback_artifact_after");
             require_hash_field(&mut blockers, report, "post_idle_frame_hash_before");
             require_hash_field(&mut blockers, report, "post_idle_frame_hash_after");
+            let dirty_revision = report
+                .get("dirty_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let presented_revision = report
+                .get("presented_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let last_render_content_revision = report
+                .get("last_render_content_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if dirty_revision == 0
+                || presented_revision < dirty_revision
+                || last_render_content_revision < presented_revision
+            {
+                blockers.push(
+                    "idle/wake report must prove render content revision covers presented dirty revision"
+                        .to_owned(),
+                );
+            }
             if report
                 .get("post_idle_frame_hash_before")
                 .and_then(serde_json::Value::as_str)
@@ -15355,6 +15430,30 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "surface_under_test",
                 "dev-code-editor",
             );
+            require_str_field(
+                &mut blockers,
+                report,
+                "measurement_source",
+                "isolated-weston-passive-dev-editor-scroll-probe",
+            );
+            require_str_field(
+                &mut blockers,
+                report,
+                "input_provenance",
+                "isolated_weston_real_wheel",
+            );
+            require_object_field(&mut blockers, report, "launched_process_evidence");
+            if report
+                .pointer("/launched_process_evidence/desktop_pid")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                == 0
+            {
+                blockers.push(
+                    "launched_process_evidence.desktop_pid must prove a launched native process"
+                        .to_owned(),
+                );
+            }
             require_nonempty_str_field(&mut blockers, report, "profile");
             require_nonempty_str_field(&mut blockers, report, "build_profile");
             require_nonempty_str_field(&mut blockers, report, "tested_binary");
@@ -15375,12 +15474,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 scroll_budget_section,
                 "wheel_to_visible_ms_p95",
             );
-            require_u64_at_least(
-                &mut blockers,
-                report,
-                "line_count",
-                min_lines,
-            );
+            require_u64_at_least(&mut blockers, report, "line_count", min_lines);
             require_u64_at_least(
                 &mut blockers,
                 report,
@@ -15484,12 +15578,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 budget_section,
                 "click_to_preview_new_frame_presented_ms_p95_large_custom",
             );
-            require_f64_at_most(
-                &mut blockers,
-                report,
-                "ack_latency_ms",
-                ack_budget,
-            );
+            require_f64_at_most(&mut blockers, report, "ack_latency_ms", ack_budget);
             require_u64_at_most(
                 &mut blockers,
                 report,
@@ -15623,7 +15712,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 );
             }
             for (index, step) in per_switch.iter().enumerate() {
-                for key in ["command_id", "source_revision", "source_hash", "ack", "ready"] {
+                for key in [
+                    "command_id",
+                    "source_revision",
+                    "source_hash",
+                    "ack",
+                    "ready",
+                ] {
                     if step.get(key).is_none() {
                         blockers.push(format!("per_switch[{index}].{key} is missing"));
                     }
@@ -16481,6 +16576,20 @@ fn native_gpu_report_integrity_reasons(
     {
         reasons.push("copied or reused pixel hash proof is forbidden".to_owned());
     }
+    if report
+        .get("measurement_source")
+        .and_then(serde_json::Value::as_str)
+        == Some("deterministic-dev-editor-scroll-model")
+    {
+        reasons.push("deterministic dev-editor scroll model evidence is forbidden".to_owned());
+    }
+    if report
+        .get("input_provenance")
+        .and_then(serde_json::Value::as_str)
+        == Some("model_only")
+    {
+        reasons.push("model-only input provenance is forbidden".to_owned());
+    }
     for (field, reason) in [
         ("modeled_ack_timing", "modeled ACK timing is forbidden"),
         (
@@ -16522,11 +16631,7 @@ fn native_gpu_report_integrity_reasons(
             "sync ACK must not contain layout proof",
         ),
     ] {
-        if report
-            .get(field)
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
+        if report.get(field).and_then(serde_json::Value::as_bool) == Some(true) {
             reasons.push(reason.to_owned());
         }
     }
@@ -16540,6 +16645,19 @@ fn native_gpu_report_integrity_reasons(
     ) {
         if surface_epoch != target_epoch {
             reasons.push("target_surface_epoch does not match surface_epoch".to_owned());
+        }
+    }
+    if let (Some(presented_revision), Some(last_render_content_revision)) = (
+        report
+            .get("presented_revision")
+            .and_then(serde_json::Value::as_u64),
+        report
+            .get("last_render_content_revision")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        if last_render_content_revision < presented_revision {
+            reasons
+                .push("last_render_content_revision is older than presented_revision".to_owned());
         }
     }
     reasons
@@ -17189,8 +17307,10 @@ fn required_native_gpu_budget_f64(
     key: &str,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     native_gpu_budget_f64(section, key).ok_or_else(|| {
-        format!("required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml")
-            .into()
+        format!(
+            "required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml"
+        )
+        .into()
     })
 }
 
@@ -17199,8 +17319,10 @@ fn required_native_gpu_budget_u64(
     key: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     native_gpu_budget_u64(section, key).ok_or_else(|| {
-        format!("required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml")
-            .into()
+        format!(
+            "required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml"
+        )
+        .into()
     })
 }
 
@@ -18302,6 +18424,15 @@ fn run_linux_human_like_desktop_surface_smoke(
             .pointer(&format!("/{measured_surface_key}/frame_timing"))
             .cloned()
             .unwrap_or_else(|| json!({})),
+        "desktop_pid": desktop.id(),
+        "preview_child_pid": supervisor
+            .get("preview_child_pid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "dev_child_pid": supervisor
+            .get("dev_child_pid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
         "driver_pass": driver_pass,
         "desktop_pass": desktop_pass,
         "supervisor_pass": supervisor_pass,

@@ -526,7 +526,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let poll_input_state = Arc::clone(&input_state);
         let mut last_poll_revision = shared_render_state
             .lock()
-            .map(|state| state.update_count)
+            .map(|state| preview_content_revision(state.update_count))
             .unwrap_or_default();
         let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
             let before_update_count = poll_shared_render_state
@@ -583,10 +583,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned".to_owned())?
                 .update_count;
+            let after_content_revision = preview_content_revision(after_update_count);
             let dirty = after_update_count != before_update_count
-                || after_update_count != last_poll_revision
+                || after_content_revision != last_poll_revision
                 || context.forced_frame;
-            last_poll_revision = last_poll_revision.max(after_update_count);
+            last_poll_revision = last_poll_revision.max(after_content_revision);
             let scheduler_reason = if context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
             } else if context.input_delta.real_os_events_observed {
@@ -611,7 +612,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             })
         });
         let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
-            let (render_layout_proof, render_layout_frame_override, render_error) = {
+            let (render_layout_proof, render_layout_frame_override, render_error, content_revision) = {
                 let shared = shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
@@ -619,9 +620,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     shared.layout_proof.clone(),
                     shared.layout_frame_override.clone(),
                     shared.last_error.clone(),
+                    preview_content_revision(shared.update_count),
                 )
             };
-            native_gpu_app_owned_render_hook(
+            let proof = native_gpu_app_owned_render_hook(
                 context,
                 &render_layout_proof,
                 render_layout_frame_override.as_ref(),
@@ -630,7 +632,14 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut app_owned_proof,
                 &mut layout_frame_cache,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            Ok(boon_native_app_window::NativeRenderHookResult {
+                proof,
+                content_revision,
+                rendered: true,
+                content_changed: true,
+                role_dirty_reason: None,
+            })
         });
         Some(boon_native_app_window::NativeWindowHooks {
             poll: Some(poll),
@@ -883,7 +892,19 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .layout_frame
                 .as_ref()
                 .ok_or_else(|| "dev layout frame cache was not initialized".to_owned())?;
-            native_gpu_dev_visible_render_hook(context, &mut visible_renderer, &shell, layout_frame)
+            let proof = native_gpu_dev_visible_render_hook(
+                context,
+                &mut visible_renderer,
+                &shell,
+                layout_frame,
+            )?;
+            Ok(boon_native_app_window::NativeRenderHookResult {
+                proof,
+                content_revision: render_state.revision.max(1),
+                rendered: true,
+                content_changed: true,
+                role_dirty_reason: None,
+            })
         });
         Some(boon_native_app_window::NativeWindowHooks {
             poll: Some(poll),
@@ -1257,9 +1278,16 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
+    let preview_exit_wait_after_dev_ms = if skip_preview_shutdown {
+        effective_preview_hold_ms
+            .saturating_sub(dev_start_delay_ms.saturating_add(dev_hold_ms))
+            .saturating_add(1_500)
+    } else {
+        effective_preview_hold_ms.saturating_add(500)
+    };
     let preview_clean_exit_after_dev_exit = wait_child_exit(
         &mut preview,
-        Duration::from_millis(effective_preview_hold_ms.saturating_add(500)),
+        Duration::from_millis(preview_exit_wait_after_dev_ms),
     )?;
     let preview_exit_status_after_dev_exit = preview_clean_exit_after_dev_exit
         .as_ref()
@@ -1358,6 +1386,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
         details["requested_preview_hold_ms"] = json!(child_hold_ms);
         details["effective_preview_hold_ms"] = json!(effective_preview_hold_ms);
+        details["preview_exit_wait_after_dev_ms"] = json!(preview_exit_wait_after_dev_ms);
         details["dev_hold_ms"] = json!(dev_hold_ms);
         details["dev_start_delay_ms"] = json!(dev_start_delay_ms);
         details["role_report_timeout_ms"] = json!(role_report_timeout_ms);
@@ -6379,7 +6408,9 @@ impl DevWindowShell {
                         != Some(pending.source_revision)
                 {
                     value["status"] = json!("stale");
-                    value["diagnostic"] = json!("dev-side preview replace result did not match pending command/revision");
+                    value["diagnostic"] = json!(
+                        "dev-side preview replace result did not match pending command/revision"
+                    );
                 }
                 if value
                     .pointer("/ack/kind")
@@ -6520,7 +6551,11 @@ impl DevWindowShell {
             ),
             None => json!({"status": "fail", "blocker": "ExampleCatalog has no tab entries"}),
         };
-        if tab_switch_json.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+        if tab_switch_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        {
             tab_switch_json["preview_transport_result"] =
                 shell.wait_for_preview_replace_result(Duration::from_secs(2));
         }
@@ -10906,21 +10941,25 @@ fn preview_focused_text_for_node(
     let address = focused_address(layout_proof, node)?;
     let mut runtime = live_runtime.lock().ok()?;
     let summary = runtime.document_state_summary();
-    focused_cell_editing_text_for_address(&summary, &address)
+    focused_editing_text_for_address(&summary, &address)
 }
 
-fn focused_cell_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
-    summary
-        .get("cells")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|cell| cell.get("address").and_then(serde_json::Value::as_str) == Some(address))
-        .and_then(|cell| {
-            cell.get("editing_text")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+fn focused_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
+    match summary {
+        Value::Object(map) => {
+            if map.get("address").and_then(serde_json::Value::as_str) == Some(address) {
+                if let Some(text) = map.get("editing_text").and_then(serde_json::Value::as_str) {
+                    return Some(text.to_owned());
+                }
+            }
+            map.values()
+                .find_map(|value| focused_editing_text_for_address(value, address))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| focused_editing_text_for_address(value, address)),
+        _ => None,
+    }
 }
 
 fn document_value_for_node(layout_proof: &Value, node: &str) -> Option<String> {
@@ -11097,6 +11136,10 @@ struct PreviewSharedRenderState {
     scroll_y_px: f64,
     last_error: Option<String>,
     last_error_count: u64,
+}
+
+fn preview_content_revision(update_count: u64) -> u64 {
+    update_count.saturating_add(1)
 }
 
 #[derive(Clone)]
@@ -11738,12 +11781,10 @@ fn preview_apply_replace_code_to_state(
         .get("preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    state.live_runtime = boon_runtime::LiveRuntime::from_source(
-        &format!("native-preview-live:{source_path}"),
-        code,
-    )
-    .ok()
-    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    state.live_runtime =
+        boon_runtime::LiveRuntime::from_source(&format!("native-preview-live:{source_path}"), code)
+            .ok()
+            .map(|runtime| Arc::new(Mutex::new(runtime)));
     if let Some(layout_proof) = response.get("document_layout_proof") {
         let mut shared = state
             .shared_render_state
@@ -12148,7 +12189,7 @@ fn preview_update_shared_focus_node_from_runtime_state(
     let focused_text = event
         .address
         .as_deref()
-        .and_then(|address| focused_cell_editing_text_for_address(state_summary, address))
+        .and_then(|address| focused_editing_text_for_address(state_summary, address))
         .or_else(|| event.target_text.clone())
         .or_else(|| event.text.clone())
         .unwrap_or_default();
@@ -13738,6 +13779,33 @@ mod tests {
             &mut input_state,
         );
         assert_eq!(shell.workspace.selected_buffer.source_text, "a\n");
+    }
+
+    #[test]
+    fn focused_editing_text_lookup_is_document_shape_generic() {
+        let summary = json!({
+            "rows": [
+                {
+                    "widgets": [
+                        {"address": "A0", "editing_text": "not selected"},
+                        {
+                            "kind": "editable-slot",
+                            "address": "B2",
+                            "editing_text": "=sum(A0:A2)"
+                        }
+                    ]
+                }
+            ],
+            "metadata": {
+                "cells": [{"address": "B2", "value": "wrong branch without editing text"}]
+            }
+        });
+
+        assert_eq!(
+            focused_editing_text_for_address(&summary, "B2"),
+            Some("=sum(A0:A2)".to_owned())
+        );
+        assert_eq!(focused_editing_text_for_address(&summary, "Z9"), None);
     }
 
     fn test_dev_editor_context(

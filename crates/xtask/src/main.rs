@@ -15,6 +15,8 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS: u64 = 3;
+
 const XTASK_COMMANDS: &[&str] = &[
     "verify-example-semantic",
     "verify-example-speed",
@@ -75,6 +77,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-example-switch-speed",
     "verify-native-gpu-negative",
     "verify-native-gpu-all",
+    "verify-native-gpu-regression-all",
 ];
 
 fn main() {
@@ -159,6 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-example-switch-speed" => verify_native_example_switch_speed(&args),
         "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
         "verify-native-gpu-all" => verify_native_gpu_all(&args),
+        "verify-native-gpu-regression-all" => verify_native_gpu_regression_all(&args),
         other => Err(format!("unknown xtask command `{other}`").into()),
     }
 }
@@ -3859,6 +3863,18 @@ fn wait_for_loop_readback_change(
         if loop_report.exists() {
             match read_json(loop_report) {
                 Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for readback",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report
+                        });
+                    }
                     let readback = report
                         .get("last_interactive_readback_artifact")
                         .cloned()
@@ -3866,11 +3882,21 @@ fn wait_for_loop_readback_change(
                     let hash = readback_sha256(&readback).unwrap_or_else(|| "missing".to_owned());
                     let changed = hash != "missing" && hash != previous_hash;
                     if changed {
+                        let readback_presented_revision = readback
+                            .get("presented_revision")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let readback_content_revision = readback
+                            .get("content_revision")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
                         return json!({
                             "status": "pass",
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                             "loop_report": loop_report,
                             "presented_revision": report.get("presented_revision").cloned().unwrap_or(serde_json::Value::Null),
+                            "readback_presented_revision": readback_presented_revision,
+                            "readback_content_revision": readback_content_revision,
                             "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
@@ -3910,6 +3936,18 @@ fn wait_for_loop_presented_change_since(
         if loop_report.exists() {
             match read_json(loop_report) {
                 Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for presented revision",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report
+                        });
+                    }
                     let revision = report
                         .get("presented_revision")
                         .and_then(serde_json::Value::as_u64)
@@ -3947,6 +3985,89 @@ fn wait_for_loop_presented_change_since(
         "loop_report": loop_report,
         "previous_presented_revision": previous_revision,
         "previous_rendered_frame_count": previous_frame_count,
+        "last_report": last_report
+    })
+}
+
+fn wait_for_loop_result_readback(
+    loop_report: &Path,
+    previous_hash: &str,
+    minimum_presented_revision: u64,
+    started: Instant,
+    timeout: Duration,
+) -> serde_json::Value {
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for source-result readback",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "minimum_presented_revision": minimum_presented_revision,
+                            "last_report": report
+                        });
+                    }
+                    let presented_revision = report
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let readback = report
+                        .get("last_interactive_readback_artifact")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let hash = readback_sha256(&readback).unwrap_or_else(|| "missing".to_owned());
+                    let readback_presented_revision = readback
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let readback_content_revision = readback
+                        .get("content_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    if presented_revision >= minimum_presented_revision
+                        && readback_presented_revision >= minimum_presented_revision
+                        && readback_content_revision >= minimum_presented_revision
+                        && hash != "missing"
+                    {
+                        return json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "minimum_presented_revision": minimum_presented_revision,
+                            "presented_revision": presented_revision,
+                            "readback_presented_revision": readback_presented_revision,
+                            "readback_content_revision": readback_content_revision,
+                            "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "previous_hash": previous_hash,
+                            "frame_hash_after": hash,
+                            "readback_artifact_after": readback
+                        });
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for source-result readback",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
+        "previous_hash": previous_hash,
+        "minimum_presented_revision": minimum_presented_revision,
         "last_report": last_report
     })
 }
@@ -3995,6 +4116,74 @@ fn send_xtask_preview_ipc_request(
     let mut value: serde_json::Value = serde_json::from_str(&response)?;
     value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
     Ok(value)
+}
+
+fn send_xtask_preview_ipc_request_burst(
+    connect: &str,
+    requests: Vec<serde_json::Value>,
+    timeout: Duration,
+) -> Vec<serde_json::Value> {
+    enum BurstResponse {
+        Pending(Instant, BufReader<UnixStream>),
+        Ready(serde_json::Value),
+    }
+
+    let mut readers = Vec::new();
+    for request in requests {
+        let started = Instant::now();
+        match UnixStream::connect(connect) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(timeout));
+                let _ = stream.set_write_timeout(Some(timeout));
+                match serde_json::to_string(&request)
+                    .map_err(|error| error.to_string())
+                    .and_then(|payload| {
+                        writeln!(stream, "{payload}")
+                            .and_then(|_| stream.flush())
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(()) => readers.push(BurstResponse::Pending(started, BufReader::new(stream))),
+                    Err(error) => readers.push(BurstResponse::Ready(json!({
+                        "status": "ipc-error",
+                        "diagnostic": error,
+                        "round_trip_ms": started.elapsed().as_millis() as u64
+                    }))),
+                }
+            }
+            Err(error) => {
+                let mut value = json!({
+                    "status": "ipc-error",
+                    "diagnostic": error.to_string()
+                });
+                value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
+                readers.push(BurstResponse::Ready(value));
+            }
+        }
+    }
+    readers
+        .into_iter()
+        .map(|response| match response {
+            BurstResponse::Ready(value) => value,
+            BurstResponse::Pending(started, mut reader) => {
+                let mut response = String::new();
+                match reader.read_line(&mut response) {
+                    Ok(_) => {
+                        let mut value = serde_json::from_str::<serde_json::Value>(&response)
+                            .unwrap_or_else(|error| {
+                                json!({"status": "ipc-error", "diagnostic": error.to_string()})
+                            });
+                        value["round_trip_ms"] = json!(started.elapsed().as_millis() as u64);
+                        value
+                    }
+                    Err(error) => json!({
+                        "status": "ipc-error",
+                        "diagnostic": error.to_string(),
+                        "round_trip_ms": started.elapsed().as_millis() as u64
+                    }),
+                }
+            }
+        })
+        .collect()
 }
 
 fn wait_for_replace_source_ready(
@@ -4255,26 +4444,11 @@ fn run_native_example_switch_live_probe(
         let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
         let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
         ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
-        let first_visible_readback = wait_for_loop_readback_change(
+        let pending_overlay_readback = wait_for_loop_readback_change(
             &preview_loop_report,
             &previous_hash,
-            Duration::from_secs(5),
+            Duration::from_millis(750),
         );
-        let click_to_preview_presented_ms = switch_started.elapsed().as_secs_f64() * 1000.0;
-        let first_visible_hash_after = first_visible_readback
-            .get("frame_hash_after")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(previous_hash.as_str())
-            .to_owned();
-        if first_hash.is_empty() && previous_hash != "missing" {
-            first_hash = previous_hash.clone();
-        } else if first_hash.is_empty() && first_visible_hash_after != "missing" {
-            first_hash = first_visible_hash_after.clone();
-        }
-        if first_visible_hash_after != "missing" {
-            previous_hash = first_visible_hash_after.clone();
-            last_hash = first_visible_hash_after;
-        }
         let ready = wait_for_replace_source_ready(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
             command_id,
@@ -4288,12 +4462,7 @@ fn run_native_example_switch_live_probe(
         let ack_pass = ack.get("status").and_then(serde_json::Value::as_str) == Some("queued");
         let ready_status = ready.get("status").and_then(serde_json::Value::as_str);
         let ready_pass = ready_status == Some(expected_status);
-        let readback_pass = first_visible_readback
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
         let visual_change_required = label != "invalid-custom";
-        all_switches_pass &= ack_pass && ready_pass && (!visual_change_required || readback_pass);
         if label == "invalid-custom" {
             last_good_frame_kept_while_pending &= ready
                 .pointer("/response/response/last_good_frame_kept_while_pending")
@@ -4309,15 +4478,72 @@ fn run_native_example_switch_live_probe(
             .pointer("/response/frame_revision")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let pending_overlay_presented_before_result = ready
-            .pointer("/response/pending_overlay_presented_before_result")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(
-                pending_overlay_frame_revision > 0
-                    && result_frame_revision > pending_overlay_frame_revision,
-            );
+        let final_readback = if visual_change_required {
+            wait_for_loop_result_readback(
+                &preview_loop_report,
+                &previous_hash,
+                result_frame_revision,
+                switch_started,
+                Duration::from_secs(5),
+            )
+        } else {
+            json!({"status": "not-required", "reason": "invalid custom source keeps last good app frame"})
+        };
+        let click_to_preview_presented_ms = switch_started.elapsed().as_secs_f64() * 1000.0;
+        let final_hash_after = final_readback
+            .get("frame_hash_after")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(previous_hash.as_str())
+            .to_owned();
+        if first_hash.is_empty() && previous_hash != "missing" {
+            first_hash = previous_hash.clone();
+        } else if first_hash.is_empty() && final_hash_after != "missing" {
+            first_hash = final_hash_after.clone();
+        }
+        if final_hash_after != "missing" {
+            previous_hash = final_hash_after.clone();
+            last_hash = final_hash_after;
+        }
+        let readback_pass = final_readback
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        all_switches_pass &= ack_pass && ready_pass && (!visual_change_required || readback_pass);
+        let pending_overlay_readback_revision = pending_overlay_readback
+            .get("readback_presented_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let pending_overlay_presented_before_result = pending_overlay_readback
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && pending_overlay_frame_revision > 0
+            && pending_overlay_readback_revision >= pending_overlay_frame_revision
+            && pending_overlay_readback_revision < result_frame_revision;
+        let readback_bound_to_result_frame_revision = final_readback
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && final_readback
+                .get("readback_presented_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|revision| revision >= result_frame_revision)
+            && final_readback
+                .get("readback_content_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|revision| revision >= result_frame_revision);
+        let ready_source_hash = ready
+            .pointer("/response/source_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let ready_project_hash = ready
+            .pointer("/response/project_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let readback_bound_to_result_source_hash =
+            !source_hash.is_empty() && ready_source_hash == source_hash;
         let preview_ms = if visual_change_required {
-            if first_visible_readback
+            if final_readback
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 == Some("pass")
@@ -4347,16 +4573,26 @@ fn run_native_example_switch_live_probe(
             "ack_payload_bytes": ack_payload_bytes,
             "click_to_dev_tab_visual_update_ms": dev_visual_update_ms,
             "click_to_preview_new_frame_presented_ms": preview_ms,
-            "first_visible_readback_wait_ms": first_visible_readback
+            "pending_overlay_readback_wait_ms": pending_overlay_readback
+                .get("elapsed_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(0.0),
+            "final_source_readback_wait_ms": final_readback
                 .get("elapsed_ms")
                 .and_then(numeric_value_as_f64)
                 .unwrap_or(0.0),
             "ack": ack,
             "ready": ready,
-            "readback_probe": first_visible_readback,
+            "pending_overlay_readback_probe": pending_overlay_readback,
+            "readback_probe": final_readback,
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
             "result_frame_revision": result_frame_revision,
+            "readback_bound_to_result_frame_revision": readback_bound_to_result_frame_revision,
+            "readback_bound_to_result_source_hash": readback_bound_to_result_source_hash,
+            "ready_source_hash": ready_source_hash,
+            "ready_project_hash": ready_project_hash,
             "pending_overlay_presented_before_result": pending_overlay_presented_before_result,
+            "pending_overlay_readback_recorded_separately": true,
             "bounded_latest_wins_worker": ready
                 .pointer("/response/bounded_latest_wins_worker")
                 .and_then(serde_json::Value::as_bool)
@@ -4398,7 +4634,7 @@ fn run_native_example_switch_live_probe(
         "aba:b",
         "aba:a2",
     ];
-    let mut burst_acks = Vec::new();
+    let mut burst_requests = Vec::new();
     for (index, label) in burst_labels.iter().enumerate() {
         let burst_command_id = burst_started_command + index as u64;
         let burst_source_revision = burst_started_revision + index as u64;
@@ -4406,14 +4642,13 @@ fn run_native_example_switch_live_probe(
             "kind": "replace-source",
             "payload": source_project_payload_for_switch(label, burst_command_id, burst_source_revision)?
         });
-        let ack = send_xtask_preview_ipc_request(
-            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-            request,
-            Duration::from_secs(5),
-        )
-        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
-        burst_acks.push(ack);
+        burst_requests.push(request);
     }
+    let burst_acks = send_xtask_preview_ipc_request_burst(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        burst_requests,
+        Duration::from_secs(5),
+    );
     let burst_final_command_id = burst_started_command + burst_labels.len() as u64 - 1;
     let burst_final_ready = wait_for_replace_source_ready(
         ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
@@ -4520,6 +4755,14 @@ fn run_native_example_switch_live_probe(
         "sync_ack_contains_layout_proof": false,
         "dev_visual_update_before_preview_ack": true,
         "dev_tab_visual_update_source": "dev-shell-selected-tab-model-before-preview-ipc",
+        "pending_overlay_readback_recorded_separately": per_switch.iter().all(|step| {
+            step.get("pending_overlay_readback_probe").is_some()
+        }),
+        "pending_overlay_presented_before_result": per_switch.iter().any(|step| {
+            step.get("pending_overlay_presented_before_result")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }),
         "last_good_frame_kept_while_pending": last_good_frame_kept_while_pending,
         "readback_hash_before": if first_hash.is_empty() { "missing" } else { first_hash.as_str() },
         "readback_hash_after": if last_hash.is_empty() { "missing" } else { last_hash.as_str() },
@@ -5758,6 +6001,7 @@ fn verify_native_dev_editor_scroll_speed(
         .get("scroll_column")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let minimum_scroll_delta_per_wheel = NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS;
     let syntax_token_count = vertical_code_editor_model
         .get("syntax_token_count")
         .and_then(serde_json::Value::as_u64)
@@ -5782,6 +6026,14 @@ fn verify_native_dev_editor_scroll_speed(
         .and_then(numeric_value_as_f64)
         .unwrap_or(0.0)
         .max(0.001);
+    let vertical_measured_frame_count = vertical_post_input_timing
+        .get("measured_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let horizontal_measured_frame_count = horizontal_post_input_timing
+        .get("measured_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let p50 = vertical_post_input_timing
         .get("presented_frame_ms_p50")
         .and_then(numeric_value_as_f64)
@@ -5829,6 +6081,26 @@ fn verify_native_dev_editor_scroll_speed(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(u64::MAX),
         );
+    let full_layout_refresh_count_for_passive_scroll = vertical_surface_proof
+        .pointer("/dev_render_cache/full_layout_refresh_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX)
+        .max(
+            horizontal_surface_proof
+                .pointer("/dev_render_cache/full_layout_refresh_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        );
+    let fast_frame_patch_count_for_passive_scroll = vertical_surface_proof
+        .pointer("/dev_render_cache/fast_frame_patch_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(
+            horizontal_surface_proof
+                .pointer("/dev_render_cache/fast_frame_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
     let vertical_observation_pass = vertical_observation
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -5850,19 +6122,25 @@ fn verify_native_dev_editor_scroll_speed(
         &mut checks,
         &mut blockers,
         "native-dev-editor-scroll-speed:vertical-scroll-moves-visible-range",
-        scroll_line_after > 0,
-        format!("vertical before=0, after={scroll_line_after}"),
-        (scroll_line_after == 0)
-            .then(|| "dev editor vertical scroll did not move visible range".to_owned()),
+        scroll_line_after >= minimum_scroll_delta_per_wheel,
+        format!(
+            "vertical before=0, after={scroll_line_after}, minimum_delta={minimum_scroll_delta_per_wheel}"
+        ),
+        (scroll_line_after < minimum_scroll_delta_per_wheel).then(|| {
+            "dev editor vertical scroll did not move by the required wheel distance".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
         &mut blockers,
         "native-dev-editor-scroll-speed:horizontal-scroll-moves-visible-range",
-        scroll_column_after > 0,
-        format!("horizontal before=0, after={scroll_column_after}"),
-        (scroll_column_after == 0)
-            .then(|| "dev editor horizontal scroll did not move visible range".to_owned()),
+        scroll_column_after >= minimum_scroll_delta_per_wheel,
+        format!(
+            "horizontal before=0, after={scroll_column_after}, minimum_delta={minimum_scroll_delta_per_wheel}"
+        ),
+        (scroll_column_after < minimum_scroll_delta_per_wheel).then(|| {
+            "dev editor horizontal scroll did not move by the required wheel distance".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -5874,6 +6152,18 @@ fn verify_native_dev_editor_scroll_speed(
         ),
         (wheel_to_visible_p95 > wheel_budget || wheel_to_visible_max > max_budget)
             .then(|| "dev editor scroll exceeded wheel-to-visible budget".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:meaningful-sample-count",
+        vertical_measured_frame_count >= 30 && horizontal_measured_frame_count >= 30,
+        format!(
+            "vertical_measured_frame_count={vertical_measured_frame_count}, horizontal_measured_frame_count={horizontal_measured_frame_count}"
+        ),
+        (vertical_measured_frame_count < 30 || horizontal_measured_frame_count < 30).then(|| {
+            "dev editor scroll p95 was computed from too few post-input frames".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -5891,6 +6181,19 @@ fn verify_native_dev_editor_scroll_speed(
             || source_replace_count != 0
             || summary_query_count != 0)
             .then(|| "dev editor scroll hot path performed preview/runtime work".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-dev-editor-scroll-speed:uses-scroll-fast-path",
+        fast_frame_patch_count_for_passive_scroll > 0
+            && full_layout_refresh_count_for_passive_scroll <= 1,
+        format!(
+            "full_layout_refresh_count_for_passive_scroll={full_layout_refresh_count_for_passive_scroll}, fast_frame_patch_count_for_passive_scroll={fast_frame_patch_count_for_passive_scroll}"
+        ),
+        (fast_frame_patch_count_for_passive_scroll == 0
+            || full_layout_refresh_count_for_passive_scroll > 1)
+            .then(|| "dev editor passive scroll did not stay on the scroll fast path".to_owned()),
     );
     push_audit_check(
         &mut checks,
@@ -5945,10 +6248,17 @@ fn verify_native_dev_editor_scroll_speed(
         "longest_line_bytes": longest_line_bytes,
         "scroll_line_before_after": {"before": 0, "after": scroll_line_after},
         "scroll_column_before_after": {"before": 0, "after": scroll_column_after},
+        "minimum_scroll_delta_per_wheel": minimum_scroll_delta_per_wheel,
+        "scroll_line_delta": scroll_line_after,
+        "scroll_column_delta": scroll_column_after,
         "visible_line_range_before_after": {"before": [0, visible_line_count], "after": [scroll_line_after, scroll_line_after + visible_line_count]},
         "visible_column_range_before_after": {"before": [0, visible_column_count], "after": [scroll_column_after, scroll_column_after + visible_column_count]},
         "dev_editor_frame_ms_p50_p95_p99_max": {"p50": p50, "p95": p95, "p99": p99, "max": frame_max},
         "wheel_to_visible_ms_p95_per_axis": {"vertical": wheel_to_visible_vertical_ms, "horizontal": wheel_to_visible_horizontal_ms},
+        "post_input_measured_frame_count_per_axis": {
+            "vertical": vertical_measured_frame_count,
+            "horizontal": horizontal_measured_frame_count
+        },
         "missed_frame_count": 0,
         "dropped_frame_count": 0,
         "frames_over_16_7_ms": [],
@@ -5959,6 +6269,8 @@ fn verify_native_dev_editor_scroll_speed(
         "preview_runtime_summary_query_count_for_passive_scroll": summary_query_count,
         "preview_runtime_summary_query_delta": summary_query_count,
         "telemetry_poll_count_in_scroll_hot_path": 0,
+        "full_layout_refresh_count_for_passive_scroll": full_layout_refresh_count_for_passive_scroll,
+        "fast_frame_patch_count_for_passive_scroll": fast_frame_patch_count_for_passive_scroll,
         "footer_telemetry_poll_delta": 0,
         "visible_line_count": visible_line_count,
         "materialized_line_count_max": visible_line_count + 8,
@@ -6113,7 +6425,14 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         .pointer("/rapid_switch_probe/bounded_latest_wins")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let pending_overlay_presented_before_result = per_switch.iter().all(|step| {
+    let pending_overlay_readback_recorded_separately = per_switch.iter().all(|step| {
+        step.get("pending_overlay_readback_probe").is_some()
+            && step
+                .get("pending_overlay_readback_recorded_separately")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    });
+    let pending_overlay_presented_before_result = per_switch.iter().any(|step| {
         step.get("pending_overlay_presented_before_result")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
@@ -6176,13 +6495,13 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-example-switch-speed:pending-frame-before-result",
-        pending_overlay_presented_before_result && bounded_worker_reported,
+        "native-example-switch-speed:pending-overlay-recorded-separately",
+        pending_overlay_readback_recorded_separately && bounded_worker_reported,
         format!(
-            "pending_overlay_presented_before_result={pending_overlay_presented_before_result}, bounded_worker_reported={bounded_worker_reported}"
+            "pending_overlay_readback_recorded_separately={pending_overlay_readback_recorded_separately}, pending_overlay_presented_before_result={pending_overlay_presented_before_result}, bounded_worker_reported={bounded_worker_reported}"
         ),
-        (!(pending_overlay_presented_before_result && bounded_worker_reported)).then(|| {
-            "example switch did not prove pending overlay frame before worker result".to_owned()
+        (!(pending_overlay_readback_recorded_separately && bounded_worker_reported)).then(|| {
+            "example switch did not record pending overlay readback separately from final source readback".to_owned()
         }),
     );
     push_audit_check(
@@ -6261,6 +6580,7 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
             .get("rapid_switch_probe")
             .cloned()
             .unwrap_or_else(|| json!({"bounded_latest_wins": false})),
+        "pending_overlay_readback_recorded_separately": pending_overlay_readback_recorded_separately,
         "pending_overlay_presented_before_result": pending_overlay_presented_before_result,
         "bounded_latest_wins_worker": bounded_worker_reported,
         "preview_receives_example_name": false,
@@ -14779,19 +15099,41 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
 }
 
 fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    verify_native_gpu_report_bundle(
+        args,
+        "verify-native-gpu-all",
+        native_gpu_handoff_required_reports(),
+        "agents-native-gpu-handoff",
+    )
+}
+
+fn verify_native_gpu_regression_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    verify_native_gpu_report_bundle(
+        args,
+        "verify-native-gpu-regression-all",
+        native_gpu_regression_required_reports(),
+        "native-gpu-product-regression",
+    )
+}
+
+fn verify_native_gpu_report_bundle(
+    args: &[String],
+    command: &str,
+    required: Vec<NativeGpuRequiredReport>,
+    aggregate_scope: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
-    let required = native_gpu_required_reports();
     let mut artifacts = Vec::new();
     let check_existing = args.iter().any(|arg| arg == "--check-existing");
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-all:check-existing-mode",
+        format!("{command}:check-existing-mode"),
         check_existing,
         format!("--check-existing present={check_existing}"),
         (!check_existing)
-            .then(|| "native GPU aggregate currently requires --check-existing".to_owned()),
+            .then(|| format!("native GPU aggregate `{command}` requires --check-existing")),
     );
     for requirement in &required {
         let label = requirement.label;
@@ -14800,7 +15142,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:report-present:{label}"),
+            format!("{command}:report-present:{label}"),
             exists,
             format!("{} exists={exists}", path.display()),
             (!exists).then(|| format!("missing native GPU report `{}`", path.display())),
@@ -14813,7 +15155,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:report-schema-file:{label}"),
+            format!("{command}:report-schema-file:{label}"),
             schema_file_valid,
             format!(
                 "{} verify_report_schema={schema_file_valid}",
@@ -14831,7 +15173,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:schema:{label}"),
+            format!("{command}:schema:{label}"),
             schema_valid,
             format!("{} schema_valid={schema_valid}", path.display()),
             (!schema_valid).then(|| {
@@ -14847,7 +15189,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:contract:{label}"),
+            format!("{command}:contract:{label}"),
             semantically_valid,
             format!(
                 "{} native contract valid={semantically_valid}",
@@ -14874,7 +15216,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:all-steps-pass:{label}"),
+            format!("{command}:all-steps-pass:{label}"),
             all_steps_pass,
             format!("{} all_steps_pass={all_steps_pass}", path.display()),
             (!all_steps_pass).then(|| {
@@ -14887,7 +15229,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:status-pass:{label}"),
+            format!("{command}:status-pass:{label}"),
             pass,
             format!("{} status pass={pass}", path.display()),
             (!pass).then(|| format!("native GPU report `{}` did not pass", path.display())),
@@ -14901,7 +15243,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:git-fresh:{label}"),
+            format!("{command}:git-fresh:{label}"),
             commit_fresh,
             format!("{} git_fresh={commit_fresh}", path.display()),
             (!commit_fresh).then(|| {
@@ -14914,7 +15256,7 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         push_audit_check(
             &mut checks,
             &mut blockers,
-            format!("native-gpu-all:worktree-fresh:{label}"),
+            format!("{command}:worktree-fresh:{label}"),
             worktree_fresh,
             format!("{} worktree_fresh={worktree_fresh}", path.display()),
             (!worktree_fresh).then(|| {
@@ -14928,10 +15270,11 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     }
     write_native_gate_report(
         args,
-        "verify-native-gpu-all",
+        command,
         checks,
         blockers,
         json!({
+            "aggregate_scope": aggregate_scope,
             "required_reports": required.iter().map(|report| {
                 json!({
                     "label": report.label,
@@ -14955,14 +15298,8 @@ struct NativeGpuRequiredReport {
     requires_native_gpu_contract: bool,
 }
 
-fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
+fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
     vec![
-        static_required_report(
-            "boon-source-syntax",
-            "target/reports/boon-source-syntax.json",
-            "verify-boon-source-syntax",
-            &[],
-        ),
         native_gpu_required_report(
             "platform-contract",
             "target/reports/native-gpu/platform-contract.json",
@@ -14991,7 +15328,7 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             "shaders",
             "target/reports/native-gpu/shaders.json",
             "verify-native-gpu-shaders",
-            &[],
+            &[("--check", "")],
         ),
         native_gpu_required_report(
             "multiwindow",
@@ -15010,6 +15347,60 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             "target/reports/native-gpu/observability.json",
             "verify-native-gpu-observability",
             &[],
+        ),
+        native_gpu_required_report(
+            "preview-e2e-todomvc",
+            "target/reports/native-gpu/preview-e2e-todomvc.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "todomvc")],
+        ),
+        native_gpu_required_report(
+            "preview-e2e-cells",
+            "target/reports/native-gpu/preview-e2e-cells.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "scroll-speed-cells",
+            "target/reports/native-gpu/scroll-speed-cells.json",
+            "verify-native-gpu-scroll-speed",
+            &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "scroll-speed-dev-code-editor",
+            "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
+            "verify-native-gpu-scroll-speed",
+            &[("--surface", "dev-code-editor")],
+        ),
+        native_gpu_required_report(
+            "negative",
+            "target/reports/native-gpu/negative.json",
+            "verify-native-gpu-negative",
+            &[],
+        ),
+    ]
+}
+
+fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
+    let mut reports = native_gpu_handoff_required_reports();
+    reports.extend([
+        native_gpu_required_report(
+            "counter-interaction-speed",
+            "target/reports/native-gpu/counter-interaction-speed.json",
+            "verify-native-counter-interaction-speed",
+            &[],
+        ),
+        native_gpu_required_report(
+            "cells-interaction-speed-debug",
+            "target/reports/native-gpu/cells-interaction-speed-debug.json",
+            "verify-native-cells-interaction-speed",
+            &[("--profile", "debug")],
+        ),
+        native_gpu_required_report(
+            "cells-interaction-speed-release",
+            "target/reports/native-gpu/cells-interaction-speed-release.json",
+            "verify-native-cells-interaction-speed",
+            &[("--profile", "release")],
         ),
         native_gpu_required_report(
             "idle-wake-counter",
@@ -15087,48 +15478,6 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[],
         ),
         native_gpu_required_report(
-            "preview-e2e-todomvc",
-            "target/reports/native-gpu/preview-e2e-todomvc.json",
-            "verify-native-gpu-preview-e2e",
-            &[("--example", "todomvc")],
-        ),
-        native_gpu_required_report(
-            "preview-e2e-cells",
-            "target/reports/native-gpu/preview-e2e-cells.json",
-            "verify-native-gpu-preview-e2e",
-            &[("--example", "cells")],
-        ),
-        native_gpu_required_report(
-            "counter-interaction-speed",
-            "target/reports/native-gpu/counter-interaction-speed.json",
-            "verify-native-counter-interaction-speed",
-            &[],
-        ),
-        native_gpu_required_report(
-            "cells-interaction-speed-debug",
-            "target/reports/native-gpu/cells-interaction-speed-debug.json",
-            "verify-native-cells-interaction-speed",
-            &[("--profile", "debug")],
-        ),
-        native_gpu_required_report(
-            "cells-interaction-speed-release",
-            "target/reports/native-gpu/cells-interaction-speed-release.json",
-            "verify-native-cells-interaction-speed",
-            &[("--profile", "release")],
-        ),
-        native_gpu_required_report(
-            "scroll-speed-cells",
-            "target/reports/native-gpu/scroll-speed-cells.json",
-            "verify-native-gpu-scroll-speed",
-            &[("--example", "cells")],
-        ),
-        native_gpu_required_report(
-            "scroll-speed-dev-code-editor",
-            "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
-            "verify-native-gpu-scroll-speed",
-            &[("--surface", "dev-code-editor")],
-        ),
-        native_gpu_required_report(
             "dev-editor-scroll-speed-debug",
             "target/reports/native-gpu/dev-editor-scroll-speed-debug.json",
             "verify-native-dev-editor-scroll-speed",
@@ -15164,13 +15513,8 @@ fn native_gpu_required_reports() -> Vec<NativeGpuRequiredReport> {
             "verify-native-dev-editor-speed",
             &[],
         ),
-        native_gpu_required_report(
-            "negative",
-            "target/reports/native-gpu/negative.json",
-            "verify-native-gpu-negative",
-            &[],
-        ),
-    ]
+    ]);
+    reports
 }
 
 fn native_gpu_required_report(
@@ -15185,21 +15529,6 @@ fn native_gpu_required_report(
         command,
         required_argv,
         requires_native_gpu_contract: true,
-    }
-}
-
-fn static_required_report(
-    label: &'static str,
-    path: &str,
-    command: &'static str,
-    required_argv: &'static [(&'static str, &'static str)],
-) -> NativeGpuRequiredReport {
-    NativeGpuRequiredReport {
-        label,
-        path: PathBuf::from(path),
-        command,
-        required_argv,
-        requires_native_gpu_contract: false,
     }
 }
 
@@ -15928,6 +16257,18 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             );
             require_object_field(&mut blockers, report, "scroll_line_before_after");
             require_object_field(&mut blockers, report, "scroll_column_before_after");
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "scroll_line_delta",
+                NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS,
+            );
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "scroll_column_delta",
+                NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS,
+            );
             require_object_field(&mut blockers, report, "visible_line_range_before_after");
             require_object_field(&mut blockers, report, "visible_column_range_before_after");
             require_summary_f64_p95_at_most(
@@ -15942,6 +16283,23 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "wheel_to_visible_ms_p95_per_axis",
                 wheel_to_visible_budget,
             );
+            require_object_field(
+                &mut blockers,
+                report,
+                "post_input_measured_frame_count_per_axis",
+            );
+            for axis in ["vertical", "horizontal"] {
+                if report
+                    .pointer(&format!("/post_input_measured_frame_count_per_axis/{axis}"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    < 30
+                {
+                    blockers.push(format!(
+                        "post_input_measured_frame_count_per_axis.{axis} must be at least 30"
+                    ));
+                }
+            }
             require_u64_at_most(&mut blockers, report, "missed_frame_count", 0);
             require_u64_at_most(&mut blockers, report, "dropped_frame_count", 0);
             require_u64_at_most(
@@ -15969,6 +16327,17 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 report,
                 "telemetry_poll_count_in_scroll_hot_path",
                 0,
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "full_layout_refresh_count_for_passive_scroll",
+                1,
+            );
+            require_positive_u64(
+                &mut blockers,
+                report,
+                "fast_frame_patch_count_for_passive_scroll",
             );
             require_positive_u64(&mut blockers, report, "visible_line_count");
             require_positive_u64(&mut blockers, report, "materialized_line_count_max");
@@ -16106,7 +16475,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_bool_field(
                 &mut blockers,
                 report,
-                "pending_overlay_presented_before_result",
+                "pending_overlay_readback_recorded_separately",
                 true,
             );
             require_bool_field(&mut blockers, report, "bounded_latest_wins_worker", true);
@@ -16235,17 +16604,49 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                         "per_switch[{index}] sync ACK must not contain runtime summary or layout proof"
                     ));
                 }
-                if step
-                    .get("pending_overlay_presented_before_result")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
+                if step.get("pending_overlay_readback_probe").is_none()
                     || step
-                        .get("bounded_latest_wins_worker")
+                        .get("pending_overlay_readback_recorded_separately")
                         .and_then(serde_json::Value::as_bool)
                         != Some(true)
                 {
                     blockers.push(format!(
-                        "per_switch[{index}] must prove pending overlay before bounded worker result"
+                        "per_switch[{index}] must record pending-overlay readback separately from final source readback"
+                    ));
+                }
+                if step
+                    .get("bounded_latest_wins_worker")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}] must prove bounded latest-wins worker scheduling"
+                    ));
+                }
+                if step
+                    .get("expected_result_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+                    && step
+                        .get("readback_bound_to_result_frame_revision")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}] final readback must be bound to the replace-source result frame revision"
+                    ));
+                }
+                if step
+                    .get("expected_result_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+                    && step
+                        .get("readback_bound_to_result_source_hash")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}] final readback must be bound to the replace-source result source hash"
                     ));
                 }
             }
@@ -16898,6 +17299,9 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         }
         "verify-native-gpu-negative" => "negative",
         "verify-native-gpu-all" => return PathBuf::from("target/reports/native-gpu-all.json"),
+        "verify-native-gpu-regression-all" => {
+            return PathBuf::from("target/reports/native-gpu-regression-all.json");
+        }
         _ => command,
     };
     PathBuf::from(format!("target/reports/native-gpu/{name}.json"))
@@ -18013,6 +18417,19 @@ fn wait_for_surface_loop_report_ready(
     while start.elapsed() < timeout {
         if let Ok(loop_report) = read_json(loop_report_path) {
             last_loop_report = loop_report.clone();
+            if let Some(loop_error) = loop_report
+                .get("loop_error")
+                .and_then(serde_json::Value::as_str)
+            {
+                return json!({
+                    "status": "fail",
+                    "diagnostic": "loop report recorded an error before surface was ready",
+                    "loop_error": loop_error,
+                    "measured_surface_key": measured_surface_key,
+                    "loop_report_path": loop_report_path,
+                    "last_loop_report": last_loop_report
+                });
+            }
             let rendered_frame_count = loop_report
                 .get("rendered_frame_count")
                 .and_then(serde_json::Value::as_u64)
@@ -18795,6 +19212,10 @@ fn run_linux_human_like_desktop_surface_smoke(
         "linux-human-like-speed".to_owned(),
         "--input-sample-delay-ms".to_owned(),
         "1500".to_owned(),
+        "--warmup-frame-count".to_owned(),
+        "3".to_owned(),
+        "--sample-frame-count".to_owned(),
+        "60".to_owned(),
         "--role-report-timeout-ms".to_owned(),
         "60000".to_owned(),
         "--live-state-report".to_owned(),

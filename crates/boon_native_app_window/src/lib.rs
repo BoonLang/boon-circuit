@@ -691,6 +691,12 @@ pub struct AppWindowReadbackArtifact {
     pub sha256: String,
     pub width: u32,
     pub height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presented_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_frame_count: Option<u64>,
     pub capture_method: String,
     pub texture_format: String,
     pub nonblank_samples: usize,
@@ -1623,11 +1629,11 @@ async fn run_surface_probe_inner(
             )?;
         }
         if let Some((artifact_dir, pending)) = interactive_readback {
-            last_interactive_readback_artifact = Some(finish_visible_surface_readback(
-                &device,
-                pending,
-                &artifact_dir,
-            )?);
+            let mut artifact = finish_visible_surface_readback(&device, pending, &artifact_dir)?;
+            artifact.presented_revision = Some(render_loop_state.presented_revision);
+            artifact.content_revision = Some(render_loop_state.last_render_content_revision);
+            artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
+            last_interactive_readback_artifact = Some(artifact);
             if let Some(report) = options.render_loop_state_report.as_deref() {
                 write_render_loop_state_report(
                     Path::new(report),
@@ -1790,8 +1796,9 @@ fn write_render_loop_state_report(
             ))
         })?;
     }
+    let status = if loop_error.is_some() { "fail" } else { "pass" };
     let report = serde_json::json!({
-        "status": "pass",
+        "status": status,
         "role": role.as_str(),
         "pid": pid,
         "window_id": window_id,
@@ -1904,6 +1911,9 @@ fn finish_visible_surface_readback(
         sha256,
         width: pending.width,
         height: pending.height,
+        presented_revision: None,
+        content_revision: None,
+        rendered_frame_count: None,
         capture_method: "wgpu-visible-surface-copy-src-readback".to_owned(),
         texture_format: format!("{:?}", pending.format),
         nonblank_samples,

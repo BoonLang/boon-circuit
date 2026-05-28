@@ -1005,18 +1005,10 @@ cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu
 cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
 cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
 cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
-cargo xtask verify-native-gpu-idle-wake --example counter --report target/reports/native-gpu/idle-wake-counter.json
-cargo xtask verify-native-gpu-idle-wake --example todomvc --report target/reports/native-gpu/idle-wake-todomvc.json
-cargo xtask verify-native-gpu-idle-wake --example cells --report target/reports/native-gpu/idle-wake-cells.json
-cargo xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --report target/reports/native-gpu/idle-wake-custom-projects.json
 cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
 cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
 cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
 cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
-cargo xtask verify-native-dev-editor-scroll-speed --profile debug --report target/reports/native-gpu/dev-editor-scroll-speed-debug.json
-cargo xtask verify-native-dev-editor-scroll-speed --profile release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json
-cargo xtask verify-native-example-switch-speed --profile debug --report target/reports/native-gpu/example-switch-speed-debug.json
-cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
 cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
@@ -1024,7 +1016,37 @@ cargo xtask verify-native-gpu-all --check-existing --report target/reports/nativ
 Every native GPU gate must overwrite or remove any prior passing report before
 execution and write a schema-valid pass/fail report. `verify-native-gpu-all`
 must link every required native GPU report by path and sha256, and it is the
-native GPU acceptance aggregate for this architecture.
+native GPU acceptance aggregate for this architecture. Its required report list
+must match the handoff list above.
+
+The broader product/regression gates remain required before claiming the
+dev-editor/example-switch recovery complete, but they are not part of the
+handoff aggregate unless this document and `AGENTS.md` are updated together:
+
+```text
+cargo xtask verify-native-counter-interaction-speed --report target/reports/native-gpu/counter-interaction-speed.json
+cargo xtask verify-native-cells-interaction-speed --profile debug --report target/reports/native-gpu/cells-interaction-speed-debug.json
+cargo xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json
+cargo xtask verify-native-gpu-idle-wake --example counter --report target/reports/native-gpu/idle-wake-counter.json
+cargo xtask verify-native-gpu-idle-wake --example todomvc --report target/reports/native-gpu/idle-wake-todomvc.json
+cargo xtask verify-native-gpu-idle-wake --example cells --report target/reports/native-gpu/idle-wake-cells.json
+cargo xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --report target/reports/native-gpu/idle-wake-custom-projects.json
+cargo xtask verify-native-real-window-input-environment --report target/reports/native-gpu/real-window-input-environment.json
+cargo xtask verify-native-visible-launch --example todomvc --report target/reports/native-gpu/todomvc-visible-launch.json
+cargo xtask verify-native-visible-launch --example cells --report target/reports/native-gpu/cells-visible-launch.json
+cargo xtask verify-native-examples --all --report target/reports/native-gpu/native-examples.json
+cargo xtask verify-native-dev-window-editor --example todomvc --report target/reports/native-gpu/dev-editor-todomvc.json
+cargo xtask verify-native-dev-window-editor --example cells --report target/reports/native-gpu/dev-editor-cells.json
+cargo xtask verify-native-example-tabs --report target/reports/native-gpu/example-tabs.json
+cargo xtask verify-native-editor-format --report target/reports/native-gpu/editor-format.json
+cargo xtask verify-native-dev-editor-scroll-speed --profile debug --report target/reports/native-gpu/dev-editor-scroll-speed-debug.json
+cargo xtask verify-native-dev-editor-scroll-speed --profile release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json
+cargo xtask verify-native-example-switch-speed --profile debug --report target/reports/native-gpu/example-switch-speed-debug.json
+cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
+cargo xtask verify-native-example-speed --example cells --report target/reports/native-gpu/speed-cells.json
+cargo xtask verify-native-dev-editor-speed --report target/reports/native-gpu/dev-editor-speed.json
+cargo xtask verify-native-gpu-regression-all --check-existing --report target/reports/native-gpu-regression-all.json
+```
 
 Do not run the legacy readiness audits as part of this architecture gate. The
 old `verify-report-schema`, `audit-machine-readiness`, `audit-goal-readiness`,

@@ -37,6 +37,9 @@ const BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS: u64 = 600;
 const BOON_EDITOR_KEY_REPEAT_DELAY_MS: u64 = 500;
 const BOON_EDITOR_KEY_REPEAT_INTERVAL_MS: u64 = 30;
 const BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP: usize = 8;
+const DEV_EDITOR_WHEEL_UNIT: f64 = 8.0;
+const DEV_EDITOR_WHEEL_MIN_STEPS: isize = 3;
+const PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX: usize = 16 * 1024;
 
 const DEV_BG: &str = "#0f1724";
 const DEV_PANEL: &str = "#141b2a";
@@ -2414,17 +2417,30 @@ fn patch_dev_render_editor_scroll(
             .total_cmp(&frame.display_list[*right].bounds.y)
     });
     let visible_lines = model.visible_lines(text_indices.len());
+    let defer_rich_syntax = model.uses_deferred_large_buffer_syntax();
     for (item_index, (line_number, line)) in text_indices.into_iter().zip(visible_lines.iter()) {
         let item = &mut frame.display_list[item_index];
         item.node =
             boon_document_model::DocumentNodeId(format!("dev-code-editor-line-text-{line_number}"));
         item.text = Some(line.clone());
-        item.style.insert(
-            "syntax_spans_json".to_owned(),
-            boon_document_model::StyleValue::Text(syntax_spans_json(
-                &model.highlighted_line_segments(*line_number, line),
-            )),
-        );
+        if defer_rich_syntax {
+            item.style.remove("syntax_spans_json");
+            item.style.insert(
+                "rich_text".to_owned(),
+                boon_document_model::StyleValue::Bool(false),
+            );
+        } else {
+            item.style.insert(
+                "syntax_spans_json".to_owned(),
+                boon_document_model::StyleValue::Text(syntax_spans_json(
+                    &model.highlighted_line_segments(*line_number, line),
+                )),
+            );
+            item.style.insert(
+                "rich_text".to_owned(),
+                boon_document_model::StyleValue::Bool(true),
+            );
+        }
         for key in [
             "editor_selection_start",
             "editor_selection_end",
@@ -2558,6 +2574,7 @@ fn dev_apply_real_window_input(
         && rect_contains(footer_bounds, position.x as f32, position.y as f32)
     {
         let max_scroll_line = shell.footer_lines().len().saturating_sub(1);
+        let before_scroll_line = shell.footer_scroll_line;
         let line_delta = scaled_scroll_steps(input.scroll_delta_y, 8.0, 3);
         if line_delta > 0 {
             shell.footer_scroll_line = shell
@@ -2569,7 +2586,7 @@ fn dev_apply_real_window_input(
                 .footer_scroll_line
                 .saturating_sub((-line_delta) as usize);
         }
-        changed = true;
+        changed = shell.footer_scroll_line != before_scroll_line;
     } else if (input.scroll_delta_y.abs() > f64::EPSILON
         || input.scroll_delta_x.abs() > f64::EPSILON)
         && let Some(position) =
@@ -2596,7 +2613,13 @@ fn dev_apply_real_window_input(
             input.scroll_delta_x
         };
         let max_scroll_line = shell.workspace.selected_buffer.line_count.saturating_sub(1);
-        let line_delta = scaled_scroll_steps(vertical_delta, 24.0, 1);
+        let before_scroll_line = shell.workspace.selected_buffer.scroll_line;
+        let before_scroll_column = shell.workspace.selected_buffer.scroll_column;
+        let line_delta = scaled_scroll_steps(
+            vertical_delta,
+            DEV_EDITOR_WHEEL_UNIT,
+            DEV_EDITOR_WHEEL_MIN_STEPS,
+        );
         if line_delta > 0 {
             shell.workspace.selected_buffer.scroll_line = shell
                 .workspace
@@ -2612,7 +2635,11 @@ fn dev_apply_real_window_input(
                 .saturating_sub((-line_delta) as usize);
         }
         let max_scroll_column = max_editor_scroll_column(&shell.workspace.selected_buffer);
-        let column_delta = scaled_scroll_steps(horizontal_delta, 24.0, 1);
+        let column_delta = scaled_scroll_steps(
+            horizontal_delta,
+            DEV_EDITOR_WHEEL_UNIT,
+            DEV_EDITOR_WHEEL_MIN_STEPS,
+        );
         if column_delta > 0 {
             shell.workspace.selected_buffer.scroll_column = shell
                 .workspace
@@ -2627,7 +2654,8 @@ fn dev_apply_real_window_input(
                 .scroll_column
                 .saturating_sub((-column_delta) as usize);
         }
-        changed = true;
+        changed = shell.workspace.selected_buffer.scroll_line != before_scroll_line
+            || shell.workspace.selected_buffer.scroll_column != before_scroll_column;
     }
 
     let mouse_events = input
@@ -3117,8 +3145,11 @@ fn dev_position_from_pointer(
 }
 
 fn max_editor_scroll_column(model: &CodeEditorModel) -> usize {
-    model
-        .source_text
+    model.max_scroll_column
+}
+
+fn max_editor_scroll_column_for_source(source: &str) -> usize {
+    source
         .lines()
         .map(|line| line.chars().count())
         .max()
@@ -4913,6 +4944,7 @@ struct CodeEditorModel {
     source_text: String,
     line_starts: Vec<usize>,
     line_count: usize,
+    max_scroll_column: usize,
     selection: EditorSelection,
     scroll_line: usize,
     scroll_column: usize,
@@ -4940,12 +4972,14 @@ impl CodeEditorModel {
         let syntax_tokens_by_line = syntax_tokens_by_line(&syntax.tokens);
         let buffer = EditorBuffer::new(source_text);
         let line_count = buffer.line_count();
+        let max_scroll_column = max_editor_scroll_column_for_source(source_text);
         Self {
             file_name: source_path_label.to_owned(),
             buffer,
             source_text: source_text.to_owned(),
             line_starts: line_starts(source_text),
             line_count,
+            max_scroll_column,
             selection: EditorSelection::collapsed(EditorPosition::start()),
             scroll_line: 0,
             scroll_column: 0,
@@ -5025,6 +5059,10 @@ impl CodeEditorModel {
             .into_iter()
             .flat_map(|(line_number, line)| self.highlighted_line_segments(line_number, &line))
             .collect()
+    }
+
+    fn uses_deferred_large_buffer_syntax(&self) -> bool {
+        self.syntax_backend == "editor-fallback-tokenizer-deferred-large-buffer"
     }
 
     fn syntax_render_categories(&self) -> Vec<&'static str> {
@@ -5143,6 +5181,7 @@ impl CodeEditorModel {
         self.line_starts = line_starts(&self.source_text);
         self.selection = self.buffer.selection().clone();
         self.line_count = self.buffer.line_count();
+        self.max_scroll_column = max_editor_scroll_column_for_source(&self.source_text);
         self.last_command = self.buffer.last_command;
     }
 
@@ -11640,7 +11679,9 @@ impl PreviewReplaceWorkerQueue {
             .spawn(move || {
                 loop {
                     let payload = queue.wait_for_latest_payload();
-                    let result = preview_build_source_project(payload.clone());
+                    let result = preview_build_source_project(payload.clone(), || {
+                        preview_source_project_payload_is_latest(&state, &payload)
+                    });
                     if let Err(error) =
                         preview_commit_source_project_result(&state, &payload, result)
                     {
@@ -12002,6 +12043,16 @@ struct PreviewReplaceBuildResult {
     diagnostic: Option<String>,
 }
 
+fn preview_source_project_payload_is_latest(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    payload: &SourceProjectPayload,
+) -> bool {
+    state.lock().is_ok_and(|state| {
+        payload.command_id == state.latest_accepted_command_id
+            && payload.source_revision == state.latest_accepted_source_revision
+    })
+}
+
 fn preview_enqueue_source_project(
     state: &Arc<Mutex<PreviewIpcState>>,
     request: &serde_json::Value,
@@ -12119,6 +12170,11 @@ fn preview_enqueue_source_project(
         "entrypoint_unit": payload.entrypoint_unit,
         "unit_count": payload.units.len(),
         "multi_unit_project_hash_validated": payload.units.len() > 1,
+        "multi_unit_execution_mode": if payload.units.len() > 1 {
+            "entrypoint-only-hash-carried"
+        } else {
+            "single-entrypoint"
+        },
         "ack_payload_bytes": 0,
         "ack_latency_ms": elapsed_ms(queued_at),
         "hash_matches": true,
@@ -12188,8 +12244,40 @@ fn source_project_payload_from_request(
     ))
 }
 
-fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplaceBuildResult {
+fn preview_stale_source_project_result(
+    payload: SourceProjectPayload,
+    build_started: Instant,
+    stage: &'static str,
+) -> PreviewReplaceBuildResult {
+    PreviewReplaceBuildResult {
+        layout_proof: json!({"status": "stale", "stage": stage}),
+        runtime_summary: json!({"status": "stale", "stage": stage}),
+        live_runtime: None,
+        timings: json!({
+            "total_ms": elapsed_ms(build_started),
+            "stale_stage": stage,
+            "cancelled_before_commit": true
+        }),
+        source_text: String::new(),
+        source_sha256: String::new(),
+        source_bytes: 0,
+        virtual_uri: payload.entrypoint_unit,
+        status: "stale",
+        diagnostic: Some(format!("replace-source payload became stale at {stage}")),
+    }
+}
+
+fn preview_build_source_project<F>(
+    payload: SourceProjectPayload,
+    is_latest: F,
+) -> PreviewReplaceBuildResult
+where
+    F: Fn() -> bool,
+{
     let build_started = Instant::now();
+    if !is_latest() {
+        return preview_stale_source_project_result(payload, build_started, "before-entrypoint");
+    }
     let entrypoint = match payload.entrypoint() {
         Ok(entrypoint) => entrypoint.clone(),
         Err(error) => {
@@ -12211,42 +12299,84 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
         }
     };
     let source_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
-    let live_runtime_started = Instant::now();
-    let live_runtime_result = boon_runtime::LiveRuntime::from_source(
-        &format!("native-preview-live:{}", entrypoint.virtual_uri),
-        &entrypoint.text,
-    );
-    let live_runtime_ms = elapsed_ms(live_runtime_started);
-    let runtime_summary_started = Instant::now();
-    let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
-        Ok(mut runtime) => {
-            let state_summary = runtime.state_summary();
-            let document_state_summary = runtime.document_state_summary();
-            let summary = preview_runtime_summary_from_state_summary(
-                Path::new(&entrypoint.virtual_uri),
-                &source_hash,
-                state_summary,
-            );
-            (
-                summary,
-                Some(document_state_summary),
-                Some(Arc::new(Mutex::new(runtime))),
-            )
-        }
-        Err(error) => (
+    let defer_runtime = entrypoint.text.len() > PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX;
+    let mut live_runtime_ms = 0.0;
+    let mut runtime_summary_ms = 0.0;
+    let (runtime_summary, document_state_summary, live_runtime) = if defer_runtime {
+        (
             json!({
-                "status": "fail",
+                "status": "deferred",
                 "owns_live_runtime": false,
-                "reason": error.to_string(),
+                "reason": "source exceeds synchronous preview switch runtime budget",
+                "sync_runtime_budget_bytes": PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX,
                 "source_path": entrypoint.virtual_uri,
                 "source_sha256": source_hash.clone(),
+                "source_bytes": entrypoint.text.len(),
                 "full_state_mirroring_allowed": false
             }),
+            Some(json!({})),
             None,
-            None,
-        ),
+        )
+    } else {
+        if !is_latest() {
+            return preview_stale_source_project_result(
+                payload,
+                build_started,
+                "before-live-runtime",
+            );
+        }
+        let live_runtime_started = Instant::now();
+        let live_runtime_result = boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview-live:{}", entrypoint.virtual_uri),
+            &entrypoint.text,
+        );
+        live_runtime_ms = elapsed_ms(live_runtime_started);
+        if !is_latest() {
+            return preview_stale_source_project_result(
+                payload,
+                build_started,
+                "after-live-runtime",
+            );
+        }
+        let runtime_summary_started = Instant::now();
+        let result = match live_runtime_result {
+            Ok(mut runtime) => {
+                let state_summary = runtime.state_summary();
+                let document_state_summary = runtime.document_state_summary();
+                let summary = preview_runtime_summary_from_state_summary(
+                    Path::new(&entrypoint.virtual_uri),
+                    &source_hash,
+                    state_summary,
+                );
+                (
+                    summary,
+                    Some(document_state_summary),
+                    Some(Arc::new(Mutex::new(runtime))),
+                )
+            }
+            Err(error) => (
+                json!({
+                    "status": "fail",
+                    "owns_live_runtime": false,
+                    "reason": error.to_string(),
+                    "source_path": entrypoint.virtual_uri,
+                    "source_sha256": source_hash.clone(),
+                    "full_state_mirroring_allowed": false
+                }),
+                None,
+                None,
+            ),
+        };
+        runtime_summary_ms = elapsed_ms(runtime_summary_started);
+        if !is_latest() {
+            return preview_stale_source_project_result(
+                payload,
+                build_started,
+                "after-runtime-summary",
+            );
+        }
+        result
     };
-    let runtime_summary_ms = elapsed_ms(runtime_summary_started);
     let layout_started = Instant::now();
     let layout_proof = native_document_layout_proof_with_state(
         Path::new(&entrypoint.virtual_uri),
@@ -12255,6 +12385,9 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
     )
     .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}));
     let layout_ms = elapsed_ms(layout_started);
+    if !is_latest() {
+        return preview_stale_source_project_result(payload, build_started, "after-layout");
+    }
     let layout_status = layout_proof
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -12263,7 +12396,7 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("missing");
-    let pass = layout_status == "pass" && runtime_status == "pass";
+    let pass = layout_status == "pass" && matches!(runtime_status, "pass" | "deferred");
     let diagnostic = (!pass).then(|| {
         format!(
             "replace-source failed before commit: layout_status={layout_status}, runtime_status={runtime_status}"
@@ -12279,6 +12412,8 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
             "layout_ms": layout_ms,
             "runtime_summary_ms": runtime_summary_ms,
             "live_runtime_ms": live_runtime_ms,
+            "runtime_deferred": defer_runtime,
+            "sync_runtime_budget_bytes": PREVIEW_SWITCH_SYNC_RUNTIME_BYTES_MAX,
             "total_ms": total_ms
         }),
         source_bytes: entrypoint.text.len() as u64,
@@ -12306,6 +12441,21 @@ fn preview_commit_source_project_result(
     if payload.command_id != state.latest_accepted_command_id
         || payload.source_revision != state.latest_accepted_source_revision
     {
+        return Ok(());
+    }
+    if result.status == "stale" {
+        state.replace_status_cache = json!({
+            "kind": "replace-source-result",
+            "status": "stale",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "project_hash": payload.project_hash,
+            "diagnostic": result.diagnostic,
+            "parse_lower_runtime_layout_timings": result.timings,
+            "bounded_latest_wins_worker": true,
+            "stale_result_rejected": true,
+            "preview_receives_example_name": false
+        });
         return Ok(());
     }
 
@@ -12340,6 +12490,11 @@ fn preview_commit_source_project_result(
             "project_hash": payload.project_hash,
             "source_hash": result.source_sha256,
             "parse_lower_runtime_layout_timings": result.timings,
+            "multi_unit_execution_mode": if payload.units.len() > 1 {
+                "entrypoint-only-hash-carried"
+            } else {
+                "single-entrypoint"
+            },
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
             "frame_revision": frame_revision,
             "pending_overlay_presented_before_result": pending_overlay_frame_revision > 0
@@ -14864,6 +15019,41 @@ mod tests {
     }
 
     #[test]
+    fn dev_render_scroll_patch_defers_rich_spans_for_large_buffers() {
+        let mut source = String::new();
+        for index in 0..12_000 {
+            source.push_str(&format!("-- large buffer scroll line {index:05}\n"));
+        }
+        assert!(source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX);
+        let (mut shell, _, _, _) = test_dev_editor_context(&source);
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        shell.workspace.selected_buffer.scroll_line = 15;
+
+        assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
+        let line = render_state
+            .layout_frame
+            .as_ref()
+            .and_then(|frame| {
+                frame
+                    .display_list
+                    .iter()
+                    .find(|item| item.node.0 == "dev-code-editor-line-text-16")
+            })
+            .expect("patched line should be visible");
+        assert_eq!(
+            line.style.get("rich_text"),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+        assert!(
+            !line.style.contains_key("syntax_spans_json"),
+            "large-buffer scroll patch should keep the fast plain-text render path"
+        );
+    }
+
+    #[test]
     fn dev_shell_translates_raw_statuses_for_visible_ui() {
         let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
         shell.last_dev_command = "startup".to_owned();
@@ -15173,7 +15363,7 @@ mod tests {
             &mut shell,
             &mut input_state
         ));
-        assert!(shell.workspace.selected_buffer.scroll_line > 0);
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 3);
         assert_eq!(shell.footer_scroll_line, footer_after);
     }
 
@@ -15215,7 +15405,7 @@ mod tests {
             &mut input_state
         ));
         assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
-        assert!(shell.workspace.selected_buffer.scroll_column > 0);
+        assert_eq!(shell.workspace.selected_buffer.scroll_column, 3);
     }
 
     #[test]
@@ -15249,7 +15439,7 @@ mod tests {
             &mut input_state
         ));
         assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
-        assert!(shell.workspace.selected_buffer.scroll_column > 0);
+        assert_eq!(shell.workspace.selected_buffer.scroll_column, 3);
     }
 
     #[test]

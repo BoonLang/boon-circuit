@@ -496,23 +496,11 @@ cargo xtask verify-native-example-switch-speed --profile debug --report target/r
 cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
 ```
 
-Before claiming native GPU handoff readiness, resolve the aggregate scope
-mismatch. In the current checkout, `verify-native-gpu-all --check-existing`
-requires more reports than the shorter `AGENTS.md` command list, including
-idle-wake, visible-launch, native-examples, dev-window-editor, example-tabs,
-editor-format, dev-editor-scroll-speed, example-switch-speed, and older speed
-reports. Therefore one of these must happen first:
-
-- update `verify-native-gpu-all` so handoff readiness aggregates only the
-  `AGENTS.md` native GPU gate list; or
-- update `AGENTS.md`, `docs/architecture/NATIVE_GPU_PIPELINE.md`, and this
-  recovery plan together so the broader aggregate list is explicitly the
-  authoritative handoff contract; or
-- keep two aggregates: one `AGENTS.md` handoff aggregate and one product
-  regression aggregate.
-
-After the scope mismatch is resolved, run the authoritative handoff gate list.
-The current `AGENTS.md` list is:
+The aggregate scope mismatch is resolved by keeping two aggregates:
+`verify-native-gpu-all` is the `AGENTS.md` handoff aggregate, while
+`verify-native-gpu-regression-all` covers broader product/editor/example-switch
+regression reports. Before claiming native GPU handoff readiness, run the
+authoritative `AGENTS.md` handoff gate list:
 
 ```bash
 cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
@@ -531,10 +519,9 @@ cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negati
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
-If the broader current `verify-native-gpu-all` remains authoritative, these
-commands are not sufficient by themselves; every additional report required by
-that aggregate must also be generated fresh and must be documented as part of
-the handoff contract.
+Then run `verify-native-gpu-regression-all --check-existing` only after the
+focused regression reports and other broader product reports documented in
+`docs/architecture/NATIVE_GPU_PIPELINE.md` have been generated fresh.
 
 ## Subagent Verification
 

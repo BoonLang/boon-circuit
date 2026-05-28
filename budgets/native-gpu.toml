@@ -70,7 +70,7 @@ click_to_dev_tab_visual_update_ms_p95 = 50.0
 sync_ack_ms_p95 = 50.0
 sync_ack_ms_max = 120.0
 click_to_preview_new_frame_presented_ms_p95_bundled = 350.0
-click_to_preview_new_frame_presented_ms_p95_large_custom = 2200.0
+click_to_preview_new_frame_presented_ms_p95_large_custom = 500.0
 sync_ack_payload_bytes_max = 16384
 
 [example_switch.release]

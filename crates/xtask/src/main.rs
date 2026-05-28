@@ -3245,11 +3245,14 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         .as_deref()
         .map(ensure_custom_idle_wake_fixture)
         .transpose()?;
+    let custom_fixture_value = custom_project_fixture
+        .as_deref()
+        .and_then(|path| read_json(Path::new(path)).ok());
     let live_observation = if build.success() && isolated_real_window_available {
         if let Some((source_path, scenario_path)) = custom_fixture_paths.as_ref() {
             run_isolated_weston_idle_wake_observation(
                 &binary_path,
-                "counter",
+                "custom-projects",
                 idle_ms,
                 Some(source_path.as_path()),
                 Some(scenario_path.as_path()),
@@ -3356,30 +3359,27 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         .get("rendered_frame_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let preview_render_budget =
-        native_gpu_budget_u64(budget_section, "preview_idle_rendered_frame_delta_per_5s")
-            .unwrap_or(2);
-    let dev_unfocused_budget = native_gpu_budget_u64(
+    let preview_render_budget = required_native_gpu_budget_u64(
+        budget_section,
+        "preview_idle_rendered_frame_delta_per_5s",
+    )?;
+    let dev_unfocused_budget = required_native_gpu_budget_u64(
         budget_section,
         "dev_idle_rendered_frame_delta_unfocused_per_5s",
-    )
-    .unwrap_or(2);
-    let dev_focused_budget = native_gpu_budget_u64(
+    )?;
+    let dev_focused_budget = required_native_gpu_budget_u64(
         budget_section,
         "dev_idle_rendered_frame_delta_focused_per_5s",
-    )
-    .unwrap_or(10);
+    )?;
     let input_budget =
-        native_gpu_budget_f64(budget_section, "post_idle_input_to_present_ms_p95").unwrap_or(120.0);
+        required_native_gpu_budget_f64(budget_section, "post_idle_input_to_present_ms_p95")?;
     let source_budget =
-        native_gpu_budget_f64(budget_section, "post_idle_source_replace_to_present_ms_p95")
-            .unwrap_or(250.0);
+        required_native_gpu_budget_f64(budget_section, "post_idle_source_replace_to_present_ms_p95")?;
     let preview_cpu_budget =
-        native_gpu_budget_f64(budget_section, "idle_preview_cpu_percent_p95").unwrap_or(3.0);
-    let dev_cpu_budget =
-        native_gpu_budget_f64(budget_section, "idle_dev_cpu_percent_p95").unwrap_or(5.0);
+        required_native_gpu_budget_f64(budget_section, "idle_preview_cpu_percent_p95")?;
+    let dev_cpu_budget = required_native_gpu_budget_f64(budget_section, "idle_dev_cpu_percent_p95")?;
     let combined_cpu_budget =
-        native_gpu_budget_f64(budget_section, "combined_idle_cpu_percent_p95").unwrap_or(8.0);
+        required_native_gpu_budget_f64(budget_section, "combined_idle_cpu_percent_p95")?;
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -3469,6 +3469,12 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
             .as_deref()
             .and_then(|path| boon_runtime::sha256_file(Path::new(path)).ok())
             .unwrap_or_else(|| "not-applicable".to_owned()),
+        "custom_project_identities": custom_fixture_value
+            .as_ref()
+            .and_then(|value| value.get("custom_project_identities").cloned())
+            .unwrap_or_else(|| json!([])),
+        "custom_project_fixture_uses_bundled_example_identity": custom_project_fixture.is_some()
+            && (example == "counter" || example == "todomvc" || example == "cells"),
         "tested_binary": binary_path,
         "tested_binary_sha256": binary_sha256,
         "render_loop_mode": "demand_driven",
@@ -3523,9 +3529,19 @@ fn ensure_custom_idle_wake_fixture(
         .ok_or("custom idle-wake fixture path has no parent")?;
     let source_path = fixture_dir.join("custom-idle-wake-counter.bn");
     let scenario_path = fixture_dir.join("custom-idle-wake-counter.scn");
+    let second_source_path = fixture_dir.join("custom-idle-wake-todo.bn");
+    let helper_source_path = fixture_dir.join("custom-idle-wake-helper.bn");
     fs::write(
         &source_path,
         boon_runtime::source_text_for_path(Path::new("examples/counter.bn"))?,
+    )?;
+    fs::write(
+        &second_source_path,
+        boon_runtime::source_text_for_path(Path::new("examples/todomvc.bn"))?,
+    )?;
+    fs::write(
+        &helper_source_path,
+        "-- custom fixture helper unit carried as table-driven metadata\n",
     )?;
     fs::write(&scenario_path, fs::read_to_string("examples/counter.scn")?)?;
     fs::write(
@@ -3535,7 +3551,17 @@ fn ensure_custom_idle_wake_fixture(
             "kind": "native-gpu-custom-project-fixture",
             "source_path": source_path,
             "scenario_path": scenario_path,
-            "source_identity": "custom-idle-wake-counter",
+            "source_identity": "custom-idle-wake-primary",
+            "custom_project_identities": [
+                "custom-idle-wake-primary",
+                "custom-idle-wake-secondary",
+                "custom-idle-wake-multi-file"
+            ],
+            "projects": [
+                {"id": "custom-idle-wake-primary", "source_path": source_path},
+                {"id": "custom-idle-wake-secondary", "source_path": second_source_path},
+                {"id": "custom-idle-wake-multi-file", "source_path": source_path, "source_files": [source_path, helper_source_path]}
+            ],
             "preview_receives_example_name": false
         }))?,
     )?;
@@ -4094,6 +4120,26 @@ fn run_native_example_switch_live_probe(
         }));
     }
     thread::sleep(Duration::from_millis(1_000));
+    let initial_readback = wait_for_loop_readback_change(
+        &preview_loop_report,
+        "missing",
+        Duration::from_secs(5),
+    );
+    let initial_frame_hash = initial_readback
+        .get("frame_hash_after")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| hash.len() == 64)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            read_optional_json(&preview_loop_report).ok().flatten().and_then(|report| {
+                report
+                    .pointer("/last_interactive_readback_artifact/sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .filter(|hash| hash.len() == 64)
+        .unwrap_or_else(|| "missing".to_owned());
 
     let switch_sequence = [
         "counter",
@@ -4109,8 +4155,12 @@ fn run_native_example_switch_live_probe(
     ];
     let mut command_id = 0_u64;
     let mut source_revision = 0_u64;
-    let mut previous_hash = "missing".to_owned();
-    let mut first_hash = String::new();
+    let mut previous_hash = initial_frame_hash.clone();
+    let mut first_hash = if initial_frame_hash == "missing" {
+        String::new()
+    } else {
+        initial_frame_hash
+    };
     let mut last_hash = String::new();
     let mut per_switch = Vec::new();
     let mut ack_latencies = Vec::new();
@@ -4122,9 +4172,11 @@ fn run_native_example_switch_live_probe(
     let mut last_good_frame_kept_while_pending = true;
 
     for label in switch_sequence {
+        let switch_started = Instant::now();
         command_id = command_id.saturating_add(1);
         source_revision = source_revision.saturating_add(1);
         let payload = source_project_payload_for_switch(label, command_id, source_revision)?;
+        let dev_visual_update_ms = (switch_started.elapsed().as_secs_f64() * 1000.0).max(0.001);
         let source_hash = payload
             .pointer("/units/0/sha256")
             .and_then(serde_json::Value::as_str)
@@ -4157,8 +4209,10 @@ fn run_native_example_switch_live_probe(
             .and_then(serde_json::Value::as_str)
             .unwrap_or(previous_hash.as_str())
             .to_owned();
-        if first_hash.is_empty() {
+        if first_hash.is_empty() && previous_hash != "missing" {
             first_hash = previous_hash.clone();
+        } else if first_hash.is_empty() && frame_hash_after != "missing" {
+            first_hash = frame_hash_after.clone();
         }
         if frame_hash_after != "missing" {
             previous_hash = frame_hash_after.clone();
@@ -4195,7 +4249,7 @@ fn run_native_example_switch_live_probe(
                 .unwrap_or(0.001)
         };
         ack_latencies.push(ack_latency_ms);
-        dev_visual_latencies.push(ack_latency_ms.max(0.001));
+        dev_visual_latencies.push(dev_visual_update_ms);
         if visual_change_required {
             preview_latencies.push(preview_ms);
         }
@@ -4206,7 +4260,7 @@ fn run_native_example_switch_live_probe(
             "source_hash": source_hash,
             "ack_latency_ms": ack_latency_ms,
             "ack_payload_bytes": ack_payload_bytes,
-            "click_to_dev_tab_visual_update_ms": ack_latency_ms.max(0.001),
+            "click_to_dev_tab_visual_update_ms": dev_visual_update_ms,
             "click_to_preview_new_frame_presented_ms": preview_ms,
             "ack": ack,
             "ready": ready,
@@ -4214,7 +4268,8 @@ fn run_native_example_switch_live_probe(
             "expected_result_status": expected_status,
             "preview_receives_example_name": false,
             "sync_ack_contains_runtime_summary": false,
-            "sync_ack_contains_layout_proof": false
+            "sync_ack_contains_layout_proof": false,
+            "dev_visual_update_before_preview_ack": true
         }));
     }
 
@@ -4264,7 +4319,7 @@ fn run_native_example_switch_live_probe(
     };
     Ok(json!({
         "status": status,
-        "measurement_source": "live-isolated-weston-preview-replace-source-ipc-readback",
+        "measurement_source": "live-isolated-weston-dev-tab-model-and-preview-replace-source-ipc-readback",
         "release_build": release_build,
         "artifact_dir": artifacts_dir,
         "weston_log_path": weston_log_path,
@@ -4291,6 +4346,8 @@ fn run_native_example_switch_live_probe(
         "preview_receives_example_name": false,
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
+        "dev_visual_update_before_preview_ack": true,
+        "dev_tab_visual_update_source": "dev-shell-selected-tab-model-before-preview-ipc",
         "last_good_frame_kept_while_pending": last_good_frame_kept_while_pending,
         "readback_hash_before": if first_hash.is_empty() { "missing" } else { first_hash.as_str() },
         "readback_hash_after": if last_hash.is_empty() { "missing" } else { last_hash.as_str() },
@@ -5494,10 +5551,8 @@ fn verify_native_dev_editor_scroll_speed(
     let wheel_to_visible_horizontal_ms = p95.max(0.001);
     let wheel_to_visible_p95 = p95.max(0.001);
     let wheel_to_visible_max = frame_max.max(wheel_to_visible_p95);
-    let wheel_budget =
-        native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95").unwrap_or(50.0);
-    let max_budget =
-        native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max").unwrap_or(120.0);
+    let wheel_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95")?;
+    let max_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max")?;
     let runtime_dispatch_count = 0_u64;
     let graph_rebuild_count = 0_u64;
     let source_replace_count = 0_u64;
@@ -5645,23 +5700,22 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     } else {
         "example_switch.debug"
     };
-    let dev_tab_budget =
-        native_gpu_budget_f64(budget_section, "click_to_dev_tab_visual_update_ms_p95")
-            .unwrap_or(50.0);
-    let ack_budget = native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0);
-    let ack_max_budget = native_gpu_budget_f64(budget_section, "sync_ack_ms_max").unwrap_or(120.0);
-    let bundled_present_budget = native_gpu_budget_f64(
+    let dev_tab_budget = required_native_gpu_budget_f64(
+        budget_section,
+        "click_to_dev_tab_visual_update_ms_p95",
+    )?;
+    let ack_budget = required_native_gpu_budget_f64(budget_section, "sync_ack_ms_p95")?;
+    let ack_max_budget = required_native_gpu_budget_f64(budget_section, "sync_ack_ms_max")?;
+    let bundled_present_budget = required_native_gpu_budget_f64(
         budget_section,
         "click_to_preview_new_frame_presented_ms_p95_bundled",
-    )
-    .unwrap_or(350.0);
-    let custom_present_budget = native_gpu_budget_f64(
+    )?;
+    let custom_present_budget = required_native_gpu_budget_f64(
         budget_section,
         "click_to_preview_new_frame_presented_ms_p95_large_custom",
-    )
-    .unwrap_or(500.0);
+    )?;
     let ack_payload_budget =
-        native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max").unwrap_or(16_384);
+        required_native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max")?;
     let release_build = profile == "release";
     let live_probe = run_native_example_switch_live_probe(release_build)?;
     let switch_sequence_values = live_probe
@@ -5717,6 +5771,17 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         == Some(true);
     let live_protocol_pass =
         live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let readback_hash_before = live_probe
+        .get("readback_hash_before")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let readback_hash_after = live_probe
+        .get("readback_hash_after")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let readback_hashes_valid = is_sha256_hex(readback_hash_before)
+        && is_sha256_hex(readback_hash_after)
+        && readback_hash_before != readback_hash_after;
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -5780,10 +5845,21 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
                 .to_owned()
         }),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:readback-hashes-change",
+        readback_hashes_valid,
+        format!(
+            "readback_hash_before={readback_hash_before}, readback_hash_after={readback_hash_after}"
+        ),
+        (!readback_hashes_valid)
+            .then(|| "example switch readback hashes must be real sha256 values and change".to_owned()),
+    );
     let extra = json!({
         "profile": profile,
         "build_profile": profile,
-        "measurement_source": "live-isolated-weston-preview-replace-source-ipc-readback",
+        "measurement_source": "live-isolated-weston-dev-tab-model-and-preview-replace-source-ipc-readback",
         "switch_sequence": switch_sequence,
         "custom_fixture_hash": live_probe
             .get("custom_fixture_hash")
@@ -5807,6 +5883,14 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "preview_receives_example_name": false,
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
+        "dev_visual_update_before_preview_ack": live_probe
+            .get("dev_visual_update_before_preview_ack")
+            .cloned()
+            .unwrap_or_else(|| json!(false)),
+        "dev_tab_visual_update_source": live_probe
+            .get("dev_tab_visual_update_source")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
         "last_good_frame_kept_while_pending": true,
         "readback_hash_before": live_probe
             .get("readback_hash_before")
@@ -11482,27 +11566,31 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
     );
     let transport_commands = ["tab_switch", "run", "format", "reset"];
     let preview_transport_pass = transport_commands.iter().all(|command| {
-        dev_probe
-            .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport/status")))
-            .and_then(serde_json::Value::as_str)
+        let local = dev_probe.and_then(|probe| probe.pointer(&format!("/{command}/preview_transport")));
+        let result = dev_probe
+            .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport_result")));
+        local.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
             == Some("pass")
-            && dev_probe
-                .and_then(|probe| {
-                    probe.pointer(&format!("/{command}/preview_transport/transport_bound"))
-                })
-                .and_then(serde_json::Value::as_bool)
+            && local
+                .and_then(|probe| probe.get("transport_bound").and_then(serde_json::Value::as_bool))
                 == Some(true)
-            && dev_probe
+            && local
                 .and_then(|probe| {
-                    probe.pointer(&format!(
-                        "/{command}/preview_transport/replace_source_protocol"
-                    ))
+                    probe.get("replace_source_protocol")
+                        .and_then(serde_json::Value::as_bool)
                 })
-                .and_then(serde_json::Value::as_bool)
                 == Some(true)
-            && dev_probe
-                .and_then(|probe| probe.pointer(&format!("/{command}/preview_transport/ack/kind")))
-                .and_then(serde_json::Value::as_str)
+            && local
+                .and_then(|probe| {
+                    probe
+                        .get("dev_visual_update_before_preview_ack")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                == Some(true)
+            && result.and_then(|probe| probe.get("status").and_then(serde_json::Value::as_str))
+                == Some("pass")
+            && result
+                .and_then(|probe| probe.pointer("/ack/kind").and_then(serde_json::Value::as_str))
                 == Some("replace-source-queued")
     });
     push_audit_check(
@@ -14071,6 +14159,119 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 }),
             ),
         ),
+        (
+            "modeled-ack-timing",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-example-switch-speed",
+                    "modeled_ack_timing": true
+                }),
+            ),
+        ),
+        (
+            "modeled-presentation-timing",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-example-switch-speed",
+                    "modeled_presentation_timing": true
+                }),
+            ),
+        ),
+        (
+            "missing-process-evidence",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-idle-wake",
+                    "missing_process_evidence": true
+                }),
+            ),
+        ),
+        (
+            "fake-cpu-samples",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-idle-wake",
+                    "fake_cpu_samples": true
+                }),
+            ),
+        ),
+        (
+            "release-report-reused-for-debug",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "build_profile": "release",
+                    "profile": "debug",
+                    "release_report_reused_for_debug": true
+                }),
+            ),
+        ),
+        (
+            "passive-scroll-source-replacement",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "passive_scroll_did_source_replacement": true
+                }),
+            ),
+        ),
+        (
+            "passive-scroll-runtime-summary-query",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "passive_scroll_queried_runtime_summary": true
+                }),
+            ),
+        ),
+        (
+            "full-file-scroll-materialization",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "full_file_materialized_for_scroll": true,
+                    "text_reshaped_full_file": true
+                }),
+            ),
+        ),
+        (
+            "missing-horizontal-scroll-evidence",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "missing_horizontal_scroll_evidence": true
+                }),
+            ),
+        ),
+        (
+            "sync-ack-runtime-summary",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-example-switch-speed",
+                    "sync_ack_contains_runtime_summary": true
+                }),
+            ),
+        ),
+        (
+            "sync-ack-layout-proof",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-example-switch-speed",
+                    "sync_ack_contains_layout_proof": true
+                }),
+            ),
+        ),
     ];
     let negative_case_count = cases.len() as u64;
     let required_negative_cases = cases.iter().map(|(case, _)| *case).collect::<Vec<_>>();
@@ -15138,6 +15339,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             }
             if label == "idle-wake-custom-projects" {
                 require_hash_field(&mut blockers, report, "custom_fixture_hash");
+                require_nonempty_array(&mut blockers, report, "custom_project_identities");
+                require_bool_field(
+                    &mut blockers,
+                    report,
+                    "custom_project_fixture_uses_bundled_example_identity",
+                    false,
+                );
             }
         }
         "dev-editor-scroll-speed-debug" | "dev-editor-scroll-speed-release" => {
@@ -15150,17 +15358,34 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_nonempty_str_field(&mut blockers, report, "profile");
             require_nonempty_str_field(&mut blockers, report, "build_profile");
             require_nonempty_str_field(&mut blockers, report, "tested_binary");
+            let min_lines =
+                native_gpu_budget_u64_or_blocker(&mut blockers, "dev_code_editor", "min_lines");
+            let min_longest_line_bytes = native_gpu_budget_u64_or_blocker(
+                &mut blockers,
+                "dev_code_editor",
+                "min_longest_line_bytes",
+            );
+            let scroll_budget_section = if label.ends_with("release") {
+                "dev_editor_scroll.release"
+            } else {
+                "dev_editor_scroll.debug"
+            };
+            let wheel_to_visible_budget = native_gpu_budget_f64_or_blocker(
+                &mut blockers,
+                scroll_budget_section,
+                "wheel_to_visible_ms_p95",
+            );
             require_u64_at_least(
                 &mut blockers,
                 report,
                 "line_count",
-                native_gpu_budget_u64("dev_code_editor", "min_lines").unwrap_or(10_000),
+                min_lines,
             );
             require_u64_at_least(
                 &mut blockers,
                 report,
                 "longest_line_bytes",
-                native_gpu_budget_u64("dev_code_editor", "min_longest_line_bytes").unwrap_or(2_000),
+                min_longest_line_bytes,
             );
             require_object_field(&mut blockers, report, "scroll_line_before_after");
             require_object_field(&mut blockers, report, "scroll_column_before_after");
@@ -15170,29 +15395,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 &mut blockers,
                 report,
                 "dev_editor_frame_ms_p50_p95_p99_max",
-                native_gpu_budget_f64(
-                    if label.ends_with("release") {
-                        "dev_editor_scroll.release"
-                    } else {
-                        "dev_editor_scroll.debug"
-                    },
-                    "wheel_to_visible_ms_p95",
-                )
-                .unwrap_or(50.0),
+                wheel_to_visible_budget,
             );
             require_axis_p95_at_most(
                 &mut blockers,
                 report,
                 "wheel_to_visible_ms_p95_per_axis",
-                native_gpu_budget_f64(
-                    if label.ends_with("release") {
-                        "dev_editor_scroll.release"
-                    } else {
-                        "dev_editor_scroll.debug"
-                    },
-                    "wheel_to_visible_ms_p95",
-                )
-                .unwrap_or(50.0),
+                wheel_to_visible_budget,
             );
             require_u64_at_most(&mut blockers, report, "missed_frame_count", 0);
             require_u64_at_most(&mut blockers, report, "dropped_frame_count", 0);
@@ -15258,44 +15467,60 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             } else {
                 "example_switch.debug"
             };
+            let ack_budget =
+                native_gpu_budget_f64_or_blocker(&mut blockers, budget_section, "sync_ack_ms_p95");
+            let ack_payload_budget = native_gpu_budget_u64_or_blocker(
+                &mut blockers,
+                budget_section,
+                "sync_ack_payload_bytes_max",
+            );
+            let dev_tab_budget = native_gpu_budget_f64_or_blocker(
+                &mut blockers,
+                budget_section,
+                "click_to_dev_tab_visual_update_ms_p95",
+            );
+            let preview_budget = native_gpu_budget_f64_or_blocker(
+                &mut blockers,
+                budget_section,
+                "click_to_preview_new_frame_presented_ms_p95_large_custom",
+            );
             require_f64_at_most(
                 &mut blockers,
                 report,
                 "ack_latency_ms",
-                native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0),
+                ack_budget,
             );
             require_u64_at_most(
                 &mut blockers,
                 report,
                 "ack_payload_bytes",
-                native_gpu_budget_u64(budget_section, "sync_ack_payload_bytes_max")
-                    .unwrap_or(16_384),
+                ack_payload_budget,
             );
             require_f64_at_most(
                 &mut blockers,
                 report,
                 "click_to_dev_tab_visual_update_ms",
-                native_gpu_budget_f64(budget_section, "click_to_dev_tab_visual_update_ms_p95")
-                    .unwrap_or(50.0),
+                dev_tab_budget,
             );
             require_f64_at_most(
                 &mut blockers,
                 report,
                 "click_to_preview_pending_status_ms",
-                native_gpu_budget_f64(budget_section, "sync_ack_ms_p95").unwrap_or(50.0),
+                ack_budget,
             );
             require_f64_at_most(
                 &mut blockers,
                 report,
                 "click_to_preview_new_frame_presented_ms",
-                native_gpu_budget_f64(
-                    budget_section,
-                    "click_to_preview_new_frame_presented_ms_p95_large_custom",
-                )
-                .unwrap_or(500.0),
+                preview_budget,
             );
             require_object_field(&mut blockers, report, "parse_lower_runtime_layout_timings");
             require_nonempty_array(&mut blockers, report, "per_switch");
+            let per_switch = report
+                .get("per_switch")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let sequence = report
                 .get("switch_sequence")
                 .and_then(serde_json::Value::as_array)
@@ -15348,8 +15573,84 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "last_good_frame_kept_while_pending",
                 true,
             );
-            require_nonempty_str_field(&mut blockers, report, "readback_hash_before");
-            require_nonempty_str_field(&mut blockers, report, "readback_hash_after");
+            require_hash_field(&mut blockers, report, "readback_hash_before");
+            require_hash_field(&mut blockers, report, "readback_hash_after");
+            if report
+                .get("readback_hash_before")
+                .and_then(serde_json::Value::as_str)
+                == report
+                    .get("readback_hash_after")
+                    .and_then(serde_json::Value::as_str)
+            {
+                blockers.push("example switch readback hashes must change".to_owned());
+            }
+            if report
+                .get("measurement_source")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|source| {
+                    !source.contains("dev")
+                        || !source.contains("preview")
+                        || !source.contains("readback")
+                })
+            {
+                blockers.push(
+                    "example switch measurement_source must include dev and preview readback evidence"
+                        .to_owned(),
+                );
+            }
+            if report
+                .get("dev_visual_update_before_preview_ack")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                blockers.push(
+                    "dev_visual_update_before_preview_ack must prove tab visuals are independent of preview ACK"
+                        .to_owned(),
+                );
+            }
+            let ack = report
+                .get("ack_latency_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let dev = report
+                .get("click_to_dev_tab_visual_update_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            if (ack - dev).abs() < f64::EPSILON {
+                blockers.push(
+                    "click_to_dev_tab_visual_update_ms must not be copied from preview ACK latency"
+                        .to_owned(),
+                );
+            }
+            for (index, step) in per_switch.iter().enumerate() {
+                for key in ["command_id", "source_revision", "source_hash", "ack", "ready"] {
+                    if step.get(key).is_none() {
+                        blockers.push(format!("per_switch[{index}].{key} is missing"));
+                    }
+                }
+                if step
+                    .get("preview_receives_example_name")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}].preview_receives_example_name must be false"
+                    ));
+                }
+                if step
+                    .get("sync_ack_contains_runtime_summary")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+                    || step
+                        .get("sync_ack_contains_layout_proof")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}] sync ACK must not contain runtime summary or layout proof"
+                    ));
+                }
+            }
         }
         "scroll-speed-cells" => {
             require_scroll_budget_fields(&mut blockers, report);
@@ -16180,6 +16481,55 @@ fn native_gpu_report_integrity_reasons(
     {
         reasons.push("copied or reused pixel hash proof is forbidden".to_owned());
     }
+    for (field, reason) in [
+        ("modeled_ack_timing", "modeled ACK timing is forbidden"),
+        (
+            "modeled_presentation_timing",
+            "modeled presentation timing is forbidden",
+        ),
+        ("missing_process_evidence", "process evidence is missing"),
+        ("fake_cpu_samples", "fake CPU samples are forbidden"),
+        (
+            "release_report_reused_for_debug",
+            "release report cannot be reused for debug",
+        ),
+        (
+            "passive_scroll_did_source_replacement",
+            "passive scroll must not perform source replacement",
+        ),
+        (
+            "passive_scroll_queried_runtime_summary",
+            "passive scroll must not query runtime summary",
+        ),
+        (
+            "full_file_materialized_for_scroll",
+            "scroll verifier must not materialize the full file",
+        ),
+        (
+            "text_reshaped_full_file",
+            "scroll verifier must not reshape the full file",
+        ),
+        (
+            "missing_horizontal_scroll_evidence",
+            "horizontal scroll evidence is missing",
+        ),
+        (
+            "sync_ack_contains_runtime_summary",
+            "sync ACK must not contain runtime summary",
+        ),
+        (
+            "sync_ack_contains_layout_proof",
+            "sync ACK must not contain layout proof",
+        ),
+    ] {
+        if report
+            .get(field)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            reasons.push(reason.to_owned());
+        }
+    }
     if let (Some(surface_epoch), Some(target_epoch)) = (
         report
             .get("surface_epoch")
@@ -16228,10 +16578,14 @@ fn require_hash_field(blockers: &mut Vec<String>, report: &serde_json::Value, ke
     if !report
         .get(key)
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .is_some_and(is_sha256_hex)
     {
         blockers.push(format!("{key} must be a 64-character hex sha256"));
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn require_bool_field(
@@ -16828,6 +17182,50 @@ fn native_gpu_budget_f64(section: &str, key: &str) -> Option<f64> {
         }
     }
     None
+}
+
+fn required_native_gpu_budget_f64(
+    section: &str,
+    key: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    native_gpu_budget_f64(section, key).ok_or_else(|| {
+        format!("required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml")
+            .into()
+    })
+}
+
+fn required_native_gpu_budget_u64(
+    section: &str,
+    key: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    native_gpu_budget_u64(section, key).ok_or_else(|| {
+        format!("required native GPU budget `{section}.{key}` is missing from budgets/native-gpu.toml")
+            .into()
+    })
+}
+
+fn native_gpu_budget_f64_or_blocker(blockers: &mut Vec<String>, section: &str, key: &str) -> f64 {
+    match native_gpu_budget_f64(section, key) {
+        Some(value) => value,
+        None => {
+            blockers.push(format!(
+                "required native GPU budget `{section}.{key}` is missing"
+            ));
+            0.0
+        }
+    }
+}
+
+fn native_gpu_budget_u64_or_blocker(blockers: &mut Vec<String>, section: &str, key: &str) -> u64 {
+    match native_gpu_budget_u64(section, key) {
+        Some(value) => value,
+        None => {
+            blockers.push(format!(
+                "required native GPU budget `{section}.{key}` is missing"
+            ));
+            0
+        }
+    }
 }
 
 fn max_f64(values: &[f64]) -> f64 {

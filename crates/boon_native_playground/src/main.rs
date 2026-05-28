@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
@@ -473,19 +473,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let code_hash = boon_runtime::sha256_bytes(source.as_bytes());
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
-    let scenario_path = Path::new(&code_file).with_extension("scn");
-    let live_runtime = if scenario_path.exists() {
-        boon_runtime::LiveRuntime::new(
-            &format!("native-preview-live:{}", code_file),
-            &source,
-            &scenario_path,
-        )
-    } else {
-        boon_runtime::LiveRuntime::from_source(
-            &format!("native-preview-live:{}", code_file),
-            &source,
-        )
-    }
+    let live_runtime = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview-live:{}", code_file),
+        &source,
+    )
     .ok()
     .map(|runtime| Arc::new(Mutex::new(runtime)));
     let connect = value_arg(args, "--connect").map(PathBuf::from);
@@ -830,6 +821,11 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     role_dirty_reason =
                         Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
                 }
+            }
+            if shell.collect_preview_replace_result() {
+                dirty = true;
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
             }
             if !input_hot_path && shell.refresh_preview_summary_if_due(context.now) {
                 dirty = true;
@@ -1634,7 +1630,6 @@ fn preview_runtime_summary(
     source: &str,
     source_sha256: &str,
 ) -> serde_json::Value {
-    let scenario_path = source_path.with_extension("scn");
     let state_summary = match runtime_state_summary_for_source(source_path, source) {
         Ok(summary) => summary,
         Err(error) => {
@@ -1644,7 +1639,6 @@ fn preview_runtime_summary(
                 "reason": error,
                 "source_path": source_path,
                 "source_sha256": source_sha256,
-                "scenario_path": scenario_path,
                 "full_state_mirroring_allowed": false
             });
         }
@@ -1660,8 +1654,7 @@ fn preview_runtime_summary(
         "public_runtime_api": "boon_runtime::LiveRuntime",
         "source_path": source_path,
         "source_sha256": source_sha256,
-        "scenario_path": scenario_path,
-        "scenario_bound": scenario_path.exists(),
+        "scenario_bound": false,
         "runtime_surface": "generic-live-runtime",
         "state_summary_hash": boon_runtime::sha256_bytes(&summary_bytes),
         "state_summary_bytes": summary_bytes.len(),
@@ -1672,21 +1665,11 @@ fn preview_runtime_summary(
 }
 
 fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<Value, String> {
-    let scenario_path = source_path.with_extension("scn");
-    let mut runtime = if scenario_path.exists() {
-        boon_runtime::LiveRuntime::new(
-            &format!("native-preview:{}", source_path.display()),
-            source,
-            &scenario_path,
-        )
-        .map_err(|error| error.to_string())?
-    } else {
-        boon_runtime::LiveRuntime::from_source(
-            &format!("native-preview:{}", source_path.display()),
-            source,
-        )
-        .map_err(|error| error.to_string())?
-    };
+    let mut runtime = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview:{}", source_path.display()),
+        source,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(runtime.state_summary())
 }
 
@@ -1694,21 +1677,11 @@ fn runtime_document_state_summary_for_source(
     source_path: &Path,
     source: &str,
 ) -> Result<Value, String> {
-    let scenario_path = source_path.with_extension("scn");
-    let mut runtime = if scenario_path.exists() {
-        boon_runtime::LiveRuntime::new(
-            &format!("native-preview-document:{}", source_path.display()),
-            source,
-            &scenario_path,
-        )
-        .map_err(|error| error.to_string())?
-    } else {
-        boon_runtime::LiveRuntime::from_source(
-            &format!("native-preview-document:{}", source_path.display()),
-            source,
-        )
-        .map_err(|error| error.to_string())?
-    };
+    let mut runtime = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview-document:{}", source_path.display()),
+        source,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(runtime.document_state_summary())
 }
 
@@ -5595,7 +5568,6 @@ impl PreviewTransport {
     }
 }
 
-#[derive(Clone, Debug)]
 struct DevWindowShell {
     catalog: ExampleCatalog,
     workspace: ExampleWorkspace,
@@ -5606,6 +5578,7 @@ struct DevWindowShell {
     selected_source_identity: String,
     selected_source_revision: u64,
     pending_replace: Option<serde_json::Value>,
+    pending_preview_replace: Option<PendingPreviewReplace>,
     latest_ready_replace: Option<serde_json::Value>,
     last_preview_transport: serde_json::Value,
     last_preview_summary: serde_json::Value,
@@ -5616,6 +5589,40 @@ struct DevWindowShell {
     last_dev_command_detail: Option<String>,
     footer_scroll_line: usize,
     caret_visible: bool,
+}
+
+struct PendingPreviewReplace {
+    command_id: u64,
+    source_revision: u64,
+    queued_at: Instant,
+    rx: mpsc::Receiver<serde_json::Value>,
+}
+
+impl Clone for DevWindowShell {
+    fn clone(&self) -> Self {
+        Self {
+            catalog: self.catalog.clone(),
+            workspace: self.workspace.clone(),
+            initial_workspace: self.initial_workspace.clone(),
+            editor_view: self.editor_view.clone(),
+            preview_transport: self.preview_transport.clone(),
+            next_command_id: self.next_command_id,
+            selected_source_identity: self.selected_source_identity.clone(),
+            selected_source_revision: self.selected_source_revision,
+            pending_replace: self.pending_replace.clone(),
+            pending_preview_replace: None,
+            latest_ready_replace: self.latest_ready_replace.clone(),
+            last_preview_transport: self.last_preview_transport.clone(),
+            last_preview_summary: self.last_preview_summary.clone(),
+            last_good_runtime_summary: self.last_good_runtime_summary.clone(),
+            last_preview_summary_refresh: self.last_preview_summary_refresh,
+            last_dev_command: self.last_dev_command.clone(),
+            last_dev_command_status: self.last_dev_command_status.clone(),
+            last_dev_command_detail: self.last_dev_command_detail.clone(),
+            footer_scroll_line: self.footer_scroll_line,
+            caret_visible: self.caret_visible,
+        }
+    }
 }
 
 impl DevWindowShell {
@@ -5644,6 +5651,7 @@ impl DevWindowShell {
             selected_source_identity,
             selected_source_revision: 1,
             pending_replace: None,
+            pending_preview_replace: None,
             latest_ready_replace: None,
             last_preview_transport: json!({
                 "status": "not-run",
@@ -5976,18 +5984,21 @@ impl DevWindowShell {
         if source_path == "dev.tabs.new" {
             let mut value = self.create_blank_custom_tab();
             if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-                value["preview_transport"] = self.replace_selected_preview("NewCustomTab");
+                value["preview_transport"] = self.queue_selected_preview("NewCustomTab");
             }
             value["dispatched_source_path"] = json!(source_path);
             value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
             return value;
         }
         if let Some(example_id) = source_path.strip_prefix("dev.tabs.select.") {
+            let started = Instant::now();
             return self
                 .workspace
                 .select_example(&self.catalog, example_id)
                 .map(|mut value| {
-                    value["preview_transport"] = self.replace_selected_preview("SelectTab");
+                    value["dev_tab_visual_update_ms"] = json!(elapsed_ms(started));
+                    value["dev_tab_visual_update_before_preview_ack"] = json!(true);
+                    value["preview_transport"] = self.queue_selected_preview("SelectTab");
                     value["dispatched_source_path"] = json!(source_path);
                     value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
                     value
@@ -6056,7 +6067,7 @@ impl DevWindowShell {
                         .unwrap_or("DevCommand"),
                 );
             }
-            value["preview_transport"] = self.replace_selected_preview(
+            value["preview_transport"] = self.queue_selected_preview(
                 value
                     .get("command")
                     .and_then(serde_json::Value::as_str)
@@ -6280,7 +6291,7 @@ impl DevWindowShell {
         })
     }
 
-    fn replace_selected_preview(&mut self, command: &str) -> serde_json::Value {
+    fn queue_selected_preview(&mut self, command: &str) -> serde_json::Value {
         let command_id = self.next_command_id;
         self.next_command_id = self.next_command_id.saturating_add(1);
         self.selected_source_revision = self.selected_source_revision.saturating_add(1);
@@ -6292,18 +6303,55 @@ impl DevWindowShell {
             &self.workspace.selected_buffer.file_name,
             &self.workspace.selected_buffer.source_text,
         );
-        let value = self.preview_transport.replace_source_project(
-            command,
-            &self.workspace.selected_example_id,
-            &payload,
-        );
-        if value
-            .pointer("/ack/kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("replace-source-queued")
-        {
-            self.pending_replace = Some(value["ack"].clone());
-        }
+        let selected_example_id = self.workspace.selected_example_id.clone();
+        let source_path = payload.entrypoint_unit.clone();
+        let source_hash = payload.project_hash.clone();
+        let transport = self.preview_transport.clone();
+        let payload_for_worker = payload.clone();
+        let command_for_worker = command.to_owned();
+        let selected_for_worker = selected_example_id.clone();
+        let (tx, rx) = mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("boon-native-dev-preview-replace".to_owned())
+            .spawn(move || {
+                let mut value = transport.replace_source_project(
+                    &command_for_worker,
+                    &selected_for_worker,
+                    &payload_for_worker,
+                );
+                value["dev_to_preview_async"] = json!(true);
+                let _ = tx.send(value);
+            });
+        self.pending_preview_replace = Some(PendingPreviewReplace {
+            command_id,
+            source_revision: self.selected_source_revision,
+            queued_at: Instant::now(),
+            rx,
+        });
+        let value = json!({
+            "status": "pass",
+            "kind": "ReplaceCode",
+            "command": command,
+            "command_id": command_id,
+            "source_revision": self.selected_source_revision,
+            "replace_source_protocol": true,
+            "transport_bound": self.preview_transport.connect.is_some(),
+            "selected_example_id": selected_example_id,
+            "source_path": source_path,
+            "source_hash": source_hash,
+            "dev_to_preview_async": true,
+            "dev_visual_update_before_preview_ack": true,
+            "ack": {
+                "kind": "replace-source-dev-queued",
+                "status": "queued-locally",
+                "command_id": command_id,
+                "source_revision": self.selected_source_revision,
+                "sync_ack_contains_runtime_summary": false,
+                "sync_ack_contains_layout_proof": false
+            },
+            "preview_receives_example_name": false
+        });
+        self.pending_replace = Some(value["ack"].clone());
         self.last_dev_command = command.to_owned();
         self.last_dev_command_status = value
             .get("status")
@@ -6314,6 +6362,82 @@ impl DevWindowShell {
         self.update_preview_summary_from_transport(&value);
         self.last_preview_transport = value.clone();
         value
+    }
+
+    fn collect_preview_replace_result(&mut self) -> bool {
+        let Some(pending) = &self.pending_preview_replace else {
+            return false;
+        };
+        match pending.rx.try_recv() {
+            Ok(mut value) => {
+                value["dev_queue_elapsed_ms"] = json!(elapsed_ms(pending.queued_at));
+                if value.get("command_id").and_then(serde_json::Value::as_u64)
+                    != Some(pending.command_id)
+                    || value
+                        .get("source_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(pending.source_revision)
+                {
+                    value["status"] = json!("stale");
+                    value["diagnostic"] = json!("dev-side preview replace result did not match pending command/revision");
+                }
+                if value
+                    .pointer("/ack/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("replace-source-queued")
+                {
+                    self.pending_replace = Some(value["ack"].clone());
+                }
+                if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+                    self.latest_ready_replace = Some(value.clone());
+                }
+                self.last_dev_command_status = value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("not-run")
+                    .to_owned();
+                self.last_dev_command_detail = json_diagnostic(&value);
+                self.update_preview_summary_from_transport(&value);
+                self.last_preview_transport = value;
+                self.pending_preview_replace = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.last_preview_transport = json!({
+                    "status": "fail",
+                    "kind": "ReplaceCode",
+                    "diagnostic": "dev preview replace worker disconnected",
+                    "command_id": pending.command_id,
+                    "source_revision": pending.source_revision,
+                    "dev_to_preview_async": true
+                });
+                self.last_dev_command_status = "fail".to_owned();
+                self.last_dev_command_detail = json_diagnostic(&self.last_preview_transport);
+                self.pending_preview_replace = None;
+                true
+            }
+        }
+    }
+
+    fn wait_for_preview_replace_result(&mut self, timeout: Duration) -> serde_json::Value {
+        let started = Instant::now();
+        while self.pending_preview_replace.is_some() && started.elapsed() < timeout {
+            if self.collect_preview_replace_result() {
+                return self.last_preview_transport.clone();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.pending_preview_replace.is_some() {
+            json!({
+                "status": "timeout",
+                "kind": "ReplaceCode",
+                "diagnostic": "timed out waiting for async dev-to-preview replace result",
+                "dev_to_preview_async": true
+            })
+        } else {
+            self.last_preview_transport.clone()
+        }
     }
 
     fn update_preview_summary_from_transport(&mut self, transport: &serde_json::Value) {
@@ -6388,7 +6512,7 @@ impl DevWindowShell {
             .find(|entry| entry.id != original)
             .map(|entry| entry.id.clone())
             .or_else(|| shell.catalog.entries.first().map(|entry| entry.id.clone()));
-        let tab_switch_json = match alternate {
+        let mut tab_switch_json = match alternate {
             Some(example_id) => shell.dispatch_host_synthetic_source_path(
                 &format!("dev.tabs.select.{example_id}"),
                 1180.0,
@@ -6396,10 +6520,27 @@ impl DevWindowShell {
             ),
             None => json!({"status": "fail", "blocker": "ExampleCatalog has no tab entries"}),
         };
-        let run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
-        let format =
+        if tab_switch_json.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            tab_switch_json["preview_transport_result"] =
+                shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        }
+        let mut run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
+        if run.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            run["preview_transport_result"] =
+                shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        }
+        let mut format =
             shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
-        let reset = shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
+        if format.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            format["preview_transport_result"] =
+                shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        }
+        let mut reset =
+            shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
+        if reset.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            reset["preview_transport_result"] =
+                shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        }
         let editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
             "\n-- host synthetic editor input",
             1180.0,
@@ -10110,10 +10251,10 @@ fn preview_record_noop_input(
     Ok(())
 }
 
-const PREVIEW_CELLS_ROW_HEIGHT_PX: f64 = 26.0;
-const PREVIEW_CELLS_COLUMN_WIDTH_PX: f64 = 80.0;
-const PREVIEW_CELLS_WINDOW_ROWS: usize = 21;
-const PREVIEW_CELLS_WINDOW_COLUMNS: usize = 10;
+const PREVIEW_TABLE_ROW_HEIGHT_PX: f64 = 26.0;
+const PREVIEW_TABLE_COLUMN_WIDTH_PX: f64 = 80.0;
+const PREVIEW_TABLE_WINDOW_ROWS: usize = 21;
+const PREVIEW_TABLE_WINDOW_COLUMNS: usize = 10;
 
 fn preview_apply_scroll_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
@@ -10192,15 +10333,15 @@ fn preview_scroll_deltas(input: &boon_native_app_window::NativeInputAdapterProof
 }
 
 fn preview_scroll_window(scroll_x_px: f64, scroll_y_px: f64) -> (usize, usize, usize, usize) {
-    let row_start = (scroll_y_px / PREVIEW_CELLS_ROW_HEIGHT_PX).floor().max(0.0) as usize;
-    let column_start = (scroll_x_px / PREVIEW_CELLS_COLUMN_WIDTH_PX)
+    let row_start = (scroll_y_px / PREVIEW_TABLE_ROW_HEIGHT_PX).floor().max(0.0) as usize;
+    let column_start = (scroll_x_px / PREVIEW_TABLE_COLUMN_WIDTH_PX)
         .floor()
         .max(0.0) as usize;
     (
         row_start,
-        PREVIEW_CELLS_WINDOW_ROWS,
+        PREVIEW_TABLE_WINDOW_ROWS,
         column_start,
-        PREVIEW_CELLS_WINDOW_COLUMNS,
+        PREVIEW_TABLE_WINDOW_COLUMNS,
     )
 }
 
@@ -10224,8 +10365,8 @@ fn preview_layout_for_scroll_window(
         source_text,
         Some(&state_summary),
     )?;
-    let residual_x = scroll_x_px % PREVIEW_CELLS_COLUMN_WIDTH_PX;
-    let residual_y = scroll_y_px % PREVIEW_CELLS_ROW_HEIGHT_PX;
+    let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
+    let residual_y = scroll_y_px % PREVIEW_TABLE_ROW_HEIGHT_PX;
     let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
     if scroll_x_px.abs() > f64::EPSILON
         || residual_x.abs() > f64::EPSILON
@@ -10576,8 +10717,8 @@ fn preview_apply_live_events(
             source_text,
             Some(&state_summary),
         )?;
-    let residual_x = scroll_x_px % PREVIEW_CELLS_COLUMN_WIDTH_PX;
-    let residual_y = scroll_y_px % PREVIEW_CELLS_ROW_HEIGHT_PX;
+    let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
+    let residual_y = scroll_y_px % PREVIEW_TABLE_ROW_HEIGHT_PX;
     let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
     if scroll_x_px.abs() > f64::EPSILON
         || residual_x.abs() > f64::EPSILON
@@ -11597,16 +11738,10 @@ fn preview_apply_replace_code_to_state(
         .get("preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    let scenario_path = Path::new(source_path).with_extension("scn");
-    state.live_runtime = if scenario_path.exists() {
-        boon_runtime::LiveRuntime::new(
-            &format!("native-preview-live:{source_path}"),
-            code,
-            &scenario_path,
-        )
-    } else {
-        boon_runtime::LiveRuntime::from_source(&format!("native-preview-live:{source_path}"), code)
-    }
+    state.live_runtime = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview-live:{source_path}"),
+        code,
+    )
     .ok()
     .map(|runtime| Arc::new(Mutex::new(runtime)));
     if let Some(layout_proof) = response.get("document_layout_proof") {
@@ -13639,6 +13774,7 @@ mod tests {
             selected_source_identity: "counter".to_owned(),
             selected_source_revision: 1,
             pending_replace: None,
+            pending_preview_replace: None,
             latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
@@ -14167,6 +14303,7 @@ mod tests {
             selected_source_identity: "custom:long".to_owned(),
             selected_source_revision: 1,
             pending_replace: None,
+            pending_preview_replace: None,
             latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
@@ -14430,6 +14567,7 @@ mod tests {
             selected_source_identity: "sample".to_owned(),
             selected_source_revision: 1,
             pending_replace: None,
+            pending_preview_replace: None,
             latest_ready_replace: None,
             last_preview_transport: json!({
                 "status": "not-run",
@@ -14533,6 +14671,7 @@ mod tests {
             selected_source_identity: "counter".to_owned(),
             selected_source_revision: 1,
             pending_replace: None,
+            pending_preview_replace: None,
             latest_ready_replace: None,
             last_preview_transport: json!({"status": "not-run"}),
             last_preview_summary: json!({"status": "not-run"}),
@@ -15153,8 +15292,8 @@ mod tests {
             &cells_path,
             &cells_source,
             &live_runtime,
-            25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX,
-            40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX,
+            25.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX,
+            40.0 * PREVIEW_TABLE_ROW_HEIGHT_PX,
         )
         .unwrap();
         assert!(
@@ -15205,8 +15344,8 @@ mod tests {
             window_width: 920.0,
             window_height: 720.0,
         });
-        scroll_forward.scroll_delta_x = 25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
-        scroll_forward.scroll_delta_y = 40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX / 5.0;
+        scroll_forward.scroll_delta_x = 25.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX / 5.0;
+        scroll_forward.scroll_delta_y = 40.0 * PREVIEW_TABLE_ROW_HEIGHT_PX / 5.0;
         preview_apply_scroll_input(
             &scroll_forward,
             Some(&cells_path),
@@ -15229,8 +15368,8 @@ mod tests {
             window_width: 920.0,
             window_height: 720.0,
         });
-        scroll_back.scroll_delta_x = -25.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
-        scroll_back.scroll_delta_y = -40.0 * PREVIEW_CELLS_ROW_HEIGHT_PX / 5.0;
+        scroll_back.scroll_delta_x = -25.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX / 5.0;
+        scroll_back.scroll_delta_y = -40.0 * PREVIEW_TABLE_ROW_HEIGHT_PX / 5.0;
         preview_apply_scroll_input(
             &scroll_back,
             Some(&cells_path),
@@ -15276,7 +15415,7 @@ mod tests {
             window_width: 920.0,
             window_height: 720.0,
         });
-        shift_wheel.scroll_delta_y = 18.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX / 5.0;
+        shift_wheel.scroll_delta_y = 18.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX / 5.0;
         preview_apply_scroll_input(
             &shift_wheel,
             Some(&cells_path),
@@ -15304,7 +15443,7 @@ mod tests {
             &cells_path,
             &cells_source,
             &live_runtime,
-            18.0 * PREVIEW_CELLS_COLUMN_WIDTH_PX,
+            18.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX,
             0.0,
         )
         .unwrap();
@@ -15354,7 +15493,7 @@ mod tests {
             &cells_source,
             &live_runtime,
             0.0,
-            10.0 * PREVIEW_CELLS_ROW_HEIGHT_PX,
+            10.0 * PREVIEW_TABLE_ROW_HEIGHT_PX,
         )
         .unwrap();
 

@@ -284,7 +284,7 @@ impl VisibleLayoutRenderer {
         let fragment_entry = generated::shader_bindings::native_gpu_rect::fs_main_entry([Some(
             wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             },
         )]);
@@ -2097,7 +2097,7 @@ mod tests {
         );
         style.insert(
             "editor_bracket_color".to_owned(),
-            StyleValue::Text("#528bff33".to_owned()),
+            StyleValue::Text("#528bff40".to_owned()),
         );
         style.insert("editor_caret_column".to_owned(), StyleValue::Number(3.0));
         style.insert("editor_caret_visible".to_owned(), StyleValue::Bool(true));
@@ -2134,6 +2134,12 @@ mod tests {
         );
 
         let (positions, colors, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let selection_rect = 2usize;
+        assert_eq!(
+            &colors[selection_rect * 24..selection_rect * 24 + 4],
+            &[12, 15, 21, 255],
+            "selection highlight must stay opaque while bracket highlights are softened"
+        );
         let first_bracket_rect = 3usize;
         let x0_ndc = positions[first_bracket_rect * 12];
         let x1_ndc = positions[first_bracket_rect * 12 + 2];
@@ -2148,7 +2154,7 @@ mod tests {
         );
         assert_eq!(
             &colors[first_bracket_rect * 24..first_bracket_rect * 24 + 4],
-            &[22, 66, 255, 51]
+            &[22, 66, 255, 64]
         );
     }
 

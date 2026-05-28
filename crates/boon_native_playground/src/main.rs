@@ -1,4 +1,6 @@
-use boon_editor::{ClipboardAdapter, EditorBuffer, EditorPosition, EditorSelection};
+use boon_editor::{
+    ClipboardAdapter, EditorBuffer, EditorPosition, EditorSelection, bracket_match_for_source,
+};
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
 use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
@@ -29,7 +31,7 @@ const BOON_EDITOR_HIGHLIGHT_BACKGROUND: &str = "#2c313a";
 const BOON_EDITOR_GUTTER: &str = "#5c6773";
 const BOON_EDITOR_SELECTION: &str = "#3E4451";
 const BOON_EDITOR_CURSOR: &str = "#528bff";
-const BOON_EDITOR_BRACKET_MATCH: &str = "#528bff33";
+const BOON_EDITOR_BRACKET_MATCH: &str = "#528bff40";
 const BOON_EDITOR_SELECTION_MATCH: &str = "#aafe661a";
 const BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX: usize = 256 * 1024;
 const BOON_EDITOR_DEFERRED_SYNTAX_LINES: usize = 256;
@@ -2392,6 +2394,9 @@ struct DevNativeInputState {
     editor_focused: bool,
     focused_dev_text_input: Option<String>,
     mouse_select_anchor: Option<EditorPosition>,
+    last_editor_click_position: Option<EditorPosition>,
+    last_editor_click_sequence: u64,
+    editor_click_count: u8,
     column_metric_cache: EditorColumnMetricCache,
 }
 
@@ -2743,6 +2748,32 @@ fn dev_input_may_change(
         })
 }
 
+fn editor_positions_same_click_cluster(left: &EditorPosition, right: &EditorPosition) -> bool {
+    left.line == right.line && left.column.abs_diff(right.column) <= 2
+}
+
+fn register_editor_click(
+    input_state: &mut DevNativeInputState,
+    position: &EditorPosition,
+    sequence: u64,
+) -> u8 {
+    const EDITOR_MULTI_CLICK_SEQUENCE_GAP: u64 = 6;
+    let same_cluster = input_state
+        .last_editor_click_position
+        .as_ref()
+        .is_some_and(|last| editor_positions_same_click_cluster(last, position));
+    let nearby_sequence = sequence.saturating_sub(input_state.last_editor_click_sequence)
+        <= EDITOR_MULTI_CLICK_SEQUENCE_GAP;
+    input_state.editor_click_count = if same_cluster && nearby_sequence {
+        input_state.editor_click_count.saturating_add(1).min(3)
+    } else {
+        1
+    };
+    input_state.last_editor_click_position = Some(position.clone());
+    input_state.last_editor_click_sequence = sequence;
+    input_state.editor_click_count
+}
+
 fn dev_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     document: &boon_document_model::DocumentFrame,
@@ -2882,11 +2913,33 @@ fn dev_apply_real_window_input(
                         &mut input_state.column_metric_cache,
                     ) {
                         if mouse_event.pressed {
-                            shell
-                                .workspace
-                                .selected_buffer
-                                .set_selection(editor_position.clone(), editor_position.clone());
-                            input_state.mouse_select_anchor = Some(editor_position);
+                            match register_editor_click(
+                                input_state,
+                                &editor_position,
+                                mouse_event.sequence,
+                            ) {
+                                1 => {
+                                    shell.workspace.selected_buffer.set_selection(
+                                        editor_position.clone(),
+                                        editor_position.clone(),
+                                    );
+                                    input_state.mouse_select_anchor = Some(editor_position);
+                                }
+                                2 => {
+                                    shell
+                                        .workspace
+                                        .selected_buffer
+                                        .select_word_at_position(editor_position);
+                                    input_state.mouse_select_anchor = None;
+                                }
+                                _ => {
+                                    shell
+                                        .workspace
+                                        .selected_buffer
+                                        .select_enclosed_or_line_at_position(editor_position);
+                                    input_state.mouse_select_anchor = None;
+                                }
+                            }
                         } else if let Some(anchor) = input_state.mouse_select_anchor.take() {
                             shell
                                 .workspace
@@ -5489,11 +5542,7 @@ impl CodeEditorModel {
             .filter(|token| {
                 matches!(
                     token.kind,
-                    "comment"
-                        | "string"
-                        | "text-literal-content"
-                        | "text-literal-interpolation"
-                        | "text-literal-delimiter"
+                    "comment" | "string" | "text-literal-content" | "text-literal-interpolation"
                 )
             })
             .map(|token| (token.start, token.end))
@@ -5504,6 +5553,95 @@ impl CodeEditorModel {
         self.buffer.set_selection(anchor, head);
         self.sync_from_buffer();
         self.last_command = Some("selection");
+    }
+
+    fn select_word_at_position(&mut self, position: EditorPosition) {
+        let line = self.line_text(position.line.saturating_sub(1));
+        let chars = line.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            self.set_selection(position.clone(), position);
+            return;
+        }
+        let mut index = position.column.saturating_sub(1).min(chars.len() - 1);
+        if chars[index].is_whitespace() && index > 0 && !chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        if chars[index].is_whitespace() {
+            self.set_selection(position.clone(), position);
+            return;
+        }
+        let is_word = is_editor_word_char(chars[index]);
+        let mut start = index;
+        while start > 0
+            && !chars[start - 1].is_whitespace()
+            && is_editor_word_char(chars[start - 1]) == is_word
+        {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < chars.len()
+            && !chars[end].is_whitespace()
+            && is_editor_word_char(chars[end]) == is_word
+        {
+            end += 1;
+        }
+        self.set_selection(
+            EditorPosition {
+                line: position.line,
+                column: start + 1,
+            },
+            EditorPosition {
+                line: position.line,
+                column: end + 1,
+            },
+        );
+        self.last_command = Some("selection-word");
+    }
+
+    fn select_line_at_position(&mut self, position: EditorPosition) {
+        let line = position.line.max(1).min(self.line_count.max(1));
+        let line_len = self.line_text(line.saturating_sub(1)).chars().count();
+        self.set_selection(
+            EditorPosition { line, column: 1 },
+            EditorPosition {
+                line,
+                column: line_len + 1,
+            },
+        );
+        self.last_command = Some("selection-line");
+    }
+
+    fn select_enclosed_or_line_at_position(&mut self, position: EditorPosition) {
+        if self.select_enclosed_at_position(position.clone()) {
+            return;
+        }
+        self.select_line_at_position(position);
+    }
+
+    fn select_enclosed_at_position(&mut self, position: EditorPosition) -> bool {
+        let caret_byte = self.buffer.byte_offset(&position);
+        let ignored_ranges = self.bracket_ignored_ranges();
+        let Some(pair) = bracket_match_for_source(&self.source_text, caret_byte, &ignored_ranges)
+        else {
+            return false;
+        };
+        if !pair.matched || pair.close_byte < pair.open_byte {
+            return false;
+        }
+        let inner_start = pair
+            .open_byte
+            .saturating_add(pair.open.len_utf8())
+            .min(self.source_text.len());
+        let inner_end = pair.close_byte.min(self.source_text.len());
+        if inner_start > inner_end {
+            return false;
+        }
+        self.set_selection(
+            self.position_for_offset(inner_start),
+            self.position_for_offset(inner_end),
+        );
+        self.last_command = Some("selection-bracket-inner");
+        true
     }
 
     fn insert_text_at_caret(&mut self, text: &str) {
@@ -5758,6 +5896,10 @@ impl CodeEditorModel {
             .trim_end_matches('\r')
             .to_owned()
     }
+}
+
+fn is_editor_word_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '/' | '-')
 }
 
 #[derive(Clone, Debug)]
@@ -10192,6 +10334,8 @@ struct PreviewNativeInputState {
     last_click_node: Option<String>,
     last_click_sequence: u64,
     focused_node: Option<String>,
+    focused_address: Option<String>,
+    focused_target_text: Option<String>,
     focused_text: String,
     focused_caret_index: usize,
     replace_focused_text_on_next_edit: bool,
@@ -10639,6 +10783,8 @@ fn preview_apply_real_window_input(
                         .saturating_sub(input_state.last_click_sequence)
                         <= 4;
                 input_state.focused_node = Some(node.clone());
+                input_state.focused_address = focused_address(layout, &node);
+                input_state.focused_target_text = focused_target_text(layout, &node);
                 input_state.focused_text =
                     preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
                         .or_else(|| document_value_for_hit_region(layout, &hit_region))
@@ -10677,6 +10823,8 @@ fn preview_apply_real_window_input(
                     pending_mouse_events.push(blur);
                 }
                 input_state.focused_node = None;
+                input_state.focused_address = None;
+                input_state.focused_target_text = None;
                 input_state.focused_text.clear();
                 input_state.focused_caret_index = 0;
                 input_state.replace_focused_text_on_next_edit = false;
@@ -10740,8 +10888,14 @@ fn preview_apply_real_window_input(
                         source,
                         text: Some(submitted_text.clone()),
                         key: Some("Enter".to_owned()),
-                        address: focused_address(layout, &focused_node),
-                        target_text: focused_target_text(layout, &focused_node),
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &focused_node)),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -10752,6 +10906,8 @@ fn preview_apply_real_window_input(
                         submit,
                     )?);
                     input_state.focused_node = None;
+                    input_state.focused_address = None;
+                    input_state.focused_target_text = None;
                     input_state.focused_text.clear();
                     input_state.focused_caret_index = 0;
                     input_state.replace_focused_text_on_next_edit = false;
@@ -10766,8 +10922,14 @@ fn preview_apply_real_window_input(
                         source,
                         text: None,
                         key: Some("Escape".to_owned()),
-                        address: focused_address(layout, &focused_node),
-                        target_text: focused_target_text(layout, &focused_node),
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &focused_node)),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -10778,6 +10940,8 @@ fn preview_apply_real_window_input(
                         escape,
                     )?);
                     input_state.focused_node = None;
+                    input_state.focused_address = None;
+                    input_state.focused_target_text = None;
                     input_state.focused_text.clear();
                     input_state.focused_caret_index = 0;
                     input_state.replace_focused_text_on_next_edit = false;
@@ -10817,8 +10981,14 @@ fn preview_apply_real_window_input(
                         source,
                         text: Some(input_state.focused_text.clone()),
                         key: None,
-                        address: focused_address(layout, &focused_node),
-                        target_text: focused_target_text(layout, &focused_node),
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &focused_node)),
                         target_occurrence: None,
                     };
                     latest_layout = Some(preview_apply_live_event(
@@ -10842,8 +11012,14 @@ fn preview_apply_real_window_input(
                             source,
                             text: Some(input_state.focused_text.clone()),
                             key: None,
-                            address: focused_address(layout, &focused_node),
-                            target_text: focused_target_text(layout, &focused_node),
+                            address: input_state
+                                .focused_address
+                                .clone()
+                                .or_else(|| focused_address(layout, &focused_node)),
+                            target_text: input_state
+                                .focused_target_text
+                                .clone()
+                                .or_else(|| focused_target_text(layout, &focused_node)),
                             target_occurrence: None,
                         };
                         latest_layout = Some(preview_apply_live_event(
@@ -10879,11 +11055,12 @@ fn preview_apply_focus_overlay(
         shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
         changed = true;
     }
+    let resolved_focused_node = preview_resolved_focused_node(&shared.layout_proof, input_state);
     let Some(frame) = shared.layout_frame_override.as_mut() else {
         return Ok(false);
     };
     for item in &mut frame.display_list {
-        let next_focused = focused_node == Some(item.node.0.as_str());
+        let next_focused = resolved_focused_node.as_deref() == Some(item.node.0.as_str());
         if item.focused != next_focused {
             item.focused = next_focused;
             changed = true;
@@ -10927,6 +11104,55 @@ fn preview_apply_focus_overlay(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn preview_resolved_focused_node(
+    layout_proof: &Value,
+    input_state: &PreviewNativeInputState,
+) -> Option<String> {
+    let requested_node = input_state.focused_node.as_deref()?;
+    let Some(address) = input_state.focused_address.as_deref() else {
+        return Some(requested_node.to_owned());
+    };
+    if focused_address(layout_proof, requested_node).as_deref() == Some(address) {
+        return Some(requested_node.to_owned());
+    }
+    focused_node_for_address(layout_proof, address)
+}
+
+fn focused_node_for_address(layout_proof: &Value, address: &str) -> Option<String> {
+    let hit_nodes = layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit.get("node").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let intents = layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    intents.iter().find_map(|intent| {
+        let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+        if intent.get("intent").and_then(serde_json::Value::as_str) == Some("address")
+            && intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(address)
+            && hit_nodes.contains(node)
+            && intents.iter().any(|candidate| {
+                candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    && candidate.get("intent").and_then(serde_json::Value::as_str) == Some("target")
+                    && candidate
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(address)
+            })
+        {
+            Some(node.to_owned())
+        } else {
+            None
+        }
+    })
 }
 
 fn preview_record_noop_input(
@@ -11532,8 +11758,14 @@ fn preview_focused_blur_event(
         source,
         text: Some(input_state.focused_text.clone()),
         key: None,
-        address: focused_address(layout_proof, focused_node),
-        target_text: focused_target_text(layout_proof, focused_node),
+        address: input_state
+            .focused_address
+            .clone()
+            .or_else(|| focused_address(layout_proof, focused_node)),
+        target_text: input_state
+            .focused_target_text
+            .clone()
+            .or_else(|| focused_target_text(layout_proof, focused_node)),
         target_occurrence: None,
     })
 }
@@ -14483,6 +14715,29 @@ mod tests {
     }
 
     #[test]
+    fn code_editor_multiclick_selects_word_then_bracket_inner_then_line() {
+        let mut model =
+            CodeEditorModel::new("custom://editor.bn", "alpha [beta-gamma]\nsecond line\n");
+        model.select_word_at_position(EditorPosition {
+            line: 1,
+            column: 10,
+        });
+        assert_eq!(model.selected_text(), "beta-gamma");
+        assert_eq!(model.selection_columns_for_line(1), Some((7, 17)));
+
+        model.select_enclosed_or_line_at_position(EditorPosition {
+            line: 1,
+            column: 10,
+        });
+        assert_eq!(model.selected_text(), "beta-gamma");
+        assert_eq!(model.selection_columns_for_line(1), Some((7, 17)));
+
+        model.select_line_at_position(EditorPosition { line: 2, column: 4 });
+        assert_eq!(model.selected_text(), "second line");
+        assert_eq!(model.selection_columns_for_line(2), Some((0, 11)));
+    }
+
+    #[test]
     fn code_editor_brackets_do_not_highlight_when_caret_is_in_root_text() {
         let mut model =
             CodeEditorModel::new("custom://editor.bn", "root\n  first: []\n  second: {}\n");
@@ -14493,6 +14748,50 @@ mod tests {
         assert!(model.bracket_columns_for_line(1).is_empty());
         assert!(model.bracket_columns_for_line(2).is_empty());
         assert!(model.bracket_columns_for_line(3).is_empty());
+    }
+
+    #[test]
+    fn code_editor_highlights_text_literal_curly_delimiters() {
+        let mut model = CodeEditorModel::new(
+            "custom://editor.bn",
+            "label: TEXT { Hello }\nplain: { value }\n",
+        );
+        model.set_selection(
+            EditorPosition {
+                line: 1,
+                column: 15,
+            },
+            EditorPosition {
+                line: 1,
+                column: 15,
+            },
+        );
+        assert_eq!(
+            model
+                .bracket_columns_for_line(1)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([12, 20]),
+            "TEXT literal delimiter braces should match even while literal contents stay ignored"
+        );
+
+        model.set_selection(
+            EditorPosition {
+                line: 2,
+                column: 11,
+            },
+            EditorPosition {
+                line: 2,
+                column: 11,
+            },
+        );
+        assert_eq!(
+            model
+                .bracket_columns_for_line(2)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([7, 15])
+        );
     }
 
     #[test]
@@ -15028,7 +15327,7 @@ mod tests {
         assert_eq!(BOON_EDITOR_FONT_FEATURE_SETTINGS, "'zero' 1, 'calt' 1");
         assert_eq!(BOON_EDITOR_SELECTION, "#3E4451");
         assert_eq!(BOON_EDITOR_CURSOR, "#528bff");
-        assert_eq!(BOON_EDITOR_BRACKET_MATCH, "#528bff33");
+        assert_eq!(BOON_EDITOR_BRACKET_MATCH, "#528bff40");
 
         let keyword = syntax_style_for_kind("keyword");
         assert_eq!(keyword.color, "#D2691E");
@@ -15374,6 +15673,109 @@ mod tests {
         assert!(
             patched_line.style.contains_key("editor_bracket_columns"),
             "bracket highlight should be patched with the caret"
+        );
+    }
+
+    #[test]
+    fn editor_double_click_selects_word_and_triple_click_selects_bracket_inner() {
+        let (mut shell, mut input_state, document, layout) =
+            test_dev_editor_context("alpha [beta-gamma]\nsecond line\n");
+        let line = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor-line-text-1")
+            .expect("line text should be laid out");
+        let mut metric_cache = EditorColumnMetricCache::default();
+        let column_edges = editor_column_edges_for_line(
+            &mut metric_cache,
+            "alpha [beta-gamma]",
+            &line.style,
+            line.bounds.height,
+        );
+        let click_x = f64::from(line.bounds.x + column_edges[7]);
+        let click_y = f64::from(line.bounds.y + line.bounds.height * 0.5);
+        let mut double_click = test_keyboard_input(Vec::new(), Vec::new());
+        double_click.mouse_button_event_count = 4;
+        double_click.mouse_button_events = vec![
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 1,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            },
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 2,
+                button: "left".to_owned(),
+                pressed: false,
+                window_protocol_id: Some(1),
+            },
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 3,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            },
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 4,
+                button: "left".to_owned(),
+                pressed: false,
+                window_protocol_id: Some(1),
+            },
+        ];
+        double_click.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: click_x,
+            y: click_y,
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &double_click,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(
+            shell.workspace.selected_buffer.selected_text(),
+            "beta-gamma"
+        );
+
+        let mut third_click = test_keyboard_input(Vec::new(), Vec::new());
+        third_click.mouse_button_event_count = 6;
+        third_click.mouse_button_events = vec![
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 5,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(1),
+            },
+            boon_native_app_window::NativeMouseButtonEventProof {
+                sequence: 6,
+                button: "left".to_owned(),
+                pressed: false,
+                window_protocol_id: Some(1),
+            },
+        ];
+        third_click.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: click_x,
+            y: click_y,
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &third_click,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(
+            shell.workspace.selected_buffer.selected_text(),
+            "beta-gamma"
         );
     }
 
@@ -16944,6 +17346,81 @@ mod tests {
         assert!(!layout_has_visible_address(&shared.layout_proof, "Z40"));
         assert_eq!(shared.scroll_x_px, 0.0);
         assert_eq!(shared.scroll_y_px, 0.0);
+    }
+
+    #[test]
+    fn cells_scroll_does_not_move_focused_grid_cell_to_reused_node() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-cells-scroll-focus", &cells_source)
+                .unwrap(),
+        ));
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (b0_x, b0_y, _b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let (mouse_x, mouse_y) = first_scroll_region_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(initial_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, b0_x, b0_y),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert_eq!(input_state.focused_address.as_deref(), Some("B0"));
+
+        let mut scroll_forward = test_keyboard_input(Vec::new(), Vec::new());
+        scroll_forward.mouse_scroll_event_count = 1;
+        scroll_forward.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: mouse_x,
+            y: mouse_y,
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        scroll_forward.scroll_delta_x = 25.0 * PREVIEW_TABLE_COLUMN_WIDTH_PX / 5.0;
+        scroll_forward.scroll_delta_y = 40.0 * PREVIEW_TABLE_ROW_HEIGHT_PX / 5.0;
+        preview_apply_scroll_input(
+            &scroll_forward,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+        preview_apply_focus_overlay(&shared_render_state, &input_state, true).unwrap();
+
+        let shared = shared_render_state.lock().unwrap();
+        assert!(layout_has_visible_address(&shared.layout_proof, "Z40"));
+        assert!(!layout_has_visible_address(&shared.layout_proof, "B0"));
+        assert_eq!(input_state.focused_address.as_deref(), Some("B0"));
+        assert!(
+            shared
+                .layout_frame_override
+                .as_ref()
+                .unwrap()
+                .display_list
+                .iter()
+                .all(|item| !item.focused),
+            "scrolling the grid must not transfer B0 focus to a reused visible cell node"
+        );
     }
 
     #[test]

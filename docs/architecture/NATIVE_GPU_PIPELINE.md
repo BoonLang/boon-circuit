@@ -1175,6 +1175,9 @@ telemetry polling occur in the scroll hot path. The older
 `verify-native-gpu-scroll-speed --surface dev-code-editor` command may remain
 only as a compatibility alias to the release report, with duplicate reports
 hash-linked or removed from the aggregate.
+Current speed targets are `wheel_to_visible_ms_p95 <= 35 ms` in debug and
+`<= 16.7 ms` in release, with corresponding max-frame budgets in
+`budgets/native-gpu.toml`.
 
 `verify-native-example-switch-speed` must prove source switching uses the
 generic async source/project payload path. Reports must cover Counter, TodoMVC,

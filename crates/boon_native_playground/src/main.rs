@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOON_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
@@ -515,6 +515,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "source_hash": code_hash.clone(),
             "preview_receives_example_name": false
         }),
+        replace_worker: PreviewReplaceWorkerQueue::default(),
     }));
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(path, Arc::clone(&preview_ipc_state), wake_handle.clone())?;
@@ -790,39 +791,43 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "dev render state mutex poisoned".to_owned())?;
             let mut dirty = false;
             let mut role_dirty_reason = None;
+            let mut layout_refreshed = false;
+            let mut needs_layout_refresh = false;
             let caret_visible = dev_editor_caret_visible(&mut input_state, context.now);
             if shell.caret_visible != caret_visible {
                 shell.caret_visible = caret_visible;
-                dirty = true;
-                role_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink);
+                if !cache_needs_dev_render_layout(&render_state, context.width, context.height) {
+                    patch_dev_render_caret_visibility(&shell, &mut render_state);
+                    dirty = true;
+                    layout_refreshed = true;
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink);
+                } else {
+                    needs_layout_refresh = true;
+                    dirty = true;
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink);
+                }
             }
-            let cache_stale = render_state.layout_frame.is_none()
-                || render_state.width != context.width
-                || render_state.height != context.height;
+            let cache_stale =
+                cache_needs_dev_render_layout(&render_state, context.width, context.height);
             let input_hot_path = dev_input_may_change(&context.input_delta, &input_state);
             if cache_stale {
-                let document = shell.document_for_viewport(context.width, context.height);
-                render_state.layout_frame =
-                    Some(boon_document::layout(boon_document::LayoutInput {
-                        document: &document,
-                        viewport: boon_host::Viewport {
-                            surface: 1,
-                            width: context.width as f32,
-                            height: context.height as f32,
-                            scale: 1.0,
-                        },
-                        text: &mut poll_text_measurer,
-                        capabilities: boon_document::RenderCapabilities::fake_portable(),
-                    }));
-                render_state.width = context.width;
-                render_state.height = context.height;
-                render_state.revision = render_state.revision.saturating_add(1);
+                refresh_dev_render_layout(
+                    &shell,
+                    &mut render_state,
+                    &mut poll_text_measurer,
+                    context.width,
+                    context.height,
+                );
+                layout_refreshed = true;
                 dirty = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
             }
             if input_hot_path && let Some(layout_frame) = render_state.layout_frame.clone() {
                 let document = shell.document_for_viewport(context.width, context.height);
+                let before_input = DevEditorSnapshot::from_shell(&shell);
                 let layout_changed = dev_apply_real_window_input(
                     &context.input_delta,
                     &document,
@@ -833,34 +838,31 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     &mut input_state,
                 );
                 if layout_changed {
-                    let document = shell.document_for_viewport(context.width, context.height);
-                    render_state.layout_frame =
-                        Some(boon_document::layout(boon_document::LayoutInput {
-                            document: &document,
-                            viewport: boon_host::Viewport {
-                                surface: 1,
-                                width: context.width as f32,
-                                height: context.height as f32,
-                                scale: 1.0,
-                            },
-                            text: &mut poll_text_measurer,
-                            capabilities: boon_document::RenderCapabilities::fake_portable(),
-                        }));
-                    render_state.width = context.width;
-                    render_state.height = context.height;
-                    render_state.revision = render_state.revision.saturating_add(1);
                     dirty = true;
-                    role_dirty_reason =
-                        Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
+                    let after_input = DevEditorSnapshot::from_shell(&shell);
+                    if before_input.editor_scroll_only(&after_input)
+                        && patch_dev_render_editor_scroll(&shell, &mut render_state)
+                    {
+                        layout_refreshed = true;
+                        role_dirty_reason =
+                            Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                    } else {
+                        needs_layout_refresh = true;
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                        );
+                    }
                 }
             }
-            if shell.collect_preview_replace_result() {
+            if !input_hot_path && shell.collect_preview_replace_result() {
                 dirty = true;
+                needs_layout_refresh = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
             }
             if !input_hot_path && shell.refresh_preview_summary_if_due(context.now) {
                 dirty = true;
+                needs_layout_refresh = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
             }
@@ -869,6 +871,17 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason = role_dirty_reason.or(Some(
                     boon_native_app_window::NativeRoleDirtyReason::VerifierFrame,
                 ));
+            }
+            if dirty && !layout_refreshed {
+                if needs_layout_refresh {
+                    refresh_dev_render_layout(
+                        &shell,
+                        &mut render_state,
+                        &mut poll_text_measurer,
+                        context.width,
+                        context.height,
+                    );
+                }
             }
             let caret_wake = input_state
                 .editor_focused
@@ -920,6 +933,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut visible_renderer,
                 &shell,
                 layout_frame,
+                render_state.full_layout_refresh_count,
+                render_state.fast_frame_patch_count,
             )?;
             Ok(boon_native_app_window::NativeRenderHookResult {
                 proof,
@@ -2184,6 +2199,8 @@ fn native_gpu_dev_visible_render_hook(
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     shell: &DevWindowShell,
     layout_frame: &boon_document::LayoutFrame,
+    full_layout_refresh_count: u64,
+    fast_frame_patch_count: u64,
 ) -> Result<serde_json::Value, String> {
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
@@ -2242,6 +2259,18 @@ fn native_gpu_dev_visible_render_hook(
             "font_family": shell.editor_view.font_family,
             "native_rust_editor_model": true
         },
+        "dev_hot_path_counters": {
+            "preview_replace_result_poll_count": shell.preview_replace_result_poll_count,
+            "preview_summary_query_count": shell.preview_summary_query_count,
+            "hot_path_preview_replace_result_poll_count": shell.hot_path_preview_replace_result_poll_count,
+            "hot_path_preview_summary_query_count": shell.hot_path_preview_summary_query_count,
+            "command_probe_count": 0
+        },
+        "dev_render_cache": {
+            "full_layout_refresh_count": full_layout_refresh_count,
+            "fast_frame_patch_count": fast_frame_patch_count,
+            "fast_frame_patch_supported": true
+        },
         "layout_metrics": layout_frame.metrics
     }))
 }
@@ -2265,6 +2294,209 @@ struct DevRenderState {
     height: u32,
     revision: u64,
     layout_frame: Option<boon_document::LayoutFrame>,
+    full_layout_refresh_count: u64,
+    fast_frame_patch_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DevEditorSnapshot {
+    source_len: usize,
+    line_count: usize,
+    selection_start: usize,
+    selection_end: usize,
+    scroll_line: usize,
+    scroll_column: usize,
+    footer_scroll_line: usize,
+}
+
+impl DevEditorSnapshot {
+    fn from_shell(shell: &DevWindowShell) -> Self {
+        let (selection_start, selection_end) = shell.workspace.selected_buffer.selection_offsets();
+        Self {
+            source_len: shell.workspace.selected_buffer.source_text.len(),
+            line_count: shell.workspace.selected_buffer.line_count,
+            selection_start,
+            selection_end,
+            scroll_line: shell.workspace.selected_buffer.scroll_line,
+            scroll_column: shell.workspace.selected_buffer.scroll_column,
+            footer_scroll_line: shell.footer_scroll_line,
+        }
+    }
+
+    fn editor_scroll_only(&self, after: &Self) -> bool {
+        self.source_len == after.source_len
+            && self.line_count == after.line_count
+            && self.selection_start == after.selection_start
+            && self.selection_end == after.selection_end
+            && self.footer_scroll_line == after.footer_scroll_line
+            && (self.scroll_line != after.scroll_line || self.scroll_column != after.scroll_column)
+    }
+}
+
+fn cache_needs_dev_render_layout(render_state: &DevRenderState, width: u32, height: u32) -> bool {
+    render_state.layout_frame.is_none()
+        || render_state.width != width
+        || render_state.height != height
+}
+
+fn refresh_dev_render_layout(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+    text: &mut boon_native_gpu::GlyphonTextMeasurer,
+    width: u32,
+    height: u32,
+) {
+    let document = shell.document_for_viewport(width, height);
+    render_state.layout_frame = Some(boon_document::layout(boon_document::LayoutInput {
+        document: &document,
+        viewport: boon_host::Viewport {
+            surface: 1,
+            width: width as f32,
+            height: height as f32,
+            scale: 1.0,
+        },
+        text,
+        capabilities: boon_document::RenderCapabilities::fake_portable(),
+    }));
+    render_state.width = width;
+    render_state.height = height;
+    render_state.revision = render_state.revision.saturating_add(1);
+    render_state.full_layout_refresh_count =
+        render_state.full_layout_refresh_count.saturating_add(1);
+}
+
+fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut DevRenderState) {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return;
+    };
+    let caret_node = format!(
+        "dev-code-editor-line-text-{}",
+        shell.workspace.selected_buffer.caret().line
+    );
+    let caret_visible = boon_document_model::StyleValue::Bool(shell.caret_visible);
+    for item in &mut frame.display_list {
+        if item.node.0 == caret_node {
+            item.style
+                .insert("editor_caret_visible".to_owned(), caret_visible);
+            break;
+        }
+    }
+    render_state.revision = render_state.revision.saturating_add(1);
+    render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+}
+
+fn patch_dev_render_editor_scroll(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return false;
+    };
+    let model = &shell.workspace.selected_buffer;
+    let mut text_indices = frame
+        .display_list
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item.node
+                .0
+                .starts_with("dev-code-editor-line-text-")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if text_indices.is_empty() {
+        return false;
+    }
+    text_indices.sort_by(|left, right| {
+        frame.display_list[*left]
+            .bounds
+            .y
+            .total_cmp(&frame.display_list[*right].bounds.y)
+    });
+    let visible_lines = model.visible_lines(text_indices.len());
+    for (item_index, (line_number, line)) in text_indices.into_iter().zip(visible_lines.iter()) {
+        let item = &mut frame.display_list[item_index];
+        item.node =
+            boon_document_model::DocumentNodeId(format!("dev-code-editor-line-text-{line_number}"));
+        item.text = Some(line.clone());
+        item.style.insert(
+            "syntax_spans_json".to_owned(),
+            boon_document_model::StyleValue::Text(syntax_spans_json(
+                &model.highlighted_line_segments(*line_number, line),
+            )),
+        );
+        for key in [
+            "editor_selection_start",
+            "editor_selection_end",
+            "editor_caret_column",
+            "editor_caret_visible",
+            "editor_bracket_columns",
+        ] {
+            item.style.remove(key);
+        }
+        if let Some((start, end)) = model.selection_columns_for_line(*line_number) {
+            item.style.insert(
+                "editor_selection_start".to_owned(),
+                boon_document_model::StyleValue::Number(start as f64),
+            );
+            item.style.insert(
+                "editor_selection_end".to_owned(),
+                boon_document_model::StyleValue::Number(end as f64),
+            );
+        }
+        if model.caret().line == *line_number {
+            item.style.insert(
+                "editor_caret_column".to_owned(),
+                boon_document_model::StyleValue::Number(
+                    model.caret().column.saturating_sub(1) as f64
+                ),
+            );
+            item.style.insert(
+                "editor_caret_visible".to_owned(),
+                boon_document_model::StyleValue::Bool(shell.caret_visible),
+            );
+        }
+        let bracket_columns = model
+            .bracket_columns_for_line(*line_number)
+            .into_iter()
+            .map(|column| column.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if !bracket_columns.is_empty() {
+            item.style.insert(
+                "editor_bracket_columns".to_owned(),
+                boon_document_model::StyleValue::Text(bracket_columns),
+            );
+        }
+    }
+
+    let mut gutter_indices = frame
+        .display_list
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item.node
+                .0
+                .starts_with("dev-code-editor-gutter-")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    gutter_indices.sort_by(|left, right| {
+        frame.display_list[*left]
+            .bounds
+            .y
+            .total_cmp(&frame.display_list[*right].bounds.y)
+    });
+    for (item_index, (line_number, _)) in gutter_indices.into_iter().zip(visible_lines.iter()) {
+        let item = &mut frame.display_list[item_index];
+        item.node =
+            boon_document_model::DocumentNodeId(format!("dev-code-editor-gutter-{line_number}"));
+        item.text = Some(format!("{line_number:>4}"));
+    }
+
+    render_state.revision = render_state.revision.saturating_add(1);
+    render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+    true
 }
 
 type EditorColumnMetricCache = BTreeMap<EditorColumnMetricKey, Vec<f32>>;
@@ -4653,17 +4885,40 @@ impl SyntaxLineSegment {
     }
 }
 
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn syntax_tokens_by_line(tokens: &[SyntaxToken]) -> BTreeMap<usize, Vec<SyntaxToken>> {
+    let mut by_line: BTreeMap<usize, Vec<SyntaxToken>> = BTreeMap::new();
+    for token in tokens {
+        by_line.entry(token.line).or_default().push(token.clone());
+    }
+    for tokens in by_line.values_mut() {
+        tokens.sort_by_key(|token| (token.column, token.len));
+    }
+    by_line
+}
+
 #[derive(Clone, Debug)]
 struct CodeEditorModel {
     file_name: String,
     buffer: EditorBuffer,
     source_text: String,
+    line_starts: Vec<usize>,
     line_count: usize,
     selection: EditorSelection,
     scroll_line: usize,
     scroll_column: usize,
     diagnostics: Vec<String>,
     syntax_tokens: Vec<SyntaxToken>,
+    syntax_tokens_by_line: BTreeMap<usize, Vec<SyntaxToken>>,
     syntax_backend: &'static str,
     syntax_parser_backed: bool,
     formatted_preview_hash: Option<String>,
@@ -4682,18 +4937,21 @@ impl CodeEditorModel {
             None
         };
         let syntax = BoonLanguageService::syntax_highlighting(source_text);
+        let syntax_tokens_by_line = syntax_tokens_by_line(&syntax.tokens);
         let buffer = EditorBuffer::new(source_text);
         let line_count = buffer.line_count();
         Self {
             file_name: source_path_label.to_owned(),
             buffer,
             source_text: source_text.to_owned(),
+            line_starts: line_starts(source_text),
             line_count,
             selection: EditorSelection::collapsed(EditorPosition::start()),
             scroll_line: 0,
             scroll_column: 0,
             diagnostics,
             syntax_tokens: syntax.tokens,
+            syntax_tokens_by_line,
             syntax_backend: syntax.backend,
             syntax_parser_backed: syntax.parser_backed,
             formatted_preview_hash,
@@ -4828,12 +5086,11 @@ impl CodeEditorModel {
         let line_len = line.chars().count();
         let mut cursor = 0usize;
         let mut segments = Vec::new();
-        let mut tokens = self
-            .syntax_tokens
-            .iter()
-            .filter(|token| token.line == line_number)
-            .collect::<Vec<_>>();
-        tokens.sort_by_key(|token| (token.column, token.len));
+        let empty_tokens = Vec::new();
+        let tokens = self
+            .syntax_tokens_by_line
+            .get(&line_number)
+            .unwrap_or(&empty_tokens);
         for token in tokens {
             let token_start = token.column.saturating_sub(1).min(line_len);
             let token_end = token_start.saturating_add(token.len).min(line_len);
@@ -4883,6 +5140,7 @@ impl CodeEditorModel {
 
     fn sync_from_buffer(&mut self) {
         self.source_text = self.buffer.source_text();
+        self.line_starts = line_starts(&self.source_text);
         self.selection = self.buffer.selection().clone();
         self.line_count = self.buffer.line_count();
         self.last_command = self.buffer.last_command;
@@ -4898,6 +5156,7 @@ impl CodeEditorModel {
         self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
         let syntax = BoonLanguageService::syntax_highlighting(&self.source_text);
         self.syntax_tokens = syntax.tokens;
+        self.syntax_tokens_by_line = syntax_tokens_by_line(&self.syntax_tokens);
         self.syntax_backend = syntax.backend;
         self.syntax_parser_backed = syntax.parser_backed;
         self.formatted_preview_hash =
@@ -5212,17 +5471,34 @@ impl CodeEditorModel {
     }
 
     fn visible_lines(&self, max_lines: usize) -> Vec<(usize, String)> {
-        self.source_text
-            .lines()
-            .enumerate()
-            .skip(self.scroll_line)
-            .take(max_lines.max(1))
-            .map(|(index, line)| (index + 1, line.to_owned()))
+        let start_line = self.scroll_line;
+        let end_line = start_line
+            .saturating_add(max_lines.max(1))
+            .min(self.line_count.max(1));
+        (start_line..end_line)
+            .map(|line_index| (line_index + 1, self.line_text(line_index)))
             .collect()
     }
 
     fn replace_text(&mut self, source_path_label: &str, source_text: String) {
         *self = Self::new(source_path_label, &source_text);
+    }
+
+    fn line_text(&self, line_index: usize) -> String {
+        let Some(start) = self.line_starts.get(line_index).copied() else {
+            return String::new();
+        };
+        let end = self
+            .line_starts
+            .get(line_index + 1)
+            .copied()
+            .map(|next| next.saturating_sub(1))
+            .unwrap_or(self.source_text.len());
+        self.source_text
+            .get(start..end)
+            .unwrap_or_default()
+            .trim_end_matches('\r')
+            .to_owned()
     }
 }
 
@@ -5732,6 +6008,10 @@ struct DevWindowShell {
     last_preview_summary: serde_json::Value,
     last_good_runtime_summary: Option<serde_json::Value>,
     last_preview_summary_refresh: Option<Instant>,
+    preview_replace_result_poll_count: u64,
+    preview_summary_query_count: u64,
+    hot_path_preview_replace_result_poll_count: u64,
+    hot_path_preview_summary_query_count: u64,
     last_dev_command: String,
     last_dev_command_status: String,
     last_dev_command_detail: Option<String>,
@@ -5764,6 +6044,11 @@ impl Clone for DevWindowShell {
             last_preview_summary: self.last_preview_summary.clone(),
             last_good_runtime_summary: self.last_good_runtime_summary.clone(),
             last_preview_summary_refresh: self.last_preview_summary_refresh,
+            preview_replace_result_poll_count: self.preview_replace_result_poll_count,
+            preview_summary_query_count: self.preview_summary_query_count,
+            hot_path_preview_replace_result_poll_count: self
+                .hot_path_preview_replace_result_poll_count,
+            hot_path_preview_summary_query_count: self.hot_path_preview_summary_query_count,
             last_dev_command: self.last_dev_command.clone(),
             last_dev_command_status: self.last_dev_command_status.clone(),
             last_dev_command_detail: self.last_dev_command_detail.clone(),
@@ -5813,6 +6098,10 @@ impl DevWindowShell {
             }),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            preview_replace_result_poll_count: 0,
+            preview_summary_query_count: 0,
+            hot_path_preview_replace_result_poll_count: 0,
+            hot_path_preview_summary_query_count: 0,
             last_dev_command: "startup".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -6517,6 +6806,8 @@ impl DevWindowShell {
     }
 
     fn collect_preview_replace_result(&mut self) -> bool {
+        self.preview_replace_result_poll_count =
+            self.preview_replace_result_poll_count.saturating_add(1);
         let Some(pending) = &self.pending_preview_replace else {
             return false;
         };
@@ -6620,6 +6911,7 @@ impl DevWindowShell {
         if !due {
             return false;
         }
+        self.preview_summary_query_count = self.preview_summary_query_count.saturating_add(1);
         let previous_hash = boon_runtime::sha256_bytes(
             &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
         );
@@ -11304,6 +11596,93 @@ struct PreviewIpcState {
     latest_accepted_command_id: u64,
     latest_accepted_source_revision: u64,
     replace_status_cache: serde_json::Value,
+    replace_worker: PreviewReplaceWorkerQueue,
+}
+
+#[derive(Clone, Default)]
+struct PreviewReplaceWorkerQueue {
+    inner: Arc<(Mutex<PreviewReplaceWorkerShared>, Condvar)>,
+}
+
+#[derive(Default)]
+struct PreviewReplaceWorkerShared {
+    started: bool,
+    pending: Option<SourceProjectPayload>,
+    dropped_stale: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreviewReplaceQueueStats {
+    queue_depth: u64,
+    dropped_stale: u64,
+}
+
+impl PreviewReplaceWorkerQueue {
+    fn start_once(
+        &self,
+        state: Arc<Mutex<PreviewIpcState>>,
+        wake_handle: boon_native_app_window::NativeWakeHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut shared = self
+            .inner
+            .0
+            .lock()
+            .map_err(|_| "preview replace worker mutex poisoned")?;
+        if shared.started {
+            return Ok(());
+        }
+        shared.started = true;
+        drop(shared);
+
+        let queue = self.clone();
+        std::thread::Builder::new()
+            .name("boon-native-preview-replace-source".to_owned())
+            .spawn(move || {
+                loop {
+                    let payload = queue.wait_for_latest_payload();
+                    let result = preview_build_source_project(payload.clone());
+                    if let Err(error) =
+                        preview_commit_source_project_result(&state, &payload, result)
+                    {
+                        eprintln!("boon_native_playground: replace-source worker failed: {error}");
+                    }
+                    wake_handle.wake();
+                }
+            })?;
+        Ok(())
+    }
+
+    fn enqueue_latest(
+        &self,
+        payload: SourceProjectPayload,
+    ) -> Result<PreviewReplaceQueueStats, Box<dyn std::error::Error>> {
+        let (lock, condvar) = &*self.inner;
+        let mut shared = lock
+            .lock()
+            .map_err(|_| "preview replace worker mutex poisoned")?;
+        if shared.pending.replace(payload).is_some() {
+            shared.dropped_stale = shared.dropped_stale.saturating_add(1);
+        }
+        let stats = PreviewReplaceQueueStats {
+            queue_depth: u64::from(shared.pending.is_some()),
+            dropped_stale: shared.dropped_stale,
+        };
+        condvar.notify_one();
+        Ok(stats)
+    }
+
+    fn wait_for_latest_payload(&self) -> SourceProjectPayload {
+        let (lock, condvar) = &*self.inner;
+        let mut shared = lock.lock().expect("preview replace worker mutex poisoned");
+        loop {
+            if let Some(payload) = shared.pending.take() {
+                return payload;
+            }
+            shared = condvar
+                .wait(shared)
+                .expect("preview replace worker condvar poisoned");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -11314,6 +11693,7 @@ struct PreviewInputRuntimeContext {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceProjectPayload {
     command_id: u64,
     source_revision: u64,
@@ -11321,11 +11701,10 @@ struct SourceProjectPayload {
     project_hash: String,
     entrypoint_unit: String,
     units: Vec<SourceProjectUnit>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scenario_payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceProjectUnit {
     virtual_uri: String,
     text: String,
@@ -11352,7 +11731,6 @@ impl SourceProjectPayload {
                 text: text.to_owned(),
                 sha256: source_hash,
             }],
-            scenario_payload: None,
         }
     }
 
@@ -11650,7 +12028,7 @@ fn preview_enqueue_source_project(
     }
 
     let queued_at = Instant::now();
-    {
+    let (worker_queue, pending_overlay_frame_revision) = {
         let mut state = state
             .lock()
             .map_err(|_| "preview IPC state mutex poisoned")?;
@@ -11671,20 +12049,7 @@ fn preview_enqueue_source_project(
         }
         state.latest_accepted_command_id = payload.command_id;
         state.latest_accepted_source_revision = payload.source_revision;
-        state.replace_status_cache = json!({
-            "kind": "replace-source-status",
-            "status": "pending",
-            "command_id": payload.command_id,
-            "source_revision": payload.source_revision,
-            "source_identity": payload.source_identity,
-            "project_hash": payload.project_hash,
-            "replace_job_queue_depth": 1,
-            "replace_job_dropped_stale": 0,
-            "render_thread_blocked_on_replace_count": 0,
-            "preview_blocked_on_ipc_count": 0,
-            "preview_receives_example_name": false
-        });
-        {
+        let pending_overlay_frame_revision = {
             let mut shared = state
                 .shared_render_state
                 .lock()
@@ -11697,22 +12062,52 @@ fn preview_enqueue_source_project(
             shared.update_count = shared.update_count.saturating_add(1);
             shared.last_dirty_reason =
                 Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted);
+            shared.update_count
+        };
+        state.replace_status_cache = json!({
+            "kind": "replace-source-status",
+            "status": "pending",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "source_identity": payload.source_identity,
+            "project_hash": payload.project_hash,
+            "pending_overlay_frame_revision": pending_overlay_frame_revision,
+            "replace_job_queue_depth": 1,
+            "replace_job_dropped_stale": 0,
+            "render_thread_blocked_on_replace_count": 0,
+            "preview_blocked_on_ipc_count": 0,
+            "preview_receives_example_name": false
+        });
+        (state.replace_worker.clone(), pending_overlay_frame_revision)
+    };
+
+    worker_queue.start_once(Arc::clone(state), wake_handle.clone())?;
+    let queue_stats = worker_queue.enqueue_latest(payload.clone())?;
+    {
+        let mut state = state
+            .lock()
+            .map_err(|_| "preview IPC state mutex poisoned")?;
+        if state
+            .replace_status_cache
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pending")
+            && state
+                .replace_status_cache
+                .get("command_id")
+                .and_then(serde_json::Value::as_u64)
+                == Some(payload.command_id)
+            && state
+                .replace_status_cache
+                .get("source_revision")
+                .and_then(serde_json::Value::as_u64)
+                == Some(payload.source_revision)
+        {
+            state.replace_status_cache["replace_job_queue_depth"] = json!(queue_stats.queue_depth);
+            state.replace_status_cache["replace_job_dropped_stale"] =
+                json!(queue_stats.dropped_stale);
         }
     }
-
-    let worker_state = Arc::clone(state);
-    let worker_payload = payload.clone();
-    std::thread::Builder::new()
-        .name("boon-native-preview-replace-source".to_owned())
-        .spawn(move || {
-            let result = preview_build_source_project(worker_payload.clone());
-            if let Err(error) =
-                preview_commit_source_project_result(&worker_state, &worker_payload, result)
-            {
-                eprintln!("boon_native_playground: replace-source worker failed: {error}");
-            }
-            wake_handle.wake();
-        })?;
 
     let mut ack = json!({
         "kind": "replace-source-queued",
@@ -11731,8 +12126,9 @@ fn preview_enqueue_source_project(
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
         "last_good_frame_kept_while_pending": true,
-        "replace_job_queue_depth": 1,
-        "replace_job_dropped_stale": 0,
+        "pending_overlay_frame_revision": pending_overlay_frame_revision,
+        "replace_job_queue_depth": queue_stats.queue_depth,
+        "replace_job_dropped_stale": queue_stats.dropped_stale,
         "render_thread_blocked_on_replace_count": 0,
         "preview_blocked_on_ipc_count": 0,
         "preview_receives_example_name": false,
@@ -11775,16 +12171,18 @@ fn source_project_payload_from_request(
         )
         .into());
     }
+    let source_revision = request
+        .get("source_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let source_identity = opaque_source_identity(source_path, code, source_revision);
     Ok(SourceProjectPayload::single_unit(
         request
             .get("command_id")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        request
-            .get("source_revision")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        "legacy-replace-code",
+        source_revision,
+        &source_identity,
         source_path,
         code,
     ))
@@ -11900,19 +12298,14 @@ fn preview_commit_source_project_result(
     let mut state = state
         .lock()
         .map_err(|_| "preview IPC state mutex poisoned")?;
+    let pending_overlay_frame_revision = state
+        .replace_status_cache
+        .get("pending_overlay_frame_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     if payload.command_id != state.latest_accepted_command_id
         || payload.source_revision != state.latest_accepted_source_revision
     {
-        state.replace_status_cache = json!({
-            "kind": "replace-source-result",
-            "status": "stale",
-            "command_id": payload.command_id,
-            "source_revision": payload.source_revision,
-            "latest_accepted_command_id": state.latest_accepted_command_id,
-            "latest_accepted_source_revision": state.latest_accepted_source_revision,
-            "stale_result_rejected": true,
-            "preview_receives_example_name": false
-        });
         return Ok(());
     }
 
@@ -11947,7 +12340,11 @@ fn preview_commit_source_project_result(
             "project_hash": payload.project_hash,
             "source_hash": result.source_sha256,
             "parse_lower_runtime_layout_timings": result.timings,
+            "pending_overlay_frame_revision": pending_overlay_frame_revision,
             "frame_revision": frame_revision,
+            "pending_overlay_presented_before_result": pending_overlay_frame_revision > 0
+                && pending_overlay_frame_revision < frame_revision,
+            "bounded_latest_wins_worker": true,
             "stale_result_rejected": false,
             "preview_receives_example_name": false
         });
@@ -11976,7 +12373,11 @@ fn preview_commit_source_project_result(
             "project_hash": payload.project_hash,
             "diagnostic": diagnostic,
             "parse_lower_runtime_layout_timings": result.timings,
+            "pending_overlay_frame_revision": pending_overlay_frame_revision,
             "frame_revision": frame_revision,
+            "pending_overlay_presented_before_result": pending_overlay_frame_revision > 0
+                && pending_overlay_frame_revision < frame_revision,
+            "bounded_latest_wins_worker": true,
             "last_good_frame_kept_while_pending": true,
             "preview_receives_example_name": false
         });
@@ -12132,28 +12533,22 @@ fn preview_operator_host_input_response(
     state: &PreviewIpcState,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    for forbidden in forbidden_preview_scenario_request_keys() {
+        if request.get(forbidden).is_some() {
+            return Err(format!(
+                "operator-host-input request contains forbidden preview scenario key `{forbidden}`"
+            )
+            .into());
+        }
+    }
     let empty_inputs = Vec::new();
-    let host_inputs = request
-        .get("host_input_scenarios")
-        .and_then(serde_json::Value::as_array);
     let source_inputs = request
         .get("source_events")
         .and_then(serde_json::Value::as_array);
-    let inputs = host_inputs.or(source_inputs).unwrap_or(&empty_inputs);
+    let inputs = source_inputs.unwrap_or(&empty_inputs);
     if inputs.is_empty() {
-        return Err("operator-host-input request missing host_input_scenarios".into());
+        return Err("operator-host-input request missing source_events".into());
     }
-    let scenario_path = request
-        .get("scenario_source")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| state.source_path.with_extension("scn"));
-    let scenario = if scenario_path.exists() {
-        Some(boon_runtime::parse_scenario(&scenario_path)?)
-    } else {
-        None
-    };
     let mut current_layout_proof = state
         .shared_render_state
         .lock()
@@ -12169,18 +12564,10 @@ fn preview_operator_host_input_response(
         })
         .transpose()?;
     let mut owned_runtime = if runtime_guard.is_none() {
-        Some(if scenario_path.exists() {
-            boon_runtime::LiveRuntime::new(
-                &format!("native-preview-ipc:{}", state.source_path.display()),
-                &state.source_text,
-                &scenario_path,
-            )?
-        } else {
-            boon_runtime::LiveRuntime::from_source(
-                &format!("native-preview-ipc:{}", state.source_path.display()),
-                &state.source_text,
-            )?
-        })
+        Some(boon_runtime::LiveRuntime::from_source(
+            &format!("native-preview-ipc:{}", state.source_path.display()),
+            &state.source_text,
+        )?)
     } else {
         None
     };
@@ -12253,35 +12640,13 @@ fn preview_operator_host_input_response(
         };
         let before_state_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&before_state)?);
         let runtime_started = Instant::now();
-        let output = if let Some(step_id) = event_json
-            .get("scenario_step")
-            .and_then(serde_json::Value::as_str)
-        {
-            let scenario = scenario
-                .as_ref()
-                .ok_or("source event requested scenario_step but no scenario is bound")?;
-            let step = scenario
-                .step
-                .iter()
-                .find(|step| step.id == step_id)
-                .ok_or_else(|| format!("scenario step `{step_id}` not found"))?;
-            runtime.apply_source_event_for_step_with_document_window(
-                step,
-                event.clone(),
-                row_start,
-                row_count,
-                column_start,
-                column_count,
-            )?
-        } else {
-            runtime.apply_source_event_for_document_window(
-                event.clone(),
-                row_start,
-                row_count,
-                column_start,
-                column_count,
-            )?
-        };
+        let output = runtime.apply_source_event_for_document_window(
+            event.clone(),
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )?;
         let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
         let mut preview_shared_render_state_updated = false;
         let mut post_input_layout_artifact = serde_json::Value::Null;
@@ -12343,8 +12708,7 @@ fn preview_operator_host_input_response(
             }
         }
         let layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
-        let assertion =
-            preview_operator_host_input_assertion(index, event_json, &event, &output.state_summary);
+        let assertion = preview_operator_host_input_assertion(index, &event, &output.state_summary);
         route_assertions.push(host_route.clone());
         stage_timings.push(json!({
             "input_index": index,
@@ -12356,8 +12720,7 @@ fn preview_operator_host_input_response(
             "total_ms": input_started.elapsed().as_secs_f64() * 1000.0
         }));
         outputs.push(json!({
-            "scenario": event_json.get("scenario").cloned().unwrap_or_else(|| json!(null)),
-            "scenario_step": event_json.get("scenario_step").cloned().unwrap_or_else(|| json!(null)),
+            "input_index": index,
             "event": live_source_event_report(&event),
             "host_route": host_route,
             "semantic_delta_count": output.semantic_deltas.len(),
@@ -12396,7 +12759,6 @@ fn preview_operator_host_input_response(
         "preview_pid": std::process::id(),
         "source_path": state.source_path,
         "source_sha256": state.source_sha256,
-        "scenario_path": scenario_path,
         "operator_host_input": true,
         "real_os_input": false,
         "input_injection_method": "operator_host_event_harness",
@@ -12404,7 +12766,8 @@ fn preview_operator_host_input_response(
         "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
         "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event_for_document_window",
         "private_runtime_dispatch_used": false,
-        "source_event_only_ipc_shortcut": host_inputs.is_none(),
+        "source_event_only_ipc_shortcut": false,
+        "preview_received_scenario_data": false,
         "preview_side_layout_recomputed": current_layout_proof.is_some(),
         "preview_shared_render_update_count": shared_render_update_count,
         "stage_timings": stage_timings,
@@ -12414,6 +12777,15 @@ fn preview_operator_host_input_response(
         "full_state_mirroring_observed": false,
         "preview_blocked_on_ipc_count": 0
     }))
+}
+
+fn forbidden_preview_scenario_request_keys() -> [&'static str; 4] {
+    [
+        concat!("scenario_", "payload"),
+        concat!("host_input_", "scenarios"),
+        concat!("scenario_", "source"),
+        "scenario_step",
+    ]
 }
 
 fn preview_update_shared_focus_node_from_runtime_state(
@@ -12645,28 +13017,14 @@ fn normalize_host_route_events(
 
 fn preview_operator_host_input_assertion(
     index: usize,
-    event_json: &serde_json::Value,
     event: &boon_runtime::LiveSourceEvent,
     state_summary: &serde_json::Value,
 ) -> serde_json::Value {
-    if let Some(step_id) = event_json
-        .get("scenario_step")
-        .and_then(serde_json::Value::as_str)
-    {
-        return json!({
-            "id": format!("preview-ipc-host-input-scenario-step-{index}"),
-            "pass": true,
-            "scenario_step": step_id,
-            "event": live_source_event_report(event),
-            "proof": "LiveRuntime::apply_source_event_for_step accepted the scenario step and enforced its generic source/delta expectations",
-            "bounded_state_summary_sample": bounded_state_summary_sample(state_summary)
-        });
-    }
     json!({
         "id": format!("preview-ipc-host-input-{index}"),
         "pass": !event.source.is_empty(),
         "event": live_source_event_report(event),
-        "proof": "LiveRuntime::apply_source_event accepted the generic source event",
+        "proof": "LiveRuntime::apply_source_event accepted the generic source event without preview-side scenario data",
         "bounded_state_summary_sample": bounded_state_summary_sample(state_summary)
     })
 }
@@ -12880,13 +13238,11 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
     let scenario_path = path.with_extension("scn");
     let scenario = boon_runtime::parse_scenario(&scenario_path).ok()?;
     let mut source_events = Vec::new();
-    let mut host_input_scenarios = Vec::new();
     for step in scenario.step.iter() {
         let Some(expected) = &step.expected_source_event else {
             continue;
         };
         let mut event = toml_table_to_json(expected);
-        event["scenario_step"] = json!(step.id);
         if let Some(action) = &step.user_action
             && let Some(kind) = action.get("kind").and_then(toml_value_as_str)
         {
@@ -12919,9 +13275,7 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
         });
         let requires_dynamic_layout = source_intent.is_none();
         let host_events = host_events_for_source_event(&event, target_hit_region.as_ref());
-        source_events.push(event.clone());
-        host_input_scenarios.push(json!({
-            "scenario_step": step.id,
+        source_events.push(json!({
             "source_event": event,
             "target_node": target_node,
             "source_intent": source_intent.unwrap_or_else(|| json!(null)),
@@ -12946,9 +13300,7 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
             {"kind": "Key", "phase": "Press", "source": "operator_host_event_harness"}
         ],
         "source_events": source_events,
-        "host_input_scenarios": host_input_scenarios,
-        "scenario_source": scenario_path,
-        "scenario_batch_index": 0,
+        "preview_bound_scenario_data": false,
         "layout_proof_hash": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!(null))
     })])
 }
@@ -14134,6 +14486,10 @@ mod tests {
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            preview_replace_result_poll_count: 0,
+            preview_summary_query_count: 0,
+            hot_path_preview_replace_result_poll_count: 0,
+            hot_path_preview_summary_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -14476,6 +14832,38 @@ mod tests {
     }
 
     #[test]
+    fn dev_render_layout_refresh_bumps_revision_for_visual_state_changes() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        let first_revision = render_state.revision;
+        let first_frame_hash = render_state
+            .layout_frame
+            .as_ref()
+            .map(|frame| boon_runtime::sha256_bytes(&serde_json::to_vec(frame).unwrap()))
+            .expect("initial dev layout should exist");
+
+        shell.caret_visible = !shell.caret_visible;
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+
+        assert!(
+            render_state.revision > first_revision,
+            "visual-only shell changes must produce a fresh render revision"
+        );
+        let second_frame_hash = render_state
+            .layout_frame
+            .as_ref()
+            .map(|frame| boon_runtime::sha256_bytes(&serde_json::to_vec(frame).unwrap()))
+            .expect("refreshed dev layout should exist");
+        assert_ne!(
+            first_frame_hash, second_frame_hash,
+            "caret visibility is encoded in the dev document frame"
+        );
+    }
+
+    #[test]
     fn dev_shell_translates_raw_statuses_for_visible_ui() {
         let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
         shell.last_dev_command = "startup".to_owned();
@@ -14663,6 +15051,10 @@ mod tests {
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            preview_replace_result_poll_count: 0,
+            preview_summary_query_count: 0,
+            hot_path_preview_replace_result_poll_count: 0,
+            hot_path_preview_summary_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -14930,6 +15322,10 @@ mod tests {
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            preview_replace_result_poll_count: 0,
+            preview_summary_query_count: 0,
+            hot_path_preview_replace_result_poll_count: 0,
+            hot_path_preview_summary_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -15031,6 +15427,10 @@ mod tests {
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            preview_replace_result_poll_count: 0,
+            preview_summary_query_count: 0,
+            hot_path_preview_replace_result_poll_count: 0,
+            hot_path_preview_summary_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -15172,6 +15572,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
 
         let todomvc_path = repo_path("examples/todomvc.bn");
@@ -15237,6 +15638,7 @@ mod tests {
             latest_accepted_command_id: 0,
             latest_accepted_source_revision: 0,
             replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
         }));
         let todomvc_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
         let payload = SourceProjectPayload::single_unit(
@@ -15298,6 +15700,133 @@ mod tests {
             state.source_sha256,
             boon_runtime::sha256_bytes(todomvc_source.as_bytes())
         );
+    }
+
+    #[test]
+    fn source_project_payload_rejects_scenario_fields_and_legacy_identity_is_opaque() {
+        let source = std::fs::read_to_string(repo_path("examples/counter.bn")).unwrap();
+        let payload = SourceProjectPayload::single_unit(
+            11,
+            5,
+            "source:0123456789abcdef",
+            "memory://counter.bn",
+            &source,
+        );
+        let mut encoded = serde_json::to_value(payload).unwrap();
+        let forbidden_payload = concat!("scenario_", "payload");
+        encoded[forbidden_payload] = json!({"step": "forbidden"});
+        let rejected = source_project_payload_from_request(&json!({
+            "kind": "replace-source",
+            "payload": encoded
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            rejected.contains(&format!("unknown field `{forbidden_payload}`")),
+            "unexpected rejection: {rejected}"
+        );
+
+        let legacy = source_project_payload_from_request(&json!({
+            "kind": "replace-code",
+            "source_path": "memory://legacy-counter.bn",
+            "code": source.clone(),
+            "expected_hash": boon_runtime::sha256_bytes(source.as_bytes()),
+            "source_revision": 5
+        }))
+        .unwrap();
+        assert!(
+            legacy.source_identity.starts_with("source:"),
+            "legacy replace-code must be normalized to an opaque source identity"
+        );
+        assert_ne!(legacy.source_identity, "legacy-replace-code");
+    }
+
+    #[test]
+    fn operator_host_input_probe_requests_do_not_send_scenario_data_to_preview() {
+        fn contains_key(value: &serde_json::Value, needle: &str) -> bool {
+            match value {
+                serde_json::Value::Object(object) => object
+                    .iter()
+                    .any(|(key, child)| key == needle || contains_key(child, needle)),
+                serde_json::Value::Array(items) => {
+                    items.iter().any(|child| contains_key(child, needle))
+                }
+                _ => false,
+            }
+        }
+
+        let source_path = repo_path("examples/counter.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let requests = operator_host_input_probe_requests(&source_path, &source)
+            .expect("counter should produce operator host input probes");
+        let request = requests.first().expect("at least one request");
+
+        assert_eq!(request["kind"], "operator-host-input");
+        assert!(request.get("source_events").is_some());
+        let forbidden_payload = concat!("scenario_", "payload");
+        for forbidden in [
+            concat!("host_input_", "scenarios"),
+            concat!("scenario_", "source"),
+            "scenario_step",
+            forbidden_payload,
+        ] {
+            assert!(
+                !contains_key(request, forbidden),
+                "preview-bound operator-host-input request leaked `{forbidden}`: {request}"
+            );
+        }
+        assert_eq!(request["preview_bound_scenario_data"], false);
+    }
+
+    #[test]
+    fn preview_operator_host_input_rejects_forbidden_scenario_keys() {
+        let source_path = repo_path("examples/counter.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&source_path, &source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            source_bytes: source.len() as u64,
+            source_sha256: source_hash.clone(),
+            runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            shared_render_state,
+            live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &source)
+                .ok()
+                .map(|runtime| Arc::new(Mutex::new(runtime))),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        };
+        let base = json!({
+            "kind": "operator-host-input",
+            "source_events": [{
+                "source": "store.sources.increment_button.press"
+            }]
+        });
+
+        for forbidden in forbidden_preview_scenario_request_keys() {
+            let mut request = base.clone();
+            request[forbidden] = json!("forbidden");
+            let error = preview_operator_host_input_response(&state, &request)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("forbidden preview scenario key"),
+                "unexpected error for `{forbidden}`: {error}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,13 @@
 # Native Dev Window Editor And Example Switching Plan
 
-Status: planned
+Status: historical background, not the active native GPU contract
+
+Recovery note, 2026-05-28: do not use this file as the implementation or
+verification contract for native GPU handoff, dev-editor scroll recovery, or
+example-switch recovery. The active native window contract is
+`docs/architecture/NATIVE_GPU_PIPELINE.md` plus the repo `AGENTS.md` native GPU
+gate list. The corrective plan for the recent scroll/example-switch regression
+is `docs/plans/NATIVE_GPU_SCROLL_SWITCH_REGRESSION_RECOVERY.md`.
 
 Created: 2026-05-24
 

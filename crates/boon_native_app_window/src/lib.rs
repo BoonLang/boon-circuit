@@ -124,6 +124,7 @@ pub enum NativeRenderLoopMode {
 pub enum NativeSchedulerReason {
     FirstFrame,
     SurfaceChanged,
+    SurfaceLifecycle,
     HostInput,
     Timer,
     ExternalWake,
@@ -147,6 +148,103 @@ pub enum NativeRoleDirtyReason {
     ErrorOverlayChanged,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NativeSurfaceLifecycleReport {
+    pub surface_epoch: u64,
+    pub reconfigure_count: u64,
+    pub resize_reconfigure_count: u64,
+    pub lost_reconfigure_count: u64,
+    pub outdated_reconfigure_count: u64,
+    pub suboptimal_frame_count: u64,
+    pub timeout_skip_count: u64,
+    pub occluded_skip_count: u64,
+    pub zero_size_skip_count: u64,
+    pub validation_error_count: u64,
+    pub final_width: u32,
+    pub final_height: u32,
+    pub last_lifecycle_event: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeSurfaceLifecycleState {
+    report: NativeSurfaceLifecycleReport,
+    needs_suboptimal_reconfigure: bool,
+}
+
+impl NativeSurfaceLifecycleState {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            report: NativeSurfaceLifecycleReport {
+                surface_epoch: 1,
+                final_width: width,
+                final_height: height,
+                ..NativeSurfaceLifecycleReport::default()
+            },
+            needs_suboptimal_reconfigure: false,
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.report.surface_epoch
+    }
+
+    fn report(&self) -> &NativeSurfaceLifecycleReport {
+        &self.report
+    }
+
+    fn reconfigured(&mut self, reason: &str, width: u32, height: u32) {
+        self.report.surface_epoch = self.report.surface_epoch.saturating_add(1);
+        self.report.reconfigure_count = self.report.reconfigure_count.saturating_add(1);
+        self.report.final_width = width;
+        self.report.final_height = height;
+        self.report.last_lifecycle_event = Some(reason.to_owned());
+        match reason {
+            "resize" => {
+                self.report.resize_reconfigure_count =
+                    self.report.resize_reconfigure_count.saturating_add(1);
+            }
+            "lost" => {
+                self.report.lost_reconfigure_count =
+                    self.report.lost_reconfigure_count.saturating_add(1);
+            }
+            "outdated" => {
+                self.report.outdated_reconfigure_count =
+                    self.report.outdated_reconfigure_count.saturating_add(1);
+            }
+            "suboptimal" => {
+                self.needs_suboptimal_reconfigure = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn note_suboptimal_frame(&mut self) {
+        self.report.suboptimal_frame_count = self.report.suboptimal_frame_count.saturating_add(1);
+        self.report.last_lifecycle_event = Some("suboptimal".to_owned());
+        self.needs_suboptimal_reconfigure = true;
+    }
+
+    fn note_timeout_skip(&mut self) {
+        self.report.timeout_skip_count = self.report.timeout_skip_count.saturating_add(1);
+        self.report.last_lifecycle_event = Some("timeout_skip".to_owned());
+    }
+
+    fn note_occluded_skip(&mut self) {
+        self.report.occluded_skip_count = self.report.occluded_skip_count.saturating_add(1);
+        self.report.last_lifecycle_event = Some("occluded_skip".to_owned());
+    }
+
+    fn note_zero_size_skip(&mut self) {
+        self.report.zero_size_skip_count = self.report.zero_size_skip_count.saturating_add(1);
+        self.report.last_lifecycle_event = Some("zero_size_skip".to_owned());
+    }
+
+    fn note_validation_error(&mut self) {
+        self.report.validation_error_count = self.report.validation_error_count.saturating_add(1);
+        self.report.last_lifecycle_event = Some("validation_error".to_owned());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeRenderLoopState {
     pub mode: NativeRenderLoopMode,
@@ -160,6 +258,8 @@ pub struct NativeRenderLoopState {
     pub scheduled_wake_count: u64,
     pub last_scheduler_reason: Option<NativeSchedulerReason>,
     pub last_role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub current_scheduler_reason: Option<NativeSchedulerReason>,
+    pub current_role_dirty_reason: Option<NativeRoleDirtyReason>,
     #[serde(skip)]
     pub next_wake_at: Option<Instant>,
 }
@@ -178,6 +278,8 @@ impl NativeRenderLoopState {
             scheduled_wake_count: 0,
             last_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
             last_role_dirty_reason: None,
+            current_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
+            current_role_dirty_reason: None,
             next_wake_at: None,
         }
     }
@@ -189,7 +291,11 @@ impl NativeRenderLoopState {
     ) -> u64 {
         self.dirty_revision = self.dirty_revision.saturating_add(1);
         self.last_scheduler_reason = Some(scheduler_reason);
-        self.last_role_dirty_reason = role_dirty_reason;
+        if role_dirty_reason.is_some() {
+            self.last_role_dirty_reason = role_dirty_reason;
+        }
+        self.current_scheduler_reason = Some(scheduler_reason);
+        self.current_role_dirty_reason = role_dirty_reason;
         self.dirty_revision
     }
 
@@ -197,12 +303,20 @@ impl NativeRenderLoopState {
         self.presented_revision = self.presented_revision.max(revision);
         self.last_render_content_revision = self.last_render_content_revision.max(revision);
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
+        if self.presented_revision >= self.dirty_revision {
+            self.current_scheduler_reason = None;
+            self.current_role_dirty_reason = None;
+        }
     }
 
     pub fn mark_presented_with_content(&mut self, revision: u64, content_revision: u64) {
         self.presented_revision = self.presented_revision.max(revision);
         self.last_render_content_revision = content_revision;
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
+        if self.presented_revision >= self.dirty_revision {
+            self.current_scheduler_reason = None;
+            self.current_role_dirty_reason = None;
+        }
     }
 
     pub fn should_render(&self, now: Instant, _wake_generation_changed: bool) -> bool {
@@ -236,6 +350,8 @@ impl NativeRenderLoopState {
         if self.next_wake_at.is_some_and(|wake_at| now >= wake_at) {
             self.next_wake_at = None;
             self.last_scheduler_reason = Some(NativeSchedulerReason::Timer);
+            self.current_scheduler_reason = Some(NativeSchedulerReason::Timer);
+            self.current_role_dirty_reason = None;
             self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
             true
         } else {
@@ -252,6 +368,8 @@ impl NativeRenderLoopState {
                     Some(NativeSchedulerReason::ExternalWake)
                 }
             });
+            self.current_scheduler_reason = self.last_scheduler_reason;
+            self.current_role_dirty_reason = poll_result.role_dirty_reason;
             if poll_result.role_dirty_reason.is_some() {
                 self.last_role_dirty_reason = poll_result.role_dirty_reason;
             }
@@ -313,19 +431,64 @@ impl NativeRenderHookResult {
     }
 
     pub fn validate_for_presented_revision(&self, dirty_revision: u64) -> Result<(), String> {
+        self.validate_for_presented_revision_with_scheduler(dirty_revision, None, None)
+    }
+
+    pub fn validate_for_presented_revision_with_scheduler(
+        &self,
+        dirty_revision: u64,
+        scheduler_reason: Option<NativeSchedulerReason>,
+        role_dirty_reason: Option<NativeRoleDirtyReason>,
+    ) -> Result<(), String> {
         if !self.rendered {
             return Err("render hook result did not render a frame".to_owned());
         }
         if self.content_revision == 0 {
             return Err("render hook result content_revision must be nonzero".to_owned());
         }
-        if self.content_revision < dirty_revision {
+        let same_content_surface_render = matches!(
+            scheduler_reason,
+            Some(NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle)
+        );
+        let scheduler_only_input_repaint = role_dirty_reason.is_none()
+            && matches!(
+                scheduler_reason,
+                Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
+            );
+        if self.content_revision < dirty_revision
+            && !same_content_surface_render
+            && !scheduler_only_input_repaint
+        {
             return Err(format!(
                 "render hook result content_revision {} is older than dirty_revision {}",
                 self.content_revision, dirty_revision
             ));
         }
         Ok(())
+    }
+
+    pub fn presented_content_revision(
+        &self,
+        dirty_revision: u64,
+        scheduler_reason: Option<NativeSchedulerReason>,
+        role_dirty_reason: Option<NativeRoleDirtyReason>,
+    ) -> u64 {
+        if self.content_revision < dirty_revision
+            && (matches!(
+                scheduler_reason,
+                Some(
+                    NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle
+                )
+            ) || (role_dirty_reason.is_none()
+                && matches!(
+                    scheduler_reason,
+                    Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
+                )))
+        {
+            dirty_revision
+        } else {
+            self.content_revision
+        }
     }
 }
 
@@ -417,6 +580,7 @@ pub struct AppWindowSurfaceProof {
     pub interactive_frame_loop: bool,
     pub render_loop_mode: NativeRenderLoopMode,
     pub render_loop_state_at_ready: NativeRenderLoopState,
+    pub surface_lifecycle: NativeSurfaceLifecycleReport,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
     pub post_input_frame_timing: Option<NativeFrameTimingProof>,
@@ -721,6 +885,7 @@ async fn run_surface_probe_async(
     )
     .await
     {
+        eprintln!("boon_native_app_window: surface loop failed after ready: {error}");
         let _ = ready_sender.try_send(Err(error));
     }
 }
@@ -839,6 +1004,7 @@ async fn run_surface_probe_inner(
         NativeRenderLoopMode::ContinuousProbe
     };
     let mut render_loop_state = NativeRenderLoopState::new(loop_mode);
+    let mut surface_lifecycle = NativeSurfaceLifecycleState::new(width, height);
 
     for frame_index in 0..total_frame_count {
         let input = empty_input_adapter_proof(false);
@@ -847,7 +1013,7 @@ async fn run_surface_probe_inner(
             NativePollContext {
                 window_id: window_id.clone(),
                 surface_id: surface_id.clone(),
-                surface_epoch: 1,
+                surface_epoch: surface_lifecycle.epoch(),
                 width,
                 height,
                 scale: scale as f32,
@@ -864,14 +1030,16 @@ async fn run_surface_probe_inner(
         }
         let rendered_revision = render_loop_state.dirty_revision;
         let acquire_start = Instant::now();
-        let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            other => {
-                return Err(NativeWindowError::Failed(format!(
-                    "get_current_texture: {other:?}"
-                )));
-            }
+        let Some(frame) = acquire_surface_texture_for_present(
+            &surface,
+            &device,
+            &config,
+            &mut surface_lifecycle,
+            &mut render_loop_state,
+            "probe loop",
+        )?
+        else {
+            continue;
         };
         let current_surface_acquire_ms = elapsed_ms(acquire_start);
         let present_start = Instant::now();
@@ -892,7 +1060,7 @@ async fn run_surface_probe_inner(
                     surface_view: &view,
                     surface_texture_format: config.format,
                     surface_id: surface_id.clone(),
-                    surface_epoch: 1,
+                    surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
                     width,
                     height,
@@ -901,12 +1069,36 @@ async fn run_surface_probe_inner(
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
-                render_result
-                    .validate_for_presented_revision(rendered_revision)
-                    .map_err(|error| {
-                        NativeWindowError::Failed(format!("external render hook: {error}"))
-                    })?;
-                rendered_content_revision = render_result.content_revision;
+                if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                ) {
+                    surface_lifecycle.note_validation_error();
+                    if let Some(report) = options.render_loop_state_report.as_deref() {
+                        let _ = write_render_loop_state_report(
+                            Path::new(report),
+                            options.role,
+                            std::process::id(),
+                            &window_id,
+                            &surface_id,
+                            surface_lifecycle.report(),
+                            &render_loop_state,
+                            Duration::ZERO,
+                            wake_handle.generation(),
+                            None,
+                            Some(&error),
+                        );
+                    }
+                    return Err(NativeWindowError::Failed(format!(
+                        "external render hook: {error}"
+                    )));
+                }
+                rendered_content_revision = render_result.presented_content_revision(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                );
                 external_render_proof = Some(render_result.proof);
                 Some(elapsed_ms(render_start))
             }
@@ -952,10 +1144,11 @@ async fn run_surface_probe_inner(
                 std::process::id(),
                 &window_id,
                 &surface_id,
-                1,
+                surface_lifecycle.report(),
                 &render_loop_state,
                 Duration::ZERO,
                 wake_handle.generation(),
+                None,
                 None,
             )?;
         }
@@ -1027,7 +1220,7 @@ async fn run_surface_probe_inner(
                 NativePollContext {
                     window_id: window_id.clone(),
                     surface_id: surface_id.clone(),
-                    surface_epoch: 1,
+                    surface_epoch: surface_lifecycle.epoch(),
                     width,
                     height,
                     scale: scale as f32,
@@ -1047,14 +1240,16 @@ async fn run_surface_probe_inner(
             }
             let rendered_revision = render_loop_state.dirty_revision;
             let acquire_start = Instant::now();
-            let frame = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(frame)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-                other => {
-                    return Err(NativeWindowError::Failed(format!(
-                        "get_current_texture after input sample: {other:?}"
-                    )));
-                }
+            let Some(frame) = acquire_surface_texture_for_present(
+                &surface,
+                &device,
+                &config,
+                &mut surface_lifecycle,
+                &mut render_loop_state,
+                "post-input sample",
+            )?
+            else {
+                continue;
             };
             let current_surface_acquire_ms = elapsed_ms(acquire_start);
             let present_start = Instant::now();
@@ -1074,7 +1269,7 @@ async fn run_surface_probe_inner(
                     surface_view: &view,
                     surface_texture_format: config.format,
                     surface_id: surface_id.clone(),
-                    surface_epoch: 1,
+                    surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
                     width,
                     height,
@@ -1083,14 +1278,36 @@ async fn run_surface_probe_inner(
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook after input: {error}"))
                 })?;
-                render_result
-                    .validate_for_presented_revision(rendered_revision)
-                    .map_err(|error| {
-                        NativeWindowError::Failed(format!(
-                            "external render hook after input: {error}"
-                        ))
-                    })?;
-                rendered_content_revision = render_result.content_revision;
+                if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                ) {
+                    surface_lifecycle.note_validation_error();
+                    if let Some(report) = options.render_loop_state_report.as_deref() {
+                        let _ = write_render_loop_state_report(
+                            Path::new(report),
+                            options.role,
+                            std::process::id(),
+                            &window_id,
+                            &surface_id,
+                            surface_lifecycle.report(),
+                            &render_loop_state,
+                            Duration::ZERO,
+                            wake_handle.generation(),
+                            None,
+                            Some(&error),
+                        );
+                    }
+                    return Err(NativeWindowError::Failed(format!(
+                        "external render hook after input: {error}"
+                    )));
+                }
+                rendered_content_revision = render_result.presented_content_revision(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                );
                 external_render_proof = Some(render_result.proof);
                 post_input_render_hook_samples.push(elapsed_ms(render_start));
             }
@@ -1156,7 +1373,7 @@ async fn run_surface_probe_inner(
         window_title: options.title.clone(),
         window_id: window_id.clone(),
         surface_id: surface_id.clone(),
-        surface_epoch: 1,
+        surface_epoch: surface_lifecycle.epoch(),
         wgpu_strategy: format!("{:?}", app_window::WGPU_STRATEGY),
         wgpu_surface_strategy: format!("{:?}", app_window::WGPU_SURFACE_STRATEGY),
         adapter_name: adapter_info.name,
@@ -1185,6 +1402,7 @@ async fn run_surface_probe_inner(
         interactive_frame_loop: true,
         render_loop_mode: loop_mode,
         render_loop_state_at_ready: render_loop_state.clone(),
+        surface_lifecycle: surface_lifecycle.report().clone(),
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
         post_input_frame_timing,
@@ -1202,15 +1420,29 @@ async fn run_surface_probe_inner(
             break;
         }
         let (current_size, current_scale) = app_surface.size_scale().await;
-        let current_width = ((current_size.width() * current_scale).round() as u32).max(1);
-        let current_height = ((current_size.height() * current_scale).round() as u32).max(1);
+        let raw_width = (current_size.width() * current_scale).round();
+        let raw_height = (current_size.height() * current_scale).round();
+        if raw_width <= 0.0 || raw_height <= 0.0 {
+            surface_lifecycle.note_zero_size_skip();
+            render_loop_state.note_idle_poll();
+            let _ =
+                wake_handle.wait_for_wake_after(last_wake_generation, Duration::from_millis(20));
+            continue;
+        }
+        let current_width = raw_width as u32;
+        let current_height = raw_height as u32;
         if current_width != width || current_height != height {
             width = current_width;
             height = current_height;
             config.width = width;
             config.height = height;
             surface.configure(&device, &config);
+            surface_lifecycle.reconfigured("resize", width, height);
             render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceChanged, None);
+        } else if surface_lifecycle.needs_suboptimal_reconfigure {
+            surface.configure(&device, &config);
+            surface_lifecycle.reconfigured("suboptimal", width, height);
+            render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
         }
         let poll_started_at = Instant::now();
         render_loop_state.consume_due_wake(poll_started_at);
@@ -1221,7 +1453,7 @@ async fn run_surface_probe_inner(
             NativePollContext {
                 window_id: window_id.clone(),
                 surface_id: surface_id.clone(),
-                surface_epoch: 1,
+                surface_epoch: surface_lifecycle.epoch(),
                 width,
                 height,
                 scale: current_scale as f32,
@@ -1265,14 +1497,16 @@ async fn run_surface_probe_inner(
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         }
         let rendered_revision = render_loop_state.dirty_revision;
-        let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            other => {
-                return Err(NativeWindowError::Failed(format!(
-                    "get_current_texture during interactive loop: {other:?}"
-                )));
-            }
+        let Some(frame) = acquire_surface_texture_for_present(
+            &surface,
+            &device,
+            &config,
+            &mut surface_lifecycle,
+            &mut render_loop_state,
+            "interactive loop",
+        )?
+        else {
+            continue;
         };
         let view = frame
             .texture
@@ -1290,7 +1524,7 @@ async fn run_surface_probe_inner(
                     surface_view: &view,
                     surface_texture_format: config.format,
                     surface_id: surface_id.clone(),
-                    surface_epoch: 1,
+                    surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
                     width,
                     height,
@@ -1299,12 +1533,36 @@ async fn run_surface_probe_inner(
                 .map_err(|error| {
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
-                render_result
-                    .validate_for_presented_revision(rendered_revision)
-                    .map_err(|error| {
-                        NativeWindowError::Failed(format!("external render hook: {error}"))
-                    })?;
-                rendered_content_revision = render_result.content_revision;
+                if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                ) {
+                    surface_lifecycle.note_validation_error();
+                    if let Some(report) = options.render_loop_state_report.as_deref() {
+                        let _ = write_render_loop_state_report(
+                            Path::new(report),
+                            options.role,
+                            std::process::id(),
+                            &window_id,
+                            &surface_id,
+                            surface_lifecycle.report(),
+                            &render_loop_state,
+                            hold_started.elapsed(),
+                            wake_handle.generation(),
+                            last_interactive_readback_artifact.as_ref(),
+                            Some(&error),
+                        );
+                    }
+                    return Err(NativeWindowError::Failed(format!(
+                        "external render hook: {error}"
+                    )));
+                }
+                rendered_content_revision = render_result.presented_content_revision(
+                    rendered_revision,
+                    render_loop_state.current_scheduler_reason,
+                    render_loop_state.current_role_dirty_reason,
+                );
             }
             None => {
                 let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1356,11 +1614,12 @@ async fn run_surface_probe_inner(
                 std::process::id(),
                 &window_id,
                 &surface_id,
-                1,
+                surface_lifecycle.report(),
                 &render_loop_state,
                 hold_started.elapsed(),
                 wake_handle.generation(),
                 last_interactive_readback_artifact.as_ref(),
+                None,
             )?;
         }
         if let Some((artifact_dir, pending)) = interactive_readback {
@@ -1376,11 +1635,12 @@ async fn run_surface_probe_inner(
                     std::process::id(),
                     &window_id,
                     &surface_id,
-                    1,
+                    surface_lifecycle.report(),
                     &render_loop_state,
                     hold_started.elapsed(),
                     wake_handle.generation(),
                     last_interactive_readback_artifact.as_ref(),
+                    None,
                 )?;
             }
         }
@@ -1397,11 +1657,12 @@ async fn run_surface_probe_inner(
             std::process::id(),
             &window_id,
             &surface_id,
-            1,
+            surface_lifecycle.report(),
             &render_loop_state,
             hold_started.elapsed(),
             wake_handle.generation(),
             last_interactive_readback_artifact.as_ref(),
+            None,
         )?;
     }
     let _ = callback_done_receiver.recv_timeout(Duration::from_secs(2));
@@ -1465,17 +1726,61 @@ fn queue_visible_surface_readback(
     })
 }
 
+fn acquire_surface_texture_for_present(
+    surface: &wgpu::Surface<'_>,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    lifecycle: &mut NativeSurfaceLifecycleState,
+    render_loop_state: &mut NativeRenderLoopState,
+    context: &str,
+) -> Result<Option<wgpu::SurfaceTexture>, NativeWindowError> {
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(frame) => Ok(Some(frame)),
+        wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+            lifecycle.note_suboptimal_frame();
+            Ok(Some(frame))
+        }
+        wgpu::CurrentSurfaceTexture::Timeout => {
+            lifecycle.note_timeout_skip();
+            Ok(None)
+        }
+        wgpu::CurrentSurfaceTexture::Occluded => {
+            lifecycle.note_occluded_skip();
+            Ok(None)
+        }
+        wgpu::CurrentSurfaceTexture::Outdated => {
+            surface.configure(device, config);
+            lifecycle.reconfigured("outdated", config.width, config.height);
+            render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
+            Ok(None)
+        }
+        wgpu::CurrentSurfaceTexture::Lost => {
+            surface.configure(device, config);
+            lifecycle.reconfigured("lost", config.width, config.height);
+            render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
+            Ok(None)
+        }
+        wgpu::CurrentSurfaceTexture::Validation => {
+            lifecycle.note_validation_error();
+            Err(NativeWindowError::Failed(format!(
+                "get_current_texture validation error during {context}"
+            )))
+        }
+    }
+}
+
 fn write_render_loop_state_report(
     path: &Path,
     role: NativeWindowRole,
     pid: u32,
     window_id: &WindowId,
     surface_id: &SurfaceId,
-    surface_epoch: u64,
+    surface_lifecycle: &NativeSurfaceLifecycleReport,
     state: &NativeRenderLoopState,
     elapsed: Duration,
     wake_generation: u64,
     last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    loop_error: Option<&str>,
 ) -> Result<(), NativeWindowError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -1491,7 +1796,8 @@ fn write_render_loop_state_report(
         "pid": pid,
         "window_id": window_id,
         "surface_id": surface_id,
-        "surface_epoch": surface_epoch,
+        "surface_epoch": surface_lifecycle.surface_epoch,
+        "surface_lifecycle": surface_lifecycle,
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "wake_generation": wake_generation,
         "render_loop_state": state,
@@ -1506,6 +1812,9 @@ fn write_render_loop_state_report(
         "scheduled_wake_count": state.scheduled_wake_count,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
+        "current_scheduler_reason": state.current_scheduler_reason,
+        "current_role_dirty_reason": state.current_role_dirty_reason,
+        "loop_error": loop_error,
         "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
     let bytes = serde_json::to_vec_pretty(&report)
@@ -2083,6 +2392,41 @@ mod tests {
     }
 
     #[test]
+    fn surface_lifecycle_reconfigure_increments_epoch_and_records_reason() {
+        let mut lifecycle = NativeSurfaceLifecycleState::new(800, 600);
+        assert_eq!(lifecycle.epoch(), 1);
+
+        lifecycle.reconfigured("resize", 1024, 768);
+
+        assert_eq!(lifecycle.epoch(), 2);
+        assert_eq!(lifecycle.report().resize_reconfigure_count, 1);
+        assert_eq!(lifecycle.report().final_width, 1024);
+        assert_eq!(lifecycle.report().final_height, 768);
+        assert_eq!(
+            lifecycle.report().last_lifecycle_event.as_deref(),
+            Some("resize")
+        );
+    }
+
+    #[test]
+    fn surface_lifecycle_skips_nonpresentable_frames_without_epoch_commit() {
+        let mut lifecycle = NativeSurfaceLifecycleState::new(800, 600);
+
+        lifecycle.note_timeout_skip();
+        lifecycle.note_occluded_skip();
+        lifecycle.note_zero_size_skip();
+
+        assert_eq!(lifecycle.epoch(), 1);
+        assert_eq!(lifecycle.report().timeout_skip_count, 1);
+        assert_eq!(lifecycle.report().occluded_skip_count, 1);
+        assert_eq!(lifecycle.report().zero_size_skip_count, 1);
+        assert_eq!(
+            lifecycle.report().last_lifecycle_event.as_deref(),
+            Some("zero_size_skip")
+        );
+    }
+
+    #[test]
     fn demand_driven_scheduler_wakes_for_role_dirty_reason_without_branching_on_it() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented(state.dirty_revision);
@@ -2256,6 +2600,136 @@ mod tests {
 
         zero.rendered = true;
         assert!(zero.validate_for_presented_revision(2).is_ok());
+    }
+
+    #[test]
+    fn surface_dirty_revision_can_present_existing_content_revision() {
+        let render = NativeRenderHookResult {
+            proof: serde_json::json!({}),
+            content_revision: 1,
+            rendered: true,
+            content_changed: false,
+            role_dirty_reason: None,
+        };
+
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(
+                    2,
+                    Some(NativeSchedulerReason::SurfaceChanged),
+                    None,
+                )
+                .is_ok(),
+            "surface resize should be allowed to repaint unchanged document content"
+        );
+        assert_eq!(
+            render.presented_content_revision(2, Some(NativeSchedulerReason::SurfaceChanged), None),
+            2
+        );
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(
+                    2,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::SourcePayloadAccepted),
+                )
+                .is_err(),
+            "runtime/source wakes must still reject stale content revisions"
+        );
+    }
+
+    #[test]
+    fn scheduler_only_host_input_can_repaint_existing_content_revision() {
+        let render = NativeRenderHookResult {
+            proof: serde_json::json!({}),
+            content_revision: 2,
+            rendered: true,
+            content_changed: false,
+            role_dirty_reason: None,
+        };
+
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(
+                    3,
+                    Some(NativeSchedulerReason::HostInput),
+                    None,
+                )
+                .is_ok(),
+            "focus/activation/mouse movement can repaint without semantic content changes"
+        );
+        assert_eq!(
+            render.presented_content_revision(3, Some(NativeSchedulerReason::HostInput), None),
+            3
+        );
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(
+                    3,
+                    Some(NativeSchedulerReason::HostInput),
+                    Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                )
+                .is_err(),
+            "real runtime input must still advance the content revision"
+        );
+    }
+
+    #[test]
+    fn scheduler_only_repaint_ignores_sticky_previous_role_dirty_reason() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision.saturating_add(1),
+                scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
+                role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                next_wake_after_ms: None,
+                wants_animation_frame: false,
+            },
+            false,
+        );
+        let semantic_revision = state.dirty_revision;
+        state.mark_presented(semantic_revision);
+
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: semantic_revision,
+                scheduler_reason: Some(NativeSchedulerReason::HostInput),
+                role_dirty_reason: None,
+                next_wake_after_ms: None,
+                wants_animation_frame: false,
+            },
+            true,
+        );
+
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+            "reporting should preserve the last semantic role dirty reason"
+        );
+        assert_eq!(state.current_role_dirty_reason, None);
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert!(
+            (NativeRenderHookResult {
+                proof: serde_json::json!({}),
+                content_revision: semantic_revision,
+                rendered: true,
+                content_changed: false,
+                role_dirty_reason: None,
+            })
+            .validate_for_presented_revision_with_scheduler(
+                state.dirty_revision,
+                state.current_scheduler_reason,
+                state.current_role_dirty_reason,
+            )
+            .is_ok(),
+            "host focus/mouse repaint must not be rejected because of a previous runtime dirty reason"
+        );
     }
 
     #[test]

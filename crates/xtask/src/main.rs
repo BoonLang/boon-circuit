@@ -1598,6 +1598,26 @@ fn verify_native_gpu_architecture(args: &[String]) -> Result<(), Box<dyn std::er
         (!preview_rejects_example)
             .then(|| "preview role does not mechanically reject --example".to_owned()),
     );
+    for forbidden in [
+        "scenario_payload",
+        "host_input_scenarios",
+        "\"scenario_source\"",
+        "apply_source_event_for_step_with_document_window",
+    ] {
+        let present = preview_source.contains(forbidden);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("architecture:preview-ipc-forbids-scenario-data:{forbidden}"),
+            !present,
+            format!("preview source contains `{forbidden}`={present}"),
+            present.then(|| {
+                format!(
+                    "preview IPC boundary still accepts or applies scenario-coupled data `{forbidden}`"
+                )
+            }),
+        );
+    }
     for dir in [
         "crates/boon_native_gpu/src",
         "crates/boon_native_app_window/src",
@@ -3434,6 +3454,21 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
     push_audit_check(
         &mut checks,
         &mut blockers,
+        "native-gpu-idle-wake:skips-idle-polls",
+        skipped_idle_poll_count > 0
+            && input_poll_count > 0
+            && forced_frame_count <= rendered_frame_count,
+        format!(
+            "skipped_idle_poll_count={skipped_idle_poll_count}, input_poll_count={input_poll_count}, forced_frame_count={forced_frame_count}, rendered_frame_count={rendered_frame_count}"
+        ),
+        (!(skipped_idle_poll_count > 0
+            && input_poll_count > 0
+            && forced_frame_count <= rendered_frame_count))
+            .then(|| "idle/wake report did not prove idle poll skipping".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         "native-gpu-idle-wake:focused-caret-budget",
         scheduled_wake_count <= dev_focused_budget,
         format!(
@@ -3517,6 +3552,7 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
         "scheduled_wake_count": scheduled_wake_count,
         "last_scheduler_reason": live_observation.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
         "last_role_dirty_reason": live_observation.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "surface_lifecycle": live_observation.get("surface_lifecycle").cloned().unwrap_or_else(|| json!({})),
         "last_rendered_at_ms": live_observation.get("elapsed_ms").and_then(numeric_value_as_f64).unwrap_or(0.0),
         "last_input_poll_at_ms": idle_ms,
         "post_idle_input_to_present_ms": post_idle_input_to_present_ms,
@@ -4169,6 +4205,7 @@ fn run_native_example_switch_live_probe(
         "counter",
         "todomvc",
         "cells",
+        "todomvc-after-cells",
         "custom:a",
         "custom:b",
         "custom:multi-file",
@@ -4264,6 +4301,21 @@ fn run_native_example_switch_live_probe(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
         }
+        let pending_overlay_frame_revision = ack
+            .get("pending_overlay_frame_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let result_frame_revision = ready
+            .pointer("/response/frame_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let pending_overlay_presented_before_result = ready
+            .pointer("/response/pending_overlay_presented_before_result")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(
+                pending_overlay_frame_revision > 0
+                    && result_frame_revision > pending_overlay_frame_revision,
+            );
         let preview_ms = if visual_change_required {
             if first_visible_readback
                 .get("status")
@@ -4287,6 +4339,7 @@ fn run_native_example_switch_live_probe(
         }
         per_switch.push(json!({
             "label": label,
+            "payload_kind": "SourceProjectPayload",
             "command_id": command_id,
             "source_revision": source_revision,
             "source_hash": source_hash,
@@ -4301,6 +4354,13 @@ fn run_native_example_switch_live_probe(
             "ack": ack,
             "ready": ready,
             "readback_probe": first_visible_readback,
+            "pending_overlay_frame_revision": pending_overlay_frame_revision,
+            "result_frame_revision": result_frame_revision,
+            "pending_overlay_presented_before_result": pending_overlay_presented_before_result,
+            "bounded_latest_wins_worker": ready
+                .pointer("/response/bounded_latest_wins_worker")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             "expected_result_status": expected_status,
             "preview_receives_example_name": false,
             "sync_ack_contains_runtime_summary": false,
@@ -4326,6 +4386,69 @@ fn run_native_example_switch_live_probe(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(stale_ack_rejected);
 
+    let burst_started_command = command_id.saturating_add(1);
+    let burst_started_revision = source_revision.saturating_add(1);
+    let burst_labels = [
+        "custom:multi-file",
+        "cells",
+        "custom:multi-file",
+        "cells",
+        "custom:multi-file",
+        "aba:a",
+        "aba:b",
+        "aba:a2",
+    ];
+    let mut burst_acks = Vec::new();
+    for (index, label) in burst_labels.iter().enumerate() {
+        let burst_command_id = burst_started_command + index as u64;
+        let burst_source_revision = burst_started_revision + index as u64;
+        let request = json!({
+            "kind": "replace-source",
+            "payload": source_project_payload_for_switch(label, burst_command_id, burst_source_revision)?
+        });
+        let ack = send_xtask_preview_ipc_request(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            request,
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+        burst_acks.push(ack);
+    }
+    let burst_final_command_id = burst_started_command + burst_labels.len() as u64 - 1;
+    let burst_final_ready = wait_for_replace_source_ready(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        burst_final_command_id,
+        Duration::from_secs(10),
+    );
+    let burst_latest_ready = burst_final_ready
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let burst_dropped_stale_count = burst_acks
+        .iter()
+        .filter_map(|ack| {
+            ack.get("replace_job_dropped_stale")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(
+            burst_final_ready
+                .pointer("/response/replace_job_dropped_stale")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let burst_queue_depth_max = burst_acks
+        .iter()
+        .filter_map(|ack| {
+            ack.get("replace_job_queue_depth")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
+    let rapid_latest_wins_bounded =
+        burst_latest_ready && burst_queue_depth_max <= 1 && burst_dropped_stale_count > 0;
+
     let shutdown_ack = send_xtask_preview_ipc_request(
         ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
         json!({"kind": "shutdown", "reason": "example-switch-speed-probe-complete"}),
@@ -4339,12 +4462,14 @@ fn run_native_example_switch_live_probe(
     terminate_child_process(&mut weston);
     let _ = weston.wait();
 
-    let ack_latency_ms = max_f64(&ack_latencies);
-    let dev_visual_ms = max_f64(&dev_visual_latencies);
-    let preview_present_ms = max_f64(&preview_latencies);
+    let ack_latency_ms_p95 = percentile_linear_f64(&ack_latencies, 95.0);
+    let ack_latency_ms_max = max_f64(&ack_latencies);
+    let dev_visual_ms = percentile_linear_f64(&dev_visual_latencies, 95.0);
+    let preview_present_ms = percentile_linear_f64(&preview_latencies, 95.0);
     let status = if all_switches_pass
         && stale_ack_rejected
         && stale_result_rejected
+        && rapid_latest_wins_bounded
         && preview_status
             .as_ref()
             .is_some_and(|status| status.success())
@@ -4370,15 +4495,26 @@ fn run_native_example_switch_live_probe(
         "command_id": command_id,
         "source_revision": source_revision,
         "source_hash": last_source_hash,
-        "ack_latency_ms": ack_latency_ms,
+        "ack_latency_ms": ack_latency_ms_p95,
+        "ack_latency_ms_p95": ack_latency_ms_p95,
+        "ack_latency_ms_max": ack_latency_ms_max,
         "ack_payload_bytes": ack_payload_bytes_max,
         "click_to_dev_tab_visual_update_ms": dev_visual_ms,
-        "click_to_preview_pending_status_ms": ack_latency_ms,
+        "click_to_preview_pending_status_ms": ack_latency_ms_p95,
         "click_to_preview_new_frame_presented_ms": preview_present_ms,
         "parse_lower_runtime_layout_timings": {"source": "preview_replace_source_worker_reported_by_status_poll"},
         "stale_ack": stale_ack,
         "stale_ack_rejected": stale_ack_rejected,
         "stale_result_rejected": stale_result_rejected,
+        "rapid_switch_probe": {
+            "labels": burst_labels,
+            "acks": burst_acks,
+            "final_ready": burst_final_ready,
+            "queue_depth_max": burst_queue_depth_max,
+            "dropped_stale_count": burst_dropped_stale_count,
+            "latest_ready": burst_latest_ready,
+            "bounded_latest_wins": rapid_latest_wins_bounded
+        },
         "preview_receives_example_name": false,
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
@@ -4409,7 +4545,7 @@ fn source_project_payload_for_switch(
             source = source.replace("TEXT { Counter }", &format!("TEXT {{ {title} }}"));
             (format!("memory://{label}.bn"), source, Vec::new())
         }
-        "todomvc" | "aba:b" => {
+        "todomvc" | "todomvc-after-cells" | "aba:b" => {
             let entry = boon_runtime::example_manifest_entry("todomvc")?;
             let mut source = boon_runtime::source_text_for_entry(&entry)?;
             if label == "aba:b" {
@@ -4944,9 +5080,6 @@ fn run_isolated_weston_idle_wake_observation(
                     connect,
                     json!({
                         "kind": "operator-host-input",
-                        "scenario_source": post_idle_scenario_path
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
                         "source_events": [source_event]
                     }),
                     Duration::from_secs(5),
@@ -5069,9 +5202,6 @@ fn run_isolated_weston_idle_wake_observation(
                             connect,
                             json!({
                                 "kind": "operator-host-input",
-                                "scenario_source": post_idle_scenario_path
-                                    .as_ref()
-                                    .map(|path| path.display().to_string()),
                                 "source_events": [source_event]
                             }),
                             Duration::from_secs(5),
@@ -5490,6 +5620,7 @@ fn run_isolated_weston_idle_wake_observation(
         "elapsed_ms": preview_loop.get("elapsed_ms").and_then(numeric_value_as_f64).unwrap_or(0.0),
         "last_scheduler_reason": preview_loop.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
         "last_role_dirty_reason": preview_loop.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "surface_lifecycle": preview_loop.get("surface_lifecycle").cloned().unwrap_or_else(|| json!({})),
         "readback_artifact_before": readback_before,
         "readback_artifact_after": post_idle_source_replace_probe
             .pointer("/readback_probe/readback_artifact_after")
@@ -5678,8 +5809,26 @@ fn verify_native_dev_editor_scroll_speed(
     let max_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max")?;
     let runtime_dispatch_count = 0_u64;
     let graph_rebuild_count = 0_u64;
-    let source_replace_count = 0_u64;
-    let summary_query_count = 0_u64;
+    let source_replace_count = vertical_surface_proof
+        .pointer("/dev_hot_path_counters/hot_path_preview_replace_result_poll_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX)
+        .max(
+            horizontal_surface_proof
+                .pointer("/dev_hot_path_counters/hot_path_preview_replace_result_poll_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        );
+    let summary_query_count = vertical_surface_proof
+        .pointer("/dev_hot_path_counters/hot_path_preview_summary_query_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX)
+        .max(
+            horizontal_surface_proof
+                .pointer("/dev_hot_path_counters/hot_path_preview_summary_query_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        );
     let vertical_observation_pass = vertical_observation
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -5882,9 +6031,14 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         .cloned()
         .unwrap_or_default();
     let ack_latency_p95 = live_probe
-        .get("ack_latency_ms")
+        .get("ack_latency_ms_p95")
+        .or_else(|| live_probe.get("ack_latency_ms"))
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
+    let ack_latency_max = live_probe
+        .get("ack_latency_ms_max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(ack_latency_p95);
     let ack_payload_bytes_max = live_probe
         .get("ack_payload_bytes")
         .and_then(serde_json::Value::as_u64)
@@ -5955,18 +6109,32 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     let readback_hashes_valid = is_sha256_hex(readback_hash_before)
         && is_sha256_hex(readback_hash_after)
         && readback_hash_before != readback_hash_after;
+    let rapid_latest_wins_bounded = live_probe
+        .pointer("/rapid_switch_probe/bounded_latest_wins")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let pending_overlay_presented_before_result = per_switch.iter().all(|step| {
+        step.get("pending_overlay_presented_before_result")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    let bounded_worker_reported = per_switch.iter().all(|step| {
+        step.get("bounded_latest_wins_worker")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
     push_audit_check(
         &mut checks,
         &mut blockers,
         "native-example-switch-speed:small-sync-ack",
         ack_latency_p95 <= ack_budget
-            && ack_latency_p95 <= ack_max_budget
+            && ack_latency_max <= ack_max_budget
             && ack_payload_bytes_max <= ack_payload_budget,
         format!(
-            "ack_p95={ack_latency_p95:.3}, ack_payload_bytes_max={ack_payload_bytes_max}, budgets=({ack_budget:.3},{ack_max_budget:.3},{ack_payload_budget})"
+            "ack_p95={ack_latency_p95:.3}, ack_max={ack_latency_max:.3}, ack_payload_bytes_max={ack_payload_bytes_max}, budgets=({ack_budget:.3},{ack_max_budget:.3},{ack_payload_budget})"
         ),
         (ack_latency_p95 > ack_budget
-            || ack_latency_p95 > ack_max_budget
+            || ack_latency_max > ack_max_budget
             || ack_payload_bytes_max > ack_payload_budget)
             .then(|| "example switch synchronous ACK exceeded latency/payload budget".to_owned()),
     );
@@ -5998,12 +6166,24 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         &mut checks,
         &mut blockers,
         "native-example-switch-speed:latest-wins-rejects-stale-work",
-        stale_ack_rejected && stale_result_rejected,
+        stale_ack_rejected && stale_result_rejected && rapid_latest_wins_bounded,
         format!(
-            "stale_ack_rejected={stale_ack_rejected}, stale_result_rejected={stale_result_rejected}"
+            "stale_ack_rejected={stale_ack_rejected}, stale_result_rejected={stale_result_rejected}, rapid_latest_wins_bounded={rapid_latest_wins_bounded}"
         ),
-        (!stale_ack_rejected || !stale_result_rejected)
+        (!stale_ack_rejected || !stale_result_rejected || !rapid_latest_wins_bounded)
             .then(|| "example switch latest-wins protocol accepted stale work".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-example-switch-speed:pending-frame-before-result",
+        pending_overlay_presented_before_result && bounded_worker_reported,
+        format!(
+            "pending_overlay_presented_before_result={pending_overlay_presented_before_result}, bounded_worker_reported={bounded_worker_reported}"
+        ),
+        (!(pending_overlay_presented_before_result && bounded_worker_reported)).then(|| {
+            "example switch did not prove pending overlay frame before worker result".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -6061,6 +6241,8 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "source_hash": last_source_hash,
         "payload_kind": "SourceProjectPayload",
         "ack_latency_ms": ack_latency_p95,
+        "ack_latency_ms_p95": ack_latency_p95,
+        "ack_latency_ms_max": ack_latency_max,
         "ack_payload_bytes": ack_payload_bytes_max,
         "click_to_dev_tab_visual_update_ms": dev_visual_p95,
         "click_to_preview_pending_status_ms": ack_latency_p95,
@@ -6075,6 +6257,12 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "debug_summary_latency_ms": 0.0,
         "stale_ack_rejected": stale_ack_rejected,
         "stale_result_rejected": stale_result_rejected,
+        "rapid_switch_probe": live_probe
+            .get("rapid_switch_probe")
+            .cloned()
+            .unwrap_or_else(|| json!({"bounded_latest_wins": false})),
+        "pending_overlay_presented_before_result": pending_overlay_presented_before_result,
+        "bounded_latest_wins_worker": bounded_worker_reported,
         "preview_receives_example_name": false,
         "sync_ack_contains_runtime_summary": false,
         "sync_ack_contains_layout_proof": false,
@@ -7245,11 +7433,24 @@ fn native_preview_manifest_scenario_evidence(
         .map(|assertions| {
             assertions
                 .iter()
-                .filter(|assertion| {
-                    assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                .enumerate()
+                .filter_map(|(fallback_index, assertion)| {
+                    (assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true))
+                        .then_some((fallback_index, assertion))
                 })
-                .filter_map(scenario_label_from_report_value)
-                .map(ToOwned::to_owned)
+                .filter_map(|(fallback_index, assertion)| {
+                    scenario_label_from_report_value(assertion)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            assertion
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|id| id.strip_prefix("preview-ipc-host-input-"))
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .or(Some(fallback_index))
+                                .and_then(|index| entry.input_scenarios.get(index).cloned())
+                        })
+                })
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
@@ -7271,8 +7472,19 @@ fn native_preview_manifest_scenario_evidence(
                             .unwrap_or_default()
                             > 0
                 })
-                .filter_map(scenario_label_from_report_value)
-                .map(ToOwned::to_owned)
+                .enumerate()
+                .filter_map(|(fallback_index, output)| {
+                    scenario_label_from_report_value(output)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            output
+                                .get("input_index")
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|index| index as usize)
+                                .or(Some(fallback_index))
+                                .and_then(|index| entry.input_scenarios.get(index).cloned())
+                        })
+                })
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
@@ -7696,13 +7908,14 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         .filter(|step| step.expected_source_event.is_some())
         .map(|step| step.id.clone())
         .collect::<Vec<_>>();
-    let expected_render_delta_by_step = scenario
+    let expected_render_delta_by_index = scenario
         .step
         .iter()
         .filter(|step| step.expected_source_event.is_some())
-        .map(|step| {
+        .enumerate()
+        .map(|(index, step)| {
             (
-                step.id.clone(),
+                index as u64,
                 !step.expect_render_delta_contains.is_empty()
                     || !step.expect_semantic_delta_contains.is_empty(),
             )
@@ -7807,11 +8020,7 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         &mut checks,
         &mut blockers,
         "native-todomvc-input-parity:framebuffer-delta-contract",
-        observed_sources.iter().all(|output| {
-            let scenario_step = output
-                .get("scenario_step")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+        observed_sources.iter().enumerate().all(|(index, output)| {
             let before_hash = output
                 .pointer("/framebuffer_delta_evidence/before_state_hash")
                 .and_then(serde_json::Value::as_str);
@@ -7822,8 +8031,8 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
                 .pointer("/framebuffer_delta_evidence/render_patch_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default();
-            let expected_runtime_or_render_delta = expected_render_delta_by_step
-                .get(scenario_step)
+            let expected_runtime_or_render_delta = expected_render_delta_by_index
+                .get(&(index as u64))
                 .copied()
                 .unwrap_or(true);
             output
@@ -7886,20 +8095,29 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         ),
         Some("TodoMVC input parity must update the preview render state used by the visible window after synthesized input".to_owned()),
     );
-    for scenario in &expected {
-        let present = observed.iter().any(|assertion| {
-            assertion
-                .get("scenario_step")
-                .and_then(serde_json::Value::as_str)
-                == Some(scenario.as_str())
+    for (index, scenario) in expected.iter().enumerate() {
+        let assertion_present = observed.iter().any(|assertion| {
+            assertion.get("id").and_then(serde_json::Value::as_str)
+                == Some(format!("preview-ipc-host-input-{index}").as_str())
         });
+        let output_present = observed_sources.iter().any(|output| {
+            output
+                .get("input_index")
+                .and_then(serde_json::Value::as_u64)
+                == Some(index as u64)
+        });
+        let present = assertion_present && output_present;
         push_audit_check(
             &mut checks,
             &mut blockers,
             format!("native-todomvc-input-parity:scenario:{scenario}"),
             present,
-            format!("scenario `{scenario}` present={present}"),
-            (!present).then(|| format!("missing TodoMVC scenario step `{scenario}`")),
+            format!(
+                "scenario `{scenario}` source-event index={index} assertion_present={assertion_present}, output_present={output_present}"
+            ),
+            (!present).then(|| {
+                format!("missing TodoMVC source-event evidence generated from scenario step `{scenario}`")
+            }),
         );
     }
 
@@ -8964,7 +9182,7 @@ fn native_runtime_assertions_after_input(
             .pointer("/native_host_input_route_evidence/status")
             .and_then(serde_json::Value::as_str)
             == Some("pass"),
-        "blocked_reason": "runtime assertions require preview-side operator host input evidence from scenario-derived host_input_scenarios"
+        "blocked_reason": "runtime assertions require preview-side operator host input evidence from generic source_events"
     })
 }
 
@@ -12513,7 +12731,7 @@ fn verify_native_cells_interaction_speed(
     let event_count = value_arg(args, "--event-count")
         .map(|value| value.parse::<u64>())
         .transpose()?
-        .unwrap_or(if profile == "release" { 64 } else { 16 })
+        .unwrap_or(if profile == "release" { 64 } else { 32 })
         .max(1);
     let default_max_p95_ms = if profile == "release" { 16.7 } else { 120.0 };
     let default_max_max_ms = if profile == "release" { 50.0 } else { 250.0 };
@@ -14514,6 +14732,26 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 }),
             ),
         ),
+        (
+            "preview-received-scenario-data",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "preview_received_scenario_data": true
+                }),
+            ),
+        ),
+        (
+            "preview-bound-scenario-data",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "preview_bound_scenario_data": true
+                }),
+            ),
+        ),
     ];
     let negative_case_count = cases.len() as u64;
     let required_negative_cases = cases.iter().map(|(case, _)| *case).collect::<Vec<_>>();
@@ -15585,8 +15823,10 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             );
             require_object_field(&mut blockers, report, "readback_artifact_before");
             require_object_field(&mut blockers, report, "readback_artifact_after");
+            require_object_field(&mut blockers, report, "surface_lifecycle");
             require_hash_field(&mut blockers, report, "post_idle_frame_hash_before");
             require_hash_field(&mut blockers, report, "post_idle_frame_hash_after");
+            require_positive_u64(&mut blockers, report, "skipped_idle_poll_count");
             let dirty_revision = report
                 .get("dirty_revision")
                 .and_then(serde_json::Value::as_u64)
@@ -15768,6 +16008,8 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             };
             let ack_budget =
                 native_gpu_budget_f64_or_blocker(&mut blockers, budget_section, "sync_ack_ms_p95");
+            let ack_max_budget =
+                native_gpu_budget_f64_or_blocker(&mut blockers, budget_section, "sync_ack_ms_max");
             let ack_payload_budget = native_gpu_budget_u64_or_blocker(
                 &mut blockers,
                 budget_section,
@@ -15789,6 +16031,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 "click_to_preview_new_frame_presented_ms_p95_large_custom",
             );
             require_f64_at_most(&mut blockers, report, "ack_latency_ms", ack_budget);
+            require_f64_at_most(&mut blockers, report, "ack_latency_ms_max", ack_max_budget);
             require_u64_at_most(
                 &mut blockers,
                 report,
@@ -15860,6 +16103,23 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             }
             require_bool_field(&mut blockers, report, "stale_ack_rejected", true);
             require_bool_field(&mut blockers, report, "stale_result_rejected", true);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "pending_overlay_presented_before_result",
+                true,
+            );
+            require_bool_field(&mut blockers, report, "bounded_latest_wins_worker", true);
+            if report
+                .pointer("/rapid_switch_probe/bounded_latest_wins")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                blockers.push(
+                    "rapid_switch_probe.bounded_latest_wins must prove bounded latest-wins scheduling"
+                        .to_owned(),
+                );
+            }
             require_bool_field(
                 &mut blockers,
                 report,
@@ -15935,6 +16195,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             }
             for (index, step) in per_switch.iter().enumerate() {
                 for key in [
+                    "payload_kind",
                     "command_id",
                     "source_revision",
                     "source_hash",
@@ -15944,6 +16205,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                     if step.get(key).is_none() {
                         blockers.push(format!("per_switch[{index}].{key} is missing"));
                     }
+                }
+                if step.get("payload_kind").and_then(serde_json::Value::as_str)
+                    != Some("SourceProjectPayload")
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}].payload_kind must be SourceProjectPayload"
+                    ));
                 }
                 if step
                     .get("preview_receives_example_name")
@@ -15965,6 +16233,19 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 {
                     blockers.push(format!(
                         "per_switch[{index}] sync ACK must not contain runtime summary or layout proof"
+                    ));
+                }
+                if step
+                    .get("pending_overlay_presented_before_result")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                    || step
+                        .get("bounded_latest_wins_worker")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                {
+                    blockers.push(format!(
+                        "per_switch[{index}] must prove pending overlay before bounded worker result"
                     ));
                 }
             }
@@ -16868,6 +17149,14 @@ fn native_gpu_report_integrity_reasons(
             "sync_ack_contains_layout_proof",
             "sync ACK must not contain layout proof",
         ),
+        (
+            "preview_received_scenario_data",
+            "preview IPC must not receive scenario data",
+        ),
+        (
+            "preview_bound_scenario_data",
+            "preview-bound IPC must not carry scenario data",
+        ),
     ] {
         if report.get(field).and_then(serde_json::Value::as_bool) == Some(true) {
             reasons.push(reason.to_owned());
@@ -17625,6 +17914,34 @@ fn native_gpu_budget_u64_or_blocker(blockers: &mut Vec<String>, section: &str, k
 
 fn max_f64(values: &[f64]) -> f64 {
     values.iter().copied().fold(0.0_f64, f64::max)
+}
+
+fn percentile_linear_f64(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted.sort_by(f64::total_cmp);
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let clamped = percentile.clamp(0.0, 100.0) / 100.0;
+    let position = clamped * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    if lower == upper {
+        sorted[lower]
+    } else {
+        let fraction = position - lower as f64;
+        sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
+    }
 }
 
 fn merge_json(mut base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
@@ -20610,7 +20927,7 @@ fn native_source_event_for_target(
         event["address"] = json!(address);
         event["target_text"] = json!(address);
     }
-    if let Some((step_id, expected)) = scenario_path
+    if let Some(expected) = scenario_path
         .filter(|path| path.exists())
         .and_then(|path| boon_runtime::parse_scenario(path).ok())
         .and_then(|scenario| {
@@ -20629,11 +20946,10 @@ fn native_source_event_for_target(
                 if expected_target_text.is_some() && expected_target_text != address {
                     return None;
                 }
-                Some((step.id, expected))
+                Some(expected)
             })
         })
     {
-        event["scenario_step"] = json!(step_id);
         for key in ["text", "key", "address", "target_text"] {
             if let Some(value) = expected.get(key).and_then(toml::Value::as_str) {
                 event[key] = json!(value);

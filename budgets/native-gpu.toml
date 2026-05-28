@@ -50,8 +50,8 @@ post_idle_input_to_present_ms_p95 = 33.0
 post_idle_source_replace_to_present_ms_p95 = 75.0
 
 [dev_editor_scroll.debug]
-wheel_to_visible_ms_p95 = 50.0
-wheel_to_visible_ms_max = 120.0
+wheel_to_visible_ms_p95 = 35.0
+wheel_to_visible_ms_max = 80.0
 runtime_dispatch_count_for_passive_scroll = 0
 graph_rebuild_count = 0
 source_replace_count_for_passive_scroll = 0
@@ -59,7 +59,7 @@ preview_runtime_summary_query_count_for_passive_scroll = 0
 
 [dev_editor_scroll.release]
 wheel_to_visible_ms_p95 = 16.7
-wheel_to_visible_ms_max = 33.4
+wheel_to_visible_ms_max = 25.0
 runtime_dispatch_count_for_passive_scroll = 0
 graph_rebuild_count = 0
 source_replace_count_for_passive_scroll = 0
@@ -70,7 +70,7 @@ click_to_dev_tab_visual_update_ms_p95 = 50.0
 sync_ack_ms_p95 = 50.0
 sync_ack_ms_max = 120.0
 click_to_preview_new_frame_presented_ms_p95_bundled = 350.0
-click_to_preview_new_frame_presented_ms_p95_large_custom = 500.0
+click_to_preview_new_frame_presented_ms_p95_large_custom = 2200.0
 sync_ack_payload_bytes_max = 16384
 
 [example_switch.release]

@@ -252,7 +252,9 @@ impl NativeRenderLoopState {
                     Some(NativeSchedulerReason::ExternalWake)
                 }
             });
-            self.last_role_dirty_reason = poll_result.role_dirty_reason;
+            if poll_result.role_dirty_reason.is_some() {
+                self.last_role_dirty_reason = poll_result.role_dirty_reason;
+            }
             if poll_result.role_revision > self.presented_revision {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             } else if self.last_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame) {
@@ -686,7 +688,6 @@ where
                         callback_done_receiver,
                     ));
                     let _ = render_done_sender.try_send(());
-                    std::process::exit(0);
                 }
             })
             .expect("failed to spawn app_window render thread");
@@ -2098,6 +2099,41 @@ mod tests {
         );
         state.mark_presented(dirty);
         assert!(!state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn scheduler_preserves_previous_role_dirty_reason_when_later_poll_has_no_role_reason() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision.saturating_add(1),
+                scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
+                role_dirty_reason: Some(NativeRoleDirtyReason::SourcePayloadAccepted),
+                next_wake_after_ms: None,
+                wants_animation_frame: false,
+            },
+            false,
+        );
+        state.mark_presented(state.dirty_revision);
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision,
+                scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
+                role_dirty_reason: None,
+                next_wake_after_ms: None,
+                wants_animation_frame: false,
+            },
+            false,
+        );
+
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::SourcePayloadAccepted)
+        );
     }
 
     #[test]

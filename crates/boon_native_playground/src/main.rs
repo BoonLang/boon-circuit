@@ -154,6 +154,8 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         scroll_y_px: 0.0,
         last_error: None,
         last_error_count: 0,
+        status_overlay: None,
+        last_dirty_reason: None,
     }));
     let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
         &format!("interaction-speed:{}", source_path.display()),
@@ -297,6 +299,8 @@ fn run_cells_interaction_speed(
         scroll_y_px: 0.0,
         last_error: None,
         last_error_count: 0,
+        status_overlay: None,
+        last_dirty_reason: None,
     }));
     let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
         &format!("interaction-speed:{}", source_path.display()),
@@ -490,6 +494,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         scroll_y_px: 0.0,
         last_error: None,
         last_error_count: 0,
+        status_overlay: None,
+        last_dirty_reason: None,
     }));
     let preview_ipc_state = Arc::new(Mutex::new(PreviewIpcState {
         source_path: PathBuf::from(&code_file),
@@ -584,6 +590,15 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "preview render state mutex poisoned".to_owned())?
                 .update_count;
             let after_content_revision = preview_content_revision(after_update_count);
+            if role_dirty_reason.is_none()
+                && (after_update_count != before_update_count
+                    || after_content_revision != last_poll_revision)
+            {
+                role_dirty_reason = poll_shared_render_state
+                    .lock()
+                    .map_err(|_| "preview render state mutex poisoned".to_owned())?
+                    .last_dirty_reason;
+            }
             let dirty = after_update_count != before_update_count
                 || after_content_revision != last_poll_revision
                 || context.forced_frame;
@@ -612,7 +627,13 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             })
         });
         let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
-            let (render_layout_proof, render_layout_frame_override, render_error, content_revision) = {
+            let (
+                render_layout_proof,
+                render_layout_frame_override,
+                render_error,
+                render_status_overlay,
+                content_revision,
+            ) = {
                 let shared = shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
@@ -620,6 +641,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     shared.layout_proof.clone(),
                     shared.layout_frame_override.clone(),
                     shared.last_error.clone(),
+                    shared.status_overlay.clone(),
                     preview_content_revision(shared.update_count),
                 )
             };
@@ -628,6 +650,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &render_layout_proof,
                 render_layout_frame_override.as_ref(),
                 render_error.as_deref(),
+                render_status_overlay.as_ref(),
                 &mut visible_renderer,
                 &mut app_owned_proof,
                 &mut layout_frame_cache,
@@ -1722,6 +1745,14 @@ fn preview_runtime_summary(
             });
         }
     };
+    preview_runtime_summary_from_state_summary(source_path, source_sha256, state_summary)
+}
+
+fn preview_runtime_summary_from_state_summary(
+    source_path: &Path,
+    source_sha256: &str,
+    state_summary: serde_json::Value,
+) -> serde_json::Value {
     let summary_bytes = serde_json::to_vec(&state_summary).unwrap_or_default();
     let summary_top_level_keys = state_summary
         .as_object()
@@ -1891,6 +1922,7 @@ fn native_gpu_app_owned_render_hook(
     layout_proof: &serde_json::Value,
     layout_frame_override: Option<&boon_document::LayoutFrame>,
     last_error: Option<&str>,
+    status_overlay: Option<&PreviewStatusOverlay>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
@@ -1935,14 +1967,24 @@ fn native_gpu_app_owned_render_hook(
         .as_ref()
         .map(|(_, frame)| frame)
         .ok_or("layout frame cache was not initialized")?;
-    let render_frame = match last_error {
-        Some(error) => preview_frame_with_error_overlay(
+    let render_frame = if let Some(error) = last_error {
+        preview_frame_with_status_overlay(
             layout_frame,
-            error,
+            PreviewStatusOverlayKind::Error,
+            &format!("Preview input error: {}", single_line_preview_error(error)),
             context.width as f32,
             context.height as f32,
-        ),
-        None => layout_frame.clone(),
+        )
+    } else if let Some(overlay) = status_overlay {
+        preview_frame_with_status_overlay(
+            layout_frame,
+            overlay.kind,
+            &overlay.message,
+            context.width as f32,
+            context.height as f32,
+        )
+    } else {
+        layout_frame.clone()
     };
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
@@ -1999,6 +2041,11 @@ fn native_gpu_app_owned_render_hook(
         "content_bounds_fill_ratio": viewport_fill_ratio(&render_frame, context.width, context.height),
         "preview_last_error": last_error,
         "preview_error_overlay_visible": last_error.is_some(),
+        "preview_status_overlay_visible": status_overlay.is_some(),
+        "preview_status_overlay_kind": status_overlay.map(|overlay| match overlay.kind {
+            PreviewStatusOverlayKind::Pending => "pending",
+            PreviewStatusOverlayKind::Error => "error",
+        }),
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
@@ -2016,9 +2063,10 @@ fn native_gpu_render_cache_stale(
     has_layout_frame_override || cached_layout_key != Some(layout_cache_key)
 }
 
-fn preview_frame_with_error_overlay(
+fn preview_frame_with_status_overlay(
     frame: &boon_document::LayoutFrame,
-    error: &str,
+    kind: PreviewStatusOverlayKind,
+    message: &str,
     width: f32,
     height: f32,
 ) -> boon_document::LayoutFrame {
@@ -2027,16 +2075,24 @@ fn preview_frame_with_error_overlay(
     let overlay_height = 72.0_f32.min((height - 32.0).max(1.0));
     let overlay_y = (height - overlay_height - 16.0).max(0.0);
     let mut background_style = BTreeMap::new();
+    let (bg, border, color, node_prefix) = match kind {
+        PreviewStatusOverlayKind::Pending => {
+            ("#dbeafe", "#2563eb", "#1e3a8a", "preview-pending-overlay")
+        }
+        PreviewStatusOverlayKind::Error => {
+            ("#fee2e2", "#dc2626", "#7f1d1d", "preview-error-overlay")
+        }
+    };
     background_style.insert(
         "bg".to_owned(),
-        boon_document_model::StyleValue::Text("#fee2e2".to_owned()),
+        boon_document_model::StyleValue::Text(bg.to_owned()),
     );
     background_style.insert(
         "border".to_owned(),
-        boon_document_model::StyleValue::Text("#dc2626".to_owned()),
+        boon_document_model::StyleValue::Text(border.to_owned()),
     );
     frame.display_list.push(boon_document::DisplayItem {
-        node: boon_document_model::DocumentNodeId("preview-error-overlay-bg".to_owned()),
+        node: boon_document_model::DocumentNodeId(format!("{node_prefix}-bg")),
         kind: boon_document_model::DocumentNodeKind::Text,
         bounds: boon_document::Rect {
             x: 16.0,
@@ -2052,11 +2108,11 @@ fn preview_frame_with_error_overlay(
     let mut text_style = BTreeMap::new();
     text_style.insert(
         "bg".to_owned(),
-        boon_document_model::StyleValue::Text("#fee2e2".to_owned()),
+        boon_document_model::StyleValue::Text(bg.to_owned()),
     );
     text_style.insert(
         "color".to_owned(),
-        boon_document_model::StyleValue::Text("#7f1d1d".to_owned()),
+        boon_document_model::StyleValue::Text(color.to_owned()),
     );
     text_style.insert(
         "size".to_owned(),
@@ -2067,7 +2123,7 @@ fn preview_frame_with_error_overlay(
         boon_document_model::StyleValue::Text("JetBrains Mono".to_owned()),
     );
     frame.display_list.push(boon_document::DisplayItem {
-        node: boon_document_model::DocumentNodeId("preview-error-overlay-text".to_owned()),
+        node: boon_document_model::DocumentNodeId(format!("{node_prefix}-text")),
         kind: boon_document_model::DocumentNodeKind::Text,
         bounds: boon_document::Rect {
             x: 28.0,
@@ -2075,15 +2131,28 @@ fn preview_frame_with_error_overlay(
             width: (overlay_width - 24.0).max(1.0),
             height: (overlay_height - 24.0).max(1.0),
         },
-        text: Some(format!(
-            "Preview input error: {}",
-            single_line_preview_error(error)
-        )),
+        text: Some(message.to_owned()),
         style: text_style,
         focused: false,
     });
     frame.metrics.display_item_count = frame.display_list.len();
     frame
+}
+
+#[cfg(test)]
+fn preview_frame_with_error_overlay(
+    frame: &boon_document::LayoutFrame,
+    error: &str,
+    width: f32,
+    height: f32,
+) -> boon_document::LayoutFrame {
+    preview_frame_with_status_overlay(
+        frame,
+        PreviewStatusOverlayKind::Error,
+        &format!("Preview input error: {}", single_line_preview_error(error)),
+        width,
+        height,
+    )
 }
 
 fn single_line_preview_error(error: &str) -> String {
@@ -10324,6 +10393,8 @@ fn preview_apply_focus_overlay(
     }
     if changed {
         shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
 }
@@ -10336,7 +10407,10 @@ fn preview_record_noop_input(
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
     shared.last_error = None;
+    shared.status_overlay = None;
     shared.update_count = shared.update_count.saturating_add(event_count);
+    shared.last_dirty_reason =
+        Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
     Ok(())
 }
 
@@ -10405,7 +10479,9 @@ fn preview_apply_scroll_input(
     shared.layout_proof = transformed;
     shared.layout_frame_override = Some(transformed_frame);
     shared.last_error = None;
+    shared.status_overlay = None;
     shared.update_count = shared.update_count.saturating_add(1);
+    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
     Ok(())
 }
 
@@ -10797,7 +10873,10 @@ fn preview_apply_live_events(
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
         shared.last_error = None;
+        shared.status_overlay = None;
         shared.update_count = shared.update_count.saturating_add(event_count);
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
         return Ok(shared.layout_proof.clone());
     }
     let (mut post_input_layout, mut post_input_frame) =
@@ -10834,8 +10913,11 @@ fn preview_apply_live_events(
         shared_render_state.layout_proof = post_input_layout.clone();
         shared_render_state.layout_frame_override = Some(post_input_frame);
         shared_render_state.last_error = None;
+        shared_render_state.status_overlay = None;
         shared_render_state.update_count =
             shared_render_state.update_count.saturating_add(event_count);
+        shared_render_state.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
     }
     Ok(post_input_layout)
 }
@@ -11190,6 +11272,20 @@ struct PreviewSharedRenderState {
     scroll_y_px: f64,
     last_error: Option<String>,
     last_error_count: u64,
+    status_overlay: Option<PreviewStatusOverlay>,
+    last_dirty_reason: Option<boon_native_app_window::NativeRoleDirtyReason>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewStatusOverlay {
+    kind: PreviewStatusOverlayKind,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PreviewStatusOverlayKind {
+    Pending,
+    Error,
 }
 
 fn preview_content_revision(update_count: u64) -> u64 {
@@ -11312,8 +11408,11 @@ fn preview_note_render_error(
         .map_err(|_| "preview render state mutex poisoned")?;
     if shared.last_error.as_deref() != Some(error.as_str()) {
         shared.last_error = Some(error);
+        shared.status_overlay = None;
         shared.last_error_count = shared.last_error_count.saturating_add(1);
         shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
     }
     Ok(())
 }
@@ -11516,6 +11615,7 @@ struct PreviewReplaceBuildResult {
     layout_proof: serde_json::Value,
     runtime_summary: serde_json::Value,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    timings: serde_json::Value,
     source_text: String,
     source_sha256: String,
     source_bytes: u64,
@@ -11584,6 +11684,20 @@ fn preview_enqueue_source_project(
             "preview_blocked_on_ipc_count": 0,
             "preview_receives_example_name": false
         });
+        {
+            let mut shared = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?;
+            shared.status_overlay = Some(PreviewStatusOverlay {
+                kind: PreviewStatusOverlayKind::Pending,
+                message: "Preview source update pending".to_owned(),
+            });
+            shared.last_error = None;
+            shared.update_count = shared.update_count.saturating_add(1);
+            shared.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted);
+        }
     }
 
     let worker_state = Arc::clone(state);
@@ -11677,6 +11791,7 @@ fn source_project_payload_from_request(
 }
 
 fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplaceBuildResult {
+    let build_started = Instant::now();
     let entrypoint = match payload.entrypoint() {
         Ok(entrypoint) => entrypoint.clone(),
         Err(error) => {
@@ -11684,6 +11799,10 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
                 layout_proof: json!({"status": "fail", "blocker": error.to_string()}),
                 runtime_summary: json!({"status": "fail", "blocker": error.to_string()}),
                 live_runtime: None,
+                timings: json!({
+                    "total_ms": elapsed_ms(build_started),
+                    "entrypoint_error": true
+                }),
                 source_text: String::new(),
                 source_sha256: String::new(),
                 source_bytes: 0,
@@ -11694,14 +11813,50 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
         }
     };
     let source_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
-    let layout_proof =
-        native_document_layout_proof(Path::new(&entrypoint.virtual_uri), &entrypoint.text)
-            .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}));
-    let runtime_summary = preview_runtime_summary(
+    let live_runtime_started = Instant::now();
+    let live_runtime_result = boon_runtime::LiveRuntime::from_source(
+        &format!("native-preview-live:{}", entrypoint.virtual_uri),
+        &entrypoint.text,
+    );
+    let live_runtime_ms = elapsed_ms(live_runtime_started);
+    let runtime_summary_started = Instant::now();
+    let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
+        Ok(mut runtime) => {
+            let state_summary = runtime.state_summary();
+            let document_state_summary = runtime.document_state_summary();
+            let summary = preview_runtime_summary_from_state_summary(
+                Path::new(&entrypoint.virtual_uri),
+                &source_hash,
+                state_summary,
+            );
+            (
+                summary,
+                Some(document_state_summary),
+                Some(Arc::new(Mutex::new(runtime))),
+            )
+        }
+        Err(error) => (
+            json!({
+                "status": "fail",
+                "owns_live_runtime": false,
+                "reason": error.to_string(),
+                "source_path": entrypoint.virtual_uri,
+                "source_sha256": source_hash.clone(),
+                "full_state_mirroring_allowed": false
+            }),
+            None,
+            None,
+        ),
+    };
+    let runtime_summary_ms = elapsed_ms(runtime_summary_started);
+    let layout_started = Instant::now();
+    let layout_proof = native_document_layout_proof_with_state(
         Path::new(&entrypoint.virtual_uri),
         &entrypoint.text,
-        &source_hash,
-    );
+        document_state_summary.as_ref(),
+    )
+    .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}));
+    let layout_ms = elapsed_ms(layout_started);
     let layout_status = layout_proof
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -11716,20 +11871,18 @@ fn preview_build_source_project(payload: SourceProjectPayload) -> PreviewReplace
             "replace-source failed before commit: layout_status={layout_status}, runtime_status={runtime_status}"
         )
     });
-    let live_runtime = pass
-        .then(|| {
-            boon_runtime::LiveRuntime::from_source(
-                &format!("native-preview-live:{}", entrypoint.virtual_uri),
-                &entrypoint.text,
-            )
-            .ok()
-            .map(|runtime| Arc::new(Mutex::new(runtime)))
-        })
-        .flatten();
+    let total_ms = elapsed_ms(build_started);
     PreviewReplaceBuildResult {
         layout_proof,
         runtime_summary,
         live_runtime,
+        timings: json!({
+            "source_bytes": entrypoint.text.len(),
+            "layout_ms": layout_ms,
+            "runtime_summary_ms": runtime_summary_ms,
+            "live_runtime_ms": live_runtime_ms,
+            "total_ms": total_ms
+        }),
         source_bytes: entrypoint.text.len() as u64,
         source_text: entrypoint.text,
         source_sha256: source_hash,
@@ -11780,7 +11933,10 @@ fn preview_commit_source_project_result(
             shared.scroll_x_px = 0.0;
             shared.scroll_y_px = 0.0;
             shared.last_error = None;
+            shared.status_overlay = None;
             shared.update_count = shared.update_count.saturating_add(1);
+            shared.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted);
             shared.update_count
         };
         state.replace_status_cache = json!({
@@ -11790,6 +11946,7 @@ fn preview_commit_source_project_result(
             "source_revision": payload.source_revision,
             "project_hash": payload.project_hash,
             "source_hash": result.source_sha256,
+            "parse_lower_runtime_layout_timings": result.timings,
             "frame_revision": frame_revision,
             "stale_result_rejected": false,
             "preview_receives_example_name": false
@@ -11804,8 +11961,11 @@ fn preview_commit_source_project_result(
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
             shared.last_error = Some(diagnostic.clone());
+            shared.status_overlay = None;
             shared.last_error_count = shared.last_error_count.saturating_add(1);
             shared.update_count = shared.update_count.saturating_add(1);
+            shared.last_dirty_reason =
+                Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
             shared.update_count
         };
         state.replace_status_cache = json!({
@@ -11815,6 +11975,7 @@ fn preview_commit_source_project_result(
             "source_revision": payload.source_revision,
             "project_hash": payload.project_hash,
             "diagnostic": diagnostic,
+            "parse_lower_runtime_layout_timings": result.timings,
             "frame_revision": frame_revision,
             "last_good_frame_kept_while_pending": true,
             "preview_receives_example_name": false
@@ -11873,7 +12034,10 @@ fn preview_apply_replace_code_to_state(
         shared.scroll_x_px = 0.0;
         shared.scroll_y_px = 0.0;
         shared.last_error = None;
+        shared.status_overlay = None;
         shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted);
     }
     Ok(true)
 }
@@ -13320,8 +13484,11 @@ fn source_hash_for_path(path: &Path) -> Result<String, Box<dyn std::error::Error
 
 fn opaque_source_identity(virtual_uri: &str, source: &str, revision: u64) -> String {
     let hash = boon_runtime::sha256_bytes(
-        format!("{virtual_uri}\n{revision}\n{}", boon_runtime::sha256_bytes(source.as_bytes()))
-            .as_bytes(),
+        format!(
+            "{virtual_uri}\n{revision}\n{}",
+            boon_runtime::sha256_bytes(source.as_bytes())
+        )
+        .as_bytes(),
     );
     format!("source:{}", &hash[..16])
 }
@@ -14984,6 +15151,8 @@ mod tests {
             scroll_y_px: 34.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: counter_path.clone(),
@@ -15052,6 +15221,8 @@ mod tests {
             scroll_y_px: 34.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: counter_path.clone(),
@@ -15097,6 +15268,14 @@ mod tests {
             json!(serde_json::to_vec(&ack).unwrap().len() as u64)
         );
         assert!(ack["ack_payload_bytes"].as_u64().unwrap() < 16_384);
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert!(shared.update_count >= 1);
+            assert_eq!(
+                shared.last_dirty_reason,
+                Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted)
+            );
+        }
 
         let start = Instant::now();
         loop {
@@ -15521,6 +15700,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
 
         let mut scroll_forward = test_keyboard_input(Vec::new(), Vec::new());
@@ -15592,6 +15773,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
 
         let mut shift_wheel = test_keyboard_input(Vec::new(), vec!["Shift"]);
@@ -15727,6 +15910,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -15834,6 +16019,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -15905,6 +16092,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -15967,6 +16156,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -16050,6 +16241,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -16141,6 +16334,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -16187,6 +16382,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 
@@ -16252,6 +16449,8 @@ mod tests {
             scroll_y_px: 0.0,
             last_error: None,
             last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
         }));
         let mut input_state = PreviewNativeInputState::default();
 

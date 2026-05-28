@@ -131,7 +131,10 @@ int main(int argc, char **argv)
     const char *mode = argc > 4 ? argv[4] : "";
     int send_enter = strcmp(mode, "enter") == 0;
     int scroll_only = strcmp(mode, "scroll-only") == 0;
+    int vertical_scroll_only = strcmp(mode, "vertical-scroll-only") == 0;
+    int horizontal_scroll_only = strcmp(mode, "horizontal-scroll-only") == 0;
     int async_input = strcmp(mode, "async-input") == 0;
+    int any_scroll_only = scroll_only || vertical_scroll_only || horizontal_scroll_only;
     struct state state = {0};
     struct wl_display *display = wl_display_connect(NULL);
     if (!display) {
@@ -153,7 +156,7 @@ int main(int argc, char **argv)
     weston_test_move_pointer(state.test, hi, lo, ns, x, y);
     wl_display_roundtrip(display);
 
-    if (!scroll_only) {
+    if (!any_scroll_only) {
         stamp(&hi, &lo, &ns);
         weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
         if (!async_input)
@@ -168,25 +171,29 @@ int main(int argc, char **argv)
 
     if (!async_input) {
         stamp(&hi, &lo, &ns);
-        weston_test_send_axis(
-            state.test,
-            hi,
-            lo,
-            ns,
-            WL_POINTER_AXIS_VERTICAL_SCROLL,
-            wl_fixed_from_double(120.0));
+        if (!horizontal_scroll_only) {
+            weston_test_send_axis(
+                state.test,
+                hi,
+                lo,
+                ns,
+                WL_POINTER_AXIS_VERTICAL_SCROLL,
+                wl_fixed_from_double(120.0));
+        }
         stamp(&hi, &lo, &ns);
-        weston_test_send_axis(
-            state.test,
-            hi,
-            lo,
-            ns,
-            WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-            wl_fixed_from_double(90.0));
+        if (!vertical_scroll_only) {
+            weston_test_send_axis(
+                state.test,
+                hi,
+                lo,
+                ns,
+                WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                wl_fixed_from_double(90.0));
+        }
         wl_display_roundtrip(display);
     }
 
-    if (text && !scroll_only) {
+    if (text && !any_scroll_only) {
         for (const char *cursor = text; *cursor; cursor++) {
             int key = key_code_for_char(*cursor);
             if (key)
@@ -194,7 +201,7 @@ int main(int argc, char **argv)
         }
         if (send_enter)
             send_key_press(state.test, KEY_ENTER);
-    } else if (!scroll_only) {
+    } else if (!any_scroll_only) {
         send_key_press(state.test, KEY_A);
     }
     if (async_input)
@@ -206,7 +213,7 @@ int main(int argc, char **argv)
         stdout,
         "{\"status\":\"pass\",\"x\":%d,\"y\":%d,\"pointer_events\":%u,"
         "\"last_pointer_x\":%d,\"last_pointer_y\":%d,\"typed_text\":\"%s\","
-        "\"sent_enter\":%s,\"scroll_only\":%s,\"async_input\":%s}\n",
+        "\"sent_enter\":%s,\"scroll_only\":%s,\"scroll_mode\":\"%s\",\"async_input\":%s}\n",
         x,
         y,
         state.pointer_events,
@@ -214,7 +221,8 @@ int main(int argc, char **argv)
         state.pointer_y,
         text ? text : "",
         send_enter ? "true" : "false",
-        scroll_only ? "true" : "false",
+        any_scroll_only ? "true" : "false",
+        mode,
         async_input ? "true" : "false");
 
     weston_test_destroy(state.test);

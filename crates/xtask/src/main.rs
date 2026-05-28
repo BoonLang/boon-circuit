@@ -3564,6 +3564,10 @@ fn ensure_custom_idle_wake_fixture(
         "-- custom fixture helper unit carried as table-driven metadata\n",
     )?;
     fs::write(&scenario_path, fs::read_to_string("examples/counter.scn")?)?;
+    let fixture_source_identity = opaque_xtask_source_identity(&format!(
+        "custom-idle-wake:{}",
+        boon_runtime::sha256_file(&source_path)?
+    ));
     fs::write(
         &fixture_path,
         serde_json::to_vec_pretty(&json!({
@@ -3571,7 +3575,7 @@ fn ensure_custom_idle_wake_fixture(
             "kind": "native-gpu-custom-project-fixture",
             "source_path": source_path,
             "scenario_path": scenario_path,
-            "source_identity": "custom-idle-wake-primary",
+            "source_identity": fixture_source_identity,
             "custom_project_identities": [
                 "custom-idle-wake-primary",
                 "custom-idle-wake-secondary",
@@ -4214,30 +4218,31 @@ fn run_native_example_switch_live_probe(
         let ack_latency_ms = ack_started.elapsed().as_secs_f64() * 1000.0;
         let ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
         ack_payload_bytes_max = ack_payload_bytes_max.max(ack_payload_bytes);
-        let ready = wait_for_replace_source_ready(
-            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-            command_id,
-            Duration::from_secs(10),
-        );
-        let readback = wait_for_loop_readback_change(
+        let first_visible_readback = wait_for_loop_readback_change(
             &preview_loop_report,
             &previous_hash,
             Duration::from_secs(5),
         );
-        let frame_hash_after = readback
+        let click_to_preview_presented_ms = switch_started.elapsed().as_secs_f64() * 1000.0;
+        let first_visible_hash_after = first_visible_readback
             .get("frame_hash_after")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(previous_hash.as_str())
             .to_owned();
         if first_hash.is_empty() && previous_hash != "missing" {
             first_hash = previous_hash.clone();
-        } else if first_hash.is_empty() && frame_hash_after != "missing" {
-            first_hash = frame_hash_after.clone();
+        } else if first_hash.is_empty() && first_visible_hash_after != "missing" {
+            first_hash = first_visible_hash_after.clone();
         }
-        if frame_hash_after != "missing" {
-            previous_hash = frame_hash_after.clone();
-            last_hash = frame_hash_after;
+        if first_visible_hash_after != "missing" {
+            previous_hash = first_visible_hash_after.clone();
+            last_hash = first_visible_hash_after;
         }
+        let ready = wait_for_replace_source_ready(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            command_id,
+            Duration::from_secs(10),
+        );
         let expected_status = if label == "invalid-custom" {
             "fail"
         } else {
@@ -4246,8 +4251,10 @@ fn run_native_example_switch_live_probe(
         let ack_pass = ack.get("status").and_then(serde_json::Value::as_str) == Some("queued");
         let ready_status = ready.get("status").and_then(serde_json::Value::as_str);
         let ready_pass = ready_status == Some(expected_status);
-        let readback_pass =
-            readback.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let readback_pass = first_visible_readback
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
         let visual_change_required = label != "invalid-custom";
         all_switches_pass &= ack_pass && ready_pass && (!visual_change_required || readback_pass);
         if label == "invalid-custom" {
@@ -4258,10 +4265,15 @@ fn run_native_example_switch_live_probe(
                 .unwrap_or(true);
         }
         let preview_ms = if visual_change_required {
-            readback
-                .get("elapsed_ms")
-                .and_then(numeric_value_as_f64)
-                .unwrap_or(f64::INFINITY)
+            if first_visible_readback
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+            {
+                click_to_preview_presented_ms
+            } else {
+                f64::INFINITY
+            }
         } else {
             ready
                 .get("elapsed_ms")
@@ -4282,9 +4294,13 @@ fn run_native_example_switch_live_probe(
             "ack_payload_bytes": ack_payload_bytes,
             "click_to_dev_tab_visual_update_ms": dev_visual_update_ms,
             "click_to_preview_new_frame_presented_ms": preview_ms,
+            "first_visible_readback_wait_ms": first_visible_readback
+                .get("elapsed_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(0.0),
             "ack": ack,
             "ready": ready,
-            "readback_probe": readback,
+            "readback_probe": first_visible_readback,
             "expected_result_status": expected_status,
             "preview_receives_example_name": false,
             "sync_ack_contains_runtime_summary": false,
@@ -4449,10 +4465,8 @@ fn source_project_payload_for_switch(
         }));
     }
     let project_hash = source_project_payload_units_hash(&units)?;
-    let source_identity_hash = boon_runtime::sha256_bytes(
-        format!("{command_id}:{source_revision}:{project_hash}").as_bytes(),
-    );
-    let source_identity = format!("source:{}", &source_identity_hash[..16]);
+    let source_identity =
+        opaque_xtask_source_identity(&format!("{command_id}:{source_revision}:{project_hash}"));
     Ok(json!({
         "command_id": command_id,
         "source_revision": source_revision,
@@ -4461,6 +4475,11 @@ fn source_project_payload_for_switch(
         "entrypoint_unit": units[0].get("virtual_uri").and_then(serde_json::Value::as_str).unwrap_or("memory://main.bn"),
         "units": units
     }))
+}
+
+fn opaque_xtask_source_identity(seed: &str) -> String {
+    let hash = boon_runtime::sha256_bytes(seed.as_bytes());
+    format!("source:{}", &hash[..16])
 }
 
 fn source_project_payload_units_hash(
@@ -5139,6 +5158,8 @@ fn run_isolated_weston_idle_wake_observation(
             match replacement_source {
                 Ok(source) => {
                     let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+                    let source_identity =
+                        opaque_xtask_source_identity(&format!("idle-wake:{source_hash}"));
                     let command_id = 9_001_u64;
                     let source_revision = 9_001_u64;
                     let request = json!({
@@ -5146,7 +5167,7 @@ fn run_isolated_weston_idle_wake_observation(
                         "payload": {
                             "command_id": command_id,
                             "source_revision": source_revision,
-                            "source_identity": format!("idle-wake-replacement-{source_hash}"),
+                            "source_identity": source_identity,
                             "project_hash": source_hash,
                             "entrypoint_unit": "memory://idle-wake-replacement.bn",
                             "units": [{
@@ -5555,63 +5576,103 @@ fn verify_native_dev_editor_scroll_speed(
             }
         ]
     });
-    let driver_target = native_scroll_driver_target("dev-code-editor", &layout_probe);
+    let vertical_driver_target =
+        native_scroll_driver_target_for_axis("dev-code-editor", &layout_probe, "vertical");
+    let horizontal_driver_target =
+        native_scroll_driver_target_for_axis("dev-code-editor", &layout_probe, "horizontal");
     let release_build = profile == "release";
-    let observation = run_linux_human_like_desktop_surface_smoke(
-        "dev-editor-scroll-speed",
+    let vertical_observation = run_linux_human_like_desktop_surface_smoke(
+        "dev-editor-scroll-speed-vertical",
         &example_id,
         &source_path,
         release_build,
         true,
         "dev_surface_proof",
-        driver_target.clone(),
+        vertical_driver_target.clone(),
         true,
+        Some("vertical-scroll-only"),
     )?;
-    let surface_proof = observation
+    let horizontal_observation = run_linux_human_like_desktop_surface_smoke(
+        "dev-editor-scroll-speed-horizontal",
+        &example_id,
+        &source_path,
+        release_build,
+        true,
+        "dev_surface_proof",
+        horizontal_driver_target.clone(),
+        true,
+        Some("horizontal-scroll-only"),
+    )?;
+    let vertical_surface_proof = vertical_observation
         .get("surface_external_render_proof")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let code_editor_model = surface_proof
+    let horizontal_surface_proof = horizontal_observation
+        .get("surface_external_render_proof")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let vertical_code_editor_model = vertical_surface_proof
         .get("code_editor_model")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let scroll_line_after = code_editor_model
+    let horizontal_code_editor_model = horizontal_surface_proof
+        .get("code_editor_model")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let scroll_line_after = vertical_code_editor_model
         .get("scroll_line")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let scroll_column_after = code_editor_model
+    let scroll_column_after = horizontal_code_editor_model
         .get("scroll_column")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let syntax_token_count = code_editor_model
+    let syntax_token_count = vertical_code_editor_model
         .get("syntax_token_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let visible_line_count = 40_u64;
     let visible_column_count = 120_u64;
-    let post_input_timing = observation
+    let vertical_post_input_timing = vertical_observation
         .get("surface_post_input_frame_timing")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let p50 = post_input_timing
+    let horizontal_post_input_timing = horizontal_observation
+        .get("surface_post_input_frame_timing")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let vertical_p95 = vertical_post_input_timing
+        .get("presented_frame_ms_p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0)
+        .max(0.001);
+    let horizontal_p95 = horizontal_post_input_timing
+        .get("presented_frame_ms_p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0)
+        .max(0.001);
+    let p50 = vertical_post_input_timing
         .get("presented_frame_ms_p50")
         .and_then(numeric_value_as_f64)
         .unwrap_or(0.0);
-    let p95 = post_input_timing
-        .get("presented_frame_ms_p95")
-        .and_then(numeric_value_as_f64)
-        .unwrap_or(0.0);
-    let p99 = post_input_timing
+    let p95 = vertical_p95.max(horizontal_p95);
+    let p99 = vertical_post_input_timing
         .get("presented_frame_ms_p99")
         .and_then(numeric_value_as_f64)
         .unwrap_or(p95);
-    let frame_max = post_input_timing
+    let frame_max = vertical_post_input_timing
         .get("presented_frame_ms_max")
         .and_then(numeric_value_as_f64)
-        .unwrap_or(p95);
-    let wheel_to_visible_vertical_ms = p95.max(0.001);
-    let wheel_to_visible_horizontal_ms = p95.max(0.001);
-    let wheel_to_visible_p95 = p95.max(0.001);
+        .unwrap_or(p95)
+        .max(
+            horizontal_post_input_timing
+                .get("presented_frame_ms_max")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(horizontal_p95),
+        );
+    let wheel_to_visible_vertical_ms = vertical_p95;
+    let wheel_to_visible_horizontal_ms = horizontal_p95;
+    let wheel_to_visible_p95 = p95;
     let wheel_to_visible_max = frame_max.max(wheel_to_visible_p95);
     let wheel_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95")?;
     let max_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max")?;
@@ -5619,14 +5680,23 @@ fn verify_native_dev_editor_scroll_speed(
     let graph_rebuild_count = 0_u64;
     let source_replace_count = 0_u64;
     let summary_query_count = 0_u64;
-    let observation_pass = observation
+    let vertical_observation_pass = vertical_observation
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass")
-        && observation
+        && vertical_observation
             .get("scroll_only_driver_mode")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
+    let horizontal_observation_pass = horizontal_observation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && horizontal_observation
+            .get("scroll_only_driver_mode")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let observation_pass = vertical_observation_pass && horizontal_observation_pass;
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -5679,14 +5749,17 @@ fn verify_native_dev_editor_scroll_speed(
         "native-dev-editor-scroll-speed:uses-passive-native-scroll-probe",
         observation_pass,
         format!(
-            "observation_status={:?}, scroll_only_driver_mode={:?}, wheel_input_observed={:?}",
-            observation
+            "vertical_status={:?}, horizontal_status={:?}, vertical_wheel={:?}, horizontal_wheel={:?}",
+            vertical_observation
                 .get("status")
                 .and_then(serde_json::Value::as_str),
-            observation
-                .get("scroll_only_driver_mode")
+            horizontal_observation
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            vertical_observation
+                .get("wheel_input_observed")
                 .and_then(serde_json::Value::as_bool),
-            observation
+            horizontal_observation
                 .get("wheel_input_observed")
                 .and_then(serde_json::Value::as_bool)
         ),
@@ -5694,7 +5767,11 @@ fn verify_native_dev_editor_scroll_speed(
             "dev editor scroll report lacks launched native passive wheel-input evidence".to_owned()
         }),
     );
-    let readback_artifact = observation
+    let vertical_readback_artifact = vertical_observation
+        .get("surface_readback_artifact")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let horizontal_readback_artifact = horizontal_observation
         .get("surface_readback_artifact")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -5705,13 +5782,15 @@ fn verify_native_dev_editor_scroll_speed(
         "surface_under_test": "dev-code-editor",
         "measurement_source": "isolated-weston-passive-dev-editor-scroll-probe",
         "input_provenance": "isolated_weston_real_wheel",
-        "input_injection_method": "isolated-weston-test-control-real-wheel",
+        "input_injection_method": "isolated-weston-test-control-real-wheel-axis-specific",
         "launched_process_evidence": {
-            "desktop_pid": observation.get("desktop_pid").cloned().unwrap_or_else(|| json!(0)),
-            "preview_child_pid": observation.get("preview_child_pid").cloned().unwrap_or_else(|| json!(0)),
-            "dev_child_pid": observation.get("dev_child_pid").cloned().unwrap_or_else(|| json!(0)),
-            "desktop_exit_status": observation.get("desktop_exit_status").cloned().unwrap_or_else(|| json!("missing")),
-            "supervisor_report": observation.get("supervisor_report").cloned().unwrap_or_else(|| json!(null))
+            "desktop_pid": vertical_observation.get("desktop_pid").cloned().unwrap_or_else(|| json!(0)),
+            "preview_child_pid": vertical_observation.get("preview_child_pid").cloned().unwrap_or_else(|| json!(0)),
+            "dev_child_pid": vertical_observation.get("dev_child_pid").cloned().unwrap_or_else(|| json!(0)),
+            "desktop_exit_status": vertical_observation.get("desktop_exit_status").cloned().unwrap_or_else(|| json!("missing")),
+            "supervisor_report": vertical_observation.get("supervisor_report").cloned().unwrap_or_else(|| json!(null)),
+            "horizontal_desktop_pid": horizontal_observation.get("desktop_pid").cloned().unwrap_or_else(|| json!(0)),
+            "horizontal_supervisor_report": horizontal_observation.get("supervisor_report").cloned().unwrap_or_else(|| json!(null))
         },
         "line_count": line_count,
         "longest_line_bytes": longest_line_bytes,
@@ -5736,7 +5815,7 @@ fn verify_native_dev_editor_scroll_speed(
         "materialized_line_count_max": visible_line_count + 8,
         "syntax_token_count": syntax_token_count,
         "parser_diagnostic_delta": 0,
-        "text_runs_shaped_p95": surface_proof
+        "text_runs_shaped_p95": vertical_surface_proof
             .pointer("/visible_surface_metrics/text_runs_shaped")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(48),
@@ -5744,11 +5823,12 @@ fn verify_native_dev_editor_scroll_speed(
         "glyph_atlas_evictions": 0,
         "upload_bytes_p50_p95_max": {"p50": 0, "p95": 0, "max": 0},
         "preview_blocked_on_ipc_count": 0,
-        "app_owned_readback_artifacts": [readback_artifact],
+        "app_owned_readback_artifacts": [vertical_readback_artifact, horizontal_readback_artifact],
         "operator_real_wheel_input_evidence": {
             "status": if observation_pass { "pass" } else { "fail" },
-            "method": "isolated-weston-test-control-scroll-only",
-            "observation": observation
+            "method": "isolated-weston-test-control-axis-specific-scroll-only",
+            "vertical_observation": vertical_observation,
+            "horizontal_observation": horizontal_observation
         },
         "dev_editor_speed_corpus": corpus,
         "prelaunch_layout_probe": layout_probe
@@ -5817,6 +5897,30 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         .get("click_to_preview_new_frame_presented_ms")
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
+    let mut bundled_preview_latencies = Vec::new();
+    let mut custom_preview_latencies = Vec::new();
+    for step in &per_switch {
+        let label = step
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if label == "invalid-custom" {
+            continue;
+        }
+        let Some(latency) = step
+            .get("click_to_preview_new_frame_presented_ms")
+            .and_then(numeric_value_as_f64)
+        else {
+            continue;
+        };
+        if matches!(label, "counter" | "todomvc" | "cells") {
+            bundled_preview_latencies.push(latency);
+        } else {
+            custom_preview_latencies.push(latency);
+        }
+    }
+    let bundled_preview_p95 = max_f64(&bundled_preview_latencies);
+    let custom_preview_p95 = max_f64(&custom_preview_latencies);
     let command_id = live_probe
         .get("command_id")
         .and_then(serde_json::Value::as_u64)
@@ -5878,13 +5982,17 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-example-switch-speed:preview-present-budget",
-        preview_p95 <= bundled_present_budget.max(custom_present_budget),
+        "native-example-switch-speed:preview-present-budget-by-source-class",
+        bundled_preview_p95 <= bundled_present_budget
+            && custom_preview_p95 <= custom_present_budget,
         format!(
-            "preview_present_p95={preview_p95:.3}, bundled_budget={bundled_present_budget:.3}, custom_budget={custom_present_budget:.3}"
+            "preview_present_p95={preview_p95:.3}, bundled_p95={bundled_preview_p95:.3}, custom_p95={custom_preview_p95:.3}, bundled_budget={bundled_present_budget:.3}, custom_budget={custom_present_budget:.3}"
         ),
-        (preview_p95 > bundled_present_budget.max(custom_present_budget))
-            .then(|| "preview source switch present exceeded budget".to_owned()),
+        (bundled_preview_p95 > bundled_present_budget
+            || custom_preview_p95 > custom_present_budget)
+            .then(|| {
+                "example switch preview present exceeded the budget for its source class".to_owned()
+            }),
     );
     push_audit_check(
         &mut checks,
@@ -5926,6 +6034,18 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
             "example switch readback hashes must be real sha256 values and change".to_owned()
         }),
     );
+    let preview_worker_timings = per_switch
+        .iter()
+        .map(|step| {
+            json!({
+                "label": step.get("label").cloned().unwrap_or_else(|| json!("missing")),
+                "timings": step
+                    .pointer("/ready/response/parse_lower_runtime_layout_timings")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"status": "missing"}))
+            })
+        })
+        .collect::<Vec<_>>();
     let extra = json!({
         "profile": profile,
         "build_profile": profile,
@@ -5945,7 +6065,12 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
         "click_to_dev_tab_visual_update_ms": dev_visual_p95,
         "click_to_preview_pending_status_ms": ack_latency_p95,
         "click_to_preview_new_frame_presented_ms": preview_p95,
-        "parse_lower_runtime_layout_timings": {"parse_ms": preview_p95 * 0.20, "lower_ms": preview_p95 * 0.20, "runtime_ms": preview_p95 * 0.30, "layout_ms": preview_p95 * 0.30},
+        "click_to_preview_new_frame_presented_ms_bundled": bundled_preview_p95,
+        "click_to_preview_new_frame_presented_ms_custom": custom_preview_p95,
+        "parse_lower_runtime_layout_timings": {
+            "source": "preview_replace_source_worker_status_response",
+            "per_switch": preview_worker_timings
+        },
         "debug_summary_bytes": 0,
         "debug_summary_latency_ms": 0.0,
         "stale_ack_rejected": stale_ack_rejected,
@@ -13730,6 +13855,7 @@ fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::err
                 "dev_surface_proof",
                 driver_target,
                 false,
+                None,
             )?
         } else {
             let entry = boon_runtime::example_manifest_entry(&label)?;
@@ -14355,6 +14481,16 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                     "command": "verify-native-dev-editor-scroll-speed",
                     "measurement_source": "deterministic-dev-editor-scroll-model",
                     "input_provenance": "model_only"
+                }),
+            ),
+        ),
+        (
+            "example-source-identity-leak",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-example-switch-speed",
+                    "source_identity": "custom:a"
                 }),
             ),
         ),
@@ -15642,6 +15778,11 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 budget_section,
                 "click_to_dev_tab_visual_update_ms_p95",
             );
+            let bundled_preview_budget = native_gpu_budget_f64_or_blocker(
+                &mut blockers,
+                budget_section,
+                "click_to_preview_new_frame_presented_ms_p95_bundled",
+            );
             let preview_budget = native_gpu_budget_f64_or_blocker(
                 &mut blockers,
                 budget_section,
@@ -15670,6 +15811,18 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 &mut blockers,
                 report,
                 "click_to_preview_new_frame_presented_ms",
+                preview_budget,
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_preview_new_frame_presented_ms_bundled",
+                bundled_preview_budget,
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_preview_new_frame_presented_ms_custom",
                 preview_budget,
             );
             require_object_field(&mut blockers, report, "parse_lower_runtime_layout_timings");
@@ -16259,7 +16412,10 @@ fn write_native_gate_report(
         json!(if blockers.is_empty() { 0 } else { 1 }),
     );
     object.insert("git_commit".to_owned(), json!(git_commit()));
-    object.insert("worktree_fingerprint".to_owned(), json!(worktree_fingerprint()));
+    object.insert(
+        "worktree_fingerprint".to_owned(),
+        json!(worktree_fingerprint()),
+    );
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
@@ -16318,7 +16474,10 @@ fn write_static_gate_report(
         json!(if blockers.is_empty() { 0 } else { 1 }),
     );
     object.insert("git_commit".to_owned(), json!(git_commit()));
-    object.insert("worktree_fingerprint".to_owned(), json!(worktree_fingerprint()));
+    object.insert(
+        "worktree_fingerprint".to_owned(),
+        json!(worktree_fingerprint()),
+    );
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
@@ -16524,6 +16683,7 @@ fn native_gpu_report_integrity_reasons(
     {
         reasons.push("binary_hash is stale for current xtask binary".to_owned());
     }
+    collect_nonopaque_source_identities(report, "$", &mut reasons);
     if let (Some(source_hash), Some(expected_source_hash)) = (
         report
             .get("source_hash")
@@ -16739,6 +16899,41 @@ fn native_gpu_report_integrity_reasons(
         }
     }
     reasons
+}
+
+fn collect_nonopaque_source_identities(
+    value: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if key == "source_identity"
+                    && !child.as_str().is_some_and(is_opaque_source_identity)
+                {
+                    reasons.push(format!(
+                        "{child_path} must be an opaque source:<hash-prefix> identity"
+                    ));
+                }
+                collect_nonopaque_source_identities(child, &child_path, reasons);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_nonopaque_source_identities(child, &format!("{path}[{index}]"), reasons);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_opaque_source_identity(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("source:") else {
+        return false;
+    };
+    suffix.len() >= 16 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn command_argv_contains_pair(argv: &[serde_json::Value], flag: &str, value: &str) -> bool {
@@ -18161,6 +18356,7 @@ fn run_linux_human_like_desktop_surface_smoke(
     measured_surface_key: &str,
     driver_target: Option<serde_json::Value>,
     scroll_only: bool,
+    scroll_mode: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let artifact_dir = PathBuf::from(format!(
         "target/artifacts/linux-human-like/desktop-surface-smoke-{}-{}-{}",
@@ -18352,7 +18548,7 @@ fn run_linux_human_like_desktop_surface_smoke(
         let mut command = Command::new(&driver_path);
         command.args([point[0].as_str(), point[1].as_str()]);
         if scroll_only {
-            command.args(["", "scroll-only"]);
+            command.args(["", scroll_mode.unwrap_or("scroll-only")]);
         }
         let output = command.env("WAYLAND_DISPLAY", &socket).output()?;
         last_driver_success = output.status.success();
@@ -18398,23 +18594,25 @@ fn run_linux_human_like_desktop_surface_smoke(
             .get("synthetic_input_probe")
             .and_then(serde_json::Value::as_bool)
             != Some(true);
+    let scroll_delta_x = input_adapter
+        .get("scroll_delta_x")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let scroll_delta_y = input_adapter
+        .get("scroll_delta_y")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let wheel_axis_observed = match scroll_mode.unwrap_or("scroll-only") {
+        "vertical-scroll-only" => scroll_delta_y.abs() > f64::EPSILON,
+        "horizontal-scroll-only" => scroll_delta_x.abs() > f64::EPSILON,
+        _ => scroll_delta_x.abs() > f64::EPSILON && scroll_delta_y.abs() > f64::EPSILON,
+    };
     let wheel_input_observed = input_adapter
         .get("mouse_scroll_event_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
         > 0
-        && input_adapter
-            .get("scroll_delta_x")
-            .and_then(numeric_value_as_f64)
-            .unwrap_or(0.0)
-            .abs()
-            > f64::EPSILON
-        && input_adapter
-            .get("scroll_delta_y")
-            .and_then(numeric_value_as_f64)
-            .unwrap_or(0.0)
-            .abs()
-            > f64::EPSILON;
+        && wheel_axis_observed;
     let driver_effect_observed = wheel_input_observed
         || input_adapter
             .get("mouse_button_event_count")
@@ -18469,6 +18667,7 @@ fn run_linux_human_like_desktop_surface_smoke(
         "measured_surface_key": measured_surface_key,
         "driver_target_region": driver_target,
         "scroll_only_driver_mode": scroll_only,
+        "scroll_driver_mode": scroll_mode.unwrap_or(if scroll_only { "scroll-only" } else { "default" }),
         "weston_control_plugin_path": plugin_path,
         "weston_test_driver_path": driver_path,
         "weston_log_path": weston_log_path,
@@ -20505,6 +20704,27 @@ fn native_scroll_driver_target(
             .or_else(|| scroll_regions.first())?,
         _ => scroll_regions.first()?,
     };
+    native_driver_target_from_region("scroll_region", target)
+}
+
+fn native_scroll_driver_target_for_axis(
+    label: &str,
+    layout_probe: &serde_json::Value,
+    axis: &str,
+) -> Option<serde_json::Value> {
+    let scroll_regions = layout_probe
+        .get("scroll_regions")
+        .and_then(serde_json::Value::as_array)?;
+    let target = scroll_regions
+        .iter()
+        .find(|region| {
+            region.get("node").and_then(serde_json::Value::as_str) == Some(label)
+                && region
+                    .get("axis")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|region_axis| region_axis.eq_ignore_ascii_case(axis))
+        })
+        .or_else(|| scroll_regions.first())?;
     native_driver_target_from_region("scroll_region", target)
 }
 

@@ -88,6 +88,7 @@ pub struct ParserLine {
     pub line: usize,
     pub indent: usize,
     pub symbols: Vec<String>,
+    pub symbol_spans: Vec<(usize, usize)>,
     pub start: usize,
     pub end: usize,
 }
@@ -99,6 +100,7 @@ pub struct ParserItem {
     pub start: usize,
     pub end: usize,
     pub symbols: Vec<String>,
+    pub symbol_spans: Vec<(usize, usize)>,
     pub field: Option<String>,
     pub example: Option<String>,
     pub function: Option<String>,
@@ -233,12 +235,16 @@ pub enum AstExprKind {
 pub struct AstCallArg {
     pub name: Option<String>,
     pub value: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstRecordField {
     pub name: String,
     pub value: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -615,6 +621,7 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
     let mut start = 0usize;
     let mut end = 0usize;
     let mut symbols = Vec::new();
+    let mut symbol_spans = Vec::new();
     for token in tokens {
         if current_line != Some(token.line) {
             if let Some(line) = current_line {
@@ -622,6 +629,7 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
                     line,
                     indent,
                     symbols: std::mem::take(&mut symbols),
+                    symbol_spans: std::mem::take(&mut symbol_spans),
                     start,
                     end,
                 });
@@ -635,6 +643,7 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
             && !token.lexeme.is_empty()
         {
             symbols.push(token.lexeme.clone());
+            symbol_spans.push((token.start, token.end));
         }
     }
     if let Some(line) = current_line {
@@ -642,6 +651,7 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
             line,
             indent,
             symbols,
+            symbol_spans,
             start,
             end,
         });
@@ -659,6 +669,7 @@ fn parser_items(lines: &[ParserLine]) -> Vec<ParserItem> {
 
 fn parser_item(line: &ParserLine) -> ParserItem {
     let symbols = line.symbols.clone();
+    let symbol_spans = line.symbol_spans.clone();
     let field = ast_field_name(&symbols).map(ToOwned::to_owned);
     let function = (symbols.first().map(String::as_str) == Some("FUNCTION"))
         .then(|| symbols.get(1).cloned())
@@ -680,6 +691,7 @@ fn parser_item(line: &ParserLine) -> ParserItem {
             && matches!(symbols.first().map(String::as_str), Some("}" | "]" | ")")),
         operators,
         symbols,
+        symbol_spans,
         field,
         example: None,
         function,
@@ -810,19 +822,42 @@ fn parse_ast_expr(
     source: &str,
 ) -> usize {
     let kind = ast_expr_kind(tokens, item, expressions, source);
-    push_ast_expr(item, expressions, kind)
+    let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
+    push_ast_expr(item, expressions, kind, start, end)
 }
 
-fn push_ast_expr(item: &ParserItem, expressions: &mut Vec<AstExpr>, kind: AstExprKind) -> usize {
+fn push_ast_expr(
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    kind: AstExprKind,
+    start: usize,
+    end: usize,
+) -> usize {
     let id = expressions.len();
     expressions.push(AstExpr {
         id,
         line: item.line,
-        start: item.start,
-        end: item.end,
+        start,
+        end,
         kind,
     });
     id
+}
+
+fn span_for_tokens(tokens: &[String], item: &ParserItem) -> Option<(usize, usize)> {
+    if tokens.is_empty() {
+        return None;
+    }
+    item.symbols
+        .windows(tokens.len())
+        .position(|window| window == tokens)
+        .and_then(|start_index| {
+            let end_index = start_index + tokens.len() - 1;
+            Some((
+                item.symbol_spans.get(start_index)?.0,
+                item.symbol_spans.get(end_index)?.1,
+            ))
+        })
 }
 
 fn ast_expr_kind(
@@ -968,6 +1003,16 @@ fn ast_number_literal(tokens: &[String]) -> Option<String> {
         {
             Some(format!("{left}.{right}"))
         }
+        [left, dot, right @ ..]
+            if dot == "."
+                && left.chars().all(|ch| ch.is_ascii_digit())
+                && !right.is_empty()
+                && right
+                    .iter()
+                    .all(|part| part.chars().all(|ch| ch.is_ascii_digit())) =>
+        {
+            Some(format!("{left}.{}", right.join("")))
+        }
         [minus, value] if minus == "-" && value.chars().all(|ch| ch.is_ascii_digit()) => {
             Some(format!("-{value}"))
         }
@@ -978,6 +1023,17 @@ fn ast_number_literal(tokens: &[String]) -> Option<String> {
                 && right.chars().all(|ch| ch.is_ascii_digit()) =>
         {
             Some(format!("-{left}.{right}"))
+        }
+        [minus, left, dot, right @ ..]
+            if minus == "-"
+                && dot == "."
+                && left.chars().all(|ch| ch.is_ascii_digit())
+                && !right.is_empty()
+                && right
+                    .iter()
+                    .all(|part| part.chars().all(|ch| ch.is_ascii_digit())) =>
+        {
+            Some(format!("-{left}.{}", right.join("")))
         }
         _ => None,
     }
@@ -995,9 +1051,12 @@ fn ast_record_fields(
             if part.len() < 3 || part.get(1).map(String::as_str) != Some(":") {
                 return None;
             }
+            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
             Some(AstRecordField {
                 name: part[0].clone(),
                 value: parse_ast_expr(&part[2..], item, expressions, source),
+                start,
+                end,
             })
         })
         .collect()
@@ -1071,14 +1130,20 @@ fn ast_call_arg(
         return None;
     }
     if tokens.get(1).map(String::as_str) == Some(":") {
+        let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
         return Some(AstCallArg {
             name: Some(tokens[0].clone()),
             value: parse_ast_expr(&tokens[2..], item, expressions, source),
+            start,
+            end,
         });
     }
+    let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
     Some(AstCallArg {
         name: None,
         value: parse_ast_expr(tokens, item, expressions, source),
+        start,
+        end,
     })
 }
 
@@ -2131,6 +2196,11 @@ document: []
         );
         assert!(
             program.ast.expressions.iter().any(|expr| {
+                matches!(&expr.kind, AstExprKind::Number(value) if value == "0.02")
+            })
+        );
+        assert!(
+            program.ast.expressions.iter().any(|expr| {
                 matches!(&expr.kind, AstExprKind::Tag(value) if value == "Completed")
             })
         );
@@ -2142,6 +2212,39 @@ document: []
             matches!(&expr.kind, AstExprKind::Object(fields)
                 if fields.iter().any(|field| field.name == "color"))
         }));
+        let oklch = program
+            .ast
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::TaggedObject { tag, fields } if tag == "Oklch" => Some(fields),
+                _ => None,
+            })
+            .expect("Oklch tagged object should parse");
+        let chroma = oklch
+            .iter()
+            .find(|field| field.name == "chroma")
+            .expect("chroma field should parse");
+        assert_eq!(&program.source[chroma.start..chroma.end], "chroma:0.02");
+        assert_eq!(
+            &program.source
+                [program.expressions[chroma.value].start..program.expressions[chroma.value].end],
+            "0.02"
+        );
+        let map_call = program
+            .ast
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::Pipe { op, args, .. } if op == "List/map" => Some(args),
+                _ => None,
+            })
+            .expect("List/map pipe should parse");
+        let new_arg = map_call
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("new"))
+            .expect("new arg should parse");
+        assert_eq!(&program.source[new_arg.start..new_arg.end], "new: item");
     }
 
     #[test]
@@ -2181,7 +2284,7 @@ FUNCTION make_entry(entry) {
     sources:
         checkbox: [click: SOURCE]
     title:
-        todo.title |> HOLD title { LATEST {} }
+        entry.title |> HOLD title { LATEST {} }
     completed:
         False |> HOLD completed {
             LATEST {

@@ -5057,7 +5057,7 @@ FUNCTION row(item) {
     sources:
         checkbox: [click: SOURCE]
     title:
-        todo.title |> HOLD title { LATEST {} }
+        entry.title |> HOLD title { LATEST {} }
     completed:
         False |> HOLD completed {
             LATEST {

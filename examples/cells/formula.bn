@@ -63,7 +63,7 @@ FUNCTION add_value(text) {
                 right_length: inner_length - right_start
                 left: inner |> Text/substring(start: 0, length: index)
                 right: inner |> Text/substring(start: right_start, length: right_length)
-                expression_value(text: left) + expression_value(text: right)
+                reference_or_number(text: left) + reference_or_number(text: right)
             }
         }
     }
@@ -97,10 +97,10 @@ FUNCTION binary_value(text, operator_index, operator_text) {
         left: text |> Text/substring(start: 0, length: operator_index)
         right: text |> Text/substring(start: right_start, length: right_length)
         operator_text |> WHILE {
-            TEXT { + } => expression_value(text: left) + expression_value(text: right)
-            TEXT { - } => expression_value(text: left) - expression_value(text: right)
-            TEXT { * } => expression_value(text: left) * expression_value(text: right)
-            TEXT { / } => expression_value(text: left) / expression_value(text: right)
+            TEXT { + } => reference_or_number(text: left) + reference_or_number(text: right)
+            TEXT { - } => reference_or_number(text: left) - reference_or_number(text: right)
+            TEXT { * } => reference_or_number(text: left) * reference_or_number(text: right)
+            TEXT { / } => reference_or_number(text: left) / reference_or_number(text: right)
             __ => Error/new(code: TEXT { parse_error })
         }
     }

@@ -4824,10 +4824,10 @@ FUNCTION row(item) {
 }
 "#;
         let parsed = boon_parser::parse_source("unknown-list-table-alias.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
+        let error = lower(&parsed).unwrap_err();
         assert!(
-            !ir.lists.iter().any(|list| list.name == "legacy"),
-            "List/spreadsheet_rows must not lower to a table initializer"
+            error.contains("unknown function or operator `List/spreadsheet_rows`"),
+            "List/spreadsheet_rows must be rejected by typechecking before IR lowering, got {error}"
         );
     }
 

@@ -212,6 +212,19 @@ pub enum MaterializationPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcePayloadShapeEntry {
+    pub source_path: String,
+    pub payload_type: Type,
+    pub fields: Vec<SourcePayloadShapeField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcePayloadShapeField {
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypeCheckReport {
     pub expression_count: usize,
     pub checked_expression_count: usize,
@@ -221,6 +234,7 @@ pub struct TypeCheckReport {
     pub render_slot_failure_count: usize,
     pub builtin_signature_coverage: Vec<String>,
     pub source_payload_shape_coverage: Vec<String>,
+    pub source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     pub full_document_typecheck_coverage: bool,
     pub list_map_binding_count_runtime_value: usize,
     pub list_map_binding_count_render_slot_materialization: usize,
@@ -298,6 +312,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_program(&mut self) -> TypeCheckReport {
+        self.check_recursive_functions();
         for statement in &self.program.ast.statements {
             self.check_statement(statement, false);
         }
@@ -328,6 +343,7 @@ impl<'a> Checker<'a> {
             .iter()
             .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
             .count();
+        let source_payload_shape_table = source_payload_shape_table(self.program);
         TypeCheckReport {
             expression_count: self.program.expressions.len(),
             checked_expression_count: self.visited.len(),
@@ -342,6 +358,7 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|source| source.path.clone())
                 .collect(),
+            source_payload_shape_table,
             full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
                 statement_expr_ids(root)
                     .into_iter()
@@ -363,7 +380,13 @@ impl<'a> Checker<'a> {
             || statement_field(statement).as_deref() == Some("document")
             || self.statement_enters_render_context(statement);
         if let Some(expr_id) = statement.expr {
-            self.ensure_expr(expr_id);
+            let flow = self.ensure_expr(expr_id);
+            if !next_in_document && type_contains_no_element(&flow.ty) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr_id,
+                    "`NoElement` can only be used as a render value".to_owned(),
+                ));
+            }
         }
         if statement_field(statement).as_deref() == Some("style") {
             self.check_style_statement(statement);
@@ -450,7 +473,8 @@ impl<'a> Checker<'a> {
         {
             let message = if type_contains_skip(&actual_type) {
                 "`SKIP` cannot be used as a render value".to_owned()
-            } else if self.expr_is_direct_data_list(expr_id) {
+            } else if matches!(actual_type, Type::List(_)) || self.expr_is_direct_data_list(expr_id)
+            {
                 format!("expected a list of renderable values for `{slot_name}:`")
             } else {
                 format!("expected renderable values for `{slot_name}:`")
@@ -1286,6 +1310,25 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_recursive_functions(&mut self) {
+        let graph = function_call_graph(self.program);
+        let function_statements = function_statement_map(&self.program.ast.statements);
+        let mut visited = BTreeSet::new();
+        let mut active = Vec::new();
+        let mut reported = BTreeSet::new();
+        for function in graph.keys() {
+            report_recursive_function_cycles(
+                function,
+                &graph,
+                &function_statements,
+                &mut visited,
+                &mut active,
+                &mut reported,
+                &mut self.diagnostics,
+            );
+        }
+    }
+
     fn diagnostic_for_expr(&self, expr_id: usize, message: String) -> TypeDiagnostic {
         let expr = self.program.expressions.get(expr_id);
         TypeDiagnostic {
@@ -1295,6 +1338,20 @@ impl<'a> Checker<'a> {
             end: expr.map(|expr| expr.end).unwrap_or_default(),
             message,
         }
+    }
+}
+
+fn diagnostic_for_statement(statement: Option<&AstStatement>, message: String) -> TypeDiagnostic {
+    TypeDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        line: statement
+            .map(|statement| statement.line)
+            .unwrap_or_default(),
+        start: statement
+            .map(|statement| statement.start)
+            .unwrap_or_default(),
+        end: statement.map(|statement| statement.end).unwrap_or_default(),
+        message,
     }
 }
 
@@ -1382,6 +1439,187 @@ fn expr_contains_list_map(expr_id: usize, expressions: &[AstExpr]) -> bool {
             .any(|field| expr_contains_list_map(field.value, expressions)),
         _ => false,
     }
+}
+
+fn function_statement_map(statements: &[AstStatement]) -> BTreeMap<String, &AstStatement> {
+    let mut functions = BTreeMap::new();
+    collect_function_statements(statements, &mut functions);
+    functions
+}
+
+fn collect_function_statements<'a>(
+    statements: &'a [AstStatement],
+    functions: &mut BTreeMap<String, &'a AstStatement>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, .. } = &statement.kind {
+            functions.insert(name.clone(), statement);
+        }
+        collect_function_statements(&statement.children, functions);
+    }
+}
+
+fn function_call_graph(program: &ParsedProgram) -> BTreeMap<String, BTreeSet<String>> {
+    let user_functions = program.functions.iter().cloned().collect::<BTreeSet<_>>();
+    let mut graph = BTreeMap::new();
+    collect_function_call_graph(
+        &program.ast.statements,
+        &program.expressions,
+        &user_functions,
+        &mut graph,
+    );
+    graph
+}
+
+fn collect_function_call_graph(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    user_functions: &BTreeSet<String>,
+    graph: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, .. } = &statement.kind {
+            let mut calls = BTreeSet::new();
+            collect_statement_user_function_calls(
+                statement,
+                expressions,
+                user_functions,
+                &mut calls,
+            );
+            graph.insert(name.clone(), calls);
+        }
+        collect_function_call_graph(&statement.children, expressions, user_functions, graph);
+    }
+}
+
+fn collect_statement_user_function_calls(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    user_functions: &BTreeSet<String>,
+    calls: &mut BTreeSet<String>,
+) {
+    if let Some(expr_id) = statement.expr {
+        collect_expr_user_function_calls(expr_id, expressions, user_functions, calls);
+    }
+    for child in &statement.children {
+        collect_statement_user_function_calls(child, expressions, user_functions, calls);
+    }
+}
+
+fn collect_expr_user_function_calls(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    user_functions: &BTreeSet<String>,
+    calls: &mut BTreeSet<String>,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Call { function, args } => {
+            if user_functions.contains(function) {
+                calls.insert(function.clone());
+            }
+            for arg in args {
+                collect_expr_user_function_calls(arg.value, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            collect_expr_user_function_calls(*input, expressions, user_functions, calls);
+            if user_functions.contains(op) {
+                calls.insert(op.clone());
+            }
+            for arg in args {
+                collect_expr_user_function_calls(arg.value, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_expr_user_function_calls(*initial, expressions, user_functions, calls);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_expr_user_function_calls(*input, expressions, user_functions, calls);
+            if let Some(output) = output {
+                collect_expr_user_function_calls(*output, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => collect_expr_user_function_calls(*output, expressions, user_functions, calls),
+        AstExprKind::Infix { left, right, .. } => {
+            collect_expr_user_function_calls(*left, expressions, user_functions, calls);
+            collect_expr_user_function_calls(*right, expressions, user_functions, calls);
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_expr_user_function_calls(field.value, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::ListLiteral { .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_)
+        | AstExprKind::MatchArm { output: None, .. } => {}
+    }
+}
+
+fn report_recursive_function_cycles(
+    function: &str,
+    graph: &BTreeMap<String, BTreeSet<String>>,
+    function_statements: &BTreeMap<String, &AstStatement>,
+    visited: &mut BTreeSet<String>,
+    active: &mut Vec<String>,
+    reported: &mut BTreeSet<String>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) {
+    if let Some(position) = active.iter().position(|candidate| candidate == function) {
+        let cycle = active[position..]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(function.to_owned()))
+            .collect::<Vec<_>>();
+        for name in &cycle[..cycle.len().saturating_sub(1)] {
+            if reported.insert(name.clone()) {
+                diagnostics.push(diagnostic_for_statement(
+                    function_statements.get(name).copied(),
+                    format!(
+                        "`FUNCTION {name}` is recursive; recursive functions are not supported by v1 type inference: {}",
+                        cycle.join(" -> ")
+                    ),
+                ));
+            }
+        }
+        return;
+    }
+    if !visited.insert(function.to_owned()) {
+        return;
+    }
+    active.push(function.to_owned());
+    if let Some(calls) = graph.get(function) {
+        for call in calls {
+            report_recursive_function_cycles(
+                call,
+                graph,
+                function_statements,
+                visited,
+                active,
+                reported,
+                diagnostics,
+            );
+        }
+    }
+    active.pop();
 }
 
 fn first_child_expr_id(statement: &AstStatement) -> Option<usize> {
@@ -1535,7 +1773,6 @@ impl Default for BuiltinSignatureRegistry {
                 "List/remove",
                 "List/range",
                 "List/chunk",
-                "List/spreadsheet_rows",
             ]
             .into_iter()
             .collect(),
@@ -1587,26 +1824,14 @@ pub struct RenderContractRegistry {
 impl Default for RenderContractRegistry {
     fn default() -> Self {
         Self {
-            constructors: [
-                "Document/new",
-                "Element/stripe",
-                "Element/text",
-                "Element/label",
-                "Element/paragraph",
-                "Element/link",
-                "Element/button",
-                "Element/checkbox",
-                "Element/text_input",
-            ]
-            .into_iter()
-            .collect(),
+            constructors: RENDER_CONSTRUCTORS.iter().copied().collect(),
         }
     }
 }
 
 impl RenderContractRegistry {
     fn is_render_constructor(&self, function: &str) -> bool {
-        self.constructors.contains(function) || function.starts_with("Element/")
+        self.constructors.contains(function)
     }
 
     fn slot_contract(&self, slot_name: &str) -> &'static str {
@@ -1615,6 +1840,23 @@ impl RenderContractRegistry {
             _ => "Element",
         }
     }
+}
+
+const RENDER_CONSTRUCTORS: &[&str] = &[
+    "Document/new",
+    "Element/container",
+    "Element/stripe",
+    "Element/text",
+    "Element/label",
+    "Element/paragraph",
+    "Element/link",
+    "Element/button",
+    "Element/checkbox",
+    "Element/text_input",
+];
+
+fn is_registered_render_constructor(function: &str) -> bool {
+    RENDER_CONSTRUCTORS.contains(&function)
 }
 
 fn type_accepts_true_false(ty: &Type) -> bool {
@@ -1837,9 +2079,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         | AstExprKind::Latest
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_) => open_object_type(),
-        AstExprKind::Call { function, .. }
-            if function.starts_with("Element/") || function == "Document/new" =>
-        {
+        AstExprKind::Call { function, .. } if is_registered_render_constructor(function) => {
             renderable_contract_type()
         }
         _ => open_object_type(),
@@ -2234,8 +2474,169 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
 fn source_payload_type(parts: &[String]) -> Type {
     match parts.last().map(String::as_str) {
         Some("text" | "key") => Type::Text,
+        Some("address") => Type::Text,
         _ => open_object_type(),
     }
+}
+
+fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShapeEntry> {
+    let source_paths = program
+        .source_ports
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    program
+        .source_ports
+        .iter()
+        .map(|source| {
+            let fields = source_payload_fields_for_path(program, &source_paths, &source.path);
+            let payload_type = Type::Object(ObjectShape {
+                fields: fields
+                    .iter()
+                    .map(|field| (field.name.clone(), field.ty.clone()))
+                    .collect(),
+                open: true,
+            });
+            SourcePayloadShapeEntry {
+                source_path: source.path.clone(),
+                payload_type,
+                fields,
+            }
+        })
+        .collect()
+}
+
+fn source_payload_fields_for_path(
+    program: &ParsedProgram,
+    source_paths: &BTreeSet<String>,
+    source_path: &str,
+) -> Vec<SourcePayloadShapeField> {
+    let mut fields = BTreeMap::new();
+    for expr in &program.expressions {
+        match &expr.kind {
+            AstExprKind::Path(parts) => {
+                if source_path_matches_parts(source_paths, source_path, parts)
+                    && let Some(field) = source_payload_field_name(parts)
+                {
+                    fields.insert(field.to_owned(), Type::Text);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_payload_pattern_fields_for_source(
+        &program.ast.statements,
+        &program.expressions,
+        source_paths,
+        source_path,
+        &mut fields,
+    );
+    fields
+        .into_iter()
+        .map(|(name, ty)| SourcePayloadShapeField { name, ty })
+        .collect()
+}
+
+fn collect_payload_pattern_fields_for_source(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    source_paths: &BTreeSet<String>,
+    source_path: &str,
+    fields: &mut BTreeMap<String, Type>,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr
+            && let Some(AstExpr {
+                kind: AstExprKind::When { input },
+                ..
+            }) = expressions.get(expr_id)
+            && expr_is_source_path(*input, expressions, source_paths, source_path)
+        {
+            for child in &statement.children {
+                if let Some(AstExpr {
+                    kind: AstExprKind::MatchArm { pattern, .. },
+                    ..
+                }) = child.expr.and_then(|expr_id| expressions.get(expr_id))
+                {
+                    for field in source_payload_fields_from_pattern(pattern) {
+                        fields.insert(field.to_owned(), Type::Text);
+                    }
+                }
+            }
+        }
+        collect_payload_pattern_fields_for_source(
+            &statement.children,
+            expressions,
+            source_paths,
+            source_path,
+            fields,
+        );
+    }
+}
+
+fn expr_is_source_path(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    source_paths: &BTreeSet<String>,
+    source_path: &str,
+) -> bool {
+    match expressions.get(expr_id).map(|expr| &expr.kind) {
+        Some(AstExprKind::Identifier(value)) => {
+            source_path_matches_parts(source_paths, source_path, std::slice::from_ref(value))
+        }
+        Some(AstExprKind::Path(parts)) => {
+            source_path_matches_parts(source_paths, source_path, parts)
+        }
+        Some(AstExprKind::Pipe { input, .. }) | Some(AstExprKind::When { input }) => {
+            expr_is_source_path(*input, expressions, source_paths, source_path)
+        }
+        _ => false,
+    }
+}
+
+fn source_path_matches_parts(
+    source_paths: &BTreeSet<String>,
+    source_path: &str,
+    parts: &[String],
+) -> bool {
+    let path = parts.join(".");
+    if !path_is_source_path(source_paths, &path) {
+        return false;
+    }
+    let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
+    path.starts_with(&format!("{source_path}."))
+        || path.starts_with(&format!("{relative}."))
+        || source_path.ends_with(&format!(".{}", parts_without_payload(parts).join(".")))
+        || relative.ends_with(&format!(".{}", parts_without_payload(parts).join(".")))
+}
+
+fn parts_without_payload(parts: &[String]) -> &[String] {
+    match parts.last().map(String::as_str) {
+        Some("text" | "key" | "address") => &parts[..parts.len().saturating_sub(1)],
+        _ => parts,
+    }
+}
+
+fn source_payload_field_name(parts: &[String]) -> Option<&str> {
+    match parts.last().map(String::as_str) {
+        Some(field @ ("text" | "key" | "address")) => Some(field),
+        _ => None,
+    }
+}
+
+fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for window in pattern.windows(2) {
+        if matches!(window[0].as_str(), "text" | "key" | "address") && window[1].as_str() == ":" {
+            fields.push(match window[0].as_str() {
+                "text" => "text",
+                "key" => "key",
+                "address" => "address",
+                _ => unreachable!(),
+            });
+        }
+    }
+    fields
 }
 
 fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
@@ -2298,6 +2699,7 @@ fn is_no_element_type(ty: &Type) -> bool {
 fn type_contains_renderable(ty: &Type) -> bool {
     match ty {
         Type::RenderContract => true,
+        ty if is_no_element_type(ty) => true,
         Type::List(item) => type_contains_renderable(item),
         Type::Object(shape) => shape.fields.values().any(type_contains_renderable),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
@@ -2306,6 +2708,25 @@ fn type_contains_renderable(ty: &Type) -> bool {
         }),
         Type::Function { result, .. } => type_contains_renderable(&result.ty),
         Type::Text | Type::Number | Type::Skip | Type::Var(_) | Type::Unknown => false,
+    }
+}
+
+fn type_contains_no_element(ty: &Type) -> bool {
+    match ty {
+        ty if is_no_element_type(ty) => true,
+        Type::List(item) => type_contains_no_element(item),
+        Type::Object(shape) => shape.fields.values().any(type_contains_no_element),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_no_element),
+        }),
+        Type::Function { result, .. } => type_contains_no_element(&result.ty),
+        Type::Text
+        | Type::Number
+        | Type::Skip
+        | Type::RenderContract
+        | Type::Var(_)
+        | Type::Unknown => false,
     }
 }
 
@@ -2572,6 +2993,34 @@ document:
         let report = check(&parsed);
         assert!(report.has_errors());
         assert_eq!(report.list_map_binding_count_render_slot_materialization, 0);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected a list of renderable values for `items:`")
+        }));
+    }
+
+    #[test]
+    fn rejects_nested_renderable_list_passed_to_items_without_flattening() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION renderable_list() {
+    LIST {
+        Element/label(label: TEXT { nested })
+    }
+}
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                renderable_list()
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-nested-render-list.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
@@ -2872,6 +3321,129 @@ document:
     }
 
     #[test]
+    fn rejects_no_element_as_normal_data_but_allows_it_in_render_slot() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+bad: NoElement
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                NoElement
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-no-element-data.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("`NoElement` can only be used as a render value"))
+                .count(),
+            1
+        );
+        assert_eq!(report.render_slot_failure_count, 0);
+    }
+
+    #[test]
+    fn rejects_unregistered_element_prefix_as_unknown_function() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+document:
+    root: Element/not_registered(label: TEXT { bad })
+"#;
+        let parsed = boon_parser::parse_source("unknown-element-prefix.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown function or operator `Element/not_registered`")
+        }));
+    }
+
+    #[test]
+    fn infers_tagged_objects_and_accepts_structural_extra_fields() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+todo: [title: TEXT { Read }, extra: 1, hidden: Hidden[id: TEXT { runtime-free }]]
+FUNCTION row(todo) {
+    Element/label(label: todo.title)
+}
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                row(todo: todo)
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("structural-extra-fields.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(report.expr_type_table.entries.iter().any(|entry| {
+            matches!(
+                &entry.flow_type.ty,
+                Type::VariantSet(variants)
+                    if variants.iter().any(|variant| {
+                        matches!(variant, Variant::Tagged { tag, .. } if tag == "Hidden")
+                    })
+            )
+        }));
+    }
+
+    #[test]
+    fn source_payload_shape_table_reports_payload_fields() {
+        let source = r#"
+store: [
+    sources: [
+        input: [
+            change: SOURCE
+            key_down: SOURCE
+        ]
+    ]
+    text:
+        Text/empty() |> HOLD text {
+            LATEST {
+                sources.input.change.text
+                sources.input.key_down |> WHEN {
+                    [key: Enter, text: submitted] => submitted
+                    __ => SKIP
+                }
+            }
+        }
+]
+document: []
+"#;
+        let parsed = boon_parser::parse_source("source-payload-shapes.bn", source).unwrap();
+        let report = check(&parsed);
+        let change = report
+            .source_payload_shape_table
+            .iter()
+            .find(|entry| entry.source_path == "store.sources.input.change")
+            .expect("change source should have a payload shape");
+        assert!(change.fields.iter().any(|field| field.name == "text"));
+        let key_down = report
+            .source_payload_shape_table
+            .iter()
+            .find(|entry| entry.source_path == "store.sources.input.key_down")
+            .expect("key_down source should have a payload shape");
+        assert!(key_down.fields.iter().any(|field| field.name == "key"));
+        assert!(key_down.fields.iter().any(|field| field.name == "text"));
+    }
+
+    #[test]
     fn accepts_then_on_source_flow() {
         let source = r#"
 source: SOURCE
@@ -2962,6 +3534,30 @@ document: []
                 report.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn rejects_recursive_functions_in_v1() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION left(value) {
+    right(value: value)
+}
+FUNCTION right(value) {
+    left(value: value)
+}
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-recursive-functions.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("recursive functions are not supported by v1 type inference")
+                && diagnostic.message.contains("left -> right -> left")
+        }));
     }
 
     #[test]

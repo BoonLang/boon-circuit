@@ -9,8 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Type {
     Text,
     Number,
+    Skip,
     VariantSet(Vec<Variant>),
     Object(ObjectShape),
+    RenderContract,
     List(Box<Type>),
     Function {
         args: Vec<Type>,
@@ -357,12 +359,17 @@ impl<'a> Checker<'a> {
     }
 
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
-        let next_in_document =
-            in_document || statement_field(statement).as_deref() == Some("document");
+        let next_in_document = in_document
+            || statement_field(statement).as_deref() == Some("document")
+            || self.statement_enters_render_context(statement);
         if let Some(expr_id) = statement.expr {
             self.ensure_expr(expr_id);
         }
+        if statement_field(statement).as_deref() == Some("style") {
+            self.check_style_statement(statement);
+        }
         self.check_hold_update_compatibility(statement);
+        self.check_latest_branch_compatibility(statement);
         if let AstStatementKind::Function { name, args } = &statement.kind {
             self.function_type_table.entries.push(FunctionTypeEntry {
                 name: name.clone(),
@@ -373,10 +380,12 @@ impl<'a> Checker<'a> {
                 },
             });
         }
-        if matches!(
-            statement_field(statement).as_deref(),
-            Some("items" | "children")
-        ) {
+        if next_in_document
+            && matches!(
+                statement_field(statement).as_deref(),
+                Some("items" | "children")
+            )
+        {
             self.check_render_slot(statement);
         }
         for child in &statement.children {
@@ -395,42 +404,58 @@ impl<'a> Checker<'a> {
         let mut actual_type = value_expr_id
             .map(|expr_id| self.ensure_expr(expr_id).ty)
             .unwrap_or_else(|| Type::List(Box::new(open_object_type())));
+        if let Some(static_list_type) = self.render_slot_static_list_type(statement) {
+            actual_type = static_list_type;
+        }
         let mut materialization_policy = MaterializationPolicy::StaticChildren;
 
         let mut diagnostics = Vec::new();
 
         if let Some(mapped) = mapped_children_for_statement(statement, &self.program.expressions) {
-            self.runtime_list_map_exprs.remove(&mapped.map_expr_id);
-            self.list_map_bindings
-                .retain(|binding| binding.map_expr_id != mapped.map_expr_id);
             value_expr_id = Some(mapped.map_expr_id);
-            actual_type = Type::List(Box::new(renderable_contract_type()));
-            item_scope_id = Some(mapped.item_scope_id);
-            template_function = Some(mapped.template_function.clone());
-            template_args = mapped.template_args.clone();
-            materialization_policy = MaterializationPolicy::RenderSlotMaterialization;
-            let binding_id = self.list_map_bindings.len();
-            optional_list_map_binding_id = Some(binding_id);
-            self.list_map_bindings.push(ListMapBinding {
-                map_expr_id: mapped.map_expr_id,
-                list_expr_id: mapped.list_expr_id,
-                input_list_type: Type::List(Box::new(open_object_type())),
-                item_expr_id: mapped.item_expr_id,
-                item_binding_name: mapped.item_binding_name,
-                item_type: open_object_type(),
-                result_type: Type::List(Box::new(renderable_contract_type())),
-                item_scope_id,
-                template_function: template_function.clone(),
-                template_args: template_args.clone(),
-                result_kind: ListMapResultKind::RenderSlotMaterialization,
-            });
+            actual_type = self.ensure_expr(mapped.map_expr_id).ty;
+            if render_slot_accepts_type(&slot_name, &actual_type) {
+                self.runtime_list_map_exprs.remove(&mapped.map_expr_id);
+                self.list_map_bindings
+                    .retain(|binding| binding.map_expr_id != mapped.map_expr_id);
+                item_scope_id = Some(mapped.item_scope_id);
+                template_function = Some(mapped.template_function.clone());
+                template_args = mapped.template_args.clone();
+                materialization_policy = MaterializationPolicy::RenderSlotMaterialization;
+                let binding_id = self.list_map_bindings.len();
+                optional_list_map_binding_id = Some(binding_id);
+                self.list_map_bindings.push(ListMapBinding {
+                    map_expr_id: mapped.map_expr_id,
+                    list_expr_id: mapped.list_expr_id,
+                    input_list_type: Type::List(Box::new(open_object_type())),
+                    item_expr_id: mapped.item_expr_id,
+                    item_binding_name: mapped.item_binding_name,
+                    item_type: open_object_type(),
+                    result_type: Type::List(Box::new(renderable_contract_type())),
+                    item_scope_id,
+                    template_function: template_function.clone(),
+                    template_args: template_args.clone(),
+                    result_kind: ListMapResultKind::RenderSlotMaterialization,
+                });
+            } else {
+                let message = if type_contains_skip(&actual_type) {
+                    "`SKIP` cannot be used as a render value".to_owned()
+                } else {
+                    format!("expected a list of renderable values for `{slot_name}:`")
+                };
+                diagnostics.push(self.diagnostic_for_expr(mapped.map_expr_id, message));
+            }
         } else if let Some(expr_id) = statement.expr
-            && self.expr_is_direct_data_list(expr_id)
+            && !render_slot_accepts_type(&slot_name, &actual_type)
         {
-            diagnostics.push(self.diagnostic_for_expr(
-                expr_id,
-                format!("expected a list of renderable values for `{slot_name}:`"),
-            ));
+            let message = if type_contains_skip(&actual_type) {
+                "`SKIP` cannot be used as a render value".to_owned()
+            } else if self.expr_is_direct_data_list(expr_id) {
+                format!("expected a list of renderable values for `{slot_name}:`")
+            } else {
+                format!("expected renderable values for `{slot_name}:`")
+            };
+            diagnostics.push(self.diagnostic_for_expr(expr_id, message));
         } else if render_slot_contains_malformed_list_map(statement, &self.program.expressions)
             && let Some(expr_id) = statement.expr.or_else(|| first_child_expr_id(statement))
         {
@@ -497,6 +522,7 @@ impl<'a> Checker<'a> {
             } else {
                 "False".to_owned()
             })]),
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
                 Type::VariantSet(vec![Variant::Tag(tag.clone())])
             }
@@ -528,6 +554,9 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                if self.render_contracts.is_render_constructor(function) {
+                    self.check_style_args(args);
+                }
                 if function == "Bool/not" {
                     let input_flow = args
                         .first()
@@ -536,7 +565,13 @@ impl<'a> Checker<'a> {
                             mode: FlowMode::Continuous,
                             ty: Type::Unknown,
                         });
-                    self.check_true_false_input(expr, &input_flow);
+                    self.check_true_false_input(expr, function, &input_flow);
+                    true_false_type()
+                } else if function == "Bool/and" {
+                    for arg in args {
+                        let arg_flow = self.ensure_expr(arg.value);
+                        self.check_true_false_input(expr, function, &arg_flow);
+                    }
                     true_false_type()
                 } else {
                     self.type_for_call_expr(expr.id, function)
@@ -547,11 +582,21 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                if self.render_contracts.is_render_constructor(op) {
+                    self.check_style_args(args);
+                }
                 if op == "List/map" {
                     self.record_runtime_list_map(expr.id, *input, args);
-                    Type::List(Box::new(open_object_type()))
+                    Type::List(Box::new(self.list_map_result_item_type(args)))
                 } else if op == "Bool/not" {
-                    self.check_true_false_input(expr, &input_flow);
+                    self.check_true_false_input(expr, op, &input_flow);
+                    true_false_type()
+                } else if op == "Bool/and" {
+                    self.check_true_false_input(expr, op, &input_flow);
+                    for arg in args {
+                        let arg_flow = self.ensure_expr(arg.value);
+                        self.check_true_false_input(expr, op, &arg_flow);
+                    }
                     true_false_type()
                 } else {
                     self.type_for_call_expr(expr.id, op)
@@ -588,7 +633,7 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::MatchArm { output, .. } => output
                 .map(|output| self.ensure_expr(output).ty)
-                .unwrap_or_else(open_object_type),
+                .unwrap_or_else(|| Type::Skip),
             AstExprKind::Source => open_object_type(),
             AstExprKind::Identifier(value) => {
                 if value == "BLOCK" {
@@ -665,15 +710,14 @@ impl<'a> Checker<'a> {
         if !matches!(ty, Type::Unknown) {
             return ty;
         }
-        if self.program.functions.iter().any(|name| name == function) {
-            if function_returns_render(function, &self.program.ast.statements, self.program) {
-                renderable_contract_type()
-            } else {
-                open_object_type()
-            }
-        } else {
-            Type::Unknown
-        }
+        self.user_function_return_type(function, &mut BTreeSet::new())
+            .unwrap_or_else(|| {
+                if self.program.functions.iter().any(|name| name == function) {
+                    open_object_type()
+                } else {
+                    Type::Unknown
+                }
+            })
     }
 
     fn type_for_call_expr(&mut self, expr_id: usize, function: &str) -> Type {
@@ -694,6 +738,169 @@ impl<'a> Checker<'a> {
             .entry(expr_id)
             .or_insert_with(|| self.vars.new_var());
         Type::Var(var)
+    }
+
+    fn list_map_result_item_type(&self, args: &[AstCallArg]) -> Type {
+        let Some(new_expr) = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("new"))
+            .and_then(|arg| self.program.expressions.get(arg.value))
+        else {
+            return open_object_type();
+        };
+        self.static_expr_type(new_expr, &mut BTreeSet::new())
+            .unwrap_or_else(open_object_type)
+    }
+
+    fn static_expr_type(
+        &self,
+        expr: &AstExpr,
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        match &expr.kind {
+            AstExprKind::Call { function, args } => {
+                if self.render_contracts.is_render_constructor(function) {
+                    return Some(renderable_contract_type());
+                }
+                self.user_function_return_type(function, active_functions)
+                    .or_else(|| {
+                        Some(
+                            self.builtins
+                                .type_for_call(function, &self.render_contracts),
+                        )
+                    })
+                    .filter(|ty| !matches!(ty, Type::Unknown))
+                    .or_else(|| {
+                        args.iter().find_map(|arg| {
+                            self.program
+                                .expressions
+                                .get(arg.value)
+                                .and_then(|arg_expr| {
+                                    self.static_expr_type(arg_expr, active_functions)
+                                })
+                        })
+                    })
+            }
+            AstExprKind::Pipe { input, op, args } => {
+                if op == "List/map" {
+                    Some(Type::List(Box::new(
+                        self.static_list_map_result_item_type(args, active_functions),
+                    )))
+                } else if self.render_contracts.is_render_constructor(op) {
+                    Some(renderable_contract_type())
+                } else {
+                    self.user_function_return_type(op, active_functions)
+                        .or_else(|| Some(self.builtins.type_for_call(op, &self.render_contracts)))
+                        .filter(|ty| !matches!(ty, Type::Unknown))
+                        .or_else(|| {
+                            self.program.expressions.get(*input).and_then(|input_expr| {
+                                self.static_expr_type(input_expr, active_functions)
+                            })
+                        })
+                }
+            }
+            AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+                Some(Type::Object(ObjectShape {
+                    fields: fields
+                        .iter()
+                        .map(|field| {
+                            (
+                                field.name.clone(),
+                                self.program
+                                    .expressions
+                                    .get(field.value)
+                                    .and_then(|field_expr| {
+                                        self.static_expr_type(field_expr, active_functions)
+                                    })
+                                    .unwrap_or_else(open_object_type),
+                            )
+                        })
+                        .collect(),
+                    open: false,
+                }))
+            }
+            AstExprKind::TaggedObject { tag, fields } => {
+                Some(Type::VariantSet(vec![Variant::Tagged {
+                    tag: tag.clone(),
+                    fields: ObjectShape {
+                        fields: fields
+                            .iter()
+                            .map(|field| {
+                                (
+                                    field.name.clone(),
+                                    self.program
+                                        .expressions
+                                        .get(field.value)
+                                        .and_then(|field_expr| {
+                                            self.static_expr_type(field_expr, active_functions)
+                                        })
+                                        .unwrap_or_else(open_object_type),
+                                )
+                            })
+                            .collect(),
+                        open: false,
+                    },
+                }]))
+            }
+            AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
+            AstExprKind::Number(_) => Some(Type::Number),
+            AstExprKind::Bool(_) => Some(true_false_type()),
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
+                Some(Type::VariantSet(vec![Variant::Tag(tag.clone())]))
+            }
+            AstExprKind::ListLiteral { .. } => Some(Type::List(Box::new(open_object_type()))),
+            AstExprKind::Infix { op, .. }
+                if matches!(op.as_str(), "==" | ">" | "<" | ">=" | "<=") =>
+            {
+                Some(true_false_type())
+            }
+            AstExprKind::Infix { .. } => Some(Type::Number),
+            _ => None,
+        }
+    }
+
+    fn static_list_map_result_item_type(
+        &self,
+        args: &[AstCallArg],
+        active_functions: &mut BTreeSet<String>,
+    ) -> Type {
+        args.iter()
+            .find(|arg| arg.name.as_deref() == Some("new"))
+            .and_then(|arg| self.program.expressions.get(arg.value))
+            .and_then(|expr| self.static_expr_type(expr, active_functions))
+            .unwrap_or_else(open_object_type)
+    }
+
+    fn user_function_return_type(
+        &self,
+        function: &str,
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        if !active_functions.insert(function.to_owned()) {
+            return None;
+        }
+        let result =
+            find_function_statement(&self.program.ast.statements, function).and_then(|statement| {
+                statement.children.iter().find_map(|child| {
+                    child.expr.and_then(|expr_id| {
+                        self.program
+                            .expressions
+                            .get(expr_id)
+                            .and_then(|expr| self.static_expr_type(expr, active_functions))
+                    })
+                })
+            });
+        active_functions.remove(function);
+        result
+    }
+
+    fn statement_enters_render_context(&self, statement: &AstStatement) -> bool {
+        let AstStatementKind::Function { name, .. } = &statement.kind else {
+            return false;
+        };
+        self.user_function_return_type(name, &mut BTreeSet::new())
+            .is_some_and(|ty| type_contains_renderable(&ty))
     }
 
     fn unresolved_type_variable_count(&mut self) -> usize {
@@ -730,6 +937,17 @@ impl<'a> Checker<'a> {
                     FlowMode::Continuous
                 }
             }
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::MatchArm { output, .. }
+                if output.is_none_or(|output| {
+                    self.program
+                        .expressions
+                        .get(output)
+                        .is_some_and(expr_is_skip)
+                }) =>
+            {
+                FlowMode::Absent
+            }
             _ => FlowMode::Continuous,
         }
     }
@@ -745,6 +963,35 @@ impl<'a> Checker<'a> {
                 .iter()
                 .any(|list| list.name == path || path.ends_with(&format!(".{}", list.name)))
         })
+    }
+
+    fn render_slot_static_list_type(&self, statement: &AstStatement) -> Option<Type> {
+        let expr = self.program.expressions.get(statement.expr?)?;
+        if !matches!(expr.kind, AstExprKind::ListLiteral { .. }) {
+            return None;
+        }
+        if statement.children.is_empty() {
+            return Some(Type::List(Box::new(renderable_contract_type())));
+        }
+        let child_types = statement
+            .children
+            .iter()
+            .filter_map(|child| child.expr)
+            .filter_map(|expr_id| {
+                self.program
+                    .expressions
+                    .get(expr_id)
+                    .and_then(|expr| self.static_expr_type(expr, &mut BTreeSet::new()))
+            })
+            .collect::<Vec<_>>();
+        let item_type = if child_types.iter().any(type_contains_skip) {
+            Type::Skip
+        } else if child_types.iter().all(is_renderable_type) {
+            renderable_contract_type()
+        } else {
+            open_object_type()
+        };
+        Some(Type::List(Box::new(item_type)))
     }
 
     fn record_runtime_list_map(
@@ -785,7 +1032,7 @@ impl<'a> Checker<'a> {
         });
     }
 
-    fn check_true_false_input(&mut self, expr: &AstExpr, input_flow: &FlowType) {
+    fn check_true_false_input(&mut self, expr: &AstExpr, operator: &str, input_flow: &FlowType) {
         if matches!(input_flow.ty, Type::Unknown)
             || is_open_object_type(&input_flow.ty)
             || type_accepts_true_false(&input_flow.ty)
@@ -794,7 +1041,7 @@ impl<'a> Checker<'a> {
         }
         self.diagnostics.push(self.diagnostic_for_expr(
             expr.id,
-            "`Bool/not` expects `True` or `False` tag".to_owned(),
+            format!("`{operator}` expects `True` or `False` tag"),
         ));
     }
 
@@ -810,8 +1057,20 @@ impl<'a> Checker<'a> {
             return;
         };
         let initial_type = self.ensure_expr(*initial).ty;
+        if matches!(initial_type, Type::Skip) {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    *initial,
+                    "`SKIP` cannot initialize a held value".to_owned(),
+                ),
+            );
+            return;
+        }
         for update in hold_update_exprs(statement, &self.program.expressions) {
             let update_type = self.ensure_expr(update).ty;
+            if matches!(update_type, Type::Skip) {
+                continue;
+            }
             if concrete_type_conflict(&initial_type, &update_type) {
                 self.constraints.push(Constraint::FlowCompatible {
                     actual: FlowType {
@@ -826,6 +1085,45 @@ impl<'a> Checker<'a> {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     update,
                     "`HOLD` update must match the held value type".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn check_latest_branch_compatibility(&mut self, statement: &AstStatement) {
+        let Some(expr_id) = statement.expr else {
+            return;
+        };
+        if !matches!(
+            self.program.expressions.get(expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Latest)
+        ) {
+            return;
+        }
+        let mut expected_type: Option<Type> = None;
+        for branch_expr_id in statement.children.iter().filter_map(|child| child.expr) {
+            let branch_type = self.ensure_expr(branch_expr_id).ty;
+            if matches!(branch_type, Type::Skip) {
+                continue;
+            }
+            let Some(expected) = expected_type.as_ref() else {
+                expected_type = Some(branch_type);
+                continue;
+            };
+            if concrete_type_conflict(expected, &branch_type) {
+                self.constraints.push(Constraint::FlowCompatible {
+                    actual: FlowType {
+                        mode: FlowMode::PresentOrAbsent,
+                        ty: branch_type.clone(),
+                    },
+                    expected: FlowType {
+                        mode: FlowMode::PresentOrAbsent,
+                        ty: expected.clone(),
+                    },
+                });
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    branch_expr_id,
+                    "`LATEST` branches must produce compatible data types".to_owned(),
                 ));
             }
         }
@@ -862,6 +1160,129 @@ impl<'a> Checker<'a> {
                     ),
                 ));
             }
+        }
+    }
+
+    fn check_style_args(&mut self, args: &[AstCallArg]) {
+        for arg in args
+            .iter()
+            .filter(|arg| arg.name.as_deref() == Some("style"))
+        {
+            self.check_style_expr(arg.value);
+        }
+    }
+
+    fn check_style_expr(&mut self, expr_id: usize) {
+        let Some(expr) = self.program.expressions.get(expr_id) else {
+            return;
+        };
+        if matches!(
+            expr.kind,
+            AstExprKind::ListLiteral { .. } | AstExprKind::Delimiter
+        ) {
+            return;
+        }
+        let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
+            let ty = self.ensure_expr(expr_id).ty;
+            if !is_open_object_type(&ty) {
+                self.diagnostics
+                    .push(self.diagnostic_for_expr(expr_id, "style must be an object".to_owned()));
+            }
+            return;
+        };
+        let fields = fields.clone();
+        for field in &fields {
+            self.check_style_field(field);
+        }
+    }
+
+    fn check_style_statement(&mut self, statement: &AstStatement) {
+        if let Some(expr_id) = statement.expr {
+            self.check_style_expr(expr_id);
+        }
+        for child in &statement.children {
+            let Some(name) = statement_field(child) else {
+                continue;
+            };
+            if let Some(expr_id) = child.expr {
+                self.check_style_field_value(&name, expr_id);
+            }
+        }
+    }
+
+    fn check_style_field(&mut self, field: &AstRecordField) {
+        self.check_style_field_value(&field.name, field.value);
+    }
+
+    fn check_style_field_value(&mut self, field_name: &str, value_expr_id: usize) {
+        match field_name {
+            "width" | "height" | "padding" | "gap" => {
+                let ty = self.ensure_expr(value_expr_id).ty;
+                if !style_dimension_accepts_type(&ty) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        value_expr_id,
+                        format!("style field `{field_name}` must be a number or `Fill` tag"),
+                    ));
+                }
+            }
+            "font" => self.check_style_nested_object(value_expr_id, |checker, nested| match nested
+                .name
+                .as_str()
+            {
+                "size" => {
+                    let ty = checker.ensure_expr(nested.value).ty;
+                    if !matches!(ty, Type::Number) {
+                        checker.diagnostics.push(checker.diagnostic_for_expr(
+                            nested.value,
+                            "style field `font.size` must be a number".to_owned(),
+                        ));
+                    }
+                }
+                "color" => checker.check_style_color_field("font.color", nested.value),
+                _ => {}
+            }),
+            "background" | "border" | "selected_border" => {
+                let prefix = field_name.to_owned();
+                self.check_style_nested_object(value_expr_id, |checker, nested| {
+                    if nested.name == "color" {
+                        checker.check_style_color_field(&format!("{prefix}.color"), nested.value);
+                    }
+                });
+            }
+            "color" => self.check_style_color_field("color", value_expr_id),
+            _ => {}
+        }
+    }
+
+    fn check_style_nested_object<F>(&mut self, expr_id: usize, mut check_field: F)
+    where
+        F: FnMut(&mut Self, &AstRecordField),
+    {
+        let Some(expr) = self.program.expressions.get(expr_id) else {
+            return;
+        };
+        let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr_id,
+                    "style nested field must be an object".to_owned(),
+                ),
+            );
+            return;
+        };
+        let fields = fields.clone();
+        for field in &fields {
+            check_field(self, field);
+        }
+    }
+
+    fn check_style_color_field(&mut self, field_name: &str, expr_id: usize) {
+        let ty = self.ensure_expr(expr_id).ty;
+        if !style_color_accepts_type(&ty) {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("style field `{field_name}` must be `Oklch[...]`"),
+            ));
         }
     }
 
@@ -1076,38 +1497,73 @@ pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
     number_functions: BTreeSet<&'static str>,
     true_false_functions: BTreeSet<&'static str>,
+    list_functions: BTreeSet<&'static str>,
+    list_item_functions: BTreeSet<&'static str>,
+    open_object_functions: BTreeSet<&'static str>,
 }
 
 impl Default for BuiltinSignatureRegistry {
     fn default() -> Self {
         Self {
-            text_functions: ["Text/empty", "Text/trim", "Text/concat"]
+            text_functions: [
+                "Text/empty",
+                "Text/trim",
+                "Text/concat",
+                "Text/substring",
+                "Error/text",
+            ]
+            .into_iter()
+            .collect(),
+            number_functions: [
+                "Number/add",
+                "Number/subtract",
+                "List/count",
+                "List/sum",
+                "Text/find",
+                "Text/length",
+                "Text/to_number",
+            ]
+            .into_iter()
+            .collect(),
+            true_false_functions: ["Bool/not", "Bool/and", "Text/is_empty", "Text/starts_with"]
                 .into_iter()
                 .collect(),
-            number_functions: ["Number/add", "Number/subtract", "List/count"]
+            list_functions: [
+                "List/map",
+                "List/retain",
+                "List/append",
+                "List/remove",
+                "List/range",
+                "List/chunk",
+                "List/spreadsheet_rows",
+            ]
+            .into_iter()
+            .collect(),
+            list_item_functions: ["List/find", "List/find_value", "List/get"]
                 .into_iter()
                 .collect(),
-            true_false_functions: ["Bool/not", "Bool/and"].into_iter().collect(),
+            open_object_functions: ["WHILE", "Widget/table", "Widget/selected", "Widget/rows"]
+                .into_iter()
+                .collect(),
         }
     }
 }
 
 impl BuiltinSignatureRegistry {
     fn type_for_call(&self, function: &str, render_contracts: &RenderContractRegistry) -> Type {
-        if self.text_functions.contains(function) || function.starts_with("Text/") {
+        if self.text_functions.contains(function) {
             Type::Text
-        } else if self.number_functions.contains(function)
-            || function.starts_with("Number/")
-            || matches!(function, "List/sum")
-        {
+        } else if self.number_functions.contains(function) {
             Type::Number
-        } else if self.true_false_functions.contains(function) || function.starts_with("Bool/") {
+        } else if self.true_false_functions.contains(function) {
             true_false_type()
-        } else if function.starts_with("List/") {
+        } else if self.list_functions.contains(function) {
             Type::List(Box::new(open_object_type()))
-        } else if function == "WHILE" {
+        } else if self.list_item_functions.contains(function) {
             open_object_type()
-        } else if function.starts_with("Error/") {
+        } else if self.open_object_functions.contains(function) {
+            open_object_type()
+        } else if function == "Error/new" {
             Type::VariantSet(vec![Variant::Tagged {
                 tag: "Error".to_owned(),
                 fields: ObjectShape {
@@ -1115,8 +1571,6 @@ impl BuiltinSignatureRegistry {
                     open: true,
                 },
             }])
-        } else if function.starts_with("Widget/") {
-            open_object_type()
         } else if render_contracts.is_render_constructor(function) {
             renderable_contract_type()
         } else {
@@ -1172,12 +1626,36 @@ fn type_accepts_true_false(ty: &Type) -> bool {
         .all(|variant| matches!(variant, Variant::Tag(tag) if tag == "True" || tag == "False"))
 }
 
+fn style_dimension_accepts_type(ty: &Type) -> bool {
+    matches!(ty, Type::Number)
+        || matches!(
+            ty,
+            Type::VariantSet(variants)
+                if variants.iter().all(|variant| {
+                    matches!(variant, Variant::Tag(tag) if tag == "Fill")
+                })
+        )
+}
+
+fn style_color_accepts_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::VariantSet(variants)
+            if variants.iter().all(|variant| {
+                matches!(variant, Variant::Tagged { tag, .. } if tag == "Oklch")
+            })
+    )
+}
+
 fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
     match (left, right) {
         (Type::Unknown, _) | (_, Type::Unknown) => false,
+        (Type::Skip, _) | (_, Type::Skip) => false,
         (left, _) if is_open_object_type(left) => false,
         (_, right) if is_open_object_type(right) => false,
-        (Type::Text, Type::Text) | (Type::Number, Type::Number) => false,
+        (Type::Text, Type::Text)
+        | (Type::Number, Type::Number)
+        | (Type::RenderContract, Type::RenderContract) => false,
         (Type::VariantSet(_), Type::VariantSet(_)) => false,
         (Type::Object(left), Type::Object(right)) => {
             left.fields.iter().any(|(field, left_type)| {
@@ -1313,6 +1791,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         } else {
             "False".to_owned()
         })]),
+        AstExprKind::Tag(value) | AstExprKind::Enum(value) if value == "SKIP" => Type::Skip,
         AstExprKind::Tag(value) | AstExprKind::Enum(value) => {
             Type::VariantSet(vec![Variant::Tag(value.clone())])
         }
@@ -1729,6 +2208,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             }
             Type::VariantSet(variants)
         }
+        (Type::Skip, ty) | (ty, Type::Skip) => ty.clone(),
         (Type::Text, Type::Text) => Type::Text,
         (Type::Number, Type::Number) => Type::Number,
         (Type::List(left), Type::List(right)) => {
@@ -1772,49 +2252,6 @@ fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
     })
 }
 
-fn function_returns_render(
-    function: &str,
-    statements: &[AstStatement],
-    program: &ParsedProgram,
-) -> bool {
-    statements.iter().any(|statement| match &statement.kind {
-        AstStatementKind::Function { name, .. } if name == function => statement
-            .children
-            .iter()
-            .any(|child| statement_returns_render(child, program)),
-        _ => function_returns_render(function, &statement.children, program),
-    })
-}
-
-fn statement_returns_render(statement: &AstStatement, program: &ParsedProgram) -> bool {
-    statement
-        .expr
-        .and_then(|expr_id| program.expressions.get(expr_id))
-        .is_some_and(|expr| expr_returns_render(expr, program))
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_returns_render(child, program))
-}
-
-fn expr_returns_render(expr: &AstExpr, program: &ParsedProgram) -> bool {
-    match &expr.kind {
-        AstExprKind::Call { function, .. } => {
-            function == "Document/new"
-                || function.starts_with("Element/")
-                || function_returns_render(function, &program.ast.statements, program)
-        }
-        AstExprKind::Pipe { input, op, args } => {
-            op.starts_with("Element/")
-                || expr_returns_render(&program.expressions[*input], program)
-                || args
-                    .iter()
-                    .any(|arg| expr_returns_render(&program.expressions[arg.value], program))
-        }
-        _ => false,
-    }
-}
-
 fn scoped_path(scope: &[String], name: &str) -> String {
     if scope.is_empty() {
         name.to_owned()
@@ -1831,7 +2268,63 @@ fn true_false_type() -> Type {
 }
 
 fn renderable_contract_type() -> Type {
-    open_object_type()
+    Type::RenderContract
+}
+
+fn render_slot_accepts_type(slot_name: &str, ty: &Type) -> bool {
+    match slot_name {
+        "items" | "children" => match ty {
+            Type::List(item) => is_renderable_type(item),
+            _ => false,
+        },
+        _ => is_renderable_type(ty),
+    }
+}
+
+fn is_renderable_type(ty: &Type) -> bool {
+    matches!(ty, Type::RenderContract) || is_no_element_type(ty)
+}
+
+fn is_no_element_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::VariantSet(variants)
+            if variants.iter().all(|variant| {
+                matches!(variant, Variant::Tag(tag) if tag == "NoElement")
+            })
+    )
+}
+
+fn type_contains_renderable(ty: &Type) -> bool {
+    match ty {
+        Type::RenderContract => true,
+        Type::List(item) => type_contains_renderable(item),
+        Type::Object(shape) => shape.fields.values().any(type_contains_renderable),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_renderable),
+        }),
+        Type::Function { result, .. } => type_contains_renderable(&result.ty),
+        Type::Text | Type::Number | Type::Skip | Type::Var(_) | Type::Unknown => false,
+    }
+}
+
+fn type_contains_skip(ty: &Type) -> bool {
+    match ty {
+        Type::Skip => true,
+        Type::List(item) => type_contains_skip(item),
+        Type::Object(shape) => shape.fields.values().any(type_contains_skip),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_skip),
+        }),
+        Type::Function { result, .. } => type_contains_skip(&result.ty),
+        Type::Text | Type::Number | Type::RenderContract | Type::Var(_) | Type::Unknown => false,
+    }
+}
+
+fn expr_is_skip(expr: &AstExpr) -> bool {
+    matches!(&expr.kind, AstExprKind::Tag(tag) | AstExprKind::Enum(tag) if tag == "SKIP")
 }
 
 fn open_object_type() -> Type {
@@ -1877,7 +2370,7 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
                 }
             }
         }
-        Type::Text | Type::Number | Type::Unknown => {}
+        Type::Text | Type::Number | Type::Skip | Type::RenderContract | Type::Unknown => {}
     }
 }
 
@@ -2023,6 +2516,70 @@ document:
     }
 
     #[test]
+    fn accepts_function_returning_renderable_list_for_items_without_slot_list_map() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+todos: LIST[4] {}
+FUNCTION todo_row(todo) {
+    Element/label(label: todo.title)
+}
+FUNCTION make_rows(todos) {
+    todos
+    |> List/map(todo, new: todo_row(todo: todo))
+}
+document:
+    root:
+        Element/stripe(
+            items: make_rows(todos: todos)
+        )
+"#;
+        let parsed = boon_parser::parse_source("items-function-list.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let slot = report
+            .render_slot_table
+            .slots
+            .iter()
+            .find(|slot| slot.slot_name == "items")
+            .expect("items slot should be typed");
+        assert!(matches!(
+            &slot.actual_type,
+            Type::List(item) if matches!(**item, Type::RenderContract)
+        ));
+        assert_eq!(report.list_map_binding_count_render_slot_materialization, 0);
+    }
+
+    #[test]
+    fn rejects_list_map_to_data_in_render_slot() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+todos: LIST[4] {}
+document:
+    root:
+        Element/stripe(
+            items:
+                todos
+                |> List/map(todo, new: todo)
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-items-data-map.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert_eq!(report.list_map_binding_count_render_slot_materialization, 0);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected a list of renderable values for `items:`")
+        }));
+    }
+
+    #[test]
     fn rejects_malformed_render_slot_list_map() {
         let source = r#"
 source: SOURCE
@@ -2067,6 +2624,30 @@ document: []
                 .message
                 .contains("`Bool/not` expects `True` or `False` tag")
         }));
+    }
+
+    #[test]
+    fn rejects_bool_and_on_non_true_false_values() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+bad_input: 1 |> Bool/and(True)
+bad_arg: True |> Bool/and(1)
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-bool-and.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("`Bool/and` expects `True` or `False` tag"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2124,6 +2705,42 @@ document: []
     }
 
     #[test]
+    fn rejects_wrong_style_field_types() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+document:
+    root:
+        Element/stripe(
+            style: [
+                width: TEXT { wide }
+                background: [color: Bright]
+                font: [size: Big]
+            ]
+            items: LIST {}
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-style.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("style field `width` must be a number or `Fill` tag")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("style field `background.color` must be `Oklch[...]`")
+        }));
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("style field `font.size` must be a number")
+        }));
+    }
+
+    #[test]
     fn rejects_missing_field_on_known_structural_object() {
         let source = r#"
 source: SOURCE
@@ -2168,6 +2785,89 @@ document: []
             diagnostic
                 .message
                 .contains("`HOLD` update must match the held value type")
+        }));
+    }
+
+    #[test]
+    fn rejects_latest_branches_with_incompatible_data_types() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+bad:
+    LATEST {
+        source |> THEN { 1 }
+        source |> THEN { TEXT { bad } }
+        source |> THEN { SKIP }
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-latest-branches.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`LATEST` branches must produce compatible data types")
+        }));
+    }
+
+    #[test]
+    fn rejects_skip_as_hold_initial_but_allows_absent_updates() {
+        let source = r#"
+source: SOURCE
+bad:
+    SKIP |> HOLD bad {
+        LATEST {}
+    }
+good:
+    TEXT { ok } |> HOLD good {
+        LATEST {
+            source |> THEN { SKIP }
+        }
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-skip-hold.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("`SKIP` cannot initialize a held value"))
+                .count(),
+            1
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("`HOLD` update must match"))
+        );
+    }
+
+    #[test]
+    fn rejects_skip_as_render_value() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                SKIP
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-skip-render.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`SKIP` cannot be used as a render value")
         }));
     }
 
@@ -2235,6 +2935,33 @@ document: []
                 .iter()
                 .any(|entry| { matches!(entry.flow_type.ty, Type::Var(_)) })
         );
+    }
+
+    #[test]
+    fn rejects_unknown_same_prefix_builtin_names() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+bad_bool: True |> Bool/xor()
+bad_text: value |> Text/frob()
+items: LIST {}
+bad_list: items |> List/shuffle()
+document: []
+"#;
+        let parsed = boon_parser::parse_source("unknown-prefixed-builtins.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        for function in ["Bool/xor", "Text/frob", "List/shuffle"] {
+            assert!(
+                report.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains(&format!("unknown function or operator `{function}`"))
+                }),
+                "missing diagnostic for {function}: {:?}",
+                report.diagnostics
+            );
+        }
     }
 
     #[test]

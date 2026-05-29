@@ -936,15 +936,6 @@ fn ast_expr_kind(
             fields: ast_record_fields(&tokens[1..], item, expressions, source),
         };
     }
-    if let Some((left, op, right)) = split_infix(tokens) {
-        let left = parse_ast_expr(left, item, expressions, source);
-        let right = parse_ast_expr(right, item, expressions, source);
-        return AstExprKind::Infix {
-            left,
-            op: op.to_owned(),
-            right,
-        };
-    }
     if let Some(pipe) = find_top_level_pipe(tokens) {
         let input = parse_ast_expr(&tokens[..pipe], item, expressions, source);
         let op = tokens
@@ -974,6 +965,15 @@ fn ast_expr_kind(
             input,
             op,
             args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source),
+        };
+    }
+    if let Some((left, op, right)) = split_infix(tokens) {
+        let left = parse_ast_expr(left, item, expressions, source);
+        let right = parse_ast_expr(right, item, expressions, source);
+        return AstExprKind::Infix {
+            left,
+            op: op.to_owned(),
+            right,
         };
     }
     if let Some((function, args)) = ast_call(tokens, item, expressions, source) {
@@ -2134,6 +2134,40 @@ FUNCTION new_todo(todo) {
             }),
             "THEN should keep nested call output blocks such as Bool/not()"
         );
+    }
+
+    #[test]
+    fn pipe_takes_precedence_over_infix_expression_input() {
+        let program = parse_source(
+            "pipe-infix-precedence.bn",
+            r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+visible: active_count == 0 |> Bool/and(completed_count > 0)
+"#,
+        )
+        .unwrap();
+
+        let pipe = program
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "Bool/and"))
+            .expect("Bool/and pipe should be parsed as the top-level expression");
+        let AstExprKind::Pipe { input, args, .. } = &pipe.kind else {
+            panic!("expected Bool/and pipe");
+        };
+        assert!(matches!(
+            &program.ast.expressions[*input].kind,
+            AstExprKind::Infix { op, .. } if op == "=="
+        ));
+        let arg = args
+            .first()
+            .expect("Bool/and should keep its comparison arg");
+        assert!(matches!(
+            &program.ast.expressions[arg.value].kind,
+            AstExprKind::Infix { op, .. } if op == ">"
+        ));
     }
 
     #[test]

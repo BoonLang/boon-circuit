@@ -1551,6 +1551,7 @@ fn native_document_layout_proof_with_state_mode(
     let parsed = cached_document_program(source_path, source)?;
     let document = boon_parser::parsed_document(&parsed)
         .ok_or("source does not contain a parseable document block")?;
+    let typecheck_report = boon_typecheck::check(&parsed);
     let runtime_state = runtime_state_override
         .cloned()
         .or_else(|| runtime_document_state_summary_for_source(source_path, source).ok());
@@ -1573,6 +1574,7 @@ fn native_document_layout_proof_with_state_mode(
             &mut source_intents,
             &mut seen_ids,
             &eval_context,
+            &typecheck_report,
             "",
             true,
         );
@@ -1626,10 +1628,16 @@ fn native_document_layout_proof_with_state_mode(
     );
     let artifact_path =
         PathBuf::from("target/artifacts/native-gpu/document-layout").join(&artifact_name);
+    let typecheck_report_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&typecheck_report)?);
+    let render_slot_table_hash =
+        boon_runtime::sha256_bytes(&serde_json::to_vec(&typecheck_report.render_slot_table)?);
     let (artifact_sha256, layout_frame_hash) = if write_artifact {
         let artifact = json!({
             "source_path": source_path,
             "source_sha256": source_sha256,
+            "typecheck_report_hash": typecheck_report_hash,
+            "render_slot_table_hash": render_slot_table_hash,
+            "typed_render_metadata_used": typecheck_report.render_slot_count > 0,
             "document_frame": frame,
             "layout_frame": layout,
             "source_intents": source_intents,
@@ -1693,9 +1701,14 @@ fn native_document_layout_proof_with_state_mode(
 
     let proof = json!({
         "status": "pass",
-        "lowering": "boon_parser_document_ast_to_boon_document_model",
+        "lowering": "boon_typecheck_render_slots_to_boon_document_model",
         "source_path": source_path,
         "source_sha256": source_sha256,
+        "typecheck_report_hash": typecheck_report_hash,
+        "render_slot_table_hash": render_slot_table_hash,
+        "typed_render_metadata_used": typecheck_report.render_slot_count > 0,
+        "unresolved_type_variable_count": typecheck_report.unresolved_type_variable_count,
+        "render_slot_failure_count": typecheck_report.render_slot_failure_count,
         "artifact_path": if write_artifact { json!(artifact_path) } else { serde_json::Value::Null },
         "artifact_sha256": artifact_sha256,
         "layout_frame_hash": layout_frame_hash,
@@ -8811,6 +8824,7 @@ fn lower_canonical_document_entry(
     source_intents: &mut Vec<serde_json::Value>,
     seen_ids: &mut BTreeSet<String>,
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
     is_root_child: bool,
 ) {
@@ -8824,6 +8838,7 @@ fn lower_canonical_document_entry(
             source_intents,
             seen_ids,
             context,
+            typecheck_report,
             scope_key,
             is_root_child,
         );
@@ -8844,6 +8859,7 @@ fn lower_canonical_document_entry(
                 source_intents,
                 seen_ids,
                 &scoped,
+                typecheck_report,
                 scope_key,
                 is_root_child,
             );
@@ -8860,6 +8876,7 @@ fn lower_canonical_document_entry(
         source_intents,
         seen_ids,
         context,
+        typecheck_report,
         scope_key,
     );
 }
@@ -8953,6 +8970,7 @@ fn lower_canonical_document_element(
     source_intents: &mut Vec<serde_json::Value>,
     seen_ids: &mut BTreeSet<String>,
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
     is_root_child: bool,
 ) {
@@ -8966,6 +8984,7 @@ fn lower_canonical_document_element(
             source_intents,
             seen_ids,
             context,
+            typecheck_report,
             scope_key,
         );
         return;
@@ -9060,6 +9079,7 @@ fn lower_canonical_document_element(
         source_intents,
         seen_ids,
         context,
+        typecheck_report,
         scope_key,
     );
 }
@@ -9095,16 +9115,21 @@ fn lower_mapped_document_children(
     source_intents: &mut Vec<serde_json::Value>,
     seen_ids: &mut BTreeSet<String>,
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
 ) -> bool {
-    let Some(mapped) = boon_parser::document_mapped_children(statement, expressions) else {
+    let Some(mapped) = typechecked_render_slot_list_map_binding(statement.id, typecheck_report)
+    else {
         return false;
     };
-    let Some(function) = functions.get(mapped.template.function_name) else {
+    let Some(function_name) = mapped.template_function.as_deref() else {
+        return true;
+    };
+    let Some(function) = functions.get(function_name) else {
         return true;
     };
     let Some(list_path) = expressions
-        .get(mapped.list_expr)
+        .get(mapped.list_expr_id)
         .and_then(|expr| document_expr_value(expr, expressions))
     else {
         return true;
@@ -9125,22 +9150,27 @@ fn lower_mapped_document_children(
         };
         item_context
             .locals
-            .insert(mapped.item_name.to_owned(), item.clone());
-        let scoped = if let Some(args) = mapped.template.args {
-            document_function_args_context(function, args, expressions, &item_context)
+            .insert(mapped.item_binding_name.clone(), item.clone());
+        let scoped = if !mapped.template_args.is_empty() {
+            document_function_args_context(
+                function,
+                &mapped.template_args,
+                expressions,
+                &item_context,
+            )
         } else {
             document_function_item_context(
                 function,
-                mapped.item_expr,
+                mapped.item_expr_id,
                 expressions,
                 item,
                 &item_context,
             )
         };
         let child_scope = if scope_key.is_empty() {
-            format!("{}-{}", mapped.item_name, index)
+            format!("{}-{}", mapped.item_binding_name, index)
         } else {
-            format!("{scope_key}-{}-{index}", mapped.item_name)
+            format!("{scope_key}-{}-{index}", mapped.item_binding_name)
         };
         for child in &function.children {
             lower_canonical_document_entry(
@@ -9152,12 +9182,26 @@ fn lower_mapped_document_children(
                 source_intents,
                 seen_ids,
                 &scoped,
+                typecheck_report,
                 &child_scope,
                 false,
             );
         }
     }
     true
+}
+
+fn typechecked_render_slot_list_map_binding<'a>(
+    statement_id: usize,
+    typecheck_report: &'a boon_typecheck::TypeCheckReport,
+) -> Option<&'a boon_typecheck::ListMapBinding> {
+    let slot = typecheck_report
+        .render_slot_table
+        .slots
+        .iter()
+        .find(|slot| slot.slot_statement_id == statement_id)?;
+    let binding_id = slot.optional_list_map_binding_id?;
+    typecheck_report.list_map_bindings.get(binding_id)
 }
 
 struct DocumentChildWindow {
@@ -9183,6 +9227,7 @@ fn lower_canonical_child_elements(
     source_intents: &mut Vec<serde_json::Value>,
     seen_ids: &mut BTreeSet<String>,
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
 ) {
     for child in &statement.children {
@@ -9197,6 +9242,7 @@ fn lower_canonical_child_elements(
                 source_intents,
                 seen_ids,
                 context,
+                typecheck_report,
                 scope_key,
             )
         {
@@ -9226,6 +9272,7 @@ fn lower_canonical_child_elements(
                 source_intents,
                 seen_ids,
                 context,
+                typecheck_report,
                 scope_key,
                 false,
             );
@@ -9249,6 +9296,7 @@ fn lower_canonical_child_elements(
                     source_intents,
                     seen_ids,
                     context,
+                    typecheck_report,
                     scope_key,
                     false,
                 );
@@ -9530,7 +9578,7 @@ fn record_fields_for_statement<'a>(
 
 fn record_fields_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<&[AstRecordField]> {
     match &expressions.get(expr_id)?.kind {
-        AstExprKind::Record(fields) => Some(fields.as_slice()),
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(fields.as_slice()),
         _ => None,
     }
 }
@@ -9669,7 +9717,12 @@ fn document_text_value_for_expr(
                 Some(value.clone())
             }
         }
-        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Number(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
+            Some(value.clone())
+        }
+        AstExprKind::TaggedObject { tag, fields } => {
+            Some(tagged_document_object_value(tag, fields, expressions))
+        }
         AstExprKind::Bool(value) => Some(value.to_string()),
         _ => document_eval_expr_value(expr, expressions, context)
             .map(|value| json_value_to_document_text(&value))
@@ -10120,7 +10173,11 @@ fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String
         | AstExprKind::TextLiteral(value)
         | AstExprKind::Number(value)
         | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
         | AstExprKind::Identifier(value) => Some(value.clone()),
+        AstExprKind::TaggedObject { tag, fields } => {
+            Some(tagged_document_object_value(tag, fields, expressions))
+        }
         AstExprKind::Bool(value) => Some(value.to_string()),
         AstExprKind::Path(parts) => Some(parts.join(".")),
         AstExprKind::Pipe { input, op, args } => {
@@ -10147,11 +10204,24 @@ fn document_expr_value(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String
             }
             Some(value)
         }
-        AstExprKind::Unknown(tokens) if tokens.first().map(String::as_str) == Some("Oklch") => {
-            Some(tokens.join(""))
-        }
         _ => None,
     }
+}
+
+fn tagged_document_object_value(
+    tag: &str,
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+) -> String {
+    let body = fields
+        .iter()
+        .filter_map(|field| {
+            let value = document_expr_value(expressions.get(field.value)?, expressions)?;
+            Some(format!("{}:{value}", field.name))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{tag}[{body}]")
 }
 
 fn document_text_value(
@@ -10180,7 +10250,12 @@ fn document_text_value(
                 Some(value.clone())
             }
         }
-        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Number(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
+            Some(value.clone())
+        }
+        AstExprKind::TaggedObject { tag, fields } => {
+            Some(tagged_document_object_value(tag, fields, expressions))
+        }
         AstExprKind::Bool(value) => Some(value.to_string()),
         _ => document_eval_expr_value(expr, expressions, context)
             .map(|value| json_value_to_document_text(&value))
@@ -10259,11 +10334,14 @@ fn document_eval_expr_value(
                 Some(Value::String(value.clone()))
             }
         }
-        AstExprKind::TextLiteral(value) | AstExprKind::Enum(value) => {
+        AstExprKind::TextLiteral(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
             Some(Value::String(value.clone()))
         }
-        AstExprKind::Number(value) => value.parse::<i64>().ok().map(|value| json!(value)),
+        AstExprKind::Number(value) => value.parse::<f64>().ok().map(|value| json!(value)),
         AstExprKind::Bool(value) => Some(Value::Bool(*value)),
+        AstExprKind::TaggedObject { tag, fields } => Some(Value::String(
+            tagged_document_object_value(tag, fields, expressions),
+        )),
         AstExprKind::Infix { left, op, right } => {
             let left = document_eval_expr_value(expressions.get(*left)?, expressions, context)?;
             let right = document_eval_expr_value(expressions.get(*right)?, expressions, context)?;

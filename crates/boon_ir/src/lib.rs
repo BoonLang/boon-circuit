@@ -26,6 +26,7 @@ pub struct TypedProgram {
     pub list_projections: Vec<ListProjection>,
     pub functions: Vec<FunctionDefinition>,
     pub view_bindings: Vec<ViewBinding>,
+    pub typecheck_report: boon_typecheck::TypeCheckReport,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
 }
@@ -467,6 +468,19 @@ pub enum ViewBindingKind {
 }
 
 pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
+    let typecheck_report = boon_typecheck::check(program);
+    if typecheck_report.has_errors() {
+        let messages = typecheck_report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "typecheck failed with {} diagnostic(s): {messages}",
+            typecheck_report.diagnostics.len(),
+        ));
+    }
     let nodes = source_driven_nodes(program);
     let fields = typed_field_defs(program);
     let row_scopes = row_scopes(program);
@@ -531,7 +545,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     let list_projections = list_projections(program);
     let functions = function_definitions(program);
     let derived_values = derived_values(program, &row_scopes, &fields, &state_cells);
-    let view_bindings = view_bindings(program, &row_scopes, &sources);
+    let view_bindings = view_bindings(program, &row_scopes, &sources, &typecheck_report);
     let expression_coverage = expression_coverage(
         program,
         &nodes,
@@ -557,6 +571,7 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
         list_projections,
         functions,
         view_bindings,
+        typecheck_report,
         derived_values,
         state_cells,
         lists,
@@ -975,6 +990,7 @@ fn view_bindings(
     program: &ParsedProgram,
     row_scopes: &[RowScope],
     sources: &[SourcePort],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
 ) -> Vec<ViewBinding> {
     let source_paths = sources
         .iter()
@@ -989,6 +1005,7 @@ fn view_bindings(
             &document_functions,
             row_scopes,
             &source_paths,
+            typecheck_report,
             &mut bindings,
             &mut Vec::new(),
             &DocumentViewBindingContext::default(),
@@ -1148,6 +1165,7 @@ fn collect_document_view_bindings(
     functions: &DocumentViewFunctionRegistry<'_>,
     row_scopes: &[RowScope],
     source_paths: &[(&str, SourceId)],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     bindings: &mut Vec<ViewBinding>,
     function_stack: &mut Vec<String>,
     context: &DocumentViewBindingContext,
@@ -1156,18 +1174,17 @@ fn collect_document_view_bindings(
         if matches!(
             document_statement_field(statement).as_deref(),
             Some("items" | "children")
-        ) && let Some(mapped) = boon_parser::document_mapped_children(statement, expressions)
+        ) && let Some(binding) = render_slot_list_map_binding(statement.id, typecheck_report)
         {
-            if let Some(function_statement) = functions.get(mapped.template.function_name)
-                && !function_stack
-                    .iter()
-                    .any(|active| active == mapped.template.function_name)
+            if let Some(function_name) = binding.template_function.as_deref()
+                && let Some(function_statement) = functions.get(function_name)
+                && !function_stack.iter().any(|active| active == function_name)
             {
-                function_stack.push(mapped.template.function_name.to_owned());
-                let scoped_context = if let Some(args) = mapped.template.args {
-                    context.with_function_args(function_statement, args)
+                function_stack.push(function_name.to_owned());
+                let scoped_context = if !binding.template_args.is_empty() {
+                    context.with_function_args(function_statement, &binding.template_args)
                 } else {
-                    context.with_function_item_expr(function_statement, mapped.item_expr)
+                    context.with_function_item_expr(function_statement, binding.item_expr_id)
                 };
                 collect_document_view_bindings(
                     &function_statement.children,
@@ -1175,6 +1192,7 @@ fn collect_document_view_bindings(
                     functions,
                     row_scopes,
                     source_paths,
+                    typecheck_report,
                     bindings,
                     function_stack,
                     &scoped_context,
@@ -1208,6 +1226,7 @@ fn collect_document_view_bindings(
                 functions,
                 row_scopes,
                 source_paths,
+                typecheck_report,
                 bindings,
                 function_stack,
                 &scoped_context,
@@ -1232,11 +1251,25 @@ fn collect_document_view_bindings(
             functions,
             row_scopes,
             source_paths,
+            typecheck_report,
             bindings,
             function_stack,
             context,
         );
     }
+}
+
+fn render_slot_list_map_binding<'a>(
+    statement_id: usize,
+    typecheck_report: &'a boon_typecheck::TypeCheckReport,
+) -> Option<&'a boon_typecheck::ListMapBinding> {
+    let slot = typecheck_report
+        .render_slot_table
+        .slots
+        .iter()
+        .find(|slot| slot.slot_statement_id == statement_id)?;
+    let binding_id = slot.optional_list_map_binding_id?;
+    typecheck_report.list_map_bindings.get(binding_id)
 }
 
 fn collect_canonical_element_view_bindings(
@@ -1503,7 +1536,7 @@ fn record_fields_for_statement<'a>(
 
 fn record_fields_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<&[AstRecordField]> {
     match &expressions.get(expr_id)?.kind {
-        AstExprKind::Record(fields) => Some(fields.as_slice()),
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(fields.as_slice()),
         _ => None,
     }
 }
@@ -1555,7 +1588,12 @@ fn document_expr_value(
 ) -> Option<String> {
     match &expr.kind {
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
-        AstExprKind::Number(value) | AstExprKind::Enum(value) => Some(value.clone()),
+        AstExprKind::Number(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
+            Some(value.clone())
+        }
+        AstExprKind::TaggedObject { tag, fields } => {
+            Some(tagged_object_value(tag, fields, expressions, context))
+        }
         AstExprKind::Identifier(value) => context
             .arg_expr(value)
             .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context))
@@ -1588,6 +1626,23 @@ fn document_expr_value(
         }
         _ => None,
     }
+}
+
+fn tagged_object_value(
+    tag: &str,
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> String {
+    let body = fields
+        .iter()
+        .filter_map(|field| {
+            let value = document_expr_value_by_id(field.value, expressions, context)?;
+            Some(format!("{}:{value}", field.name))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{tag}[{body}]")
 }
 
 fn require_known_symbol(
@@ -2012,6 +2067,9 @@ pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
         "list_projections": program.list_projections,
         "functions": program.functions,
         "view_bindings": program.view_bindings,
+        "typecheck_report": program.typecheck_report,
+        "render_slot_table": program.typecheck_report.render_slot_table,
+        "list_map_bindings": program.typecheck_report.list_map_bindings,
     })
 }
 
@@ -2192,8 +2250,11 @@ fn expression_ir_node_kind(expr: &AstExpr) -> Option<IrNodeKind> {
         | AstExprKind::Number(_)
         | AstExprKind::Bool(_)
         | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::TaggedObject { .. }
         | AstExprKind::Infix { .. }
-        | AstExprKind::Record(_) => Some(IrNodeKind::PureCall),
+        | AstExprKind::Record(_)
+        | AstExprKind::Object(_) => Some(IrNodeKind::PureCall),
         AstExprKind::MatchArm { .. } | AstExprKind::Delimiter | AstExprKind::Unknown(_) => None,
     }
 }
@@ -2241,9 +2302,10 @@ fn expression_is_indexed(_expr: &AstExpr, kind: &IrNodeKind) -> bool {
 
 fn ast_expr_label(expr: &AstExpr) -> String {
     match &expr.kind {
-        AstExprKind::Identifier(name) | AstExprKind::Number(name) | AstExprKind::Enum(name) => {
-            format!("{:?}", name)
-        }
+        AstExprKind::Identifier(name)
+        | AstExprKind::Number(name)
+        | AstExprKind::Enum(name)
+        | AstExprKind::Tag(name) => format!("{:?}", name),
         AstExprKind::Unknown(tokens) => tokens.join("_"),
         AstExprKind::Delimiter => "delimiter".to_owned(),
         AstExprKind::Path(parts) => parts.join("."),
@@ -2259,7 +2321,8 @@ fn ast_expr_label(expr: &AstExpr) -> String {
         AstExprKind::Then { .. } => "then".to_owned(),
         AstExprKind::Infix { op, .. } => format!("infix_{op}"),
         AstExprKind::MatchArm { .. } => "match_arm".to_owned(),
-        AstExprKind::Record(_) => "record".to_owned(),
+        AstExprKind::Record(_) | AstExprKind::Object(_) => "object".to_owned(),
+        AstExprKind::TaggedObject { tag, .. } => format!("tagged_object_{tag}"),
         AstExprKind::ListLiteral { .. } => "list".to_owned(),
     }
 }
@@ -2564,10 +2627,12 @@ fn ast_initial_value(
                 summary: value.clone(),
             }),
         AstExprKind::Bool(value) => InitialValue::Bool { value: *value },
-        AstExprKind::Enum(value) if value == "Text/empty" => InitialValue::Text {
-            value: String::new(),
-        },
-        AstExprKind::Enum(value) => InitialValue::Enum {
+        AstExprKind::Enum(value) | AstExprKind::Tag(value) if value == "Text/empty" => {
+            InitialValue::Text {
+                value: String::new(),
+            }
+        }
+        AstExprKind::Enum(value) | AstExprKind::Tag(value) => InitialValue::Enum {
             value: value.clone(),
         },
         AstExprKind::Path(parts) if parts.as_slice() == ["Text/empty"] => InitialValue::Text {
@@ -2806,9 +2871,10 @@ fn scalar_number_operand(field: &FieldDef, expr_id: usize, target: &str) -> Opti
 fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
     let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
     Some(match &expr.kind {
-        AstExprKind::Identifier(value) | AstExprKind::Enum(value) | AstExprKind::Number(value) => {
-            value.clone()
-        }
+        AstExprKind::Identifier(value)
+        | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
+        | AstExprKind::Number(value) => value.clone(),
         AstExprKind::Path(parts) => parts.join("."),
         AstExprKind::Bool(true) => "True".to_owned(),
         AstExprKind::Bool(false) => "False".to_owned(),
@@ -2825,6 +2891,8 @@ fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<Stri
         | AstExprKind::Infix { .. }
         | AstExprKind::MatchArm { .. }
         | AstExprKind::Record(_)
+        | AstExprKind::Object(_)
+        | AstExprKind::TaggedObject { .. }
         | AstExprKind::ListLiteral { .. } => ast_expr_label(expr),
     })
 }
@@ -2834,6 +2902,7 @@ fn ast_simple_update_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option
     match &expr.kind {
         AstExprKind::Identifier(value)
         | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
         | AstExprKind::Number(value)
         | AstExprKind::StringLiteral(value)
         | AstExprKind::TextLiteral(value) => Some(value.clone()),
@@ -2871,7 +2940,7 @@ fn list_append_fields(field: &FieldDef) -> Vec<ListAppendField> {
         .iter()
         .filter(|expr| expr.id > append_expr.id)
         .find_map(|expr| match &expr.kind {
-            AstExprKind::Record(fields) => Some(
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(
                 fields
                     .iter()
                     .filter_map(|record_field| {
@@ -3842,7 +3911,12 @@ fn collect_expr_tree(
                 collect_expr_tree(*output, program, seen, exprs);
             }
         }
-        AstExprKind::Record(fields) => {
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+            for field in fields {
+                collect_expr_tree(field.value, program, seen, exprs);
+            }
+        }
+        AstExprKind::TaggedObject { fields, .. } => {
             for field in fields {
                 collect_expr_tree(field.value, program, seen, exprs);
             }
@@ -3854,6 +3928,7 @@ fn collect_expr_tree(
         | AstExprKind::Number(_)
         | AstExprKind::Bool(_)
         | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest
         | AstExprKind::ListLiteral { .. }

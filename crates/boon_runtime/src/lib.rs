@@ -632,6 +632,8 @@ pub fn run_source_initial_state(
     let capacity_report = runtime_profile.capacity_report(&ir);
     let generic_runtime_slices = generic_runtime_slices_report(&ir, &compiled);
     let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(&ir, &compiled);
+    let typecheck_report_hash = typecheck_report_hash(&ir);
+    let render_slot_table_hash = render_slot_table_hash(&ir);
     let report = json!({
         "status": "pass",
         "command": "playground-initial-state",
@@ -643,6 +645,12 @@ pub fn run_source_initial_state(
         "program_kind": "generic",
         "expression_count": ir.expression_count,
         "expression_coverage": &ir.expression_coverage,
+        "typecheck_report_hash": typecheck_report_hash,
+        "render_slot_table_hash": render_slot_table_hash,
+        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
+        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
+        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
+        "typecheck_report": &ir.typecheck_report,
         "graph_node_count": ir.graph_node_count,
         "graph_rebuild_count": 0,
         "graph_clones_per_item": 0,
@@ -673,6 +681,11 @@ pub fn run_source_initial_state(
             "runtime_profile_detail": runtime_profile_detail,
             "capacities": capacity_report,
             "expression_coverage": &ir.expression_coverage,
+            "typecheck_report_hash": typecheck_report_hash,
+            "render_slot_table_hash": render_slot_table_hash,
+            "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
+            "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
+            "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
             "generic_interpreter_complete": derive_generic_interpreter_complete(&ir, &compiled, &generic_runtime_slices),
             "example_behavior_adapter": derive_example_behavior_adapter(&compiled, &generic_runtime_slices),
             "adapter_kind": "generic",
@@ -2196,6 +2209,8 @@ fn base_example_report(
     let runtime_profile = RuntimeProfile::from_ir(ir);
     let capacity_report = runtime_profile.capacity_report(ir);
     let runtime_profile_detail = runtime_profile.detail_report(ir);
+    let typecheck_report_hash = typecheck_report_hash(ir);
+    let render_slot_table_hash = render_slot_table_hash(ir);
     let runtime_execution = json!({
         "implementation": implementation,
         "source_loaded_from_boon": true,
@@ -2205,6 +2220,11 @@ fn base_example_report(
         "runtime_profile_detail": runtime_profile_detail,
         "capacities": capacity_report,
         "expression_coverage": &ir.expression_coverage,
+        "typecheck_report_hash": typecheck_report_hash,
+        "render_slot_table_hash": render_slot_table_hash,
+        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
+        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
+        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
         "generic_interpreter_complete": generic_interpreter_complete,
         "example_behavior_adapter": example_behavior_adapter,
         "adapter_kind": "generic",
@@ -2235,6 +2255,12 @@ fn base_example_report(
         "program_hash": program_hash,
         "expression_count": ir.expression_count,
         "expression_coverage": &ir.expression_coverage,
+        "typecheck_report_hash": typecheck_report_hash,
+        "render_slot_table_hash": render_slot_table_hash,
+        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
+        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
+        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
+        "typecheck_report": &ir.typecheck_report,
         "total_ticks": scenario.step.len(),
         "total_source_events": scenario.step.iter().filter(|step| step.expected_source_event.is_some()).count(),
         "total_semantic_deltas": semantic_deltas.len(),
@@ -5270,7 +5296,15 @@ impl GenericScheduledRuntime {
                 .map(BoonValue::Number)
                 .unwrap_or(BoonValue::NaN)),
             AstExprKind::Bool(value) => Ok(BoonValue::Bool(value)),
-            AstExprKind::Enum(value) => Ok(BoonValue::Text(value)),
+            AstExprKind::Enum(value) | AstExprKind::Tag(value) => Ok(BoonValue::Text(value)),
+            AstExprKind::TaggedObject { tag, fields } => {
+                let mut body = Vec::new();
+                for field in fields {
+                    let value = boon_value_scalar_text(&self.eval_expr(field.value, frame)?);
+                    body.push(format!("{}:{}", field.name, value));
+                }
+                Ok(BoonValue::Text(format!("{tag}[{}]", body.join(","))))
+            }
             AstExprKind::Call { function, args } => self.eval_call(&function, &args, None, frame),
             AstExprKind::Pipe { input, op, args } => {
                 let value = if self
@@ -5290,7 +5324,7 @@ impl GenericScheduledRuntime {
                 let right = self.eval_expr(right, frame)?;
                 Ok(generic_infix_value(left, &op, right))
             }
-            AstExprKind::Record(fields) => {
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
                 let mut record = BTreeMap::new();
                 for field in fields {
                     let value = self.eval_expr(field.value, frame)?;
@@ -8909,6 +8943,22 @@ enum BoonValue {
     Error(String),
 }
 
+fn boon_value_scalar_text(value: &BoonValue) -> String {
+    match value {
+        BoonValue::Text(value) => value.clone(),
+        BoonValue::Number(value) => value.to_string(),
+        BoonValue::Bool(true) => "True".to_owned(),
+        BoonValue::Bool(false) => "False".to_owned(),
+        BoonValue::Empty => String::new(),
+        BoonValue::NaN => "NaN".to_owned(),
+        BoonValue::Error(value) => value.clone(),
+        BoonValue::Record(_)
+        | BoonValue::List(_)
+        | BoonValue::RowRef { .. }
+        | BoonValue::ListRef(_) => String::new(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GenericEvalRow {
     list: String,
@@ -11482,6 +11532,18 @@ fn git_commit() -> String {
                 .unwrap_or_else(|| "unknown".to_owned())
         })
         .clone()
+}
+
+fn typecheck_report_hash(ir: &TypedProgram) -> String {
+    serde_json::to_vec(&ir.typecheck_report)
+        .map(|bytes| sha256_bytes(&bytes))
+        .unwrap_or_else(|_| "unserializable-typecheck-report".to_owned())
+}
+
+fn render_slot_table_hash(ir: &TypedProgram) -> String {
+    serde_json::to_vec(&ir.typecheck_report.render_slot_table)
+        .map(|bytes| sha256_bytes(&bytes))
+        .unwrap_or_else(|_| "unserializable-render-slot-table".to_owned())
 }
 
 fn current_binary_hash() -> String {

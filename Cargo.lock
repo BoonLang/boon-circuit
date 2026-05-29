@@ -567,6 +567,7 @@ name = "boon_ir"
 version = "0.1.0"
 dependencies = [
  "boon_parser",
+ "boon_typecheck",
  "serde",
  "serde_json",
 ]
@@ -612,6 +613,7 @@ dependencies = [
  "boon_native_gpu",
  "boon_parser",
  "boon_runtime",
+ "boon_typecheck",
  "serde",
  "serde_json",
  "toml",
@@ -661,6 +663,15 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "boon_typecheck"
+version = "0.1.0"
+dependencies = [
+ "boon_parser",
+ "ena",
+ "serde",
 ]
 
 [[package]]
@@ -1078,6 +1089,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ena"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
+dependencies = [
+ "log",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/boon_parser",
+    "crates/boon_typecheck",
     "crates/boon_ir",
     "crates/boon_runtime",
     "crates/boon_report_schema",
@@ -26,6 +27,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 boon_parser = { path = "crates/boon_parser" }
+boon_typecheck = { path = "crates/boon_typecheck" }
 boon_ir = { path = "crates/boon_ir" }
 boon_runtime = { path = "crates/boon_runtime" }
 boon_report_schema = { path = "crates/boon_report_schema" }
@@ -41,6 +43,7 @@ serde_json = "1.0"
 toml = "0.9"
 sha2 = "0.10"
 chumsky = "0.9"
+ena = "0.14"
 bitvec = "1.0"
 ropey = "1.6"
 unicode-segmentation = "1.13"

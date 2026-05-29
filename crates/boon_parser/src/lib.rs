@@ -184,6 +184,11 @@ pub enum AstExprKind {
     Number(String),
     Bool(bool),
     Enum(String),
+    Tag(String),
+    TaggedObject {
+        tag: String,
+        fields: Vec<AstRecordField>,
+    },
     Source,
     Call {
         function: String,
@@ -215,6 +220,7 @@ pub enum AstExprKind {
         pattern: Vec<String>,
         output: Option<usize>,
     },
+    Object(Vec<AstRecordField>),
     Record(Vec<AstRecordField>),
     ListLiteral {
         capacity: Option<usize>,
@@ -399,103 +405,6 @@ pub fn parsed_document(program: &ParsedProgram) -> Option<DocumentAst> {
             root,
             expressions: program.ast.expressions.clone(),
         })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DocumentMappedChildren<'a> {
-    pub list_expr: usize,
-    pub item_expr: usize,
-    pub item_name: &'a str,
-    pub template: DocumentChildTemplate<'a>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DocumentChildTemplate<'a> {
-    pub function_name: &'a str,
-    pub args: Option<&'a [AstCallArg]>,
-}
-
-pub fn document_mapped_children<'a>(
-    statement: &'a AstStatement,
-    expressions: &'a [AstExpr],
-) -> Option<DocumentMappedChildren<'a>> {
-    if let Some(expr_id) = statement.expr
-        && let Some(mapped) = document_mapped_children_expr(expr_id, expressions, None)
-    {
-        return Some(mapped);
-    }
-    let mut previous_expr_id = statement.expr;
-    for child in &statement.children {
-        let Some(expr_id) = child.expr else {
-            continue;
-        };
-        if let Some(mapped) = document_mapped_children_expr(expr_id, expressions, previous_expr_id)
-        {
-            return Some(mapped);
-        }
-        previous_expr_id = Some(expr_id);
-    }
-    None
-}
-
-fn document_mapped_children_expr<'a>(
-    expr_id: usize,
-    expressions: &'a [AstExpr],
-    fallback_input: Option<usize>,
-) -> Option<DocumentMappedChildren<'a>> {
-    let expr = expressions.get(expr_id)?;
-    let AstExprKind::Pipe { input, op, args } = &expr.kind else {
-        return None;
-    };
-    if op != "List/map" {
-        return None;
-    }
-    let list_expr = document_pipe_input_expr(*input, expressions, fallback_input)?;
-    let item_arg = args.iter().find(|arg| arg.name.is_none())?;
-    let item_name = document_expr_single_name(expressions.get(item_arg.value)?)?;
-    let new_expr = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("new"))
-        .and_then(|arg| expressions.get(arg.value))?;
-    Some(DocumentMappedChildren {
-        list_expr,
-        item_expr: item_arg.value,
-        item_name,
-        template: document_child_template(new_expr)?,
-    })
-}
-
-fn document_pipe_input_expr(
-    input: usize,
-    expressions: &[AstExpr],
-    fallback_input: Option<usize>,
-) -> Option<usize> {
-    match &expressions.get(input)?.kind {
-        AstExprKind::Delimiter | AstExprKind::Unknown(_) => fallback_input,
-        _ => Some(input),
-    }
-}
-
-fn document_expr_single_name(expr: &AstExpr) -> Option<&str> {
-    match &expr.kind {
-        AstExprKind::Identifier(value) => Some(value.as_str()),
-        AstExprKind::Path(parts) if parts.len() == 1 => Some(parts[0].as_str()),
-        _ => None,
-    }
-}
-
-fn document_child_template(expr: &AstExpr) -> Option<DocumentChildTemplate<'_>> {
-    match &expr.kind {
-        AstExprKind::Call { function, args } => Some(DocumentChildTemplate {
-            function_name: function.as_str(),
-            args: Some(args.as_slice()),
-        }),
-        AstExprKind::Identifier(function) => Some(DocumentChildTemplate {
-            function_name: function.as_str(),
-            args: None,
-        }),
-        _ => None,
-    }
 }
 
 pub fn format_source(
@@ -940,11 +849,8 @@ fn ast_expr_kind(
     if tokens == ["False"] {
         return AstExprKind::Bool(false);
     }
-    if tokens.len() == 1 && tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
-        return AstExprKind::Number(tokens[0].clone());
-    }
-    if tokens.len() == 2 && tokens[0] == "-" && tokens[1].chars().all(|ch| ch.is_ascii_digit()) {
-        return AstExprKind::Number(format!("-{}", tokens[1]));
+    if let Some(number) = ast_number_literal(tokens) {
+        return AstExprKind::Number(number);
     }
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
         return AstExprKind::MatchArm {
@@ -981,7 +887,19 @@ fn ast_expr_kind(
     if tokens.first().map(String::as_str) == Some("[")
         && tokens.last().map(String::as_str) == Some("]")
     {
-        return AstExprKind::Record(ast_record_fields(tokens, item, expressions, source));
+        return AstExprKind::Object(ast_record_fields(tokens, item, expressions, source));
+    }
+    if tokens.len() >= 3
+        && tokens.get(1).map(String::as_str) == Some("[")
+        && tokens.last().map(String::as_str) == Some("]")
+        && tokens
+            .first()
+            .is_some_and(|token| value_starts_uppercase_identifier(token))
+    {
+        return AstExprKind::TaggedObject {
+            tag: tokens[0].clone(),
+            fields: ast_record_fields(&tokens[1..], item, expressions, source),
+        };
     }
     if let Some((left, op, right)) = split_infix(tokens) {
         let left = parse_ast_expr(left, item, expressions, source);
@@ -1026,13 +944,10 @@ fn ast_expr_kind(
     if let Some((function, args)) = ast_call(tokens, item, expressions, source) {
         return AstExprKind::Call { function, args };
     }
-    if tokens.first().map(String::as_str) == Some("Oklch") {
-        return AstExprKind::StringLiteral(tokens.join(""));
-    }
     if tokens.len() == 1 && is_name(&tokens[0]) {
         let token = tokens[0].clone();
         if value_starts_uppercase_identifier(&token) {
-            AstExprKind::Enum(token)
+            AstExprKind::Tag(token)
         } else {
             AstExprKind::Identifier(token)
         }
@@ -1040,6 +955,31 @@ fn ast_expr_kind(
         AstExprKind::Path(path_segments(tokens))
     } else {
         AstExprKind::Unknown(tokens.to_vec())
+    }
+}
+
+fn ast_number_literal(tokens: &[String]) -> Option<String> {
+    match tokens {
+        [value] if value.chars().all(|ch| ch.is_ascii_digit()) => Some(value.clone()),
+        [left, dot, right]
+            if dot == "."
+                && left.chars().all(|ch| ch.is_ascii_digit())
+                && right.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            Some(format!("{left}.{right}"))
+        }
+        [minus, value] if minus == "-" && value.chars().all(|ch| ch.is_ascii_digit()) => {
+            Some(format!("-{value}"))
+        }
+        [minus, left, dot, right]
+            if minus == "-"
+                && dot == "."
+                && left.chars().all(|ch| ch.is_ascii_digit())
+                && right.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            Some(format!("-{left}.{right}"))
+        }
+        _ => None,
     }
 }
 
@@ -1598,7 +1538,6 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
         "item_key",
         "ListKey",
         "Option[ListKey",
-        "TodoId",
         "selected_todo_id",
         "next_todo_id",
         "generation:",
@@ -1613,12 +1552,6 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
         }
     }
     for item in ast.semantic_parser_items() {
-        if item.field.as_deref() == Some("id") {
-            return Err(ParseError {
-                path: path.to_owned(),
-                message: format!("Boon source exposes app-visible `id` at line {}", item.line),
-            });
-        }
         if item.field.as_deref() == Some("alive") {
             return Err(ParseError {
                 path: path.to_owned(),
@@ -2176,6 +2109,42 @@ FUNCTION new_cell(cell) {
     }
 
     #[test]
+    fn parses_structural_objects_tagged_objects_tags_and_decimals() {
+        let source = r#"
+source: SOURCE
+value: 1.25 |> HOLD value { LATEST {} }
+items: LIST[1] {}
+items |> List/map(item, new: item)
+style: [color: Oklch[lightness:0.97,chroma:0.02,hue:18.6], mode: Completed]
+document: []
+"#;
+        let program = parse_source("structural-types.bn", source).unwrap();
+        assert!(
+            program.ast.expressions.iter().any(|expr| {
+                matches!(&expr.kind, AstExprKind::Number(value) if value == "1.25")
+            })
+        );
+        assert!(
+            program.ast.expressions.iter().any(|expr| {
+                matches!(&expr.kind, AstExprKind::Number(value) if value == "0.97")
+            })
+        );
+        assert!(
+            program.ast.expressions.iter().any(|expr| {
+                matches!(&expr.kind, AstExprKind::Tag(value) if value == "Completed")
+            })
+        );
+        assert!(program.ast.expressions.iter().any(|expr| {
+            matches!(&expr.kind, AstExprKind::TaggedObject { tag, fields }
+                if tag == "Oklch" && fields.iter().any(|field| field.name == "lightness"))
+        }));
+        assert!(program.ast.expressions.iter().any(|expr| {
+            matches!(&expr.kind, AstExprKind::Object(fields)
+                if fields.iter().any(|field| field.name == "color"))
+        }));
+    }
+
+    #[test]
     fn row_template_scope_comes_from_list_map_not_function_name() {
         let source = include_str!("../../../examples/todomvc.bn").replace("new_todo", "make_item");
         let program = parse_source("examples/todomvc.bn", source).unwrap();
@@ -2525,10 +2494,9 @@ todos |> List/map(todo, new: new_todo(todo: todo))
     }
 
     #[test]
-    fn rejects_hidden_todo_id() {
+    fn permits_user_structural_id_fields_and_todo_id_tags() {
         let source = "LIST {}\nid: TodoId[id: Ulid/generate()]\nSOURCE\nHOLD\nLATEST\nList/map";
-        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
-        assert!(err.message.contains("hidden runtime identity") || err.message.contains("id"));
+        parse_source("examples/todomvc.bn", source).unwrap();
     }
 
     #[test]
@@ -2618,47 +2586,9 @@ document:
     }
 
     #[test]
-    fn document_mapped_children_resolve_continuation_pipe_input() {
-        let source = r#"
-source: SOURCE
-value: "" |> HOLD value { LATEST {} }
-visible_todos: LIST[4] {}
-FUNCTION todo_row(todo) {
-    Element/label(label: todo.title)
-}
-document:
-    root:
-        Element/stripe(
-            direction: Column
-            items:
-                visible_todos
-                |> List/map(todo, new: todo_row(todo: todo))
-        )
-"#;
-        let parsed = parse_source("document-mapped-children.bn", source).unwrap();
-        let document = parsed_document(&parsed).expect("document should parse");
-        let items = find_statement(&document.root.children, |statement| {
-            matches!(
-                &statement.kind,
-                AstStatementKind::Field { name } if name == "items"
-            )
-        })
-        .expect("items slot should exist");
-        let mapped = document_mapped_children(items, &document.expressions)
-            .expect("items slot should expose mapped children");
-        assert_eq!(mapped.item_name, "todo");
-        assert_eq!(mapped.template.function_name, "todo_row");
-        assert!(matches!(
-            &document.expressions[mapped.list_expr].kind,
-            AstExprKind::Identifier(value) if value == "visible_todos"
-        ));
-    }
-
-    #[test]
-    fn rejects_app_visible_identity_field() {
+    fn permits_app_visible_id_field_as_ordinary_data() {
         let source = "LIST {}\nid: TEXT { exposed }\nSOURCE\nHOLD\nLATEST\nList/map";
-        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
-        assert!(err.message.contains("app-visible `id`"));
+        parse_source("examples/todomvc.bn", source).unwrap();
     }
 
     #[test]

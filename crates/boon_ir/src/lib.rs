@@ -1044,23 +1044,44 @@ impl DocumentViewBindingContext {
         call: &AstStatement,
         expressions: &[AstExpr],
     ) -> Self {
+        if let Some(args) = document_call_args(call, expressions) {
+            return self.with_function_args(function, args);
+        }
+        self.clone()
+    }
+
+    fn with_function_args(
+        &self,
+        function: &AstStatement,
+        args: &[boon_parser::AstCallArg],
+    ) -> Self {
         let mut next = self.clone();
         let formals = match &function.kind {
             AstStatementKind::Function { args, .. } => args.as_slice(),
             _ => &[],
         };
         let mut scope = BTreeMap::new();
-        if let Some(args) = document_call_args(call, expressions) {
-            for (index, arg) in args.iter().enumerate() {
-                let Some(name) = arg
-                    .name
-                    .as_deref()
-                    .or_else(|| formals.get(index).map(String::as_str))
-                else {
-                    continue;
-                };
-                scope.insert(name.to_owned(), arg.value);
-            }
+        for (index, arg) in args.iter().enumerate() {
+            let Some(name) = arg
+                .name
+                .as_deref()
+                .or_else(|| formals.get(index).map(String::as_str))
+            else {
+                continue;
+            };
+            scope.insert(name.to_owned(), arg.value);
+        }
+        next.arg_exprs.push(scope);
+        next
+    }
+
+    fn with_function_item_expr(&self, function: &AstStatement, item_expr_id: usize) -> Self {
+        let mut next = self.clone();
+        let mut scope = BTreeMap::new();
+        if let AstStatementKind::Function { args, .. } = &function.kind
+            && let Some(first_formal) = args.first()
+        {
+            scope.insert(first_formal.clone(), item_expr_id);
         }
         next.arg_exprs.push(scope);
         next
@@ -1132,6 +1153,36 @@ fn collect_document_view_bindings(
     context: &DocumentViewBindingContext,
 ) {
     for statement in statements {
+        if matches!(
+            document_statement_field(statement).as_deref(),
+            Some("items" | "children")
+        ) && let Some(mapped) = boon_parser::document_mapped_children(statement, expressions)
+        {
+            if let Some(function_statement) = functions.get(mapped.template.function_name)
+                && !function_stack
+                    .iter()
+                    .any(|active| active == mapped.template.function_name)
+            {
+                function_stack.push(mapped.template.function_name.to_owned());
+                let scoped_context = if let Some(args) = mapped.template.args {
+                    context.with_function_args(function_statement, args)
+                } else {
+                    context.with_function_item_expr(function_statement, mapped.item_expr)
+                };
+                collect_document_view_bindings(
+                    &function_statement.children,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                    function_stack,
+                    &scoped_context,
+                );
+                function_stack.pop();
+            }
+            continue;
+        }
         if let Some(function) = document_statement_call(statement, expressions)
             && function.starts_with("Element/")
         {

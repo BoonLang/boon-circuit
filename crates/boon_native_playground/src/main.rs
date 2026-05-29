@@ -8870,6 +8870,21 @@ fn document_function_call_context<'a>(
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'a>,
 ) -> DocumentEvalContext<'a> {
+    if let Some(args) = document_call_args(call, expressions) {
+        return document_function_args_context(function, args, expressions, context);
+    }
+    DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+    }
+}
+
+fn document_function_args_context<'a>(
+    function: &AstStatement,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'a>,
+) -> DocumentEvalContext<'a> {
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
@@ -8878,23 +8893,52 @@ fn document_function_call_context<'a>(
         AstStatementKind::Function { args, .. } => args.as_slice(),
         _ => &[],
     };
-    if let Some(args) = document_call_args(call, expressions) {
-        for (index, arg) in args.iter().enumerate() {
-            let Some(name) = arg
-                .name
-                .as_deref()
-                .or_else(|| formals.get(index).map(String::as_str))
-            else {
-                continue;
-            };
-            if let Some(expr) = expressions.get(arg.value) {
-                let value = document_eval_expr_value(expr, expressions, context)
-                    .or_else(|| document_expr_value(expr, expressions).map(Value::String));
-                if let Some(value) = value {
-                    scoped.locals.insert(name.to_owned(), value);
-                }
+    for (index, arg) in args.iter().enumerate() {
+        let Some(name) = arg
+            .name
+            .as_deref()
+            .or_else(|| formals.get(index).map(String::as_str))
+        else {
+            continue;
+        };
+        if let Some(expr) = expressions.get(arg.value) {
+            let value = document_eval_expr_value(expr, expressions, context)
+                .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+            if let Some(value) = value {
+                scoped.locals.insert(name.to_owned(), value);
             }
         }
+    }
+    scoped
+}
+
+fn document_function_item_context<'a>(
+    function: &AstStatement,
+    item_expr_id: usize,
+    expressions: &[AstExpr],
+    item_value: &Value,
+    context: &DocumentEvalContext<'a>,
+) -> DocumentEvalContext<'a> {
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+    };
+    let first_formal = match &function.kind {
+        AstStatementKind::Function { args, .. } => args.first().map(String::as_str),
+        _ => None,
+    };
+    if let Some(name) = first_formal {
+        scoped.locals.insert(name.to_owned(), item_value.clone());
+    }
+    if let Some(AstExpr {
+        kind: AstExprKind::Identifier(name),
+        ..
+    }) = expressions.get(item_expr_id)
+    {
+        scoped
+            .locals
+            .entry(name.clone())
+            .or_insert_with(|| item_value.clone());
     }
     scoped
 }
@@ -8926,20 +8970,6 @@ fn lower_canonical_document_element(
         );
         return;
     };
-    if function == "Element/repeat" {
-        lower_canonical_repeat(
-            statement,
-            expressions,
-            functions,
-            parent,
-            frame,
-            source_intents,
-            seen_ids,
-            context,
-            scope_key,
-        );
-        return;
-    }
     if document_child_bool(statement, "visible", expressions, context) == Some(false) {
         return;
     }
@@ -9056,7 +9086,7 @@ fn canonical_document_node_kind(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_canonical_repeat(
+fn lower_mapped_document_children(
     statement: &AstStatement,
     expressions: &[AstExpr],
     functions: &DocumentFunctionRegistry<'_>,
@@ -9066,65 +9096,81 @@ fn lower_canonical_repeat(
     seen_ids: &mut BTreeSet<String>,
     context: &DocumentEvalContext<'_>,
     scope_key: &str,
-) {
-    let Some(list_path) = document_child_value(statement, "list", expressions) else {
-        return;
+) -> bool {
+    let Some(mapped) = boon_parser::document_mapped_children(statement, expressions) else {
+        return false;
     };
-    let item_name =
-        document_child_value(statement, "item", expressions).unwrap_or_else(|| "item".to_owned());
+    let Some(function) = functions.get(mapped.template.function_name) else {
+        return true;
+    };
+    let Some(list_path) = expressions
+        .get(mapped.list_expr)
+        .and_then(|expr| document_expr_value(expr, expressions))
+    else {
+        return true;
+    };
     let Some(items) = document_resolved_value(&list_path, context).and_then(Value::as_array) else {
-        return;
+        return true;
     };
-    let repeat_window = virtualized_repeat_window(items.len(), scope_key);
+    let child_window = materialized_child_window(items.len(), scope_key);
     for (index, item) in items
         .iter()
         .enumerate()
-        .skip(repeat_window.start)
-        .take(repeat_window.end.saturating_sub(repeat_window.start))
+        .skip(child_window.start)
+        .take(child_window.end.saturating_sub(child_window.start))
     {
-        let mut scoped = DocumentEvalContext {
+        let mut item_context = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
         };
-        scoped.locals.insert(item_name.clone(), item.clone());
-        let child_scope = if scope_key.is_empty() {
-            format!("{item_name}-{index}")
+        item_context
+            .locals
+            .insert(mapped.item_name.to_owned(), item.clone());
+        let scoped = if let Some(args) = mapped.template.args {
+            document_function_args_context(function, args, expressions, &item_context)
         } else {
-            format!("{scope_key}-{item_name}-{index}")
+            document_function_item_context(
+                function,
+                mapped.item_expr,
+                expressions,
+                item,
+                &item_context,
+            )
         };
-        for child in &statement.children {
-            if matches!(
-                document_field_name(child).as_deref(),
-                Some("child" | "template" | "items" | "children")
-            ) {
-                lower_canonical_document_entry(
-                    child,
-                    expressions,
-                    functions,
-                    parent,
-                    frame,
-                    source_intents,
-                    seen_ids,
-                    &scoped,
-                    &child_scope,
-                    false,
-                );
-            }
+        let child_scope = if scope_key.is_empty() {
+            format!("{}-{}", mapped.item_name, index)
+        } else {
+            format!("{scope_key}-{}-{index}", mapped.item_name)
+        };
+        for child in &function.children {
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                &scoped,
+                &child_scope,
+                false,
+            );
         }
     }
+    true
 }
 
-struct RepeatWindow {
+struct DocumentChildWindow {
     start: usize,
     end: usize,
 }
 
-fn virtualized_repeat_window(len: usize, scope_key: &str) -> RepeatWindow {
+fn materialized_child_window(len: usize, scope_key: &str) -> DocumentChildWindow {
     let visible = len.min(28);
     let start = 0;
     let end = len.min(start + visible);
     let _ = scope_key;
-    RepeatWindow { start, end }
+    DocumentChildWindow { start, end }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9141,6 +9187,21 @@ fn lower_canonical_child_elements(
 ) {
     for child in &statement.children {
         let field = document_field_name(child);
+        if matches!(field.as_deref(), Some("items" | "children"))
+            && lower_mapped_document_children(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                scope_key,
+            )
+        {
+            continue;
+        }
         if !matches!(
             field.as_deref(),
             Some("items" | "children" | "child" | "contents" | "template")

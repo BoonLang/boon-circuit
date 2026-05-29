@@ -401,6 +401,103 @@ pub fn parsed_document(program: &ParsedProgram) -> Option<DocumentAst> {
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentMappedChildren<'a> {
+    pub list_expr: usize,
+    pub item_expr: usize,
+    pub item_name: &'a str,
+    pub template: DocumentChildTemplate<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentChildTemplate<'a> {
+    pub function_name: &'a str,
+    pub args: Option<&'a [AstCallArg]>,
+}
+
+pub fn document_mapped_children<'a>(
+    statement: &'a AstStatement,
+    expressions: &'a [AstExpr],
+) -> Option<DocumentMappedChildren<'a>> {
+    if let Some(expr_id) = statement.expr
+        && let Some(mapped) = document_mapped_children_expr(expr_id, expressions, None)
+    {
+        return Some(mapped);
+    }
+    let mut previous_expr_id = statement.expr;
+    for child in &statement.children {
+        let Some(expr_id) = child.expr else {
+            continue;
+        };
+        if let Some(mapped) = document_mapped_children_expr(expr_id, expressions, previous_expr_id)
+        {
+            return Some(mapped);
+        }
+        previous_expr_id = Some(expr_id);
+    }
+    None
+}
+
+fn document_mapped_children_expr<'a>(
+    expr_id: usize,
+    expressions: &'a [AstExpr],
+    fallback_input: Option<usize>,
+) -> Option<DocumentMappedChildren<'a>> {
+    let expr = expressions.get(expr_id)?;
+    let AstExprKind::Pipe { input, op, args } = &expr.kind else {
+        return None;
+    };
+    if op != "List/map" {
+        return None;
+    }
+    let list_expr = document_pipe_input_expr(*input, expressions, fallback_input)?;
+    let item_arg = args.iter().find(|arg| arg.name.is_none())?;
+    let item_name = document_expr_single_name(expressions.get(item_arg.value)?)?;
+    let new_expr = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("new"))
+        .and_then(|arg| expressions.get(arg.value))?;
+    Some(DocumentMappedChildren {
+        list_expr,
+        item_expr: item_arg.value,
+        item_name,
+        template: document_child_template(new_expr)?,
+    })
+}
+
+fn document_pipe_input_expr(
+    input: usize,
+    expressions: &[AstExpr],
+    fallback_input: Option<usize>,
+) -> Option<usize> {
+    match &expressions.get(input)?.kind {
+        AstExprKind::Delimiter | AstExprKind::Unknown(_) => fallback_input,
+        _ => Some(input),
+    }
+}
+
+fn document_expr_single_name(expr: &AstExpr) -> Option<&str> {
+    match &expr.kind {
+        AstExprKind::Identifier(value) => Some(value.as_str()),
+        AstExprKind::Path(parts) if parts.len() == 1 => Some(parts[0].as_str()),
+        _ => None,
+    }
+}
+
+fn document_child_template(expr: &AstExpr) -> Option<DocumentChildTemplate<'_>> {
+    match &expr.kind {
+        AstExprKind::Call { function, args } => Some(DocumentChildTemplate {
+            function_name: function.as_str(),
+            args: Some(args.as_slice()),
+        }),
+        AstExprKind::Identifier(function) => Some(DocumentChildTemplate {
+            function_name: function.as_str(),
+            args: None,
+        }),
+        _ => None,
+    }
+}
+
 pub fn format_source(
     path: impl Into<String>,
     source: impl Into<String>,
@@ -2518,6 +2615,43 @@ document:
                 AstExprKind::StringLiteral(value) if value == "What needs to be done?"
             )
         }));
+    }
+
+    #[test]
+    fn document_mapped_children_resolve_continuation_pipe_input() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+visible_todos: LIST[4] {}
+FUNCTION todo_row(todo) {
+    Element/label(label: todo.title)
+}
+document:
+    root:
+        Element/stripe(
+            direction: Column
+            items:
+                visible_todos
+                |> List/map(todo, new: todo_row(todo: todo))
+        )
+"#;
+        let parsed = parse_source("document-mapped-children.bn", source).unwrap();
+        let document = parsed_document(&parsed).expect("document should parse");
+        let items = find_statement(&document.root.children, |statement| {
+            matches!(
+                &statement.kind,
+                AstStatementKind::Field { name } if name == "items"
+            )
+        })
+        .expect("items slot should exist");
+        let mapped = document_mapped_children(items, &document.expressions)
+            .expect("items slot should expose mapped children");
+        assert_eq!(mapped.item_name, "todo");
+        assert_eq!(mapped.template.function_name, "todo_row");
+        assert!(matches!(
+            &document.expressions[mapped.list_expr].kind,
+            AstExprKind::Identifier(value) if value == "visible_todos"
+        ));
     }
 
     #[test]

@@ -286,14 +286,9 @@ FUNCTION todo_list() {
             scroll: True
             scrollbars: True
         ]
-        items: LIST {
-            Element/repeat(
-                element: []
-                list: visible_todos
-                item: todo
-                child: todo_row(todo: todo)
-            )
-        }
+        items:
+            visible_todos
+            |> List/map(todo, new: todo_row(todo: todo))
     )
 }
 

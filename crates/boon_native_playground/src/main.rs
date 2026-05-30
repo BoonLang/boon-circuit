@@ -8757,7 +8757,9 @@ fn canonical_element_function<'a>(
 ) -> Option<&'a str> {
     let expr = expressions.get(statement.expr?)?;
     match &expr.kind {
-        AstExprKind::Call { function, .. } if function.starts_with("Element/") => {
+        AstExprKind::Call { function, .. }
+            if boon_typecheck::is_registered_element_constructor(function) =>
+        {
             Some(function.as_str())
         }
         _ => None,

@@ -1202,7 +1202,7 @@ fn collect_document_view_bindings(
             continue;
         }
         if let Some(function) = document_statement_call(statement, expressions)
-            && function.starts_with("Element/")
+            && boon_typecheck::is_registered_element_constructor(function)
         {
             collect_canonical_element_view_bindings(
                 function,
@@ -4082,6 +4082,49 @@ FUNCTION counter_button(press, label) {
                 .iter()
                 .any(|binding| binding.kind == ViewBindingKind::Data && binding.path == "label")
         );
+    }
+
+    #[test]
+    fn function_returned_render_list_keeps_typed_materialization_metadata() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+store:
+    todos: LIST[4] {}
+
+FUNCTION todo_row(todo) {
+    Element/label(label: todo.title)
+}
+
+FUNCTION make_rows(todos) {
+    todos
+    |> List/map(todo, new: todo_row(todo: todo))
+}
+
+document:
+    root:
+        Element/stripe(
+            items: make_rows(todos: store.todos)
+        )
+"#;
+        let parsed = boon_parser::parse_source("function-render-list-ir.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let slot = ir
+            .typecheck_report
+            .render_slot_table
+            .slots
+            .iter()
+            .find(|slot| slot.slot_name == "items")
+            .expect("items slot should be typed");
+        let binding = slot
+            .optional_list_map_binding_id
+            .and_then(|id| ir.typecheck_report.list_map_bindings.get(id))
+            .expect("function-returned render list should expose materialization metadata");
+        assert_eq!(binding.template_function.as_deref(), Some("todo_row"));
+        assert!(matches!(
+            parsed.expressions.get(binding.list_expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Path(parts)) if parts == &vec!["store".to_owned(), "todos".to_owned()]
+        ));
     }
 
     #[test]

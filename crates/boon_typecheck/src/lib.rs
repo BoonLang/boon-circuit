@@ -1,7 +1,7 @@
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, ParsedProgram,
 };
-use ena::unify::{InPlaceUnificationTable, NoError, UnifyKey};
+use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,6 +22,8 @@ pub enum Type {
     Unknown,
 }
 
+impl EqUnifyValue for Type {}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Variant {
     Tag(String),
@@ -38,7 +40,7 @@ pub struct ObjectShape {
 pub struct TypeVar(pub u32);
 
 impl UnifyKey for TypeVar {
-    type Value = ();
+    type Value = Option<Type>;
 
     fn index(&self) -> u32 {
         self.0
@@ -60,15 +62,23 @@ pub struct TypeVarStore {
 
 impl TypeVarStore {
     pub fn new_var(&mut self) -> TypeVar {
-        self.table.new_key(())
+        self.table.new_key(None)
     }
 
-    pub fn unify(&mut self, left: TypeVar, right: TypeVar) -> Result<(), NoError> {
+    pub fn unify(&mut self, left: TypeVar, right: TypeVar) -> Result<(), (Type, Type)> {
         self.table.unify_var_var(left, right)
+    }
+
+    pub fn bind(&mut self, var: TypeVar, ty: Type) -> Result<(), (Type, Type)> {
+        self.table.unify_var_value(var, Some(ty))
     }
 
     pub fn root(&mut self, var: TypeVar) -> TypeVar {
         self.table.find(var)
+    }
+
+    pub fn resolved(&mut self, var: TypeVar) -> Option<Type> {
+        self.table.probe_value(var)
     }
 }
 
@@ -155,6 +165,7 @@ pub struct ExprTypeTable {
 pub struct FunctionTypeEntry {
     pub name: String,
     pub args: Vec<String>,
+    pub arg_types: Vec<Type>,
     pub result: FlowType,
 }
 
@@ -269,6 +280,7 @@ struct Checker<'a> {
     object_bindings: BTreeMap<String, ObjectShape>,
     name_bindings: BTreeMap<String, Type>,
     flow_bindings: BTreeMap<String, FlowMode>,
+    function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     expr_type_vars: BTreeMap<usize, TypeVar>,
     runtime_list_map_exprs: BTreeSet<usize>,
     visited: BTreeSet<usize>,
@@ -290,6 +302,7 @@ impl<'a> Checker<'a> {
         let object_bindings = object_bindings(program);
         let name_bindings = name_bindings(program);
         let flow_bindings = flow_bindings(program);
+        let function_param_requirements = function_param_requirements(program);
         Self {
             program,
             vars: TypeVarStore::default(),
@@ -299,6 +312,7 @@ impl<'a> Checker<'a> {
             object_bindings,
             name_bindings,
             flow_bindings,
+            function_param_requirements,
             expr_type_vars: BTreeMap::new(),
             runtime_list_map_exprs: BTreeSet::new(),
             visited: BTreeSet::new(),
@@ -391,12 +405,24 @@ impl<'a> Checker<'a> {
         if statement_field(statement).as_deref() == Some("style") {
             self.check_style_statement(statement);
         }
+        self.check_pattern_constraints(statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
         if let AstStatementKind::Function { name, args } = &statement.kind {
+            let arg_types = args
+                .iter()
+                .map(|arg| {
+                    self.function_param_requirements
+                        .get(name)
+                        .and_then(|requirements| requirements.get(arg))
+                        .cloned()
+                        .unwrap_or_else(open_object_type)
+                })
+                .collect();
             self.function_type_table.entries.push(FunctionTypeEntry {
                 name: name.clone(),
                 args: args.clone(),
+                arg_types,
                 result: FlowType {
                     mode: FlowMode::Continuous,
                     ty: self.type_for_call(name),
@@ -434,7 +460,7 @@ impl<'a> Checker<'a> {
 
         let mut diagnostics = Vec::new();
 
-        if let Some(mapped) = mapped_children_for_statement(statement, &self.program.expressions) {
+        if let Some(mapped) = mapped_children_for_statement(statement, self.program) {
             value_expr_id = Some(mapped.map_expr_id);
             actual_type = self.ensure_expr(mapped.map_expr_id).ty;
             if render_slot_accepts_type(&slot_name, &actual_type) {
@@ -520,6 +546,7 @@ impl<'a> Checker<'a> {
         {
             return existing;
         }
+        let expr_var = self.expr_type_var_key(expr_id);
         self.visited.insert(expr_id);
         let flow_type = self
             .program
@@ -528,8 +555,22 @@ impl<'a> Checker<'a> {
             .map(|expr| self.infer_expr(expr))
             .unwrap_or(FlowType {
                 mode: FlowMode::Continuous,
-                ty: self.expr_type_var(expr_id),
+                ty: Type::Var(expr_var),
             });
+        self.constraints.push(Constraint::Equal {
+            left: Type::Var(expr_var),
+            right: flow_type.ty.clone(),
+        });
+        if !matches!(flow_type.ty, Type::Var(var) if var == expr_var)
+            && self.vars.bind(expr_var, flow_type.ty.clone()).is_err()
+        {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr_id,
+                    "incompatible inferred expression types".to_owned(),
+                ),
+            );
+        }
         self.expr_type_table.entries.push(ExprTypeEntry {
             expr_id,
             flow_type: flow_type.clone(),
@@ -578,6 +619,7 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                self.check_user_function_arguments(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
                     self.check_style_args(args);
                 }
@@ -606,12 +648,37 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
+                self.check_user_function_arguments(expr.id, op, Some(*input), args);
                 if self.render_contracts.is_render_constructor(op) {
                     self.check_style_args(args);
                 }
                 if op == "List/map" {
+                    if let Some(new_expr_id) = list_map_new_expr_id(args) {
+                        let item_type = self.ensure_expr(new_expr_id).ty;
+                        if type_contains_skip(&item_type) {
+                            self.diagnostics.push(self.diagnostic_for_expr(
+                                new_expr_id,
+                                "`SKIP` cannot be used as a `List/map` item".to_owned(),
+                            ));
+                        }
+                    }
                     self.record_runtime_list_map(expr.id, *input, args);
                     Type::List(Box::new(self.list_map_result_item_type(args)))
+                } else if op == "WHILE" {
+                    if !matches!(input_flow.mode, FlowMode::Continuous) {
+                        self.constraints.push(Constraint::FlowCompatible {
+                            actual: input_flow.clone(),
+                            expected: FlowType {
+                                mode: FlowMode::Continuous,
+                                ty: input_flow.ty.clone(),
+                            },
+                        });
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            *input,
+                            "`WHILE` requires a continuous selector".to_owned(),
+                        ));
+                    }
+                    self.type_for_call_expr(expr.id, op)
                 } else if op == "Bool/not" {
                     self.check_true_false_input(expr, op, &input_flow);
                     true_false_type()
@@ -628,7 +695,9 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Hold { initial, .. } => self.ensure_expr(*initial).ty,
             AstExprKind::Latest => open_object_type(),
-            AstExprKind::When { input } => self.ensure_expr(*input).ty,
+            AstExprKind::When { input } => self
+                .when_result_type(expr.id)
+                .unwrap_or_else(|| self.ensure_expr(*input).ty),
             AstExprKind::Then { input, output } => {
                 let input_flow = self.ensure_expr(*input);
                 if !matches!(
@@ -692,8 +761,18 @@ impl<'a> Checker<'a> {
 
     fn type_for_path(&mut self, expr_id: usize, parts: &[String]) -> Type {
         let path = parts.join(".");
-        if path_is_source_path(&self.source_paths, &path) {
-            return source_payload_type(parts);
+        if let Some(access) = source_payload_access(&self.source_paths, parts) {
+            match access {
+                SourcePayloadAccess::Direct => return open_object_type(),
+                SourcePayloadAccess::Field(field) => return source_payload_field_type(&field),
+                SourcePayloadAccess::UnknownField(field) => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expr_id,
+                        format!("unknown source payload field `{field}`"),
+                    ));
+                    return self.expr_type_var(expr_id);
+                }
+            }
         }
         if let Some(ty) = self.name_bindings.get(&path) {
             return ty.clone();
@@ -757,11 +836,15 @@ impl<'a> Checker<'a> {
     }
 
     fn expr_type_var(&mut self, expr_id: usize) -> Type {
+        Type::Var(self.expr_type_var_key(expr_id))
+    }
+
+    fn expr_type_var_key(&mut self, expr_id: usize) -> TypeVar {
         let var = *self
             .expr_type_vars
             .entry(expr_id)
             .or_insert_with(|| self.vars.new_var());
-        Type::Var(var)
+        var
     }
 
     fn list_map_result_item_type(&self, args: &[AstCallArg]) -> Type {
@@ -774,6 +857,19 @@ impl<'a> Checker<'a> {
         };
         self.static_expr_type(new_expr, &mut BTreeSet::new())
             .unwrap_or_else(open_object_type)
+    }
+
+    fn when_result_type(&mut self, expr_id: usize) -> Option<Type> {
+        let arm_expr_ids = when_arm_expr_ids(&self.program.ast.statements, expr_id);
+        let mut result: Option<Type> = None;
+        for arm_expr_id in arm_expr_ids {
+            let arm_type = self.ensure_expr(arm_expr_id).ty;
+            result = Some(match result {
+                Some(existing) => widen_structural_type(&existing, &arm_type),
+                None => arm_type,
+            });
+        }
+        result
     }
 
     fn static_expr_type(
@@ -962,6 +1058,24 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::Call { args, .. } => args
+                .iter()
+                .map(|arg| self.flow_mode_for_expr_id(arg.value))
+                .fold(FlowMode::Continuous, merge_flow_modes),
+            AstExprKind::Pipe { input, op, args } => {
+                if op == "WHILE" {
+                    FlowMode::Continuous
+                } else if op == "List/map" || op == "WHEN" {
+                    self.flow_mode_for_expr_id(*input)
+                } else {
+                    args.iter()
+                        .map(|arg| self.flow_mode_for_expr_id(arg.value))
+                        .chain(std::iter::once(self.flow_mode_for_expr_id(*input)))
+                        .fold(FlowMode::Continuous, merge_flow_modes)
+                }
+            }
+            AstExprKind::When { input } => self.flow_mode_for_expr_id(*input),
+            AstExprKind::Hold { .. } => FlowMode::Continuous,
             AstExprKind::MatchArm { output, .. }
                 if output.is_none_or(|output| {
                     self.program
@@ -974,6 +1088,14 @@ impl<'a> Checker<'a> {
             }
             _ => FlowMode::Continuous,
         }
+    }
+
+    fn flow_mode_for_expr_id(&self, expr_id: usize) -> FlowMode {
+        self.program
+            .expressions
+            .get(expr_id)
+            .map(|expr| self.flow_mode_for_expr(expr))
+            .unwrap_or(FlowMode::Continuous)
     }
 
     fn expr_is_direct_data_list(&self, expr_id: usize) -> bool {
@@ -1041,6 +1163,7 @@ impl<'a> Checker<'a> {
             .and_then(child_template)
             .map(|(function, args)| (Some(function), args))
             .unwrap_or((None, Vec::new()));
+        let item_type = self.list_map_result_item_type(args);
         self.list_map_bindings.push(ListMapBinding {
             map_expr_id,
             list_expr_id,
@@ -1048,7 +1171,7 @@ impl<'a> Checker<'a> {
             item_expr_id,
             item_binding_name,
             item_type: open_object_type(),
-            result_type: Type::List(Box::new(open_object_type())),
+            result_type: Type::List(Box::new(item_type)),
             item_scope_id: Some(stable_scope_id_for_map(map_expr_id)),
             template_function,
             template_args,
@@ -1067,6 +1190,88 @@ impl<'a> Checker<'a> {
             expr.id,
             format!("`{operator}` expects `True` or `False` tag"),
         ));
+    }
+
+    fn check_pattern_constraints(&mut self, statement: &AstStatement) {
+        let Some(expr_id) = statement.expr else {
+            return;
+        };
+        let Some(selector_expr_id) = pattern_selector_expr_id(expr_id, &self.program.expressions)
+        else {
+            return;
+        };
+        let selector_type = self.ensure_expr(selector_expr_id).ty;
+        self.constraints.push(Constraint::PatternCovers { expr_id });
+        for arm_expr_id in statement.children.iter().filter_map(|child| child.expr) {
+            let Some(AstExpr {
+                kind: AstExprKind::MatchArm { pattern, .. },
+                ..
+            }) = self.program.expressions.get(arm_expr_id)
+            else {
+                continue;
+            };
+            if let Some(variant) = pattern_variant(pattern) {
+                self.constraints.push(Constraint::HasVariant {
+                    value: selector_type.clone(),
+                    variant,
+                });
+            }
+        }
+    }
+
+    fn check_user_function_arguments(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        pipe_input: Option<usize>,
+        call_args: &[AstCallArg],
+    ) {
+        let Some(requirements) = self.function_param_requirements.get(function).cloned() else {
+            return;
+        };
+        let Some(function_statement) =
+            find_function_statement(&self.program.ast.statements, function)
+        else {
+            return;
+        };
+        let AstStatementKind::Function {
+            args: function_args,
+            ..
+        } = &function_statement.kind
+        else {
+            return;
+        };
+        for (param, expected) in requirements {
+            let Some(actual_expr_id) =
+                function_call_argument_expr(function_args, &param, pipe_input, call_args)
+            else {
+                continue;
+            };
+            let actual = self.ensure_expr(actual_expr_id).ty;
+            self.constraints.push(Constraint::Assignable {
+                actual: actual.clone(),
+                expected: expected.clone(),
+            });
+            if type_is_assignable_to(&actual, &expected) {
+                continue;
+            }
+            let message = if let Some(field) = missing_field_name(&actual, &expected) {
+                format!("object is missing field `{field}`")
+            } else if let Some(field) = incompatible_field_name(&actual, &expected) {
+                format!("object field `{field}` has incompatible type")
+            } else {
+                format!(
+                    "`FUNCTION {function}` argument `{param}` does not satisfy the required structural shape"
+                )
+            };
+            let diagnostic_expr_id = if self.program.expressions.get(actual_expr_id).is_some() {
+                actual_expr_id
+            } else {
+                expr_id
+            };
+            self.diagnostics
+                .push(self.diagnostic_for_expr(diagnostic_expr_id, message));
+        }
     }
 
     fn check_hold_update_compatibility(&mut self, statement: &AstStatement) {
@@ -1368,15 +1573,63 @@ struct MappedChildren {
 
 fn mapped_children_for_statement(
     statement: &AstStatement,
-    expressions: &[AstExpr],
+    program: &ParsedProgram,
 ) -> Option<MappedChildren> {
+    let expressions = &program.expressions;
     if let Some(expr_id) = statement.expr
         && let Some(mapped) = mapped_children_expr(expr_id, expressions, None)
+            .or_else(|| mapped_children_function_call(expr_id, program))
     {
         return Some(mapped);
     }
     let mut previous_expr_id = statement.expr;
     for child in &statement.children {
+        let Some(expr_id) = child.expr else {
+            continue;
+        };
+        if let Some(mapped) = mapped_children_expr(expr_id, expressions, previous_expr_id)
+            .or_else(|| mapped_children_function_call(expr_id, program))
+        {
+            return Some(mapped);
+        }
+        previous_expr_id = Some(expr_id);
+    }
+    None
+}
+
+fn mapped_children_function_call(
+    expr_id: usize,
+    program: &ParsedProgram,
+) -> Option<MappedChildren> {
+    let expr = program.expressions.get(expr_id)?;
+    let (function, input, args) = match &expr.kind {
+        AstExprKind::Call { function, args } => (function.as_str(), None, args.as_slice()),
+        AstExprKind::Pipe { input, op, args } if op != "List/map" => {
+            (op.as_str(), Some(*input), args.as_slice())
+        }
+        _ => return None,
+    };
+    let function_statement = find_function_statement(&program.ast.statements, function)?;
+    let AstStatementKind::Function {
+        args: function_args,
+        ..
+    } = &function_statement.kind
+    else {
+        return None;
+    };
+    let mut mapped = mapped_children_for_function_body(function_statement, &program.expressions)?;
+    let list_parameter = expr_single_name(program.expressions.get(mapped.list_expr_id)?)?;
+    mapped.list_expr_id = function_call_argument_expr(function_args, list_parameter, input, args)?;
+    mapped.map_expr_id = expr_id;
+    Some(mapped)
+}
+
+fn mapped_children_for_function_body(
+    function_statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<MappedChildren> {
+    let mut previous_expr_id = None;
+    for child in &function_statement.children {
         let Some(expr_id) = child.expr else {
             continue;
         };
@@ -1386,6 +1639,36 @@ fn mapped_children_for_statement(
         previous_expr_id = Some(expr_id);
     }
     None
+}
+
+fn function_call_argument_expr(
+    function_args: &[String],
+    parameter: &str,
+    pipe_input: Option<usize>,
+    call_args: &[AstCallArg],
+) -> Option<usize> {
+    let position = function_args.iter().position(|arg| arg == parameter)?;
+    if position == 0
+        && let Some(input) = pipe_input
+    {
+        return Some(input);
+    }
+    call_args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(parameter))
+        .map(|arg| arg.value)
+        .or_else(|| {
+            let positional_index = if pipe_input.is_some() {
+                position.checked_sub(1)?
+            } else {
+                position
+            };
+            call_args
+                .iter()
+                .filter(|arg| arg.name.is_none())
+                .nth(positional_index)
+                .map(|arg| arg.value)
+        })
 }
 
 fn render_slot_contains_malformed_list_map(
@@ -1660,6 +1943,37 @@ fn mapped_children_expr(
     })
 }
 
+fn list_map_new_expr_id(args: &[AstCallArg]) -> Option<usize> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == Some("new"))
+        .map(|arg| arg.value)
+}
+
+fn pattern_selector_expr_id(expr_id: usize, expressions: &[AstExpr]) -> Option<usize> {
+    match &expressions.get(expr_id)?.kind {
+        AstExprKind::When { input } => Some(*input),
+        AstExprKind::Pipe { input, op, .. } if op == "WHILE" => Some(*input),
+        _ => None,
+    }
+}
+
+fn pattern_variant(pattern: &[String]) -> Option<Variant> {
+    let first = pattern
+        .iter()
+        .find(|part| !matches!(part.as_str(), "__" | "=>" | "{" | "}"))?;
+    if !starts_uppercase_identifier(first) {
+        return None;
+    }
+    Some(Variant::Tag(first.clone()))
+}
+
+fn starts_uppercase_identifier(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
 fn pipe_input_expr(
     input: usize,
     expressions: &[AstExpr],
@@ -1836,8 +2150,8 @@ impl RenderContractRegistry {
 
     fn slot_contract(&self, slot_name: &str) -> &'static str {
         match slot_name {
-            "items" | "children" => "LIST<Element>",
-            _ => "Element",
+            "items" | "children" => "LIST<RenderableContract>",
+            _ => "RenderableContract",
         }
     }
 }
@@ -1855,8 +2169,12 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Element/text_input",
 ];
 
-fn is_registered_render_constructor(function: &str) -> bool {
+pub fn is_registered_render_constructor(function: &str) -> bool {
     RENDER_CONSTRUCTORS.contains(&function)
+}
+
+pub fn is_registered_element_constructor(function: &str) -> bool {
+    is_registered_render_constructor(function) && function != "Document/new"
 }
 
 fn type_accepts_true_false(ty: &Type) -> bool {
@@ -1913,10 +2231,114 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
     }
 }
 
+fn merge_flow_modes(left: FlowMode, right: FlowMode) -> FlowMode {
+    match (left, right) {
+        (FlowMode::Absent, _) | (_, FlowMode::Absent) => FlowMode::Absent,
+        (FlowMode::PresentOrAbsent, _) | (_, FlowMode::PresentOrAbsent) => {
+            FlowMode::PresentOrAbsent
+        }
+        (FlowMode::TickPresent, _) | (_, FlowMode::TickPresent) => FlowMode::TickPresent,
+        (FlowMode::Continuous, FlowMode::Continuous) => FlowMode::Continuous,
+    }
+}
+
+fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
+    match (actual, expected) {
+        (_, Type::Unknown) | (Type::Unknown, _) | (Type::Var(_), _) | (_, Type::Var(_)) => true,
+        (_, expected) if is_open_object_type(expected) => true,
+        (actual, _) if is_open_object_type(actual) => true,
+        (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
+        (actual, expected) if type_accepts_true_false(expected) => type_accepts_true_false(actual),
+        (Type::RenderContract, Type::RenderContract) => true,
+        (actual, Type::RenderContract) => is_renderable_type(actual),
+        (Type::List(actual), Type::List(expected)) => type_is_assignable_to(actual, expected),
+        (Type::Object(actual), Type::Object(expected)) => {
+            expected.fields.iter().all(|(field, expected_field)| {
+                actual
+                    .fields
+                    .get(field)
+                    .is_some_and(|actual_field| type_is_assignable_to(actual_field, expected_field))
+                    || actual.open
+            })
+        }
+        (Type::VariantSet(actual), Type::VariantSet(expected)) => expected.iter().all(|expected| {
+            actual
+                .iter()
+                .any(|actual| variant_is_assignable_to(actual, expected))
+        }),
+        _ => false,
+    }
+}
+
+fn variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool {
+    match (actual, expected) {
+        (Variant::Tag(actual), Variant::Tag(expected)) => actual == expected,
+        (
+            Variant::Tagged {
+                tag: actual_tag,
+                fields: actual_fields,
+            },
+            Variant::Tagged {
+                tag: expected_tag,
+                fields: expected_fields,
+            },
+        ) => {
+            actual_tag == expected_tag
+                && type_is_assignable_to(
+                    &Type::Object(actual_fields.clone()),
+                    &Type::Object(expected_fields.clone()),
+                )
+        }
+        _ => false,
+    }
+}
+
+fn missing_field_name(actual: &Type, expected: &Type) -> Option<String> {
+    let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
+        return None;
+    };
+    expected.fields.iter().find_map(|(field, expected_field)| {
+        let Some(actual_field) = actual.fields.get(field) else {
+            return (!actual.open).then(|| field.clone());
+        };
+        missing_field_name(actual_field, expected_field).map(|nested| format!("{field}.{nested}"))
+    })
+}
+
+fn incompatible_field_name(actual: &Type, expected: &Type) -> Option<String> {
+    let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
+        return None;
+    };
+    expected.fields.iter().find_map(|(field, expected_field)| {
+        let actual_field = actual.fields.get(field)?;
+        if let Some(nested) = incompatible_field_name(actual_field, expected_field) {
+            return Some(format!("{field}.{nested}"));
+        }
+        (!type_is_assignable_to(actual_field, expected_field)).then(|| field.clone())
+    })
+}
+
 fn hold_update_exprs(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<usize> {
     let mut updates = Vec::new();
     collect_hold_update_exprs(statement, expressions, &mut updates);
     updates
+}
+
+fn when_arm_expr_ids(statements: &[AstStatement], expr_id: usize) -> Vec<usize> {
+    for statement in statements {
+        if statement.expr == Some(expr_id) {
+            return statement
+                .children
+                .iter()
+                .filter_map(|child| child.expr)
+                .collect();
+        }
+        let nested = when_arm_expr_ids(&statement.children, expr_id);
+        if !nested.is_empty() {
+            return nested;
+        }
+    }
+    Vec::new()
 }
 
 fn collect_hold_update_exprs(
@@ -2086,6 +2508,239 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
     }
 }
 
+fn function_param_requirements(
+    program: &ParsedProgram,
+) -> BTreeMap<String, BTreeMap<String, Type>> {
+    let mut requirements = BTreeMap::new();
+    collect_function_param_requirements(
+        &program.ast.statements,
+        &program.expressions,
+        &mut requirements,
+    );
+    requirements
+}
+
+fn collect_function_param_requirements(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    requirements: &mut BTreeMap<String, BTreeMap<String, Type>>,
+) {
+    for statement in statements {
+        if let AstStatementKind::Function { name, args } = &statement.kind {
+            let params = args.iter().cloned().collect::<BTreeSet<_>>();
+            let function_requirements = requirements.entry(name.clone()).or_default();
+            for child in &statement.children {
+                collect_param_requirements_statement(
+                    child,
+                    expressions,
+                    &params,
+                    function_requirements,
+                );
+            }
+        }
+        collect_function_param_requirements(&statement.children, expressions, requirements);
+    }
+}
+
+fn collect_param_requirements_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    params: &BTreeSet<String>,
+    requirements: &mut BTreeMap<String, Type>,
+) {
+    if let Some(expr_id) = statement.expr {
+        collect_param_requirements_expr(expr_id, expressions, params, requirements, None);
+    }
+    for child in &statement.children {
+        collect_param_requirements_statement(child, expressions, params, requirements);
+    }
+}
+
+fn collect_param_requirements_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    params: &BTreeSet<String>,
+    requirements: &mut BTreeMap<String, Type>,
+    expected: Option<Type>,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Identifier(name) if params.contains(name) => {
+            if let Some(expected) = expected {
+                add_param_requirement(requirements, name, expected);
+            }
+        }
+        AstExprKind::Path(parts) if parts.len() >= 2 && params.contains(&parts[0]) => {
+            add_param_requirement(
+                requirements,
+                &parts[0],
+                object_type_for_path_requirement(&parts[1..], expected),
+            );
+        }
+        AstExprKind::Call { function, args } => {
+            let arg_expected = argument_expected_type(function);
+            for arg in args {
+                let expected = render_arg_expected_type(function, arg.name.as_deref())
+                    .or_else(|| arg_expected.clone());
+                collect_param_requirements_expr(
+                    arg.value,
+                    expressions,
+                    params,
+                    requirements,
+                    expected,
+                );
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            let input_expected = pipe_input_expected_type(op);
+            collect_param_requirements_expr(
+                *input,
+                expressions,
+                params,
+                requirements,
+                input_expected,
+            );
+            let arg_expected = argument_expected_type(op);
+            for arg in args {
+                let expected = render_arg_expected_type(op, arg.name.as_deref())
+                    .or_else(|| arg_expected.clone());
+                collect_param_requirements_expr(
+                    arg.value,
+                    expressions,
+                    params,
+                    requirements,
+                    expected,
+                );
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_param_requirements_expr(*initial, expressions, params, requirements, expected);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_param_requirements_expr(*input, expressions, params, requirements, None);
+            if let Some(output) = output {
+                collect_param_requirements_expr(
+                    *output,
+                    expressions,
+                    params,
+                    requirements,
+                    expected,
+                );
+            }
+        }
+        AstExprKind::Infix { left, right, op } => {
+            let expected = if matches!(op.as_str(), "+" | "-" | "*" | "/" | ">" | "<" | ">=" | "<=")
+            {
+                Some(Type::Number)
+            } else {
+                None
+            };
+            collect_param_requirements_expr(
+                *left,
+                expressions,
+                params,
+                requirements,
+                expected.clone(),
+            );
+            collect_param_requirements_expr(*right, expressions, params, requirements, expected);
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => collect_param_requirements_expr(*output, expressions, params, requirements, expected),
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_param_requirements_expr(
+                    field.value,
+                    expressions,
+                    params,
+                    requirements,
+                    None,
+                );
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::ListLiteral { .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_)
+        | AstExprKind::MatchArm { output: None, .. } => {}
+    }
+}
+
+fn add_param_requirement(requirements: &mut BTreeMap<String, Type>, param: &str, expected: Type) {
+    requirements
+        .entry(param.to_owned())
+        .and_modify(|existing| *existing = widen_structural_type(existing, &expected))
+        .or_insert(expected);
+}
+
+fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -> Type {
+    let Some((field, rest)) = parts.split_first() else {
+        return leaf_type.unwrap_or_else(open_object_type);
+    };
+    let field_type = if rest.is_empty() {
+        leaf_type.unwrap_or_else(open_object_type)
+    } else {
+        object_type_for_path_requirement(rest, leaf_type)
+    };
+    Type::Object(ObjectShape {
+        fields: [(field.clone(), field_type)].into_iter().collect(),
+        open: true,
+    })
+}
+
+fn pipe_input_expected_type(function: &str) -> Option<Type> {
+    if function == "List/map" || matches!(function, "List/retain" | "List/count") {
+        Some(Type::List(Box::new(open_object_type())))
+    } else if function.starts_with("Text/") {
+        Some(Type::Text)
+    } else if function.starts_with("Number/") {
+        Some(Type::Number)
+    } else if function == "Bool/not" || function == "Bool/and" {
+        Some(true_false_type())
+    } else {
+        None
+    }
+}
+
+fn argument_expected_type(function: &str) -> Option<Type> {
+    if function == "Bool/not" || function == "Bool/and" {
+        Some(true_false_type())
+    } else if function.starts_with("Text/") {
+        Some(Type::Text)
+    } else if function.starts_with("Number/") {
+        Some(Type::Number)
+    } else {
+        None
+    }
+}
+
+fn render_arg_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
+    if !is_registered_render_constructor(function) {
+        return None;
+    }
+    match arg_name {
+        Some("label" | "text" | "value" | "display_value" | "edit_value" | "placeholder") => {
+            Some(Type::Text)
+        }
+        Some("checked" | "visible" | "selected") => Some(true_false_type()),
+        _ => None,
+    }
+}
+
 fn name_bindings(program: &ParsedProgram) -> BTreeMap<String, Type> {
     let mut bindings = BTreeMap::new();
     collect_name_bindings(
@@ -2142,7 +2797,14 @@ fn collect_flow_bindings(
 fn simple_flow_mode(expr: &AstExpr, expressions: &[AstExpr]) -> FlowMode {
     match &expr.kind {
         AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
-        AstExprKind::When { .. } => FlowMode::PresentOrAbsent,
+        AstExprKind::When { input } => expressions
+            .get(*input)
+            .map(|expr| simple_flow_mode(expr, expressions))
+            .unwrap_or(FlowMode::Continuous),
+        AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
+            let _ = input;
+            FlowMode::Continuous
+        }
         AstExprKind::Pipe { input, .. } => expressions
             .get(*input)
             .map(|expr| simple_flow_mode(expr, expressions))
@@ -2471,10 +3133,49 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     }
 }
 
-fn source_payload_type(parts: &[String]) -> Type {
-    match parts.last().map(String::as_str) {
-        Some("text" | "key") => Type::Text,
-        Some("address") => Type::Text,
+enum SourcePayloadAccess {
+    Direct,
+    Field(String),
+    UnknownField(String),
+}
+
+fn source_payload_access(
+    source_paths: &BTreeSet<String>,
+    parts: &[String],
+) -> Option<SourcePayloadAccess> {
+    let path = parts.join(".");
+    for source_path in source_paths {
+        let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
+        for base in [source_path.as_str(), relative] {
+            if path == base || base.ends_with(&format!(".{path}")) {
+                return Some(SourcePayloadAccess::Direct);
+            }
+            if let Some(suffix) = path.strip_prefix(&format!("{base}.")) {
+                return Some(source_payload_access_for_suffix(suffix));
+            }
+            if let Some((field, base_without_field)) = parts.split_last() {
+                let base_without_field = base_without_field.join(".");
+                if !base_without_field.is_empty()
+                    && base.ends_with(&format!(".{base_without_field}"))
+                {
+                    return Some(source_payload_access_for_suffix(field));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
+    match suffix {
+        "text" | "key" | "address" => SourcePayloadAccess::Field(suffix.to_owned()),
+        _ => SourcePayloadAccess::UnknownField(suffix.to_owned()),
+    }
+}
+
+fn source_payload_field_type(field: &str) -> Type {
+    match field {
+        "text" | "key" | "address" => Type::Text,
         _ => open_object_type(),
     }
 }
@@ -2836,6 +3537,14 @@ document:
         let report = check(&parsed);
         assert!(report.full_document_typecheck_coverage);
         assert_eq!(report.checked_expression_count, report.expression_count);
+        assert_eq!(
+            report
+                .constraints
+                .iter()
+                .filter(|constraint| matches!(constraint, Constraint::Equal { .. }))
+                .count(),
+            report.expression_count
+        );
     }
 
     #[test]
@@ -2879,7 +3588,7 @@ document:
         assert_eq!(report.list_map_binding_count_render_slot_materialization, 1);
         let slot = &report.render_slot_table.slots[0];
         assert_eq!(slot.slot_name, "items");
-        assert_eq!(slot.expected_contract, "LIST<Element>");
+        assert_eq!(slot.expected_contract, "LIST<RenderableContract>");
         assert_eq!(slot.template_function.as_deref(), Some("todo_row"));
         let binding = &report.list_map_bindings[slot.optional_list_map_binding_id.unwrap()];
         assert_eq!(binding.item_binding_name, "todo");
@@ -2909,6 +3618,31 @@ document: []
                 .iter()
                 .any(|entry| { matches!(entry.flow_type.ty, Type::List(_)) })
         );
+        assert!(report.list_map_bindings.iter().any(|binding| matches!(
+            &binding.result_type,
+            Type::List(item) if is_open_object_type(item)
+        )));
+    }
+
+    #[test]
+    fn rejects_skip_as_list_map_item_outside_render_slots() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+todos: LIST[4] {}
+rows:
+    todos
+    |> List/map(todo, new: SKIP)
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-list-map-skip-item.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`SKIP` cannot be used as a `List/map` item")
+        }));
     }
 
     #[test]
@@ -2937,7 +3671,7 @@ document:
     }
 
     #[test]
-    fn accepts_function_returning_renderable_list_for_items_without_slot_list_map() {
+    fn function_returning_renderable_list_for_items_gets_render_metadata() {
         let source = r#"
 source: SOURCE
 value: "" |> HOLD value { LATEST {} }
@@ -2972,7 +3706,20 @@ document:
             &slot.actual_type,
             Type::List(item) if matches!(**item, Type::RenderContract)
         ));
-        assert_eq!(report.list_map_binding_count_render_slot_materialization, 0);
+        assert_eq!(report.list_map_binding_count_render_slot_materialization, 1);
+        let binding = slot
+            .optional_list_map_binding_id
+            .and_then(|id| report.list_map_bindings.get(id))
+            .expect("function-returned render list should keep materialization metadata");
+        let list_expr = parsed
+            .expressions
+            .get(binding.list_expr_id)
+            .expect("binding list expression should point to call-site source list");
+        assert!(matches!(
+            &list_expr.kind,
+            AstExprKind::Identifier(name) if name == "todos"
+        ));
+        assert_eq!(binding.template_function.as_deref(), Some("todo_row"));
     }
 
     #[test]
@@ -3120,6 +3867,99 @@ document: []
     }
 
     #[test]
+    fn rejects_while_on_present_or_absent_selector() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+bad:
+    source |> WHILE {
+        __ => 1
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-while-source-flow.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`WHILE` requires a continuous selector")
+        }));
+        assert!(report.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                Constraint::FlowCompatible {
+                    actual: FlowType {
+                        mode: FlowMode::PresentOrAbsent,
+                        ..
+                    },
+                    expected: FlowType {
+                        mode: FlowMode::Continuous,
+                        ..
+                    }
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn when_preserves_continuous_selector_flow() {
+        let source = r#"
+source: SOURCE
+selected: True |> HOLD selected { LATEST {} }
+matched:
+    selected |> WHEN {
+        True => 1
+        False => 0
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("continuous-when-flow.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let when_expr_id = parsed
+            .expressions
+            .iter()
+            .find_map(|expr| matches!(expr.kind, AstExprKind::When { .. }).then_some(expr.id))
+            .expect("fixture should contain WHEN expression");
+        let when_flow = report
+            .expr_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.expr_id == when_expr_id)
+            .expect("WHEN expression should be typed");
+        assert_eq!(when_flow.flow_type.mode, FlowMode::Continuous);
+        assert!(report.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                Constraint::PatternCovers { expr_id } if *expr_id == when_expr_id
+            )
+        }));
+        assert!(report.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                Constraint::HasVariant {
+                    variant: Variant::Tag(tag),
+                    ..
+                } if tag == "True"
+            )
+        }));
+        assert!(report.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                Constraint::HasVariant {
+                    variant: Variant::Tag(tag),
+                    ..
+                } if tag == "False"
+            )
+        }));
+    }
+
+    #[test]
     fn rejects_wrong_oklch_field_type() {
         let source = r#"
 source: SOURCE
@@ -3210,6 +4050,78 @@ document: []
         }));
         assert!(report.constraints.iter().any(|constraint| {
             matches!(constraint, Constraint::HasField { field, .. } if field == "completed")
+        }));
+    }
+
+    #[test]
+    fn rejects_function_argument_missing_required_structural_field() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION row(todo) {
+    Element/label(label: todo.title)
+}
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                row(todo: [completed: True])
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-function-arg-shape.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("object is missing field `title`")
+        }));
+        assert!(report.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                Constraint::Assignable {
+                    expected: Type::Object(shape),
+                    ..
+                } if shape.fields.contains_key("title")
+            )
+        }));
+        let row_entry = report
+            .function_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.name == "row")
+            .expect("row function type should be reported");
+        assert_eq!(row_entry.args, vec!["todo".to_owned()]);
+        assert!(matches!(
+            row_entry.arg_types.as_slice(),
+            [Type::Object(shape)] if matches!(shape.fields.get("title"), Some(Type::Text))
+        ));
+    }
+
+    #[test]
+    fn rejects_function_argument_field_with_incompatible_required_type() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION row(todo) {
+    Element/label(label: todo.title)
+}
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                row(todo: [title: 1])
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("bad-function-arg-field-type.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("object field `title` has incompatible type")
         }));
     }
 
@@ -3441,6 +4353,28 @@ document: []
             .expect("key_down source should have a payload shape");
         assert!(key_down.fields.iter().any(|field| field.name == "key"));
         assert!(key_down.fields.iter().any(|field| field.name == "text"));
+    }
+
+    #[test]
+    fn rejects_unknown_source_payload_field() {
+        let source = r#"
+source: SOURCE
+value:
+    Text/empty() |> HOLD value {
+        LATEST {
+            source.foo
+        }
+    }
+document: []
+"#;
+        let parsed = boon_parser::parse_source("bad-source-payload-field.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unknown source payload field `foo`")
+        }));
     }
 
     #[test]

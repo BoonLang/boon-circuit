@@ -2752,17 +2752,25 @@ impl RuntimeRootContract {
     }
 
     fn document() -> Self {
-        Self::new(["Button", "Document", "Row", "Stack", "Text", "TextInput"])
-            .with_fixed_constructor("Document/new", "Document")
-            .with_fixed_constructor("Element/container", "Stack")
-            .with_stripe_direction_constructor("Element/stripe")
-            .with_fixed_constructor("Element/text", "Text")
-            .with_fixed_constructor("Element/label", "Text")
-            .with_fixed_constructor("Element/paragraph", "Text")
-            .with_fixed_constructor("Element/link", "Text")
-            .with_fixed_constructor("Element/button", "Button")
-            .with_fixed_constructor("Element/checkbox", "Button")
-            .with_fixed_constructor("Element/text_input", "TextInput")
+        Self::new([
+            "Button",
+            "Checkbox",
+            "Document",
+            "Row",
+            "Stack",
+            "Text",
+            "TextInput",
+        ])
+        .with_fixed_constructor("Document/new", "Document")
+        .with_fixed_constructor("Element/container", "Stack")
+        .with_stripe_direction_constructor("Element/stripe")
+        .with_fixed_constructor("Element/text", "Text")
+        .with_fixed_constructor("Element/label", "Text")
+        .with_fixed_constructor("Element/paragraph", "Text")
+        .with_fixed_constructor("Element/link", "Text")
+        .with_fixed_constructor("Element/button", "Button")
+        .with_fixed_constructor("Element/checkbox", "Checkbox")
+        .with_fixed_constructor("Element/text_input", "TextInput")
     }
 }
 
@@ -3002,7 +3010,7 @@ fn document_render_contract_label(compact: bool) -> String {
         "[...]".to_owned()
     } else {
         "[
-    kind: Button | Document | Row | Stack | Text | TextInput
+    kind: Button | Checkbox | Document | Row | Stack | Text | TextInput
 ]"
         .to_owned()
     }

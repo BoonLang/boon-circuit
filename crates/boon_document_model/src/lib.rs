@@ -19,6 +19,7 @@ pub enum DocumentNodeKind {
     Row,
     Text,
     Button,
+    Checkbox,
     TextInput,
     Table,
     TableCell,

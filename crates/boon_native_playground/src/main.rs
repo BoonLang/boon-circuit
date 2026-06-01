@@ -3067,7 +3067,7 @@ fn patch_dev_render_type_inspector_content(
                     "text_inset",
                     boon_document_model::StyleValue::Text(text_inset_for_scroll_column(
                         effective_scroll_column,
-                        12,
+                        BOON_EDITOR_FONT_SIZE,
                     )),
                 );
                 patched |= set_display_style_value(
@@ -9883,6 +9883,7 @@ impl DevWindowShell {
             if matches!(
                 node.kind,
                 boon_document_model::DocumentNodeKind::Button
+                    | boon_document_model::DocumentNodeKind::Checkbox
                     | boon_document_model::DocumentNodeKind::TextInput
             ) {
                 controls.push(json!({
@@ -10536,7 +10537,7 @@ fn dev_type_inspector_detail_node(
     scroll_column: usize,
     extra_styles: &[(&str, &str)],
 ) -> boon_document_model::DocumentNode {
-    let mut node = dev_text_node(id, text, DEV_TEXT, 12, extra_styles);
+    let mut node = dev_text_node(id, text, DEV_TEXT, BOON_EDITOR_FONT_SIZE, extra_styles);
     node.style.insert(
         "rich_text".to_owned(),
         boon_document_model::StyleValue::Bool(true),
@@ -10547,7 +10548,10 @@ fn dev_type_inspector_detail_node(
     );
     node.style.insert(
         "text_inset".to_owned(),
-        boon_document_model::StyleValue::Text(text_inset_for_scroll_column(scroll_column, 12)),
+        boon_document_model::StyleValue::Text(text_inset_for_scroll_column(
+            scroll_column,
+            BOON_EDITOR_FONT_SIZE,
+        )),
     );
     node.style.insert(
         "text_clip_padding".to_owned(),
@@ -11979,7 +11983,8 @@ fn canonical_document_node_kind(
         "Element/text" | "Element/label" | "Element/paragraph" | "Element/link" => {
             boon_document_model::DocumentNodeKind::Text
         }
-        "Element/button" | "Element/checkbox" => boon_document_model::DocumentNodeKind::Button,
+        "Element/button" => boon_document_model::DocumentNodeKind::Button,
+        "Element/checkbox" => boon_document_model::DocumentNodeKind::Checkbox,
         "Element/text_input" => boon_document_model::DocumentNodeKind::TextInput,
         _ => boon_document_model::DocumentNodeKind::Stack,
     }
@@ -12241,14 +12246,18 @@ fn lower_canonical_style_block(
             "font" => {
                 if let Some(font_fields) = record_fields_for_statement(child, expressions) {
                     for font_field in font_fields {
-                        if matches!(font_field.name.as_str(), "size" | "color" | "weight")
-                            && let Some(value) = document_style_value_for_expr(
-                                font_field.value,
-                                expressions,
-                                context,
-                            )
+                        if matches!(
+                            font_field.name.as_str(),
+                            "size" | "color" | "weight" | "family" | "style"
+                        ) && let Some(value) =
+                            document_style_value_for_expr(font_field.value, expressions, context)
                         {
-                            node.style.insert(font_field.name.clone(), value);
+                            let style_key = match font_field.name.as_str() {
+                                "family" => "font",
+                                "style" => "font_style",
+                                other => other,
+                            };
+                            node.style.insert(style_key.to_owned(), value);
                         }
                     }
                 }
@@ -12256,10 +12265,18 @@ fn lower_canonical_style_block(
                     let Some(font_field) = document_field_name(font_child) else {
                         continue;
                     };
-                    if matches!(font_field.as_str(), "size" | "color" | "weight") {
+                    if matches!(
+                        font_field.as_str(),
+                        "size" | "color" | "weight" | "family" | "style"
+                    ) {
                         if let Some(value) = document_style_value(font_child, expressions, context)
                         {
-                            node.style.insert(font_field, value);
+                            let style_key = match font_field.as_str() {
+                                "family" => "font",
+                                "style" => "font_style",
+                                other => other,
+                            };
+                            node.style.insert(style_key.to_owned(), value);
                         }
                     }
                 }
@@ -12357,14 +12374,18 @@ fn lower_canonical_style_record(
             "font" => {
                 if let Some(font_fields) = record_fields_for_expr(field.value, expressions) {
                     for font_field in font_fields {
-                        if matches!(font_field.name.as_str(), "size" | "color" | "weight")
-                            && let Some(value) = document_style_value_for_expr(
-                                font_field.value,
-                                expressions,
-                                context,
-                            )
+                        if matches!(
+                            font_field.name.as_str(),
+                            "size" | "color" | "weight" | "family" | "style"
+                        ) && let Some(value) =
+                            document_style_value_for_expr(font_field.value, expressions, context)
                         {
-                            node.style.insert(font_field.name.clone(), value);
+                            let style_key = match font_field.name.as_str() {
+                                "family" => "font",
+                                "style" => "font_style",
+                                other => other,
+                            };
+                            node.style.insert(style_key.to_owned(), value);
                         }
                     }
                 }
@@ -12969,7 +12990,8 @@ fn document_node_kind_from_name(name: &str) -> boon_document_model::DocumentNode
     match name {
         "Row" => boon_document_model::DocumentNodeKind::Row,
         "Text" => boon_document_model::DocumentNodeKind::Text,
-        "Button" | "Checkbox" => boon_document_model::DocumentNodeKind::Button,
+        "Button" => boon_document_model::DocumentNodeKind::Button,
+        "Checkbox" => boon_document_model::DocumentNodeKind::Checkbox,
         "Input" | "TextInput" => boon_document_model::DocumentNodeKind::TextInput,
         "Table" => boon_document_model::DocumentNodeKind::Table,
         "TableCell" => boon_document_model::DocumentNodeKind::TableCell,
@@ -13348,9 +13370,12 @@ fn json_value_to_document_text(value: &Value) -> String {
 #[derive(Default)]
 struct PreviewNativeInputState {
     last_mouse_button_event_count: u64,
+    last_mouse_motion_event_count: u64,
     last_keyboard_event_sequence: u64,
     last_click_node: Option<String>,
     last_click_sequence: u64,
+    hovered_node: Option<String>,
+    hovered_target_text: Option<String>,
     focused_node: Option<String>,
     focused_address: Option<String>,
     focused_target_text: Option<String>,
@@ -13395,7 +13420,9 @@ fn preview_input_has_unhandled_source_events(
     if input.synthetic_input_probe {
         return false;
     }
-    !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count).is_empty()
+    input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
+        || !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
+            .is_empty()
         || input
             .keyboard_events
             .iter()
@@ -13751,6 +13778,7 @@ fn preview_apply_real_window_input(
         .map_err(|_| "preview render state mutex poisoned")?
         .layout_proof
         .clone();
+    preview_update_hover_from_input(&layout_proof, input, shared_render_state, input_state)?;
 
     let mut latest_layout = if input_state.pending_live_events.is_empty() {
         None
@@ -14054,6 +14082,7 @@ fn preview_apply_real_window_input(
             }
         }
     }
+    preview_apply_hover_overlay(shared_render_state, input_state)?;
     preview_apply_focus_overlay(shared_render_state, input_state, true)?;
     Ok(())
 }
@@ -14122,6 +14151,77 @@ fn preview_apply_focus_overlay(
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
+fn preview_update_hover_from_input(
+    layout_proof: &Value,
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if input.synthetic_input_probe
+        || input.mouse_motion_event_count <= input_state.last_mouse_motion_event_count
+    {
+        return Ok(false);
+    }
+    input_state.last_mouse_motion_event_count = input.mouse_motion_event_count;
+    let next = input
+        .mouse_window_pos
+        .and_then(|position| document_hit_region_at(layout_proof, position.x, position.y))
+        .and_then(|hit_region| {
+            let node = hit_region
+                .get("node")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let target = focused_target_text(layout_proof, &node);
+            Some((node, target))
+        });
+    let (next_node, next_target) = next.unwrap_or((String::new(), None));
+    let next_node = (!next_node.is_empty()).then_some(next_node);
+    if input_state.hovered_node == next_node && input_state.hovered_target_text == next_target {
+        return Ok(false);
+    }
+    input_state.hovered_node = next_node;
+    input_state.hovered_target_text = next_target;
+    preview_apply_hover_overlay(shared_render_state, input_state)
+}
+
+fn preview_apply_hover_overlay(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &PreviewNativeInputState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if shared.layout_frame_override.is_none() {
+        shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
+    }
+    let layout_proof = shared.layout_proof.clone();
+    let Some(frame) = shared.layout_frame_override.as_mut() else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for item in &mut frame.display_list {
+        if item.style.get("hover_visible") != Some(&boon_document_model::StyleValue::Bool(true)) {
+            changed |= remove_display_style_key(&mut item.style, "__hover_paint");
+            continue;
+        }
+        let item_target = focused_target_text(&layout_proof, &item.node.0);
+        let active = input_state.hovered_node.as_deref() == Some(item.node.0.as_str())
+            || (item_target.is_some()
+                && item_target.as_deref() == input_state.hovered_target_text.as_deref());
+        changed |= set_display_style_value(
+            &mut item.style,
+            "__hover_paint",
+            boon_document_model::StyleValue::Bool(active),
+        );
+    }
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
     }
     Ok(changed)
 }
@@ -16440,11 +16540,12 @@ fn preview_operator_host_input_response(
                     .map_err(|_| "preview render state mutex poisoned")?
                     .update_count;
                 post_input_frame_method = "runtime-state-focused-node-overlay";
-            } else if let Ok((post_input_layout, post_input_frame)) =
-                native_document_layout_proof_with_state_embedded(
+            } else if let Ok((post_input_layout, Some(post_input_frame))) =
+                native_document_layout_proof_with_state_mode(
                     &state.source_path,
                     &state.source_text,
                     Some(&output.state_summary),
+                    true,
                 )
             {
                 if post_input_layout
@@ -20666,8 +20767,118 @@ mod tests {
             .expect("type inspector row should render");
         assert_eq!(
             row.style.get("text_inset"),
-            Some(&boon_document_model::StyleValue::Text("-22.32".to_owned()))
+            Some(&boon_document_model::StyleValue::Text("-29.76".to_owned()))
         );
+        assert_eq!(
+            row.style.get("size"),
+            Some(&boon_document_model::StyleValue::Number(
+                BOON_EDITOR_FONT_SIZE as f64
+            ))
+        );
+    }
+
+    #[test]
+    fn todomvc_layout_uses_generic_visual_contracts() {
+        let source_path = PathBuf::from("examples/todomvc.bn");
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let (layout_proof, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, None)
+                .expect("TodoMVC layout should lower");
+
+        let title = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("todos"))
+            .expect("TodoMVC title should render");
+        assert_eq!(
+            title.style.get("font"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Helvetica Neue".to_owned()
+            ))
+        );
+        assert!(
+            layout
+                .display_list
+                .iter()
+                .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
+        );
+        let panel = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.style.get("shadow1_color").is_some()
+                    && item.style.get("shadow2_color").is_some()
+                    && item.bounds.width >= 540.0
+            })
+            .expect("TodoMVC panel should carry generic shadow styles");
+        assert_eq!(
+            panel.style.get("shadow1_y"),
+            Some(&boon_document_model::StyleValue::Number(2.0))
+        );
+
+        let delete_buttons = layout
+            .display_list
+            .iter()
+            .filter(|item| item.text.as_deref() == Some("×"))
+            .collect::<Vec<_>>();
+        assert!(
+            !delete_buttons.is_empty(),
+            "delete buttons should remain hit-testable"
+        );
+        assert!(delete_buttons.iter().all(|item| {
+            item.style.get("hover_visible") == Some(&boon_document_model::StyleValue::Bool(true))
+        }));
+
+        let hover_title = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Read documentation"))
+            .expect("first todo title should render");
+        let mut hover = deterministic_click_input(0, 0.0, 0.0);
+        hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(hover_title.bounds.x + hover_title.bounds.width * 0.5),
+            y: f64::from(hover_title.bounds.y + hover_title.bounds.height * 0.5),
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let proof = {
+            shared_render_state
+                .lock()
+                .expect("render state")
+                .layout_proof
+                .clone()
+        };
+        assert!(
+            preview_update_hover_from_input(&proof, &hover, &shared_render_state, &mut input_state)
+                .expect("hover overlay should update")
+        );
+        let shared = shared_render_state.lock().expect("render state");
+        let hovered_delete_count = shared
+            .layout_frame_override
+            .as_ref()
+            .expect("hover overlay should install frame override")
+            .display_list
+            .iter()
+            .filter(|item| item.text.as_deref() == Some("×"))
+            .filter(|item| {
+                item.style.get("paint") == Some(&boon_document_model::StyleValue::Bool(true))
+                    || item.style.get("__hover_paint")
+                        == Some(&boon_document_model::StyleValue::Bool(true))
+            })
+            .count();
+        assert_eq!(hovered_delete_count, 1);
     }
 
     #[test]

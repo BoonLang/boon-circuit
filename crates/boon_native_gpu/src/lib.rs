@@ -30,6 +30,7 @@ const JETBRAINS_MONO_BOLD_ITALIC_FONT_BYTES: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Patched-BoldItalic.ttf");
 const EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 const EDITOR_FONT_FEATURES: &str = "zero,calt";
+const DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -151,11 +152,11 @@ impl boon_document::TextMeasurer for GlyphonTextMeasurer {
             &mut self.font_system,
             text,
             &text_attrs(
-                EDITOR_FONT_FAMILY,
+                DOCUMENT_FONT_FAMILY,
                 Style::Normal,
                 Weight::NORMAL,
                 [0, 0, 0, 255],
-                EDITOR_FONT_FEATURES,
+                "",
             ),
             Shaping::Advanced,
             None,
@@ -944,8 +945,15 @@ fn text_attrs<'a>(
     color: [u8; 4],
     font_features: &str,
 ) -> Attrs<'a> {
+    let family = match font_family {
+        "SansSerif" | "sans-serif" => Family::SansSerif,
+        "Serif" | "serif" => Family::Serif,
+        "Monospace" | "monospace" => Family::Monospace,
+        "Helvetica Neue" | "Helvetica" | "Arial" => Family::Name(DOCUMENT_FONT_FAMILY),
+        _ => Family::Name(font_family),
+    };
     Attrs::new()
-        .family(Family::Name(font_family))
+        .family(family)
         .style(font_style)
         .weight(font_weight)
         .color(Color::rgba(color[0], color[1], color[2], color[3]))
@@ -1009,14 +1017,21 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
     {
         let size = style_number(&item.style, "size").unwrap_or(14.0);
         let raw_text = item.text.as_deref().unwrap_or_default();
+        if style_bool(&item.style, "paint") == Some(false)
+            || (style_bool(&item.style, "hover_visible") == Some(true)
+                && style_bool(&item.style, "__hover_paint") != Some(true))
+        {
+            continue;
+        }
         let checked = style_bool(&item.style, "checked") == Some(true);
         let input_wants_caret_layout = matches!(item.kind, DocumentNodeKind::TextInput)
             && (item.focused
                 || style_bool(&item.style, "focus") == Some(true)
                 || style_bool(&item.style, "caret_visible").is_some()
                 || item.style.contains_key("caret_column"));
+        let mut placeholder_active = false;
         let (text, color) = if raw_text.trim().is_empty() {
-            if checked {
+            if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
                 (
                     "✓".to_owned(),
                     style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
@@ -1024,6 +1039,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             } else if let Some(placeholder) =
                 style_text(&item.style, "placeholder").filter(|text| !text.trim().is_empty())
             {
+                placeholder_active = true;
                 (
                     placeholder.to_owned(),
                     style_color_u8(&item.style, "placeholder_color")
@@ -1047,10 +1063,10 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             };
             (raw_text.to_owned(), color)
         };
-        let font_family = if checked {
+        let font_family = if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
             "DejaVu Sans"
         } else {
-            style_text(&item.style, "font").unwrap_or("JetBrains Mono")
+            style_text(&item.style, "font").unwrap_or(DOCUMENT_FONT_FAMILY)
         };
         let rich_spans = rich_text_spans(&item.style, &text, color);
         runs.push(TextRun {
@@ -1059,7 +1075,13 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             text,
             rich_spans,
             font_family: font_family.to_owned(),
-            font_style: text_font_style(&item.style),
+            font_style: if placeholder_active {
+                style_text(&item.style, "placeholder_style")
+                    .map(text_font_style_value)
+                    .unwrap_or_else(|| text_font_style(&item.style))
+            } else {
+                text_font_style(&item.style)
+            },
             font_weight: text_font_weight(&item.style),
             font_features: style_text(&item.style, "font_features")
                 .unwrap_or("")
@@ -1340,6 +1362,9 @@ fn text_font_weight(style: &StyleMap) -> Weight {
 
 fn text_font_weight_value(value: &str) -> Weight {
     match value.to_ascii_lowercase().as_str() {
+        "hairline" | "thin" => Weight(100),
+        "extralight" | "extra-light" | "ultralight" | "ultra-light" => Weight(200),
+        "light" => Weight(300),
         "bold" => Weight::BOLD,
         "bolder" => Weight::EXTRA_BOLD,
         "semibold" | "semi-bold" => Weight::SEMIBOLD,
@@ -1486,11 +1511,18 @@ fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextAlign {
     if style_bool(style, "center") == Some(true) {
         return TextAlign::Center;
     }
-    match style_text(style, "align") {
+    match style_text(style, "text_align")
+        .or_else(|| style_text(style, "align_text"))
+        .or_else(|| style_text(style, "align"))
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("left") => TextAlign::Left,
         Some("center") => TextAlign::Center,
         Some("right") => TextAlign::Right,
-        _ if matches!(kind, DocumentNodeKind::Button) => TextAlign::Center,
+        _ if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) => {
+            TextAlign::Center
+        }
         _ => TextAlign::Left,
     }
 }
@@ -1508,6 +1540,7 @@ fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVertica
         _ if matches!(
             kind,
             DocumentNodeKind::Button
+                | DocumentNodeKind::Checkbox
                 | DocumentNodeKind::Text
                 | DocumentNodeKind::TextInput
                 | DocumentNodeKind::TableCell
@@ -1597,6 +1630,20 @@ fn rect_vertices(
         .enumerate()
     {
         metrics.visible_display_item_count += 1;
+        if style_bool(&item.style, "paint") == Some(false)
+            || (style_bool(&item.style, "hover_visible") == Some(true)
+                && style_bool(&item.style, "__hover_paint") != Some(true))
+        {
+            continue;
+        }
+        push_shadows(
+            &mut positions,
+            &mut colors,
+            item.bounds,
+            width,
+            height,
+            &item.style,
+        );
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
@@ -1612,6 +1659,9 @@ fn rect_vertices(
         let selected_border = (style_bool(&item.style, "selected") == Some(true))
             .then(|| style_color_f32(&item.style, "selected_border"))
             .flatten();
+        let focus_border = (item.focused || style_bool(&item.style, "focus") == Some(true))
+            .then(|| style_color_f32(&item.style, "focus_border"))
+            .flatten();
         if let Some(border) = selected_border.or_else(|| style_color_f32(&item.style, "border")) {
             push_border(
                 &mut positions,
@@ -1619,11 +1669,24 @@ fn rect_vertices(
                 item.bounds,
                 width,
                 height,
-                if item.focused {
+                if item.focused && focus_border.is_none() {
                     [0.098, 0.459, 0.824, 1.0]
                 } else {
                     border
                 },
+                style_number(&item.style, "border_width").unwrap_or(2.0),
+            );
+            metrics.rendered_rect_count += 1;
+        }
+        if let Some(border) = focus_border {
+            push_border(
+                &mut positions,
+                &mut colors,
+                item.bounds,
+                width,
+                height,
+                border,
+                style_number(&item.style, "focus_border_width").unwrap_or(2.0),
             );
             metrics.rendered_rect_count += 1;
         }
@@ -1726,6 +1789,36 @@ fn rect_vertices(
                 width,
                 height,
                 color,
+            );
+            metrics.rendered_rect_count += 1;
+        }
+        if style_bool(&item.style, "underline_if") == Some(true) {
+            let color = style_color_f32(&item.style, "underline_color")
+                .or_else(|| style_color_f32(&item.style, "color"))
+                .unwrap_or([0.58, 0.58, 0.58, 1.0]);
+            push_rect(
+                &mut positions,
+                &mut colors,
+                Rect {
+                    x: item.bounds.x + 4.0,
+                    y: item.bounds.y + item.bounds.height - 5.0,
+                    width: (item.bounds.width - 8.0).max(1.0),
+                    height: 1.0,
+                },
+                width,
+                height,
+                color,
+            );
+            metrics.rendered_rect_count += 1;
+        }
+        if matches!(item.kind, DocumentNodeKind::Checkbox) {
+            push_checkbox(
+                &mut positions,
+                &mut colors,
+                item.bounds,
+                width,
+                height,
+                &item.style,
             );
             metrics.rendered_rect_count += 1;
         }
@@ -1832,6 +1925,157 @@ fn push_rect(
     }
 }
 
+fn push_shadows(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+) {
+    for index in 1..=6 {
+        let color_key = format!("shadow{index}_color");
+        let Some(color) = style_color_f32(style, &color_key) else {
+            continue;
+        };
+        let x = style_number(style, &format!("shadow{index}_x")).unwrap_or(0.0);
+        let y = style_number(style, &format!("shadow{index}_y")).unwrap_or(0.0);
+        let blur = style_number(style, &format!("shadow{index}_blur")).unwrap_or(0.0);
+        let spread = style_number(style, &format!("shadow{index}_spread")).unwrap_or(0.0);
+        let inset = style_bool(style, &format!("shadow{index}_inset")) == Some(true);
+        if inset {
+            let thickness = blur.max(1.0);
+            push_rect(
+                positions,
+                colors,
+                Rect {
+                    x: rect.x,
+                    y: rect.y + rect.height - thickness + y,
+                    width: rect.width,
+                    height: thickness,
+                },
+                width,
+                height,
+                color,
+            );
+        } else {
+            let expansion = spread;
+            push_rect(
+                positions,
+                colors,
+                Rect {
+                    x: rect.x + x - expansion,
+                    y: rect.y + y - expansion,
+                    width: (rect.width + expansion * 2.0).max(1.0),
+                    height: (rect.height + expansion * 2.0).max(1.0),
+                },
+                width,
+                height,
+                color,
+            );
+        }
+    }
+}
+
+fn push_circle(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let color = rgba8_from_f32(color);
+    let segments = 48;
+    for index in 0..segments {
+        let a0 = std::f32::consts::TAU * index as f32 / segments as f32;
+        let a1 = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
+        for (x, y) in [
+            (center_x, center_y),
+            (center_x + radius * a0.cos(), center_y + radius * a0.sin()),
+            (center_x + radius * a1.cos(), center_y + radius * a1.sin()),
+        ] {
+            positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
+            positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
+            colors.extend_from_slice(&color);
+        }
+    }
+}
+
+fn push_polygon(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    points: &[(f32, f32)],
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    if points.len() < 3 {
+        return;
+    }
+    let color = rgba8_from_f32(color);
+    for index in 1..points.len() - 1 {
+        for (x, y) in [points[0], points[index], points[index + 1]] {
+            positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
+            positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
+            colors.extend_from_slice(&color);
+        }
+    }
+}
+
+fn push_checkbox(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+) {
+    let checked = style_bool(style, "checked") == Some(true);
+    let center_x = rect.x + rect.width * 0.5;
+    let center_y = rect.y + rect.height * 0.5;
+    let radius = rect.width.min(rect.height) * 0.5;
+    let ring_color = if checked {
+        style_color_f32(style, "checked_border").unwrap_or([0.101, 0.356, 0.292, 1.0])
+    } else {
+        style_color_f32(style, "checkbox_border").unwrap_or([0.830, 0.830, 0.830, 1.0])
+    };
+    let inner_color = style_color_f32(style, "checkbox_background").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    push_circle(
+        positions, colors, center_x, center_y, radius, width, height, ring_color,
+    );
+    push_circle(
+        positions,
+        colors,
+        center_x,
+        center_y,
+        (radius - style_number(style, "checkbox_border_width").unwrap_or(1.5)).max(0.0),
+        width,
+        height,
+        inner_color,
+    );
+    if checked {
+        let map_svg = |x: f32, y: f32| {
+            (
+                rect.x + ((x + 10.0) / 100.0) * rect.width,
+                rect.y + ((y + 18.0) / 135.0) * rect.height,
+            )
+        };
+        let points = [
+            map_svg(72.0, 25.0),
+            map_svg(42.0, 71.0),
+            map_svg(27.0, 56.0),
+            map_svg(23.0, 60.0),
+            map_svg(43.0, 80.0),
+            map_svg(77.0, 28.0),
+        ];
+        let color = style_color_f32(style, "check_color").unwrap_or([0.108, 0.540, 0.432, 1.0]);
+        push_polygon(positions, colors, &points, width, height, color);
+    }
+}
+
 fn push_border(
     positions: &mut Vec<f32>,
     colors: &mut Vec<u8>,
@@ -1839,8 +2083,9 @@ fn push_border(
     width: f32,
     height: f32,
     color: [f32; 4],
+    thickness: f32,
 ) {
-    let thickness = 2.0;
+    let thickness = thickness.max(1.0);
     for edge in [
         Rect {
             x: rect.x,
@@ -1889,6 +2134,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
         }
         DocumentNodeKind::TextInput => [1.0, 1.0, 1.0, 1.0],
         DocumentNodeKind::Button => [0.92, 0.95, 0.97, 1.0],
+        DocumentNodeKind::Checkbox => [1.0, 1.0, 1.0, 0.0],
         DocumentNodeKind::Table | DocumentNodeKind::TableCell => [1.0, 1.0, 1.0, 1.0],
         DocumentNodeKind::Text => [0.965, 0.972, 0.982, 1.0],
     }

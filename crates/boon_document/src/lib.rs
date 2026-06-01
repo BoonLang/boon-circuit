@@ -220,7 +220,7 @@ impl LayoutBuilder<'_, '_> {
         let control_size = style_spacing(&node.style, "size").filter(|_| {
             matches!(
                 node.kind,
-                DocumentNodeKind::Button | DocumentNodeKind::TableCell
+                DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::TableCell
             ) && node.text.is_none()
         });
         let auto_width = style_text(&node.style, "width")

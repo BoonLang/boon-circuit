@@ -186,13 +186,31 @@ FUNCTION todo_app() {
             height: Fill
             align: [row: Center]
             background: [color: Oklch[lightness:0.97]]
-            font: [size: 14, color: Oklch[lightness:0.17]]
+            font: [
+                family: TEXT { Helvetica Neue }
+                size: 14
+                color: Oklch[lightness:0.17]
+                weight: Light
+            ]
         ]
         items: LIST {
             todo_header()
             todo_panel()
+            todo_gap()
             todo_info()
         }
+    )
+}
+
+FUNCTION todo_gap() {
+    Element/container(
+        element: []
+        style: [
+            width: 550
+            height: 65
+            background: [color: Oklch[lightness:0.97]]
+        ]
+        child: Text/empty()
     )
 }
 
@@ -204,7 +222,12 @@ FUNCTION todo_header() {
             height: 118
             align: [row: Center]
             background: [color: Oklch[lightness:0.97]]
-            font: [size: 100, color: Oklch[lightness:0.54,chroma:0.156,hue:21.2]]
+            font: [
+                family: TEXT { Helvetica Neue }
+                size: 100
+                color: Oklch[lightness:0.54,chroma:0.156,hue:21.2,alpha:0.915]
+                weight: Hairline
+            ]
         ]
         child: TEXT { todos }
     )
@@ -219,7 +242,12 @@ FUNCTION todo_panel() {
             width: 550
             align: [row: Center]
             background: [color: Oklch[lightness:1]]
-            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+            shadow1_y: 2
+            shadow1_blur: 4
+            shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]
+            shadow2_y: 10
+            shadow2_blur: 50
+            shadow2_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.05]
         ]
         items: LIST {
             todo_new_entry()
@@ -237,18 +265,25 @@ FUNCTION todo_new_entry() {
         style: [
             width: Fill
             height: 66
-            padding: 8
+            padding: 0
+            gap: 0
             background: [color: Oklch[lightness:1]]
-            border: [color: Oklch[lightness:0.89,chroma:0.02,hue:18]]
+            border: [color: Oklch[lightness:0.92]]
+            focus_border: Oklch[lightness:0.72,chroma:0.07,hue:20]
+            focus_border_width: 1
         ]
         items: LIST {
             Element/button(
                 element: [event: [click: store.sources.toggle_all_checkbox.click]]
                 style: [
-                    width: 36
-                    height: 50
+                    width: 60
+                    height: 66
                     background: [color: Oklch[lightness:1]]
-                    font: [size: 28, color: Oklch[lightness:0.56]]
+                    font: [
+                        family: TEXT { Helvetica Neue }
+                        size: 22
+                        color: Oklch[lightness:0.56]
+                    ]
                 ]
                 label: TEXT { ⌄ }
             )
@@ -260,10 +295,22 @@ FUNCTION todo_new_entry() {
                     ]
                 ]
                 style: [
-                    width: 480
-                    height: 56
-                    background: [color: Oklch[lightness:1]]
-                    font: [size: 24, color: Oklch[lightness:0.42]]
+                    width: 490
+                    height: 66
+                    background: [color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]]
+                    shadow1_inset: True
+                    shadow1_y: -2
+                    shadow1_blur: 1
+                    shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.03]
+                    focus_border: Oklch[lightness:0.72,chroma:0.07,hue:20]
+                    focus_border_width: 1
+                    placeholder_color: Oklch[lightness:0.92]
+                    placeholder_style: Italic
+                    font: [
+                        family: TEXT { Helvetica Neue }
+                        size: 24
+                        color: Oklch[lightness:0.42]
+                    ]
                 ]
                 label: TEXT { What needs to be done? }
                 text: new_todo_text
@@ -281,7 +328,6 @@ FUNCTION todo_list() {
         gap: 0
         style: [
             width: Fill
-            height: 354
             background: [color: Oklch[lightness:1]]
             scroll: True
             scrollbars: True
@@ -300,14 +346,21 @@ FUNCTION todo_row(todo) {
         style: [
             width: Fill
             height: 59
-            padding: 6
+            padding: 9
+            gap: 5
             background: [color: Oklch[lightness:1]]
             border: [color: Oklch[lightness:0.93]]
         ]
         items: LIST {
             Element/checkbox(
                 element: [event: [click: todo.sources.todo_checkbox.click]]
-                style: [size: 28]
+                style: [
+                    size: 40
+                    checkbox_border: Oklch[lightness:0.84]
+                    checked_border: Oklch[lightness:0.64,chroma:0.060,hue:180]
+                    check_color: Oklch[lightness:0.62,chroma:0.105,hue:178]
+                    checkbox_background: Oklch[lightness:1]
+                ]
                 label: Text/empty()
                 checked: todo.completed
                 target: todo.title
@@ -315,10 +368,18 @@ FUNCTION todo_row(todo) {
             Element/button(
                 element: [event: [double_click: todo.sources.todo_title_element.double_click]]
                 style: [
-                    width: 430
+                    width: 416
                     height: 42
                     background: [color: Oklch[lightness:1]]
-                    font: [size: 24, color: Oklch[lightness:0.42]]
+                    strike_if: todo.completed
+                    color_if: todo.completed
+                    if_color: Oklch[lightness:0.65]
+                    text_align: Left
+                    font: [
+                        family: TEXT { Helvetica Neue }
+                        size: 24
+                        color: Oklch[lightness:0.42]
+                    ]
                 ]
                 label: todo.title
                 visible: todo.not_editing
@@ -333,11 +394,19 @@ FUNCTION todo_row(todo) {
                     ]
                 ]
                 style: [
-                    width: 430
+                    width: 416
                     height: 43
                     background: [color: Oklch[lightness:1]]
                     border: [color: Oklch[lightness:0.67]]
-                    font: [size: 24, color: Oklch[lightness:0.42]]
+                    shadow1_inset: True
+                    shadow1_y: -1
+                    shadow1_blur: 5
+                    shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]
+                    font: [
+                        family: TEXT { Helvetica Neue }
+                        size: 24
+                        color: Oklch[lightness:0.42]
+                    ]
                 ]
                 label: TEXT { Edit todo }
                 text: todo.edit_text
@@ -349,10 +418,15 @@ FUNCTION todo_row(todo) {
             Element/button(
                 element: [event: [press: todo.sources.remove_todo_button.press]]
                 style: [
-                    width: 32
-                    height: 32
+                    width: 40
+                    height: 40
+                    hover_visible: True
                     background: [color: Oklch[lightness:1]]
-                    font: [size: 24, color: Oklch[lightness:0.73,chroma:0.06,hue:18.6]]
+                    font: [
+                        family: TEXT { Helvetica Neue }
+                        size: 30
+                        color: Oklch[lightness:0.73,chroma:0.06,hue:18.6]
+                    ]
                 ]
                 label: TEXT { × }
                 target: todo.title
@@ -372,34 +446,51 @@ FUNCTION todo_footer() {
             padding: 9
             background: [color: Oklch[lightness:1]]
             border: [color: Oklch[lightness:0.93]]
+            shadow1_y: 1
+            shadow1_blur: 1
+            shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]
+            shadow2_y: 8
+            shadow2_spread: -3
+            shadow2_color: Oklch[lightness:0.973]
+            shadow3_y: 9
+            shadow3_blur: 1
+            shadow3_spread: -3
+            shadow3_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]
+            shadow4_y: 16
+            shadow4_spread: -6
+            shadow4_color: Oklch[lightness:0.973]
+            shadow5_y: 17
+            shadow5_blur: 2
+            shadow5_spread: -6
+            shadow5_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]
         ]
         items: LIST {
             Element/label(
                 element: []
-                style: [width: 130, height: 24, font: [size: 14, color: Oklch[lightness:0.17]]]
+                style: [width: 130, height: 24, font: [family: TEXT { Helvetica Neue }, size: 14, color: Oklch[lightness:0.17]]]
                 label: TEXT { {active_count} items left }
             )
             Element/button(
                 element: [event: [press: store.sources.filter_all.press]]
-                style: [width: 43, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                style: [width: 43, height: 24, background: [color: Oklch[lightness:1]], selected_border: [color: Oklch[lightness:0.58,chroma:0.17,hue:24,alpha:0.20]], border_width: 1, font: [family: TEXT { Helvetica Neue }, size: 14, color: Oklch[lightness:0.17]]]
                 label: TEXT { All }
                 selected: selected_filter == All
             )
             Element/button(
                 element: [event: [press: store.sources.filter_active.press]]
-                style: [width: 65, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                style: [width: 65, height: 24, background: [color: Oklch[lightness:1]], selected_border: [color: Oklch[lightness:0.58,chroma:0.17,hue:24,alpha:0.20]], border_width: 1, font: [family: TEXT { Helvetica Neue }, size: 14, color: Oklch[lightness:0.17]]]
                 label: TEXT { Active }
                 selected: selected_filter == Active
             )
             Element/button(
                 element: [event: [press: store.sources.filter_completed.press]]
-                style: [width: 95, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                style: [width: 95, height: 24, background: [color: Oklch[lightness:1]], selected_border: [color: Oklch[lightness:0.58,chroma:0.17,hue:24,alpha:0.20]], border_width: 1, font: [family: TEXT { Helvetica Neue }, size: 14, color: Oklch[lightness:0.17]]]
                 label: TEXT { Completed }
                 selected: selected_filter == Completed
             )
             Element/button(
                 element: [event: [press: store.sources.clear_completed_button.press]]
-                style: [width: 130, height: 24, background: [color: Oklch[lightness:1]], font: [size: 14, color: Oklch[lightness:0.17]]]
+                style: [width: 130, height: 24, background: [color: Oklch[lightness:1]], font: [family: TEXT { Helvetica Neue }, size: 14, color: Oklch[lightness:0.17]]]
                 label: TEXT { Clear completed }
                 visible: has_completed
             )
@@ -416,7 +507,7 @@ FUNCTION todo_info() {
             width: 550
             align: [row: Center]
             background: [color: Oklch[lightness:0.97]]
-            font: [size: 12, color: Oklch[lightness:0.42]]
+            font: [family: TEXT { Helvetica Neue }, size: 12, color: Oklch[lightness:0.42]]
         ]
         items: LIST {
             Element/label(

@@ -1988,7 +1988,7 @@ fn push_circle(
     color: [f32; 4],
 ) {
     let color = rgba8_from_f32(color);
-    let segments = 48;
+    let segments = 128;
     for index in 0..segments {
         let a0 = std::f32::consts::TAU * index as f32 / segments as f32;
         let a1 = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
@@ -2004,25 +2004,120 @@ fn push_circle(
     }
 }
 
-fn push_polygon(
+fn push_annulus(
     positions: &mut Vec<f32>,
     colors: &mut Vec<u8>,
-    points: &[(f32, f32)],
+    center_x: f32,
+    center_y: f32,
+    outer_radius: f32,
+    inner_radius: f32,
     width: f32,
     height: f32,
     color: [f32; 4],
 ) {
-    if points.len() < 3 {
+    push_annulus_gradient(
+        positions,
+        colors,
+        center_x,
+        center_y,
+        outer_radius,
+        inner_radius,
+        width,
+        height,
+        color,
+        color,
+    );
+}
+
+fn push_annulus_gradient(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    center_x: f32,
+    center_y: f32,
+    outer_radius: f32,
+    inner_radius: f32,
+    width: f32,
+    height: f32,
+    outer_color: [f32; 4],
+    inner_color: [f32; 4],
+) {
+    if outer_radius <= 0.0 || inner_radius < 0.0 || inner_radius >= outer_radius {
         return;
     }
-    let color = rgba8_from_f32(color);
-    for index in 1..points.len() - 1 {
-        for (x, y) in [points[0], points[index], points[index + 1]] {
+    let outer_color = rgba8_from_f32(outer_color);
+    let inner_color = rgba8_from_f32(inner_color);
+    let segments = 128;
+    for index in 0..segments {
+        let a0 = std::f32::consts::TAU * index as f32 / segments as f32;
+        let a1 = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
+        let outer0 = (
+            center_x + outer_radius * a0.cos(),
+            center_y + outer_radius * a0.sin(),
+        );
+        let outer1 = (
+            center_x + outer_radius * a1.cos(),
+            center_y + outer_radius * a1.sin(),
+        );
+        let inner0 = (
+            center_x + inner_radius * a0.cos(),
+            center_y + inner_radius * a0.sin(),
+        );
+        let inner1 = (
+            center_x + inner_radius * a1.cos(),
+            center_y + inner_radius * a1.sin(),
+        );
+        for ((x, y), color) in [
+            (outer0, outer_color),
+            (outer1, outer_color),
+            (inner1, inner_color),
+            (outer0, outer_color),
+            (inner1, inner_color),
+            (inner0, inner_color),
+        ] {
             positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
             positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
             colors.extend_from_slice(&color);
         }
     }
+}
+
+fn push_stroked_segment(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    from: (f32, f32),
+    to: (f32, f32),
+    thickness: f32,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let length = dx.hypot(dy);
+    if length <= f32::EPSILON {
+        return;
+    }
+    let half = thickness.max(1.0) * 0.5;
+    let px = -dy / length * half;
+    let py = dx / length * half;
+    let points = [
+        (from.0 + px, from.1 + py),
+        (to.0 + px, to.1 + py),
+        (to.0 - px, to.1 - py),
+        (from.0 - px, from.1 - py),
+    ];
+    let color_bytes = rgba8_from_f32(color);
+    for (x, y) in [
+        points[0], points[1], points[2], points[0], points[2], points[3],
+    ] {
+        positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
+        positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
+        colors.extend_from_slice(&color_bytes);
+    }
+    push_circle(
+        positions, colors, from.0, from.1, half, width, height, color,
+    );
+    push_circle(positions, colors, to.0, to.1, half, width, height, color);
 }
 
 fn push_checkbox(
@@ -2036,22 +2131,64 @@ fn push_checkbox(
     let checked = style_bool(style, "checked") == Some(true);
     let center_x = rect.x + rect.width * 0.5;
     let center_y = rect.y + rect.height * 0.5;
-    let radius = rect.width.min(rect.height) * 0.5;
+    let radius = (rect.width.min(rect.height) * 0.5
+        - style_number(style, "checkbox_inset").unwrap_or(2.0))
+    .max(1.0);
+    let border_width = style_number(style, "checkbox_border_width").unwrap_or(1.5);
     let ring_color = if checked {
         style_color_f32(style, "checked_border").unwrap_or([0.101, 0.356, 0.292, 1.0])
     } else {
         style_color_f32(style, "checkbox_border").unwrap_or([0.830, 0.830, 0.830, 1.0])
     };
     let inner_color = style_color_f32(style, "checkbox_background").unwrap_or([1.0, 1.0, 1.0, 1.0]);
-    push_circle(
-        positions, colors, center_x, center_y, radius, width, height, ring_color,
+    let aa = style_number(style, "checkbox_aa")
+        .unwrap_or(0.8)
+        .clamp(0.0, 1.5);
+    let inner_radius = (radius - border_width).max(0.0);
+    let inner_solid_radius = (inner_radius - aa).max(0.0);
+    push_annulus_gradient(
+        positions,
+        colors,
+        center_x,
+        center_y,
+        radius + aa,
+        radius,
+        width,
+        height,
+        color_with_alpha_scale(ring_color, 0.0),
+        ring_color,
     );
+    push_annulus(
+        positions,
+        colors,
+        center_x,
+        center_y,
+        radius,
+        inner_radius,
+        width,
+        height,
+        ring_color,
+    );
+    if inner_radius > inner_solid_radius {
+        push_annulus_gradient(
+            positions,
+            colors,
+            center_x,
+            center_y,
+            inner_radius,
+            inner_solid_radius,
+            width,
+            height,
+            color_with_alpha_scale(inner_color, 0.0),
+            inner_color,
+        );
+    }
     push_circle(
         positions,
         colors,
         center_x,
         center_y,
-        (radius - style_number(style, "checkbox_border_width").unwrap_or(1.5)).max(0.0),
+        inner_solid_radius,
         width,
         height,
         inner_color,
@@ -2063,16 +2200,43 @@ fn push_checkbox(
                 rect.y + ((y + 18.0) / 135.0) * rect.height,
             )
         };
-        let points = [
-            map_svg(72.0, 25.0),
-            map_svg(42.0, 71.0),
-            map_svg(27.0, 56.0),
-            map_svg(23.0, 60.0),
-            map_svg(43.0, 80.0),
-            map_svg(77.0, 28.0),
-        ];
+        let start = map_svg(27.0, 56.0);
+        let middle = map_svg(42.0, 71.0);
+        let end = map_svg(72.0, 25.0);
         let color = style_color_f32(style, "check_color").unwrap_or([0.108, 0.540, 0.432, 1.0]);
-        push_polygon(positions, colors, &points, width, height, color);
+        let thickness = style_number(style, "check_width").unwrap_or(3.0);
+        let check_aa = style_number(style, "check_aa")
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.5);
+        if check_aa > 0.0 {
+            let aa_color = color_with_alpha_scale(color, 0.28);
+            push_stroked_segment(
+                positions,
+                colors,
+                start,
+                middle,
+                thickness + check_aa * 2.0,
+                width,
+                height,
+                aa_color,
+            );
+            push_stroked_segment(
+                positions,
+                colors,
+                middle,
+                end,
+                thickness + check_aa * 2.0,
+                width,
+                height,
+                aa_color,
+            );
+        }
+        push_stroked_segment(
+            positions, colors, start, middle, thickness, width, height, color,
+        );
+        push_stroked_segment(
+            positions, colors, middle, end, thickness, width, height, color,
+        );
     }
 }
 
@@ -2118,6 +2282,11 @@ fn push_border(
 
 fn rgba8_from_f32(color: [f32; 4]) -> [u8; 4] {
     color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn color_with_alpha_scale(mut color: [f32; 4], scale: f32) -> [f32; 4] {
+    color[3] = (color[3] * scale).clamp(0.0, 1.0);
+    color
 }
 
 fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {

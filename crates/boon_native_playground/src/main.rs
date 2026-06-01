@@ -1160,10 +1160,15 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let role_report_timeout_ms = numeric_arg(args, "--role-report-timeout-ms").unwrap_or(12_000);
     let dev_start_delay_ms = numeric_arg(args, "--dev-start-delay-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
+    let effective_dev_hold_ms = if probe {
+        dev_hold_ms.max(input_sample_delay_ms.saturating_add(45_000))
+    } else {
+        dev_hold_ms
+    };
     let effective_preview_hold_ms = if probe {
         child_hold_ms.max(
             dev_start_delay_ms
-                .saturating_add(dev_hold_ms)
+                .saturating_add(effective_dev_hold_ms)
                 .saturating_add(input_sample_delay_ms)
                 .max(dev_start_delay_ms.saturating_add(role_report_timeout_ms))
                 .saturating_add(5_000),
@@ -1265,7 +1270,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("dev report path is not UTF-8")?
             .to_owned(),
         "--hold-ms".to_owned(),
-        dev_hold_ms.to_string(),
+        effective_dev_hold_ms.to_string(),
         "--ipc-stress-messages".to_owned(),
         "4096".to_owned(),
         "--ipc-queue-capacity".to_owned(),
@@ -1399,7 +1404,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let preview_exit_wait_after_dev_ms = if skip_preview_shutdown {
         effective_preview_hold_ms
-            .saturating_sub(dev_start_delay_ms.saturating_add(dev_hold_ms))
+            .saturating_sub(dev_start_delay_ms.saturating_add(effective_dev_hold_ms))
             .saturating_add(15_000)
     } else {
         effective_preview_hold_ms.saturating_add(500)
@@ -1520,6 +1525,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["effective_preview_hold_ms"] = json!(effective_preview_hold_ms);
         details["preview_exit_wait_after_dev_ms"] = json!(preview_exit_wait_after_dev_ms);
         details["dev_hold_ms"] = json!(dev_hold_ms);
+        details["effective_dev_hold_ms"] = json!(effective_dev_hold_ms);
         details["dev_start_delay_ms"] = json!(dev_start_delay_ms);
         details["role_report_timeout_ms"] = json!(role_report_timeout_ms);
         details["demand_driven_loop"] = json!(demand_driven_loop);
@@ -9710,7 +9716,9 @@ impl DevWindowShell {
         &self,
         surface_proof: &boon_native_app_window::AppWindowSurfaceProof,
     ) -> serde_json::Value {
-        let mut probe = self.command_probe();
+        let mut shell_probe = self.clone();
+        shell_probe.preview_transport = PreviewTransport::new(None);
+        let mut probe = shell_probe.command_probe();
         let route_proof = self.dev_window_route_proof(surface_proof);
         let route_pass = route_proof
             .get("status")
@@ -9748,6 +9756,7 @@ impl DevWindowShell {
         probe["app_window_synthetic_input_probe"] =
             json!(surface_proof.input_adapter.synthetic_input_probe);
         probe["real_os_input_claimed"] = json!(false);
+        probe["preview_transport_probe_deferred_to_ipc_probe"] = json!(true);
         probe["real_window_event_boundary"] =
             json!("app_window coalesced input sampled from exact dev child window process");
         probe["target_dev_pid"] = json!(surface_proof.pid);
@@ -16690,6 +16699,11 @@ fn preview_operator_host_input_response(
     let mut shared_render_update_count = 0_u64;
     let mut stage_timings = Vec::new();
     for (index, input_json) in inputs.iter().enumerate() {
+        let report_index = input_json
+            .get("source_event_index")
+            .and_then(serde_json::Value::as_u64)
+            .map(|index| index as usize)
+            .unwrap_or(index);
         let input_started = Instant::now();
         let event_json = input_json.get("source_event").unwrap_or(input_json);
         let runtime = if let Some(runtime) = runtime_guard.as_mut() {
@@ -16817,10 +16831,11 @@ fn preview_operator_host_input_response(
             }
         }
         let layout_ms = layout_started.elapsed().as_secs_f64() * 1000.0;
-        let assertion = preview_operator_host_input_assertion(index, &event, &output.state_summary);
+        let assertion =
+            preview_operator_host_input_assertion(report_index, &event, &output.state_summary);
         route_assertions.push(host_route.clone());
         stage_timings.push(json!({
-            "input_index": index,
+            "input_index": report_index,
             "window_ms": window_ms,
             "before_summary_ms": before_summary_ms,
             "route_ms": route_ms,
@@ -16829,7 +16844,7 @@ fn preview_operator_host_input_response(
             "total_ms": input_started.elapsed().as_secs_f64() * 1000.0
         }));
         outputs.push(json!({
-            "input_index": index,
+            "input_index": report_index,
             "event": live_source_event_report(&event),
             "host_route": host_route,
             "semantic_delta_count": output.semantic_deltas.len(),
@@ -17334,6 +17349,8 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
 }
 
 fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<serde_json::Value>> {
+    const SOURCE_EVENTS_PER_REQUEST: usize = 4;
+
     let layout_proof = native_document_layout_proof(path, code).ok()?;
     let source_intents = layout_proof
         .get("source_intent_assertions")
@@ -17384,7 +17401,9 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
         });
         let requires_dynamic_layout = source_intent.is_none();
         let host_events = host_events_for_source_event(&event, target_hit_region.as_ref());
+        let source_event_index = source_events.len();
         source_events.push(json!({
+            "source_event_index": source_event_index,
             "source_event": event,
             "target_node": target_node,
             "source_intent": source_intent.unwrap_or_else(|| json!(null)),
@@ -17397,21 +17416,38 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
     if source_events.is_empty() {
         return None;
     }
-    Some(vec![json!({
-        "kind": "operator-host-input",
-        "source_path": path.display().to_string(),
-        "source_hash": boon_runtime::sha256_bytes(code.as_bytes()),
-        "operator_host_input": true,
-        "real_os_input": false,
-        "host_events": [
-            {"kind": "Pointer", "phase": "Press", "source": "operator_host_event_harness"},
-            {"kind": "TextInput", "source": "operator_host_event_harness"},
-            {"kind": "Key", "phase": "Press", "source": "operator_host_event_harness"}
-        ],
-        "source_events": source_events,
-        "preview_bound_scenario_data": false,
-        "layout_proof_hash": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!(null))
-    })])
+    let source_hash = boon_runtime::sha256_bytes(code.as_bytes());
+    let source_path = path.display().to_string();
+    let layout_proof_hash = layout_proof
+        .get("artifact_sha256")
+        .cloned()
+        .unwrap_or_else(|| json!(null));
+    let batch_count = source_events.len().div_ceil(SOURCE_EVENTS_PER_REQUEST);
+    Some(
+        source_events
+            .chunks(SOURCE_EVENTS_PER_REQUEST)
+            .enumerate()
+            .map(|(batch_index, batch)| {
+                json!({
+                    "kind": "operator-host-input",
+                    "source_path": source_path.clone(),
+                    "source_hash": source_hash.clone(),
+                    "operator_host_input": true,
+                    "real_os_input": false,
+                    "host_events": [
+                        {"kind": "Pointer", "phase": "Press", "source": "operator_host_event_harness"},
+                        {"kind": "TextInput", "source": "operator_host_event_harness"},
+                        {"kind": "Key", "phase": "Press", "source": "operator_host_event_harness"}
+                    ],
+                    "source_events": batch,
+                    "source_event_batch_index": batch_index,
+                    "source_event_batch_count": batch_count,
+                    "preview_bound_scenario_data": false,
+                    "layout_proof_hash": layout_proof_hash.clone()
+                })
+            })
+            .collect(),
+    )
 }
 
 fn toml_table_to_json(table: &BTreeMap<String, toml::Value>) -> serde_json::Value {
@@ -21084,7 +21120,7 @@ mod tests {
         assert_eq!(
             title.style.get("font"),
             Some(&boon_document_model::StyleValue::Text(
-                "Helvetica Neue".to_owned()
+                "Helvetica Neue, Helvetica, Arial, SansSerif".to_owned()
             ))
         );
         assert!(

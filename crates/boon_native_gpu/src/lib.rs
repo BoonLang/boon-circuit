@@ -184,9 +184,7 @@ impl GlyphonTextMeasurer {
             };
         }
         let font_size = f32::from_bits(style_key.font_size_bits).max(1.0);
-        let line_height = f32::from_bits(style_key.line_height_bits)
-            .max(font_size)
-            .max(text_line_height(font_size));
+        let line_height = f32::from_bits(style_key.line_height_bits).max(font_size);
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
         buffer.set_size(&mut self.font_system, None, Some(line_height));
         buffer.set_text(
@@ -713,6 +711,7 @@ struct TextRunSignature {
     font_features: String,
     text_inset: u32,
     text_clip_padding: u32,
+    line_height: u32,
     width: u32,
     height: u32,
     size: u32,
@@ -731,6 +730,7 @@ struct TextRunPlacementSignature {
     font_features: String,
     text_inset: u32,
     text_clip_padding: u32,
+    line_height: u32,
     x: u32,
     y: u32,
     width: u32,
@@ -752,6 +752,7 @@ impl TextRunSignature {
             font_features: run.font_features.clone(),
             text_inset: run.text_inset.to_bits(),
             text_clip_padding: run.text_clip_padding.to_bits(),
+            line_height: run.line_height.to_bits(),
             width: run.bounds.width.to_bits(),
             height: run.bounds.height.to_bits(),
             size: run.size.to_bits(),
@@ -773,6 +774,7 @@ impl TextRunPlacementSignature {
             font_features: run.font_features.clone(),
             text_inset: run.text_inset.to_bits(),
             text_clip_padding: run.text_clip_padding.to_bits(),
+            line_height: run.line_height.to_bits(),
             x: run.bounds.x.to_bits(),
             y: run.bounds.y.to_bits(),
             width: run.bounds.width.to_bits(),
@@ -954,8 +956,9 @@ fn shape_text_run(font_system: &mut FontSystem, run: &TextRun) -> Buffer {
         run.color,
         &run.font_features,
     );
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.25));
-    buffer.set_size(font_system, None, Some(bounds.height.max(font_size * 1.25)));
+    let line_height = run.line_height.max(font_size);
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    buffer.set_size(font_system, None, Some(bounds.height.max(line_height)));
     if run.rich_spans.is_empty() {
         buffer.set_text(
             font_system,
@@ -1043,6 +1046,7 @@ struct TextRun {
     text_clip_padding: f32,
     color: [u8; 4],
     size: f32,
+    line_height: f32,
     align: TextAlign,
     vertical_align: TextVerticalAlign,
 }
@@ -1075,6 +1079,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         .filter(|item| rect_intersects(item.bounds, viewport))
     {
         let size = style_number(&item.style, "size").unwrap_or(14.0);
+        let line_height = style_line_height(&item.style, size);
         let raw_text = item.text.as_deref().unwrap_or_default();
         if style_bool(&item.style, "paint") == Some(false)
             || (style_bool(&item.style, "hover_visible") == Some(true)
@@ -1149,6 +1154,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
             color,
             size,
+            line_height,
             align: text_align(&item.kind, &item.style),
             vertical_align: text_vertical_align(&item.kind, &item.style),
         });
@@ -1226,6 +1232,7 @@ fn editor_type_hint_runs(item: &DisplayItem, _width: u32, _height: u32) -> Vec<T
                 text_clip_padding: 0.0,
                 color,
                 size: font_size,
+                line_height: item.bounds.height,
                 align: TextAlign::Left,
                 vertical_align: TextVerticalAlign::Center,
             })
@@ -1458,7 +1465,12 @@ fn text_left_for_width(run: &TextRun, text_width: f32) -> f32 {
 }
 
 fn text_top_for_height(run: &TextRun) -> f32 {
-    text_top_for_parts(run.bounds, run.size, run.text_inset, run.vertical_align)
+    text_top_for_parts(
+        run.bounds,
+        run.line_height,
+        run.text_inset,
+        run.vertical_align,
+    )
 }
 
 fn text_line_height(font_size: f32) -> f32 {
@@ -1472,16 +1484,16 @@ fn style_line_height(style: &StyleMap, font_size: f32) -> f32 {
         Some(value) if value > 0.0 => value,
         _ => fallback,
     }
-    .max(font_size)
+    .max(1.0)
 }
 
 fn text_top_for_parts(
     bounds: Rect,
-    font_size: f32,
+    line_height: f32,
     text_inset: f32,
     vertical_align: TextVerticalAlign,
 ) -> f32 {
-    let line_height = text_line_height(font_size);
+    let line_height = line_height.max(1.0);
     match vertical_align {
         TextVerticalAlign::Top => bounds.y + 1.0,
         TextVerticalAlign::Center => bounds.y + ((bounds.height - line_height) / 2.0).max(0.0),
@@ -1560,7 +1572,7 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
         .filter(|item| {
             matches!(
                 item.kind,
-                DocumentNodeKind::Text | DocumentNodeKind::TextInput
+                DocumentNodeKind::Text | DocumentNodeKind::TextInput | DocumentNodeKind::Button
             )
         })
         .filter(|item| {
@@ -1571,6 +1583,8 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
                 || item.style.contains_key("caret_column")
                 || item.focused
                 || style_bool(&item.style, "focus") == Some(true)
+                || style_bool(&item.style, "strike_if") == Some(true)
+                || style_bool(&item.style, "underline_if") == Some(true)
         })
         .map(|item| item.node.clone())
         .collect()
@@ -1602,7 +1616,10 @@ fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVertica
     {
         return TextVerticalAlign::Center;
     }
-    match style_text(style, "vertical_align").or_else(|| style_text(style, "align_y")) {
+    let vertical_align = style_text(style, "vertical_align")
+        .or_else(|| style_text(style, "align_y"))
+        .map(str::to_ascii_lowercase);
+    match vertical_align.as_deref() {
         Some("top") => TextVerticalAlign::Top,
         Some("center") => TextVerticalAlign::Center,
         Some("bottom") => TextVerticalAlign::Bottom,
@@ -1716,13 +1733,15 @@ fn rect_vertices(
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
-        push_rect(
+        let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
+        push_styled_rect(
             &mut positions,
             &mut colors,
             item.bounds,
             width,
             height,
             fill,
+            border_radius,
         );
         metrics.rendered_rect_count += 1;
         let selected_border = (style_bool(&item.style, "selected") == Some(true))
@@ -1732,7 +1751,7 @@ fn rect_vertices(
             .then(|| style_color_f32(&item.style, "focus_border"))
             .flatten();
         if let Some(border) = selected_border.or_else(|| style_color_f32(&item.style, "border")) {
-            push_border_all(
+            push_styled_border_all(
                 &mut positions,
                 &mut colors,
                 item.bounds,
@@ -1743,7 +1762,9 @@ fn rect_vertices(
                 } else {
                     border
                 },
+                fill,
                 style_number(&item.style, "border_width").unwrap_or(2.0),
+                border_radius,
             );
             metrics.rendered_rect_count += 1;
         }
@@ -1756,14 +1777,16 @@ fn rect_vertices(
             &item.style,
         );
         if let Some(border) = focus_border {
-            push_border_all(
+            push_styled_border_all(
                 &mut positions,
                 &mut colors,
                 item.bounds,
                 width,
                 height,
                 border,
+                fill,
                 style_number(&item.style, "focus_border_width").unwrap_or(2.0),
+                border_radius,
             );
             metrics.rendered_rect_count += 1;
         }
@@ -1854,14 +1877,32 @@ fn rect_vertices(
             let color = style_color_f32(&item.style, "if_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
+            let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
+            let text_columns = item
+                .text
+                .as_deref()
+                .map(|text| text.chars().count() as f32)
+                .unwrap_or_default();
+            let line_height = style_line_height(
+                &item.style,
+                style_number(&item.style, "size").unwrap_or(14.0),
+            );
+            let x = text_layout
+                .map(|layout| layout.x_for_column(0.0))
+                .unwrap_or(item.bounds.x + 4.0);
+            let x1 = text_layout
+                .map(|layout| layout.x_for_column(text_columns))
+                .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
             push_rect(
                 &mut positions,
                 &mut colors,
                 Rect {
-                    x: item.bounds.x + 4.0,
-                    y: item.bounds.y + item.bounds.height * 0.58,
-                    width: (item.bounds.width - 8.0).max(1.0),
-                    height: 2.0,
+                    x,
+                    y: item.bounds.y
+                        + ((item.bounds.height - line_height) / 2.0).max(0.0)
+                        + line_height * 0.58,
+                    width: (x1 - x).max(1.0),
+                    height: style_number(&item.style, "text_decoration_thickness").unwrap_or(1.6),
                 },
                 width,
                 height,
@@ -1873,13 +1914,25 @@ fn rect_vertices(
             let color = style_color_f32(&item.style, "underline_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
+            let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
+            let text_columns = item
+                .text
+                .as_deref()
+                .map(|text| text.chars().count() as f32)
+                .unwrap_or_default();
+            let x = text_layout
+                .map(|layout| layout.x_for_column(0.0))
+                .unwrap_or(item.bounds.x + 4.0);
+            let x1 = text_layout
+                .map(|layout| layout.x_for_column(text_columns))
+                .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
             push_rect(
                 &mut positions,
                 &mut colors,
                 Rect {
-                    x: item.bounds.x + 4.0,
+                    x,
                     y: item.bounds.y + item.bounds.height - 5.0,
-                    width: (item.bounds.width - 8.0).max(1.0),
+                    width: (x1 - x).max(1.0),
                     height: 1.0,
                 },
                 width,
@@ -1945,8 +1998,9 @@ fn rect_vertices(
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
             let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
             let vertical_align = text_vertical_align(&item.kind, &item.style);
-            let line_top = text_top_for_parts(item.bounds, font_size, text_inset, vertical_align);
-            let line_height = text_line_height(font_size).min(item.bounds.height.max(1.0));
+            let line_height =
+                style_line_height(&item.style, font_size).min(item.bounds.height.max(1.0));
+            let line_top = text_top_for_parts(item.bounds, line_height, text_inset, vertical_align);
             let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
             let caret_x = text_layouts
                 .and_then(|layouts| layouts.get(&item.node))
@@ -1998,6 +2052,230 @@ fn push_rect(
     positions.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
     let color = rgba8_from_f32(color);
     for _ in 0..6 {
+        colors.extend_from_slice(&color);
+    }
+}
+
+fn push_styled_rect(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+    radius: f32,
+) {
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
+    if radius <= 0.25 {
+        push_rect(positions, colors, rect, width, height, color);
+        return;
+    }
+    push_rounded_rect(positions, colors, rect, width, height, color, radius);
+}
+
+fn push_styled_border_all(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    border_color: [f32; 4],
+    fill_color: [f32; 4],
+    thickness: f32,
+    radius: f32,
+) {
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
+    if radius <= 0.25 {
+        push_border_all(
+            positions,
+            colors,
+            rect,
+            width,
+            height,
+            border_color,
+            thickness,
+        );
+        return;
+    }
+
+    let thickness = thickness.max(0.25).min(rect.width.min(rect.height) * 0.5);
+    push_rounded_rect(positions, colors, rect, width, height, border_color, radius);
+    let inner = Rect {
+        x: rect.x + thickness,
+        y: rect.y + thickness,
+        width: (rect.width - thickness * 2.0).max(0.0),
+        height: (rect.height - thickness * 2.0).max(0.0),
+    };
+    if inner.width > 0.0 && inner.height > 0.0 {
+        push_rounded_rect(
+            positions,
+            colors,
+            inner,
+            width,
+            height,
+            fill_color,
+            (radius - thickness).max(0.0),
+        );
+    }
+}
+
+fn push_rounded_rect(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+    radius: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
+    if radius <= 0.25 {
+        push_rect(positions, colors, rect, width, height, color);
+        return;
+    }
+    push_rect(
+        positions,
+        colors,
+        Rect {
+            x: rect.x + radius,
+            y: rect.y,
+            width: (rect.width - radius * 2.0).max(0.0),
+            height: rect.height,
+        },
+        width,
+        height,
+        color,
+    );
+    push_rect(
+        positions,
+        colors,
+        Rect {
+            x: rect.x,
+            y: rect.y + radius,
+            width: radius,
+            height: (rect.height - radius * 2.0).max(0.0),
+        },
+        width,
+        height,
+        color,
+    );
+    push_rect(
+        positions,
+        colors,
+        Rect {
+            x: rect.x + rect.width - radius,
+            y: rect.y + radius,
+            width: radius,
+            height: (rect.height - radius * 2.0).max(0.0),
+        },
+        width,
+        height,
+        color,
+    );
+
+    let segments = ((radius * 1.5).ceil() as usize).clamp(4, 12);
+    push_corner_fan(
+        positions,
+        colors,
+        [rect.x + radius, rect.y + radius],
+        radius,
+        std::f32::consts::PI,
+        std::f32::consts::PI * 1.5,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_fan(
+        positions,
+        colors,
+        [rect.x + rect.width - radius, rect.y + radius],
+        radius,
+        std::f32::consts::PI * 1.5,
+        std::f32::consts::PI * 2.0,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_fan(
+        positions,
+        colors,
+        [rect.x + rect.width - radius, rect.y + rect.height - radius],
+        radius,
+        0.0,
+        std::f32::consts::PI * 0.5,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_fan(
+        positions,
+        colors,
+        [rect.x + radius, rect.y + rect.height - radius],
+        radius,
+        std::f32::consts::PI * 0.5,
+        std::f32::consts::PI,
+        segments,
+        width,
+        height,
+        color,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_corner_fan(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    center: [f32; 2],
+    radius: f32,
+    start: f32,
+    end: f32,
+    segments: usize,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    for index in 0..segments {
+        let a0 = start + (end - start) * (index as f32 / segments as f32);
+        let a1 = start + (end - start) * ((index + 1) as f32 / segments as f32);
+        push_triangle(
+            positions,
+            colors,
+            center,
+            [center[0] + a0.cos() * radius, center[1] + a0.sin() * radius],
+            [center[0] + a1.cos() * radius, center[1] + a1.sin() * radius],
+            width,
+            height,
+            color,
+        );
+    }
+}
+
+fn push_triangle(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    for point in [a, b, c] {
+        positions.extend_from_slice(&[
+            (point[0] / width.max(1.0))
+                .mul_add(2.0, -1.0)
+                .clamp(-1.0, 1.0),
+            (1.0 - (point[1] / height.max(1.0)) * 2.0).clamp(-1.0, 1.0),
+        ]);
+    }
+    let color = rgba8_from_f32(color);
+    for _ in 0..3 {
         colors.extend_from_slice(&color);
     }
 }
@@ -2409,7 +2687,7 @@ fn push_border_all(
     color: [f32; 4],
     thickness: f32,
 ) {
-    let thickness = thickness.max(1.0);
+    let thickness = thickness.max(0.25);
     for edge in [
         Rect {
             x: rect.x,
@@ -2455,7 +2733,7 @@ fn push_side_borders(
         let thickness = style_number(style, &format!("border_{side}_width"))
             .or_else(|| style_number(style, "border_width"))
             .unwrap_or(1.0)
-            .max(1.0);
+            .max(0.25);
         let edge = match side {
             "top" => Rect {
                 x: rect.x,
@@ -2939,6 +3217,52 @@ mod tests {
         assert_eq!(run.vertical_align, TextVerticalAlign::Top);
         assert_eq!(text_left_for_width(run, 30.0), 14.0);
         assert_eq!(text_top_for_height(run), 21.0);
+    }
+
+    #[test]
+    fn text_run_signatures_include_line_height() {
+        let mut compact_style = StyleMap::new();
+        compact_style.insert("size".to_owned(), StyleValue::Number(16.0));
+        compact_style.insert("line_height".to_owned(), StyleValue::Number(18.0));
+        let mut tall_style = compact_style.clone();
+        tall_style.insert("line_height".to_owned(), StyleValue::Number(28.0));
+        let frame = |style: StyleMap| LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("line-height-sensitive".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 160.0,
+                    height: 40.0,
+                },
+                text: Some("Line height".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let compact_run = text_runs(&frame(compact_style), 320, 120)
+            .pop()
+            .expect("compact text should render");
+        let tall_run = text_runs(&frame(tall_style), 320, 120)
+            .pop()
+            .expect("tall text should render");
+
+        assert_ne!(
+            TextRunSignature::from_run(&compact_run),
+            TextRunSignature::from_run(&tall_run),
+            "changing only line_height must invalidate shaped text buffers"
+        );
+        assert_ne!(
+            TextRunPlacementSignature::from_run(&compact_run),
+            TextRunPlacementSignature::from_run(&tall_run),
+            "changing only line_height must invalidate placement caches"
+        );
     }
 
     #[test]

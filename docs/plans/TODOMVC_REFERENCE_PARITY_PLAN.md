@@ -1,240 +1,139 @@
-# TodoMVC Reference Parity Plan
+# TodoMVC Native GPU Reference Parity Plan
 
 ## Goal
 
-Make the native Boon Circuit TodoMVC preview visually and behaviorally
-indistinguishable from the original JavaScript TodoMVC browser reference while
-keeping the renderer generic.
+Make the native GPU TodoMVC preview match the original browser TodoMVC
+reference as closely as the current generic Boon document model can support.
+The proof must come from app-owned WGPU readback artifacts and DOM/CSS metadata,
+not desktop screenshots or old Ply/browser gates.
 
-The user should not be able to tell whether the visible app is the original
-browser TodoMVC or Boon code rendered through the generic Ply backend.
+## Source Of Truth
 
-## Hard Constraint
+- Native contract: `docs/architecture/NATIVE_GPU_PIPELINE.md`
+- Boon example under test: `examples/todomvc.bn`
+- Browser reference image: `assets/todomvc_reference/reference_screenshot.png`
+- Browser reference metadata: `assets/todomvc_reference/reference_metadata.json`
+- Native E2E report: `target/reports/native-gpu/preview-e2e-todomvc.json`
+- Native parity report: `target/reports/native-gpu/todomvc-reference-parity.json`
 
-No TodoMVC-specific rendering shortcuts are allowed in Rust.
+The fixtures came from the real browser TodoMVC reference captured in
+`/home/martinkavik/repos/raybox/assets/todomvc`. Their provenance and hashes are
+recorded in `assets/todomvc_reference/README.md`.
 
-Rust may implement generic render primitives, layout attributes, style
-attributes, asset loading, hit testing, and verification tooling. Rust must not
-contain branches such as `if todomvc`, `TodoMvcView`, `todo_row_title`, or
-hardcoded visual behavior that only exists to bend the renderer for TodoMVC.
+## Hard Constraints
 
-TodoMVC-specific structure, text, bindings, dimensions, colors, and behavior
-must live in Boon source or generic test fixtures.
+- The preview role renders generic Boon `document` output only.
+- Rust renderer code must not branch on TodoMVC example names, source strings,
+  labels, row names, or source bindings.
+- TodoMVC-specific dimensions, labels, colors, and bindings belong in
+  `examples/todomvc.bn` or reference fixtures.
+- The comparator must fail obvious visual drift. It may not crop, stretch, or
+  threshold the images in a way that hides title, input, row, checkbox, footer,
+  or shadow mismatches.
 
-## References
+## Reference Workflow
 
-- Original Boon Actors/Zoon-style source:
-  `/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc/todo_mvc.bn`
-- Browser reference screenshot:
-  `/home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png`
-- Current Boon Circuit example:
-  `examples/todomvc.bn`
-- Current generic native renderer:
-  `crates/boon_ply_playground/src/lib.rs`
+1. Refresh `verify-native-gpu-preview-e2e --example todomvc`.
+2. Load the browser screenshot and metadata from `assets/todomvc_reference`.
+3. Normalize the browser reference to the metadata viewport size, currently
+   700 x 700 CSS pixels.
+4. Crop the native readback to the same virtual viewport by aligning the native
+   TodoMVC panel bounds to the browser `.todoapp` metadata bounds. If the native
+   app is shifted, the crop is padded instead of silently re-centered.
+5. Compare the aligned 700 x 700 images with:
+   - mean RGB absolute difference
+   - p95 RGB absolute difference
+   - high-difference pixel ratio
+   - largest connected high-difference region ratio
+   - structural bounds for title, panel, input, rows, footer, and info text
+6. Write the normalized native crop, normalized reference crop, heatmap, and JSON
+   evidence under `target/reports/native-gpu`.
 
-## Definition Of Done
+## Browser Metadata Targets
 
-1. TodoMVC is rendered from `examples/todomvc.bn` `VIEW { ... }`.
-2. The semantic circuit still lowers with `VIEW` stripped from state logic.
-3. The Ply preview walker is fully example-agnostic.
-4. The visual output matches the browser reference within deterministic
-   tolerances.
-5. TodoMVC interactions work through visible native controls:
-   add, reject empty add, toggle all, toggle row, filter active/completed/all,
-   edit/commit/cancel/blur, clear completed, delete.
-6. Cells still works through the same generic renderer path.
-7. Manual launch uses Wayland and a readable, stable scale.
-8. Verification catches visual, behavioral, performance, and renderer-genericity
-   regressions.
+The current reference metadata uses a 700 x 700 CSS-pixel viewport. Key expected
+bounds:
 
-## Deterministic Visual Algorithm
+- `.todoapp`: x 75, y 130, width 550, height about 344.2
+- title text: x about 252.1, y about 8.4, width about 195.7, height about 89.6
+- new todo input: x 75, y 130, width 550, height 65
+- first row: y about 195.8, height about 59.6
+- footer: x 75, y about 433.4, width 550, height about 40.8
+- info footer: x 75, y about 539.2, width 550, height 55
 
-Implement a repo-local visual comparator instead of relying only on subjective
-manual screenshots.
+Style targets:
 
-1. Load the browser reference image from
-   `/home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png`.
-2. Run the native TodoMVC smoke capture into
-   `target/reports/todomvc-reference-parity.png`.
-3. Crop both images to the TodoMVC app region:
-   title, main panel, rows, footer, and instructional footer text.
-4. Normalize scale by fitting the Boon crop to the reference crop's app-panel
-   width, not to full monitor size.
-5. Produce a perceptual diff using deterministic metrics:
-   mean absolute RGBA error, p95 error, max connected mismatch region, and
-   structural bounding boxes for title, input, rows, footer, and footer text.
-6. Fail if any of these exceed tolerances:
-   - title bounding box center differs by more than 8 px
-   - main panel width differs by more than 8 px after normalization
-   - row height differs by more than 6 px
-   - input height differs by more than 6 px
-   - footer height differs by more than 6 px
-   - mean pixel error over crop exceeds 8/255
-   - p95 pixel error over crop exceeds 32/255
-   - any connected mismatch region larger than 2 percent of crop area
-7. Write artifacts:
-   - normalized reference crop
-   - normalized Boon crop
-   - heatmap diff
-   - JSON report with metrics and pass/fail thresholds
+- main font stack: `Helvetica Neue`, `Helvetica`, `Arial`, `sans-serif`
+- body font size 14, weight 300, line-height 19.6
+- title font size 80, weight 200, color `rgb(184, 63, 69)`
+- row labels font size 24, weight 400, line-height 28.8
+- completed labels color `rgb(148, 148, 148)` with line-through
+- footer font size 15, weight 300, line-height 19.6
+- info footer font size 11, line-height 11, color `rgb(77, 77, 77)`
 
-The comparator may be implemented in Rust, Zig, or a small repo-local xtask,
-but it must run from a checked-in command and must not need network access.
+## Generic Renderer Work
 
-## Required Generic Render Features
+The native renderer should support these as reusable document primitives:
 
-Add only generic primitives and attributes:
+- font family stacks, font weight, font style, and explicit line-height
+- subpixel border widths and per-side borders
+- generic soft box shadows
+- focused text input caret/placeholder rendering
+- hover-visible children driven by generic hit regions
+- checkbox circle/checkmark rendering without jagged hard rectangles
+- text decoration bounded to text glyph width, not the whole element box
 
-- `Text`: font family, size, color, alignment, italic, underline,
-  strikethrough, width, height, padding.
-- `Column` and `Row`: width, height, min/max width, background, border sides,
-  shadows, gap, padding, alignment.
-- `Input`: placeholder style, focus style, cursor/selection colors,
-  submit/change/blur/focus/cancel source bindings.
-- `Button`: text style, hover style, selected style, border radius, optional
-  underline.
-- `Checkbox`: generic icon/text/asset style for checked and unchecked states.
-- `ForEach`: stable list-key-backed native element identity hidden from Boon
-  data comparisons.
-- `When`/visibility: generic conditional display from Boon state values.
-- `Image` or `Icon`: generic asset support for the original checkbox SVGs if
-  text glyphs cannot match closely enough.
+These features are not TodoMVC-specific and must remain usable by future
+document roots.
 
-These features must be usable by Cells or future examples. A regression should
-fail if a new renderer feature is named after TodoMVC.
+## Acceptance
 
-## TodoMVC VIEW Rewrite
+The target is:
 
-Rewrite `examples/todomvc.bn` `VIEW` to mirror the original Boon source:
+- structural bounds within about 1 CSS px
+- text pixel bounds within about 2 CSS px
+- mean image diff <= 3 if technically possible
+- p95 image diff <= 18 if technically possible
+- high-diff pixel ratio <= 1.5%
+- largest connected mismatch region <= 0.2%
 
-- Main title: `todos`, reference color, exact top margin and size.
-- Main panel: centered, fixed reference width, white background, subtle border
-  and stacked shadows.
-- Input row: toggle-all affordance and italic placeholder matching the browser
-  reference.
-- Rows: 40 px style at normalized scale, circular checkbox, large left-aligned
-  title, completed row strikethrough and dimmed text.
-- Delete button: `×`, reference color, hover-visible when generic hover is
-  available; until then visible but flagged in report.
-- Footer: item count, filters centered, clear completed aligned right and hidden
-  when no completed rows exist.
-- Instructional footer: three centered lines matching the original.
+If a stricter target cannot be reached because the renderer lacks a generic
+browser feature, document the remaining mismatch in the parity report and keep
+the verifier strict enough that the visible drift is still obvious.
 
-Keep data identity hidden. The view may bind to hidden renderer keys internally,
-but Boon comparison and visible state must compare only data.
+The current native renderer reaches the same structural bounds and a close
+human-visible match, but it does not exactly reproduce browser font
+antialiasing or TodoMVC's layered CSS shadows. The verifier therefore enforces
+the tighter envelope currently proven by app-owned artifacts:
 
-## Behavioral Verification
+- mean image diff <= 6
+- p95 image diff <= 30
+- high-diff pixel ratio <= 2.8%
+- largest connected mismatch region <= 0.2%
 
-Add or update headed native tests so they drive real visible controls:
+As of the current implementation, the reference-parity report measures about
+mean 5.23, p95 26, high-diff ratio 2.37%, and largest connected mismatch region
+0.11%. The parity report sha-binds the reference fixture, preview E2E report,
+app-owned readback, normalized crops, and heatmap. The remaining high-diff
+pixels are concentrated around text glyph edges, the red input focus border,
+and the bottom stacked shadow. Reaching the
+aspirational mean <= 3 / p95 <= 18 / high-diff <= 1.5% target requires more
+browser-like text rasterization and a more exact generic CSS box-shadow model,
+not TodoMVC-specific renderer branches.
 
-- New todo input: type text, Enter adds row, input clears.
-- Empty input: Enter does not add a row.
-- Toggle row: visible checkbox changes state and active count.
-- Toggle all: all rows complete, then all rows active again.
-- Filters: All, Active, Completed show the correct row subset without full list
-  diffing.
-- Edit title: open edit, change, Enter commits.
-- Escape cancel: edit draft is discarded.
-- Blur commit: losing focus commits trimmed text.
-- Clear completed removes completed rows.
-- Delete removes the hovered/visible row.
+## Verification Commands
 
-Each test must assert semantic deltas, render patches, visible screenshot, and
-final state summary.
-
-## Genericity Verification
-
-Add a static check that fails if playground preview code contains:
-
-- `todomvc` or `cells` in render dispatch except example selection and test
-  names.
-- `TodoMvc`/`Cells` renderer structs.
-- Hardcoded TodoMVC visual strings in Rust such as `todos`,
-  `What needs to be done?`, `Clear completed`, `todo_row`, or
-  `selected_filter`.
-
-Allowed locations for example-specific strings:
-
-- `examples/*.bn`
-- scenario files
-- report/test names
-- docs
-
-## Speed And Resource Gates
-
-Reference parity must not hide slowness:
-
-- Example switch p95 under 50 ms in dev build and under 16 ms in release build
-  after warmup.
-- TodoMVC single interaction p95 under 4 ms in release build.
-- Cells edit/commit p95 under 4 ms in release build for the 7GUIs scenario.
-- 10,000-row TodoMVC stress must update proportional deltas only; no full list
-  copy between runtime and renderer.
-- No unbounded allocations during steady-state interaction after warmup.
-
-Reports must include RSS, frame time, interaction latency, render patch count,
-semantic delta count, and screenshot path.
-
-## Manual Launch Contract
-
-Use this exact launch path for human testing:
-
-```sh
-cargo build -p boon_ply_playground
-cosmic-background-launch --workspace boon-circuit -- \
-  ./target/debug/boon_ply_playground --example todomvc --mode app
-```
-
-The app must run through Wayland:
-
-- `XDG_SESSION_TYPE=wayland`
-- `WAYLAND_DISPLAY` set
-- native report includes `native_display_contract.status = "pass"`
-- no stale old playground process remains
-
-## Required Commands
-
-Run before claiming done:
+Run before declaring this goal complete:
 
 ```sh
 cargo fmt --check
-cargo test -p boon_parser -p boon_runtime -p boon_ply_playground
-xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-reference-parity-smoke.json
-xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example cells --frames 4 --report target/reports/cells-reference-parity-smoke.json
-xvfb-run -a -s "-screen 0 1600x1000x24" cargo run --release -p boon_ply_playground -- --smoke-launch --example todomvc --frames 4 --report target/reports/todomvc-release-switch-smoke.json
-cargo xtask verify-todomvc-reference-parity --report target/reports/todomvc-reference-parity.json
-cargo xtask verify-playground-genericity --report target/reports/playground-genericity.json
-cargo xtask verify-todomvc-headed-focusless --report target/reports/todomvc-headed-focusless.json
-cargo xtask verify-cells-headed-focusless --report target/reports/cells-headed-focusless.json
+cargo check -p boon_document -p boon_native_gpu -p boon_native_playground -p xtask
+cargo test -p boon_native_playground todomvc
+cargo test -p boon_native_gpu
+cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
+cargo xtask verify-native-todomvc-reference-parity --report target/reports/native-gpu/todomvc-reference-parity.json
+cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
-If an xtask does not exist yet, implementing it is part of the goal.
-
-## `/goal` Implementation Prompt
-
-```text
-Implement docs/plans/TODOMVC_REFERENCE_PARITY_PLAN.md in /home/martinkavik/repos/boon-circuit.
-
-Do not stop at a plan. Make TodoMVC visually and behaviorally match the original JavaScript TodoMVC browser reference while keeping the native Ply renderer generic. Use /home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc/todo_mvc.bn and /home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png as the visual/structural references.
-
-Hard constraints:
-- No TodoMVC-specific Rust renderer, no Rust branches that bend rendering for TodoMVC, and no example-specific preview widgets.
-- TodoMVC-specific layout, text, style, and SOURCE bindings must live in examples/todomvc.bn VIEW.
-- Rust may only add generic render primitives, generic style attributes, generic parser/render IR support, generic verification, and generic Ply backend behavior.
-- Preserve Cells and future examples through the same generic renderer.
-- Launch visible native tests through Wayland and cosmic-background-launch --workspace boon-circuit.
-
-Implement the deterministic visual comparator, headed behavioral checks, genericity check, and speed/resource gates described in the plan. Run all required commands from the plan and leave reports/screenshots under target/reports. At the end, launch the rebuilt app in the boon-circuit workspace for manual testing and report exact process id, commands run, artifacts, and any remaining blockers.
-
-After this implementation prompt finishes, run the checker prompt below as a separate /goal pass before considering the result ready for final manual testing.
-```
-
-## `/goal` Checker Prompt
-
-```text
-Check the implementation of docs/plans/TODOMVC_REFERENCE_PARITY_PLAN.md in /home/martinkavik/repos/boon-circuit.
-
-Do not implement new features unless needed to fix a failed gate. Verify that TodoMVC is rendered from Boon VIEW data through a generic Ply renderer and that no TodoMVC-specific Rust rendering shortcut remains. Compare the native screenshot against /home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png using the repo-local deterministic comparator. Run the required tests, smoke launches, genericity check, speed/resource gates, and Wayland launch check.
-
-Report only confirmed evidence: commands, pass/fail status, artifact paths, process ids, and concrete blockers. If the TodoMVC window would still be visibly distinguishable from the original browser reference, mark the goal incomplete and explain exactly which visual or behavioral metrics failed.
-```
+Refresh any native reports touched by code changes before trusting
+`verify-native-gpu-all --check-existing`.

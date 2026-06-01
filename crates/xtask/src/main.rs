@@ -8141,8 +8141,9 @@ fn verify_native_todomvc_reference_parity(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
-    let reference =
-        PathBuf::from("/home/martinkavik/repos/raybox/assets/todomvc/reference_screenshot.png");
+    let reference = PathBuf::from("assets/todomvc_reference/reference_screenshot.png");
+    let reference_metadata = PathBuf::from("assets/todomvc_reference/reference_metadata.json");
+    let reference_metadata_value = read_optional_json(&reference_metadata)?;
     let preview_e2e_report = native_preview_e2e_report_path("todomvc");
     let report_value = read_optional_json(&preview_e2e_report)?;
     let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
@@ -8163,13 +8164,53 @@ fn verify_native_todomvc_reference_parity(
     let layout_evidence = todomvc_layout_reference_evidence(&layout_artifact);
     let pixel_evidence = preview_artifact_path
         .as_deref()
-        .and_then(|path| todomvc_pixel_reference_evidence(path, &reference, &layout_evidence).ok())
+        .and_then(|path| {
+            todomvc_pixel_reference_evidence(
+                path,
+                &reference,
+                reference_metadata_value.as_ref(),
+                &layout_evidence,
+            )
+            .ok()
+        })
         .unwrap_or_else(|| {
             json!({
                 "pass": false,
                 "missing": ["preview artifact unavailable for pixel evidence"]
             })
         });
+    let mut artifact_sha256s = Vec::new();
+    let mut artifact_paths = BTreeSet::new();
+    for path in [
+        reference.as_path(),
+        reference_metadata.as_path(),
+        preview_e2e_report.as_path(),
+    ] {
+        if path.exists() && artifact_paths.insert(path.to_path_buf()) {
+            artifact_sha256s.push(artifact_hash(path)?);
+        }
+    }
+    if let Some(path) = preview_artifact_path.as_deref()
+        && path.exists()
+        && artifact_paths.insert(path.to_path_buf())
+    {
+        artifact_sha256s.push(artifact_hash(path)?);
+    }
+    for key in [
+        "/visual_artifacts/native_normalized_crop",
+        "/visual_artifacts/reference_normalized_crop",
+        "/visual_artifacts/diff_heatmap",
+    ] {
+        if let Some(path) = pixel_evidence
+            .pointer(key)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            && path.exists()
+            && artifact_paths.insert(path.clone())
+        {
+            artifact_sha256s.push(artifact_hash(&path)?);
+        }
+    }
 
     push_audit_check(
         &mut checks,
@@ -8183,6 +8224,32 @@ fn verify_native_todomvc_reference_parity(
         Some(
             "TodoMVC reference screenshot is missing or not the expected 1400x1400 image"
                 .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:reference-metadata-exists",
+        reference_metadata_value.is_some()
+            && reference_metadata_value
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/viewport/width"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(700)
+            && reference_metadata_value
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/viewport/height"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(700),
+        format!(
+            "reference_metadata={} viewport={:?}",
+            reference_metadata.display(),
+            reference_metadata_value
+                .as_ref()
+                .and_then(|metadata| metadata.get("viewport"))
+        ),
+        Some(
+            "TodoMVC reference metadata is missing or not the expected 700x700 viewport".to_owned(),
         ),
     );
     push_audit_check(
@@ -8270,6 +8337,7 @@ fn verify_native_todomvc_reference_parity(
         blockers,
         json!({
             "reference_screenshot": reference,
+            "reference_metadata": reference_metadata,
             "reference_dimensions": reference_dimensions,
             "preview_e2e_report": preview_e2e_report,
             "preview_readback_artifact": preview_artifact_path,
@@ -8277,6 +8345,7 @@ fn verify_native_todomvc_reference_parity(
             "freshness_evidence": freshness_evidence,
             "layout_evidence": layout_evidence,
             "pixel_evidence": pixel_evidence,
+            "artifact_sha256s": artifact_sha256s,
             "moonzoon_reference_source": "/home/martinkavik/repos/MoonZoon/examples/todomvc/frontend/src/main.rs",
             "visual_comparator_contract": "structural reference parity plus app-owned framebuffer title geometry, crop, and diff evidence"
         }),
@@ -8619,6 +8688,7 @@ fn native_preview_e2e_freshness_evidence(
     readback_artifact_path: Option<&Path>,
 ) -> serde_json::Value {
     let source_paths = [
+        "crates/xtask/src/main.rs",
         "crates/boon_native_playground/src/main.rs",
         "crates/boon_native_gpu/src/lib.rs",
         "crates/boon_document/src/lib.rs",
@@ -8627,6 +8697,8 @@ fn native_preview_e2e_freshness_evidence(
         "crates/boon_ir/src/lib.rs",
         "crates/boon_parser/src/lib.rs",
         "examples/todomvc.bn",
+        "assets/todomvc_reference/reference_screenshot.png",
+        "assets/todomvc_reference/reference_metadata.json",
     ];
     let source_mtimes = source_paths
         .iter()
@@ -8832,13 +8904,20 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
 fn todomvc_pixel_reference_evidence(
     path: &Path,
     reference: &Path,
+    reference_metadata: Option<&serde_json::Value>,
     layout_evidence: &serde_json::Value,
 ) -> Result<serde_json::Value, image::ImageError> {
     let image = image::open(path)?.to_rgba8();
     let (width, height) = image.dimensions();
     let reference_image = image::open(reference)?.to_rgba8();
-    let visual_artifacts =
-        write_todomvc_visual_artifacts(&image, &reference_image, path, reference, layout_evidence)?;
+    let visual_artifacts = write_todomvc_visual_artifacts(
+        &image,
+        &reference_image,
+        path,
+        reference,
+        reference_metadata,
+        layout_evidence,
+    )?;
     let red_title = count_region_pixels(&image, 0, 0, width, height / 4, |r, g, b, _| {
         r > 150 && g < 100 && b < 120
     });
@@ -8855,15 +8934,15 @@ fn todomvc_pixel_reference_evidence(
         a > 180 && r > 150 && g < 120 && b < 140
     });
     let title_pixel_bounds_pass = title_pixel_bounds.as_ref().is_some_and(|bounds| {
-        let width_ratio = bounds.width() as f64 / width.max(1) as f64;
-        let height_ratio = bounds.height() as f64 / height.max(1) as f64;
         let center_ratio = bounds.center_x() / width.max(1) as f64;
-        width_ratio >= 0.22
-            && width_ratio <= 0.38
-            && height_ratio >= 0.08
-            && height_ratio <= 0.16
+        let title_width = bounds.width();
+        let title_height = bounds.height();
+        title_width >= 175
+            && title_width <= 230
+            && title_height >= 52
+            && title_height <= 76
             && center_ratio >= 0.42
-            && center_ratio <= 0.68
+            && center_ratio <= 0.58
             && bounds.y0 <= height / 8
     });
     let reference_title_bounds = color_pixel_bounds(
@@ -8877,19 +8956,19 @@ fn todomvc_pixel_reference_evidence(
     let crop_diff_pass = visual_artifacts
         .get("normalized_crop_mean_abs_diff")
         .and_then(serde_json::Value::as_f64)
-        .is_some_and(|diff| diff <= 30.0);
+        .is_some_and(|diff| diff <= 6.0);
     let diff_p95_pass = visual_artifacts
         .get("normalized_crop_p95_abs_diff")
         .and_then(serde_json::Value::as_f64)
-        .is_some_and(|diff| diff <= 115.0);
+        .is_some_and(|diff| diff <= 30.0);
     let high_diff_ratio_pass = visual_artifacts
         .get("normalized_crop_high_diff_ratio")
         .and_then(serde_json::Value::as_f64)
-        .is_some_and(|ratio| ratio <= 0.11);
+        .is_some_and(|ratio| ratio <= 0.028);
     let connected_mismatch_pass = visual_artifacts
         .get("normalized_crop_largest_mismatch_region_ratio")
         .and_then(serde_json::Value::as_f64)
-        .is_some_and(|ratio| ratio <= 0.035);
+        .is_some_and(|ratio| ratio <= 0.002);
     let mut missing = Vec::new();
     if red_title < 600 {
         missing.push("large red title pixels");
@@ -8931,10 +9010,10 @@ fn todomvc_pixel_reference_evidence(
         "title_pixel_bounds_pass": title_pixel_bounds_pass,
         "visual_artifacts": visual_artifacts,
         "thresholds": {
-            "normalized_crop_mean_abs_diff_max": 30.0,
-            "normalized_crop_p95_abs_diff_max": 115.0,
-            "normalized_crop_high_diff_ratio_max": 0.11,
-            "normalized_crop_largest_mismatch_region_ratio_max": 0.035
+            "normalized_crop_mean_abs_diff_max": 6.0,
+            "normalized_crop_p95_abs_diff_max": 30.0,
+            "normalized_crop_high_diff_ratio_max": 0.028,
+            "normalized_crop_largest_mismatch_region_ratio_max": 0.002
         }
     }))
 }
@@ -8977,6 +9056,48 @@ struct JsonBounds {
     width: f64,
     height: f64,
     center_x: f64,
+}
+
+impl JsonBounds {
+    fn to_json_value(&self) -> serde_json::Value {
+        json!({
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "center_x": self.center_x
+        })
+    }
+}
+
+fn todomvc_reference_viewport(metadata: &serde_json::Value) -> Option<(u32, u32)> {
+    Some((
+        metadata
+            .pointer("/viewport/width")
+            .and_then(serde_json::Value::as_u64)? as u32,
+        metadata
+            .pointer("/viewport/height")
+            .and_then(serde_json::Value::as_u64)? as u32,
+    ))
+}
+
+fn todomvc_reference_todoapp_bounds(metadata: &serde_json::Value) -> Option<JsonBounds> {
+    metadata
+        .get("elements")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|element| {
+            element
+                .get("classes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|classes| {
+                    classes
+                        .iter()
+                        .any(|class| class.as_str() == Some("todoapp"))
+                })
+        })
+        .and_then(|element| element.get("bounds"))
+        .and_then(parse_json_bounds)
 }
 
 fn parse_json_bounds(value: &serde_json::Value) -> Option<JsonBounds> {
@@ -9041,6 +9162,7 @@ fn write_todomvc_visual_artifacts(
     reference: &image::RgbaImage,
     native_path: &Path,
     reference_path: &Path,
+    reference_metadata: Option<&serde_json::Value>,
     layout_evidence: &serde_json::Value,
 ) -> Result<serde_json::Value, image::ImageError> {
     let artifact_dir = PathBuf::from("target/reports/native-gpu");
@@ -9049,20 +9171,32 @@ fn write_todomvc_visual_artifacts(
     let reference_crop_path = artifact_dir.join("todomvc-reference-normalized-crop.png");
     let diff_path = artifact_dir.join("todomvc-reference-diff-heatmap.png");
 
-    let native_crop = crop_native_todomvc_frame(native, layout_evidence);
-    let reference_crop = crop_reference_todomvc_frame(reference);
-    let native_normalized = image::imageops::resize(
-        &native_crop,
-        700,
-        700,
-        image::imageops::FilterType::Triangle,
+    let viewport = reference_metadata
+        .and_then(todomvc_reference_viewport)
+        .unwrap_or((700, 700));
+    let reference_todoapp = reference_metadata.and_then(todomvc_reference_todoapp_bounds);
+    let native_crop = crop_native_todomvc_frame(
+        native,
+        layout_evidence,
+        reference_todoapp.as_ref(),
+        viewport,
     );
     let reference_normalized = image::imageops::resize(
-        &reference_crop,
-        700,
-        700,
+        reference,
+        viewport.0,
+        viewport.1,
         image::imageops::FilterType::Triangle,
     );
+    let native_normalized = if native_crop.dimensions() == viewport {
+        native_crop
+    } else {
+        image::imageops::resize(
+            &native_crop,
+            viewport.0,
+            viewport.1,
+            image::imageops::FilterType::Triangle,
+        )
+    };
     let (heatmap, diff_metrics) = todomvc_diff_heatmap(&native_normalized, &reference_normalized);
     native_normalized.save(&native_crop_path)?;
     reference_normalized.save(&reference_crop_path)?;
@@ -9074,7 +9208,8 @@ fn write_todomvc_visual_artifacts(
         "native_normalized_crop": native_crop_path,
         "reference_normalized_crop": reference_crop_path,
         "diff_heatmap": diff_path,
-        "normalized_crop_dimensions": [700, 700],
+        "normalized_crop_dimensions": [viewport.0, viewport.1],
+        "reference_todoapp_bounds": reference_todoapp.map(|bounds| bounds.to_json_value()),
         "normalized_crop_mean_abs_diff": diff_metrics.mean_abs_diff,
         "normalized_crop_p95_abs_diff": diff_metrics.p95_abs_diff,
         "normalized_crop_high_diff_ratio": diff_metrics.high_diff_ratio,
@@ -9086,45 +9221,29 @@ fn write_todomvc_visual_artifacts(
 fn crop_native_todomvc_frame(
     image: &image::RgbaImage,
     layout_evidence: &serde_json::Value,
+    reference_todoapp: Option<&JsonBounds>,
+    viewport: (u32, u32),
 ) -> image::RgbaImage {
-    let title = layout_evidence
-        .get("title_bounds")
-        .and_then(parse_json_bounds);
     let surface = layout_evidence
         .get("surface_bounds")
         .and_then(parse_json_bounds);
-    let footer = layout_evidence
-        .get("footer_bounds")
-        .and_then(parse_json_bounds);
-    let x0 = [title.as_ref(), surface.as_ref(), footer.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|bounds| bounds.x)
-        .fold(f64::INFINITY, f64::min)
-        .floor()
-        .max(0.0) as u32;
-    let x1 = [title.as_ref(), surface.as_ref(), footer.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|bounds| bounds.x + bounds.width)
-        .fold(0.0, f64::max)
-        .ceil()
-        .min(image.width() as f64) as u32;
-    let y0 = title
+    let x0 = surface
         .as_ref()
-        .map(|bounds| bounds.y)
-        .unwrap_or(0.0)
-        .floor()
-        .max(0.0) as u32;
-    let y1 = surface
-        .as_ref()
-        .map(|bounds| bounds.y + bounds.height + 140.0)
-        .unwrap_or(image.height() as f64)
-        .ceil()
-        .min(image.height() as f64) as u32;
-    crop_nonempty(image, x0, y0, x1, y1)
+        .zip(reference_todoapp)
+        .map(|(native, reference)| native.x - reference.x)
+        .unwrap_or_else(|| (image.width() as f64 - viewport.0 as f64) / 2.0)
+        .round() as i32;
+    crop_with_padding(
+        image,
+        x0,
+        0,
+        viewport.0,
+        viewport.1,
+        image::Rgba([247, 247, 247, 255]),
+    )
 }
 
+#[allow(dead_code)]
 fn crop_reference_todomvc_frame(image: &image::RgbaImage) -> image::RgbaImage {
     let title_bounds = color_pixel_bounds(
         image,
@@ -9142,6 +9261,32 @@ fn crop_reference_todomvc_frame(image: &image::RgbaImage) -> image::RgbaImage {
     let x1 = (x0 as f64 + crop_width).min(image.width() as f64) as u32;
     let y1 = (image.height() as f64 * 0.48).ceil() as u32;
     crop_nonempty(image, x0, 0, x1, y1)
+}
+
+fn crop_with_padding(
+    image: &image::RgbaImage,
+    x0: i32,
+    y0: i32,
+    width: u32,
+    height: u32,
+    background: image::Rgba<u8>,
+) -> image::RgbaImage {
+    let mut output = image::RgbaImage::from_pixel(width, height, background);
+    for dest_y in 0..height {
+        let source_y = y0 + dest_y as i32;
+        if !(0..image.height() as i32).contains(&source_y) {
+            continue;
+        }
+        for dest_x in 0..width {
+            let source_x = x0 + dest_x as i32;
+            if !(0..image.width() as i32).contains(&source_x) {
+                continue;
+            }
+            let pixel = *image.get_pixel(source_x as u32, source_y as u32);
+            output.put_pixel(dest_x, dest_y, pixel);
+        }
+    }
+    output
 }
 
 fn crop_nonempty(image: &image::RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32) -> image::RgbaImage {

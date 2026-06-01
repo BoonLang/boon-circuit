@@ -7036,6 +7036,11 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             .pointer("/preview_surface_proof/input_adapter")
             .cloned()
         {
+            let input_adapter = isolated_real_window_launch_proof
+                .get("preview_input_adapter")
+                .cloned()
+                .filter(native_input_adapter_has_delivered_events)
+                .unwrap_or(input_adapter);
             let adapter_installed = input_adapter
                 .get("installed")
                 .and_then(serde_json::Value::as_bool)
@@ -9759,6 +9764,21 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         native_gpu_operator_input_driver_attempt("scroll-speed", &label, driver_target.clone());
     let linked_linux_real_window_speed_evidence =
         linked_linux_human_like_speed_real_window_evidence(&label, &source_hash);
+    let measured_surface_key = if dev_editor {
+        "dev_surface_proof"
+    } else {
+        "preview_surface_proof"
+    };
+    let vertical_driver_target =
+        native_scroll_driver_target_for_axis(&label, &layout_probe, "vertical")
+            .or_else(|| driver_target.clone());
+    let horizontal_driver_target =
+        native_scroll_driver_target_for_axis(&label, &layout_probe, "horizontal")
+            .or_else(|| driver_target.clone());
+    let mut axis_specific_real_window_scroll_observation = json!({
+        "status": "not-run",
+        "reason": "native scroll-speed axis-specific Weston wheel probes were not attempted"
+    });
 
     if build.success() && selector_valid && isolated_real_window_available {
         let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
@@ -9801,6 +9821,30 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 "isolated Weston native launch did not prove real-window wheel delivery for this native scroll run".to_owned()
             }),
         );
+        let vertical_observation = run_linux_human_like_desktop_surface_smoke(
+            &format!("{label}-native-scroll-speed-vertical"),
+            &source_example_id,
+            &source_path,
+            true,
+            dev_editor,
+            measured_surface_key,
+            vertical_driver_target.clone(),
+            true,
+            Some("vertical-scroll-only"),
+        )?;
+        let horizontal_observation = run_linux_human_like_desktop_surface_smoke(
+            &format!("{label}-native-scroll-speed-horizontal"),
+            &source_example_id,
+            &source_path,
+            true,
+            dev_editor,
+            measured_surface_key,
+            horizontal_driver_target.clone(),
+            true,
+            Some("horizontal-scroll-only"),
+        )?;
+        axis_specific_real_window_scroll_observation =
+            native_scroll_axis_observation_summary(vertical_observation, horizontal_observation);
     } else if build.success() && wayland && selector_valid {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
@@ -10007,11 +10051,6 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         {
             extra["preview_blocked_on_ipc_count"] = blocked;
         }
-        let measured_surface_key = if dev_editor {
-            "dev_surface_proof"
-        } else {
-            "preview_surface_proof"
-        };
         extra["measured_surface_role"] = json!(if dev_editor { "dev" } else { "preview" });
         if dev_editor {
             if let Some(metrics) = supervisor
@@ -10147,6 +10186,45 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             if real_wheel_input_observed {
                 extra["real_wheel_input"] = json!(true);
             }
+        }
+    }
+    extra["axis_specific_real_window_scroll_observation"] =
+        axis_specific_real_window_scroll_observation.clone();
+    if axis_specific_real_window_scroll_observation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        if let Some(combined_input_adapter) =
+            axis_specific_real_window_scroll_observation.get("combined_input_adapter")
+        {
+            let adapter_installed = combined_input_adapter
+                .get("installed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let wheel_api = combined_input_adapter
+                .get("wheel_api")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let provenance_api = combined_input_adapter
+                .get("per_window_event_provenance_api")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            extra["native_input_adapter"] = combined_input_adapter.clone();
+            extra["native_input_adapter_installed"] = json!(adapter_installed);
+            extra["native_wheel_adapter_installed"] =
+                json!(adapter_installed && !wheel_api.is_empty());
+            extra["native_per_window_input_provenance_installed"] =
+                json!(adapter_installed && !provenance_api.is_empty());
+            extra["native_input_observation_only"] = json!(false);
+            extra["app_owned_window_input"] = json!(true);
+            extra["real_window_input"] = json!(true);
+            extra["real_os_input"] = json!(true);
+            extra["real_wheel_input"] = json!(true);
+            extra["input_injection_method"] =
+                json!("isolated-weston-test-control-axis-specific-scroll-only");
         }
     }
     add_native_scroll_model_evidence(&mut extra, dev_editor);
@@ -10799,6 +10877,185 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
                     }))
         );
     }
+}
+
+fn native_scroll_axis_observation_summary(
+    vertical_observation: serde_json::Value,
+    horizontal_observation: serde_json::Value,
+) -> serde_json::Value {
+    let vertical_pass = native_scroll_axis_observation_pass(&vertical_observation, "vertical");
+    let horizontal_pass =
+        native_scroll_axis_observation_pass(&horizontal_observation, "horizontal");
+    let combined_input_adapter =
+        native_scroll_combined_axis_input_adapter(&vertical_observation, &horizontal_observation);
+    json!({
+        "status": if vertical_pass && horizontal_pass { "pass" } else { "fail" },
+        "method": "isolated-weston-test-control-axis-specific-scroll-only",
+        "vertical_pass": vertical_pass,
+        "horizontal_pass": horizontal_pass,
+        "combined_input_adapter": combined_input_adapter,
+        "vertical_observation": vertical_observation,
+        "horizontal_observation": horizontal_observation
+    })
+}
+
+fn native_scroll_axis_observation_pass(observation: &serde_json::Value, axis: &str) -> bool {
+    let input_adapter = observation
+        .get("surface_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    let axis_delta = match axis {
+        "vertical" => input_adapter
+            .get("scroll_delta_y")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0),
+        "horizontal" => input_adapter
+            .get("scroll_delta_x")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    observation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && observation
+            .get("wheel_input_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && observation
+            .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && input_adapter
+            .get("mouse_scroll_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && axis_delta.abs() > f64::EPSILON
+}
+
+fn native_scroll_combined_axis_input_adapter(
+    vertical_observation: &serde_json::Value,
+    horizontal_observation: &serde_json::Value,
+) -> serde_json::Value {
+    let vertical = vertical_observation
+        .get("surface_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    let horizontal = horizontal_observation
+        .get("surface_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    let scroll_delta_y = vertical
+        .get("scroll_delta_y")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let scroll_delta_x = horizontal
+        .get("scroll_delta_x")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let scroll_events = vertical
+        .get("mouse_scroll_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            horizontal
+                .get("mouse_scroll_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let motion_events = vertical
+        .get("mouse_motion_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            horizontal
+                .get("mouse_motion_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let button_events = vertical
+        .get("mouse_button_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            horizontal
+                .get("mouse_button_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let keyboard_events = vertical
+        .get("keyboard_key_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            horizontal
+                .get("keyboard_key_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let installed = vertical
+        .get("installed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || horizontal
+            .get("installed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let real_os_events_observed = vertical
+        .get("real_os_events_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && horizontal
+            .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let wheel_api = vertical
+        .get("wheel_api")
+        .or_else(|| horizontal.get("wheel_api"))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let provenance_api = vertical
+        .get("per_window_event_provenance_api")
+        .or_else(|| horizontal.get("per_window_event_provenance_api"))
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let mouse_window_pos = horizontal
+        .get("mouse_window_pos")
+        .or_else(|| vertical.get("mouse_window_pos"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mouse_last_window_protocol_id = horizontal
+        .get("mouse_last_window_protocol_id")
+        .or_else(|| vertical.get("mouse_last_window_protocol_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let keyboard_last_window_protocol_id = horizontal
+        .get("keyboard_last_window_protocol_id")
+        .or_else(|| vertical.get("keyboard_last_window_protocol_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "installed": installed,
+        "wheel_api": wheel_api,
+        "per_window_event_provenance_api": provenance_api,
+        "real_os_events_observed": real_os_events_observed,
+        "synthetic_input_probe": false,
+        "input_injection_method": "isolated-weston-test-control-axis-specific-scroll-only",
+        "mouse_scroll_event_count": scroll_events,
+        "mouse_motion_event_count": motion_events,
+        "mouse_button_event_count": button_events,
+        "keyboard_key_event_count": keyboard_events,
+        "scroll_delta_x": scroll_delta_x,
+        "scroll_delta_y": scroll_delta_y,
+        "mouse_window_pos": mouse_window_pos,
+        "mouse_last_window_protocol_id": mouse_last_window_protocol_id,
+        "keyboard_last_window_protocol_id": keyboard_last_window_protocol_id,
+        "axis_specific_observation": {
+            "vertical_status": vertical_observation.get("status").cloned().unwrap_or(serde_json::Value::Null),
+            "horizontal_status": horizontal_observation.get("status").cloned().unwrap_or(serde_json::Value::Null),
+            "vertical_scroll_delta_y": scroll_delta_y,
+            "horizontal_scroll_delta_x": scroll_delta_x
+        }
+    })
 }
 
 fn native_scroll_input_route_evidence(
@@ -18898,10 +19155,15 @@ fn run_isolated_weston_desktop_preview_e2e(
     } else {
         "/preview_surface_proof"
     };
-    let input_adapter = supervisor
+    let initial_input_adapter = supervisor
         .pointer(&format!("{measured_surface_pointer}/input_adapter"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let input_adapter = measured_loop_report
+        .get("observed_input_adapter")
+        .cloned()
+        .filter(native_input_adapter_has_delivered_events)
+        .unwrap_or(initial_input_adapter);
     let real_os_events_observed = input_adapter
         .get("real_os_events_observed")
         .and_then(serde_json::Value::as_bool)
@@ -18915,6 +19177,12 @@ fn run_isolated_weston_desktop_preview_e2e(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
         > 0
+        || (input_adapter
+            .get("mouse_motion_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+            && input_adapter.get("mouse_window_pos").is_some())
         || input_adapter
             .get("mouse_scroll_event_count")
             .and_then(serde_json::Value::as_u64)
@@ -21360,9 +21628,17 @@ fn run_native_layout_probe(
 }
 
 fn native_preview_driver_target(
-    _example: &str,
+    example: &str,
     layout_probe: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    if let Ok(entry) = boon_runtime::example_manifest_entry(example) {
+        let scenario_path = Path::new(&entry.scenario);
+        if let Some(target) =
+            native_preview_driver_target_from_scenario(layout_probe, scenario_path)
+        {
+            return Some(target);
+        }
+    }
     if let Some(target) = native_preview_driver_target_from_source(layout_probe) {
         return Some(target);
     }
@@ -21456,6 +21732,7 @@ fn native_preview_driver_target_from_scenario(
     let hit_targets = layout_probe
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)?;
+    let mut candidates = Vec::new();
     for step in scenario.step {
         let Some(expected) = step.expected_source_event else {
             continue;
@@ -21497,9 +21774,28 @@ fn native_preview_driver_target_from_scenario(
         else {
             continue;
         };
-        return native_driver_target_from_region("hit_region", hit_target);
+        candidates.push(hit_target);
     }
-    None
+    candidates.sort_by(|left, right| {
+        let left_y = native_region_axis(left, "y");
+        let right_y = native_region_axis(right, "y");
+        let left_safe_content = left_y >= 120.0;
+        let right_safe_content = right_y >= 120.0;
+        right_safe_content
+            .cmp(&left_safe_content)
+            .then_with(|| {
+                left_y
+                    .partial_cmp(&right_y)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                native_region_axis(left, "x")
+                    .partial_cmp(&native_region_axis(right, "x"))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let target = candidates.first().copied()?;
+    native_driver_target_from_region("hit_region", target)
 }
 
 fn native_source_event_for_target(
@@ -21721,6 +22017,19 @@ fn native_gpu_app_window_input_observed(report: &serde_json::Value) -> bool {
             .and_then(serde_json::Value::as_u64)
             .is_some()
             || report
+                .pointer("/native_input_adapter/mouse_button_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            || (report
+                .pointer("/native_input_adapter/mouse_motion_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+                && report
+                    .pointer("/native_input_adapter/mouse_window_pos")
+                    .is_some())
+            || report
                 .pointer("/native_input_adapter/mouse_scroll_event_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0)
@@ -21729,6 +22038,46 @@ fn native_gpu_app_window_input_observed(report: &serde_json::Value) -> bool {
                 .pointer("/native_input_adapter/keyboard_last_window_protocol_id")
                 .and_then(serde_json::Value::as_u64)
                 .is_some())
+}
+
+fn native_input_adapter_has_delivered_events(input_adapter: &serde_json::Value) -> bool {
+    input_adapter
+        .get("real_os_events_observed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && input_adapter
+            .get("synthetic_input_probe")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && (input_adapter
+            .get("mouse_last_window_protocol_id")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            || input_adapter
+                .get("keyboard_last_window_protocol_id")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+            || input_adapter
+                .get("mouse_button_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            || (input_adapter
+                .get("mouse_motion_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+                && input_adapter.get("mouse_window_pos").is_some())
+            || input_adapter
+                .get("mouse_scroll_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            || input_adapter
+                .get("keyboard_key_event_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0)
 }
 
 fn native_gpu_operator_input_driver_attempt(

@@ -1121,6 +1121,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 &app_surface,
+                                None,
                             ),
                             Some(&error),
                         );
@@ -1184,7 +1185,11 @@ async fn run_surface_probe_inner(
                 Duration::ZERO,
                 wake_handle.generation(),
                 None,
-                render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
+                render_loop_report_extras(
+                    resize_wake_count.load(Ordering::Relaxed),
+                    &app_surface,
+                    None,
+                ),
                 None,
             )?;
         }
@@ -1237,7 +1242,8 @@ async fn run_surface_probe_inner(
     if options.synthetic_input_probe {
         inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
     }
-    let input_adapter = sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
+    let mut input_adapter =
+        sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
     let mut post_input_frame_timing = None;
     if input_adapter.real_os_events_observed && hooks.is_some() {
         let post_input_sample_count = sample_frame_count.max(1);
@@ -1251,6 +1257,7 @@ async fn run_surface_probe_inner(
             } else {
                 sample_input_adapter(&mut mouse, &keyboard, false)
             };
+            merge_input_adapter_proof(&mut input_adapter, &frame_input);
             if let Some(poll_result) = poll_native_window_hooks(
                 &mut hooks,
                 NativePollContext {
@@ -1336,6 +1343,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 &app_surface,
+                                Some(&input_adapter),
                             ),
                             Some(&error),
                         );
@@ -1403,6 +1411,7 @@ async fn run_surface_probe_inner(
         }
     }
 
+    let mut observed_input_adapter = input_adapter.clone();
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
         pid: std::process::id(),
@@ -1490,6 +1499,7 @@ async fn run_surface_probe_inner(
         let poll_started_at = Instant::now();
         render_loop_state.consume_due_wake(poll_started_at);
         let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        merge_input_adapter_proof(&mut observed_input_adapter, &input);
         render_loop_state.note_input_poll();
         let poll_result = poll_native_window_hooks(
             &mut hooks,
@@ -1598,6 +1608,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 &app_surface,
+                                Some(&observed_input_adapter),
                             ),
                             Some(&error),
                         );
@@ -1667,7 +1678,11 @@ async fn run_surface_probe_inner(
                 hold_started.elapsed(),
                 wake_handle.generation(),
                 last_interactive_readback_artifact.as_ref(),
-                render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
+                render_loop_report_extras(
+                    resize_wake_count.load(Ordering::Relaxed),
+                    &app_surface,
+                    Some(&observed_input_adapter),
+                ),
                 None,
             )?;
         }
@@ -1692,6 +1707,7 @@ async fn run_surface_probe_inner(
                     render_loop_report_extras(
                         resize_wake_count.load(Ordering::Relaxed),
                         &app_surface,
+                        Some(&observed_input_adapter),
                     ),
                     None,
                 )?;
@@ -1715,7 +1731,11 @@ async fn run_surface_probe_inner(
             hold_started.elapsed(),
             wake_handle.generation(),
             last_interactive_readback_artifact.as_ref(),
-            render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
+            render_loop_report_extras(
+                resize_wake_count.load(Ordering::Relaxed),
+                &app_surface,
+                Some(&observed_input_adapter),
+            ),
             None,
         )?;
     }
@@ -1827,15 +1847,18 @@ fn acquire_surface_texture_for_present(
 struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
     app_window_surface_content_report: Option<serde_json::Value>,
+    observed_input_adapter: Option<NativeInputAdapterProof>,
 }
 
 fn render_loop_report_extras(
     resize_wake_count: u64,
     app_surface: &app_window::surface::Surface,
+    observed_input_adapter: Option<&NativeInputAdapterProof>,
 ) -> NativeRenderLoopReportExtras {
     NativeRenderLoopReportExtras {
         resize_wake_count,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
+        observed_input_adapter: observed_input_adapter.cloned(),
     }
 }
 
@@ -1923,6 +1946,7 @@ fn write_render_loop_state_report(
         "scheduled_wake_count": state.scheduled_wake_count,
         "resize_wake_count": extras.resize_wake_count,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
+        "observed_input_adapter": extras.observed_input_adapter,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
         "current_scheduler_reason": state.current_scheduler_reason,
@@ -2365,6 +2389,65 @@ fn sample_input_adapter_delta(
         } else {
             0.0
         },
+    }
+}
+
+fn merge_input_adapter_proof(base: &mut NativeInputAdapterProof, sample: &NativeInputAdapterProof) {
+    base.sampled_after_visible_window |= sample.sampled_after_visible_window;
+    base.real_os_events_observed |= sample.real_os_events_observed;
+    base.mouse_motion_event_count = base
+        .mouse_motion_event_count
+        .max(sample.mouse_motion_event_count);
+    base.mouse_button_event_count = base
+        .mouse_button_event_count
+        .max(sample.mouse_button_event_count);
+    base.mouse_scroll_event_count = base
+        .mouse_scroll_event_count
+        .max(sample.mouse_scroll_event_count);
+    base.mouse_total_event_count = base
+        .mouse_total_event_count
+        .max(sample.mouse_total_event_count);
+    base.keyboard_key_event_count = base
+        .keyboard_key_event_count
+        .max(sample.keyboard_key_event_count);
+    if sample.mouse_last_window_protocol_id.is_some() {
+        base.mouse_last_window_protocol_id = sample.mouse_last_window_protocol_id;
+    }
+    if sample.keyboard_last_window_protocol_id.is_some() {
+        base.keyboard_last_window_protocol_id = sample.keyboard_last_window_protocol_id;
+    }
+    if sample.mouse_window_pos.is_some() {
+        base.mouse_window_pos = sample.mouse_window_pos.clone();
+    }
+    base.scroll_delta_x += sample.scroll_delta_x;
+    base.scroll_delta_y += sample.scroll_delta_y;
+    for button in &sample.mouse_buttons_down {
+        if !base.mouse_buttons_down.contains(button) {
+            base.mouse_buttons_down.push(button.clone());
+        }
+    }
+    for key in &sample.pressed_keys {
+        if !base.pressed_keys.contains(key) {
+            base.pressed_keys.push(key.clone());
+        }
+    }
+    for event in &sample.mouse_button_events {
+        if !base
+            .mouse_button_events
+            .iter()
+            .any(|existing| existing.sequence == event.sequence)
+        {
+            base.mouse_button_events.push(event.clone());
+        }
+    }
+    for event in &sample.keyboard_events {
+        if !base
+            .keyboard_events
+            .iter()
+            .any(|existing| existing.sequence == event.sequence)
+        {
+            base.keyboard_events.push(event.clone());
+        }
     }
 }
 

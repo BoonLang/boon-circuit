@@ -73,7 +73,9 @@ const DEV_TYPE_INSPECTOR_ROW_GAP: u32 = 2;
 const DEV_TYPE_INSPECTOR_WRAP_CHARS: usize = 240;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH: usize = 5;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS: usize = 16;
-const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 4;
+const DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS: usize = 1;
+const DEV_TYPE_INSPECTOR_LIST_LOAD_STEP: usize = 4;
+const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
@@ -2539,6 +2541,8 @@ struct DevEditorSnapshot {
     type_inspector_selection: Option<TypeInspectorSelection>,
     type_inspector_width: u32,
     type_inspector_resize_hovered: bool,
+    type_inspector_collapsed_paths: BTreeSet<String>,
+    type_inspector_list_item_limits: BTreeMap<String, usize>,
     hovered_editor_position: Option<EditorPosition>,
 }
 
@@ -2562,6 +2566,8 @@ impl DevEditorSnapshot {
             type_inspector_selection: shell.type_inspector_selection.clone(),
             type_inspector_width: shell.type_inspector_width,
             type_inspector_resize_hovered: shell.type_inspector_resize_hovered,
+            type_inspector_collapsed_paths: shell.type_inspector_collapsed_paths.clone(),
+            type_inspector_list_item_limits: shell.type_inspector_list_item_limits.clone(),
             hovered_editor_position: shell.hovered_editor_position.clone(),
         }
     }
@@ -2579,6 +2585,8 @@ impl DevEditorSnapshot {
             && self.type_inspector_selection == after.type_inspector_selection
             && self.type_inspector_width == after.type_inspector_width
             && self.type_inspector_resize_hovered == after.type_inspector_resize_hovered
+            && self.type_inspector_collapsed_paths == after.type_inspector_collapsed_paths
+            && self.type_inspector_list_item_limits == after.type_inspector_list_item_limits
             && self.hovered_editor_position == after.hovered_editor_position
             && (self.scroll_line != after.scroll_line || self.scroll_column != after.scroll_column)
     }
@@ -2596,6 +2604,8 @@ impl DevEditorSnapshot {
             && self.type_inspector_selection == after.type_inspector_selection
             && self.type_inspector_width == after.type_inspector_width
             && self.type_inspector_resize_hovered == after.type_inspector_resize_hovered
+            && self.type_inspector_collapsed_paths == after.type_inspector_collapsed_paths
+            && self.type_inspector_list_item_limits == after.type_inspector_list_item_limits
             && self.hovered_editor_position == after.hovered_editor_position
     }
 
@@ -2608,6 +2618,8 @@ impl DevEditorSnapshot {
             && self.scroll_line == after.scroll_line
             && self.scroll_column == after.scroll_column
             && self.type_inspector_width == after.type_inspector_width
+            && self.type_inspector_collapsed_paths == after.type_inspector_collapsed_paths
+            && self.type_inspector_list_item_limits == after.type_inspector_list_item_limits
             && (self.footer_scroll_line != after.footer_scroll_line
                 || self.footer_selection != after.footer_selection
                 || self.type_inspector_scroll_line != after.type_inspector_scroll_line
@@ -3522,6 +3534,12 @@ fn dev_apply_real_window_input_with_clipboard(
                 input_state.mouse_select_anchor = None;
                 input_state.footer_mouse_select_anchor = None;
                 clear_dev_key_repeat(input_state);
+                if mouse_event.pressed && shell.apply_type_inspector_action(inspector_position.line)
+                {
+                    input_state.type_inspector_mouse_select_anchor = None;
+                    changed = true;
+                    continue;
+                }
                 if mouse_event.pressed {
                     shell.set_type_inspector_selection(
                         inspector_position.clone(),
@@ -8017,6 +8035,7 @@ impl PreviewTransport {
         paths: &[String],
         source_sha256: &str,
         state_summary_hash: &str,
+        max_list_items: usize,
     ) -> serde_json::Value {
         let Some(connect) = &self.connect else {
             return json!({
@@ -8036,7 +8055,7 @@ impl PreviewTransport {
                 "state_summary_hash": state_summary_hash,
                 "max_depth": DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH,
                 "max_fields": DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS,
-                "max_list_items": DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS
+                "max_list_items": max_list_items
             }),
             Duration::ZERO,
             Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
@@ -8085,6 +8104,8 @@ struct DevWindowShell {
     type_inspector_selection: Option<TypeInspectorSelection>,
     type_inspector_width: u32,
     type_inspector_resize_hovered: bool,
+    type_inspector_collapsed_paths: BTreeSet<String>,
+    type_inspector_list_item_limits: BTreeMap<String, usize>,
     hovered_editor_position: Option<EditorPosition>,
     caret_visible: bool,
     runtime_value_cache: RefCell<Option<RuntimeValueCache>>,
@@ -8118,6 +8139,13 @@ type FooterSelection = TypeInspectorSelection;
 
 struct TypeInspectorContent {
     detail_lines: Vec<String>,
+    actions: Vec<Option<TypeInspectorAction>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TypeInspectorAction {
+    TogglePath(String),
+    LoadMoreListItems { path: String, next_limit: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -8221,6 +8249,8 @@ impl Clone for DevWindowShell {
             type_inspector_selection: self.type_inspector_selection.clone(),
             type_inspector_width: self.type_inspector_width,
             type_inspector_resize_hovered: self.type_inspector_resize_hovered,
+            type_inspector_collapsed_paths: self.type_inspector_collapsed_paths.clone(),
+            type_inspector_list_item_limits: self.type_inspector_list_item_limits.clone(),
             hovered_editor_position: self.hovered_editor_position.clone(),
             caret_visible: self.caret_visible,
             runtime_value_cache: RefCell::new(self.runtime_value_cache.borrow().clone()),
@@ -8282,6 +8312,8 @@ impl DevWindowShell {
             type_inspector_selection: None,
             type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
             type_inspector_resize_hovered: false,
+            type_inspector_collapsed_paths: BTreeSet::new(),
+            type_inspector_list_item_limits: BTreeMap::new(),
             hovered_editor_position: None,
             caret_visible: true,
             runtime_value_cache: RefCell::new(None),
@@ -8349,6 +8381,7 @@ impl DevWindowShell {
         let Some(active) = self.active_type_hint() else {
             return TypeInspectorContent {
                 detail_lines: vec!["no inferred type".to_owned()],
+                actions: vec![None],
             };
         };
         let token = self
@@ -8359,23 +8392,23 @@ impl DevWindowShell {
             .map(|text| one_line(text.trim(), wrap_chars))
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| "-".to_owned());
-        TypeInspectorContent {
-            detail_lines: self.type_inspector_detail_lines(&active, &token, wrap_chars),
-        }
+        self.type_inspector_detail_content(&active, &token, wrap_chars)
     }
 
-    fn type_inspector_detail_lines(
+    fn type_inspector_detail_content(
         &self,
         active: &ActiveTypeHint<'_>,
         token: &str,
         wrap_chars: usize,
-    ) -> Vec<String> {
+    ) -> TypeInspectorContent {
         let root = type_inspector_root_name(token);
         let value_summary = self.runtime_value_summary(&root, wrap_chars);
         type_tree_lines_with_inline_values(
             &root,
             &active.hint.detail_label,
             value_summary.as_ref(),
+            &self.type_inspector_collapsed_paths,
+            &self.type_inspector_list_item_limits,
             wrap_chars,
         )
     }
@@ -8396,6 +8429,26 @@ impl DevWindowShell {
         head: TypeInspectorPosition,
     ) {
         self.type_inspector_selection = Some(TypeInspectorSelection { anchor, head });
+    }
+
+    fn apply_type_inspector_action(&mut self, line: usize) -> bool {
+        let content = self.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+        let Some(action) = content.actions.get(line).and_then(Clone::clone) else {
+            return false;
+        };
+        self.type_inspector_selection = None;
+        match action {
+            TypeInspectorAction::TogglePath(path) => {
+                if !self.type_inspector_collapsed_paths.insert(path.clone()) {
+                    self.type_inspector_collapsed_paths.remove(&path);
+                }
+            }
+            TypeInspectorAction::LoadMoreListItems { path, next_limit } => {
+                self.type_inspector_list_item_limits
+                    .insert(path, next_limit);
+            }
+        }
+        true
     }
 
     fn select_all_type_inspector_content(&mut self) {
@@ -8508,7 +8561,8 @@ impl DevWindowShell {
         let state_hash = runtime_summary
             .get("state_summary_hash")
             .and_then(serde_json::Value::as_str)?;
-        let paths_key = paths.join("|");
+        let max_list_items = self.type_inspector_requested_list_items();
+        let paths_key = format!("{}|list-items:{max_list_items}", paths.join("|"));
         if let Some(cache) = self.runtime_value_cache.borrow().as_ref()
             && cache.source_hash == source_hash
             && cache.state_hash == state_hash
@@ -8516,9 +8570,9 @@ impl DevWindowShell {
         {
             return Some(cache.summary.clone());
         }
-        let response = self
-            .preview_transport
-            .runtime_value(&paths, &source_hash, state_hash);
+        let response =
+            self.preview_transport
+                .runtime_value(&paths, &source_hash, state_hash, max_list_items);
         let summary = selected_runtime_value_summary(&response);
         if summary.is_some()
             && response.get("status").and_then(serde_json::Value::as_str) == Some("pass")
@@ -8531,6 +8585,18 @@ impl DevWindowShell {
             });
         }
         Some(summary)
+    }
+
+    fn type_inspector_requested_list_items(&self) -> usize {
+        self.type_inspector_list_item_limits
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS)
+            .clamp(
+                DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS,
+                DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS,
+            )
     }
 
     fn type_inspector_runtime_value_active(&self) -> bool {
@@ -10964,34 +11030,87 @@ fn type_tree_lines_with_inline_values(
     root: &str,
     type_label: &str,
     value_summary: Option<&serde_json::Value>,
+    collapsed_paths: &BTreeSet<String>,
+    list_item_limits: &BTreeMap<String, usize>,
     wrap_chars: usize,
-) -> Vec<String> {
+) -> TypeInspectorContent {
     let root = if root.is_empty() { "-" } else { root };
-    render_named_type_tree(root, type_label, value_summary, 0, 0, wrap_chars)
+    let lines = render_named_type_tree(
+        root,
+        root,
+        type_label,
+        value_summary,
+        &TypeInspectorTreeView {
+            collapsed_paths,
+            list_item_limits,
+        },
+        0,
+        0,
+        wrap_chars,
+    );
+    TypeInspectorContent {
+        detail_lines: lines.iter().map(|line| line.text.clone()).collect(),
+        actions: lines.into_iter().map(|line| line.action).collect(),
+    }
+}
+
+struct TypeInspectorTreeView<'a> {
+    collapsed_paths: &'a BTreeSet<String>,
+    list_item_limits: &'a BTreeMap<String, usize>,
+}
+
+struct TypeInspectorLine {
+    text: String,
+    action: Option<TypeInspectorAction>,
+}
+
+impl TypeInspectorLine {
+    fn plain(text: String) -> Self {
+        Self { text, action: None }
+    }
+
+    fn action(text: String, action: TypeInspectorAction) -> Self {
+        Self {
+            text,
+            action: Some(action),
+        }
+    }
 }
 
 fn render_named_type_tree(
     name: &str,
+    path: &str,
     type_label: &str,
     value_summary: Option<&serde_json::Value>,
+    view: &TypeInspectorTreeView<'_>,
     indent_depth: usize,
     expand_depth: usize,
     wrap_chars: usize,
-) -> Vec<String> {
+) -> Vec<TypeInspectorLine> {
     let indent = " ".repeat(indent_depth * 4);
     let trimmed_type = normalized_type_label(type_label);
     if type_label_is_empty_object(&trimmed_type) {
-        return vec![format!("{indent}{name}: []")];
+        return vec![TypeInspectorLine::plain(format!("{indent}{name}: []"))];
     }
     if let Some(item_type) = list_item_type_label(&trimmed_type) {
-        let mut lines = vec![append_inline_hint(
-            format!("{indent}{name}: LIST"),
-            runtime_list_item_hint(value_summary),
+        let collapsed = view.collapsed_paths.contains(path);
+        let marker = if collapsed { "▸" } else { "▾" };
+        let mut lines = vec![TypeInspectorLine::action(
+            append_inline_hint(
+                format!("{indent}{marker} {name}: LIST"),
+                runtime_list_item_hint(value_summary),
+            ),
+            TypeInspectorAction::TogglePath(path.to_owned()),
         )];
+        if collapsed {
+            return lines;
+        }
         if expand_depth < 3 {
             lines.extend(render_list_items(
+                path,
                 &item_type,
                 value_summary,
+                view,
                 indent_depth + 1,
                 expand_depth + 1,
                 wrap_chars,
@@ -11000,34 +11119,51 @@ fn render_named_type_tree(
         return lines;
     }
     if type_label_is_object(&trimmed_type) {
-        let mut lines = vec![format!("{indent}{name}: [")];
+        let collapsed = view.collapsed_paths.contains(path);
+        let marker = if collapsed { "▸" } else { "▾" };
+        let object_line = if collapsed {
+            append_inline_hint(format!("{indent}{marker} {name}: [...]"), None)
+        } else {
+            format!("{indent}{marker} {name}: [")
+        };
+        let mut lines = vec![TypeInspectorLine::action(
+            object_line,
+            TypeInspectorAction::TogglePath(path.to_owned()),
+        )];
+        if collapsed {
+            return lines;
+        }
         lines.extend(render_type_object_fields(
             &trimmed_type,
             value_summary,
+            view,
+            path,
             indent_depth + 1,
             expand_depth + 1,
             wrap_chars,
         ));
-        lines.push(format!("{indent}]"));
+        lines.push(TypeInspectorLine::plain(format!("{indent}]")));
         return lines;
     }
     let value_hint = value_summary
         .map(|summary| runtime_value_hint_for_type(&trimmed_type, summary))
         .or_else(|| (indent_depth == 0).then_some("ABSENT".to_owned()));
     let type_text = one_line(&trimmed_type, wrap_chars);
-    vec![append_inline_hint(
+    vec![TypeInspectorLine::plain(append_inline_hint(
         format!("{indent}{name}: {type_text}"),
         value_hint,
-    )]
+    ))]
 }
 
 fn render_type_object_fields(
     type_label: &str,
     value_summary: Option<&serde_json::Value>,
+    view: &TypeInspectorTreeView<'_>,
+    path: &str,
     indent_depth: usize,
     expand_depth: usize,
     wrap_chars: usize,
-) -> Vec<String> {
+) -> Vec<TypeInspectorLine> {
     let fields = split_type_object_fields(type_label);
     if fields.is_empty() {
         return Vec::new();
@@ -11035,10 +11171,13 @@ fn render_type_object_fields(
     let mut lines = Vec::new();
     for field in fields {
         let field_value = value_summary_field(value_summary, &field.name);
+        let field_path = format!("{path}.{}", field.name);
         lines.extend(render_named_type_tree(
             &field.name,
+            &field_path,
             &field.type_label,
             field_value,
+            view,
             indent_depth,
             expand_depth,
             wrap_chars,
@@ -11048,26 +11187,46 @@ fn render_type_object_fields(
 }
 
 fn render_list_items(
+    list_path: &str,
     item_type: &str,
     value_summary: Option<&serde_json::Value>,
+    view: &TypeInspectorTreeView<'_>,
     indent_depth: usize,
     expand_depth: usize,
     wrap_chars: usize,
-) -> Vec<String> {
+) -> Vec<TypeInspectorLine> {
     let indent = " ".repeat(indent_depth * 4);
     let Some(sample) = value_summary
         .and_then(|summary| summary.get("sample"))
         .and_then(serde_json::Value::as_array)
     else {
-        return vec![format!("{indent}[...]")];
+        return vec![TypeInspectorLine::plain(format!("{indent}[...]"))];
     };
+    let requested_limit = view
+        .list_item_limits
+        .get(list_path)
+        .copied()
+        .unwrap_or(DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS)
+        .max(DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS);
+    let visible_count = requested_limit.min(sample.len());
     let mut lines = Vec::new();
-    for (index, item) in sample.iter().enumerate() {
-        lines.push(format!("{indent}[{}]:", index + 1));
+    for (index, item) in sample.iter().take(visible_count).enumerate() {
+        let item_path = format!("{list_path}[{}]", index + 1);
+        let collapsed = view.collapsed_paths.contains(&item_path);
+        let marker = if collapsed { "▸" } else { "▾" };
+        lines.push(TypeInspectorLine::action(
+            format!("{indent}{marker} [{}]:", index + 1),
+            TypeInspectorAction::TogglePath(item_path.clone()),
+        ));
+        if collapsed {
+            continue;
+        }
         if type_label_is_object(item_type.trim()) {
             lines.extend(render_type_object_fields(
                 item_type,
                 Some(item),
+                view,
+                &item_path,
                 indent_depth + 1,
                 expand_depth + 1,
                 wrap_chars,
@@ -11075,8 +11234,10 @@ fn render_list_items(
         } else {
             lines.extend(render_named_type_tree(
                 "value",
+                &format!("{item_path}.value"),
                 item_type,
                 Some(item),
+                view,
                 indent_depth + 1,
                 expand_depth + 1,
                 wrap_chars,
@@ -11086,10 +11247,29 @@ fn render_list_items(
     let len = value_summary
         .and_then(|summary| summary.get("len"))
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(sample.len() as u64);
-    let hidden = len.saturating_sub(sample.len() as u64);
+        .unwrap_or(sample.len() as u64) as usize;
+    let loaded_count = sample.len();
+    let hidden = len.saturating_sub(visible_count);
     if hidden > 0 {
-        lines.push(format!("{indent}... {hidden} more"));
+        let next_limit = visible_count
+            .saturating_add(DEV_TYPE_INSPECTOR_LIST_LOAD_STEP)
+            .min(len)
+            .min(DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS);
+        let label = if loaded_count < next_limit {
+            format!("{indent}+ load more")
+        } else {
+            format!(
+                "{indent}+ load {} more",
+                next_limit.saturating_sub(visible_count)
+            )
+        };
+        lines.push(TypeInspectorLine::action(
+            label,
+            TypeInspectorAction::LoadMoreListItems {
+                path: list_path.to_owned(),
+                next_limit,
+            },
+        ));
     }
     lines
 }
@@ -11895,6 +12075,12 @@ fn lower_canonical_document_element(
         canonical_document_node_kind(function, statement, expressions),
     );
     node.parent = Some(parent.clone());
+    if !scope_key.is_empty() {
+        node.style.insert(
+            "__scope_key".to_owned(),
+            boon_document_model::StyleValue::Text(scope_key.to_owned()),
+        );
+    }
 
     lower_canonical_element_style(statement, expressions, context, &mut node);
     lower_canonical_element_text(statement, expressions, context, &mut node);
@@ -12303,18 +12489,7 @@ fn lower_canonical_style_block(
                     );
                 }
             }
-            "padding" => {
-                if let Some(value) =
-                    document_style_value(child, expressions, context).or_else(|| {
-                        child
-                            .children
-                            .iter()
-                            .find_map(|entry| document_style_value(entry, expressions, context))
-                    })
-                {
-                    node.style.insert("padding".to_owned(), value);
-                }
-            }
+            "padding" => lower_spacing_style(child, "padding", expressions, context, node),
             "outline" | "border" | "borders" | "selected_border" => {
                 if let Some(color) =
                     statement_nested_style_value(child, "color", expressions, context)
@@ -12352,6 +12527,53 @@ fn statement_nested_style_value(
             .find(|field| field.name == nested_name)
             .and_then(|field| document_style_value_for_expr(field.value, expressions, context))
     })
+}
+
+fn lower_spacing_style(
+    statement: &AstStatement,
+    prefix: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(value) = document_style_value(statement, expressions, context) {
+        node.style.insert(prefix.to_owned(), value);
+    }
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        if matches!(field.as_str(), "top" | "right" | "bottom" | "left")
+            && let Some(value) = document_style_value(child, expressions, context)
+        {
+            node.style.insert(format!("{prefix}_{field}"), value);
+        }
+    }
+}
+
+fn lower_spacing_style_field(
+    field: &AstRecordField,
+    prefix: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+        node.style.insert(prefix.to_owned(), value);
+    }
+    if let Some(nested) = record_fields_for_expr(field.value, expressions) {
+        for nested_field in nested {
+            if matches!(
+                nested_field.name.as_str(),
+                "top" | "right" | "bottom" | "left"
+            ) && let Some(value) =
+                document_style_value_for_expr(nested_field.value, expressions, context)
+            {
+                node.style
+                    .insert(format!("{prefix}_{}", nested_field.name), value);
+            }
+        }
+    }
 }
 
 fn lower_canonical_style_record(
@@ -12405,19 +12627,7 @@ fn lower_canonical_style_record(
                     }
                 }
             }
-            "padding" => {
-                if let Some(value) =
-                    document_style_value_for_expr(field.value, expressions, context).or_else(|| {
-                        record_fields_for_expr(field.value, expressions).and_then(|nested| {
-                            nested.iter().find_map(|entry| {
-                                document_style_value_for_expr(entry.value, expressions, context)
-                            })
-                        })
-                    })
-                {
-                    node.style.insert("padding".to_owned(), value);
-                }
-            }
+            "padding" => lower_spacing_style_field(field, "padding", expressions, context, node),
             "outline" | "border" | "borders" | "selected_border" => {
                 if let Some(value) =
                     record_field_nested_style_value(field, "color", expressions, context).or_else(
@@ -14209,7 +14419,26 @@ fn preview_apply_hover_overlay(
             continue;
         }
         let item_target = focused_target_text(&layout_proof, &item.node.0);
+        let item_scope = display_style_text(&item.style, "__scope_key");
+        let hovered_scope = input_state.hovered_node.as_deref().and_then(|hovered| {
+            layout_proof
+                .pointer("/display_item_samples")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| {
+                    items.iter().find_map(|sample| {
+                        (sample.get("node").and_then(serde_json::Value::as_str) == Some(hovered))
+                            .then(|| {
+                                sample
+                                    .pointer("/style/__scope_key")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .flatten()
+                    })
+                })
+        });
         let active = input_state.hovered_node.as_deref() == Some(item.node.0.as_str())
+            || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
             || (item_target.is_some()
                 && item_target.as_deref() == input_state.hovered_target_text.as_deref());
         changed |= set_display_style_value(
@@ -14224,6 +14453,18 @@ fn preview_apply_hover_overlay(
             Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
     }
     Ok(changed)
+}
+
+fn display_style_text<'a>(
+    style: &'a BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> Option<&'a str> {
+    match style.get(key)? {
+        boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
+        boon_document_model::StyleValue::Number(_) | boon_document_model::StyleValue::Bool(_) => {
+            None
+        }
+    }
 }
 
 fn preview_resolved_focused_node(
@@ -14850,9 +15091,9 @@ fn live_source_event_for_hit_region(
 ) -> Option<boon_runtime::LiveSourceEvent> {
     let node = hit_region.get("node")?.as_str()?;
     let source_intents = if prefer_double_click {
-        ["double_click", "change", "source", "click", "press"]
+        ["double_click", "source", "click", "press"]
     } else {
-        ["source", "click", "press", "double_click", "change"]
+        ["source", "click", "press", "double_click"]
     };
     let source = source_intents
         .into_iter()
@@ -18203,21 +18444,58 @@ mod tests {
             },
             "truncated": false
         });
-        let text =
-            type_tree_lines_with_inline_values("store", type_label, Some(&value_summary), 160)
-                .join("\n");
-        assert!(text.contains("store: ["));
+        let content = type_tree_lines_with_inline_values(
+            "store",
+            type_label,
+            Some(&value_summary),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            160,
+        );
+        let text = content.detail_lines.join("\n");
+        assert!(text.contains("▾ store: ["));
         assert!(text.contains("selected_filter: Active | All | Completed = All"));
-        assert!(text.contains("todos: LIST = 2 items"));
-        assert!(text.contains("[1]:"));
-        assert!(text.contains("[2]:"));
+        assert!(text.contains("▾ todos: LIST = 2 items"));
+        assert!(text.contains("▾ [1]:"));
+        assert!(!text.contains("[2]:"));
+        assert!(text.contains("+ load 1 more"));
         assert!(!text.contains("[0]:"));
         assert!(text.contains("completed: BOOL"));
         assert!(text.contains("False"));
-        assert!(text.contains("True"));
+        assert!(!text.contains("True"));
         assert!(text.contains("title: TEXT"));
         assert!(text.contains("TEXT { Read documentation }"));
         assert!(!text.contains("LIST[2]"));
+
+        let mut list_limits = BTreeMap::new();
+        list_limits.insert("store.todos".to_owned(), 2);
+        let loaded_text = type_tree_lines_with_inline_values(
+            "store",
+            type_label,
+            Some(&value_summary),
+            &BTreeSet::new(),
+            &list_limits,
+            160,
+        )
+        .detail_lines
+        .join("\n");
+        assert!(loaded_text.contains("▾ [2]:"));
+        assert!(loaded_text.contains("True"));
+
+        let mut collapsed = BTreeSet::new();
+        collapsed.insert("store.todos[1]".to_owned());
+        let collapsed_text = type_tree_lines_with_inline_values(
+            "store",
+            type_label,
+            Some(&value_summary),
+            &collapsed,
+            &list_limits,
+            160,
+        )
+        .detail_lines
+        .join("\n");
+        assert!(collapsed_text.contains("▸ [1]:"));
+        assert!(!collapsed_text.contains("TEXT { Read documentation }"));
     }
 
     #[test]
@@ -18229,10 +18507,19 @@ mod tests {
     ]
 ]";
 
-        let text = type_tree_lines_with_inline_values("sources", type_label, None, 160).join("\n");
+        let text = type_tree_lines_with_inline_values(
+            "sources",
+            type_label,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            160,
+        )
+        .detail_lines
+        .join("\n");
 
         assert!(text.contains("press: []"));
-        assert!(text.contains("change: ["));
+        assert!(text.contains("▾ change: ["));
         assert!(!text.contains("-- empty"));
         assert!(!text.contains("sources: [: ["));
     }
@@ -19376,6 +19663,8 @@ mod tests {
             type_inspector_selection: None,
             type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
             type_inspector_resize_hovered: false,
+            type_inspector_collapsed_paths: BTreeSet::new(),
+            type_inspector_list_item_limits: BTreeMap::new(),
             hovered_editor_position: None,
             caret_visible: false,
             runtime_value_cache: RefCell::new(None),
@@ -20519,6 +20808,8 @@ mod tests {
             type_inspector_selection: None,
             type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
             type_inspector_resize_hovered: false,
+            type_inspector_collapsed_paths: BTreeSet::new(),
+            type_inspector_list_item_limits: BTreeMap::new(),
             hovered_editor_position: None,
             caret_visible: true,
             runtime_value_cache: RefCell::new(None),
@@ -20828,16 +21119,39 @@ mod tests {
         assert!(delete_buttons.iter().all(|item| {
             item.style.get("hover_visible") == Some(&boon_document_model::StyleValue::Bool(true))
         }));
+        assert!(delete_buttons.iter().all(|item| {
+            matches!(
+                item.style.get("__scope_key"),
+                Some(boon_document_model::StyleValue::Text(value)) if value == "todo-0"
+                    || value == "todo-1"
+                    || value == "todo-2"
+                    || value == "todo-3"
+            )
+        }));
 
-        let hover_title = layout
+        let first_row = layout
             .display_list
             .iter()
-            .find(|item| item.text.as_deref() == Some("Read documentation"))
-            .expect("first todo title should render");
+            .find(|item| {
+                item.node.0.ends_with("todo-0")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+            })
+            .expect("first TodoMVC row should render");
+        assert_eq!(
+            first_row.style.get("hover_scope"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        assert_eq!(
+            first_row.style.get("border_bottom"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.93]".to_owned()
+            ))
+        );
+
         let mut hover = deterministic_click_input(0, 0.0, 0.0);
         hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
-            x: f64::from(hover_title.bounds.x + hover_title.bounds.width * 0.5),
-            y: f64::from(hover_title.bounds.y + hover_title.bounds.height * 0.5),
+            x: f64::from(first_row.bounds.x + first_row.bounds.width - 12.0),
+            y: f64::from(first_row.bounds.y + first_row.bounds.height * 0.5),
             window_width: 920.0,
             window_height: 720.0,
         });
@@ -20879,6 +21193,77 @@ mod tests {
             })
             .count();
         assert_eq!(hovered_delete_count, 1);
+    }
+
+    #[test]
+    fn todomvc_clicking_new_todo_input_focuses_without_textless_change_event() {
+        let source_path = repo_path("examples/todomvc.bn");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-todomvc-input-focus", &source).unwrap(),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&state_summary),
+        )
+        .unwrap();
+        let (toggle_x, toggle_y, _) =
+            source_hit_center(&layout_proof, "store.sources.toggle_all_checkbox.click").unwrap();
+        let (input_x, input_y, input_node) =
+            source_hit_center(&layout_proof, "store.sources.new_todo_input.change").unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, toggle_x, toggle_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, input_x, input_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            input_state.focused_node.as_deref(),
+            Some(input_node.as_str())
+        );
+        assert_eq!(input_state.focused_text, "");
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["new_todo_text"], "");
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(1, "R")], Vec::new()),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["new_todo_text"], "r");
     }
 
     #[test]
@@ -21238,6 +21623,8 @@ mod tests {
             type_inspector_selection: None,
             type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
             type_inspector_resize_hovered: false,
+            type_inspector_collapsed_paths: BTreeSet::new(),
+            type_inspector_list_item_limits: BTreeMap::new(),
             hovered_editor_position: None,
             caret_visible: true,
             runtime_value_cache: RefCell::new(None),
@@ -21351,6 +21738,8 @@ mod tests {
             type_inspector_selection: None,
             type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
             type_inspector_resize_hovered: false,
+            type_inspector_collapsed_paths: BTreeSet::new(),
+            type_inspector_list_item_limits: BTreeMap::new(),
             hovered_editor_position: None,
             caret_visible: true,
             runtime_value_cache: RefCell::new(None),

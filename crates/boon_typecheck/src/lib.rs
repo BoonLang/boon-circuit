@@ -36,7 +36,53 @@ pub enum Variant {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectShape {
     pub fields: BTreeMap<String, Type>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_order: Vec<String>,
     pub open: bool,
+}
+
+impl ObjectShape {
+    fn new(fields: BTreeMap<String, Type>, open: bool) -> Self {
+        let field_order = fields.keys().cloned().collect();
+        Self {
+            fields,
+            field_order,
+            open,
+        }
+    }
+
+    fn from_ordered_fields(fields: impl IntoIterator<Item = (String, Type)>, open: bool) -> Self {
+        let mut shape_fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        for (field, ty) in fields {
+            if !shape_fields.contains_key(&field) {
+                field_order.push(field.clone());
+            }
+            shape_fields.insert(field, ty);
+        }
+        Self {
+            fields: shape_fields,
+            field_order,
+            open,
+        }
+    }
+
+    fn ordered_fields(&self) -> Vec<(&String, &Type)> {
+        let mut seen = BTreeSet::new();
+        let mut fields = Vec::new();
+        for field in &self.field_order {
+            if let Some(ty) = self.fields.get(field) {
+                seen.insert(field.as_str());
+                fields.push((field, ty));
+            }
+        }
+        for (field, ty) in &self.fields {
+            if seen.insert(field.as_str()) {
+                fields.push((field, ty));
+            }
+        }
+        fields
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -360,25 +406,17 @@ impl<'a> Checker<'a> {
 
     fn refresh_static_row_scope_bindings(&mut self) {
         for row_scope in &self.program.row_scope_functions {
-            let Some(Type::Object(shape)) =
-                self.user_function_return_type(&row_scope.function, &mut BTreeSet::new())
-            else {
+            let Some(row_type) = canonical_row_scope_type(
+                self.program,
+                &self.name_bindings,
+                &self.function_param_requirements,
+                &row_scope.function,
+                &row_scope.list,
+                &row_scope.row_scope,
+                self.user_function_return_type(&row_scope.function, &mut BTreeSet::new()),
+            ) else {
                 continue;
             };
-            let output_type = Type::Object(shape.clone());
-            let row_type = self
-                .name_bindings
-                .get(&row_scope.list)
-                .and_then(|existing| match existing {
-                    Type::List(item) => Some(widen_structural_type(item, &output_type)),
-                    _ => None,
-                })
-                .or_else(|| {
-                    self.name_bindings
-                        .get(&row_scope.row_scope)
-                        .map(|existing| widen_structural_type(existing, &output_type))
-                })
-                .unwrap_or(output_type);
             self.name_bindings
                 .insert(row_scope.row_scope.clone(), row_type.clone());
             self.name_bindings.insert(
@@ -386,7 +424,7 @@ impl<'a> Checker<'a> {
                 Type::List(Box::new(row_type.clone())),
             );
             if let Type::Object(shape) = &row_type {
-                for (field, ty) in &shape.fields {
+                for (field, ty) in shape.ordered_fields() {
                     self.name_bindings.insert(field.clone(), ty.clone());
                     self.name_bindings
                         .insert(format!("{}.{}", row_scope.row_scope, field), ty.clone());
@@ -495,13 +533,7 @@ impl<'a> Checker<'a> {
         if let AstStatementKind::Function { name, args } = &statement.kind {
             let arg_types = args
                 .iter()
-                .map(|arg| {
-                    self.function_param_requirements
-                        .get(name)
-                        .and_then(|requirements| requirements.get(arg))
-                        .cloned()
-                        .unwrap_or_else(open_object_type)
-                })
+                .map(|arg| self.function_arg_display_type(name, arg))
                 .collect();
             self.function_type_table.entries.push(FunctionTypeEntry {
                 name: name.clone(),
@@ -524,6 +556,69 @@ impl<'a> Checker<'a> {
         for child in &statement.children {
             self.check_statement(child, next_in_document);
         }
+    }
+
+    fn function_arg_display_type(&self, function: &str, arg: &str) -> Type {
+        if self
+            .program
+            .row_scope_functions
+            .iter()
+            .any(|row_scope| row_scope.function == function && row_scope.row_scope == arg)
+            && let Some(ty) = self.name_bindings.get(arg)
+        {
+            return ty.clone();
+        }
+        let requirement = self
+            .function_param_requirements
+            .get(function)
+            .and_then(|requirements| requirements.get(arg))
+            .cloned();
+        if let Some(ty) = self.function_arg_call_site_type(function, arg) {
+            return requirement
+                .as_ref()
+                .map(|requirement| merge_canonical_row_type(&ty, requirement))
+                .unwrap_or(ty);
+        }
+        if let Some(ty) = self.name_bindings.get(arg) {
+            return requirement
+                .as_ref()
+                .map(|requirement| merge_canonical_row_type(ty, requirement))
+                .unwrap_or_else(|| ty.clone());
+        }
+        requirement.unwrap_or_else(open_object_type)
+    }
+
+    fn function_arg_call_site_type(&self, function: &str, arg: &str) -> Option<Type> {
+        let function_args = function_statement_args(self.program, function)?;
+        let mut ty = None;
+        for expr in &self.program.expressions {
+            let arg_expr_id = match &expr.kind {
+                AstExprKind::Call {
+                    function: call,
+                    args,
+                } if call == function => {
+                    function_call_argument_expr(function_args, arg, None, args)
+                }
+                AstExprKind::Pipe { input, op, args } if op == function => {
+                    function_call_argument_expr(function_args, arg, Some(*input), args)
+                }
+                _ => None,
+            };
+            let Some(arg_expr_id) = arg_expr_id else {
+                continue;
+            };
+            let Some(arg_expr) = self.program.expressions.get(arg_expr_id) else {
+                continue;
+            };
+            let Some(arg_ty) = self.static_expr_type(arg_expr, &mut BTreeSet::new()) else {
+                continue;
+            };
+            ty = Some(match ty {
+                Some(existing) => merge_canonical_row_type(&existing, &arg_ty),
+                None => arg_ty,
+            });
+        }
+        ty
     }
 
     fn check_render_slot(&mut self, statement: &AstStatement) {
@@ -564,13 +659,16 @@ impl<'a> Checker<'a> {
                 materialization_policy = MaterializationPolicy::RenderSlotMaterialization;
                 let binding_id = self.list_map_bindings.len();
                 optional_list_map_binding_id = Some(binding_id);
+                let input_list_type = self.ensure_expr(mapped.list_expr_id).ty;
+                let item_type = list_item_type_from_list_type(&input_list_type)
+                    .unwrap_or_else(open_object_type);
                 self.list_map_bindings.push(ListMapBinding {
                     map_expr_id: mapped.map_expr_id,
                     list_expr_id: mapped.list_expr_id,
-                    input_list_type: Type::List(Box::new(open_object_type())),
+                    input_list_type,
                     item_expr_id: mapped.item_expr_id,
                     item_binding_name: mapped.item_binding_name,
-                    item_type: open_object_type(),
+                    item_type,
                     result_type: Type::List(Box::new(renderable_contract_type())),
                     item_scope_id,
                     template_function: template_function.clone(),
@@ -760,13 +858,12 @@ impl<'a> Checker<'a> {
                 Type::VariantSet(vec![Variant::Tag(tag.clone())])
             }
             AstExprKind::TaggedObject { tag, fields } => {
-                let shape = ObjectShape {
-                    fields: fields
+                let shape = ObjectShape::from_ordered_fields(
+                    fields
                         .iter()
-                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty))
-                        .collect(),
-                    open: false,
-                };
+                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
+                    false,
+                );
                 self.check_tagged_object_contract(expr, tag, fields, &shape);
                 Type::VariantSet(vec![Variant::Tagged {
                     tag: tag.clone(),
@@ -774,13 +871,12 @@ impl<'a> Checker<'a> {
                 }])
             }
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-                Type::Object(ObjectShape {
-                    fields: fields
+                Type::Object(ObjectShape::from_ordered_fields(
+                    fields
                         .iter()
-                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty))
-                        .collect(),
-                    open: false,
-                })
+                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
+                    false,
+                ))
             }
             AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
             AstExprKind::Call { function, args } => {
@@ -1040,18 +1136,18 @@ impl<'a> Checker<'a> {
         input_flow: Option<&FlowType>,
         args: &[AstCallArg],
     ) -> Type {
-        let mut fields = BTreeMap::new();
+        let mut fields = Vec::new();
         if let Some(input_flow) = input_flow
             && !matches!(input_flow.ty, Type::Unknown)
         {
-            fields.insert("input".to_owned(), input_flow.ty.clone());
+            fields.push(("input".to_owned(), input_flow.ty.clone()));
         }
         for arg in args {
             let Some(name) = &arg.name else {
                 continue;
             };
             let ty = self.ensure_expr(arg.value).ty;
-            fields.insert(name.clone(), ty);
+            fields.push((name.clone(), ty));
         }
         self.render_contracts.constructor_shape(function, fields)
     }
@@ -1188,10 +1284,27 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-                Some(Type::Object(ObjectShape {
-                    fields: fields
-                        .iter()
-                        .map(|field| {
+                Some(Type::Object(ObjectShape::from_ordered_fields(
+                    fields.iter().map(|field| {
+                        (
+                            field.name.clone(),
+                            self.program
+                                .expressions
+                                .get(field.value)
+                                .and_then(|field_expr| {
+                                    self.static_expr_type(field_expr, active_functions)
+                                })
+                                .unwrap_or_else(open_object_type),
+                        )
+                    }),
+                    false,
+                )))
+            }
+            AstExprKind::TaggedObject { tag, fields } => {
+                Some(Type::VariantSet(vec![Variant::Tagged {
+                    tag: tag.clone(),
+                    fields: ObjectShape::from_ordered_fields(
+                        fields.iter().map(|field| {
                             (
                                 field.name.clone(),
                                 self.program
@@ -1202,32 +1315,9 @@ impl<'a> Checker<'a> {
                                     })
                                     .unwrap_or_else(open_object_type),
                             )
-                        })
-                        .collect(),
-                    open: false,
-                }))
-            }
-            AstExprKind::TaggedObject { tag, fields } => {
-                Some(Type::VariantSet(vec![Variant::Tagged {
-                    tag: tag.clone(),
-                    fields: ObjectShape {
-                        fields: fields
-                            .iter()
-                            .map(|field| {
-                                (
-                                    field.name.clone(),
-                                    self.program
-                                        .expressions
-                                        .get(field.value)
-                                        .and_then(|field_expr| {
-                                            self.static_expr_type(field_expr, active_functions)
-                                        })
-                                        .unwrap_or_else(open_object_type),
-                                )
-                            })
-                            .collect(),
-                        open: false,
-                    },
+                        }),
+                        false,
+                    ),
                 }]))
             }
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
@@ -1359,11 +1449,11 @@ impl<'a> Checker<'a> {
         args: &[AstCallArg],
         active_functions: &mut BTreeSet<String>,
     ) -> Type {
-        let mut fields = BTreeMap::new();
+        let mut fields = Vec::new();
         if let Some(input_ty) = input_ty
             && !matches!(input_ty, Type::Unknown)
         {
-            fields.insert("input".to_owned(), input_ty);
+            fields.push(("input".to_owned(), input_ty));
         }
         for arg in args {
             let Some(name) = &arg.name else {
@@ -1375,7 +1465,7 @@ impl<'a> Checker<'a> {
                 .get(arg.value)
                 .and_then(|expr| self.static_expr_type(expr, active_functions))
                 .unwrap_or_else(open_object_type);
-            fields.insert(name.clone(), ty);
+            fields.push((name.clone(), ty));
         }
         self.render_contracts.constructor_shape(function, fields)
     }
@@ -1406,9 +1496,16 @@ impl<'a> Checker<'a> {
             return Some(renderable);
         }
         let mut fields = BTreeMap::new();
-        self.collect_static_statement_fields(&statement.children, active_functions, &mut fields);
+        let mut field_order = Vec::new();
+        self.collect_static_statement_fields(
+            &statement.children,
+            active_functions,
+            &mut fields,
+            &mut field_order,
+        );
         (!fields.is_empty()).then_some(Type::Object(ObjectShape {
             fields,
+            field_order,
             open: false,
         }))
     }
@@ -1418,18 +1515,21 @@ impl<'a> Checker<'a> {
         statements: &[AstStatement],
         active_functions: &mut BTreeSet<String>,
         fields: &mut BTreeMap<String, Type>,
+        field_order: &mut Vec<String>,
     ) {
         for statement in statements {
             if let Some(field) = statement_output_name(statement)
                 && field != "document"
                 && let Some(ty) = self.static_statement_type(statement, active_functions)
             {
-                fields
-                    .entry(field)
-                    .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
-                    .or_insert(ty);
+                insert_ordered_shape_field(fields, field_order, field, ty);
             } else {
-                self.collect_static_statement_fields(&statement.children, active_functions, fields);
+                self.collect_static_statement_fields(
+                    &statement.children,
+                    active_functions,
+                    fields,
+                    field_order,
+                );
             }
         }
     }
@@ -1452,13 +1552,16 @@ impl<'a> Checker<'a> {
                 .and_then(|expr| self.static_expr_type(expr, active_functions))
                 .or_else(|| {
                     let mut fields = BTreeMap::new();
+                    let mut field_order = Vec::new();
                     self.collect_static_statement_fields(
                         &statement.children,
                         active_functions,
                         &mut fields,
+                        &mut field_order,
                     );
                     (!fields.is_empty()).then_some(Type::Object(ObjectShape {
                         fields,
+                        field_order,
                         open: false,
                     }))
                 }),
@@ -1643,13 +1746,16 @@ impl<'a> Checker<'a> {
             .map(|(function, args)| (Some(function), args))
             .unwrap_or((None, Vec::new()));
         let item_type = self.list_map_result_item_type(args);
+        let input_list_type = self.ensure_expr(list_expr_id).ty;
+        let input_item_type =
+            list_item_type_from_list_type(&input_list_type).unwrap_or_else(open_object_type);
         self.list_map_bindings.push(ListMapBinding {
             map_expr_id,
             list_expr_id,
-            input_list_type: Type::List(Box::new(open_object_type())),
+            input_list_type,
             item_expr_id,
             item_binding_name,
-            item_type: open_object_type(),
+            item_type: input_item_type,
             result_type: Type::List(Box::new(item_type)),
             item_scope_id: Some(stable_scope_id_for_map(map_expr_id)),
             template_function,
@@ -2234,6 +2340,14 @@ fn function_statement_map(statements: &[AstStatement]) -> BTreeMap<String, &AstS
     functions
 }
 
+fn function_statement_args<'a>(program: &'a ParsedProgram, function: &str) -> Option<&'a [String]> {
+    let statement = find_function_statement(&program.ast.statements, function)?;
+    let AstStatementKind::Function { args, .. } = &statement.kind else {
+        return None;
+    };
+    Some(args)
+}
+
 fn collect_function_statements<'a>(
     statements: &'a [AstStatement],
     functions: &mut BTreeMap<String, &'a AstStatement>,
@@ -2676,10 +2790,7 @@ impl BuiltinSignatureRegistry {
         } else if function == "Error/new" {
             Type::VariantSet(vec![Variant::Tagged {
                 tag: "Error".to_owned(),
-                fields: ObjectShape {
-                    fields: BTreeMap::new(),
-                    open: true,
-                },
+                fields: ObjectShape::new(BTreeMap::new(), true),
             }])
         } else if render_contracts.is_render_constructor(function) {
             render_contracts.constructor_shape(function, BTreeMap::new())
@@ -2802,18 +2913,21 @@ impl RenderContractRegistry {
         }
     }
 
-    fn constructor_shape(&self, function: &str, mut fields: BTreeMap<String, Type>) -> Type {
+    fn constructor_shape(
+        &self,
+        function: &str,
+        fields: impl IntoIterator<Item = (String, Type)>,
+    ) -> Type {
+        let mut ordered_fields = fields.into_iter().collect::<Vec<_>>();
+        let lookup_fields = ordered_fields.iter().cloned().collect::<BTreeMap<_, _>>();
         let kind = self
             .roots
             .get(self.active_root)
             .and_then(|root| root.constructors.get(function))
-            .map(|contract| contract.kind_type(&fields))
+            .map(|contract| contract.kind_type(&lookup_fields))
             .unwrap_or_else(|| Type::VariantSet(vec![Variant::Tag("Renderable".to_owned())]));
-        fields.insert("kind".to_owned(), kind);
-        Type::Object(ObjectShape {
-            fields,
-            open: false,
-        })
+        ordered_fields.push(("kind".to_owned(), kind));
+        Type::Object(ObjectShape::from_ordered_fields(ordered_fields, false))
     }
 
     fn is_renderable_object_type(&self, ty: &Type) -> bool {
@@ -3024,8 +3138,8 @@ fn object_shape_label(
 ) -> String {
     if compact {
         let fields = shape
-            .fields
-            .iter()
+            .ordered_fields()
+            .into_iter()
             .map(|(field, ty)| {
                 format!(
                     "{field}: {}",
@@ -3038,8 +3152,8 @@ fn object_shape_label(
     let indent = " ".repeat((depth + 1) * 4);
     let closing_indent = " ".repeat(depth * 4);
     let fields = shape
-        .fields
-        .iter()
+        .ordered_fields()
+        .into_iter()
         .map(|(field, ty)| {
             let value = boon_facing_type_label_with_depth(ty, depth + 1, false, max_depth);
             if value.contains('\n') {
@@ -3357,19 +3471,33 @@ fn collect_object_bindings(
 }
 
 fn object_shape_for_statement(statement: &AstStatement, expressions: &[AstExpr]) -> ObjectShape {
-    ObjectShape {
-        fields: statement
-            .children
-            .iter()
-            .filter_map(|child| {
-                let field = statement_field(child)?;
-                let ty = simple_statement_value_type(child, expressions)
-                    .unwrap_or_else(open_object_type);
-                Some((field, ty))
-            })
-            .collect(),
-        open: true,
+    ObjectShape::from_ordered_fields(
+        statement.children.iter().filter_map(|child| {
+            let field = statement_field(child)?;
+            let ty =
+                simple_statement_value_type(child, expressions).unwrap_or_else(open_object_type);
+            Some((field, ty))
+        }),
+        true,
+    )
+}
+
+fn simple_list_statement_type(statement: &AstStatement, expressions: &[AstExpr]) -> Type {
+    let mut item_type = None;
+    for child in &statement.children {
+        let Some(expr_id) = child.expr else {
+            continue;
+        };
+        let Some(expr) = expressions.get(expr_id) else {
+            continue;
+        };
+        let ty = simple_expr_type(expr, expressions);
+        item_type = Some(match item_type {
+            Some(existing) => widen_structural_type(&existing, &ty),
+            None => ty,
+        });
     }
+    Type::List(Box::new(item_type.unwrap_or_else(open_object_type)))
 }
 
 fn simple_statement_value_type(statement: &AstStatement, expressions: &[AstExpr]) -> Option<Type> {
@@ -3424,21 +3552,18 @@ fn object_shape_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<Obje
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => fields,
         _ => return None,
     };
-    Some(ObjectShape {
-        fields: fields
-            .iter()
-            .map(|field| {
-                (
-                    field.name.clone(),
-                    expressions
-                        .get(field.value)
-                        .map(|expr| simple_expr_type(expr, expressions))
-                        .unwrap_or_else(open_object_type),
-                )
-            })
-            .collect(),
-        open: false,
-    })
+    Some(ObjectShape::from_ordered_fields(
+        fields.iter().map(|field| {
+            (
+                field.name.clone(),
+                expressions
+                    .get(field.value)
+                    .map(|expr| simple_expr_type(expr, expressions))
+                    .unwrap_or_else(open_object_type),
+            )
+        }),
+        false,
+    ))
 }
 
 fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
@@ -3454,10 +3579,9 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Tag(value) | AstExprKind::Enum(value) => {
             Type::VariantSet(vec![Variant::Tag(value.clone())])
         }
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => Type::Object(ObjectShape {
-            fields: fields
-                .iter()
-                .map(|field| {
+        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+            Type::Object(ObjectShape::from_ordered_fields(
+                fields.iter().map(|field| {
                     (
                         field.name.clone(),
                         expressions
@@ -3465,10 +3589,10 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                             .map(|expr| simple_expr_type(expr, expressions))
                             .unwrap_or_else(open_object_type),
                     )
-                })
-                .collect(),
-            open: false,
-        }),
+                }),
+                false,
+            ))
+        }
         AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if matches!(
@@ -3489,15 +3613,14 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if function == "List/chunk" =>
         {
-            Type::List(Box::new(Type::Object(ObjectShape {
-                fields: [
+            Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+                [
                     ("row_number".to_owned(), Type::Text),
                     ("cells".to_owned(), Type::List(Box::new(open_object_type()))),
                 ]
-                .into_iter()
-                .collect(),
-                open: true,
-            })))
+                .into_iter(),
+                true,
+            ))))
         }
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if function == "Bool/not" || function == "Bool/and" =>
@@ -3750,10 +3873,10 @@ fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -
     } else {
         object_type_for_path_requirement(rest, leaf_type)
     };
-    Type::Object(ObjectShape {
-        fields: [(field.clone(), field_type)].into_iter().collect(),
-        open: true,
-    })
+    Type::Object(ObjectShape::from_ordered_fields(
+        [(field.clone(), field_type)].into_iter(),
+        true,
+    ))
 }
 
 fn pipe_input_expected_type(function: &str) -> Option<Type> {
@@ -3927,7 +4050,7 @@ fn collect_name_bindings(
             AstStatementKind::List {
                 field: Some(name), ..
             } => {
-                let ty = Type::List(Box::new(open_object_type()));
+                let ty = simple_list_statement_type(statement, expressions);
                 bindings.insert(name.clone(), ty.clone());
                 bindings.insert(scoped_path(scope, name), ty);
                 collect_name_bindings(
@@ -4000,30 +4123,26 @@ fn collect_row_scope_bindings(
         bindings
             .entry(row_scope.row_scope.clone())
             .or_insert_with(open_object_type);
-        if let Some(shape) = list_item_shape(program, &row_scope.list)
-            .or_else(|| {
-                function_param_requirements
-                    .get(&row_scope.function)
-                    .and_then(|requirements| requirements.get(&row_scope.row_scope))
-                    .and_then(object_shape_from_type)
-            })
-            .or_else(|| function_result_shape(program, &row_scope.function))
-        {
-            for (field, ty) in &shape.fields {
-                bindings.insert(field.clone(), ty.clone());
-                bindings.insert(format!("{}.{}", row_scope.row_scope, field), ty.clone());
+        if let Some(item_ty) = canonical_row_scope_type(
+            program,
+            bindings,
+            function_param_requirements,
+            &row_scope.function,
+            &row_scope.list,
+            &row_scope.row_scope,
+            function_result_shape(program, &row_scope.function).map(Type::Object),
+        ) {
+            if let Type::Object(shape) = &item_ty {
+                for (field, ty) in shape.ordered_fields() {
+                    bindings.insert(field.clone(), ty.clone());
+                    bindings.insert(format!("{}.{}", row_scope.row_scope, field), ty.clone());
+                }
             }
-            let item_ty = Type::Object(shape);
             bindings.insert(row_scope.row_scope.clone(), item_ty.clone());
             bindings
                 .entry(row_scope.list.clone())
                 .and_modify(|existing| {
-                    if matches!(existing, Type::List(item) if is_open_object_type(item)) {
-                        *existing = Type::List(Box::new(item_ty.clone()));
-                    } else {
-                        *existing =
-                            widen_structural_type(existing, &Type::List(Box::new(item_ty.clone())));
-                    }
+                    *existing = Type::List(Box::new(item_ty.clone()));
                 })
                 .or_insert_with(|| Type::List(Box::new(item_ty)));
         }
@@ -4037,6 +4156,7 @@ fn collect_row_scope_bindings(
                     .expressions
                     .get(arg.value)
                     .and_then(expr_single_name)
+                    && !bindings.contains_key(name)
                 {
                     bindings.insert(name.to_owned(), open_object_type());
                 }
@@ -4082,6 +4202,100 @@ fn collect_row_scope_bindings(
     }
 }
 
+fn canonical_row_scope_type(
+    program: &ParsedProgram,
+    bindings: &BTreeMap<String, Type>,
+    function_param_requirements: &BTreeMap<String, BTreeMap<String, Type>>,
+    function: &str,
+    list: &str,
+    row_scope: &str,
+    canonical_return: Option<Type>,
+) -> Option<Type> {
+    let mut row_type = canonical_return.filter(type_has_known_user_shape);
+    let list_item_type = bindings
+        .get(list)
+        .and_then(|existing| match existing {
+            Type::List(item) => Some((**item).clone()),
+            _ => None,
+        })
+        .or_else(|| list_item_shape(program, list).map(Type::Object));
+
+    if let Some(extra) = list_item_type.filter(type_has_known_user_shape) {
+        row_type = Some(match row_type {
+            Some(existing) => merge_canonical_row_type(&existing, &extra),
+            None => extra,
+        });
+    }
+
+    let requirement_type = function_param_requirements
+        .get(function)
+        .and_then(|requirements| requirements.get(row_scope))
+        .cloned();
+    if let Some(extra) = requirement_type.filter(type_has_known_user_shape) {
+        row_type = Some(match row_type {
+            Some(existing) => merge_canonical_row_type(&existing, &extra),
+            None => extra,
+        });
+    }
+
+    row_type
+}
+
+fn type_has_known_user_shape(ty: &Type) -> bool {
+    match ty {
+        Type::Unknown | Type::UnresolvedShape { .. } => false,
+        Type::Object(shape) => !shape.fields.is_empty(),
+        Type::List(item) => type_has_known_user_shape(item),
+        _ => true,
+    }
+}
+
+fn list_item_type_from_list_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::List(item) => Some((**item).clone()),
+        _ => None,
+    }
+}
+
+fn merge_canonical_row_type(canonical: &Type, extra: &Type) -> Type {
+    if is_value_placeholder_type(canonical) {
+        return extra.clone();
+    }
+    if is_value_placeholder_type(extra) {
+        return canonical.clone();
+    }
+    match (canonical, extra) {
+        (Type::Object(canonical_shape), Type::Object(extra_shape)) => {
+            let mut fields = canonical_shape.fields.clone();
+            for (field, extra_ty) in extra_shape.ordered_fields() {
+                fields
+                    .entry(field.clone())
+                    .and_modify(|existing| {
+                        *existing = merge_canonical_row_type(existing, extra_ty);
+                    })
+                    .or_insert_with(|| extra_ty.clone());
+            }
+            Type::Object(ObjectShape {
+                fields,
+                field_order: object_field_order_for_widened_shapes(canonical_shape, extra_shape),
+                open: canonical_shape.open || extra_shape.open,
+            })
+        }
+        (Type::List(canonical_item), Type::List(extra_item)) => Type::List(Box::new(
+            merge_canonical_row_type(canonical_item, extra_item),
+        )),
+        _ => widen_structural_type(canonical, extra),
+    }
+}
+
+fn is_value_placeholder_type(ty: &Type) -> bool {
+    match ty {
+        Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. } => true,
+        Type::Object(shape) => shape.open && shape.fields.is_empty(),
+        _ => false,
+    }
+}
+
 fn pattern_variable_names(pattern: &[String]) -> Vec<String> {
     pattern
         .iter()
@@ -4110,8 +4324,18 @@ fn is_binding_name(value: &str) -> bool {
 fn function_result_shape(program: &ParsedProgram, function: &str) -> Option<ObjectShape> {
     let function = find_function_statement(&program.ast.statements, function)?;
     let mut fields = BTreeMap::new();
-    collect_statement_shape_fields(&function.children, &program.expressions, &mut fields);
-    (!fields.is_empty()).then_some(ObjectShape { fields, open: true })
+    let mut field_order = Vec::new();
+    collect_statement_shape_fields(
+        &function.children,
+        &program.expressions,
+        &mut fields,
+        &mut field_order,
+    );
+    (!fields.is_empty()).then_some(ObjectShape {
+        fields,
+        field_order,
+        open: true,
+    })
 }
 
 fn find_function_statement<'a>(
@@ -4136,19 +4360,17 @@ fn collect_statement_shape_fields(
     statements: &[AstStatement],
     expressions: &[AstExpr],
     fields: &mut BTreeMap<String, Type>,
+    field_order: &mut Vec<String>,
 ) {
     for statement in statements {
-        if let Some(field) = statement_field(statement)
-            && field != "sources"
-        {
-            let ty = simple_statement_value_type(statement, expressions)
-                .unwrap_or_else(open_object_type);
-            fields
-                .entry(field)
-                .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
-                .or_insert(ty);
+        if let Some(field) = statement_field(statement) {
+            let ty = simple_statement_value_type(statement, expressions).unwrap_or_else(|| {
+                Type::Object(object_shape_for_statement(statement, expressions))
+            });
+            insert_ordered_shape_field(fields, field_order, field, ty);
+        } else {
+            collect_statement_shape_fields(&statement.children, expressions, fields, field_order);
         }
-        collect_statement_shape_fields(&statement.children, expressions, fields);
     }
 }
 
@@ -4158,6 +4380,7 @@ fn list_item_shape(program: &ParsedProgram, list_name: &str) -> Option<ObjectSha
     }
     let list = find_list_statement(&program.ast.statements, list_name)?;
     let mut fields = BTreeMap::new();
+    let mut field_order = Vec::new();
     for child in &list.children {
         let Some(expr_id) = child.expr else {
             continue;
@@ -4175,23 +4398,14 @@ fn list_item_shape(program: &ParsedProgram, list_name: &str) -> Option<ObjectSha
                 .get(field.value)
                 .map(|expr| simple_expr_type(expr, &program.expressions))
                 .unwrap_or_else(open_object_type);
-            fields
-                .entry(field.name.clone())
-                .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
-                .or_insert(ty);
+            insert_ordered_shape_field(&mut fields, &mut field_order, field.name.clone(), ty);
         }
     }
-    (!fields.is_empty()).then_some(ObjectShape { fields, open: true })
-}
-
-fn object_shape_from_type(ty: &Type) -> Option<ObjectShape> {
-    match ty {
-        Type::Object(shape) => Some(ObjectShape {
-            fields: shape.fields.clone(),
-            open: false,
-        }),
-        _ => None,
-    }
+    (!fields.is_empty()).then_some(ObjectShape {
+        fields,
+        field_order,
+        open: true,
+    })
 }
 
 fn list_item_shape_from_field(program: &ParsedProgram, list_name: &str) -> Option<ObjectShape> {
@@ -4279,11 +4493,45 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             }
             Type::Object(ObjectShape {
                 fields,
+                field_order: object_field_order_for_widened_shapes(left, right),
                 open: left.open || right.open,
             })
         }
         _ => open_object_type(),
     }
+}
+
+fn object_field_order_for_widened_shapes(left: &ObjectShape, right: &ObjectShape) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut seen = BTreeSet::new();
+    for field in left.field_order.iter().chain(right.field_order.iter()) {
+        if left.fields.contains_key(field) || right.fields.contains_key(field) {
+            if seen.insert(field.as_str()) {
+                order.push(field.clone());
+            }
+        }
+    }
+    for field in left.fields.keys().chain(right.fields.keys()) {
+        if seen.insert(field.as_str()) {
+            order.push(field.clone());
+        }
+    }
+    order
+}
+
+fn insert_ordered_shape_field(
+    fields: &mut BTreeMap<String, Type>,
+    field_order: &mut Vec<String>,
+    field: String,
+    ty: Type,
+) {
+    if !fields.contains_key(&field) {
+        field_order.push(field.clone());
+    }
+    fields
+        .entry(field)
+        .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
+        .or_insert(ty);
 }
 
 fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
@@ -4381,13 +4629,12 @@ fn source_payload_shape_table(program: &ParsedProgram) -> Vec<SourcePayloadShape
         .iter()
         .map(|source| {
             let fields = source_payload_fields_for_path(program, &source_paths, &source.path);
-            let payload_type = Type::Object(ObjectShape {
-                fields: fields
+            let payload_type = Type::Object(ObjectShape::from_ordered_fields(
+                fields
                     .iter()
-                    .map(|field| (field.name.clone(), field.ty.clone()))
-                    .collect(),
-                open: false,
-            });
+                    .map(|field| (field.name.clone(), field.ty.clone())),
+                false,
+            ));
             SourcePayloadShapeEntry {
                 source_path: source.path.clone(),
                 payload_type,
@@ -4596,7 +4843,9 @@ fn collect_statement_type_hints(
                 ));
             }
             AstStatementKind::List { .. } => {
-                let ty = Type::List(Box::new(open_object_type()));
+                let ty = statement_field(statement)
+                    .and_then(|field| name_bindings.get(&field).cloned())
+                    .unwrap_or_else(|| simple_list_statement_type(statement, &program.expressions));
                 entries.push(type_hint_entry_for_range(
                     program,
                     statement.expr,
@@ -4695,29 +4944,30 @@ fn statement_hint_type(
 ) -> Type {
     let value_expr = direct_statement_value_expr_id(statement, &program.expressions);
     if !statement.children.is_empty() {
-        let fields = statement
-            .children
-            .iter()
-            .filter_map(|child| {
-                let field = statement_output_name(child)?;
-                let ty = match &child.kind {
-                    AstStatementKind::Source { .. } => {
-                        source_statement_value_type(child, source_payload_shape_table)
-                    }
-                    _ => statement_hint_type(
-                        program,
-                        child,
-                        expr_types,
-                        source_payload_shape_table,
-                        name_bindings,
-                    ),
-                };
-                Some((field, ty))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        for child in &statement.children {
+            let Some(field) = statement_output_name(child) else {
+                continue;
+            };
+            let ty = match &child.kind {
+                AstStatementKind::Source { .. } => {
+                    source_statement_value_type(child, source_payload_shape_table)
+                }
+                _ => statement_hint_type(
+                    program,
+                    child,
+                    expr_types,
+                    source_payload_shape_table,
+                    name_bindings,
+                ),
+            };
+            insert_ordered_shape_field(&mut fields, &mut field_order, field, ty);
+        }
         if !fields.is_empty() {
             return Type::Object(ObjectShape {
                 fields,
+                field_order,
                 open: false,
             });
         }
@@ -4761,10 +5011,10 @@ fn source_statement_value_type(
     match &statement.kind {
         AstStatementKind::Source {
             event: Some(event), ..
-        } => Type::Object(ObjectShape {
-            fields: [(event.clone(), payload)].into_iter().collect(),
-            open: false,
-        }),
+        } => Type::Object(ObjectShape::from_ordered_fields(
+            [(event.clone(), payload)].into_iter(),
+            false,
+        )),
         _ => payload,
     }
 }
@@ -5364,17 +5614,11 @@ fn expr_is_skip(expr: &AstExpr) -> bool {
 }
 
 fn open_object_type() -> Type {
-    Type::Object(ObjectShape {
-        fields: BTreeMap::new(),
-        open: true,
-    })
+    Type::Object(ObjectShape::new(BTreeMap::new(), true))
 }
 
 fn exact_empty_object_type() -> Type {
-    Type::Object(ObjectShape {
-        fields: BTreeMap::new(),
-        open: false,
-    })
+    Type::Object(ObjectShape::new(BTreeMap::new(), false))
 }
 
 fn unresolved_shape(reason: impl Into<String>) -> Type {
@@ -5388,7 +5632,8 @@ fn is_open_object_type(ty: &Type) -> bool {
         ty,
         Type::Object(ObjectShape {
             fields,
-            open: true
+            open: true,
+            ..
         }) if fields.is_empty()
     )
 }
@@ -5442,13 +5687,12 @@ fn stable_scope_id_for_map(expr_id: usize) -> usize {
 
 #[allow(dead_code)]
 fn object_shape(fields: &[AstRecordField]) -> ObjectShape {
-    ObjectShape {
-        fields: fields
+    ObjectShape::from_ordered_fields(
+        fields
             .iter()
-            .map(|field| (field.name.clone(), open_object_type()))
-            .collect(),
-        open: false,
-    }
+            .map(|field| (field.name.clone(), open_object_type())),
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -6395,10 +6639,8 @@ FUNCTION row(todo) {
         assert_eq!(registry.active_root(), "scene");
         assert!(registry.is_render_constructor("Scene/mesh"));
 
-        let mesh = registry.constructor_shape(
-            "Scene/mesh",
-            [("id".to_owned(), Type::Text)].into_iter().collect(),
-        );
+        let mesh =
+            registry.constructor_shape("Scene/mesh", [("id".to_owned(), Type::Text)].into_iter());
         assert!(registry.is_renderable_object_type(&mesh));
         assert_eq!(
             boon_facing_type_detail_label(&mesh),
@@ -6466,6 +6708,55 @@ FUNCTION row(todo) {
                 store_hint.detail_label
             );
         }
+        let source_index = store_hint.detail_label.find("sources: [").unwrap();
+        let new_text_index = store_hint.detail_label.find("new_todo_text: TEXT").unwrap();
+        let title_index = store_hint.detail_label.find("title_to_add: TEXT").unwrap();
+        let filter_index = store_hint
+            .detail_label
+            .find("selected_filter: Active | All | Completed")
+            .unwrap();
+        let todos_index = store_hint.detail_label.find("todos: LIST<[").unwrap();
+        assert!(
+            source_index < new_text_index
+                && new_text_index < title_index
+                && title_index < filter_index
+                && filter_index < todos_index,
+            "store detail fields should follow the Boon source order:\n{}",
+            store_hint.detail_label
+        );
+        let todos_detail = &store_hint.detail_label[todos_index..];
+        let todo_sources_index = todos_detail.find("sources: [").unwrap();
+        let todo_title_index = todos_detail.find("title: TEXT").unwrap();
+        let todo_completed_index = todos_detail.find("completed: BOOL").unwrap();
+        assert!(
+            todo_sources_index < todo_title_index && todo_title_index < todo_completed_index,
+            "mapped todo items should keep the function return field order and refine field types:\n{}",
+            store_hint.detail_label
+        );
+
+        let new_todo_line = source
+            .lines()
+            .position(|line| line.trim() == "FUNCTION new_todo(todo, store) {")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare new_todo");
+        let new_todo_arg = report
+            .type_hint_table
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.line == new_todo_line
+                    && entry.category == "function_arg"
+                    && entry.detail_label.contains("sources: [")
+            })
+            .expect("new_todo row argument should have a canonical row shape");
+        assert!(
+            new_todo_arg.detail_label.find("sources: [").unwrap()
+                < new_todo_arg.detail_label.find("title: TEXT").unwrap()
+                && new_todo_arg.detail_label.find("title: TEXT").unwrap()
+                    < new_todo_arg.detail_label.find("completed: BOOL").unwrap(),
+            "function row argument should display function-return order with refined field types:\n{}",
+            new_todo_arg.detail_label
+        );
 
         for (line_text, expected) in [
             ("change: SOURCE", "[\n    text: TEXT\n]"),

@@ -114,7 +114,7 @@ impl std::error::Error for RenderError {}
 
 pub struct GlyphonTextMeasurer {
     font_system: FontSystem,
-    cache: BTreeMap<(String, u32), boon_document::TextMetrics>,
+    cache: BTreeMap<(String, TextMeasureStyleKey), boon_document::TextMetrics>,
 }
 
 impl GlyphonTextMeasurer {
@@ -134,7 +134,46 @@ impl Default for GlyphonTextMeasurer {
 
 impl boon_document::TextMeasurer for GlyphonTextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> boon_document::TextMetrics {
-        let cache_key = (text.to_owned(), font_size.to_bits());
+        let style_key = TextMeasureStyleKey {
+            font_size_bits: font_size.to_bits(),
+            line_height_bits: text_line_height(font_size).to_bits(),
+            font_family: DOCUMENT_FONT_FAMILY.to_owned(),
+            font_style: "normal".to_owned(),
+            font_weight: "normal".to_owned(),
+        };
+        self.measure_with_key(text, style_key)
+    }
+
+    fn measure_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        style: &StyleMap,
+    ) -> boon_document::TextMetrics {
+        let font_size = font_size.max(1.0);
+        let style_key = TextMeasureStyleKey {
+            font_size_bits: font_size.to_bits(),
+            line_height_bits: style_line_height(style, font_size).to_bits(),
+            font_family: style_text(style, "font")
+                .unwrap_or(DOCUMENT_FONT_FAMILY)
+                .to_owned(),
+            font_style: style_text(style, "font_style")
+                .or_else(|| style_text(style, "style"))
+                .unwrap_or("normal")
+                .to_owned(),
+            font_weight: style_text(style, "weight").unwrap_or("normal").to_owned(),
+        };
+        self.measure_with_key(text, style_key)
+    }
+}
+
+impl GlyphonTextMeasurer {
+    fn measure_with_key(
+        &mut self,
+        text: &str,
+        style_key: TextMeasureStyleKey,
+    ) -> boon_document::TextMetrics {
+        let cache_key = (text.to_owned(), style_key.clone());
         if let Some(metrics) = self.cache.get(&cache_key) {
             return *metrics;
         }
@@ -144,17 +183,19 @@ impl boon_document::TextMeasurer for GlyphonTextMeasurer {
                 height: 0.0,
             };
         }
-        let font_size = font_size.max(1.0);
-        let line_height = (font_size * 1.25).max(1.0);
+        let font_size = f32::from_bits(style_key.font_size_bits).max(1.0);
+        let line_height = f32::from_bits(style_key.line_height_bits)
+            .max(font_size)
+            .max(text_line_height(font_size));
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
         buffer.set_size(&mut self.font_system, None, Some(line_height));
         buffer.set_text(
             &mut self.font_system,
             text,
             &text_attrs(
-                DOCUMENT_FONT_FAMILY,
-                Style::Normal,
-                Weight::NORMAL,
+                &style_key.font_family,
+                text_font_style_value(&style_key.font_style),
+                text_font_weight_value(&style_key.font_weight),
                 [0, 0, 0, 255],
                 "",
             ),
@@ -169,6 +210,15 @@ impl boon_document::TextMeasurer for GlyphonTextMeasurer {
         self.cache.insert(cache_key, metrics);
         metrics
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TextMeasureStyleKey {
+    font_size_bits: u32,
+    line_height_bits: u32,
+    font_family: String,
+    font_style: String,
+    font_weight: String,
 }
 
 #[derive(Clone, Debug)]
@@ -945,6 +995,7 @@ fn text_attrs<'a>(
     color: [u8; 4],
     font_features: &str,
 ) -> Attrs<'a> {
+    let font_family = resolved_font_family(font_family);
     let family = match font_family {
         "SansSerif" | "sans-serif" => Family::SansSerif,
         "Serif" | "serif" => Family::Serif,
@@ -958,6 +1009,14 @@ fn text_attrs<'a>(
         .weight(font_weight)
         .color(Color::rgba(color[0], color[1], color[2], color[3]))
         .font_features(text_font_features(font_features))
+}
+
+fn resolved_font_family(value: &str) -> &str {
+    value
+        .split(|ch| ch == ',' || ch == '|')
+        .map(str::trim)
+        .find(|family| !family.is_empty())
+        .unwrap_or(value)
 }
 
 fn editor_font_system() -> FontSystem {
@@ -1406,6 +1465,16 @@ fn text_line_height(font_size: f32) -> f32 {
     (font_size.clamp(8.0, 120.0) * 1.25).max(1.0)
 }
 
+fn style_line_height(style: &StyleMap, font_size: f32) -> f32 {
+    let fallback = text_line_height(font_size);
+    match style_number(style, "line_height") {
+        Some(value) if value > 0.0 && value < 4.0 => font_size * value,
+        Some(value) if value > 0.0 => value,
+        _ => fallback,
+    }
+    .max(font_size)
+}
+
 fn text_top_for_parts(
     bounds: Rect,
     font_size: f32,
@@ -1663,7 +1732,7 @@ fn rect_vertices(
             .then(|| style_color_f32(&item.style, "focus_border"))
             .flatten();
         if let Some(border) = selected_border.or_else(|| style_color_f32(&item.style, "border")) {
-            push_border(
+            push_border_all(
                 &mut positions,
                 &mut colors,
                 item.bounds,
@@ -1678,8 +1747,16 @@ fn rect_vertices(
             );
             metrics.rendered_rect_count += 1;
         }
+        push_side_borders(
+            &mut positions,
+            &mut colors,
+            item.bounds,
+            width,
+            height,
+            &item.style,
+        );
         if let Some(border) = focus_border {
-            push_border(
+            push_border_all(
                 &mut positions,
                 &mut colors,
                 item.bounds,
@@ -1959,21 +2036,104 @@ fn push_shadows(
                 color,
             );
         } else {
-            let expansion = spread;
-            push_rect(
-                positions,
-                colors,
-                Rect {
-                    x: rect.x + x - expansion,
-                    y: rect.y + y - expansion,
-                    width: (rect.width + expansion * 2.0).max(1.0),
-                    height: (rect.height + expansion * 2.0).max(1.0),
-                },
-                width,
-                height,
-                color,
-            );
+            if blur <= 0.0 {
+                push_rect(
+                    positions,
+                    colors,
+                    Rect {
+                        x: rect.x + x - spread,
+                        y: rect.y + y - spread,
+                        width: (rect.width + spread * 2.0).max(1.0),
+                        height: (rect.height + spread * 2.0).max(1.0),
+                    },
+                    width,
+                    height,
+                    color,
+                );
+                continue;
+            }
+            let base = Rect {
+                x: rect.x + x - spread,
+                y: rect.y + y - spread,
+                width: (rect.width + spread * 2.0).max(1.0),
+                height: (rect.height + spread * 2.0).max(1.0),
+            };
+            let steps = (blur / 4.0).ceil().clamp(2.0, 10.0) as u32;
+            for step in 0..steps {
+                let inner_expand = blur * step as f32 / steps as f32;
+                let outer_expand = blur * (step + 1) as f32 / steps as f32;
+                let t = (step + 1) as f32 / steps as f32;
+                push_shadow_halo(
+                    positions,
+                    colors,
+                    base,
+                    inner_expand,
+                    outer_expand,
+                    width,
+                    height,
+                    color_with_alpha_scale(color, (1.0 - t).max(0.04) / steps as f32),
+                );
+            }
         }
+    }
+}
+
+fn push_shadow_halo(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    inner_expand: f32,
+    outer_expand: f32,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let inner = expanded_rect(rect, inner_expand);
+    let outer = expanded_rect(rect, outer_expand);
+    let top_height = (inner.y - outer.y).max(0.0);
+    let bottom_y = inner.y + inner.height;
+    let bottom_height = (outer.y + outer.height - bottom_y).max(0.0);
+    let left_width = (inner.x - outer.x).max(0.0);
+    let right_x = inner.x + inner.width;
+    let right_width = (outer.x + outer.width - right_x).max(0.0);
+    for band in [
+        Rect {
+            x: outer.x,
+            y: outer.y,
+            width: outer.width,
+            height: top_height,
+        },
+        Rect {
+            x: outer.x,
+            y: bottom_y,
+            width: outer.width,
+            height: bottom_height,
+        },
+        Rect {
+            x: outer.x,
+            y: inner.y,
+            width: left_width,
+            height: inner.height,
+        },
+        Rect {
+            x: right_x,
+            y: inner.y,
+            width: right_width,
+            height: inner.height,
+        },
+    ] {
+        if band.width > 0.0 && band.height > 0.0 {
+            push_rect(positions, colors, band, width, height, color);
+        }
+    }
+}
+
+fn expanded_rect(rect: Rect, amount: f32) -> Rect {
+    Rect {
+        x: rect.x - amount,
+        y: rect.y - amount,
+        width: (rect.width + amount * 2.0).max(1.0),
+        height: (rect.height + amount * 2.0).max(1.0),
     }
 }
 
@@ -2240,7 +2400,7 @@ fn push_checkbox(
     }
 }
 
-fn push_border(
+fn push_border_all(
     positions: &mut Vec<f32>,
     colors: &mut Vec<u8>,
     rect: Rect,
@@ -2276,6 +2436,53 @@ fn push_border(
             height: rect.height,
         },
     ] {
+        push_rect(positions, colors, edge, width, height, color);
+    }
+}
+
+fn push_side_borders(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+) {
+    for side in ["top", "right", "bottom", "left"] {
+        let Some(color) = style_color_f32(style, &format!("border_{side}")) else {
+            continue;
+        };
+        let thickness = style_number(style, &format!("border_{side}_width"))
+            .or_else(|| style_number(style, "border_width"))
+            .unwrap_or(1.0)
+            .max(1.0);
+        let edge = match side {
+            "top" => Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: thickness,
+            },
+            "right" => Rect {
+                x: rect.x + rect.width - thickness,
+                y: rect.y,
+                width: thickness,
+                height: rect.height,
+            },
+            "bottom" => Rect {
+                x: rect.x,
+                y: rect.y + rect.height - thickness,
+                width: rect.width,
+                height: thickness,
+            },
+            "left" => Rect {
+                x: rect.x,
+                y: rect.y,
+                width: thickness,
+                height: rect.height,
+            },
+            _ => unreachable!(),
+        };
         push_rect(positions, colors, edge, width, height, color);
     }
 }

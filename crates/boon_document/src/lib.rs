@@ -9,6 +9,16 @@ use std::ops::Range;
 
 pub trait TextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics;
+
+    fn measure_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        style: &BTreeMap<String, StyleValue>,
+    ) -> TextMetrics {
+        let _ = style;
+        self.measure(text, font_size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -215,7 +225,7 @@ impl LayoutBuilder<'_, '_> {
                 height: 0.0,
             };
         };
-        let padding = style_spacing(&node.style, "padding").unwrap_or(0.0);
+        let padding = style_edges(&node.style, "padding");
         let gap = style_spacing(&node.style, "gap").unwrap_or(0.0);
         let control_size = style_spacing(&node.style, "size").filter(|_| {
             matches!(
@@ -233,8 +243,11 @@ impl LayoutBuilder<'_, '_> {
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(|value| {
-                self.text
-                    .measure(value, style_spacing(&node.style, "size").unwrap_or(14.0))
+                self.text.measure_styled(
+                    value,
+                    style_spacing(&node.style, "size").unwrap_or(14.0),
+                    &node.style,
+                )
             })
             .unwrap_or(TextMetrics {
                 width: 0.0,
@@ -243,7 +256,7 @@ impl LayoutBuilder<'_, '_> {
         let mut width = if auto_width {
             let auto_padding = style_spacing(&node.style, "auto_padding")
                 .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
-            (measured.width + auto_padding).max(1.0)
+            (measured.width + auto_padding + padding.horizontal()).max(1.0)
         } else {
             explicit_width
                 .unwrap_or_else(|| measured.width.max(available_width))
@@ -272,9 +285,9 @@ impl LayoutBuilder<'_, '_> {
         });
 
         if !node.children.is_empty() {
-            let content_x = node_x + padding;
-            let content_y = y + padding;
-            let content_width = (width - padding * 2.0).max(1.0);
+            let content_x = node_x + padding.left;
+            let content_y = y + padding.top;
+            let content_width = (width - padding.horizontal()).max(1.0);
             match node.kind {
                 DocumentNodeKind::Row => {
                     let mut cursor_x = content_x;
@@ -287,7 +300,7 @@ impl LayoutBuilder<'_, '_> {
                         max_child_height = max_child_height.max(child_rect.height);
                     }
                     if explicit_height.is_none() {
-                        height = (max_child_height + padding * 2.0).max(24.0);
+                        height = (max_child_height + padding.vertical()).max(24.0);
                     }
                 }
                 _ => {
@@ -300,10 +313,10 @@ impl LayoutBuilder<'_, '_> {
                         max_child_width = max_child_width.max(child_rect.width);
                     }
                     if explicit_width.is_none() {
-                        width = max_child_width.max(width).max(1.0) + padding * 2.0;
+                        width = max_child_width.max(width).max(1.0) + padding.horizontal();
                     }
                     if explicit_height.is_none() {
-                        height = (cursor_y - y - gap).max(24.0) + padding;
+                        height = (cursor_y - y - gap).max(24.0) + padding.bottom;
                     }
                 }
             }
@@ -316,7 +329,7 @@ impl LayoutBuilder<'_, '_> {
             height,
         };
         self.display_list[display_index].bounds = rect;
-        if node.source_binding.is_some() {
+        if node.source_binding.is_some() || style_bool(&node.style, "hover_scope") == Some(true) {
             self.hit_regions.push(HitRegion {
                 id: format!("hit:{}", node.id.0),
                 node: node.id.clone(),
@@ -334,6 +347,34 @@ impl LayoutBuilder<'_, '_> {
             self.demands.push(demand_from_materialized(&node, range));
         }
         rect
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeSpacing {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+impl EdgeSpacing {
+    fn horizontal(self) -> f32 {
+        self.left + self.right
+    }
+
+    fn vertical(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+fn style_edges(style: &BTreeMap<String, StyleValue>, prefix: &str) -> EdgeSpacing {
+    let all = style_spacing(style, prefix).unwrap_or(0.0);
+    EdgeSpacing {
+        top: style_spacing(style, &format!("{prefix}_top")).unwrap_or(all),
+        right: style_spacing(style, &format!("{prefix}_right")).unwrap_or(all),
+        bottom: style_spacing(style, &format!("{prefix}_bottom")).unwrap_or(all),
+        left: style_spacing(style, &format!("{prefix}_left")).unwrap_or(all),
     }
 }
 

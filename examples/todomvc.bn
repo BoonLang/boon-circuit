@@ -90,18 +90,18 @@ store: [
 ]
 
 FUNCTION new_todo(todo, store) {
-    sources: [
-        remove_todo_button: [press: SOURCE]
-        editing_todo_title_element: [
-            change: SOURCE
-            key_down: SOURCE
-            blur: SOURCE
-        ]
-        todo_title_element: [double_click: SOURCE]
-        todo_checkbox: [click: SOURCE]
-    ]
-
     [
+        sources: [
+            remove_todo_button: [press: SOURCE]
+            editing_todo_title_element: [
+                change: SOURCE
+                key_down: SOURCE
+                blur: SOURCE
+            ]
+            todo_title_element: [double_click: SOURCE]
+            todo_checkbox: [click: SOURCE]
+        ]
+
         title:
             todo.title |> HOLD title {
                 LATEST {
@@ -269,7 +269,7 @@ FUNCTION todo_new_entry() {
             gap: 0
             background: [color: Oklch[lightness:1]]
             border: [color: Oklch[lightness:0.92]]
-            focus_border: Oklch[lightness:0.72,chroma:0.07,hue:20]
+            focus_border: Oklch[lightness:0.84,chroma:0.02,hue:20]
             focus_border_width: 1
         ]
         items: LIST {
@@ -302,7 +302,7 @@ FUNCTION todo_new_entry() {
                     shadow1_y: -2
                     shadow1_blur: 1
                     shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.03]
-                    focus_border: Oklch[lightness:0.72,chroma:0.07,hue:20]
+                    focus_border: Oklch[lightness:0.84,chroma:0.02,hue:20]
                     focus_border_width: 1
                     placeholder_color: Oklch[lightness:0.92]
                     placeholder_style: Italic
@@ -330,7 +330,7 @@ FUNCTION todo_list() {
             width: Fill
             background: [color: Oklch[lightness:1]]
             scroll: True
-            scrollbars: True
+            scrollbars: False
         ]
         items:
             visible_todos
@@ -349,17 +349,21 @@ FUNCTION todo_row(todo) {
             padding: 9
             gap: 5
             background: [color: Oklch[lightness:1]]
-            border: [color: Oklch[lightness:0.93]]
+            border_bottom: Oklch[lightness:0.93]
+            border_bottom_width: 1
+            hover_scope: True
         ]
         items: LIST {
             Element/checkbox(
                 element: [event: [click: todo.sources.todo_checkbox.click]]
                 style: [
                     size: 40
-                    checkbox_border: Oklch[lightness:0.84]
+                    checkbox_border: Oklch[lightness:0.78]
                     checked_border: Oklch[lightness:0.64,chroma:0.060,hue:180]
                     check_color: Oklch[lightness:0.62,chroma:0.105,hue:178]
                     checkbox_background: Oklch[lightness:1]
+                    checkbox_border_width: 1.2
+                    check_width: 2.6
                 ]
                 label: Text/empty()
                 checked: todo.completed
@@ -445,7 +449,8 @@ FUNCTION todo_footer() {
             height: 41
             padding: 9
             background: [color: Oklch[lightness:1]]
-            border: [color: Oklch[lightness:0.93]]
+            border_top: Oklch[lightness:0.93]
+            border_top_width: 1
             shadow1_y: 1
             shadow1_blur: 1
             shadow1_color: Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]

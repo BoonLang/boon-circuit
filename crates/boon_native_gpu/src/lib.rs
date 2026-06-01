@@ -1,5 +1,6 @@
 use boon_document::{
-    DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap, StyleValue,
+    DisplayItem, DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap,
+    StyleValue,
 };
 use boon_host::SurfaceId;
 use glyphon::{
@@ -612,6 +613,12 @@ struct RichTextSpanPayload {
     font_weight: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct EditorTypeHintPayload {
+    anchor_column: usize,
+    compact_label: String,
+}
+
 #[derive(Clone, Debug)]
 struct TextRunLayoutMetrics {
     left: f32,
@@ -897,11 +904,7 @@ fn shape_text_run(font_system: &mut FontSystem, run: &TextRun) -> Buffer {
         &run.font_features,
     );
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.25));
-    buffer.set_size(
-        font_system,
-        Some((bounds.width + run.text_clip_padding).max(1.0)),
-        Some(bounds.height.max(font_size * 1.25)),
-    );
+    buffer.set_size(font_system, None, Some(bounds.height.max(font_size * 1.25)));
     if run.rich_spans.is_empty() {
         buffer.set_text(
             font_system,
@@ -998,74 +1001,152 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         width: width as f32,
         height: height as f32,
     };
-    frame
+    let mut runs = Vec::new();
+    for item in frame
         .display_list
         .iter()
         .filter(|item| rect_intersects(item.bounds, viewport))
-        .filter_map(|item| {
-            let size = style_number(&item.style, "size").unwrap_or(14.0);
-            let raw_text = item.text.as_deref().unwrap_or_default();
-            let checked = style_bool(&item.style, "checked") == Some(true);
-            let input_wants_caret_layout = matches!(item.kind, DocumentNodeKind::TextInput)
-                && (item.focused
-                    || style_bool(&item.style, "focus") == Some(true)
-                    || style_bool(&item.style, "caret_visible").is_some()
-                    || item.style.contains_key("caret_column"));
-            let (text, color) = if raw_text.trim().is_empty() {
-                if checked {
-                    (
-                        "✓".to_owned(),
-                        style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
-                    )
-                } else if let Some(placeholder) =
-                    style_text(&item.style, "placeholder").filter(|text| !text.trim().is_empty())
-                {
-                    (
-                        placeholder.to_owned(),
-                        style_color_u8(&item.style, "placeholder_color")
-                            .unwrap_or([154, 154, 154, 255]),
-                    )
-                } else if input_wants_caret_layout {
-                    (
-                        String::new(),
-                        style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
-                    )
-                } else {
-                    return None;
-                }
+    {
+        let size = style_number(&item.style, "size").unwrap_or(14.0);
+        let raw_text = item.text.as_deref().unwrap_or_default();
+        let checked = style_bool(&item.style, "checked") == Some(true);
+        let input_wants_caret_layout = matches!(item.kind, DocumentNodeKind::TextInput)
+            && (item.focused
+                || style_bool(&item.style, "focus") == Some(true)
+                || style_bool(&item.style, "caret_visible").is_some()
+                || item.style.contains_key("caret_column"));
+        let (text, color) = if raw_text.trim().is_empty() {
+            if checked {
+                (
+                    "✓".to_owned(),
+                    style_color_u8(&item.style, "check_color").unwrap_or([92, 194, 175, 255]),
+                )
+            } else if let Some(placeholder) =
+                style_text(&item.style, "placeholder").filter(|text| !text.trim().is_empty())
+            {
+                (
+                    placeholder.to_owned(),
+                    style_color_u8(&item.style, "placeholder_color")
+                        .unwrap_or([154, 154, 154, 255]),
+                )
+            } else if input_wants_caret_layout {
+                (
+                    String::new(),
+                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]),
+                )
             } else {
-                let color = if style_bool(&item.style, "color_if") == Some(true) {
-                    style_color_u8(&item.style, "if_color")
-                        .or_else(|| style_color_u8(&item.style, "color"))
-                        .unwrap_or([36, 44, 58, 255])
-                } else {
-                    style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255])
-                };
-                (raw_text.to_owned(), color)
-            };
-            let font_family = if checked {
-                "DejaVu Sans"
+                continue;
+            }
+        } else {
+            let color = if style_bool(&item.style, "color_if") == Some(true) {
+                style_color_u8(&item.style, "if_color")
+                    .or_else(|| style_color_u8(&item.style, "color"))
+                    .unwrap_or([36, 44, 58, 255])
             } else {
-                style_text(&item.style, "font").unwrap_or("JetBrains Mono")
+                style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255])
             };
-            let rich_spans = rich_text_spans(&item.style, &text, color);
+            (raw_text.to_owned(), color)
+        };
+        let font_family = if checked {
+            "DejaVu Sans"
+        } else {
+            style_text(&item.style, "font").unwrap_or("JetBrains Mono")
+        };
+        let rich_spans = rich_text_spans(&item.style, &text, color);
+        runs.push(TextRun {
+            node: item.node.clone(),
+            bounds: item.bounds,
+            text,
+            rich_spans,
+            font_family: font_family.to_owned(),
+            font_style: text_font_style(&item.style),
+            font_weight: text_font_weight(&item.style),
+            font_features: style_text(&item.style, "font_features")
+                .unwrap_or("")
+                .to_owned(),
+            text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
+            text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
+            color,
+            size,
+            align: text_align(&item.kind, &item.style),
+            vertical_align: text_vertical_align(&item.kind, &item.style),
+        });
+        runs.extend(editor_type_hint_runs(item, width, height));
+    }
+    runs
+}
+
+fn editor_type_hint_runs(item: &DisplayItem, _width: u32, _height: u32) -> Vec<TextRun> {
+    if !matches!(item.kind, DocumentNodeKind::Text) {
+        return Vec::new();
+    }
+    let Some(hints_json) = style_text(&item.style, "editor_type_hints_json") else {
+        return Vec::new();
+    };
+    let Ok(hints) = serde_json::from_str::<Vec<EditorTypeHintPayload>>(hints_json) else {
+        return Vec::new();
+    };
+    if hints.is_empty() {
+        return Vec::new();
+    }
+    let source_text = item.text.as_deref().unwrap_or_default();
+    let column_edges =
+        editor_text_column_edges_for_style(source_text, &item.style, item.bounds.height);
+    let inset = style_number(&item.style, "text_inset").unwrap_or(0.0);
+    let font_size = (style_number(&item.style, "size").unwrap_or(14.0) - 1.0).max(10.0);
+    let font_family = style_text(&item.style, "font").unwrap_or("JetBrains Mono");
+    let font_features = style_text(&item.style, "font_features")
+        .unwrap_or("")
+        .to_owned();
+    let color =
+        style_color_u8(&item.style, "editor_type_hint_color").unwrap_or([138, 160, 184, 255]);
+    let source_len = source_text.chars().count();
+    hints
+        .into_iter()
+        .take(1)
+        .enumerate()
+        .filter_map(|(index, hint)| {
+            if hint.compact_label.trim().is_empty() {
+                return None;
+            }
+            let column = hint
+                .anchor_column
+                .saturating_sub(1)
+                .max(source_len)
+                .min(source_len);
+            let x = item.bounds.x
+                + inset
+                + column_edges
+                    .get(column)
+                    .copied()
+                    .or_else(|| column_edges.last().copied())
+                    .unwrap_or_default()
+                + 12.0;
+            let available_width = item.bounds.x + item.bounds.width - x;
+            if available_width < font_size * 2.0 {
+                return None;
+            }
+            let text = format!(": {}", hint.compact_label);
             Some(TextRun {
-                node: item.node.clone(),
-                bounds: item.bounds,
+                node: DocumentNodeId(format!("{}:type-hint:{index}", item.node.0)),
+                bounds: Rect {
+                    x,
+                    y: item.bounds.y,
+                    width: available_width,
+                    height: item.bounds.height,
+                },
                 text,
-                rich_spans,
+                rich_spans: Vec::new(),
                 font_family: font_family.to_owned(),
-                font_style: text_font_style(&item.style),
-                font_weight: text_font_weight(&item.style),
-                font_features: style_text(&item.style, "font_features")
-                    .unwrap_or("")
-                    .to_owned(),
-                text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
-                text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
+                font_style: Style::Italic,
+                font_weight: Weight::NORMAL,
+                font_features: font_features.clone(),
+                text_inset: 0.0,
+                text_clip_padding: 0.0,
                 color,
-                size,
-                align: text_align(&item.kind, &item.style),
-                vertical_align: text_vertical_align(&item.kind, &item.style),
+                size: font_size,
+                align: TextAlign::Left,
+                vertical_align: TextVerticalAlign::Center,
             })
         })
         .collect()
@@ -2236,6 +2317,161 @@ mod tests {
         assert_eq!(run.vertical_align, TextVerticalAlign::Top);
         assert_eq!(text_left_for_width(run, 30.0), 14.0);
         assert_eq!(text_top_for_height(run), 21.0);
+    }
+
+    #[test]
+    fn editor_type_hints_render_as_virtual_text_without_changing_source_run() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(14.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert(
+            "font".to_owned(),
+            StyleValue::Text("JetBrains Mono".to_owned()),
+        );
+        style.insert(
+            "font_features".to_owned(),
+            StyleValue::Text("zero,calt".to_owned()),
+        );
+        style.insert(
+            "syntax_spans_json".to_owned(),
+            StyleValue::Text(
+                r##"[{"text":"count","source_text":"count","color":"#eeeeee"}]"##.to_owned(),
+            ),
+        );
+        style.insert(
+            "editor_type_hints_json".to_owned(),
+            StyleValue::Text(
+                r#"[{"anchor_column":6,"compact_label":"Number","line":1,"start":0,"end":5,"category":"definition","detail_label":"Number"}]"#
+                    .to_owned(),
+            ),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("dev-code-editor-line-text-1".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 260.0,
+                    height: 22.0,
+                },
+                text: Some("count".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 320, 120);
+        assert!(runs.iter().any(|run| run.text == "count"));
+        assert!(runs.iter().any(|run| run.text == ": Number"));
+        let source_run = runs
+            .iter()
+            .find(|run| run.text == "count")
+            .expect("source run should remain source-exact");
+        assert_eq!(source_run.node.0, "dev-code-editor-line-text-1");
+    }
+
+    #[test]
+    fn editor_type_hints_do_not_render_sliced_runs_outside_source_bounds() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(14.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert(
+            "font".to_owned(),
+            StyleValue::Text("JetBrains Mono".to_owned()),
+        );
+        style.insert(
+            "font_features".to_owned(),
+            StyleValue::Text("zero,calt".to_owned()),
+        );
+        style.insert(
+            "editor_type_hints_json".to_owned(),
+            StyleValue::Text(
+                r#"[{"anchor_column":27,"compact_label":"Number","line":1,"start":0,"end":26,"category":"definition","detail_label":"Number"}]"#
+                    .to_owned(),
+            ),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("dev-code-editor-line-text-1".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 42.0,
+                    height: 22.0,
+                },
+                text: Some("abcdefghijklmnopqrstuvwxyz".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 320, 120);
+
+        assert!(
+            runs.iter()
+                .any(|run| run.text == "abcdefghijklmnopqrstuvwxyz")
+        );
+        assert!(
+            !runs.iter().any(|run| run.text == ": Number"),
+            "off-row virtual type hints should be skipped instead of rendered as clipped slices"
+        );
+    }
+
+    #[test]
+    fn text_runs_shape_as_single_unwrapped_lines_when_bounds_are_narrow() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(14.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert(
+            "font".to_owned(),
+            StyleValue::Text("JetBrains Mono".to_owned()),
+        );
+        style.insert(
+            "font_features".to_owned(),
+            StyleValue::Text("zero,calt".to_owned()),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("dev-code-editor-line-text-1".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 22.0,
+                },
+                text: Some("active_count == 0 |> Bool/and(completed_count > 0)".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let runs = text_runs(&frame, 640, 160);
+        let run = runs.first().expect("text run should render");
+        let mut font_system = editor_font_system();
+        let buffer = shape_text_run(&mut font_system, run);
+        let line_count = buffer.layout_runs().count();
+        let line_width = shaped_line_width(&buffer).expect("text should shape");
+
+        assert_eq!(line_count, 1);
+        assert!(
+            line_width > run.bounds.width,
+            "logical text width should exceed visible clip bounds instead of wrapping"
+        );
     }
 
     #[test]

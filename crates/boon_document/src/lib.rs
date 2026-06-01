@@ -280,8 +280,9 @@ impl LayoutBuilder<'_, '_> {
                     let mut cursor_x = content_x;
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
+                        let child_available_width = (content_x + content_width - cursor_x).max(1.0);
                         let child_rect =
-                            self.layout_node(child, cursor_x, content_y, content_width);
+                            self.layout_node(child, cursor_x, content_y, child_available_width);
                         cursor_x += child_rect.width + gap;
                         max_child_height = max_child_height.max(child_rect.height);
                     }
@@ -433,5 +434,80 @@ fn demand_from_materialized(node: &DocumentNode, materialized: &MaterializedRang
         axis: materialized.axis,
         visible: materialized.visible.clone(),
         overscan: materialized.overscan.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_fill_uses_remaining_width_after_fixed_siblings() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut row = DocumentNode::new("row", DocumentNodeKind::Row);
+        row.parent = Some(frame.root.clone());
+        row.style
+            .insert("width".to_owned(), StyleValue::Number(300.0));
+        row.style
+            .insert("height".to_owned(), StyleValue::Number(40.0));
+        row.style.insert("gap".to_owned(), StyleValue::Number(8.0));
+        row.children.push(DocumentNodeId("fixed".to_owned()));
+        row.children.push(DocumentNodeId("fill".to_owned()));
+
+        let mut fixed = DocumentNode::new("fixed", DocumentNodeKind::Text);
+        fixed.parent = Some(row.id.clone());
+        fixed
+            .style
+            .insert("width".to_owned(), StyleValue::Number(50.0));
+        fixed
+            .style
+            .insert("height".to_owned(), StyleValue::Number(20.0));
+
+        let mut fill = DocumentNode::new("fill", DocumentNodeKind::Text);
+        fill.parent = Some(row.id.clone());
+        fill.style
+            .insert("width".to_owned(), StyleValue::Text("fill".to_owned()));
+        fill.style
+            .insert("height".to_owned(), StyleValue::Number(20.0));
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(row.id.clone());
+        frame.nodes.insert(row.id.clone(), row);
+        frame.nodes.insert(fixed.id.clone(), fixed);
+        frame.nodes.insert(fill.id.clone(), fill);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let fixed = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "fixed")
+            .expect("fixed child should be laid out");
+        let fill = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "fill")
+            .expect("fill child should be laid out");
+
+        assert_eq!(fixed.bounds.width, 50.0);
+        assert_eq!(fill.bounds.x, 58.0);
+        assert_eq!(fill.bounds.width, 242.0);
+        assert!(fill.bounds.x + fill.bounds.width <= 300.0);
     }
 }

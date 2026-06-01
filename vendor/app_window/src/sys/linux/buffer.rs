@@ -55,9 +55,8 @@ impl AllocatedBuffer {
         }
 
         let mut mmap = unsafe { MmapMut::map_mut(&file) }.unwrap();
-        const DEFAULT_COLOR: [u8; 4] = [0, 0, 0xFF, 0xFF];
         for pixel in mmap.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&DEFAULT_COLOR); //I guess due to endiannness we are actually BGRA?
+            pixel.copy_from_slice(&default_surface_pixel_argb8888_le());
         }
 
         let pool = shm.create_pool(file.as_fd(), width * height * 4, queue_handle, ());
@@ -95,6 +94,18 @@ impl AllocatedBuffer {
             .allocated_buffer = Some(allocated_buffer.clone());
         allocated_buffer
     }
+}
+
+fn default_surface_pixel_argb8888_le() -> [u8; 4] {
+    // wl_shm::Format::Argb8888 is stored as native-endian ARGB; on the
+    // little-endian Linux targets we use, the byte order in memory is BGRA.
+    const APP_NEUTRAL_DARK_RGB: [u8; 3] = [0x0b, 0x0f, 0x14];
+    [
+        APP_NEUTRAL_DARK_RGB[2],
+        APP_NEUTRAL_DARK_RGB[1],
+        APP_NEUTRAL_DARK_RGB[0],
+        0xff,
+    ]
 }
 
 pub(super) fn create_shm_buffer_decor(
@@ -174,4 +185,22 @@ pub(super) fn create_shm_buffer_decor(
         .unwrap()
         .allocated_buffer = Some(allocated_buffer.clone());
     allocated_buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_surface_placeholder_is_neutral_dark_not_red() {
+        assert_eq!(
+            default_surface_pixel_argb8888_le(),
+            [0x14, 0x0f, 0x0b, 0xff]
+        );
+        assert_ne!(
+            default_surface_pixel_argb8888_le(),
+            [0x00, 0x00, 0xff, 0xff],
+            "ARGB8888 little-endian [0, 0, 255, 255] displays as a red resize flash"
+        );
+    }
 }

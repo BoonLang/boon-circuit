@@ -4,6 +4,22 @@ use crate::coordinates::Size;
 use crate::sys;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WindowHandle};
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SurfaceContentReport {
+    pub external_surface_created: bool,
+    pub shm_content_attach_count: u64,
+    pub shm_content_attach_after_external_surface_count: u64,
+    pub external_surface_configure_skip_count: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceCursorIcon {
+    Default,
+    ColumnResize,
+}
+
 /// A type that can be drawn on, e.g. by wgpu.
 ///
 /// A `Surface` represents a drawable area within a window. It provides the necessary
@@ -276,6 +292,16 @@ impl Surface {
     /// - **Windows/Linux**: Typically called at the end of a resize operation
     pub fn size_update<F: Fn(Size) + Send + 'static>(&mut self, update: F) {
         self.sys.size_update(update)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn content_report(&self) -> SurfaceContentReport {
+        self.sys.content_report()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_cursor_icon(&self, icon: SurfaceCursorIcon) {
+        self.sys.set_cursor_icon(icon)
     }
 }
 

@@ -399,6 +399,7 @@ pub struct NativePollResult {
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub next_wake_after_ms: Option<u64>,
     pub wants_animation_frame: bool,
+    pub cursor_icon: NativeCursorIcon,
 }
 
 impl NativePollResult {
@@ -410,8 +411,16 @@ impl NativePollResult {
             role_dirty_reason: None,
             next_wake_after_ms: None,
             wants_animation_frame: false,
+            cursor_icon: NativeCursorIcon::Default,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCursorIcon {
+    Default,
+    ColumnResize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -585,6 +594,8 @@ pub struct AppWindowSurfaceProof {
     pub render_loop_mode: NativeRenderLoopMode,
     pub render_loop_state_at_ready: NativeRenderLoopState,
     pub surface_lifecycle: NativeSurfaceLifecycleReport,
+    pub resize_wake_count: u64,
+    pub app_window_surface_content_report: Option<serde_json::Value>,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
     pub post_input_frame_timing: Option<NativeFrameTimingProof>,
@@ -914,7 +925,16 @@ async fn run_surface_probe_inner(
         options.title.clone(),
     )
     .await;
-    let app_surface = window.surface().await;
+    let mut app_surface = window.surface().await;
+    let resize_wake_count = Arc::new(AtomicU64::new(0));
+    {
+        let resize_wake_count = Arc::clone(&resize_wake_count);
+        let resize_wake_handle = wake_handle.clone();
+        app_surface.size_update(move |_| {
+            resize_wake_count.fetch_add(1, Ordering::Relaxed);
+            resize_wake_handle.wake();
+        });
+    }
     let (size, scale) = app_surface.size_scale().await;
     let raw_display_handle = app_surface.raw_display_handle();
     let raw_window_handle = app_surface.raw_window_handle();
@@ -1032,6 +1052,7 @@ async fn run_surface_probe_inner(
                 forced_frame: true,
             },
         )? {
+            apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
             if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                 render_loop_state
                     .schedule_wake_after(Instant::now(), Duration::from_millis(next_wake_after_ms));
@@ -1097,6 +1118,10 @@ async fn run_surface_probe_inner(
                             Duration::ZERO,
                             wake_handle.generation(),
                             None,
+                            render_loop_report_extras(
+                                resize_wake_count.load(Ordering::Relaxed),
+                                &app_surface,
+                            ),
                             Some(&error),
                         );
                     }
@@ -1159,6 +1184,7 @@ async fn run_surface_probe_inner(
                 Duration::ZERO,
                 wake_handle.generation(),
                 None,
+                render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
                 None,
             )?;
         }
@@ -1239,6 +1265,7 @@ async fn run_surface_probe_inner(
                     forced_frame: true,
                 },
             )? {
+                apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
                 if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                     render_loop_state.schedule_wake_after(
                         Instant::now(),
@@ -1306,6 +1333,10 @@ async fn run_surface_probe_inner(
                             Duration::ZERO,
                             wake_handle.generation(),
                             None,
+                            render_loop_report_extras(
+                                resize_wake_count.load(Ordering::Relaxed),
+                                &app_surface,
+                            ),
                             Some(&error),
                         );
                     }
@@ -1413,6 +1444,8 @@ async fn run_surface_probe_inner(
         render_loop_mode: loop_mode,
         render_loop_state_at_ready: render_loop_state.clone(),
         surface_lifecycle: surface_lifecycle.report().clone(),
+        resize_wake_count: resize_wake_count.load(Ordering::Relaxed),
+        app_window_surface_content_report: app_window_surface_content_report(&app_surface),
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
         post_input_frame_timing,
@@ -1473,6 +1506,7 @@ async fn run_surface_probe_inner(
             },
         )?;
         if let Some(poll_result) = poll_result {
+            apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
             if let Some(next_wake_after_ms) = poll_result.next_wake_after_ms {
                 render_loop_state.schedule_wake_after(
                     poll_started_at,
@@ -1561,6 +1595,10 @@ async fn run_surface_probe_inner(
                             hold_started.elapsed(),
                             wake_handle.generation(),
                             last_interactive_readback_artifact.as_ref(),
+                            render_loop_report_extras(
+                                resize_wake_count.load(Ordering::Relaxed),
+                                &app_surface,
+                            ),
                             Some(&error),
                         );
                     }
@@ -1629,6 +1667,7 @@ async fn run_surface_probe_inner(
                 hold_started.elapsed(),
                 wake_handle.generation(),
                 last_interactive_readback_artifact.as_ref(),
+                render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
                 None,
             )?;
         }
@@ -1650,6 +1689,10 @@ async fn run_surface_probe_inner(
                     hold_started.elapsed(),
                     wake_handle.generation(),
                     last_interactive_readback_artifact.as_ref(),
+                    render_loop_report_extras(
+                        resize_wake_count.load(Ordering::Relaxed),
+                        &app_surface,
+                    ),
                     None,
                 )?;
             }
@@ -1672,6 +1715,7 @@ async fn run_surface_probe_inner(
             hold_started.elapsed(),
             wake_handle.generation(),
             last_interactive_readback_artifact.as_ref(),
+            render_loop_report_extras(resize_wake_count.load(Ordering::Relaxed), &app_surface),
             None,
         )?;
     }
@@ -1779,6 +1823,61 @@ fn acquire_surface_texture_for_present(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct NativeRenderLoopReportExtras {
+    resize_wake_count: u64,
+    app_window_surface_content_report: Option<serde_json::Value>,
+}
+
+fn render_loop_report_extras(
+    resize_wake_count: u64,
+    app_surface: &app_window::surface::Surface,
+) -> NativeRenderLoopReportExtras {
+    NativeRenderLoopReportExtras {
+        resize_wake_count,
+        app_window_surface_content_report: app_window_surface_content_report(app_surface),
+    }
+}
+
+fn app_window_surface_content_report(
+    surface: &app_window::surface::Surface,
+) -> Option<serde_json::Value> {
+    #[cfg(target_os = "linux")]
+    {
+        let report = surface.content_report();
+        Some(serde_json::json!({
+            "external_surface_created": report.external_surface_created,
+            "shm_content_attach_count": report.shm_content_attach_count,
+            "shm_content_attach_after_external_surface_count": report
+                .shm_content_attach_after_external_surface_count,
+            "external_surface_configure_skip_count": report.external_surface_configure_skip_count
+        }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = surface;
+        None
+    }
+}
+
+fn apply_native_cursor_icon(surface: &app_window::surface::Surface, icon: NativeCursorIcon) {
+    #[cfg(target_os = "linux")]
+    {
+        let surface_icon = match icon {
+            NativeCursorIcon::Default => app_window::surface::SurfaceCursorIcon::Default,
+            NativeCursorIcon::ColumnResize => app_window::surface::SurfaceCursorIcon::ColumnResize,
+        };
+        surface.set_cursor_icon(surface_icon);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = surface;
+        let _ = icon;
+    }
+}
+
 fn write_render_loop_state_report(
     path: &Path,
     role: NativeWindowRole,
@@ -1790,6 +1889,7 @@ fn write_render_loop_state_report(
     elapsed: Duration,
     wake_generation: u64,
     last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    extras: NativeRenderLoopReportExtras,
     loop_error: Option<&str>,
 ) -> Result<(), NativeWindowError> {
     if let Some(parent) = path.parent() {
@@ -1821,6 +1921,8 @@ fn write_render_loop_state_report(
         "input_poll_count": state.input_poll_count,
         "forced_frame_count": state.forced_frame_count,
         "scheduled_wake_count": state.scheduled_wake_count,
+        "resize_wake_count": extras.resize_wake_count,
+        "app_window_surface_content_report": extras.app_window_surface_content_report,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
         "current_scheduler_reason": state.current_scheduler_reason,
@@ -2471,6 +2573,7 @@ mod tests {
                 scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
                 role_dirty_reason: Some(NativeRoleDirtyReason::SourcePayloadAccepted),
                 next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
             },
             false,
@@ -2483,6 +2586,7 @@ mod tests {
                 scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
                 role_dirty_reason: None,
                 next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
             },
             false,
@@ -2554,6 +2658,7 @@ mod tests {
             scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
             role_dirty_reason: Some(NativeRoleDirtyReason::DocumentPatchApplied),
             next_wake_after_ms: None,
+            cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
         };
 
@@ -2584,6 +2689,7 @@ mod tests {
                 scheduler_reason: Some(NativeSchedulerReason::HostInput),
                 role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
                 next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
             },
             true,
@@ -2606,6 +2712,7 @@ mod tests {
             scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
             role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
             next_wake_after_ms: None,
+            cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
         };
 
@@ -2724,6 +2831,7 @@ mod tests {
                 scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
                 role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
                 next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
             },
             false,
@@ -2738,6 +2846,7 @@ mod tests {
                 scheduler_reason: Some(NativeSchedulerReason::HostInput),
                 role_dirty_reason: None,
                 next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
             },
             true,

@@ -208,6 +208,47 @@ impl Surface {
         self.window_internal.lock().unwrap().size_update_notify =
             Some(window::DebugWrapper(Box::new(update)));
     }
+
+    pub fn content_report(&self) -> crate::surface::SurfaceContentReport {
+        self.window_internal.lock().unwrap().content_report()
+    }
+
+    pub fn set_cursor_icon(&self, icon: crate::surface::SurfaceCursorIcon) {
+        let request = match icon {
+            crate::surface::SurfaceCursorIcon::Default => None,
+            crate::surface::SurfaceCursorIcon::ColumnResize => {
+                Some(cursor::CursorRequest::column_resize())
+            }
+        };
+        let (cursor_request, pointer, serial, pointer_over_client, app_state) = {
+            let mut window_internal = self.window_internal.lock().unwrap();
+            window_internal.client_cursor_request = request;
+            (
+                window_internal.client_cursor_request(),
+                window_internal.wl_pointer.clone(),
+                window_internal.wl_pointer_enter_serial,
+                window_internal.wl_pointer_enter_surface == window_internal.wl_surface,
+                window_internal.app_state.upgrade(),
+            )
+        };
+        let (Some(pointer), Some(serial), true, Some(app_state)) =
+            (pointer, serial, pointer_over_client, app_state)
+        else {
+            return;
+        };
+        let lock = app_state.active_cursor.lock().unwrap();
+        let active_cursor = lock.as_ref().expect("No active cursor");
+        let active_request = active_cursor.active_request.lock().unwrap();
+        if *active_request != cursor_request {
+            pointer.set_cursor(
+                serial,
+                Some(&active_cursor.cursor_surface),
+                cursor_request.hot_x,
+                cursor_request.hot_y,
+            );
+            active_cursor.cursor_request(cursor_request);
+        }
+    }
 }
 
 impl Drop for Surface {

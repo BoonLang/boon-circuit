@@ -9,14 +9,15 @@ use wayland_client::{Connection, QueueHandle};
 use wayland_cursor::CursorTheme;
 
 use super::main_thread::on_main_thread;
-use super::{App, AppState, SurfaceEvents, BUTTON_WIDTH, TITLEBAR_HEIGHT};
+use super::{App, AppState, BUTTON_WIDTH, SurfaceEvents, TITLEBAR_HEIGHT};
 use crate::coordinates::{Position, Size};
 
 const CURSOR_SIZE: i32 = 16;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CursorRequest {
     pub name: &'static str,
+    pub fallback_names: &'static [&'static str],
     pub hot_x: i32,
     pub hot_y: i32,
 }
@@ -25,6 +26,7 @@ impl CursorRequest {
     pub fn right_side() -> Self {
         CursorRequest {
             name: "right_side",
+            fallback_names: &["left_ptr"],
             hot_x: CURSOR_SIZE / 2,
             hot_y: 0,
         }
@@ -32,6 +34,7 @@ impl CursorRequest {
     pub fn bottom_side() -> Self {
         CursorRequest {
             name: "bottom_side",
+            fallback_names: &["left_ptr"],
             hot_x: 0,
             hot_y: CURSOR_SIZE / 2,
         }
@@ -39,16 +42,37 @@ impl CursorRequest {
     pub fn left_ptr() -> Self {
         CursorRequest {
             name: "left_ptr",
+            fallback_names: &[],
             hot_x: CURSOR_SIZE / 8,
             hot_y: CURSOR_SIZE / 8,
+        }
+    }
+    pub fn column_resize() -> Self {
+        CursorRequest {
+            name: "sb_h_double_arrow",
+            fallback_names: &[
+                "h_double_arrow",
+                "col-resize",
+                "ew-resize",
+                "left_side",
+                "right_side",
+                "left_ptr",
+            ],
+            hot_x: CURSOR_SIZE / 2,
+            hot_y: CURSOR_SIZE / 2,
         }
     }
     pub fn bottom_right_corner() -> Self {
         CursorRequest {
             name: "bottom_right_corner",
+            fallback_names: &["left_ptr"],
             hot_x: CURSOR_SIZE / 2,
             hot_y: CURSOR_SIZE / 2,
         }
+    }
+
+    fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.name).chain(self.fallback_names.iter().copied())
     }
 }
 
@@ -68,8 +92,9 @@ impl ActiveCursor {
     ) -> Self {
         let mut cursor_theme =
             CursorTheme::load(connection, shm, CURSOR_SIZE as u32).expect("Can't load cursors");
-        cursor_theme
-            .set_fallback(|_, _| Some(include_bytes!("../../../linux_assets/left_ptr").into()));
+        cursor_theme.set_fallback(|name, _| {
+            (name == "left_ptr").then(|| include_bytes!("../../../linux_assets/left_ptr").into())
+        });
         let cursor = cursor_theme
             .get_cursor("left_ptr")
             .expect("Can't get cursor");
@@ -88,56 +113,62 @@ impl ActiveCursor {
         let move_active_request = active_request.clone();
         std::thread::Builder::new()
             .name("Cursor thread".to_string())
-            .spawn(move || loop {
-                let move_cursor_theme = move_cursor_theme.clone();
-                let move_cursor_surface = move_cursor_surface.clone();
-                let mt_active_request = move_active_request.clone();
-                let (sender, receiver) = std::sync::mpsc::channel();
+            .spawn(move || {
+                loop {
+                    let move_cursor_theme = move_cursor_theme.clone();
+                    let move_cursor_surface = move_cursor_surface.clone();
+                    let mt_active_request = move_active_request.clone();
+                    let (sender, receiver) = std::sync::mpsc::channel();
 
-                on_main_thread(move || {
-                    let mut binding = move_cursor_theme.lock().unwrap();
-                    let cursor = binding
-                        .get_cursor(mt_active_request.lock().unwrap().name)
-                        .expect("Can't get cursor");
-                    let present_time = start_time.elapsed();
-                    let frame_info = cursor.frame_and_duration(present_time.as_millis() as u32);
-                    let buffer = &cursor[frame_info.frame_index];
-                    move_cursor_surface.attach(Some(buffer), 0, 0);
-                    move_cursor_surface.damage_buffer(
-                        0,
-                        0,
-                        buffer.dimensions().0 as i32,
-                        buffer.dimensions().1 as i32,
-                    );
-                    move_cursor_surface.commit();
-                    let next_present_time = (cursor.image_count() > 1).then(|| {
-                        present_time
-                            + Duration::from_millis(frame_info.frame_duration.max(16) as u64)
+                    on_main_thread(move || {
+                        let mut binding = move_cursor_theme.lock().unwrap();
+                        let request = mt_active_request.lock().unwrap().clone();
+                        let cursor_name = request
+                            .names()
+                            .find(|name| binding.get_cursor(name).is_some())
+                            .expect("Can't get cursor");
+                        let cursor = binding.get_cursor(cursor_name).expect("Can't get cursor");
+                        let present_time = start_time.elapsed();
+                        let frame_info = cursor.frame_and_duration(present_time.as_millis() as u32);
+                        let buffer = &cursor[frame_info.frame_index];
+                        move_cursor_surface.attach(Some(buffer), 0, 0);
+                        move_cursor_surface.damage_buffer(
+                            0,
+                            0,
+                            buffer.dimensions().0 as i32,
+                            buffer.dimensions().1 as i32,
+                        );
+                        move_cursor_surface.commit();
+                        let next_present_time = (cursor.image_count() > 1).then(|| {
+                            present_time
+                                + Duration::from_millis(frame_info.frame_duration.max(16) as u64)
+                        });
+                        sender
+                            .send(next_present_time)
+                            .expect("Can't send next present time");
                     });
-                    sender
-                        .send(next_present_time)
-                        .expect("Can't send next present time");
-                });
-                let next_present_time = receiver.recv().expect("Can't receive next present time");
-                let request = match next_present_time {
-                    Some(next_present_time) => {
-                        let sleep_time = next_present_time.saturating_sub(start_time.elapsed());
-                        match cursor_request_receiver.recv_timeout(sleep_time) {
-                            Ok(request) => Some(request),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                panic!("Cursor request channel disconnected");
+                    let next_present_time =
+                        receiver.recv().expect("Can't receive next present time");
+                    let request = match next_present_time {
+                        Some(next_present_time) => {
+                            let sleep_time = next_present_time.saturating_sub(start_time.elapsed());
+                            match cursor_request_receiver.recv_timeout(sleep_time) {
+                                Ok(request) => Some(request),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    panic!("Cursor request channel disconnected");
+                                }
                             }
                         }
+                        None => Some(
+                            cursor_request_receiver
+                                .recv()
+                                .expect("Cursor request channel disconnected"),
+                        ),
+                    };
+                    if let Some(request) = request {
+                        *move_active_request.lock().unwrap() = request;
                     }
-                    None => Some(
-                        cursor_request_receiver
-                            .recv()
-                            .expect("Cursor request channel disconnected"),
-                    ),
-                };
-                if let Some(request) = request {
-                    *move_active_request.lock().unwrap() = request;
                 }
             })
             .expect("Can't launch cursor thread");

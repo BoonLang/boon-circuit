@@ -26,9 +26,9 @@ store: [
         }
 
     title_to_add:
-        sources.new_todo_input.key_down |> WHEN {
-            [key: Enter, text: text] =>
-                text |> Text/trim() |> WHEN {
+        sources.new_todo_input.key_down.key |> WHEN {
+            Enter =>
+                new_todo_text |> Text/trim() |> WHEN {
                     TEXT {} => SKIP
                     title => title
                 }
@@ -105,9 +105,9 @@ FUNCTION new_todo(todo, store) {
         title:
             todo.title |> HOLD title {
                 LATEST {
-                    sources.editing_todo_title_element.key_down |> WHEN {
-                        [key: Enter, text: text] =>
-                            text |> Text/trim() |> WHEN {
+                    sources.editing_todo_title_element.key_down.key |> WHEN {
+                        Enter =>
+                            edit_text |> Text/trim() |> WHEN {
                                 TEXT {} => title
                                 trimmed => trimmed
                             }

@@ -8,6 +8,7 @@ use boon_parser::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,9 +56,26 @@ const DEV_PASS: &str = "#2a9d8f";
 const DEV_WARN: &str = "#f4a261";
 const DEV_FAIL: &str = "#e63946";
 const DEV_DIRTY: &str = "#fcbf49";
+const DEV_ROOT_PADDING: u32 = 10;
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
+const DEV_FOOTER_SCROLL_PADDING: u32 = 6;
+const DEV_FOOTER_ROW_GAP: u32 = 3;
+const DEV_MAIN_GAP: u32 = 4;
+const DEV_EDITOR_MIN_WIDTH: u32 = 360;
+const DEV_TYPE_INSPECTOR_DEFAULT_WIDTH: u32 = 400;
+const DEV_TYPE_INSPECTOR_MIN_WIDTH: u32 = 280;
+const DEV_TYPE_INSPECTOR_MAX_WIDTH: u32 = 720;
+const DEV_TYPE_INSPECTOR_RESIZE_HANDLE_WIDTH: u32 = 10;
+const DEV_TYPE_INSPECTOR_LINE_HEIGHT: u32 = 20;
+const DEV_TYPE_INSPECTOR_DETAIL_PADDING: u32 = 2;
+const DEV_TYPE_INSPECTOR_ROW_GAP: u32 = 2;
+const DEV_TYPE_INSPECTOR_WRAP_CHARS: usize = 240;
+const DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH: usize = 5;
+const DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS: usize = 16;
+const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 4;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
+const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 
 fn main() {
@@ -629,6 +647,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason,
                 next_wake_after_ms: input_state.focused_node.is_some().then_some(500),
                 wants_animation_frame: false,
+                cursor_icon: boon_native_app_window::NativeCursorIcon::Default,
             })
         });
         let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
@@ -857,6 +876,16 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         role_dirty_reason = Some(
                             boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
                         );
+                    } else if before_input.secondary_visual_only(&after_input)
+                        && patch_dev_render_secondary_content(&shell, &mut render_state)
+                    {
+                        render_state.revision = render_state.revision.saturating_add(1);
+                        render_state.fast_frame_patch_count =
+                            render_state.fast_frame_patch_count.saturating_add(1);
+                        layout_refreshed = true;
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                        );
                     } else {
                         needs_layout_refresh = true;
                         role_dirty_reason = Some(
@@ -926,6 +955,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason,
                 next_wake_after_ms,
                 wants_animation_frame: false,
+                cursor_icon: shell.current_cursor_icon(),
             })
         });
         let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
@@ -1856,6 +1886,40 @@ fn preview_runtime_summary_response(
     })
 }
 
+fn preview_fresh_runtime_summary_for_state(
+    state: &Arc<Mutex<PreviewIpcState>>,
+) -> Result<(serde_json::Value, Arc<Mutex<PreviewSharedRenderState>>), Box<dyn std::error::Error>> {
+    let (source_path, source_sha256, fallback_summary, live_runtime, shared_render_state) = {
+        let state = state
+            .lock()
+            .map_err(|_| "preview IPC state mutex poisoned")?;
+        (
+            state.source_path.clone(),
+            state.source_sha256.clone(),
+            state.runtime_summary.clone(),
+            state.live_runtime.clone(),
+            state.shared_render_state.clone(),
+        )
+    };
+    let Some(live_runtime) = live_runtime else {
+        return Ok((fallback_summary, shared_render_state));
+    };
+    let state_summary = {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "preview live runtime mutex poisoned")?;
+        runtime.state_summary()
+    };
+    let runtime_summary =
+        preview_runtime_summary_from_state_summary(&source_path, &source_sha256, state_summary);
+    if let Ok(mut state) = state.lock()
+        && state.source_sha256 == source_sha256
+    {
+        state.runtime_summary = runtime_summary.clone();
+    }
+    Ok((runtime_summary, shared_render_state))
+}
+
 #[derive(Clone, Debug)]
 struct ReportPresentSurface {
     id: boon_host::SurfaceId,
@@ -2294,6 +2358,7 @@ fn dev_code_editor_visible_style_report(
     let mut rich_text_line_count = 0_u64;
     let mut syntax_span_line_count = 0_u64;
     let mut non_empty_syntax_span_line_count = 0_u64;
+    let mut type_hint_line_count = 0_u64;
     let mut font_family_line_count = 0_u64;
     let mut font_feature_line_count = 0_u64;
     let mut missing_samples = Vec::new();
@@ -2318,6 +2383,15 @@ fn dev_code_editor_visible_style_report(
             });
         let has_syntax_spans = syntax_spans.is_some();
         let has_non_empty_syntax_spans = syntax_spans.is_some_and(|text| text != "[]");
+        let type_hints = item
+            .style
+            .get("editor_type_hints_json")
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Text(text) => Some(text.as_str()),
+                _ => None,
+            });
+        let has_type_hints = type_hints.is_some();
+        let has_non_empty_type_hints = type_hints.is_some_and(|text| text != "[]");
         let has_font_family = item.style.get("font").is_some();
         let has_font_features = item.style.get("font_features").is_some();
 
@@ -2329,6 +2403,9 @@ fn dev_code_editor_visible_style_report(
         }
         if non_empty_text && has_non_empty_syntax_spans {
             non_empty_syntax_span_line_count = non_empty_syntax_span_line_count.saturating_add(1);
+        }
+        if has_type_hints {
+            type_hint_line_count = type_hint_line_count.saturating_add(1);
         }
         if has_font_family {
             font_family_line_count = font_family_line_count.saturating_add(1);
@@ -2349,6 +2426,8 @@ fn dev_code_editor_visible_style_report(
                 "text": item.text.as_deref().unwrap_or_default().chars().take(80).collect::<String>(),
                 "rich_text": rich_text,
                 "syntax_spans_json": has_syntax_spans,
+                "editor_type_hints_json": has_type_hints,
+                "non_empty_type_hints_json": has_non_empty_type_hints,
                 "non_empty_syntax_spans_json": has_non_empty_syntax_spans,
                 "font": has_font_family,
                 "font_features": has_font_features
@@ -2369,6 +2448,7 @@ fn dev_code_editor_visible_style_report(
         "rich_text_line_count": rich_text_line_count,
         "syntax_span_line_count": syntax_span_line_count,
         "non_empty_syntax_span_line_count": non_empty_syntax_span_line_count,
+        "type_hint_line_count": type_hint_line_count,
         "font_family_line_count": font_family_line_count,
         "font_feature_line_count": font_feature_line_count,
         "missing_style_samples": missing_samples
@@ -2389,6 +2469,19 @@ fn dev_code_editor_model_report(shell: &DevWindowShell) -> serde_json::Value {
         "syntax_render_categories": model.syntax_render_categories(),
         "syntax_render_segment_samples": model.syntax_render_segment_samples(),
         "syntax_render_segment_count": model.syntax_render_segments_for_visible_lines(40).len(),
+        "type_hint_backend": model.type_hint_backend(),
+        "type_hint_count": model.type_hint_count(),
+        "type_hint_samples": model.type_hint_samples(),
+        "caret_type_hint": model
+            .type_hint_at_position(model.caret())
+            .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
+            .unwrap_or_else(|| json!(null)),
+        "hover_type_hint": shell
+            .hovered_editor_position
+            .as_ref()
+            .and_then(|position| model.type_hint_at_position(position))
+            .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
+            .unwrap_or_else(|| json!(null)),
         "syntax_theme": model.syntax_theme_report(),
         "diagnostic_count": model.diagnostics.len(),
         "font_family": shell.editor_view.font_family,
@@ -2399,13 +2492,20 @@ fn dev_code_editor_model_report(shell: &DevWindowShell) -> serde_json::Value {
 #[derive(Default)]
 struct DevNativeInputState {
     last_mouse_button_event_count: u64,
+    last_mouse_motion_event_count: u64,
     last_keyboard_event_sequence: u64,
+    primary_modifier_down: bool,
     caret_blink_started_at: Option<Instant>,
     held_repeat_key: Option<String>,
     held_repeat_next_at: Option<Instant>,
     editor_focused: bool,
+    type_inspector_focused: bool,
+    footer_focused: bool,
+    type_inspector_resizing: bool,
     focused_dev_text_input: Option<String>,
     mouse_select_anchor: Option<EditorPosition>,
+    type_inspector_mouse_select_anchor: Option<TypeInspectorPosition>,
+    footer_mouse_select_anchor: Option<FooterPosition>,
     last_editor_click_position: Option<EditorPosition>,
     last_editor_click_sequence: u64,
     editor_click_count: u8,
@@ -2433,6 +2533,13 @@ struct DevEditorSnapshot {
     scroll_line: usize,
     scroll_column: usize,
     footer_scroll_line: usize,
+    footer_selection: Option<FooterSelection>,
+    type_inspector_scroll_line: usize,
+    type_inspector_scroll_column: usize,
+    type_inspector_selection: Option<TypeInspectorSelection>,
+    type_inspector_width: u32,
+    type_inspector_resize_hovered: bool,
+    hovered_editor_position: Option<EditorPosition>,
 }
 
 impl DevEditorSnapshot {
@@ -2449,6 +2556,13 @@ impl DevEditorSnapshot {
             scroll_line: shell.workspace.selected_buffer.scroll_line,
             scroll_column: shell.workspace.selected_buffer.scroll_column,
             footer_scroll_line: shell.footer_scroll_line,
+            footer_selection: shell.footer_selection.clone(),
+            type_inspector_scroll_line: shell.type_inspector_scroll_line,
+            type_inspector_scroll_column: shell.type_inspector_scroll_column,
+            type_inspector_selection: shell.type_inspector_selection.clone(),
+            type_inspector_width: shell.type_inspector_width,
+            type_inspector_resize_hovered: shell.type_inspector_resize_hovered,
+            hovered_editor_position: shell.hovered_editor_position.clone(),
         }
     }
 
@@ -2459,6 +2573,13 @@ impl DevEditorSnapshot {
             && self.selection_start == after.selection_start
             && self.selection_end == after.selection_end
             && self.footer_scroll_line == after.footer_scroll_line
+            && self.footer_selection == after.footer_selection
+            && self.type_inspector_scroll_line == after.type_inspector_scroll_line
+            && self.type_inspector_scroll_column == after.type_inspector_scroll_column
+            && self.type_inspector_selection == after.type_inspector_selection
+            && self.type_inspector_width == after.type_inspector_width
+            && self.type_inspector_resize_hovered == after.type_inspector_resize_hovered
+            && self.hovered_editor_position == after.hovered_editor_position
             && (self.scroll_line != after.scroll_line || self.scroll_column != after.scroll_column)
     }
 
@@ -2469,6 +2590,31 @@ impl DevEditorSnapshot {
             && self.scroll_line == after.scroll_line
             && self.scroll_column == after.scroll_column
             && self.footer_scroll_line == after.footer_scroll_line
+            && self.footer_selection == after.footer_selection
+            && self.type_inspector_scroll_line == after.type_inspector_scroll_line
+            && self.type_inspector_scroll_column == after.type_inspector_scroll_column
+            && self.type_inspector_selection == after.type_inspector_selection
+            && self.type_inspector_width == after.type_inspector_width
+            && self.type_inspector_resize_hovered == after.type_inspector_resize_hovered
+            && self.hovered_editor_position == after.hovered_editor_position
+    }
+
+    fn secondary_visual_only(&self, after: &Self) -> bool {
+        self.source_hash == after.source_hash
+            && self.source_len == after.source_len
+            && self.line_count == after.line_count
+            && self.selection_start == after.selection_start
+            && self.selection_end == after.selection_end
+            && self.scroll_line == after.scroll_line
+            && self.scroll_column == after.scroll_column
+            && self.type_inspector_width == after.type_inspector_width
+            && (self.footer_scroll_line != after.footer_scroll_line
+                || self.footer_selection != after.footer_selection
+                || self.type_inspector_scroll_line != after.type_inspector_scroll_line
+                || self.type_inspector_scroll_column != after.type_inspector_scroll_column
+                || self.type_inspector_selection != after.type_inspector_selection
+                || self.type_inspector_resize_hovered != after.type_inspector_resize_hovered
+                || self.hovered_editor_position != after.hovered_editor_position)
     }
 }
 
@@ -2628,6 +2774,7 @@ fn patch_dev_render_editor_visual_state(
             patched = true;
         }
     }
+    patched |= patch_dev_render_secondary_content(shell, render_state);
     if patched {
         render_state.revision = render_state.revision.saturating_add(1);
         render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
@@ -2669,27 +2816,71 @@ fn patch_dev_render_editor_scroll(
     });
     let visible_lines = model.visible_lines(text_indices.len());
     let bracket_columns_by_line = model.bracket_columns_by_line();
-    for (item_index, (line_number, line)) in text_indices.into_iter().zip(visible_lines.iter()) {
+    for (slot, item_index) in text_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
-        item.node =
-            boon_document_model::DocumentNodeId(format!("dev-code-editor-line-text-{line_number}"));
-        item.text = Some(line.clone());
-        item.style.insert(
-            "syntax_spans_json".to_owned(),
-            boon_document_model::StyleValue::Text(syntax_spans_json(
-                &model.highlighted_line_segments(*line_number, line),
-            )),
-        );
+        if let Some((line_number, line)) = visible_lines.get(slot) {
+            item.node = boon_document_model::DocumentNodeId(format!(
+                "dev-code-editor-line-text-{line_number}"
+            ));
+            item.text = Some(line.clone());
+            item.style.insert(
+                "syntax_spans_json".to_owned(),
+                boon_document_model::StyleValue::Text(syntax_spans_json(
+                    &model.highlighted_line_segments(*line_number, line),
+                )),
+            );
+            item.style.insert(
+                "text_inset".to_owned(),
+                boon_document_model::StyleValue::Text(text_inset_for_scroll_column(
+                    model.scroll_column,
+                    BOON_EDITOR_FONT_SIZE,
+                )),
+            );
+            let type_hints = model.inline_type_hints_for_line(*line_number);
+            if type_hints.is_empty() {
+                item.style.remove("editor_type_hints_json");
+                item.style.remove("editor_type_hint_color");
+            } else {
+                item.style.insert(
+                    "editor_type_hints_json".to_owned(),
+                    boon_document_model::StyleValue::Text(editor_type_hints_json(&type_hints)),
+                );
+                item.style.insert(
+                    "editor_type_hint_color".to_owned(),
+                    boon_document_model::StyleValue::Text("#8aa0b8".to_owned()),
+                );
+            }
+            apply_dev_editor_visual_style(
+                &mut item.style,
+                model,
+                &bracket_columns_by_line,
+                *line_number,
+                shell.caret_visible,
+            );
+        } else {
+            item.node = boon_document_model::DocumentNodeId(format!(
+                "dev-code-editor-line-text-blank-{slot}"
+            ));
+            item.text = Some(String::new());
+            item.style.insert(
+                "syntax_spans_json".to_owned(),
+                boon_document_model::StyleValue::Text(syntax_spans_json(&[])),
+            );
+            item.style.remove("editor_type_hints_json");
+            item.style.remove("editor_type_hint_color");
+            for key in [
+                "editor_selection_start",
+                "editor_selection_end",
+                "editor_caret_column",
+                "editor_caret_visible",
+                "editor_bracket_columns",
+            ] {
+                item.style.remove(key);
+            }
+        }
         item.style.insert(
             "rich_text".to_owned(),
             boon_document_model::StyleValue::Bool(true),
-        );
-        apply_dev_editor_visual_style(
-            &mut item.style,
-            model,
-            &bracket_columns_by_line,
-            *line_number,
-            shell.caret_visible,
         );
     }
 
@@ -2710,11 +2901,18 @@ fn patch_dev_render_editor_scroll(
             .y
             .total_cmp(&frame.display_list[*right].bounds.y)
     });
-    for (item_index, (line_number, _)) in gutter_indices.into_iter().zip(visible_lines.iter()) {
+    for (slot, item_index) in gutter_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
-        item.node =
-            boon_document_model::DocumentNodeId(format!("dev-code-editor-gutter-{line_number}"));
-        item.text = Some(format!("{line_number:>4}"));
+        if let Some((line_number, _)) = visible_lines.get(slot) {
+            item.node = boon_document_model::DocumentNodeId(format!(
+                "dev-code-editor-gutter-{line_number}"
+            ));
+            item.text = Some(format!("{line_number:>4}"));
+        } else {
+            item.node =
+                boon_document_model::DocumentNodeId(format!("dev-code-editor-gutter-blank-{slot}"));
+            item.text = Some(String::new());
+        }
     }
 
     render_state.revision = render_state.revision.saturating_add(1);
@@ -2724,6 +2922,270 @@ fn patch_dev_render_editor_scroll(
         render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
     }
     true
+}
+
+fn patch_dev_render_secondary_content(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let footer = patch_dev_render_footer_content(shell, render_state);
+    let type_inspector = patch_dev_render_type_inspector_content(shell, render_state);
+    footer || type_inspector
+}
+
+fn patch_dev_render_footer_content(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return false;
+    };
+    let footer_row_count = frame
+        .display_list
+        .iter()
+        .filter_map(|item| {
+            item.node
+                .0
+                .strip_prefix("dev-footer-row-")
+                .and_then(|rest| rest.strip_suffix("-value"))
+                .and_then(|index| index.parse::<usize>().ok())
+        })
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if footer_row_count == 0 {
+        return false;
+    }
+    let footer_lines = wrap_footer_lines(shell.footer_lines(), DEV_FOOTER_VALUE_WRAP_CHARS);
+    let effective_scroll_line = shell
+        .footer_scroll_line
+        .min(footer_lines.len().saturating_sub(1));
+    let visible_rows = footer_lines
+        .into_iter()
+        .skip(effective_scroll_line)
+        .take(footer_row_count)
+        .collect::<Vec<_>>();
+    let mut patched = false;
+    for visible_index in 0..footer_row_count {
+        let (label, value) = visible_rows
+            .get(visible_index)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let line_index = effective_scroll_line + visible_index;
+        let label_id = format!("dev-footer-row-{visible_index}-label");
+        let value_id = format!("dev-footer-row-{visible_index}-value");
+        for item in &mut frame.display_list {
+            if item.node.0 == label_id && item.text.as_deref() != Some(label.as_str()) {
+                item.text = Some(label.clone());
+                patched = true;
+            } else if item.node.0 == value_id && item.text.as_deref() != Some(value.as_str()) {
+                item.text = Some(value.clone());
+                patched = true;
+            }
+            if item.node.0 == label_id {
+                patched |= apply_footer_selection_style(
+                    &mut item.style,
+                    shell.footer_selection.as_ref(),
+                    line_index,
+                    &label,
+                    &value,
+                    FooterLinePart::Label,
+                );
+            } else if item.node.0 == value_id {
+                patched |= apply_footer_selection_style(
+                    &mut item.style,
+                    shell.footer_selection.as_ref(),
+                    line_index,
+                    &label,
+                    &value,
+                    FooterLinePart::Value,
+                );
+            }
+        }
+    }
+    patched
+}
+
+fn patch_dev_render_type_inspector_content(
+    shell: &DevWindowShell,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return false;
+    };
+    let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+    let detail_row_count = frame
+        .display_list
+        .iter()
+        .filter_map(|item| {
+            item.node
+                .0
+                .strip_prefix("dev-type-inspector-detail-row-")
+                .and_then(|index| index.parse::<usize>().ok())
+        })
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut updates = BTreeMap::new();
+    let effective_scroll_line = shell
+        .type_inspector_scroll_line
+        .min(content.detail_lines.len().saturating_sub(detail_row_count));
+    let effective_scroll_column = shell
+        .type_inspector_scroll_column
+        .min(shell.type_inspector_max_scroll_column());
+    for index in 0..detail_row_count {
+        updates.insert(
+            format!("dev-type-inspector-detail-row-{index}"),
+            content
+                .detail_lines
+                .get(effective_scroll_line + index)
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+
+    let mut patched = false;
+    for item in &mut frame.display_list {
+        if let Some(text) = updates.get(&item.node.0) {
+            if item.text.as_deref() != Some(text.as_str()) {
+                item.text = Some(text.clone());
+                patched = true;
+            }
+            if item.node.0.starts_with("dev-type-inspector-detail-row-") {
+                patched |= set_display_style_value(
+                    &mut item.style,
+                    "rich_text",
+                    boon_document_model::StyleValue::Bool(true),
+                );
+                patched |= set_display_style_value(
+                    &mut item.style,
+                    "syntax_spans_json",
+                    boon_document_model::StyleValue::Text(type_inspector_syntax_spans_json(text)),
+                );
+                patched |= set_display_style_value(
+                    &mut item.style,
+                    "text_inset",
+                    boon_document_model::StyleValue::Text(text_inset_for_scroll_column(
+                        effective_scroll_column,
+                        12,
+                    )),
+                );
+                patched |= set_display_style_value(
+                    &mut item.style,
+                    "editor_selection_color",
+                    boon_document_model::StyleValue::Text(BOON_EDITOR_SELECTION.to_owned()),
+                );
+                let line_index = item
+                    .node
+                    .0
+                    .strip_prefix("dev-type-inspector-detail-row-")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .map(|index| effective_scroll_line + index)
+                    .unwrap_or(effective_scroll_line);
+                if let Some((start, end)) = shell
+                    .type_inspector_selection
+                    .as_ref()
+                    .and_then(|selection| selection.columns_for_line(line_index, text))
+                {
+                    patched |= set_display_style_value(
+                        &mut item.style,
+                        "editor_selection_start",
+                        boon_document_model::StyleValue::Number(start as f64),
+                    );
+                    patched |= set_display_style_value(
+                        &mut item.style,
+                        "editor_selection_end",
+                        boon_document_model::StyleValue::Number(end as f64),
+                    );
+                } else {
+                    patched |= remove_display_style_key(&mut item.style, "editor_selection_start");
+                    patched |= remove_display_style_key(&mut item.style, "editor_selection_end");
+                }
+            }
+        }
+    }
+    patched
+}
+
+#[derive(Clone, Copy)]
+enum FooterLinePart {
+    Label,
+    Value,
+}
+
+fn apply_footer_selection_style(
+    style: &mut BTreeMap<String, boon_document_model::StyleValue>,
+    selection: Option<&FooterSelection>,
+    line_index: usize,
+    label: &str,
+    value: &str,
+    part: FooterLinePart,
+) -> bool {
+    let mut patched = false;
+    patched |= set_display_style_value(
+        style,
+        "editor_selection_color",
+        boon_document_model::StyleValue::Text(BOON_EDITOR_SELECTION.to_owned()),
+    );
+    if let Some((start, end)) =
+        footer_selection_columns_for_part(selection, line_index, label, value, part)
+    {
+        patched |= set_display_style_value(
+            style,
+            "editor_selection_start",
+            boon_document_model::StyleValue::Number(start as f64),
+        );
+        patched |= set_display_style_value(
+            style,
+            "editor_selection_end",
+            boon_document_model::StyleValue::Number(end as f64),
+        );
+    } else {
+        patched |= remove_display_style_key(style, "editor_selection_start");
+        patched |= remove_display_style_key(style, "editor_selection_end");
+    }
+    patched
+}
+
+fn footer_selection_columns_for_part(
+    selection: Option<&FooterSelection>,
+    line_index: usize,
+    label: &str,
+    value: &str,
+    part: FooterLinePart,
+) -> Option<(usize, usize)> {
+    let selection = selection?;
+    let display_line = footer_display_line(label, value);
+    let (start, end) = selection.columns_for_line(line_index, &display_line)?;
+    let label_len = label.chars().count();
+    let value_len = value.chars().count();
+    let value_start = if label.is_empty() { 0 } else { label_len + 2 };
+    let (part_start, part_len) = match part {
+        FooterLinePart::Label => (0, label_len),
+        FooterLinePart::Value => (value_start, value_len),
+    };
+    if part_len == 0 {
+        return None;
+    }
+    let part_end = part_start + part_len;
+    let local_start = start.max(part_start).min(part_end) - part_start;
+    let local_end = end.max(part_start).min(part_end) - part_start;
+    (local_end > local_start).then_some((local_start, local_end))
+}
+
+fn set_display_style_value(
+    style: &mut BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+    value: boon_document_model::StyleValue,
+) -> bool {
+    style.insert(key.to_owned(), value.clone()) != Some(value)
+}
+
+fn remove_display_style_key(
+    style: &mut BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> bool {
+    style.remove(key).is_some()
 }
 
 type EditorColumnMetricCache = BTreeMap<EditorColumnMetricKey, Vec<f32>>;
@@ -2740,12 +3202,30 @@ fn dev_input_may_change(
     input_state: &DevNativeInputState,
 ) -> bool {
     (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
+        || input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
         || input
             .mouse_button_events
             .iter()
             .any(|event| event.sequence > input_state.last_mouse_button_event_count)
         || (input_state.editor_focused
             && input_state.mouse_select_anchor.is_some()
+            && input
+                .mouse_buttons_down
+                .iter()
+                .any(|button| button == "left"))
+        || (input_state.type_inspector_focused
+            && input_state.type_inspector_mouse_select_anchor.is_some()
+            && input
+                .mouse_buttons_down
+                .iter()
+                .any(|button| button == "left"))
+        || (input_state.footer_focused
+            && input_state.footer_mouse_select_anchor.is_some()
+            && input
+                .mouse_buttons_down
+                .iter()
+                .any(|button| button == "left"))
+        || (input_state.type_inspector_resizing
             && input
                 .mouse_buttons_down
                 .iter()
@@ -2795,12 +3275,115 @@ fn dev_apply_real_window_input(
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
 ) -> bool {
+    let mut clipboard = NativeClipboardAdapter;
+    dev_apply_real_window_input_with_clipboard(
+        input,
+        document,
+        layout_frame,
+        surface_width,
+        surface_height,
+        shell,
+        input_state,
+        &mut clipboard,
+    )
+}
+
+fn dev_apply_real_window_input_with_clipboard(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    document: &boon_document_model::DocumentFrame,
+    layout_frame: &boon_document::LayoutFrame,
+    surface_width: u32,
+    surface_height: u32,
+    shell: &mut DevWindowShell,
+    input_state: &mut DevNativeInputState,
+    clipboard: &mut dyn ClipboardAdapter,
+) -> bool {
     if input.synthetic_input_probe {
         return false;
     }
     let mut changed = false;
 
+    if update_dev_editor_hover_from_input(
+        input,
+        layout_frame,
+        surface_width,
+        surface_height,
+        shell,
+        input_state,
+    ) {
+        changed = true;
+    }
+
     if (input.scroll_delta_y.abs() > f64::EPSILON || input.scroll_delta_x.abs() > f64::EPSILON)
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+        && let Some(inspector_bounds) = layout_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .map(|item| item.bounds)
+        && rect_contains(inspector_bounds, position.x as f32, position.y as f32)
+    {
+        let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+        let visible_line_count = layout_frame
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-type-inspector-detail-row-"))
+            .count()
+            .max(1);
+        let max_scroll_line = content
+            .detail_lines
+            .len()
+            .saturating_sub(visible_line_count);
+        let before_scroll_line = shell.type_inspector_scroll_line;
+        let before_scroll_column = shell.type_inspector_scroll_column;
+        let shift_pressed = input
+            .pressed_keys
+            .iter()
+            .any(|key| key_is_shift_modifier(key));
+        let vertical_delta = if shift_pressed && input.scroll_delta_x.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            input.scroll_delta_y
+        };
+        let horizontal_delta = if shift_pressed && input.scroll_delta_x.abs() <= f64::EPSILON {
+            input.scroll_delta_y
+        } else {
+            input.scroll_delta_x
+        };
+        let line_delta = scaled_scroll_steps(vertical_delta, 8.0, 3);
+        if line_delta > 0 {
+            shell.type_inspector_scroll_line = shell
+                .type_inspector_scroll_line
+                .saturating_add(line_delta as usize)
+                .min(max_scroll_line);
+        } else if line_delta < 0 {
+            shell.type_inspector_scroll_line = shell
+                .type_inspector_scroll_line
+                .saturating_sub((-line_delta) as usize);
+        }
+        let max_scroll_column = content
+            .detail_lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let column_delta = scaled_scroll_steps(horizontal_delta, 8.0, 3);
+        if column_delta > 0 {
+            shell.type_inspector_scroll_column = shell
+                .type_inspector_scroll_column
+                .saturating_add(column_delta as usize)
+                .min(max_scroll_column);
+        } else if column_delta < 0 {
+            shell.type_inspector_scroll_column = shell
+                .type_inspector_scroll_column
+                .saturating_sub((-column_delta) as usize);
+        }
+        changed = shell.type_inspector_scroll_line != before_scroll_line
+            || shell.type_inspector_scroll_column != before_scroll_column;
+    } else if (input.scroll_delta_y.abs() > f64::EPSILON
+        || input.scroll_delta_x.abs() > f64::EPSILON)
         && let Some(position) =
             input_layout_position(input.mouse_window_pos, surface_width, surface_height)
         && let Some(footer_bounds) = layout_frame
@@ -2810,7 +3393,9 @@ fn dev_apply_real_window_input(
             .map(|item| item.bounds)
         && rect_contains(footer_bounds, position.x as f32, position.y as f32)
     {
-        let max_scroll_line = shell.footer_lines().len().saturating_sub(1);
+        let max_scroll_line = wrap_footer_lines(shell.footer_lines(), DEV_FOOTER_VALUE_WRAP_CHARS)
+            .len()
+            .saturating_sub(1);
         let before_scroll_line = shell.footer_scroll_line;
         let line_delta = scaled_scroll_steps(input.scroll_delta_y, 8.0, 3);
         if line_delta > 0 {
@@ -2911,12 +3496,95 @@ fn dev_apply_real_window_input(
         if let Some(position) =
             input_layout_position(input.mouse_window_pos, surface_width, surface_height)
         {
+            if !mouse_event.pressed && input_state.type_inspector_resizing {
+                shell.set_type_inspector_width_from_pointer(surface_width, position.x as f32);
+                input_state.type_inspector_resizing = false;
+                shell.type_inspector_resize_hovered = type_inspector_resize_handle_hovered(
+                    layout_frame,
+                    position.x as f32,
+                    position.y as f32,
+                );
+                changed = true;
+                continue;
+            }
+            if let Some(inspector_position) = type_inspector_position_from_pointer(
+                shell,
+                layout_frame,
+                position.x as f32,
+                position.y as f32,
+                &mut input_state.column_metric_cache,
+            ) {
+                input_state.editor_focused = false;
+                input_state.type_inspector_focused = true;
+                input_state.footer_focused = false;
+                input_state.type_inspector_resizing = false;
+                input_state.focused_dev_text_input = None;
+                input_state.mouse_select_anchor = None;
+                input_state.footer_mouse_select_anchor = None;
+                clear_dev_key_repeat(input_state);
+                if mouse_event.pressed {
+                    shell.set_type_inspector_selection(
+                        inspector_position.clone(),
+                        inspector_position.clone(),
+                    );
+                    input_state.type_inspector_mouse_select_anchor = Some(inspector_position);
+                } else if let Some(anchor) = input_state.type_inspector_mouse_select_anchor.take() {
+                    shell.set_type_inspector_selection(anchor, inspector_position);
+                }
+                changed = true;
+                continue;
+            }
+            if let Some(footer_position) = footer_position_from_pointer(
+                shell,
+                layout_frame,
+                position.x as f32,
+                position.y as f32,
+                &mut input_state.column_metric_cache,
+            ) {
+                input_state.editor_focused = false;
+                input_state.type_inspector_focused = false;
+                input_state.footer_focused = true;
+                input_state.type_inspector_resizing = false;
+                input_state.focused_dev_text_input = None;
+                input_state.mouse_select_anchor = None;
+                input_state.type_inspector_mouse_select_anchor = None;
+                clear_dev_key_repeat(input_state);
+                if mouse_event.pressed {
+                    shell.set_footer_selection(footer_position.clone(), footer_position.clone());
+                    input_state.footer_mouse_select_anchor = Some(footer_position);
+                } else if let Some(anchor) = input_state.footer_mouse_select_anchor.take() {
+                    shell.set_footer_selection(anchor, footer_position);
+                }
+                changed = true;
+                continue;
+            }
             if let Some((node_id, source_path)) =
                 dev_source_binding_at(document, layout_frame, position.x as f32, position.y as f32)
             {
-                if source_path == "dev.editor.insert_text" || node_id == "dev-code-editor" {
-                    input_state.editor_focused = true;
+                if source_path == "dev.type_inspector.resize" {
+                    input_state.editor_focused = false;
+                    input_state.type_inspector_focused = false;
+                    input_state.footer_focused = false;
                     input_state.focused_dev_text_input = None;
+                    input_state.mouse_select_anchor = None;
+                    input_state.type_inspector_mouse_select_anchor = None;
+                    input_state.footer_mouse_select_anchor = None;
+                    shell.hovered_editor_position = None;
+                    shell.type_inspector_resize_hovered = true;
+                    clear_dev_key_repeat(input_state);
+                    if mouse_event.pressed {
+                        input_state.type_inspector_resizing = true;
+                    }
+                    shell.set_type_inspector_width_from_pointer(surface_width, position.x as f32);
+                    changed = true;
+                    continue;
+                } else if source_path == "dev.editor.insert_text" || node_id == "dev-code-editor" {
+                    input_state.editor_focused = true;
+                    input_state.type_inspector_focused = false;
+                    input_state.footer_focused = false;
+                    input_state.type_inspector_resizing = false;
+                    input_state.focused_dev_text_input = None;
+                    input_state.footer_mouse_select_anchor = None;
                     if let Some(editor_position) = dev_position_from_pointer(
                         &shell.workspace.selected_buffer,
                         layout_frame,
@@ -2962,23 +3630,52 @@ fn dev_apply_real_window_input(
                     changed = true;
                 } else if source_path == "dev.custom.name" {
                     input_state.editor_focused = false;
+                    input_state.type_inspector_focused = false;
+                    input_state.footer_focused = false;
+                    input_state.type_inspector_resizing = false;
                     input_state.focused_dev_text_input = Some(source_path);
                     input_state.mouse_select_anchor = None;
+                    input_state.type_inspector_mouse_select_anchor = None;
+                    input_state.footer_mouse_select_anchor = None;
+                    shell.hovered_editor_position = None;
                     clear_dev_key_repeat(input_state);
                     changed = true;
                 } else {
                     input_state.editor_focused = false;
+                    input_state.type_inspector_focused = false;
+                    input_state.footer_focused = false;
+                    input_state.type_inspector_resizing = false;
                     input_state.focused_dev_text_input = None;
                     input_state.mouse_select_anchor = None;
+                    input_state.type_inspector_mouse_select_anchor = None;
+                    input_state.footer_mouse_select_anchor = None;
+                    shell.hovered_editor_position = None;
                     shell.dispatch_source_path(&source_path);
                     changed = true;
                 }
             } else {
                 input_state.editor_focused = false;
+                input_state.type_inspector_focused = false;
+                input_state.footer_focused = false;
+                input_state.type_inspector_resizing = false;
                 input_state.focused_dev_text_input = None;
                 input_state.mouse_select_anchor = None;
+                input_state.type_inspector_mouse_select_anchor = None;
+                input_state.footer_mouse_select_anchor = None;
+                shell.hovered_editor_position = None;
             }
         }
+    }
+    if input
+        .mouse_buttons_down
+        .iter()
+        .any(|button| button == "left")
+        && input_state.type_inspector_resizing
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+    {
+        changed |= shell.set_type_inspector_width_from_pointer(surface_width, position.x as f32);
+        shell.type_inspector_resize_hovered = true;
     }
     if input
         .mouse_buttons_down
@@ -2999,17 +3696,56 @@ fn dev_apply_real_window_input(
         shell.workspace.selected_buffer.set_selection(anchor, head);
         changed = true;
     }
+    if input
+        .mouse_buttons_down
+        .iter()
+        .any(|button| button == "left")
+        && input_state.type_inspector_focused
+        && let Some(anchor) = input_state.type_inspector_mouse_select_anchor.clone()
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+        && let Some(head) = type_inspector_position_from_pointer(
+            shell,
+            layout_frame,
+            position.x as f32,
+            position.y as f32,
+            &mut input_state.column_metric_cache,
+        )
+    {
+        shell.set_type_inspector_selection(anchor, head);
+        changed = true;
+    }
+    if input
+        .mouse_buttons_down
+        .iter()
+        .any(|button| button == "left")
+        && input_state.footer_focused
+        && let Some(anchor) = input_state.footer_mouse_select_anchor.clone()
+        && let Some(position) =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+        && let Some(head) = footer_position_from_pointer(
+            shell,
+            layout_frame,
+            position.x as f32,
+            position.y as f32,
+            &mut input_state.column_metric_cache,
+        )
+    {
+        shell.set_footer_selection(anchor, head);
+        changed = true;
+    }
 
     let shift_pressed = input
         .pressed_keys
         .iter()
-        .any(|key| key == "Shift" || key == "RightShift");
-    let primary_modifier_pressed = input.pressed_keys.iter().any(|key| {
-        matches!(
-            key.as_str(),
-            "Control" | "RightControl" | "Command" | "RightCommand"
-        )
-    });
+        .any(|key| key_is_shift_modifier(key));
+    if input
+        .pressed_keys
+        .iter()
+        .any(|key| key_is_primary_modifier(key))
+    {
+        input_state.primary_modifier_down = true;
+    }
     let keyboard_events = input
         .keyboard_events
         .iter()
@@ -3019,7 +3755,20 @@ fn dev_apply_real_window_input(
     for event in keyboard_events {
         input_state.last_keyboard_event_sequence =
             input_state.last_keyboard_event_sequence.max(event.sequence);
-        if !input_state.editor_focused && input_state.focused_dev_text_input.is_none() {
+        if !input_state.editor_focused
+            && !input_state.type_inspector_focused
+            && !input_state.footer_focused
+            && input_state.focused_dev_text_input.is_none()
+        {
+            continue;
+        }
+        if key_is_primary_modifier(event.key.as_str()) {
+            input_state.primary_modifier_down = event.pressed;
+            if !event.pressed && input_state.held_repeat_key.as_deref() == Some(event.key.as_str())
+            {
+                clear_dev_key_repeat(input_state);
+            }
+            changed = true;
             continue;
         }
         if !event.pressed {
@@ -3028,45 +3777,18 @@ fn dev_apply_real_window_input(
             }
             continue;
         }
-        if primary_modifier_pressed {
-            let mut clipboard = NativeClipboardAdapter;
+        if input_state.primary_modifier_down
+            || input
+                .pressed_keys
+                .iter()
+                .any(|key| key_is_primary_modifier(key))
+        {
             if input_state.editor_focused {
-                match event.key.as_str() {
-                    "A" => shell.workspace.selected_buffer.select_all(),
-                    "C" => {
-                        let _ = shell
-                            .workspace
-                            .selected_buffer
-                            .copy_to_adapter(&mut clipboard);
-                    }
-                    "X" => {
-                        let _ = shell
-                            .workspace
-                            .selected_buffer
-                            .cut_to_adapter(&mut clipboard);
-                        shell.workspace.persist_selected_buffer();
-                        shell.workspace.set_selected_dirty(true);
-                    }
-                    "V" => {
-                        let _ = shell
-                            .workspace
-                            .selected_buffer
-                            .paste_from_adapter(&mut clipboard);
-                        shell.workspace.persist_selected_buffer();
-                        shell.workspace.set_selected_dirty(true);
-                    }
-                    "Z" => {
-                        let _ = shell.workspace.selected_buffer.undo();
-                        shell.workspace.persist_selected_buffer();
-                        shell.workspace.set_selected_dirty(true);
-                    }
-                    "Y" => {
-                        let _ = shell.workspace.selected_buffer.redo();
-                        shell.workspace.persist_selected_buffer();
-                        shell.workspace.set_selected_dirty(true);
-                    }
-                    _ => {}
-                }
+                apply_dev_editor_primary_shortcut(shell, event.key.as_str(), clipboard);
+            } else if input_state.type_inspector_focused {
+                apply_dev_type_inspector_primary_shortcut(shell, event.key.as_str(), clipboard);
+            } else if input_state.footer_focused {
+                apply_dev_footer_primary_shortcut(shell, event.key.as_str(), clipboard);
             }
             changed = true;
             continue;
@@ -3079,6 +3801,9 @@ fn dev_apply_real_window_input(
             false
         };
         if applied {
+            if input_state.editor_focused {
+                shell.hovered_editor_position = None;
+            }
             if dev_key_is_repeatable(event.key.as_str()) {
                 let now = Instant::now();
                 input_state.held_repeat_key = Some(event.key.clone());
@@ -3090,7 +3815,13 @@ fn dev_apply_real_window_input(
             changed = true;
         }
     }
+    let primary_modifier_pressed = input_state.primary_modifier_down
+        || input
+            .pressed_keys
+            .iter()
+            .any(|key| key_is_primary_modifier(key));
     if (input_state.editor_focused || input_state.focused_dev_text_input.is_some())
+        && !input_state.type_inspector_focused
         && !primary_modifier_pressed
     {
         if let Some(key) = input_state.held_repeat_key.clone() {
@@ -3112,6 +3843,9 @@ fn dev_apply_real_window_input(
                         false
                     };
                     if key_applied {
+                        if input_state.editor_focused {
+                            shell.hovered_editor_position = None;
+                        }
                         changed = true;
                     }
                     applied += 1;
@@ -3141,6 +3875,78 @@ fn dev_apply_real_window_input(
     }
 
     changed
+}
+
+fn update_dev_editor_hover_from_input(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    layout_frame: &boon_document::LayoutFrame,
+    surface_width: u32,
+    surface_height: u32,
+    shell: &mut DevWindowShell,
+    input_state: &mut DevNativeInputState,
+) -> bool {
+    if input.mouse_motion_event_count <= input_state.last_mouse_motion_event_count {
+        return false;
+    }
+    if input.scroll_delta_y.abs() > f64::EPSILON
+        || input.scroll_delta_x.abs() > f64::EPSILON
+        || !input.mouse_button_events.is_empty()
+        || !input.mouse_buttons_down.is_empty()
+    {
+        input_state.last_mouse_motion_event_count = input.mouse_motion_event_count;
+        return false;
+    }
+    input_state.last_mouse_motion_event_count = input.mouse_motion_event_count;
+    let Some(position) =
+        input_layout_position(input.mouse_window_pos, surface_width, surface_height)
+    else {
+        let changed =
+            shell.hovered_editor_position.is_some() || shell.type_inspector_resize_hovered;
+        shell.hovered_editor_position = None;
+        shell.type_inspector_resize_hovered = false;
+        return changed;
+    };
+    let resize_hovered =
+        type_inspector_resize_handle_hovered(layout_frame, position.x as f32, position.y as f32);
+    if resize_hovered {
+        let changed =
+            shell.hovered_editor_position.is_some() || !shell.type_inspector_resize_hovered;
+        shell.hovered_editor_position = None;
+        shell.type_inspector_resize_hovered = true;
+        return changed;
+    }
+    let Some(editor_bounds) = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "dev-code-editor")
+        .map(|item| item.bounds)
+    else {
+        let changed =
+            shell.hovered_editor_position.is_some() || shell.type_inspector_resize_hovered;
+        shell.hovered_editor_position = None;
+        shell.type_inspector_resize_hovered = false;
+        return changed;
+    };
+    if !rect_contains(editor_bounds, position.x as f32, position.y as f32) {
+        let changed =
+            shell.hovered_editor_position.is_some() || shell.type_inspector_resize_hovered;
+        shell.hovered_editor_position = None;
+        shell.type_inspector_resize_hovered = false;
+        return changed;
+    }
+    let next_hover = dev_position_from_pointer(
+        &shell.workspace.selected_buffer,
+        layout_frame,
+        position.x as f32,
+        position.y as f32,
+        &mut input_state.column_metric_cache,
+    );
+    if shell.hovered_editor_position == next_hover && !shell.type_inspector_resize_hovered {
+        return false;
+    }
+    shell.hovered_editor_position = next_hover;
+    shell.type_inspector_resize_hovered = false;
+    true
 }
 
 fn dev_editor_caret_visible(input_state: &mut DevNativeInputState, now: Instant) -> bool {
@@ -3178,6 +3984,18 @@ fn input_layout_position(
     })
 }
 
+fn type_inspector_resize_handle_hovered(
+    layout_frame: &boon_document::LayoutFrame,
+    x: f32,
+    y: f32,
+) -> bool {
+    layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "dev-type-inspector-resize-handle")
+        .is_some_and(|item| rect_contains(item.bounds, x, y))
+}
+
 fn clear_dev_key_repeat(input_state: &mut DevNativeInputState) {
     input_state.held_repeat_key = None;
     input_state.held_repeat_next_at = None;
@@ -3205,6 +4023,131 @@ fn dev_key_is_repeatable(key: &str) -> bool {
             | "PageDown"
             | "PageUp"
     ) || keyboard_event_text(key, false).is_some()
+}
+
+fn key_is_shift_modifier(key: &str) -> bool {
+    matches!(
+        key,
+        "Shift" | "RightShift" | "LeftShift" | "ShiftLeft" | "ShiftRight"
+    )
+}
+
+fn key_is_primary_modifier(key: &str) -> bool {
+    matches!(
+        key,
+        "Control"
+            | "RightControl"
+            | "LeftControl"
+            | "ControlLeft"
+            | "ControlRight"
+            | "Ctrl"
+            | "LeftCtrl"
+            | "RightCtrl"
+            | "Command"
+            | "RightCommand"
+            | "LeftCommand"
+            | "Meta"
+            | "Super"
+            | "Logo"
+            | "Win"
+    )
+}
+
+fn normalized_editor_shortcut_key(key: &str) -> Option<&'static str> {
+    match key {
+        "A" | "a" | "KeyA" => Some("A"),
+        "C" | "c" | "KeyC" => Some("C"),
+        "V" | "v" | "KeyV" => Some("V"),
+        "X" | "x" | "KeyX" => Some("X"),
+        "Y" | "y" | "KeyY" => Some("Y"),
+        "Z" | "z" | "KeyZ" => Some("Z"),
+        _ => None,
+    }
+}
+
+fn apply_dev_editor_primary_shortcut(
+    shell: &mut DevWindowShell,
+    key: &str,
+    clipboard: &mut dyn ClipboardAdapter,
+) -> bool {
+    match normalized_editor_shortcut_key(key) {
+        Some("A") => {
+            shell.workspace.selected_buffer.select_all();
+            true
+        }
+        Some("C") => {
+            let _ = shell.workspace.selected_buffer.copy_to_adapter(clipboard);
+            true
+        }
+        Some("X") => {
+            let _ = shell.workspace.selected_buffer.cut_to_adapter(clipboard);
+            shell.hovered_editor_position = None;
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        Some("V") => {
+            let _ = shell
+                .workspace
+                .selected_buffer
+                .paste_from_adapter(clipboard);
+            shell.hovered_editor_position = None;
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        Some("Z") => {
+            let _ = shell.workspace.selected_buffer.undo();
+            shell.hovered_editor_position = None;
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        Some("Y") => {
+            let _ = shell.workspace.selected_buffer.redo();
+            shell.hovered_editor_position = None;
+            shell.workspace.persist_selected_buffer();
+            shell.workspace.set_selected_dirty(true);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_dev_type_inspector_primary_shortcut(
+    shell: &mut DevWindowShell,
+    key: &str,
+    clipboard: &mut dyn ClipboardAdapter,
+) -> bool {
+    match normalized_editor_shortcut_key(key) {
+        Some("A") => {
+            shell.select_all_type_inspector_content();
+            true
+        }
+        Some("C") => {
+            let _ = shell.copy_type_inspector_selection_to_adapter(clipboard);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_dev_footer_primary_shortcut(
+    shell: &mut DevWindowShell,
+    key: &str,
+    clipboard: &mut dyn ClipboardAdapter,
+) -> bool {
+    match normalized_editor_shortcut_key(key) {
+        Some("A") => {
+            shell.select_all_footer_content();
+            true
+        }
+        Some("C") => {
+            let _ = shell.copy_footer_selection_to_adapter(clipboard);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn apply_dev_editor_key(shell: &mut DevWindowShell, key: &str, shift_pressed: bool) -> bool {
@@ -3344,17 +4287,98 @@ struct NativeClipboardAdapter;
 
 impl ClipboardAdapter for NativeClipboardAdapter {
     fn get_text(&mut self) -> Result<String, String> {
-        arboard::Clipboard::new()
-            .map_err(|error| error.to_string())?
-            .get_text()
+        match arboard::Clipboard::new()
             .map_err(|error| error.to_string())
+            .and_then(|mut clipboard| clipboard.get_text().map_err(|error| error.to_string()))
+        {
+            Ok(text) => Ok(text),
+            Err(arboard_error) => command_get_clipboard_text().map_err(|command_error| {
+                format!("arboard: {arboard_error}; command: {command_error}")
+            }),
+        }
     }
 
     fn set_text(&mut self, text: &str) -> Result<(), String> {
-        arboard::Clipboard::new()
-            .map_err(|error| error.to_string())?
-            .set_text(text.to_owned())
+        let arboard_result = arboard::Clipboard::new()
             .map_err(|error| error.to_string())
+            .and_then(|mut clipboard| {
+                clipboard
+                    .set_text(text.to_owned())
+                    .map_err(|error| error.to_string())
+            });
+        let command_result = command_set_clipboard_text(text);
+        match (arboard_result, command_result) {
+            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Err(arboard_error), Err(command_error)) => Err(format!(
+                "arboard: {arboard_error}; command: {command_error}"
+            )),
+        }
+    }
+}
+
+fn command_get_clipboard_text() -> Result<String, String> {
+    let mut errors = Vec::new();
+    for (program, args) in [
+        ("wl-paste", Vec::<&str>::new()),
+        ("xclip", vec!["-selection", "clipboard", "-o"]),
+        ("xsel", vec!["--clipboard", "--output"]),
+    ] {
+        match Command::new(program).args(args).output() {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8(output.stdout).map_err(|error| error.to_string());
+            }
+            Ok(output) => errors.push(command_error(program, &output)),
+            Err(error) => errors.push(format!("{program}: {error}")),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn command_set_clipboard_text(text: &str) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (program, args) in [
+        ("wl-copy", Vec::<&str>::new()),
+        ("xclip", vec!["-selection", "clipboard"]),
+        ("xsel", vec!["--clipboard", "--input"]),
+    ] {
+        match spawn_clipboard_set_command(program, &args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn spawn_clipboard_set_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("{program}: {error}"))?;
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(program, &output))
+    }
+}
+
+fn command_error(program: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        format!("{program}: exited with {}", output.status)
+    } else {
+        format!("{program}: {stderr}")
     }
 }
 
@@ -3396,11 +4420,148 @@ fn dev_position_from_pointer(
     let relative_x = (x - line_item.bounds.x - inset).max(0.0);
     let visible_column =
         nearest_editor_column(&column_edges, relative_x).min(line_text.chars().count() + 1);
-    let column = model
-        .scroll_column
-        .saturating_add(visible_column)
-        .min(line_text.chars().count() + 1);
+    let column = if inset < 0.0 {
+        visible_column
+    } else {
+        model.scroll_column.saturating_add(visible_column)
+    }
+    .min(line_text.chars().count() + 1);
     Some(EditorPosition { line, column })
+}
+
+fn type_inspector_position_from_pointer(
+    shell: &DevWindowShell,
+    layout_frame: &boon_document::LayoutFrame,
+    x: f32,
+    y: f32,
+    column_metric_cache: &mut EditorColumnMetricCache,
+) -> Option<TypeInspectorPosition> {
+    let detail_bounds = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "dev-type-inspector-detail")
+        .map(|item| item.bounds)?;
+    if !rect_contains(detail_bounds, x, y) {
+        return None;
+    }
+    let mut row_items = layout_frame
+        .display_list
+        .iter()
+        .filter(|item| item.node.0.starts_with("dev-type-inspector-detail-row-"))
+        .collect::<Vec<_>>();
+    row_items.sort_by(|left, right| left.bounds.y.total_cmp(&right.bounds.y));
+    let slot = row_items
+        .iter()
+        .position(|item| rect_contains(item.bounds, x, y))
+        .or_else(|| {
+            let relative_y = (y - detail_bounds.y).max(0.0);
+            let row_stride =
+                DEV_TYPE_INSPECTOR_LINE_HEIGHT.saturating_add(DEV_TYPE_INSPECTOR_ROW_GAP) as f32;
+            Some((relative_y / row_stride.max(1.0)).floor() as usize)
+        })?;
+    let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+    let line = shell
+        .type_inspector_scroll_line
+        .min(content.detail_lines.len().saturating_sub(row_items.len()))
+        .saturating_add(slot)
+        .min(content.detail_lines.len().saturating_sub(1));
+    let line_text = content.detail_lines.get(line)?;
+    let row_item = row_items.get(slot).or_else(|| row_items.last())?;
+    let inset = style_number_from_map(&row_item.style, "text_inset").unwrap_or(0.0);
+    let column_edges = editor_column_edges_for_line(
+        column_metric_cache,
+        line_text,
+        &row_item.style,
+        row_item.bounds.height,
+    );
+    let relative_x = (x - row_item.bounds.x - inset).max(0.0);
+    let column =
+        nearest_editor_column(&column_edges, relative_x).min(line_text.chars().count() + 1);
+    Some(TypeInspectorPosition { line, column })
+}
+
+fn footer_position_from_pointer(
+    shell: &DevWindowShell,
+    layout_frame: &boon_document::LayoutFrame,
+    x: f32,
+    y: f32,
+    column_metric_cache: &mut EditorColumnMetricCache,
+) -> Option<FooterPosition> {
+    let footer_bounds = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "dev-footer-scroll")
+        .map(|item| item.bounds)?;
+    if !rect_contains(footer_bounds, x, y) {
+        return None;
+    }
+    let mut row_items = layout_frame
+        .display_list
+        .iter()
+        .filter(|item| {
+            item.node
+                .0
+                .strip_prefix("dev-footer-row-")
+                .is_some_and(|rest| rest.parse::<usize>().is_ok())
+        })
+        .collect::<Vec<_>>();
+    row_items.sort_by(|left, right| left.bounds.y.total_cmp(&right.bounds.y));
+    let slot = row_items
+        .iter()
+        .position(|item| rect_contains(item.bounds, x, y))
+        .or_else(|| {
+            let relative_y = (y - footer_bounds.y - DEV_FOOTER_SCROLL_PADDING as f32).max(0.0);
+            let row_stride = DEV_FOOTER_LINE_HEIGHT.saturating_add(DEV_FOOTER_ROW_GAP) as f32;
+            Some((relative_y / row_stride.max(1.0)).floor() as usize)
+        })?;
+    let footer_lines = wrap_footer_lines(shell.footer_lines(), DEV_FOOTER_VALUE_WRAP_CHARS);
+    let line = shell
+        .footer_scroll_line
+        .min(footer_lines.len().saturating_sub(row_items.len()))
+        .saturating_add(slot)
+        .min(footer_lines.len().saturating_sub(1));
+    let (label, value) = footer_lines.get(line)?;
+    let label_len = label.chars().count();
+    let value_len = value.chars().count();
+    let value_prefix = if label.is_empty() { 0 } else { label_len + 2 };
+    let label_id = format!("dev-footer-row-{slot}-label");
+    let value_id = format!("dev-footer-row-{slot}-value");
+    if !label.is_empty()
+        && let Some(label_item) = layout_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == label_id)
+        && rect_contains(label_item.bounds, x, y)
+    {
+        let column_edges = editor_column_edges_for_line(
+            column_metric_cache,
+            label,
+            &label_item.style,
+            label_item.bounds.height,
+        );
+        let relative_x = (x - label_item.bounds.x).max(0.0);
+        let column = nearest_editor_column(&column_edges, relative_x).min(label_len + 1);
+        return Some(TypeInspectorPosition { line, column });
+    }
+    if let Some(value_item) = layout_frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == value_id)
+    {
+        let column_edges = editor_column_edges_for_line(
+            column_metric_cache,
+            value,
+            &value_item.style,
+            value_item.bounds.height,
+        );
+        let relative_x = (x - value_item.bounds.x).max(0.0);
+        let local_column = nearest_editor_column(&column_edges, relative_x).min(value_len + 1);
+        return Some(TypeInspectorPosition {
+            line,
+            column: value_prefix + local_column,
+        });
+    }
+    Some(TypeInspectorPosition { line, column: 1 })
 }
 
 fn max_editor_scroll_column(model: &CodeEditorModel) -> usize {
@@ -3414,6 +4575,32 @@ fn max_editor_scroll_column_for_source(source: &str) -> usize {
         .max()
         .unwrap_or(0)
         .saturating_sub(1)
+}
+
+fn text_inset_for_scroll_column(scroll_column: usize, font_size: u32) -> String {
+    if scroll_column == 0 {
+        "0".to_owned()
+    } else {
+        format!("{:.2}", -(scroll_column as f32) * font_size as f32 * 0.62)
+    }
+}
+
+fn visible_rows_for_scroll_area(height: u32, padding: u32, row_height: u32, row_gap: u32) -> usize {
+    let inner_height = height.saturating_sub(padding.saturating_mul(2));
+    let row_stride = row_height.saturating_add(row_gap).max(1);
+    ((inner_height.saturating_add(row_gap)) / row_stride).max(1) as usize
+}
+
+fn clamp_type_inspector_width_for_viewport(width: u32, viewport_width: u32) -> u32 {
+    let main_width = viewport_width.saturating_sub(DEV_ROOT_PADDING.saturating_mul(2));
+    let non_sidebar_width = DEV_EDITOR_MIN_WIDTH
+        .saturating_add(DEV_TYPE_INSPECTOR_RESIZE_HANDLE_WIDTH)
+        .saturating_add(DEV_MAIN_GAP.saturating_mul(2));
+    let max_width = main_width
+        .saturating_sub(non_sidebar_width)
+        .min(DEV_TYPE_INSPECTOR_MAX_WIDTH);
+    let min_width = DEV_TYPE_INSPECTOR_MIN_WIDTH.min(max_width);
+    width.clamp(min_width, max_width)
 }
 
 fn editor_column_edges_for_line(
@@ -3462,6 +4649,19 @@ fn style_number_from_map(
         boon_document_model::StyleValue::Number(value) => Some(*value as f32),
         boon_document_model::StyleValue::Text(value) => value.parse::<f32>().ok(),
         boon_document_model::StyleValue::Bool(_) => None,
+    }
+}
+
+#[cfg(test)]
+fn style_text_from_map<'a>(
+    style: &'a BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> Option<&'a str> {
+    match style.get(key)? {
+        boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
+        boon_document_model::StyleValue::Number(_) | boon_document_model::StyleValue::Bool(_) => {
+            None
+        }
     }
 }
 
@@ -4464,6 +5664,45 @@ impl BoonLanguageService {
         }
     }
 
+    fn type_hinting(source_path_label: &str, source: &str) -> EditorTypeHinting {
+        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            return EditorTypeHinting {
+                backend: "disabled-large-buffer",
+                hints: Vec::new(),
+            };
+        }
+        let Ok(parsed) = boon_parser::parse_source(source_path_label, source) else {
+            return EditorTypeHinting {
+                backend: "unavailable",
+                hints: Vec::new(),
+            };
+        };
+        let report = boon_typecheck::check(&parsed);
+        if report.has_errors() {
+            return EditorTypeHinting {
+                backend: "unavailable",
+                hints: Vec::new(),
+            };
+        }
+        EditorTypeHinting {
+            backend: "boon_typecheck::TypeHintTable",
+            hints: report
+                .type_hint_table
+                .entries
+                .into_iter()
+                .map(|entry| EditorTypeHint {
+                    line: entry.line,
+                    start: entry.start,
+                    end: entry.end,
+                    anchor_column: entry.anchor_column,
+                    category: entry.category,
+                    compact_label: entry.compact_label,
+                    detail_label: entry.detail_label,
+                })
+                .collect(),
+        }
+    }
+
     fn syntax_tokens_fallback_limited(source: &str, max_lines: usize) -> Vec<SyntaxToken> {
         let mut end = 0usize;
         let mut lines = 0usize;
@@ -5111,6 +6350,23 @@ struct SyntaxHighlighting {
     tokens: Vec<SyntaxToken>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+struct EditorTypeHint {
+    line: usize,
+    start: usize,
+    end: usize,
+    anchor_column: usize,
+    category: String,
+    compact_label: String,
+    detail_label: String,
+}
+
+#[derive(Clone, Debug)]
+struct EditorTypeHinting {
+    backend: &'static str,
+    hints: Vec<EditorTypeHint>,
+}
+
 #[derive(Clone, Debug)]
 struct SyntaxToken {
     kind: &'static str,
@@ -5204,6 +6460,85 @@ fn syntax_tokens_by_line(tokens: &[SyntaxToken]) -> BTreeMap<usize, Vec<SyntaxTo
     by_line
 }
 
+fn type_hints_by_line(hints: &[EditorTypeHint]) -> BTreeMap<usize, Vec<EditorTypeHint>> {
+    let mut by_line: BTreeMap<usize, Vec<EditorTypeHint>> = BTreeMap::new();
+    for hint in hints {
+        by_line.entry(hint.line).or_default().push(hint.clone());
+    }
+    for hints in by_line.values_mut() {
+        hints.sort_by_key(|hint| (hint.anchor_column, hint.start, hint.end));
+    }
+    by_line
+}
+
+fn inline_type_hint_is_useful(hint: &EditorTypeHint, line_text: &str) -> bool {
+    let line_len = line_text.chars().count();
+    if line_len > 96 {
+        return false;
+    }
+    let label = hint.compact_label.trim();
+    let max_label_len = if hint.category == "function_signature" {
+        96
+    } else {
+        38
+    };
+    if label.is_empty() || label.chars().count() > max_label_len {
+        return false;
+    }
+    if hint.category != "function_signature" && label == "[...]" {
+        return false;
+    }
+    if label.contains("function(") {
+        return false;
+    }
+    match hint.category.as_str() {
+        "function_signature" => true,
+        "call" => inline_label_is_call_result(label),
+        "function_return" | "render_slot" => inline_label_is_high_signal(label),
+        "definition" => {
+            inline_label_is_tag_union(label)
+                || (label == "TEXT" && inline_text_field_is_useful(line_text))
+        }
+        _ => false,
+    }
+}
+
+fn inline_text_field_is_useful(line_text: &str) -> bool {
+    line_text.trim_end().ends_with(':')
+}
+
+fn inline_label_is_call_result(label: &str) -> bool {
+    inline_label_is_high_signal(label) || matches!(label, "TEXT" | "NUMBER" | "BOOL")
+}
+
+fn inline_label_is_high_signal(label: &str) -> bool {
+    label.starts_with("[kind:")
+        || label.starts_with("LIST<[kind:")
+        || label == "BOOL"
+        || inline_label_is_tag_union(label)
+}
+
+fn inline_label_is_tag_union(label: &str) -> bool {
+    label.contains(" | ") && !label.starts_with('[') && !label.starts_with("LIST<")
+}
+
+fn inline_type_hint_priority(hint: &EditorTypeHint) -> (u8, usize, usize) {
+    let category_priority = match hint.category.as_str() {
+        "function_signature" => 0,
+        "function_return" => 1,
+        "call" if hint.compact_label.starts_with("[kind:") => 2,
+        "call" => 3,
+        "render_slot" => 4,
+        "definition" => 5,
+        _ => 8,
+    };
+    (
+        category_priority,
+        hint.compact_label.chars().count(),
+        hint.start,
+    )
+}
+
 #[derive(Clone, Debug)]
 struct CodeEditorModel {
     file_name: String,
@@ -5220,6 +6555,9 @@ struct CodeEditorModel {
     syntax_tokens_by_line: BTreeMap<usize, Vec<SyntaxToken>>,
     syntax_backend: &'static str,
     syntax_parser_backed: bool,
+    type_hints: Vec<EditorTypeHint>,
+    type_hints_by_line: BTreeMap<usize, Vec<EditorTypeHint>>,
+    type_hint_backend: &'static str,
     formatted_preview_hash: Option<String>,
     clipboard_cache: String,
     last_command: Option<&'static str>,
@@ -5237,6 +6575,8 @@ impl CodeEditorModel {
         };
         let syntax = BoonLanguageService::syntax_highlighting(source_text);
         let syntax_tokens_by_line = syntax_tokens_by_line(&syntax.tokens);
+        let type_hinting = BoonLanguageService::type_hinting(source_path_label, source_text);
+        let type_hints_by_line = type_hints_by_line(&type_hinting.hints);
         let buffer = EditorBuffer::new(source_text);
         let line_count = buffer.line_count();
         let max_scroll_column = max_editor_scroll_column_for_source(source_text);
@@ -5255,6 +6595,9 @@ impl CodeEditorModel {
             syntax_tokens_by_line,
             syntax_backend: syntax.backend,
             syntax_parser_backed: syntax.parser_backed,
+            type_hints: type_hinting.hints,
+            type_hints_by_line,
+            type_hint_backend: type_hinting.backend,
             formatted_preview_hash,
             clipboard_cache: String::new(),
             last_command: None,
@@ -5271,6 +6614,72 @@ impl CodeEditorModel {
 
     fn syntax_parser_backed(&self) -> bool {
         self.syntax_parser_backed
+    }
+
+    fn type_hint_backend(&self) -> &'static str {
+        self.type_hint_backend
+    }
+
+    fn type_hint_count(&self) -> usize {
+        self.type_hints.len()
+    }
+
+    fn type_hint_samples(&self) -> Vec<serde_json::Value> {
+        self.type_hints
+            .iter()
+            .take(12)
+            .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
+            .collect()
+    }
+
+    fn type_hints_for_line(&self, line_number: usize) -> &[EditorTypeHint] {
+        self.type_hints_by_line
+            .get(&line_number)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn inline_type_hints_for_line(&self, line_number: usize) -> Vec<EditorTypeHint> {
+        let line_text = self.line_text(line_number.saturating_sub(1));
+        let Some(mut hint) = self
+            .type_hints_for_line(line_number)
+            .iter()
+            .filter(|hint| inline_type_hint_is_useful(hint, &line_text))
+            .min_by_key(|hint| inline_type_hint_priority(hint))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let line_len = line_text.chars().count();
+        hint.anchor_column = line_len.saturating_add(1);
+        vec![hint]
+    }
+
+    fn type_hint_at_position(&self, position: &EditorPosition) -> Option<&EditorTypeHint> {
+        self.type_hints_by_line
+            .get(&position.line)?
+            .iter()
+            .filter(|hint| self.type_hint_contains_position(hint, position))
+            .min_by_key(|hint| hint.end.saturating_sub(hint.start))
+    }
+
+    fn type_hint_contains_position(
+        &self,
+        hint: &EditorTypeHint,
+        position: &EditorPosition,
+    ) -> bool {
+        let start = self.position_for_offset(hint.start);
+        let end = self.position_for_offset(hint.end);
+        if position.line < start.line || position.line > end.line {
+            return false;
+        }
+        if position.line == start.line && position.column < start.column {
+            return false;
+        }
+        if position.line == end.line && position.column > end.column.max(start.column) {
+            return false;
+        }
+        true
     }
 
     fn syntax_categories(&self) -> Vec<&'static str> {
@@ -5469,6 +6878,10 @@ impl CodeEditorModel {
         self.syntax_tokens_by_line = syntax_tokens_by_line(&self.syntax_tokens);
         self.syntax_backend = syntax.backend;
         self.syntax_parser_backed = syntax.parser_backed;
+        let type_hinting = BoonLanguageService::type_hinting(&self.file_name, &self.source_text);
+        self.type_hints = type_hinting.hints;
+        self.type_hints_by_line = type_hints_by_line(&self.type_hints);
+        self.type_hint_backend = type_hinting.backend;
         self.formatted_preview_hash =
             if self.source_text.len() <= BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
                 BoonLanguageService::format(&self.file_name, &self.source_text)
@@ -5872,6 +7285,13 @@ impl CodeEditorModel {
             "syntax_render_categories": self.syntax_render_categories(),
             "syntax_render_segment_samples": self.syntax_render_segment_samples(),
             "syntax_render_segment_count": self.syntax_render_segments_for_visible_lines(40).len(),
+            "type_hint_backend": self.type_hint_backend(),
+            "type_hint_count": self.type_hint_count(),
+            "type_hint_samples": self.type_hint_samples(),
+            "caret_type_hint": self
+                .type_hint_at_position(self.caret())
+                .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
+                .unwrap_or_else(|| json!(null)),
             "syntax_invalid_token_samples": self.syntax_invalid_token_samples(),
             "syntax_theme": self.syntax_theme_report(),
             "invalid_reserved_token_probe": BoonLanguageService::invalid_syntax_probe()
@@ -5926,12 +7346,25 @@ impl CodeEditorView {
         }
     }
 
+    #[cfg(test)]
     fn append_to(
         &self,
         frame: &mut boon_document_model::DocumentFrame,
         parent: boon_document_model::DocumentNodeId,
         model: &CodeEditorModel,
         height: u32,
+        caret_visible: bool,
+    ) {
+        self.append_to_with_width(frame, parent, model, height, "fill", caret_visible);
+    }
+
+    fn append_to_with_width(
+        &self,
+        frame: &mut boon_document_model::DocumentFrame,
+        parent: boon_document_model::DocumentNodeId,
+        model: &CodeEditorModel,
+        height: u32,
+        width: &str,
         caret_visible: bool,
     ) {
         let editor_height = height.max(96);
@@ -5945,7 +7378,7 @@ impl CodeEditorView {
                 ("border", BOON_EDITOR_DARK_BACKGROUND),
                 ("padding", &BOON_EDITOR_PADDING.to_string()),
                 ("height", &editor_height.to_string()),
-                ("width", "fill"),
+                ("width", width),
                 ("scroll", "true"),
                 ("scroll_x", "true"),
                 ("font", self.font_family),
@@ -6082,6 +7515,7 @@ impl CodeEditorView {
         caret_visible: bool,
     ) -> boon_document_model::DocumentNode {
         let syntax_spans_json = syntax_spans_json(segments);
+        let text_inset = text_inset_for_scroll_column(model.scroll_column, BOON_EDITOR_FONT_SIZE);
         let mut node = dev_node(
             &format!("dev-code-editor-line-text-{line_number}"),
             boon_document_model::DocumentNodeKind::Text,
@@ -6095,14 +7529,25 @@ impl CodeEditorView {
                 ("font", self.font_family),
                 ("font_features", BOON_EDITOR_FONT_FEATURES),
                 ("syntax_spans_json", &syntax_spans_json),
-                ("text_inset", "0"),
-                ("text_clip_padding", "4"),
+                ("text_inset", text_inset.as_str()),
+                ("text_clip_padding", "0"),
                 ("editor_selection_color", BOON_EDITOR_SELECTION),
                 ("editor_caret_color", BOON_EDITOR_CURSOR),
                 ("editor_bracket_color", BOON_EDITOR_BRACKET_MATCH),
                 ("editor_selection_match_color", BOON_EDITOR_SELECTION_MATCH),
             ],
         );
+        let type_hints = model.inline_type_hints_for_line(line_number);
+        if !type_hints.is_empty() {
+            node.style.insert(
+                "editor_type_hints_json".to_owned(),
+                boon_document_model::StyleValue::Text(editor_type_hints_json(&type_hints)),
+            );
+            node.style.insert(
+                "editor_type_hint_color".to_owned(),
+                boon_document_model::StyleValue::Text("#8aa0b8".to_owned()),
+            );
+        }
         apply_dev_editor_visual_style(
             &mut node.style,
             model,
@@ -6133,6 +7578,190 @@ fn syntax_spans_json(segments: &[SyntaxLineSegment]) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&spans).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn type_inspector_syntax_spans_json(text: &str) -> String {
+    syntax_spans_json(&type_inspector_syntax_segments(text))
+}
+
+fn type_inspector_syntax_segments(line: &str) -> Vec<SyntaxLineSegment> {
+    let mut segments = Vec::new();
+    let mut index = 0;
+    let mut column = 1;
+    let mut expect_text_value_open = false;
+    let mut in_text_value = false;
+    while index < line.len() {
+        let rest = &line[index..];
+        let ch = rest.chars().next().unwrap_or_default();
+        if in_text_value {
+            if ch == '}' {
+                push_type_inspector_segment(
+                    &mut segments,
+                    "punctuation",
+                    1,
+                    &mut column,
+                    ch.to_string(),
+                );
+                index += ch.len_utf8();
+                in_text_value = false;
+                continue;
+            }
+            let text = rest
+                .chars()
+                .take_while(|next| *next != '}')
+                .collect::<String>();
+            index += text.len();
+            push_type_inspector_segment(
+                &mut segments,
+                "text-literal-content",
+                1,
+                &mut column,
+                text,
+            );
+            continue;
+        }
+        if ch.is_whitespace() {
+            let text = rest
+                .chars()
+                .take_while(|next| next.is_whitespace())
+                .collect::<String>();
+            push_type_inspector_segment(&mut segments, "variable", 1, &mut column, text);
+            index += segments
+                .last()
+                .map(|segment| segment.text.len())
+                .unwrap_or(0);
+            continue;
+        }
+        if rest.starts_with("...") {
+            expect_text_value_open = false;
+            push_type_inspector_segment(
+                &mut segments,
+                "chain-alt",
+                1,
+                &mut column,
+                "...".to_owned(),
+            );
+            index += 3;
+            continue;
+        }
+        if ch == '"' {
+            expect_text_value_open = false;
+            let mut escaped = false;
+            let mut end = ch.len_utf8();
+            for (offset, next) in rest[ch.len_utf8()..].char_indices() {
+                end = ch.len_utf8() + offset + next.len_utf8();
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if next == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if next == '"' {
+                    break;
+                }
+            }
+            let text = rest[..end.min(rest.len())].to_owned();
+            index += text.len();
+            push_type_inspector_segment(&mut segments, "string", 1, &mut column, text);
+            continue;
+        }
+        if ch.is_ascii_digit()
+            || (ch == '-'
+                && rest
+                    .chars()
+                    .nth(1)
+                    .is_some_and(|next| next.is_ascii_digit()))
+        {
+            expect_text_value_open = false;
+            let mut first = true;
+            let text = rest
+                .chars()
+                .take_while(|next| {
+                    if first {
+                        first = false;
+                        return next.is_ascii_digit() || *next == '-';
+                    }
+                    next.is_ascii_digit() || *next == '.'
+                })
+                .collect::<String>();
+            index += text.len();
+            push_type_inspector_segment(&mut segments, "number", 1, &mut column, text);
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let text = rest
+                .chars()
+                .take_while(|next| next.is_ascii_alphanumeric() || matches!(*next, '_' | '/' | '-'))
+                .collect::<String>();
+            let after = rest.get(text.len()..).unwrap_or_default();
+            let kind = type_inspector_word_kind(&text, after);
+            index += text.len();
+            expect_text_value_open = text == "TEXT";
+            push_type_inspector_segment(&mut segments, kind, 1, &mut column, text);
+            continue;
+        }
+        let text = ch.to_string();
+        let kind = if matches!(
+            ch,
+            '[' | ']' | '{' | '}' | '<' | '>' | ':' | ',' | '(' | ')'
+        ) {
+            "punctuation"
+        } else if matches!(ch, '|' | '=' | '+' | '-' | '*' | '/') {
+            "operator"
+        } else if ch == '.' {
+            "dot"
+        } else {
+            "variable"
+        };
+        if ch == '{' && expect_text_value_open {
+            in_text_value = true;
+        }
+        if !ch.is_whitespace() && ch != '{' {
+            expect_text_value_open = false;
+        }
+        index += ch.len_utf8();
+        push_type_inspector_segment(&mut segments, kind, 1, &mut column, text);
+    }
+    segments
+}
+
+fn type_inspector_word_kind(text: &str, after: &str) -> &'static str {
+    match text {
+        "TEXT" | "NUMBER" | "BOOL" | "LIST" | "VALUE" | "ABSENT" => "type",
+        "FUNCTION" | "function" => "keyword",
+        "true" | "false" | "null" => "tag",
+        _ if after.trim_start().starts_with(':') => "definition",
+        _ if text
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase()) =>
+        {
+            "tag"
+        }
+        _ => "variable",
+    }
+}
+
+fn push_type_inspector_segment(
+    segments: &mut Vec<SyntaxLineSegment>,
+    kind: &'static str,
+    line: usize,
+    column: &mut usize,
+    text: String,
+) {
+    *column += text.chars().count();
+    segments.push(SyntaxLineSegment::new(
+        kind,
+        line,
+        *column - text.chars().count(),
+        text,
+    ));
+}
+
+fn editor_type_hints_json(hints: &[EditorTypeHint]) -> String {
+    serde_json::to_string(hints).unwrap_or_else(|_| "[]".to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -6382,6 +8011,48 @@ impl PreviewTransport {
             }),
         }
     }
+
+    fn runtime_value(
+        &self,
+        paths: &[String],
+        source_sha256: &str,
+        state_summary_hash: &str,
+    ) -> serde_json::Value {
+        let Some(connect) = &self.connect else {
+            return json!({
+                "status": "not-bound",
+                "kind": "runtime-value-result",
+                "transport_bound": false,
+                "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false
+            });
+        };
+        match send_preview_ipc_request_with_timeouts(
+            connect,
+            json!({
+                "kind": "runtime-value",
+                "paths": paths,
+                "source_sha256": source_sha256,
+                "state_summary_hash": state_summary_hash,
+                "max_depth": DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH,
+                "max_fields": DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS,
+                "max_list_items": DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS
+            }),
+            Duration::ZERO,
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+        ) {
+            Ok(value) => value,
+            Err(error) => json!({
+                "status": "unavailable",
+                "kind": "runtime-value-result",
+                "transport_bound": true,
+                "diagnostic": error.to_string(),
+                "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false
+            }),
+        }
+    }
 }
 
 struct DevWindowShell {
@@ -6408,7 +8079,15 @@ struct DevWindowShell {
     last_dev_command_status: String,
     last_dev_command_detail: Option<String>,
     footer_scroll_line: usize,
+    footer_selection: Option<FooterSelection>,
+    type_inspector_scroll_line: usize,
+    type_inspector_scroll_column: usize,
+    type_inspector_selection: Option<TypeInspectorSelection>,
+    type_inspector_width: u32,
+    type_inspector_resize_hovered: bool,
+    hovered_editor_position: Option<EditorPosition>,
     caret_visible: bool,
+    runtime_value_cache: RefCell<Option<RuntimeValueCache>>,
 }
 
 struct PendingPreviewReplace {
@@ -6416,6 +8095,97 @@ struct PendingPreviewReplace {
     source_revision: u64,
     queued_at: Instant,
     rx: mpsc::Receiver<serde_json::Value>,
+}
+
+struct ActiveTypeHint<'a> {
+    hint: &'a EditorTypeHint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeInspectorPosition {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeInspectorSelection {
+    anchor: TypeInspectorPosition,
+    head: TypeInspectorPosition,
+}
+
+type FooterPosition = TypeInspectorPosition;
+type FooterSelection = TypeInspectorSelection;
+
+struct TypeInspectorContent {
+    detail_lines: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeValueCache {
+    source_hash: String,
+    state_hash: String,
+    paths_key: String,
+    summary: Option<serde_json::Value>,
+}
+
+impl TypeInspectorSelection {
+    fn ordered(&self) -> (TypeInspectorPosition, TypeInspectorPosition) {
+        if (self.anchor.line, self.anchor.column) <= (self.head.line, self.head.column) {
+            (self.anchor.clone(), self.head.clone())
+        } else {
+            (self.head.clone(), self.anchor.clone())
+        }
+    }
+
+    fn is_collapsed(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    fn columns_for_line(&self, line: usize, line_text: &str) -> Option<(usize, usize)> {
+        if self.is_collapsed() {
+            return None;
+        }
+        let (start, end) = self.ordered();
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let line_len = line_text.chars().count();
+        let start_col = if line == start.line {
+            start.column.saturating_sub(1).min(line_len)
+        } else {
+            0
+        };
+        let end_col = if line == end.line {
+            end.column.saturating_sub(1).min(line_len)
+        } else {
+            line_len
+        };
+        (end_col > start_col).then_some((start_col, end_col))
+    }
+
+    fn selected_text(&self, lines: &[String]) -> String {
+        if self.is_collapsed() {
+            return String::new();
+        }
+        let (start, end) = self.ordered();
+        let mut selected = Vec::new();
+        for line in start.line..=end.line {
+            let Some(line_text) = lines.get(line) else {
+                continue;
+            };
+            let Some((start_col, end_col)) = self.columns_for_line(line, line_text) else {
+                continue;
+            };
+            selected.push(
+                line_text
+                    .chars()
+                    .skip(start_col)
+                    .take(end_col.saturating_sub(start_col))
+                    .collect::<String>(),
+            );
+        }
+        selected.join("\n")
+    }
 }
 
 impl Clone for DevWindowShell {
@@ -6445,7 +8215,15 @@ impl Clone for DevWindowShell {
             last_dev_command_status: self.last_dev_command_status.clone(),
             last_dev_command_detail: self.last_dev_command_detail.clone(),
             footer_scroll_line: self.footer_scroll_line,
+            footer_selection: self.footer_selection.clone(),
+            type_inspector_scroll_line: self.type_inspector_scroll_line,
+            type_inspector_scroll_column: self.type_inspector_scroll_column,
+            type_inspector_selection: self.type_inspector_selection.clone(),
+            type_inspector_width: self.type_inspector_width,
+            type_inspector_resize_hovered: self.type_inspector_resize_hovered,
+            hovered_editor_position: self.hovered_editor_position.clone(),
             caret_visible: self.caret_visible,
+            runtime_value_cache: RefCell::new(self.runtime_value_cache.borrow().clone()),
         }
     }
 }
@@ -6498,7 +8276,15 @@ impl DevWindowShell {
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
             footer_scroll_line: 0,
+            footer_selection: None,
+            type_inspector_scroll_line: 0,
+            type_inspector_scroll_column: 0,
+            type_inspector_selection: None,
+            type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
+            type_inspector_resize_hovered: false,
+            hovered_editor_position: None,
             caret_visible: true,
+            runtime_value_cache: RefCell::new(None),
         }
     }
 
@@ -6508,6 +8294,265 @@ impl DevWindowShell {
 
     fn document_for_viewport(&self, width: u32, height: u32) -> boon_document_model::DocumentFrame {
         dev_shell_document(self, width, height)
+    }
+
+    fn type_inspector_width_for_viewport(&self, viewport_width: u32) -> u32 {
+        clamp_type_inspector_width_for_viewport(self.type_inspector_width, viewport_width)
+    }
+
+    fn set_type_inspector_width_from_pointer(
+        &mut self,
+        surface_width: u32,
+        pointer_x: f32,
+    ) -> bool {
+        let raw_width = (surface_width as f32 - pointer_x - DEV_ROOT_PADDING as f32)
+            .round()
+            .max(0.0) as u32;
+        let next_width = clamp_type_inspector_width_for_viewport(raw_width, surface_width);
+        if self.type_inspector_width == next_width {
+            return false;
+        }
+        self.type_inspector_width = next_width;
+        true
+    }
+
+    fn current_cursor_icon(&self) -> boon_native_app_window::NativeCursorIcon {
+        if self.type_inspector_resize_hovered {
+            boon_native_app_window::NativeCursorIcon::ColumnResize
+        } else {
+            boon_native_app_window::NativeCursorIcon::Default
+        }
+    }
+
+    fn active_type_hint(&self) -> Option<ActiveTypeHint<'_>> {
+        let buffer = &self.workspace.selected_buffer;
+        if let Some(position) = self.hovered_editor_position.as_ref()
+            && let Some(hint) = buffer.type_hint_at_position(position)
+        {
+            return Some(ActiveTypeHint { hint });
+        }
+        let caret = buffer.caret().clone();
+        buffer
+            .type_hint_at_position(&caret)
+            .or_else(|| {
+                (caret.column > 1)
+                    .then(|| EditorPosition {
+                        line: caret.line,
+                        column: caret.column.saturating_sub(1),
+                    })
+                    .and_then(|position| buffer.type_hint_at_position(&position))
+            })
+            .map(|hint| ActiveTypeHint { hint })
+    }
+
+    fn type_inspector_content(&self, wrap_chars: usize) -> TypeInspectorContent {
+        let Some(active) = self.active_type_hint() else {
+            return TypeInspectorContent {
+                detail_lines: vec!["no inferred type".to_owned()],
+            };
+        };
+        let token = self
+            .workspace
+            .selected_buffer
+            .source_text
+            .get(active.hint.start..active.hint.end)
+            .map(|text| one_line(text.trim(), wrap_chars))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "-".to_owned());
+        TypeInspectorContent {
+            detail_lines: self.type_inspector_detail_lines(&active, &token, wrap_chars),
+        }
+    }
+
+    fn type_inspector_detail_lines(
+        &self,
+        active: &ActiveTypeHint<'_>,
+        token: &str,
+        wrap_chars: usize,
+    ) -> Vec<String> {
+        let root = type_inspector_root_name(token);
+        let value_summary = self.runtime_value_summary(&root, wrap_chars);
+        type_tree_lines_with_inline_values(
+            &root,
+            &active.hint.detail_label,
+            value_summary.as_ref(),
+            wrap_chars,
+        )
+    }
+
+    fn type_inspector_max_scroll_column(&self) -> usize {
+        self.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .detail_lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1)
+    }
+
+    fn set_type_inspector_selection(
+        &mut self,
+        anchor: TypeInspectorPosition,
+        head: TypeInspectorPosition,
+    ) {
+        self.type_inspector_selection = Some(TypeInspectorSelection { anchor, head });
+    }
+
+    fn select_all_type_inspector_content(&mut self) {
+        let lines = self
+            .type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .detail_lines;
+        let end_line = lines.len().saturating_sub(1);
+        let end_column = lines
+            .get(end_line)
+            .map(|line| line.chars().count().saturating_add(1))
+            .unwrap_or(1);
+        self.type_inspector_selection = Some(TypeInspectorSelection {
+            anchor: TypeInspectorPosition { line: 0, column: 1 },
+            head: TypeInspectorPosition {
+                line: end_line,
+                column: end_column,
+            },
+        });
+    }
+
+    fn selected_type_inspector_text(&self) -> String {
+        let lines = self
+            .type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .detail_lines;
+        self.type_inspector_selection
+            .as_ref()
+            .map(|selection| selection.selected_text(&lines))
+            .unwrap_or_default()
+    }
+
+    fn copy_type_inspector_selection_to_adapter(
+        &self,
+        clipboard: &mut dyn ClipboardAdapter,
+    ) -> serde_json::Value {
+        let text = self.selected_type_inspector_text();
+        match clipboard.set_text(&text) {
+            Ok(()) => {
+                json!({"status": "pass", "command": "type-inspector-copy", "bytes": text.len()})
+            }
+            Err(error) => {
+                json!({"status": "fallback", "command": "type-inspector-copy", "reason": error, "bytes": text.len()})
+            }
+        }
+    }
+
+    fn footer_display_lines(&self) -> Vec<String> {
+        footer_display_lines(&wrap_footer_lines(
+            self.footer_lines(),
+            DEV_FOOTER_VALUE_WRAP_CHARS,
+        ))
+    }
+
+    fn set_footer_selection(&mut self, anchor: FooterPosition, head: FooterPosition) {
+        self.footer_selection = Some(TypeInspectorSelection { anchor, head });
+    }
+
+    fn select_all_footer_content(&mut self) {
+        let lines = self.footer_display_lines();
+        let end_line = lines.len().saturating_sub(1);
+        let end_column = lines
+            .get(end_line)
+            .map(|line| line.chars().count().saturating_add(1))
+            .unwrap_or(1);
+        self.footer_selection = Some(TypeInspectorSelection {
+            anchor: TypeInspectorPosition { line: 0, column: 1 },
+            head: TypeInspectorPosition {
+                line: end_line,
+                column: end_column,
+            },
+        });
+    }
+
+    fn selected_footer_text(&self) -> String {
+        let lines = self.footer_display_lines();
+        self.footer_selection
+            .as_ref()
+            .map(|selection| selection.selected_text(&lines))
+            .unwrap_or_default()
+    }
+
+    fn copy_footer_selection_to_adapter(
+        &self,
+        clipboard: &mut dyn ClipboardAdapter,
+    ) -> serde_json::Value {
+        let text = self.selected_footer_text();
+        match clipboard.set_text(&text) {
+            Ok(()) => json!({"status": "pass", "command": "footer-copy", "bytes": text.len()}),
+            Err(error) => {
+                json!({"status": "fallback", "command": "footer-copy", "reason": error, "bytes": text.len()})
+            }
+        }
+    }
+
+    fn runtime_value_summary(&self, token: &str, wrap_chars: usize) -> Option<serde_json::Value> {
+        self.runtime_value_for_token(token, wrap_chars).flatten()
+    }
+
+    fn runtime_value_for_token(
+        &self,
+        token: &str,
+        _wrap_chars: usize,
+    ) -> Option<Option<serde_json::Value>> {
+        let paths = runtime_value_path_candidates(token);
+        if paths.is_empty() {
+            return None;
+        }
+        let buffer = &self.workspace.selected_buffer;
+        let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
+        let runtime_summary = self.visible_runtime_summary(&source_hash)?;
+        let state_hash = runtime_summary
+            .get("state_summary_hash")
+            .and_then(serde_json::Value::as_str)?;
+        let paths_key = paths.join("|");
+        if let Some(cache) = self.runtime_value_cache.borrow().as_ref()
+            && cache.source_hash == source_hash
+            && cache.state_hash == state_hash
+            && cache.paths_key == paths_key
+        {
+            return Some(cache.summary.clone());
+        }
+        let response = self
+            .preview_transport
+            .runtime_value(&paths, &source_hash, state_hash);
+        let summary = selected_runtime_value_summary(&response);
+        if summary.is_some()
+            && response.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        {
+            *self.runtime_value_cache.borrow_mut() = Some(RuntimeValueCache {
+                source_hash,
+                state_hash: state_hash.to_owned(),
+                paths_key,
+                summary: summary.clone(),
+            });
+        }
+        Some(summary)
+    }
+
+    fn type_inspector_runtime_value_active(&self) -> bool {
+        let Some(active) = self.active_type_hint() else {
+            return false;
+        };
+        let token = self
+            .workspace
+            .selected_buffer
+            .source_text
+            .get(active.hint.start..active.hint.end)
+            .map(str::trim)
+            .unwrap_or_default();
+        !runtime_value_path_candidates(token).is_empty()
+    }
+
+    fn preview_summary_refresh_interval(&self) -> Duration {
+        if self.type_inspector_runtime_value_active() {
+            Duration::from_millis(DEV_PREVIEW_INSPECTOR_REFRESH_MS)
+        } else {
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS)
+        }
     }
 
     fn footer_lines(&self) -> Vec<(String, String)> {
@@ -6584,6 +8629,12 @@ impl DevWindowShell {
                 ),
             ),
         ];
+        for (index, diagnostic) in buffer.diagnostics.iter().enumerate() {
+            lines.push((
+                format!("Code diagnostic {}", index + 1),
+                one_line(diagnostic, 180),
+            ));
+        }
         if runtime_state_hash != "-" {
             lines.push((
                 "Runtime".to_owned(),
@@ -6600,15 +8651,22 @@ impl DevWindowShell {
             ));
         }
         if preview_error_count > 0 || preview_error != "-" {
-            lines.push((
-                "Preview error".to_owned(),
+            let preview_error_summary = if preview_error_count > 0 {
                 format!(
-                    "{} error{}, {}",
+                    "{} reported error event{}; latest details below",
                     preview_error_count,
                     if preview_error_count == 1 { "" } else { "s" },
-                    one_line(preview_error, 96)
-                ),
-            ));
+                )
+            } else {
+                "latest error details below".to_owned()
+            };
+            lines.push(("Preview error".to_owned(), preview_error_summary));
+            for (index, detail) in preview_error_detail_lines(preview_error)
+                .into_iter()
+                .enumerate()
+            {
+                lines.push((format!("Preview detail {}", index + 1), detail));
+            }
         }
         if let Some(pending) = &self.pending_replace {
             let command_id = pending
@@ -6811,6 +8869,7 @@ impl DevWindowShell {
 
     fn dispatch_source_path(&mut self, source_path: &str) -> serde_json::Value {
         if source_path == "dev.tabs.new" {
+            self.hovered_editor_position = None;
             let mut value = self.create_blank_custom_tab();
             if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
                 value["preview_transport"] = self.queue_selected_preview("NewCustomTab");
@@ -6821,6 +8880,7 @@ impl DevWindowShell {
         }
         if let Some(example_id) = source_path.strip_prefix("dev.tabs.select.") {
             let started = Instant::now();
+            self.hovered_editor_position = None;
             return self
                 .workspace
                 .select_example(&self.catalog, example_id)
@@ -6844,8 +8904,12 @@ impl DevWindowShell {
 
         let mut value = match source_path {
             "dev.commands.run" => self.workspace.run_selected(),
-            "dev.commands.format" => self.workspace.format_selected(),
+            "dev.commands.format" => {
+                self.hovered_editor_position = None;
+                self.workspace.format_selected()
+            }
             "dev.commands.reset" => {
+                self.hovered_editor_position = None;
                 self.workspace
                     .reset_selected(&self.catalog)
                     .unwrap_or_else(|error| {
@@ -6857,11 +8921,14 @@ impl DevWindowShell {
                     })
             }
             "dev.commands.remove_custom" => {
+                self.hovered_editor_position = None;
                 self.workspace.remove_selected_custom(&mut self.catalog)
             }
-            "dev.editor.insert_text" => self
-                .workspace
-                .apply_editor_text_input("\n-- host synthetic editor input"),
+            "dev.editor.insert_text" => {
+                self.hovered_editor_position = None;
+                self.workspace
+                    .apply_editor_text_input("\n-- host synthetic editor input")
+            }
             other => {
                 return json!({
                     "status": "fail",
@@ -7297,9 +9364,10 @@ impl DevWindowShell {
     }
 
     fn refresh_preview_summary_if_due(&mut self, now: Instant) -> bool {
-        let due = self.last_preview_summary_refresh.is_none_or(|last| {
-            now.duration_since(last) >= Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS)
-        });
+        let refresh_interval = self.preview_summary_refresh_interval();
+        let due = self
+            .last_preview_summary_refresh
+            .is_none_or(|last| now.duration_since(last) >= refresh_interval);
         if !due {
             return false;
         }
@@ -7322,9 +9390,10 @@ impl DevWindowShell {
     }
 
     fn preview_summary_wake_after_ms(&self, now: Instant) -> u64 {
+        let refresh_interval = self.preview_summary_refresh_interval();
         self.last_preview_summary_refresh
             .and_then(|last| {
-                let due_at = last + Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS);
+                let due_at = last + refresh_interval;
                 due_at.checked_duration_since(now)
             })
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -7866,7 +9935,7 @@ impl DevWindowShell {
 
 fn dev_shell_document(
     shell: &DevWindowShell,
-    _viewport_width: u32,
+    viewport_width: u32,
     viewport_height: u32,
 ) -> boon_document_model::DocumentFrame {
     use boon_document_model::{DocumentFrame, DocumentNodeKind};
@@ -7885,7 +9954,7 @@ fn dev_shell_document(
         &[
             ("bg", DEV_BG),
             ("color", DEV_TEXT),
-            ("padding", "10"),
+            ("padding", &DEV_ROOT_PADDING.to_string()),
             ("gap", "8"),
             ("width", "fill"),
             ("height", &root_height.to_string()),
@@ -8140,12 +10209,44 @@ fn dev_shell_document(
         }
         append_child(&mut frame, toolbar_parent.clone(), button);
     }
-    shell.editor_view.append_to(
+    let main_gap = DEV_MAIN_GAP;
+    let type_inspector_width = shell.type_inspector_width_for_viewport(viewport_width);
+    let editor_width = viewport_width
+        .saturating_sub(DEV_ROOT_PADDING)
+        .saturating_sub(main_gap.saturating_mul(2))
+        .saturating_sub(DEV_TYPE_INSPECTOR_RESIZE_HANDLE_WIDTH)
+        .saturating_sub(type_inspector_width)
+        .max(DEV_EDITOR_MIN_WIDTH);
+    let editor_width = editor_width.to_string();
+    let main = dev_node(
+        "dev-main-row",
+        DocumentNodeKind::Row,
+        None,
+        &[
+            ("bg", DEV_BG),
+            ("padding", "0"),
+            ("gap", &main_gap.to_string()),
+            ("height", &editor_height.to_string()),
+            ("width", "fill"),
+        ],
+    );
+    let main_parent = main.id.clone();
+    append_child(&mut frame, root.clone(), main);
+    shell.editor_view.append_to_with_width(
         &mut frame,
-        root.clone(),
+        main_parent.clone(),
         &shell.workspace.selected_buffer,
         editor_height,
+        &editor_width,
         shell.caret_visible,
+    );
+    append_dev_type_inspector_resize_handle(&mut frame, main_parent.clone(), shell, editor_height);
+    append_dev_type_inspector(
+        &mut frame,
+        main_parent,
+        shell,
+        editor_height,
+        type_inspector_width,
     );
     append_dev_footer(&mut frame, root, shell, footer_height);
     frame.focus = Some(boon_document_model::DocumentNodeId(
@@ -8188,8 +10289,8 @@ fn append_dev_footer(
         &[
             ("bg", DEV_BG),
             ("border", DEV_BORDER_MUTED),
-            ("padding", "6"),
-            ("gap", "3"),
+            ("padding", &DEV_FOOTER_SCROLL_PADDING.to_string()),
+            ("gap", &DEV_FOOTER_ROW_GAP.to_string()),
             ("height", &scroll_height.to_string()),
             ("width", "fill"),
             ("scroll", "true"),
@@ -8216,14 +10317,20 @@ fn append_dev_footer(
     );
     append_child(frame, footer_parent, scroll);
 
-    let visible_line_count =
-        (scroll_height.saturating_sub(12) / DEV_FOOTER_LINE_HEIGHT).max(1) as usize;
+    let visible_line_count = visible_rows_for_scroll_area(
+        scroll_height,
+        DEV_FOOTER_SCROLL_PADDING,
+        DEV_FOOTER_LINE_HEIGHT,
+        DEV_FOOTER_ROW_GAP,
+    );
     for (visible_index, (label, value)) in footer_lines
-        .into_iter()
+        .iter()
+        .cloned()
         .skip(effective_scroll_line)
         .take(visible_line_count)
         .enumerate()
     {
+        let line_index = effective_scroll_line + visible_index;
         let row_id = format!("dev-footer-row-{visible_index}");
         let row_bg = if visible_index % 2 == 0 {
             DEV_BG
@@ -8244,39 +10351,227 @@ fn append_dev_footer(
         );
         let row_parent = row.id.clone();
         append_child(frame, scroll_parent.clone(), row);
-        append_child(
-            frame,
-            row_parent.clone(),
-            dev_text_node(
-                &format!("dev-footer-row-{visible_index}-label"),
-                &label,
-                DEV_ACCENT,
-                12,
-                &[
-                    ("bg", row_bg),
-                    ("width", "92"),
-                    ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
-                    ("font", BOON_EDITOR_FONT_FAMILY),
-                ],
-            ),
+        let mut label_node = dev_text_node(
+            &format!("dev-footer-row-{visible_index}-label"),
+            &label,
+            DEV_ACCENT,
+            12,
+            &[
+                ("bg", row_bg),
+                ("width", "92"),
+                ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
         );
+        let mut value_node = dev_text_node(
+            &format!("dev-footer-row-{visible_index}-value"),
+            &value,
+            DEV_TEXT_MUTED,
+            12,
+            &[
+                ("bg", row_bg),
+                ("width", "fill"),
+                ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                ("font", BOON_EDITOR_FONT_FAMILY),
+            ],
+        );
+        apply_footer_selection_style(
+            &mut label_node.style,
+            shell.footer_selection.as_ref(),
+            line_index,
+            &label,
+            &value,
+            FooterLinePart::Label,
+        );
+        apply_footer_selection_style(
+            &mut value_node.style,
+            shell.footer_selection.as_ref(),
+            line_index,
+            &label,
+            &value,
+            FooterLinePart::Value,
+        );
+        append_child(frame, row_parent.clone(), label_node);
+        append_child(frame, row_parent, value_node);
+    }
+}
+
+fn append_dev_type_inspector_resize_handle(
+    frame: &mut boon_document_model::DocumentFrame,
+    parent: boon_document_model::DocumentNodeId,
+    shell: &DevWindowShell,
+    height: u32,
+) {
+    let hovered = shell.type_inspector_resize_hovered;
+    let handle_bg = if hovered {
+        DEV_ACCENT
+    } else {
+        DEV_BORDER_MUTED
+    };
+    let mut handle = dev_node(
+        "dev-type-inspector-resize-handle",
+        boon_document_model::DocumentNodeKind::Stack,
+        None,
+        &[
+            ("bg", handle_bg),
+            ("padding", "0"),
+            ("height", &height.to_string()),
+            ("width", &DEV_TYPE_INSPECTOR_RESIZE_HANDLE_WIDTH.to_string()),
+            ("cursor", "col-resize"),
+        ],
+    );
+    handle.source_binding = Some(boon_document_model::SourceBinding {
+        id: boon_document_model::SourceBindingId("source:dev-type-inspector-resize".to_owned()),
+        source_path: "dev.type_inspector.resize".to_owned(),
+        intent: "drag".to_owned(),
+    });
+    append_child(frame, parent, handle);
+}
+
+fn append_dev_type_inspector(
+    frame: &mut boon_document_model::DocumentFrame,
+    parent: boon_document_model::DocumentNodeId,
+    shell: &DevWindowShell,
+    height: u32,
+    width: u32,
+) {
+    let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+    let inspector = dev_node(
+        "dev-type-inspector",
+        boon_document_model::DocumentNodeKind::Stack,
+        None,
+        &[
+            ("bg", DEV_PANEL),
+            ("padding", "0"),
+            ("gap", "0"),
+            ("height", &height.to_string()),
+            ("width", &width.to_string()),
+        ],
+    );
+    let inspector_parent = inspector.id.clone();
+    append_child(frame, parent, inspector);
+
+    let detail_height = height.max(60);
+    let detail = dev_node(
+        "dev-type-inspector-detail",
+        boon_document_model::DocumentNodeKind::ScrollRoot,
+        None,
+        &[
+            ("bg", DEV_BG),
+            ("padding", &DEV_TYPE_INSPECTOR_DETAIL_PADDING.to_string()),
+            ("gap", &DEV_TYPE_INSPECTOR_ROW_GAP.to_string()),
+            ("height", &detail_height.to_string()),
+            ("width", "fill"),
+            ("scroll", "true"),
+        ],
+    );
+    let mut detail = detail;
+    detail.scroll = Some(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+    detail
+        .materialized
+        .push(boon_document_model::MaterializedRange {
+            axis: boon_document_model::Axis::Vertical,
+            visible: 0..16,
+            overscan: 0..24,
+        });
+    let detail_parent = detail.id.clone();
+    let visible_line_count = visible_rows_for_scroll_area(
+        detail_height,
+        DEV_TYPE_INSPECTOR_DETAIL_PADDING,
+        DEV_TYPE_INSPECTOR_LINE_HEIGHT,
+        DEV_TYPE_INSPECTOR_ROW_GAP,
+    );
+    let effective_scroll_line = shell.type_inspector_scroll_line.min(
+        content
+            .detail_lines
+            .len()
+            .saturating_sub(visible_line_count),
+    );
+    let effective_scroll_column = shell
+        .type_inspector_scroll_column
+        .min(shell.type_inspector_max_scroll_column());
+    detail.scroll = Some(boon_document_model::ScrollState {
+        x: effective_scroll_column as f32,
+        y: effective_scroll_line as f32,
+    });
+    frame.scroll_roots.insert(
+        boon_document_model::ScrollRootId(detail_parent.0.clone()),
+        boon_document_model::ScrollState {
+            x: effective_scroll_column as f32,
+            y: effective_scroll_line as f32,
+        },
+    );
+    append_child(frame, inspector_parent, detail);
+    for index in 0..visible_line_count {
+        let text = content
+            .detail_lines
+            .get(effective_scroll_line + index)
+            .map(String::as_str)
+            .unwrap_or_default();
         append_child(
             frame,
-            row_parent,
-            dev_text_node(
-                &format!("dev-footer-row-{visible_index}-value"),
-                &value,
-                DEV_TEXT_MUTED,
-                12,
+            detail_parent.clone(),
+            dev_type_inspector_detail_node(
+                &format!("dev-type-inspector-detail-row-{index}"),
+                text,
+                shell,
+                effective_scroll_line + index,
+                effective_scroll_column,
                 &[
-                    ("bg", row_bg),
+                    ("bg", DEV_BG),
                     ("width", "fill"),
-                    ("height", &DEV_FOOTER_LINE_HEIGHT.to_string()),
+                    ("height", &DEV_TYPE_INSPECTOR_LINE_HEIGHT.to_string()),
                     ("font", BOON_EDITOR_FONT_FAMILY),
                 ],
             ),
         );
     }
+}
+
+fn dev_type_inspector_detail_node(
+    id: &str,
+    text: &str,
+    shell: &DevWindowShell,
+    line_index: usize,
+    scroll_column: usize,
+    extra_styles: &[(&str, &str)],
+) -> boon_document_model::DocumentNode {
+    let mut node = dev_text_node(id, text, DEV_TEXT, 12, extra_styles);
+    node.style.insert(
+        "rich_text".to_owned(),
+        boon_document_model::StyleValue::Bool(true),
+    );
+    node.style.insert(
+        "syntax_spans_json".to_owned(),
+        boon_document_model::StyleValue::Text(type_inspector_syntax_spans_json(text)),
+    );
+    node.style.insert(
+        "text_inset".to_owned(),
+        boon_document_model::StyleValue::Text(text_inset_for_scroll_column(scroll_column, 12)),
+    );
+    node.style.insert(
+        "text_clip_padding".to_owned(),
+        boon_document_model::StyleValue::Number(0.0),
+    );
+    node.style.insert(
+        "editor_selection_color".to_owned(),
+        boon_document_model::StyleValue::Text(BOON_EDITOR_SELECTION.to_owned()),
+    );
+    if let Some((start, end)) = shell
+        .type_inspector_selection
+        .as_ref()
+        .and_then(|selection| selection.columns_for_line(line_index, text))
+    {
+        node.style.insert(
+            "editor_selection_start".to_owned(),
+            boon_document_model::StyleValue::Number(start as f64),
+        );
+        node.style.insert(
+            "editor_selection_end".to_owned(),
+            boon_document_model::StyleValue::Number(end as f64),
+        );
+    }
+    node
 }
 
 fn dev_text_node(
@@ -8518,40 +10813,623 @@ fn wrap_footer_lines(lines: Vec<(String, String)>, max_chars: usize) -> Vec<(Str
         .collect()
 }
 
+fn footer_display_line(label: &str, value: &str) -> String {
+    if label.is_empty() {
+        value.to_owned()
+    } else {
+        format!("{label}: {value}")
+    }
+}
+
+fn footer_display_lines(lines: &[(String, String)]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|(label, value)| footer_display_line(label, value))
+        .collect()
+}
+
+fn preview_error_detail_lines(error: &str) -> Vec<String> {
+    let trimmed = error.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return Vec::new();
+    }
+    let detail_text = trimmed
+        .split_once(" diagnostic(s): ")
+        .map(|(_, detail)| detail)
+        .unwrap_or(trimmed);
+    let mut details = detail_text
+        .split('\n')
+        .flat_map(|line| line.split("; "))
+        .map(|line| one_line(line, 180))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        details.push(one_line(trimmed, 180));
+    }
+    details
+}
+
+fn runtime_value_path_candidates(token: &str) -> Vec<String> {
+    let inspected = type_inspector_root_name(token);
+    let cleaned = inspected
+        .as_str()
+        .trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '[' | ']'))
+        })
+        .to_owned();
+    if cleaned.is_empty()
+        || !cleaned
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '[' | ']'))
+    {
+        return Vec::new();
+    }
+    let mut paths = vec![cleaned.clone()];
+    if cleaned != "store" && !cleaned.starts_with("store.") {
+        paths.push(format!("store.{cleaned}"));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn type_inspector_root_name(token: &str) -> String {
+    let trimmed = token.trim();
+    let candidate = trimmed
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(trimmed)
+        .trim();
+    if candidate.is_empty() {
+        "-".to_owned()
+    } else {
+        candidate.to_owned()
+    }
+}
+
+#[cfg(test)]
+fn runtime_value_response_detail_lines(
+    response: &serde_json::Value,
+    wrap_chars: usize,
+) -> Vec<String> {
+    let status = response
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    if status != "pass" {
+        let reason = response
+            .get("diagnostic")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| response.get("status").and_then(serde_json::Value::as_str))
+            .unwrap_or("runtime value unavailable");
+        return wrap_text_chunks(&format!("unavailable: {reason}"), wrap_chars);
+    }
+    let Some(values) = response
+        .get("values")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return vec!["unavailable: missing values".to_owned()];
+    };
+    let mut lines = Vec::new();
+    let mut seen_value_hashes = BTreeSet::new();
+    for (path, value) in values {
+        if runtime_value_summary_is_missing(value) {
+            continue;
+        }
+        let value_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(value).unwrap_or_default());
+        if !seen_value_hashes.insert(value_hash) {
+            continue;
+        }
+        lines.push(format!("{path}:"));
+        lines.extend(runtime_value_summary_lines(value, 1));
+    }
+    if lines.is_empty() {
+        for (path, value) in values {
+            lines.push(format!("{path}:"));
+            lines.extend(runtime_value_summary_lines(value, 1));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("unavailable: no matching runtime path".to_owned());
+    }
+    lines
+}
+
+fn selected_runtime_value_summary(response: &serde_json::Value) -> Option<serde_json::Value> {
+    let values = response
+        .get("values")
+        .and_then(serde_json::Value::as_object)?;
+    let mut seen_value_hashes = BTreeSet::new();
+    for value in values.values() {
+        if runtime_value_summary_is_missing(value) {
+            continue;
+        }
+        let value_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(value).unwrap_or_default());
+        if seen_value_hashes.insert(value_hash) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn runtime_value_summary_is_missing(summary: &serde_json::Value) -> bool {
+    summary.get("kind").and_then(serde_json::Value::as_str) == Some("missing")
+}
+
+fn type_tree_lines_with_inline_values(
+    root: &str,
+    type_label: &str,
+    value_summary: Option<&serde_json::Value>,
+    wrap_chars: usize,
+) -> Vec<String> {
+    let root = if root.is_empty() { "-" } else { root };
+    render_named_type_tree(root, type_label, value_summary, 0, 0, wrap_chars)
+}
+
+fn render_named_type_tree(
+    name: &str,
+    type_label: &str,
+    value_summary: Option<&serde_json::Value>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+) -> Vec<String> {
+    let indent = " ".repeat(indent_depth * 4);
+    let trimmed_type = normalized_type_label(type_label);
+    if type_label_is_empty_object(&trimmed_type) {
+        return vec![format!("{indent}{name}: []")];
+    }
+    if let Some(item_type) = list_item_type_label(&trimmed_type) {
+        let mut lines = vec![append_inline_hint(
+            format!("{indent}{name}: LIST"),
+            runtime_list_item_hint(value_summary),
+        )];
+        if expand_depth < 3 {
+            lines.extend(render_list_items(
+                &item_type,
+                value_summary,
+                indent_depth + 1,
+                expand_depth + 1,
+                wrap_chars,
+            ));
+        }
+        return lines;
+    }
+    if type_label_is_object(&trimmed_type) {
+        let mut lines = vec![format!("{indent}{name}: [")];
+        lines.extend(render_type_object_fields(
+            &trimmed_type,
+            value_summary,
+            indent_depth + 1,
+            expand_depth + 1,
+            wrap_chars,
+        ));
+        lines.push(format!("{indent}]"));
+        return lines;
+    }
+    let value_hint = value_summary
+        .map(|summary| runtime_value_hint_for_type(&trimmed_type, summary))
+        .or_else(|| (indent_depth == 0).then_some("ABSENT".to_owned()));
+    let type_text = one_line(&trimmed_type, wrap_chars);
+    vec![append_inline_hint(
+        format!("{indent}{name}: {type_text}"),
+        value_hint,
+    )]
+}
+
+fn render_type_object_fields(
+    type_label: &str,
+    value_summary: Option<&serde_json::Value>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+) -> Vec<String> {
+    let fields = split_type_object_fields(type_label);
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for field in fields {
+        let field_value = value_summary_field(value_summary, &field.name);
+        lines.extend(render_named_type_tree(
+            &field.name,
+            &field.type_label,
+            field_value,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+        ));
+    }
+    lines
+}
+
+fn render_list_items(
+    item_type: &str,
+    value_summary: Option<&serde_json::Value>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+) -> Vec<String> {
+    let indent = " ".repeat(indent_depth * 4);
+    let Some(sample) = value_summary
+        .and_then(|summary| summary.get("sample"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec![format!("{indent}[...]")];
+    };
+    let mut lines = Vec::new();
+    for (index, item) in sample.iter().enumerate() {
+        lines.push(format!("{indent}[{}]:", index + 1));
+        if type_label_is_object(item_type.trim()) {
+            lines.extend(render_type_object_fields(
+                item_type,
+                Some(item),
+                indent_depth + 1,
+                expand_depth + 1,
+                wrap_chars,
+            ));
+        } else {
+            lines.extend(render_named_type_tree(
+                "value",
+                item_type,
+                Some(item),
+                indent_depth + 1,
+                expand_depth + 1,
+                wrap_chars,
+            ));
+        }
+    }
+    let len = value_summary
+        .and_then(|summary| summary.get("len"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(sample.len() as u64);
+    let hidden = len.saturating_sub(sample.len() as u64);
+    if hidden > 0 {
+        lines.push(format!("{indent}... {hidden} more"));
+    }
+    lines
+}
+
+#[derive(Clone, Debug)]
+struct TypeTreeField {
+    name: String,
+    type_label: String,
+}
+
+fn split_type_object_fields(type_label: &str) -> Vec<TypeTreeField> {
+    let lines = type_label.lines().collect::<Vec<_>>();
+    let Some(field_indent) = lines
+        .iter()
+        .filter_map(|line| {
+            parse_type_field_line(line).map(|_| {
+                line.chars()
+                    .take_while(|character| *character == ' ')
+                    .count()
+            })
+        })
+        .min()
+    else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    let mut current_name = None::<String>;
+    let mut current_type_lines = Vec::<String>::new();
+    for line in lines {
+        let indent = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        let parsed = (indent == field_indent)
+            .then(|| parse_type_field_line(line))
+            .flatten();
+        if let Some((name, first_type_line)) = parsed {
+            if let Some(name) = current_name.replace(name) {
+                fields.push(TypeTreeField {
+                    name,
+                    type_label: current_type_lines.join("\n").trim().to_owned(),
+                });
+                current_type_lines.clear();
+            }
+            current_type_lines.push(first_type_line);
+        } else if current_name.is_some() && indent >= field_indent {
+            current_type_lines.push(line.to_owned());
+        }
+    }
+    if let Some(name) = current_name {
+        fields.push(TypeTreeField {
+            name,
+            type_label: current_type_lines.join("\n").trim().to_owned(),
+        });
+    }
+    fields
+}
+
+fn parse_type_field_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('[') || trimmed.starts_with(']') {
+        return None;
+    }
+    let (name, type_label) = trimmed.split_once(": ")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some((name.to_owned(), type_label.to_owned()))
+}
+
+fn list_item_type_label(type_label: &str) -> Option<String> {
+    let trimmed = type_label.trim();
+    let inner = trimmed.strip_prefix("LIST<")?.strip_suffix('>')?;
+    Some(inner.trim().to_owned())
+}
+
+fn type_label_is_object(type_label: &str) -> bool {
+    type_label.trim_start().starts_with('[')
+}
+
+fn normalized_type_label(type_label: &str) -> String {
+    let trimmed = type_label.trim();
+    let label = trimmed
+        .strip_prefix(':')
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    display_type_alias_label(label)
+}
+
+fn display_type_alias_label(type_label: &str) -> String {
+    match type_label.trim() {
+        "False | True" | "True | False" => "BOOL".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn type_label_is_empty_object(type_label: &str) -> bool {
+    let trimmed = type_label.trim();
+    trimmed.starts_with('[')
+        && trimmed.ends_with(']')
+        && trimmed
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim()
+            .is_empty()
+}
+
+fn value_summary_field<'a>(
+    summary: Option<&'a serde_json::Value>,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    summary?
+        .get("fields")
+        .and_then(serde_json::Value::as_object)?
+        .get(field)
+}
+
+fn runtime_list_item_hint(summary: Option<&serde_json::Value>) -> Option<String> {
+    let len = summary?.get("len").and_then(serde_json::Value::as_u64)?;
+    Some(if len == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{len} items")
+    })
+}
+
+fn runtime_value_hint_for_type(type_label: &str, summary: &serde_json::Value) -> String {
+    runtime_value_summary_inline_label_for_type(type_label, summary).unwrap_or_else(|| {
+        if runtime_value_summary_is_missing(summary) {
+            "ABSENT".to_owned()
+        } else {
+            runtime_json_kind_label(summary)
+        }
+    })
+}
+
+fn runtime_value_summary_inline_label_for_type(
+    type_label: &str,
+    summary: &serde_json::Value,
+) -> Option<String> {
+    if summary.get("kind").and_then(serde_json::Value::as_str) == Some("string") {
+        let value = summary
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return Some(if type_label.trim() == "TEXT" {
+            runtime_text_value_label(value)
+        } else {
+            value.to_owned()
+        });
+    }
+    runtime_value_summary_inline_label(summary)
+}
+
+fn runtime_json_kind_label(summary: &serde_json::Value) -> String {
+    match summary.get("kind").and_then(serde_json::Value::as_str) {
+        Some("object") => "[...]".to_owned(),
+        Some("list") => "LIST".to_owned(),
+        Some(kind) => kind.to_owned(),
+        None => "VALUE".to_owned(),
+    }
+}
+
+fn append_inline_hint(line: String, hint: Option<String>) -> String {
+    let Some(hint) = hint.filter(|hint| !hint.is_empty()) else {
+        return line;
+    };
+    format!("{line} = {hint}")
+}
+
+#[cfg(test)]
+fn runtime_value_summary_lines(summary: &serde_json::Value, depth: usize) -> Vec<String> {
+    let indent = " ".repeat(depth * 4);
+    match summary.get("kind").and_then(serde_json::Value::as_str) {
+        Some("missing") => vec![format!("{indent}missing")],
+        Some("null") => vec![format!("{indent}null")],
+        Some("string") => {
+            let value = summary
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            vec![format!("{indent}{}", runtime_text_value_label(value))]
+        }
+        Some("bool" | "number") => {
+            let value = summary
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            vec![format!("{indent}{}", runtime_scalar_value_label(&value))]
+        }
+        Some("list") => {
+            let mut lines = vec![append_inline_hint(
+                format!("{indent}LIST"),
+                runtime_list_item_hint(Some(summary)),
+            )];
+            if let Some(sample) = summary.get("sample").and_then(serde_json::Value::as_array) {
+                for (index, item) in sample.iter().enumerate() {
+                    lines.push(format!("{indent}[{}]:", index + 1));
+                    lines.extend(runtime_value_summary_lines(item, depth + 1));
+                }
+            }
+            if summary
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                lines.push(format!("{indent}..."));
+            }
+            lines
+        }
+        Some("object") => {
+            let field_count = summary
+                .get("field_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let mut lines = vec![format!("{indent}[")];
+            if let Some(fields) = summary.get("fields").and_then(serde_json::Value::as_object) {
+                for (field, value) in fields {
+                    if let Some(label) = runtime_value_summary_inline_label(value) {
+                        lines.push(format!("{indent}    {field}: {label}"));
+                    } else {
+                        lines.push(format!("{indent}    {field}:"));
+                        lines.extend(runtime_value_summary_lines(value, depth + 2));
+                    }
+                }
+            }
+            if summary
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                lines.push(format!("{indent}    ..."));
+            }
+            if field_count == 0 {
+                lines.push(format!("{indent}    -- empty"));
+            }
+            lines.push(format!("{indent}]"));
+            lines
+        }
+        Some(kind)
+            if summary
+                .get("collapsed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            vec![format!("{indent}{kind} ...")]
+        }
+        Some(kind) => vec![format!("{indent}{kind}")],
+        None => vec![format!("{indent}VALUE")],
+    }
+}
+
+fn runtime_value_summary_inline_label(summary: &serde_json::Value) -> Option<String> {
+    match summary.get("kind").and_then(serde_json::Value::as_str) {
+        Some("string") => Some(runtime_text_value_label(
+            summary
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )),
+        Some("bool" | "number") => {
+            let value = summary
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some(runtime_scalar_value_label(&value))
+        }
+        Some("null") => Some("null".to_owned()),
+        Some("missing") => Some("missing".to_owned()),
+        _ => None,
+    }
+}
+
+fn runtime_text_value_label(value: &str) -> String {
+    if value.is_empty() {
+        "TEXT {}".to_owned()
+    } else {
+        format!("TEXT {{ {value} }}")
+    }
+}
+
+fn runtime_scalar_value_label(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => runtime_text_value_label(value),
+        serde_json::Value::Bool(true) => "True".to_owned(),
+        serde_json::Value::Bool(false) => "False".to_owned(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_owned(),
+        serde_json::Value::Array(_) => "LIST".to_owned(),
+        serde_json::Value::Object(_) => "[...]".to_owned(),
+    }
+}
+
 fn wrap_text_chunks(value: &str, max_chars: usize) -> Vec<String> {
     let max_chars = max_chars.max(8);
-    let normalized = value
-        .replace('\n', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
+    if value.is_empty() {
         return vec![String::new()];
     }
     let mut chunks = Vec::new();
-    let mut current = String::new();
-    for word in normalized.split(' ') {
-        if word.chars().count() > max_chars {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            let chars = word.chars().collect::<Vec<_>>();
-            for piece in chars.chunks(max_chars) {
-                chunks.push(piece.iter().collect());
-            }
+    for source_line in value.split('\n') {
+        if source_line.is_empty() {
+            chunks.push(String::new());
             continue;
         }
-        let separator = if current.is_empty() { 0 } else { 1 };
-        if current.chars().count() + separator + word.chars().count() > max_chars {
-            chunks.push(std::mem::take(&mut current));
+        let leading = source_line
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        let normalized = source_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            chunks.push(leading);
+            continue;
+        }
+        let mut current = String::new();
+        for word in normalized.split(' ') {
+            if word.chars().count() > max_chars {
+                if !current.is_empty() {
+                    chunks.push(format!("{leading}{current}"));
+                    current.clear();
+                }
+                let chars = word.chars().collect::<Vec<_>>();
+                for piece in chars.chunks(max_chars) {
+                    chunks.push(format!("{leading}{}", piece.iter().collect::<String>()));
+                }
+                continue;
+            }
+            let separator = if current.is_empty() { 0 } else { 1 };
+            let current_len = current.chars().count() + leading.chars().count();
+            if current_len + separator + word.chars().count() > max_chars {
+                chunks.push(format!("{leading}{current}"));
+                current.clear();
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
         }
         if !current.is_empty() {
-            current.push(' ');
+            chunks.push(format!("{leading}{current}"));
         }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
     }
     chunks
 }
@@ -10912,7 +13790,8 @@ fn preview_apply_real_window_input(
                 let was_already_focused =
                     input_state.focused_node.as_deref() == Some(node.as_str());
                 if !was_already_focused
-                    && let Some(blur) = preview_focused_blur_event(layout, input_state)
+                    && let Some(blur) =
+                        preview_focused_blur_event(layout, input_state, live_runtime)
                 {
                     pending_mouse_events.push(blur);
                 }
@@ -10959,7 +13838,7 @@ fn preview_apply_real_window_input(
                 input_state.last_click_node = Some(node);
                 input_state.last_click_sequence = mouse_release.sequence;
             } else {
-                if let Some(blur) = preview_focused_blur_event(layout, input_state) {
+                if let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime) {
                     pending_mouse_events.push(blur);
                 }
                 input_state.focused_node = None;
@@ -11024,9 +13903,10 @@ fn preview_apply_real_window_input(
                     .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
                 {
                     let submitted_text = input_state.focused_text.clone();
+                    let carries_text = !source.ends_with(".key_down");
                     let submit = boon_runtime::LiveSourceEvent {
                         source,
-                        text: Some(submitted_text.clone()),
+                        text: carries_text.then_some(submitted_text.clone()),
                         key: Some("Enter".to_owned()),
                         address: input_state
                             .focused_address
@@ -11891,12 +14771,19 @@ fn live_source_event_for_hit_region(
 fn preview_focused_blur_event(
     layout_proof: &Value,
     input_state: &PreviewNativeInputState,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
 ) -> Option<boon_runtime::LiveSourceEvent> {
     let focused_node = input_state.focused_node.as_deref()?;
     let source = live_source_for_node_intent(layout_proof, focused_node, "blur")?;
+    let text = live_runtime
+        .lock()
+        .ok()
+        .map(|runtime| runtime.source_payload_has_text(&source))
+        .unwrap_or(false)
+        .then(|| input_state.focused_text.clone());
     Some(boon_runtime::LiveSourceEvent {
         source,
-        text: Some(input_state.focused_text.clone()),
+        text,
         key: None,
         address: input_state
             .focused_address
@@ -12515,15 +15402,8 @@ fn handle_preview_ipc_client(
         return Ok(());
     }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("runtime-summary") {
-        let (runtime_summary, shared_render_state) = {
-            let state = state
-                .lock()
-                .map_err(|_| "preview IPC state mutex poisoned")?;
-            (
-                state.runtime_summary.clone(),
-                state.shared_render_state.clone(),
-            )
-        };
+        let (runtime_summary, shared_render_state) =
+            preview_fresh_runtime_summary_for_state(&state)?;
         let (last_error, last_error_count) = {
             let shared = shared_render_state
                 .lock()
@@ -12535,6 +15415,21 @@ fn handle_preview_ipc_client(
             last_error.as_deref(),
             last_error_count,
         );
+        writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+        stream.flush()?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("runtime-value") {
+        let response = preview_runtime_value_response(&state, &request).unwrap_or_else(|error| {
+            json!({
+                "kind": "runtime-value-result",
+                "status": "fail",
+                "diagnostic": error.to_string(),
+                "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false,
+                "preview_pid": std::process::id()
+            })
+        });
         writeln!(stream, "{}", serde_json::to_string(&response)?)?;
         stream.flush()?;
         return Ok(());
@@ -12599,6 +15494,182 @@ fn handle_preview_ipc_client(
     writeln!(stream, "{}", serde_json::to_string(&response)?)?;
     stream.flush()?;
     Ok(())
+}
+
+fn preview_runtime_value_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let paths = request
+        .get("paths")
+        .and_then(serde_json::Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .filter(|path| !path.is_empty())
+                .take(8)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let max_depth = request
+        .get("max_depth")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH as u64)
+        .min(6) as usize;
+    let max_fields = request
+        .get("max_fields")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS as u64)
+        .clamp(1, 16) as usize;
+    let max_list_items = request
+        .get("max_list_items")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS as u64)
+        .clamp(1, 12) as usize;
+    let (source_path, source_sha256, fallback_state_summary_hash, live_runtime) = {
+        let state = state
+            .lock()
+            .map_err(|_| "preview IPC state mutex poisoned")?;
+        (
+            state.source_path.clone(),
+            state.source_sha256.clone(),
+            state
+                .runtime_summary
+                .get("state_summary_hash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            state.live_runtime.clone(),
+        )
+    };
+    let Some(live_runtime) = live_runtime else {
+        return Ok(json!({
+            "kind": "runtime-value-result",
+            "status": "not-ready",
+            "source_sha256": source_sha256,
+            "paths": paths,
+            "values": {},
+            "full_state_mirroring_allowed": false,
+            "full_state_mirroring_observed": false,
+            "preview_pid": std::process::id()
+        }));
+    };
+    let mut runtime = live_runtime
+        .lock()
+        .map_err(|_| "preview live runtime mutex poisoned")?;
+    let state_summary = runtime.state_summary();
+    let state_summary_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&state_summary)?);
+    let runtime_summary =
+        preview_runtime_summary_from_state_summary(&source_path, &source_sha256, state_summary);
+    if let Ok(mut state) = state.lock()
+        && state.source_sha256 == source_sha256
+    {
+        state.runtime_summary = runtime_summary;
+    }
+    if let Some(expected_hash) = request
+        .get("state_summary_hash")
+        .and_then(serde_json::Value::as_str)
+        && expected_hash != state_summary_hash
+    {
+        return Ok(json!({
+                "kind": "runtime-value-result",
+                "status": "stale",
+                "source_sha256": source_sha256,
+                "state_summary_hash": state_summary_hash,
+                "fallback_state_summary_hash": fallback_state_summary_hash,
+                "expected_state_summary_hash": expected_hash,
+                "paths": paths,
+                "values": {},
+                "full_state_mirroring_allowed": false,
+            "full_state_mirroring_observed": false,
+            "preview_pid": std::process::id()
+        }));
+    }
+    let values = runtime.runtime_value_summaries(&paths, max_depth, max_fields, max_list_items);
+    Ok(json!({
+        "kind": "runtime-value-result",
+        "status": "pass",
+        "source_sha256": source_sha256,
+        "state_summary_hash": state_summary_hash,
+        "paths": paths,
+        "values": values,
+        "max_depth": max_depth,
+        "max_fields": max_fields,
+        "max_list_items": max_list_items,
+        "full_state_mirroring_allowed": false,
+        "full_state_mirroring_observed": false,
+        "preview_pid": std::process::id()
+    }))
+}
+
+#[cfg(test)]
+fn bounded_runtime_value_summary(
+    value: &serde_json::Value,
+    depth: usize,
+    max_depth: usize,
+    max_fields: usize,
+    max_list_items: usize,
+) -> serde_json::Value {
+    if depth >= max_depth {
+        return json!({
+            "kind": state_summary_type_name(value),
+            "collapsed": true
+        });
+    }
+    match value {
+        serde_json::Value::Null => json!({"kind": "null", "value": null}),
+        serde_json::Value::Bool(value) => json!({"kind": "bool", "value": value}),
+        serde_json::Value::Number(value) => json!({"kind": "number", "value": value}),
+        serde_json::Value::String(value) => json!({"kind": "string", "value": value}),
+        serde_json::Value::Array(items) => {
+            let sample = items
+                .iter()
+                .take(max_list_items)
+                .map(|item| {
+                    bounded_runtime_value_summary(
+                        item,
+                        depth + 1,
+                        max_depth,
+                        max_fields,
+                        max_list_items,
+                    )
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "kind": "list",
+                "len": items.len(),
+                "sample_start": 0,
+                "sample": sample,
+                "truncated": items.len() > max_list_items
+            })
+        }
+        serde_json::Value::Object(fields) => {
+            let sampled = fields
+                .iter()
+                .take(max_fields)
+                .map(|(field, value)| {
+                    (
+                        field.clone(),
+                        bounded_runtime_value_summary(
+                            value,
+                            depth + 1,
+                            max_depth,
+                            max_fields,
+                            max_list_items,
+                        ),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "kind": "object",
+                "field_count": fields.len(),
+                "fields": sampled,
+                "truncated": fields.len() > max_fields
+            })
+        }
+    }
 }
 
 struct PreviewReplaceBuildResult {
@@ -14061,16 +17132,6 @@ fn host_events_for_source_event(
             "source": "operator_host_event_harness"
         }));
     }
-    if (source.ends_with(".key_down") || source.ends_with(".blur")) && event.get("text").is_some() {
-        events.insert(
-            0,
-            json!({
-                "kind": "TextInput",
-                "text": event.get("text").cloned().unwrap_or_else(|| json!("")),
-                "source": "operator_host_event_harness"
-            }),
-        );
-    }
     json!(events)
 }
 
@@ -14602,6 +17663,22 @@ fn read_json(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct TestClipboard {
+        text: String,
+    }
+
+    impl ClipboardAdapter for TestClipboard {
+        fn get_text(&mut self) -> Result<String, String> {
+            Ok(self.text.clone())
+        }
+
+        fn set_text(&mut self, text: &str) -> Result<(), String> {
+            self.text = text.to_owned();
+            Ok(())
+        }
+    }
+
     fn repo_path(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -14696,7 +17773,7 @@ mod tests {
         );
         assert_eq!(
             rendered.style.get("text_clip_padding"),
-            Some(&boon_document_model::StyleValue::Number(4.0))
+            Some(&boon_document_model::StyleValue::Number(0.0))
         );
 
         let boon_document_model::StyleValue::Text(spans_json) = rendered
@@ -14760,6 +17837,941 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span["source_text"].as_str() == Some("|>") && span["text"].as_str() == Some("|>")
         }));
+    }
+
+    #[test]
+    fn code_editor_view_attaches_virtual_type_hint_metadata_without_changing_source_spans() {
+        let source = include_str!("../../../examples/counter.bn").to_owned();
+        let model = CodeEditorModel::new("examples/counter.bn", &source);
+        assert_eq!(model.type_hint_backend(), "boon_typecheck::TypeHintTable");
+        assert!(model.type_hint_count() > 0);
+        let call_line = source
+            .lines()
+            .position(|line| line.trim() == "root: counter_app()")
+            .map(|index| index + 1)
+            .expect("counter source should contain a root function call");
+        let call_line_source = model.line_text(call_line - 1);
+
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let parent = frame.root.clone();
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 820, true);
+        let rendered = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(format!(
+                "dev-code-editor-line-text-{call_line}"
+            )))
+            .expect("line text should render");
+        let boon_document_model::StyleValue::Text(spans_json) = rendered
+            .style
+            .get("syntax_spans_json")
+            .expect("rich syntax spans should be attached")
+        else {
+            panic!("syntax_spans_json should be text");
+        };
+        let spans = serde_json::from_str::<Vec<serde_json::Value>>(spans_json)
+            .expect("syntax spans should be valid JSON");
+        let source_text = spans
+            .iter()
+            .map(|span| span["source_text"].as_str().unwrap_or_default())
+            .collect::<String>();
+        assert_eq!(source_text, call_line_source);
+
+        let boon_document_model::StyleValue::Text(type_hints_json) = rendered
+            .style
+            .get("editor_type_hints_json")
+            .expect("type hint metadata should be attached separately")
+        else {
+            panic!("editor_type_hints_json should be text");
+        };
+        let type_hints = serde_json::from_str::<Vec<serde_json::Value>>(type_hints_json)
+            .expect("type hints should be valid JSON");
+        assert!(type_hints.iter().any(|hint| {
+            hint["compact_label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("[kind:"))
+                || hint["detail_label"]
+                    .as_str()
+                    .is_some_and(|label| label.contains("kind:"))
+        }));
+    }
+
+    #[test]
+    fn editor_copy_excludes_virtual_inline_type_hints() {
+        let source = include_str!("../../../examples/counter.bn").to_owned();
+        let mut model = CodeEditorModel::new("examples/counter.bn", &source);
+        let call_line = source
+            .lines()
+            .position(|line| line.trim() == "root: counter_app()")
+            .map(|index| index + 1)
+            .expect("counter source should contain a root function call");
+        let line_source = model.line_text(call_line - 1).to_owned();
+        assert!(
+            !model.inline_type_hints_for_line(call_line).is_empty(),
+            "test line should carry virtual inline type hints"
+        );
+        model.set_selection(
+            EditorPosition {
+                line: call_line,
+                column: 1,
+            },
+            EditorPosition {
+                line: call_line,
+                column: line_source.chars().count() + 1,
+            },
+        );
+
+        let mut clipboard = TestClipboard::default();
+        let result = model.copy_to_adapter(&mut clipboard);
+        assert_eq!(result["status"], "pass");
+        assert_eq!(clipboard.text, line_source);
+        assert!(!clipboard.text.contains(": [kind:"));
+    }
+
+    #[test]
+    fn type_inspector_syntax_spans_color_notation_without_changing_text() {
+        let text = "    completed: BOOL = False, count: NUMBER = 12, title: TEXT = TEXT { Done }";
+        let spans_json = type_inspector_syntax_spans_json(text);
+        let spans = serde_json::from_str::<Vec<serde_json::Value>>(&spans_json)
+            .expect("inspector spans should be valid JSON");
+        let source_text = spans
+            .iter()
+            .map(|span| span["source_text"].as_str().unwrap_or_default())
+            .collect::<String>();
+        assert_eq!(source_text, text);
+        assert!(spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("completed")
+                && span["color"].as_str() == Some(syntax_color_for_kind("definition"))
+        }));
+        assert!(spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("BOOL")
+                && span["color"].as_str() == Some(syntax_color_for_kind("type"))
+        }));
+        assert!(spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("12")
+                && span["color"].as_str() == Some(syntax_color_for_kind("number"))
+        }));
+        assert!(spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("False")
+                && span["color"].as_str() == Some(syntax_color_for_kind("tag"))
+        }));
+
+        let empty_segments = type_inspector_syntax_segments("no inferred type");
+        assert!(
+            empty_segments.iter().all(|span| span.kind == "variable"),
+            "empty-state text should not be highlighted as tags or types: {empty_segments:?}"
+        );
+
+        let text_value = "edit_text: TEXT = TEXT { Read documentation255 }";
+        let text_value_segments = type_inspector_syntax_segments(text_value);
+        assert_eq!(
+            text_value_segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            text_value
+        );
+        let content_segment = text_value_segments
+            .iter()
+            .find(|segment| segment.text.contains("Read documentation255"))
+            .expect("TEXT value content should stay in one content segment");
+        assert_eq!(content_segment.kind, "text-literal-content");
+    }
+
+    #[test]
+    fn runtime_value_inspector_uses_bounded_paths_and_summaries() {
+        assert_eq!(
+            runtime_value_path_candidates("count"),
+            vec!["count".to_owned(), "store.count".to_owned()]
+        );
+        assert_eq!(
+            runtime_value_path_candidates("store.todos[2].title"),
+            vec!["store.todos[2].title".to_owned()]
+        );
+        assert_eq!(
+            runtime_value_path_candidates("store: ["),
+            vec!["store".to_owned()]
+        );
+
+        let summary = bounded_runtime_value_summary(
+            &json!({
+                "first": 1,
+                "second": {"nested": true},
+                "third": ["a", "b", "c"]
+            }),
+            0,
+            2,
+            2,
+            2,
+        );
+        assert_eq!(summary["kind"], "object");
+        assert_eq!(summary["field_count"], 3);
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(
+            summary["fields"]
+                .as_object()
+                .expect("bounded object should expose sampled fields")
+                .len(),
+            2
+        );
+
+        let lines = runtime_value_response_detail_lines(
+            &json!({
+                "status": "pass",
+                "values": {
+                    "store": summary
+                },
+                "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false
+            }),
+            80,
+        )
+        .join("\n");
+        assert!(lines.contains("store:"));
+        assert!(lines.contains("    ["));
+        assert!(lines.contains("        first: 1"));
+        assert!(lines.contains("        ..."));
+
+        let text_lines = runtime_value_response_detail_lines(
+            &json!({
+                "status": "pass",
+                "values": {
+                    "store.title": {"kind": "string", "value": "asdf"},
+                    "store.empty": {"kind": "string", "value": ""}
+                },
+                "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false
+            }),
+            80,
+        )
+        .join("\n");
+        assert!(text_lines.contains("TEXT { asdf }"));
+        assert!(text_lines.contains("TEXT {}"));
+
+        let spans = type_inspector_syntax_segments("    TEXT { asdf }");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == "type" && span.text == "TEXT")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == "punctuation" && span.text == "{")
+        );
+    }
+
+    #[test]
+    fn type_inspector_merges_values_into_type_tree_with_boon_indices() {
+        let type_label = "[
+    selected_filter: Active | All | Completed
+    todos: LIST<[
+        completed: BOOL
+        title: TEXT
+    ]>
+]";
+        let value_summary = json!({
+            "kind": "object",
+            "field_count": 2,
+            "fields": {
+                "selected_filter": {"kind": "string", "value": "All"},
+                "todos": {
+                    "kind": "list",
+                    "len": 2,
+                    "sample": [
+                        {
+                            "kind": "object",
+                            "field_count": 2,
+                            "fields": {
+                                "completed": {"kind": "bool", "value": false},
+                                "title": {"kind": "string", "value": "Read documentation"}
+                            },
+                            "truncated": false
+                        },
+                        {
+                            "kind": "object",
+                            "field_count": 2,
+                            "fields": {
+                                "completed": {"kind": "bool", "value": true},
+                                "title": {"kind": "string", "value": "Finish TodoMVC renderer"}
+                            },
+                            "truncated": false
+                        }
+                    ],
+                    "truncated": false
+                }
+            },
+            "truncated": false
+        });
+        let text =
+            type_tree_lines_with_inline_values("store", type_label, Some(&value_summary), 160)
+                .join("\n");
+        assert!(text.contains("store: ["));
+        assert!(text.contains("selected_filter: Active | All | Completed = All"));
+        assert!(text.contains("todos: LIST = 2 items"));
+        assert!(text.contains("[1]:"));
+        assert!(text.contains("[2]:"));
+        assert!(!text.contains("[0]:"));
+        assert!(text.contains("completed: BOOL"));
+        assert!(text.contains("False"));
+        assert!(text.contains("True"));
+        assert!(text.contains("title: TEXT"));
+        assert!(text.contains("TEXT { Read documentation }"));
+        assert!(!text.contains("LIST[2]"));
+    }
+
+    #[test]
+    fn type_inspector_renders_empty_objects_without_placeholder_rows() {
+        let type_label = ": [
+    press: []
+    change: [
+        text: TEXT
+    ]
+]";
+
+        let text = type_tree_lines_with_inline_values("sources", type_label, None, 160).join("\n");
+
+        assert!(text.contains("press: []"));
+        assert!(text.contains("change: ["));
+        assert!(!text.contains("-- empty"));
+        assert!(!text.contains("sources: [: ["));
+    }
+
+    #[test]
+    fn type_inspector_does_not_cache_missing_runtime_value_responses() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let (mut shell, _input_state, _document, _layout) = test_dev_editor_context(&source);
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        shell.last_good_runtime_summary = Some(json!({
+            "status": "pass",
+            "source_sha256": source_hash,
+            "state_summary_hash": "abcdef1234567890"
+        }));
+
+        assert!(shell.runtime_value_for_token("store", 160).is_some());
+        assert!(
+            shell.runtime_value_cache.borrow().is_none(),
+            "a transport failure or missing values response must not poison the value cache"
+        );
+    }
+
+    #[test]
+    fn code_editor_inline_type_hints_are_sparse_and_hover_uses_exact_type() {
+        let source = include_str!("../../../examples/counter.bn").to_owned();
+        let model = CodeEditorModel::new("examples/counter.bn", &source);
+        assert_eq!(model.type_hint_backend(), "boon_typecheck::TypeHintTable");
+
+        let count_line = source
+            .lines()
+            .position(|line| line.trim() == "count:")
+            .map(|index| index + 1)
+            .expect("counter source should declare count");
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("counter source should declare store");
+        let store_hint = model
+            .type_hints_for_line(store_line)
+            .iter()
+            .find(|hint| hint.category == "definition")
+            .expect("store should have a structural type hint");
+        assert!(
+            store_hint.detail_label.contains("count: NUMBER"),
+            "parent structural summaries should use the inferred count type: {}",
+            store_hint.detail_label
+        );
+        assert!(
+            !store_hint.detail_label.contains("..."),
+            "detail type labels should never imply hidden fields with ellipses: {} / {}",
+            store_hint.compact_label,
+            store_hint.detail_label
+        );
+        let count_hint = model
+            .type_hint_at_position(&EditorPosition {
+                line: count_line,
+                column: 5,
+            })
+            .expect("count should have an exact inferred type");
+        assert_eq!(count_hint.compact_label, "NUMBER");
+        assert!(
+            model.inline_type_hints_for_line(count_line).is_empty(),
+            "obvious scalar field definitions should stay out of inline rendering"
+        );
+
+        let style_line = source
+            .lines()
+            .position(|line| line.trim() == "style: [")
+            .map(|index| index + 1)
+            .expect("counter source should contain a style object line");
+        assert!(
+            model.inline_type_hints_for_line(style_line).is_empty(),
+            "dense object structural hints must stay out of inline rendering"
+        );
+
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let parent = frame.root.clone();
+        CodeEditorView::new().append_to(&mut frame, parent, &model, 820, true);
+        let rendered = frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(format!(
+                "dev-code-editor-line-text-{style_line}"
+            )))
+            .expect("style line text should render");
+        assert!(
+            !rendered.style.contains_key("editor_type_hints_json"),
+            "style object line should not carry inline type hint metadata"
+        );
+
+        let function_line = source
+            .lines()
+            .position(|line| line.trim() == "FUNCTION counter_button(press, label) {")
+            .map(|index| index + 1)
+            .expect("counter source should contain a parameterized function");
+        let function_inline = model.inline_type_hints_for_line(function_line);
+        assert!(
+            function_inline.iter().any(|hint| {
+                hint.category == "function_signature"
+                    && hint.compact_label.contains("press: [...]")
+                    && hint.compact_label.contains("label: TEXT")
+                    && hint.compact_label.contains("[kind:")
+            }),
+            "function definitions should show a compact signature only when it is concise: {:?}",
+            function_inline
+        );
+        let label_column = source
+            .lines()
+            .nth(function_line - 1)
+            .and_then(|line| line.find("label"))
+            .map(|column| column + 1)
+            .expect("function signature should contain label");
+        let label_hint = model
+            .type_hint_at_position(&EditorPosition {
+                line: function_line,
+                column: label_column,
+            })
+            .expect("function argument should have an exact inferred type");
+        assert_eq!(label_hint.category, "function_arg");
+        assert_eq!(label_hint.compact_label, "TEXT");
+
+        let call_line = source
+            .lines()
+            .position(|line| line.trim() == "child: counter_panel()")
+            .map(|index| index + 1)
+            .expect("counter source should contain a child function call");
+        let call_inline = model.inline_type_hints_for_line(call_line);
+        assert!(
+            call_inline
+                .iter()
+                .any(|hint| hint.category == "call" && hint.compact_label.starts_with("[kind:")),
+            "function calls returning document objects should remain visible inline: {:?}",
+            call_inline
+        );
+
+        let todo_source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let todo_model = CodeEditorModel::new("examples/todomvc.bn", &todo_source);
+        let selected_filter_line = todo_source
+            .lines()
+            .position(|line| line.trim() == "selected_filter:")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare selected_filter");
+        let selected_filter_inline = todo_model.inline_type_hints_for_line(selected_filter_line);
+        assert!(
+            selected_filter_inline.iter().any(|hint| {
+                hint.category == "definition"
+                    && hint.compact_label.contains("All")
+                    && hint.compact_label.contains("Active")
+                    && hint.compact_label.contains("Completed")
+            }),
+            "tag option fields should show their option set inline: {:?}",
+            selected_filter_inline
+        );
+        for field_name in ["title:", "edit_text:"] {
+            let field_line = todo_source
+                .lines()
+                .position(|line| line.trim() == field_name)
+                .map(|index| index + 1)
+                .unwrap_or_else(|| panic!("TodoMVC should declare {field_name}"));
+            let field_inline = todo_model.inline_type_hints_for_line(field_line);
+            assert!(
+                field_inline
+                    .iter()
+                    .any(|hint| hint.category == "definition" && hint.compact_label == "TEXT"),
+                "{field_name} should show its inferred Text type inline: {:?}",
+                field_inline
+            );
+        }
+        let list_count_line = todo_source
+            .lines()
+            .position(|line| line.trim() == "|> List/count()")
+            .map(|index| index + 1)
+            .expect("TodoMVC should count retained todos through a pipeline");
+        let list_count_inline = todo_model.inline_type_hints_for_line(list_count_line);
+        assert!(
+            list_count_inline
+                .iter()
+                .any(|hint| hint.category == "call" && hint.compact_label == "NUMBER"),
+            "pipeline calls returning scalars should show the result inline: {:?}",
+            list_count_inline
+        );
+
+        let mut shell = DevWindowShell::new(
+            "examples/counter.bn",
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: count_line,
+            column: 5,
+        });
+        let footer_text = shell
+            .footer_lines()
+            .into_iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !footer_text.contains("Hover:") && !footer_text.contains("Type:"),
+            "detailed type display should live in the sidebar, not footer: {footer_text}"
+        );
+        let hover_document = shell.document();
+        assert!(
+            !hover_document
+                .nodes
+                .contains_key(&boon_document_model::DocumentNodeId(
+                    "dev-toolbar-hover-type".to_owned(),
+                )),
+            "type display should live in the sidebar instead of the toolbar"
+        );
+        assert!(
+            !hover_document
+                .nodes
+                .contains_key(&boon_document_model::DocumentNodeId(
+                    "dev-type-inspector-origin".to_owned(),
+                )),
+            "inspector header metadata should not consume sidebar space"
+        );
+        let inspector_detail = hover_document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector-detail-row-0".to_owned(),
+            ))
+            .expect("type inspector should expose full detail rows");
+        assert!(
+            inspector_detail
+                .text
+                .as_ref()
+                .is_some_and(|text| text.text.starts_with("count: NUMBER")),
+            "inspector scalar row should put the type first with any live value inline: {:?}",
+            inspector_detail.text
+        );
+        assert_eq!(
+            inspector_detail.style.get("rich_text"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        let boon_document_model::StyleValue::Text(inspector_spans_json) = inspector_detail
+            .style
+            .get("syntax_spans_json")
+            .expect("type inspector detail should carry syntax spans")
+        else {
+            panic!("syntax_spans_json should be text");
+        };
+        let inspector_spans = serde_json::from_str::<Vec<serde_json::Value>>(inspector_spans_json)
+            .expect("inspector syntax spans should be valid JSON");
+        assert!(inspector_spans.iter().any(|span| {
+            span["source_text"].as_str() == Some("NUMBER")
+                && span["color"].as_str() == Some(syntax_color_for_kind("type"))
+        }));
+
+        let mut caret_shell = DevWindowShell::new(
+            "examples/counter.bn",
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        caret_shell.workspace.selected_buffer.set_selection(
+            EditorPosition {
+                line: count_line,
+                column: 5,
+            },
+            EditorPosition {
+                line: count_line,
+                column: 5,
+            },
+        );
+        let caret_document = caret_shell.document();
+        let caret_detail = caret_document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector-detail-row-0".to_owned(),
+            ))
+            .expect("type inspector should fall back to caret");
+        assert!(
+            caret_detail
+                .text
+                .as_ref()
+                .is_some_and(|text| text.text.starts_with("count: NUMBER")),
+            "caret inspector should use the same merged type/value row: {:?}",
+            caret_detail.text
+        );
+    }
+
+    #[test]
+    fn moving_pointer_out_of_editor_clears_stale_hover_type() {
+        let source = include_str!("../../../examples/counter.bn").to_owned();
+        let count_line = source
+            .lines()
+            .position(|line| line.trim() == "count:")
+            .map(|index| index + 1)
+            .expect("counter source should declare count");
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("counter source should declare store");
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(&source);
+        shell.workspace.selected_buffer.set_selection(
+            EditorPosition {
+                line: store_line,
+                column: 2,
+            },
+            EditorPosition {
+                line: store_line,
+                column: 2,
+            },
+        );
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: count_line,
+            column: 5,
+        });
+        assert_eq!(
+            shell
+                .active_type_hint()
+                .map(|active| active.hint.compact_label.as_str()),
+            Some("NUMBER")
+        );
+
+        let inspector_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .expect("type inspector should be laid out")
+            .bounds;
+        let mut motion = test_keyboard_input(Vec::new(), Vec::new());
+        motion.mouse_motion_event_count = 1;
+        motion.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(inspector_bounds.x + inspector_bounds.width * 0.5),
+            y: f64::from(inspector_bounds.y + inspector_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        assert!(dev_apply_real_window_input(
+            &motion,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.hovered_editor_position, None);
+        assert_ne!(
+            shell
+                .active_type_hint()
+                .map(|active| active.hint.compact_label.as_str()),
+            Some("NUMBER"),
+            "after leaving the editor the inspector should fall back to the caret instead of stale hover"
+        );
+    }
+
+    #[test]
+    fn dev_type_inspector_is_laid_out_inside_the_visible_window() {
+        let (_, _, document, layout) = test_dev_editor_context("value: Text/empty()\n");
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+        let inspector_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .expect("type inspector should be laid out")
+            .bounds;
+        let inspector_node = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .expect("type inspector should be laid out");
+        assert!(
+            !inspector_node.style.contains_key("border"),
+            "type inspector should not have a heavy outer border"
+        );
+        let inspector_document_node = document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector".to_owned(),
+            ))
+            .expect("type inspector document node should exist");
+        assert_eq!(
+            style_number_from_map(&inspector_document_node.style, "padding"),
+            Some(0.0)
+        );
+        let detail_node = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector-detail")
+            .expect("type inspector detail should be laid out");
+        assert!(
+            !detail_node.style.contains_key("border"),
+            "type inspector detail should not add a second frame"
+        );
+        let detail_document_node = document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector-detail".to_owned(),
+            ))
+            .expect("type inspector detail document node should exist");
+        assert_eq!(
+            style_number_from_map(&detail_document_node.style, "padding"),
+            Some(2.0)
+        );
+
+        assert!(
+            inspector_bounds.x >= editor_bounds.x + editor_bounds.width,
+            "type inspector should sit to the right of the editor: editor={editor_bounds:?} inspector={inspector_bounds:?}"
+        );
+        assert!(
+            inspector_bounds.x + inspector_bounds.width <= 1180.0,
+            "type inspector should fit inside the dev viewport: inspector={inspector_bounds:?}"
+        );
+        assert!(
+            inspector_bounds.width >= DEV_TYPE_INSPECTOR_DEFAULT_WIDTH as f32 - 0.5,
+            "type inspector default should be wider than the old narrow sidebar: inspector={inspector_bounds:?}"
+        );
+        assert!(
+            (inspector_bounds.x + inspector_bounds.width - (1180.0 - DEV_ROOT_PADDING as f32))
+                .abs()
+                <= 1.0,
+            "type inspector should use the available right edge without an extra unused gutter: inspector={inspector_bounds:?}"
+        );
+    }
+
+    #[test]
+    fn dev_type_inspector_resize_handle_changes_sidebar_width() {
+        let (mut shell, mut input_state, document, layout) =
+            test_dev_editor_context("value: Text/empty()\n");
+        let handle_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector-resize-handle")
+            .expect("type inspector resize handle should be laid out")
+            .bounds;
+        let handle_item = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector-resize-handle")
+            .expect("type inspector resize handle should be laid out");
+        assert!(handle_bounds.width >= 10.0);
+        assert_eq!(
+            style_text_from_map(&handle_item.style, "cursor"),
+            Some("col-resize")
+        );
+        let starting_width = shell.type_inspector_width;
+
+        let mut hover = test_keyboard_input(Vec::new(), Vec::new());
+        hover.mouse_motion_event_count = 1;
+        hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(handle_bounds.x + handle_bounds.width * 0.5),
+            y: f64::from(handle_bounds.y + handle_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &hover,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(shell.type_inspector_resize_hovered);
+        assert_eq!(
+            shell.current_cursor_icon(),
+            boon_native_app_window::NativeCursorIcon::ColumnResize
+        );
+        let hover_document = shell.document_for_viewport(1180, 820);
+        let hover_handle = hover_document
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector-resize-handle".to_owned(),
+            ))
+            .expect("hovered resize handle should render");
+        assert_eq!(style_text_value(hover_handle, "bg"), Some(DEV_ACCENT));
+
+        let mut press = test_keyboard_input(Vec::new(), Vec::new());
+        press.mouse_button_event_count = 1;
+        press.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 1,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        }];
+        press.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(handle_bounds.x + handle_bounds.width * 0.5),
+            y: f64::from(handle_bounds.y + handle_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        assert!(dev_apply_real_window_input(
+            &press,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(input_state.type_inspector_resizing);
+
+        let before_drag = DevEditorSnapshot::from_shell(&shell);
+        let mut drag = test_keyboard_input(Vec::new(), Vec::new());
+        drag.mouse_motion_event_count = 1;
+        drag.mouse_buttons_down = vec!["left".to_owned()];
+        drag.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(handle_bounds.x - 120.0),
+            y: f64::from(handle_bounds.y + handle_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        assert!(dev_apply_real_window_input(
+            &drag,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(
+            shell.type_inspector_width > starting_width,
+            "dragging the handle left should widen the sidebar"
+        );
+        let after_drag = DevEditorSnapshot::from_shell(&shell);
+        assert!(
+            !before_drag.secondary_visual_only(&after_drag),
+            "resizing changes geometry and must request a real layout refresh"
+        );
+    }
+
+    #[test]
+    fn editor_primary_clipboard_shortcuts_work_with_native_key_names() {
+        let source = "alpha\nbeta".to_owned();
+        let mut shell = DevWindowShell::new(
+            "custom://clipboard.bn",
+            &source,
+            Some("custom:clipboard"),
+            PreviewTransport::new(None),
+        );
+        let mut clipboard = TestClipboard::default();
+
+        assert!(apply_dev_editor_primary_shortcut(
+            &mut shell,
+            "KeyA",
+            &mut clipboard
+        ));
+        assert_eq!(shell.workspace.selected_buffer.selected_text(), source);
+        assert!(apply_dev_editor_primary_shortcut(
+            &mut shell,
+            "KeyC",
+            &mut clipboard
+        ));
+        assert_eq!(clipboard.text, source);
+
+        let end = shell
+            .workspace
+            .selected_buffer
+            .position_for_offset(shell.workspace.selected_buffer.source_text.len());
+        shell
+            .workspace
+            .selected_buffer
+            .set_selection(end.clone(), end);
+        assert!(apply_dev_editor_primary_shortcut(
+            &mut shell,
+            "KeyV",
+            &mut clipboard
+        ));
+        assert_eq!(
+            shell.workspace.selected_buffer.source_text,
+            "alpha\nbetaalpha\nbeta"
+        );
+
+        shell.workspace.selected_buffer.set_selection(
+            EditorPosition { line: 1, column: 1 },
+            EditorPosition { line: 1, column: 6 },
+        );
+        assert!(apply_dev_editor_primary_shortcut(
+            &mut shell,
+            "KeyX",
+            &mut clipboard
+        ));
+        assert_eq!(clipboard.text, "alpha");
+        assert!(
+            shell
+                .workspace
+                .selected_buffer
+                .source_text
+                .starts_with("\nbeta")
+        );
+    }
+
+    #[test]
+    fn editor_primary_clipboard_shortcut_tracks_modifier_key_events() {
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context("alpha beta");
+        shell.workspace.selected_buffer.set_selection(
+            EditorPosition { line: 1, column: 1 },
+            EditorPosition { line: 1, column: 6 },
+        );
+        let mut clipboard = TestClipboard::default();
+        let input = test_keyboard_input(
+            vec![
+                boon_native_app_window::NativeKeyboardEventProof {
+                    sequence: input_state.last_keyboard_event_sequence.saturating_add(1),
+                    key: "Control".to_owned(),
+                    pressed: true,
+                    window_protocol_id: Some(1),
+                },
+                boon_native_app_window::NativeKeyboardEventProof {
+                    sequence: input_state.last_keyboard_event_sequence.saturating_add(2),
+                    key: "KeyC".to_owned(),
+                    pressed: true,
+                    window_protocol_id: Some(1),
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert!(dev_apply_real_window_input_with_clipboard(
+            &input,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+            &mut clipboard
+        ));
+        assert_eq!(clipboard.text, "alpha");
+        assert_eq!(shell.workspace.selected_buffer.clipboard_cache, "alpha");
+        assert_eq!(
+            shell.workspace.selected_buffer.last_command.as_deref(),
+            Some("clipboard-copy")
+        );
     }
 
     #[test]
@@ -15257,7 +19269,15 @@ mod tests {
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
             footer_scroll_line: 0,
+            footer_selection: None,
+            type_inspector_scroll_line: 0,
+            type_inspector_scroll_column: 0,
+            type_inspector_selection: None,
+            type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
+            type_inspector_resize_hovered: false,
+            hovered_editor_position: None,
             caret_visible: false,
+            runtime_value_cache: RefCell::new(None),
         };
         let input_state = DevNativeInputState {
             editor_focused: true,
@@ -15686,6 +19706,64 @@ mod tests {
     }
 
     #[test]
+    fn dev_render_scroll_patch_blanks_reused_rows_past_end_of_file() {
+        let source = (1..=80)
+            .map(|line| format!("value_{line}: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut shell, _, _, _) = test_dev_editor_context(&source);
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        shell.workspace.selected_buffer.scroll_line =
+            shell.workspace.selected_buffer.line_count.saturating_sub(3);
+
+        assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
+        let frame = render_state
+            .layout_frame
+            .as_ref()
+            .expect("patched dev layout should exist");
+        let mut text_rows = frame
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-code-editor-line-text-"))
+            .collect::<Vec<_>>();
+        text_rows.sort_by(|left, right| left.bounds.y.total_cmp(&right.bounds.y));
+        let first_blank = text_rows
+            .iter()
+            .position(|item| item.text.as_deref().unwrap_or_default().is_empty())
+            .expect("scrolling near EOF should leave blank recycled rows");
+        assert!(
+            first_blank > 0,
+            "real EOF lines should still render before blank rows"
+        );
+        assert!(
+            text_rows[first_blank..].iter().all(|item| item
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()),
+            "rows after EOF must be blank instead of stale repeated source text"
+        );
+
+        let mut gutters = frame
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-code-editor-gutter-"))
+            .collect::<Vec<_>>();
+        gutters.sort_by(|left, right| left.bounds.y.total_cmp(&right.bounds.y));
+        assert!(
+            gutters[first_blank..].iter().all(|item| item
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()),
+            "gutter rows after EOF must be blank with the source rows"
+        );
+    }
+
+    #[test]
     fn editor_caret_click_uses_visual_patch_without_full_layout_refresh() {
         let (mut shell, mut input_state, document, layout) =
             test_dev_editor_context("value: [count]\nnext: {}\n");
@@ -15901,6 +19979,182 @@ mod tests {
     }
 
     #[test]
+    fn inspector_runtime_values_use_fast_preview_summary_refresh() {
+        let source = include_str!("../../../examples/counter.bn");
+        let (mut shell, _, _, _) = test_dev_editor_context(source);
+        let count_line = source
+            .lines()
+            .position(|line| line.trim() == "count:")
+            .map(|index| index + 1)
+            .expect("counter example should define count");
+        let count_column = source
+            .lines()
+            .nth(count_line - 1)
+            .and_then(|line| line.find("count"))
+            .map(|index| index + 2)
+            .expect("count line should contain count");
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: count_line,
+            column: count_column,
+        });
+        assert_eq!(
+            shell.preview_summary_refresh_interval(),
+            Duration::from_millis(DEV_PREVIEW_INSPECTOR_REFRESH_MS)
+        );
+
+        shell.hovered_editor_position = None;
+        assert_eq!(
+            shell.preview_summary_refresh_interval(),
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS)
+        );
+    }
+
+    #[test]
+    fn preview_runtime_summary_query_reflects_live_runtime_updates() {
+        let source_path = PathBuf::from("examples/counter.bn");
+        let source = include_str!("../../../examples/counter.bn").to_owned();
+        let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
+        let mut runtime =
+            boon_runtime::LiveRuntime::from_source("runtime-summary-refresh-counter", &source)
+                .expect("counter source should build live runtime");
+        let initial_summary = preview_runtime_summary_from_state_summary(
+            &source_path,
+            &source_sha256,
+            runtime.state_summary(),
+        );
+        let initial_hash = initial_summary["state_summary_hash"]
+            .as_str()
+            .expect("initial summary should include state hash")
+            .to_owned();
+        let live_runtime = Arc::new(Mutex::new(runtime));
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            source_bytes: source.len() as u64,
+            source_sha256: source_sha256.clone(),
+            runtime_summary: initial_summary,
+            shared_render_state,
+            live_runtime: Some(Arc::clone(&live_runtime)),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        }));
+
+        live_runtime
+            .lock()
+            .expect("runtime mutex should lock")
+            .apply_source_event(boon_runtime::LiveSourceEvent {
+                source: "store.sources.increment_button.press".to_owned(),
+                text: None,
+                key: None,
+                address: None,
+                target_text: None,
+                target_occurrence: None,
+            })
+            .expect("increment event should apply");
+
+        let (fresh_summary, _) = preview_fresh_runtime_summary_for_state(&state)
+            .expect("runtime summary query should refresh from live runtime");
+        let fresh_hash = fresh_summary["state_summary_hash"]
+            .as_str()
+            .expect("fresh summary should include state hash");
+        assert_ne!(fresh_hash, initial_hash);
+        assert_eq!(
+            state.lock().expect("IPC state should lock").runtime_summary["state_summary_hash"]
+                .as_str(),
+            Some(fresh_hash)
+        );
+    }
+
+    #[test]
+    fn preview_runtime_value_query_reflects_todomvc_completed_toggle() {
+        let source_path = PathBuf::from("examples/todomvc.bn");
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
+        let mut runtime =
+            boon_runtime::LiveRuntime::from_source("runtime-value-refresh-todomvc", &source)
+                .expect("TodoMVC source should build live runtime");
+        let initial_summary = preview_runtime_summary_from_state_summary(
+            &source_path,
+            &source_sha256,
+            runtime.state_summary(),
+        );
+        let live_runtime = Arc::new(Mutex::new(runtime));
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path,
+            source_text: source.clone(),
+            source_bytes: source.len() as u64,
+            source_sha256,
+            runtime_summary: initial_summary,
+            shared_render_state,
+            live_runtime: Some(Arc::clone(&live_runtime)),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        }));
+
+        live_runtime
+            .lock()
+            .expect("runtime mutex should lock")
+            .apply_source_event(boon_runtime::LiveSourceEvent {
+                source: "todo.sources.todo_checkbox.click".to_owned(),
+                text: None,
+                key: None,
+                address: None,
+                target_text: Some("Buy groceries".to_owned()),
+                target_occurrence: None,
+            })
+            .expect("TodoMVC checkbox event should apply");
+
+        let response = preview_runtime_value_response(
+            &state,
+            &json!({
+                "kind": "runtime-value",
+                "paths": ["store.todos"],
+                "max_depth": DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH,
+                "max_fields": DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS,
+                "max_list_items": DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS
+            }),
+        )
+        .expect("runtime value response should succeed");
+        assert_eq!(response["status"], "pass");
+        assert_eq!(
+            response["values"]["store.todos"]["sample"][3]["fields"]["completed"]["value"],
+            true
+        );
+        assert!(
+            response["values"]["store.todos"]["sample"][3]["fields"]
+                .get("key")
+                .is_none(),
+            "inspector values should not expose hidden runtime row keys"
+        );
+    }
+
+    #[test]
     fn dev_footer_keeps_last_good_runtime_summary_during_transient_poll_failures() {
         let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
         let source_hash =
@@ -15979,6 +20233,112 @@ mod tests {
     }
 
     #[test]
+    fn dev_footer_expands_preview_and_code_diagnostics() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: [\n");
+        shell.workspace.selected_buffer.diagnostics =
+            vec!["examples/counter.bn: expected closing bracket".to_owned()];
+        shell.last_preview_summary = json!({
+            "status": "pass",
+            "preview_last_error_count": 7,
+            "preview_last_error": "typecheck failed with 2 diagnostic(s): unknown identifier `missing`; object is missing field `title`"
+        });
+
+        let footer_text = shell.footer_display_lines().join("\n");
+        assert!(footer_text.contains("Code diagnostic 1: examples/counter.bn"));
+        assert!(footer_text.contains("Preview error: 7 reported error events"));
+        assert!(footer_text.contains("Preview detail 1: unknown identifier `missing`"));
+        assert!(footer_text.contains("Preview detail 2: object is missing field `title`"));
+    }
+
+    #[test]
+    fn dev_footer_selection_can_be_copied_from_ui_focus() {
+        let (mut shell, mut input_state, _, _) = test_dev_editor_context("store: []\n");
+        shell.last_preview_summary = json!({
+            "status": "pass",
+            "preview_last_error_count": 1,
+            "preview_last_error": "typecheck failed with 1 diagnostic(s): unknown identifier `missing`"
+        });
+        let document = shell.document_for_viewport(1180, 820);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 1180.0,
+                height: 820.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let footer_value = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-footer-row-0-value")
+            .expect("footer value row should be visible")
+            .bounds;
+        let mut click = test_keyboard_input(Vec::new(), Vec::new());
+        click.mouse_button_event_count = 1;
+        click.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 1,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        }];
+        click.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(footer_value.x + 4.0),
+            y: f64::from(footer_value.y + footer_value.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+        assert!(dev_apply_real_window_input(
+            &click,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(input_state.footer_focused);
+
+        let mut clipboard = TestClipboard::default();
+        let select_all = test_keyboard_input(vec![test_key_press(2, "KeyA")], vec!["Control"]);
+        assert!(dev_apply_real_window_input_with_clipboard(
+            &select_all,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+            &mut clipboard
+        ));
+        let copy = test_keyboard_input(vec![test_key_press(3, "KeyC")], vec!["Control"]);
+        assert!(dev_apply_real_window_input_with_clipboard(
+            &copy,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state,
+            &mut clipboard
+        ));
+        assert!(clipboard.text.contains("Preview detail 1"));
+        assert!(clipboard.text.contains("unknown identifier `missing`"));
+
+        let selected_frame = shell.document_for_viewport(1180, 820);
+        let selected_value = selected_frame
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-footer-row-0-value".to_owned(),
+            ))
+            .expect("footer value row should render");
+        assert!(selected_value.style.contains_key("editor_selection_start"));
+    }
+
+    #[test]
     fn dev_editor_caret_blinks_only_while_editor_is_focused() {
         let started = Instant::now()
             .checked_sub(Duration::from_millis(
@@ -16052,7 +20412,15 @@ mod tests {
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
             footer_scroll_line: 0,
+            footer_selection: None,
+            type_inspector_scroll_line: 0,
+            type_inspector_scroll_column: 0,
+            type_inspector_selection: None,
+            type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
+            type_inspector_resize_hovered: false,
+            hovered_editor_position: None,
             caret_visible: true,
+            runtime_value_cache: RefCell::new(None),
         };
 
         let frame = shell.document_for_viewport(1180, 820);
@@ -16171,6 +20539,274 @@ mod tests {
     }
 
     #[test]
+    fn type_inspector_scroll_is_routed_separately_from_editor_scroll() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare store");
+        let (mut shell, mut input_state, document, layout) = test_dev_editor_context(&source);
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: store_line,
+            column: 2,
+        });
+        let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
+        let visible_line_count = layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-type-inspector-detail-row-"))
+            .count();
+        assert!(
+            content.detail_lines.len() > visible_line_count,
+            "test source should create enough inspector detail to scroll: {:?}",
+            content.detail_lines
+        );
+        assert_eq!(
+            content.detail_lines.first().map(String::as_str),
+            Some("store: [")
+        );
+        let inspector_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .expect("type inspector should be laid out")
+            .bounds;
+
+        let mut inspector_scroll = test_keyboard_input(Vec::new(), Vec::new());
+        inspector_scroll.scroll_delta_y = 24.0;
+        inspector_scroll.mouse_scroll_event_count = 1;
+        inspector_scroll.mouse_window_pos =
+            Some(boon_native_app_window::NativeMouseWindowPosition {
+                x: f64::from(inspector_bounds.x + inspector_bounds.width * 0.5),
+                y: f64::from(inspector_bounds.y + inspector_bounds.height * 0.5),
+                window_width: 1180.0,
+                window_height: 820.0,
+            });
+        assert!(dev_apply_real_window_input(
+            &inspector_scroll,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert!(shell.type_inspector_scroll_line > 0);
+        assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
+        assert_eq!(shell.footer_scroll_line, 0);
+    }
+
+    #[test]
+    fn type_inspector_shift_wheel_scrolls_horizontally() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare store");
+        let (mut shell, mut input_state, _document, _layout) = test_dev_editor_context(&source);
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: store_line,
+            column: 2,
+        });
+        assert!(
+            shell.type_inspector_max_scroll_column() > 8,
+            "TodoMVC store type should be wide enough for horizontal inspector scroll"
+        );
+
+        let document = shell.document_for_viewport(1180, 820);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 1180.0,
+                height: 820.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+        let inspector_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector")
+            .expect("type inspector should be laid out")
+            .bounds;
+        let mut shift_wheel = test_keyboard_input(Vec::new(), vec!["Shift"]);
+        shift_wheel.scroll_delta_y = 24.0;
+        shift_wheel.mouse_scroll_event_count = 1;
+        shift_wheel.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(inspector_bounds.x + inspector_bounds.width * 0.5),
+            y: f64::from(inspector_bounds.y + inspector_bounds.height * 0.5),
+            window_width: 1180.0,
+            window_height: 820.0,
+        });
+
+        assert!(dev_apply_real_window_input(
+            &shift_wheel,
+            &document,
+            &layout,
+            1180,
+            820,
+            &mut shell,
+            &mut input_state
+        ));
+        assert_eq!(shell.type_inspector_scroll_line, 0);
+        assert_eq!(shell.type_inspector_scroll_column, 3);
+        assert_eq!(shell.workspace.selected_buffer.scroll_column, 0);
+
+        let scrolled = shell.document_for_viewport(1180, 820);
+        let row = scrolled
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-type-inspector-detail-row-0".to_owned(),
+            ))
+            .expect("type inspector row should render");
+        assert_eq!(
+            row.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Text("-22.32".to_owned()))
+        );
+    }
+
+    #[test]
+    fn type_inspector_selection_can_be_copied() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare store");
+        let mut shell = DevWindowShell::new(
+            "examples/todomvc.bn",
+            &source,
+            Some("todomvc"),
+            PreviewTransport::new(None),
+        );
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: store_line,
+            column: 2,
+        });
+        shell.select_all_type_inspector_content();
+        let mut clipboard = TestClipboard::default();
+
+        assert!(apply_dev_type_inspector_primary_shortcut(
+            &mut shell,
+            "KeyC",
+            &mut clipboard
+        ));
+        assert!(clipboard.text.contains("new_todo_text"));
+        assert!(clipboard.text.contains("todos"));
+
+        let frame = shell.document_for_viewport(1180, 820);
+        let selected_row = frame
+            .nodes
+            .values()
+            .find(|node| {
+                node.id.0.starts_with("dev-type-inspector-detail-row-")
+                    && node.style.contains_key("editor_selection_start")
+                    && node.style.contains_key("editor_selection_end")
+            })
+            .expect("rendered inspector rows should carry selection metadata");
+        assert_eq!(
+            selected_row.style.get("editor_selection_color"),
+            Some(&boon_document_model::StyleValue::Text(
+                BOON_EDITOR_SELECTION.to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn dev_editor_and_inspector_rows_stay_inside_visible_panels() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let store_line = source
+            .lines()
+            .position(|line| line.trim() == "store: [")
+            .map(|index| index + 1)
+            .expect("TodoMVC should declare store");
+        let (mut shell, _input_state, _document, _layout) = test_dev_editor_context(&source);
+        shell.hovered_editor_position = Some(EditorPosition {
+            line: store_line,
+            column: 2,
+        });
+
+        let document = shell.document_for_viewport(881, 825);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = boon_document::layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 881.0,
+                height: 825.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        });
+
+        let editor_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor")
+            .expect("editor should be laid out")
+            .bounds;
+        let detail_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-type-inspector-detail")
+            .expect("type inspector detail should be laid out")
+            .bounds;
+        let footer_scroll_bounds = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-footer-scroll")
+            .expect("footer scroll should be laid out")
+            .bounds;
+
+        for item in layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-code-editor-line-text-"))
+        {
+            assert!(
+                item.bounds.x + item.bounds.width <= editor_bounds.x + editor_bounds.width + 0.5,
+                "{} leaks past editor: {:?} editor={:?}",
+                item.node.0,
+                item.bounds,
+                editor_bounds
+            );
+        }
+        for item in layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-type-inspector-detail-row-"))
+        {
+            assert!(
+                item.bounds.y + item.bounds.height <= detail_bounds.y + detail_bounds.height + 0.5,
+                "{} leaks below inspector detail: {:?} detail={:?}",
+                item.node.0,
+                item.bounds,
+                detail_bounds
+            );
+        }
+        for item in layout
+            .display_list
+            .iter()
+            .filter(|item| item.node.0.starts_with("dev-footer-row-"))
+        {
+            assert!(
+                item.bounds.y + item.bounds.height
+                    <= footer_scroll_bounds.y + footer_scroll_bounds.height + 0.5,
+                "{} leaks below footer scroll: {:?} footer={:?}",
+                item.node.0,
+                item.bounds,
+                footer_scroll_bounds
+            );
+        }
+    }
+
+    #[test]
     fn editor_horizontal_scroll_updates_column_without_moving_lines() {
         let source = (0..24)
             .map(|index| {
@@ -16209,6 +20845,18 @@ mod tests {
         ));
         assert_eq!(shell.workspace.selected_buffer.scroll_line, 0);
         assert_eq!(shell.workspace.selected_buffer.scroll_column, 3);
+
+        let scrolled = shell.document_for_viewport(1180, 820);
+        let row = scrolled
+            .nodes
+            .get(&boon_document_model::DocumentNodeId(
+                "dev-code-editor-line-text-1".to_owned(),
+            ))
+            .expect("editor row should render");
+        assert_eq!(
+            row.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Number(-29.76))
+        );
     }
 
     #[test]
@@ -16373,7 +21021,15 @@ mod tests {
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
             footer_scroll_line: 0,
+            footer_selection: None,
+            type_inspector_scroll_line: 0,
+            type_inspector_scroll_column: 0,
+            type_inspector_selection: None,
+            type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
+            type_inspector_resize_hovered: false,
+            hovered_editor_position: None,
             caret_visible: true,
+            runtime_value_cache: RefCell::new(None),
         };
 
         let activation =
@@ -16478,7 +21134,15 @@ mod tests {
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
             footer_scroll_line: 0,
+            footer_selection: None,
+            type_inspector_scroll_line: 0,
+            type_inspector_scroll_column: 0,
+            type_inspector_selection: None,
+            type_inspector_width: DEV_TYPE_INSPECTOR_DEFAULT_WIDTH,
+            type_inspector_resize_hovered: false,
+            hovered_editor_position: None,
             caret_visible: true,
+            runtime_value_cache: RefCell::new(None),
         };
 
         let official_frame = shell.document_for_viewport(1180, 820);

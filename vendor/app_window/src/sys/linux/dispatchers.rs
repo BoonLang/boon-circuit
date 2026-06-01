@@ -24,7 +24,7 @@ use super::buffer::AllocatedBuffer;
 use super::cursor::{CursorRequest, MouseRegion};
 use super::{App, BufferReleaseInfo, Configure, OutputInfo, SurfaceEvents};
 use crate::coordinates::Position;
-use crate::sys::window::WindowInternal;
+use crate::sys::window::{ConfigureContentBufferAction, WindowInternal};
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
     fn event(
@@ -200,28 +200,39 @@ impl Dispatch<XdgSurface, Arc<Mutex<WindowInternal>>> for App {
                             f.0(locked_data.applied_size())
                         }
 
-                        //rebuild main buffer
-                        let buffer = AllocatedBuffer::new(
-                            locked_data.applied_configure.as_ref().unwrap().width,
-                            locked_data.applied_configure.as_ref().unwrap().height,
-                            &app_state.shm,
-                            qh,
-                            data.clone(),
-                        );
-                        //attach to surface
-                        locked_data.wl_surface.as_ref().expect("No surface").attach(
-                            Some(&buffer.buffer),
-                            0,
-                            0,
-                        );
-                        // ack_configure MUST come before commit per xdg-shell protocol
-                        proxy.ack_configure(serial);
-                        locked_data.has_been_configured = true;
-                        locked_data
-                            .wl_surface
-                            .as_ref()
-                            .expect("No surface")
-                            .commit();
+                        match locked_data.configure_content_buffer_action() {
+                            ConfigureContentBufferAction::AttachShmBuffer => {
+                                // rebuild main buffer
+                                let buffer = AllocatedBuffer::new(
+                                    locked_data.applied_configure.as_ref().unwrap().width,
+                                    locked_data.applied_configure.as_ref().unwrap().height,
+                                    &app_state.shm,
+                                    qh,
+                                    data.clone(),
+                                );
+                                // attach to surface
+                                locked_data.wl_surface.as_ref().expect("No surface").attach(
+                                    Some(&buffer.buffer),
+                                    0,
+                                    0,
+                                );
+                                locked_data.note_shm_content_attach();
+                                // ack_configure MUST come before commit per xdg-shell protocol
+                                proxy.ack_configure(serial);
+                                locked_data.has_been_configured = true;
+                                locked_data
+                                    .wl_surface
+                                    .as_ref()
+                                    .expect("No surface")
+                                    .commit();
+                            }
+                            ConfigureContentBufferAction::SkipExternalSurfaceOwner => {
+                                locked_data.note_external_surface_configure_skip();
+                                // ack_configure MUST come before the next WGPU surface commit.
+                                proxy.ack_configure(serial);
+                                locked_data.has_been_configured = true;
+                            }
+                        }
                     } else {
                         // No buffer changes needed, but still must ack
                         proxy.ack_configure(serial);
@@ -313,6 +324,10 @@ impl Dispatch<WlBuffer, BufferReleaseInfo> for App {
                 let buf = release.allocated_buffer.expect("No allocated buffer");
 
                 let mut lock = release.window_internal.lock().unwrap();
+                if lock.external_surface_created {
+                    proxy.destroy();
+                    return;
+                }
                 if buf.width == lock.applied_configure.as_ref().unwrap().width
                     && buf.height == lock.applied_configure.as_ref().unwrap().height
                 {
@@ -488,8 +503,8 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                     MouseRegion::BottomRight => CursorRequest::bottom_right_corner(),
                     MouseRegion::Bottom => CursorRequest::bottom_side(),
                     MouseRegion::Right => CursorRequest::right_side(),
-                    MouseRegion::Client
-                    | MouseRegion::MaximizeButton
+                    MouseRegion::Client => data.client_cursor_request(),
+                    MouseRegion::MaximizeButton
                     | MouseRegion::CloseButton
                     | MouseRegion::MinimizeButton => CursorRequest::left_ptr(),
                     MouseRegion::Titlebar => CursorRequest::left_ptr(),

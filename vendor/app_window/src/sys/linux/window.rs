@@ -14,9 +14,11 @@ use wayland_protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
 
 use super::ax::AX;
 use super::buffer::{AllocatedBuffer, create_shm_buffer_decor};
+use super::cursor::CursorRequest;
 use super::main_thread::MAIN_THREAD_INFO;
 use super::{App, AppState, Configure, FullscreenError, Surface, SurfaceEvents};
 use crate::coordinates::{Position, Size};
+use crate::surface::SurfaceContentReport;
 
 pub struct DebugWrapper(pub Box<dyn Fn(Size) + Send>);
 impl Debug for DebugWrapper {
@@ -51,6 +53,27 @@ pub(super) struct WindowInternal {
     pub title: String,
     pub current_outputs: HashSet<u32>,
     pub has_been_configured: bool,
+    pub external_surface_created: bool,
+    pub shm_content_attach_count: u64,
+    pub shm_content_attach_after_external_surface_count: u64,
+    pub external_surface_configure_skip_count: u64,
+    pub client_cursor_request: Option<CursorRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConfigureContentBufferAction {
+    AttachShmBuffer,
+    SkipExternalSurfaceOwner,
+}
+
+pub(super) fn configure_content_buffer_action(
+    external_surface_created: bool,
+) -> ConfigureContentBufferAction {
+    if external_surface_created {
+        ConfigureContentBufferAction::SkipExternalSurfaceOwner
+    } else {
+        ConfigureContentBufferAction::AttachShmBuffer
+    }
 }
 
 impl WindowInternal {
@@ -85,6 +108,11 @@ impl WindowInternal {
             xdg_surface: None,
             current_outputs: HashSet::new(),
             has_been_configured: false,
+            external_surface_created: false,
+            shm_content_attach_count: 0,
+            shm_content_attach_after_external_surface_count: 0,
+            external_surface_configure_skip_count: 0,
+            client_cursor_request: None,
         }));
         if ax {
             let _aximpl = AX::new(size, title.clone(), window_internal.clone());
@@ -109,6 +137,42 @@ impl WindowInternal {
     pub fn applied_size(&self) -> Size {
         let applied = self.applied_configure.clone().expect("No configure event");
         Size::new(applied.width as f64, applied.height as f64)
+    }
+
+    pub(super) fn mark_external_surface_created(&mut self) {
+        self.external_surface_created = true;
+        self.drawable_buffer = None;
+    }
+
+    pub(super) fn configure_content_buffer_action(&self) -> ConfigureContentBufferAction {
+        configure_content_buffer_action(self.external_surface_created)
+    }
+
+    pub(super) fn note_shm_content_attach(&mut self) {
+        self.shm_content_attach_count += 1;
+        if self.external_surface_created {
+            self.shm_content_attach_after_external_surface_count += 1;
+        }
+    }
+
+    pub(super) fn note_external_surface_configure_skip(&mut self) {
+        self.external_surface_configure_skip_count += 1;
+    }
+
+    pub(super) fn content_report(&self) -> SurfaceContentReport {
+        SurfaceContentReport {
+            external_surface_created: self.external_surface_created,
+            shm_content_attach_count: self.shm_content_attach_count,
+            shm_content_attach_after_external_surface_count: self
+                .shm_content_attach_after_external_surface_count,
+            external_surface_configure_skip_count: self.external_surface_configure_skip_count,
+        }
+    }
+
+    pub(super) fn client_cursor_request(&self) -> CursorRequest {
+        self.client_cursor_request
+            .clone()
+            .unwrap_or_else(CursorRequest::left_ptr)
     }
 
     pub fn close_window(&self) {
@@ -291,14 +355,11 @@ impl Window {
             display
         })
         .await;
-        let surface = self
-            .internal
-            .lock()
-            .unwrap()
-            .wl_surface
-            .as_ref()
-            .expect("No surface")
-            .clone();
+        let surface = {
+            let mut internal = self.internal.lock().unwrap();
+            internal.mark_external_surface_created();
+            internal.wl_surface.as_ref().expect("No surface").clone()
+        };
         crate::surface::Surface {
             sys: Surface {
                 wl_display: display,
@@ -312,5 +373,26 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         self.internal.lock().unwrap().close_window();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigureContentBufferAction, configure_content_buffer_action};
+
+    #[test]
+    fn configure_uses_shm_buffer_before_external_surface_exists() {
+        assert_eq!(
+            configure_content_buffer_action(false),
+            ConfigureContentBufferAction::AttachShmBuffer
+        );
+    }
+
+    #[test]
+    fn configure_skips_shm_buffer_after_external_surface_exists() {
+        assert_eq!(
+            configure_content_buffer_action(true),
+            ConfigureContentBufferAction::SkipExternalSurfaceOwner
+        );
     }
 }

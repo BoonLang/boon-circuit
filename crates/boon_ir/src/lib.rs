@@ -1342,7 +1342,7 @@ fn canonical_view_node_kind(function: &str) -> &str {
         "Element/checkbox" => "Checkbox",
         "Element/button" => "Button",
         "Element/label" | "Element/text" | "Element/paragraph" | "Element/link" => "Text",
-        "Element/stripe" if function.ends_with("stripe") => "Column",
+        "Element/stripe" if function.ends_with("stripe") => "Stripe",
         _ => function.strip_prefix("Element/").unwrap_or(function),
     }
 }
@@ -4041,6 +4041,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stripe_view_binding_uses_neutral_kind_metadata() {
+        assert_eq!(canonical_view_node_kind("Element/stripe"), "Stripe");
+    }
+
+    #[test]
     fn document_view_bindings_resolve_function_arguments_generically() {
         let source = r#"
 store: [
@@ -4230,8 +4235,7 @@ document:
         }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "store.sources.new_todo_input.key_down"
-                && source.payload_schema.fields
-                    == vec![SourcePayloadField::Key, SourcePayloadField::Text]
+                && source.payload_schema.fields == vec![SourcePayloadField::Key]
         }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "store.sources.new_todo_input.change"
@@ -4365,7 +4369,7 @@ document:
                 && branch.source == "todo.sources.editing_todo_title_element.key_down"
                 && branch.expression
                     == UpdateExpression::TextTrimOrPrevious {
-                        path: "text".to_owned(),
+                        path: "edit_text".to_owned(),
                         previous: "title".to_owned(),
                     }
                 && branch.indexed

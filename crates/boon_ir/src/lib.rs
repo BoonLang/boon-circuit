@@ -1108,7 +1108,14 @@ impl DocumentViewBindingContext {
 fn view_data_path(value: &str) -> Option<String> {
     let path = value.strip_prefix('$')?;
     let path = path.split_once(':').map_or(path, |(path, _)| path);
-    (!path.trim().is_empty()).then(|| path.to_owned())
+    (!path.trim().is_empty()).then(|| normalized_view_data_path(path))
+}
+
+fn normalized_view_data_path(path: &str) -> String {
+    path.split('.')
+        .filter(|part| *part != "PASSED")
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn view_data_path_for_expr_id(
@@ -1133,7 +1140,8 @@ fn view_data_path_for_expr(
             .arg_expr(value)
             .and_then(|expr_id| view_data_path_for_expr_id(expr_id, expressions, context))
             .or_else(|| Some(value.clone())),
-        AstExprKind::Path(parts) => Some(parts.join(".")),
+        AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == "element") => None,
+        AstExprKind::Path(parts) => Some(normalized_view_data_path(&parts.join("."))),
         AstExprKind::Infix { left, .. } => view_data_path_for_expr_id(*left, expressions, context),
         _ => None,
     }
@@ -1154,8 +1162,6 @@ fn attr_can_bind_data(attr: &str) -> bool {
             | "target"
             | "key"
             | "address"
-            | "color_if"
-            | "strike_if"
     )
 }
 
@@ -1358,10 +1364,23 @@ fn collect_canonical_element_source_bindings(
 ) {
     if let Some(fields) = record_fields_for_statement(element_field, expressions) {
         for field in fields {
-            if field.name != "event" {
+            if field.name == "events" {
+                if let Some(group_path) =
+                    document_expr_value_by_id(field.value, expressions, context)
+                {
+                    push_canonical_view_event_group_bindings(
+                        node_kind,
+                        &group_path,
+                        row_scopes,
+                        source_paths,
+                        bindings,
+                    );
+                }
                 continue;
             }
-            if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
+            if field.name == "event"
+                && let Some(event_fields) = record_fields_for_expr(field.value, expressions)
+            {
                 for source_field in event_fields {
                     if let Some(value) =
                         document_expr_value_by_id(source_field.value, expressions, context)
@@ -1400,6 +1419,42 @@ fn collect_canonical_element_source_bindings(
             );
         }
     }
+}
+
+fn push_canonical_view_event_group_bindings(
+    node_kind: &str,
+    group_path: &str,
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+) {
+    let normalized_group = normalized_document_source_path(group_path);
+    let prefix = format!("{normalized_group}.");
+    for (path, source_id) in source_paths
+        .iter()
+        .filter(|(source_path, _)| source_path.starts_with(&prefix))
+    {
+        let Some(attr) = path.rsplit('.').next() else {
+            continue;
+        };
+        let binding_attr = if attr == "key_down" { "submit" } else { attr };
+        bindings.push(ViewBinding {
+            id: ViewBindingId(bindings.len()),
+            node_kind: node_kind.to_owned(),
+            attr: binding_attr.to_owned(),
+            path: (*path).to_owned(),
+            kind: ViewBindingKind::Source,
+            scope_id: scope_id_for_path(row_scopes, path),
+            source_id: Some(*source_id),
+        });
+    }
+}
+
+fn normalized_document_source_path(path: &str) -> String {
+    path.split('.')
+        .filter(|part| *part != "PASSED" && *part != "events")
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn push_canonical_view_source_binding(
@@ -3221,13 +3276,18 @@ enum PathMatch {
 }
 
 fn path_parts_match(candidate: &[String], expected: &[&str], path_match: PathMatch) -> bool {
+    let candidate = candidate
+        .iter()
+        .filter(|part| part.as_str() != "PASSED" && part.as_str() != "events")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     (match path_match {
         PathMatch::Exact => candidate.len() == expected.len(),
         PathMatch::Prefix => candidate.len() >= expected.len(),
     }) && candidate
         .iter()
         .take(expected.len())
-        .map(String::as_str)
+        .copied()
         .eq(expected.iter().copied())
 }
 

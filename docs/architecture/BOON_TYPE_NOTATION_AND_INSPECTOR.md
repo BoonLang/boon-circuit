@@ -27,8 +27,10 @@ todos: LIST<[
   `tag Active | All | Completed`.
 - Untagged object shapes use bracket notation: `[title: TEXT]`.
 - Exact empty objects display as `[]`.
-- Collapsed known object shapes display as `[...]`; this must not mean an exact
-  empty object.
+- Collapsed known object shapes keep the normal opening bracket on the collapsed
+  row, for example `▸ style: [` or `▸ color: Oklch[`. Do not display `[...]`,
+  because it looks like an old placeholder and is easy to confuse with missing
+  structure.
 - Detailed object shapes use newlines and 4-space indentation:
 
 ```boon

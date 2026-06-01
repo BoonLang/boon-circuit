@@ -449,12 +449,188 @@ pub fn format_source(
         };
         formatted_lines.push(format!("{}{}", " ".repeat(indent_columns), content));
     }
+    formatted_lines = compact_format_bracket_blocks(formatted_lines);
     while formatted_lines.last().is_some_and(|line| line.is_empty()) {
         formatted_lines.pop();
     }
     let mut formatted = formatted_lines.join("\n");
     formatted.push('\n');
     Ok(formatted)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FormatNode {
+    Blank,
+    Line {
+        indent: usize,
+        content: String,
+    },
+    BracketBlock {
+        indent: usize,
+        prefix: String,
+        children: Vec<FormatNode>,
+    },
+}
+
+fn compact_format_bracket_blocks(lines: Vec<String>) -> Vec<String> {
+    let mut index = 0;
+    let nodes = parse_format_nodes(&lines, &mut index, None);
+    let mut formatted = Vec::new();
+    render_format_nodes(&nodes, &mut formatted);
+    formatted
+}
+
+fn parse_format_nodes(
+    lines: &[String],
+    index: &mut usize,
+    close_indent: Option<usize>,
+) -> Vec<FormatNode> {
+    let mut nodes = Vec::new();
+    while *index < lines.len() {
+        let line = &lines[*index];
+        if line.is_empty() {
+            nodes.push(FormatNode::Blank);
+            *index += 1;
+            continue;
+        }
+        let indent = line.chars().take_while(|ch| *ch == ' ').count();
+        let content = line[indent..].to_owned();
+        if close_indent == Some(indent) && content == "]" {
+            *index += 1;
+            break;
+        }
+        if let Some(prefix) = format_bracket_block_prefix(&content) {
+            *index += 1;
+            let children = parse_format_nodes(lines, index, Some(indent));
+            nodes.push(FormatNode::BracketBlock {
+                indent,
+                prefix,
+                children,
+            });
+        } else {
+            nodes.push(FormatNode::Line { indent, content });
+            *index += 1;
+        }
+    }
+    nodes
+}
+
+fn format_bracket_block_prefix(content: &str) -> Option<String> {
+    let prefix = content.strip_suffix('[')?.trim_end();
+    if prefix.contains("--") {
+        return None;
+    }
+    Some(prefix.to_owned())
+}
+
+fn render_format_nodes(nodes: &[FormatNode], output: &mut Vec<String>) {
+    let nonblank = nodes
+        .iter()
+        .filter(|node| !matches!(node, FormatNode::Blank))
+        .collect::<Vec<_>>();
+    let object_of_objects = nonblank.len() > 1
+        && nonblank
+            .iter()
+            .all(|node| matches!(node, FormatNode::BracketBlock { .. }));
+    let mut previous_multiline = false;
+    let mut rendered_any = false;
+    for node in nodes {
+        if matches!(node, FormatNode::Blank) {
+            if !object_of_objects {
+                push_format_blank(output);
+            }
+            continue;
+        }
+        let multiline = format_node_inline_text(node).is_none();
+        if object_of_objects && rendered_any && (previous_multiline || multiline) {
+            push_format_blank(output);
+        }
+        render_format_node(node, output);
+        previous_multiline = multiline;
+        rendered_any = true;
+    }
+}
+
+fn render_format_node(node: &FormatNode, output: &mut Vec<String>) {
+    match node {
+        FormatNode::Blank => push_format_blank(output),
+        FormatNode::Line { indent, content } => {
+            output.push(format!("{}{}", " ".repeat(*indent), content));
+        }
+        FormatNode::BracketBlock {
+            indent,
+            prefix,
+            children,
+        } => {
+            if let Some(inline) = format_node_inline_text(node) {
+                output.push(format!("{}{}", " ".repeat(*indent), inline));
+                return;
+            }
+            output.push(format!("{}{}", " ".repeat(*indent), bracket_open(prefix)));
+            render_format_nodes(children, output);
+            output.push(format!("{}]", " ".repeat(*indent)));
+        }
+    }
+}
+
+fn push_format_blank(output: &mut Vec<String>) {
+    if output.last().is_some_and(|line| line.is_empty()) {
+        return;
+    }
+    output.push(String::new());
+}
+
+fn format_node_inline_text(node: &FormatNode) -> Option<String> {
+    const MAX_INLINE_CHARS: usize = 96;
+    let text = format_node_inline_text_unbounded(node)?;
+    (text.chars().count() <= MAX_INLINE_CHARS).then_some(text)
+}
+
+fn format_node_inline_text_unbounded(node: &FormatNode) -> Option<String> {
+    match node {
+        FormatNode::Blank => None,
+        FormatNode::Line { content, .. } => {
+            if content.starts_with("--") {
+                None
+            } else {
+                Some(content.clone())
+            }
+        }
+        FormatNode::BracketBlock {
+            prefix, children, ..
+        } => {
+            let nonblank = children
+                .iter()
+                .filter(|child| !matches!(child, FormatNode::Blank))
+                .collect::<Vec<_>>();
+            match nonblank.as_slice() {
+                [] => Some(bracket_inline(prefix, "")),
+                [child] => {
+                    let child = format_node_inline_text_unbounded(child)?;
+                    Some(bracket_inline(prefix, &child))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn bracket_open(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "[".to_owned()
+    } else {
+        format!("{prefix} [")
+    }
+}
+
+fn bracket_inline(prefix: &str, inner: &str) -> String {
+    if prefix.is_empty() {
+        format!("[{inner}]")
+    } else if inner.is_empty() {
+        format!("{prefix} []")
+    } else {
+        format!("{prefix} [{inner}]")
+    }
 }
 
 pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
@@ -1717,7 +1893,13 @@ fn derive_program_tables(
     row_scopes: &[ParsedRowScopeFunction],
 ) -> StructureTables {
     let mut tables = StructureTables::default();
-    derive_structure_from_statements(&ast.statements, row_scopes, &mut Vec::new(), &mut tables);
+    derive_structure_from_statements(
+        &ast.statements,
+        &ast.expressions,
+        row_scopes,
+        &mut Vec::new(),
+        &mut tables,
+    );
     tables
 }
 
@@ -1729,6 +1911,7 @@ fn collect_row_scope_functions(ast: &AstProgram) -> Vec<ParsedRowScopeFunction> 
 
 fn derive_structure_from_statements(
     statements: &[AstStatement],
+    expressions: &[AstExpr],
     row_scopes: &[ParsedRowScopeFunction],
     scope: &mut Vec<String>,
     tables: &mut StructureTables,
@@ -1740,6 +1923,7 @@ fn derive_structure_from_statements(
                     scope.push(row_scope.to_owned());
                     derive_structure_from_statements(
                         &statement.children,
+                        expressions,
                         row_scopes,
                         scope,
                         tables,
@@ -1751,10 +1935,18 @@ fn derive_structure_from_statements(
                 if name == "document" {
                     continue;
                 }
+                collect_source_ports_from_statement_expr(
+                    statement,
+                    expressions,
+                    scope,
+                    row_scopes,
+                    tables,
+                );
                 if !statement.children.is_empty() {
                     scope.push(name.clone());
                     derive_structure_from_statements(
                         &statement.children,
+                        expressions,
                         row_scopes,
                         scope,
                         tables,
@@ -1763,10 +1955,18 @@ fn derive_structure_from_statements(
                 }
             }
             AstStatementKind::Source { field, event } => {
-                if let Some(field) = field.as_deref() {
+                let collected_from_expr = collect_source_ports_from_statement_expr(
+                    statement,
+                    expressions,
+                    scope,
+                    row_scopes,
+                    tables,
+                );
+                if !collected_from_expr && let Some(field) = field.as_deref() {
+                    let source_scope = source_scope_without_events(scope);
                     let path = match event.as_deref() {
-                        Some(event) => join_path(scope, [field, event]),
-                        None => join_path(scope, [field]),
+                        Some(event) => join_path(&source_scope, [field, event]),
+                        None => join_path(&source_scope, [field]),
                     };
                     tables.source_ports.push(ParsedSourcePort {
                         path,
@@ -1774,7 +1974,13 @@ fn derive_structure_from_statements(
                         scoped: source_scope_is_scoped(scope, row_scopes),
                     });
                 }
-                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+                derive_structure_from_statements(
+                    &statement.children,
+                    expressions,
+                    row_scopes,
+                    scope,
+                    tables,
+                );
             }
             AstStatementKind::Hold { name } => {
                 let path = scope_path(scope).unwrap_or_else(|| format!("hold_{}", statement.line));
@@ -1784,7 +1990,13 @@ fn derive_structure_from_statements(
                     path,
                     line: statement.line,
                 });
-                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+                derive_structure_from_statements(
+                    &statement.children,
+                    expressions,
+                    row_scopes,
+                    scope,
+                    tables,
+                );
             }
             AstStatementKind::List { field, capacity } => {
                 let name = field
@@ -1796,12 +2008,97 @@ fn derive_structure_from_statements(
                     line: statement.line,
                     capacity: *capacity,
                 });
-                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+                derive_structure_from_statements(
+                    &statement.children,
+                    expressions,
+                    row_scopes,
+                    scope,
+                    tables,
+                );
             }
             AstStatementKind::Block | AstStatementKind::Expression => {
-                derive_structure_from_statements(&statement.children, row_scopes, scope, tables);
+                derive_structure_from_statements(
+                    &statement.children,
+                    expressions,
+                    row_scopes,
+                    scope,
+                    tables,
+                );
             }
         }
+    }
+}
+
+fn collect_source_ports_from_statement_expr(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    scope: &[String],
+    row_scopes: &[ParsedRowScopeFunction],
+    tables: &mut StructureTables,
+) -> bool {
+    let Some(expr_id) = statement.expr else {
+        return false;
+    };
+    let mut expr_scope = scope.to_vec();
+    match &statement.kind {
+        AstStatementKind::Field { name }
+        | AstStatementKind::Source {
+            field: Some(name), ..
+        } => {
+            expr_scope.push(name.clone());
+        }
+        _ => {}
+    }
+    let before = tables.source_ports.len();
+    let scoped = source_scope_is_scoped(&expr_scope, row_scopes);
+    collect_source_ports_from_expr(
+        expr_id,
+        expressions,
+        &mut expr_scope,
+        statement.line,
+        scoped,
+        tables,
+    );
+    tables.source_ports.len() > before
+}
+
+fn collect_source_ports_from_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    scope: &mut Vec<String>,
+    line: usize,
+    scoped: bool,
+    tables: &mut StructureTables,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::Source => {
+            let source_scope = source_scope_without_events(scope);
+            if let Some(path) = scope_path(&source_scope) {
+                tables
+                    .source_ports
+                    .push(ParsedSourcePort { path, line, scoped });
+            }
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                scope.push(field.name.clone());
+                collect_source_ports_from_expr(
+                    field.value,
+                    expressions,
+                    scope,
+                    line,
+                    scoped,
+                    tables,
+                );
+                scope.pop();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1899,6 +2196,14 @@ fn scope_path(scope: &[String]) -> Option<String> {
     })
 }
 
+fn source_scope_without_events(scope: &[String]) -> Vec<String> {
+    scope
+        .iter()
+        .filter(|segment| segment.as_str() != "events")
+        .cloned()
+        .collect()
+}
+
 fn source_scope_is_scoped(scope: &[String], row_scopes: &[ParsedRowScopeFunction]) -> bool {
     scope_is_indexed(scope, row_scopes)
 }
@@ -1953,6 +2258,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn formatter_compacts_one_field_bracket_chains_generically() {
+        let source = r#"
+store: [
+    sources: [
+        remove_todo_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+        editing_todo_title_element: [
+            events: [
+                change: SOURCE
+                key_down: SOURCE
+                blur: SOURCE
+            ]
+        ]
+        todo_title_element: [
+            events: [
+                double_click: SOURCE
+            ]
+        ]
+        todo_checkbox: [
+            events: [
+                click: SOURCE
+            ]
+        ]
+    ]
+]
+value: Text/empty() |> HOLD value { LATEST { sources.remove_todo_button.events.press } }
+items: LIST {}
+items |> List/map(item, new: item)
+document: Document/new(root: Element/label(element: [], style: [], label: TEXT { x }))
+"#;
+        let formatted = format_source("format-sources.bn", source).unwrap();
+
+        assert!(formatted.contains("remove_todo_button: [events: [press: SOURCE]]"));
+        assert!(formatted.contains(
+            "editing_todo_title_element: [\n            events: [\n                change: SOURCE\n                key_down: SOURCE\n                blur: SOURCE\n            ]\n        ]"
+        ));
+        assert!(formatted.contains("todo_title_element: [events: [double_click: SOURCE]]"));
+        assert!(formatted.contains("todo_checkbox: [events: [click: SOURCE]]"));
+        assert!(formatted.contains(
+            "remove_todo_button: [events: [press: SOURCE]]\n\n        editing_todo_title_element"
+        ));
+        assert!(
+            formatted.contains(
+                "        ]\n\n        todo_title_element: [events: [double_click: SOURCE]]"
+            )
+        );
+    }
+
+    #[test]
+    fn formatter_inlines_tiny_payload_objects_but_keeps_multi_field_parents_expanded() {
+        let source = r#"
+store: [
+    event: [
+        change: [
+            text: TEXT
+        ]
+        key_down: [
+            key: TEXT
+        ]
+        blur: [
+        ]
+    ]
+    source: SOURCE
+]
+value: Text/empty() |> HOLD value { LATEST { source |> THEN { TEXT { x } } } }
+items: LIST {}
+items |> List/map(item, new: item)
+document: Document/new(root: Element/label(element: [], style: [], label: TEXT { x }))
+"#;
+        let formatted = format_source("format-payloads.bn", source).unwrap();
+
+        assert!(formatted.contains("change: [text: TEXT]"));
+        assert!(formatted.contains("key_down: [key: TEXT]"));
+        assert!(formatted.contains("blur: []"));
+        assert!(formatted.contains(
+            "event: [\n        change: [text: TEXT]\n        key_down: [key: TEXT]\n        blur: []\n    ]"
+        ));
+    }
+
+    #[test]
+    fn formatter_keeps_todomvc_source_declarations_in_designed_compact_shape() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let formatted = format_source("examples/todomvc.bn", source).unwrap();
+
+        assert!(formatted.contains("toggle_all_checkbox: [events: [click: SOURCE]]"));
+        assert!(formatted.contains("remove_todo_button: [events: [press: SOURCE]]"));
+        assert!(formatted.contains(
+            "editing_todo_title_element: [\n                events: [\n                    change: SOURCE\n                    key_down: SOURCE\n                    blur: SOURCE\n                ]\n            ]"
+        ));
+        assert!(formatted.contains("todo_title_element: [events: [double_click: SOURCE]]"));
+    }
+
+    #[test]
     fn parses_todomvc_marker_and_constructs() {
         let source = include_str!("../../../examples/todomvc.bn");
         let program = parse_source("examples/todomvc.bn", source).unwrap();
@@ -1976,6 +2377,12 @@ mod tests {
                 .source_ports
                 .iter()
                 .any(|port| port.path == "store.sources.new_todo_input.change" && !port.scoped)
+        );
+        assert!(
+            program
+                .source_ports
+                .iter()
+                .any(|port| port.path == "store.sources.toggle_all_checkbox.click" && !port.scoped)
         );
         assert!(
             program

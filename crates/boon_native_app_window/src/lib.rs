@@ -13,6 +13,8 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::SurfaceTargetUnsafe;
 
+const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -359,6 +361,13 @@ impl NativeRenderLoopState {
         }
     }
 
+    pub fn idle_wait_timeout(&self, now: Instant) -> Duration {
+        self.next_wake_at
+            .and_then(|wake_at| wake_at.checked_duration_since(now))
+            .map(|timeout| timeout.min(PASSIVE_INPUT_POLL_INTERVAL))
+            .unwrap_or(PASSIVE_INPUT_POLL_INTERVAL)
+    }
+
     pub fn apply_poll_result(&mut self, poll_result: &NativePollResult, real_os_input: bool) {
         if poll_result.dirty {
             self.last_scheduler_reason = poll_result.scheduler_reason.or_else(|| {
@@ -421,6 +430,8 @@ impl NativePollResult {
 pub enum NativeCursorIcon {
     Default,
     ColumnResize,
+    Pointer,
+    Text,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1477,8 +1488,10 @@ async fn run_surface_probe_inner(
         if raw_width <= 0.0 || raw_height <= 0.0 {
             surface_lifecycle.note_zero_size_skip();
             render_loop_state.note_idle_poll();
-            let _ =
-                wake_handle.wait_for_wake_after(last_wake_generation, Duration::from_millis(20));
+            let _ = wake_handle.wait_for_wake_after(
+                last_wake_generation,
+                render_loop_state.idle_wait_timeout(Instant::now()),
+            );
             continue;
         }
         let current_width = raw_width as u32;
@@ -1539,11 +1552,7 @@ async fn run_surface_probe_inner(
         }
         if !render_loop_state.should_render(Instant::now(), false) {
             render_loop_state.note_idle_poll();
-            let idle_timeout = render_loop_state
-                .next_wake_at
-                .and_then(|wake_at| wake_at.checked_duration_since(Instant::now()))
-                .unwrap_or_else(|| Duration::from_millis(20))
-                .min(Duration::from_millis(20));
+            let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
             let _ = wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
             continue;
         }
@@ -1890,6 +1899,8 @@ fn apply_native_cursor_icon(surface: &app_window::surface::Surface, icon: Native
         let surface_icon = match icon {
             NativeCursorIcon::Default => app_window::surface::SurfaceCursorIcon::Default,
             NativeCursorIcon::ColumnResize => app_window::surface::SurfaceCursorIcon::ColumnResize,
+            NativeCursorIcon::Pointer => app_window::surface::SurfaceCursorIcon::Pointer,
+            NativeCursorIcon::Text => app_window::surface::SurfaceCursorIcon::Text,
         };
         surface.set_cursor_icon(surface_icon);
     }
@@ -1924,6 +1935,16 @@ fn write_render_loop_state_report(
         })?;
     }
     let status = if loop_error.is_some() { "fail" } else { "pass" };
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+    let input_polls_per_second = state.input_poll_count as f64 / elapsed_seconds;
+    let renders_per_second = state.rendered_frame_count as f64 / elapsed_seconds;
+    let active_timer_reason = state.next_wake_at.map(|_| {
+        if state.current_scheduler_reason == Some(NativeSchedulerReason::Timer) {
+            "timer_due"
+        } else {
+            "scheduled_wake"
+        }
+    });
     let report = serde_json::json!({
         "status": status,
         "role": role.as_str(),
@@ -1942,8 +1963,12 @@ fn write_render_loop_state_report(
         "rendered_frame_count": state.rendered_frame_count,
         "skipped_idle_poll_count": state.skipped_idle_poll_count,
         "input_poll_count": state.input_poll_count,
+        "input_polls_per_second": input_polls_per_second,
         "forced_frame_count": state.forced_frame_count,
+        "renders_per_second": renders_per_second,
         "scheduled_wake_count": state.scheduled_wake_count,
+        "active_timer_reason": active_timer_reason,
+        "passive_input_poll_interval_ms": PASSIVE_INPUT_POLL_INTERVAL.as_millis() as u64,
         "resize_wake_count": extras.resize_wake_count,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
@@ -2571,6 +2596,18 @@ mod tests {
         state.note_idle_poll();
         assert_eq!(state.rendered_frame_count, 1);
         assert_eq!(state.skipped_idle_poll_count, 1);
+    }
+
+    #[test]
+    fn demand_driven_idle_wait_uses_slow_passive_input_poll() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
+
+        state.schedule_wake_after(now, Duration::from_millis(30));
+        assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(30));
     }
 
     #[test]

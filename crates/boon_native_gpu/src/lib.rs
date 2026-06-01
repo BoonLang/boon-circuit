@@ -835,8 +835,8 @@ impl GlyphonTextState {
             for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
                 let line_width =
                     shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
-                let left = text_left_for_width(run, line_width);
-                let top = text_top_for_height(run);
+                let left = text_paint_left_for_width(run, line_width);
+                let top = text_paint_top_for_height(run);
                 areas.push(TextArea {
                     buffer,
                     left,
@@ -935,7 +935,7 @@ impl GlyphonTextState {
             .map(|(run, buffer)| {
                 let line_width =
                     shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
-                let left = text_left_for_width(run, line_width);
+                let left = text_paint_left_for_width(run, line_width);
                 let column_edges = shaped_column_edges(&run.text, buffer, line_width);
                 (
                     run.node.clone(),
@@ -1082,7 +1082,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         let line_height = style_line_height(&item.style, size);
         let raw_text = item.text.as_deref().unwrap_or_default();
         if style_bool(&item.style, "paint") == Some(false)
-            || (style_bool(&item.style, "hover_visible") == Some(true)
+            || (style_bool(&item.style, "__hover_visible") == Some(true)
                 && style_bool(&item.style, "__hover_paint") != Some(true))
         {
             continue;
@@ -1118,13 +1118,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
                 continue;
             }
         } else {
-            let color = if style_bool(&item.style, "color_if") == Some(true) {
-                style_color_u8(&item.style, "if_color")
-                    .or_else(|| style_color_u8(&item.style, "color"))
-                    .unwrap_or([36, 44, 58, 255])
-            } else {
-                style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255])
-            };
+            let color = style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]);
             (raw_text.to_owned(), color)
         };
         let font_family = if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
@@ -1464,13 +1458,25 @@ fn text_left_for_width(run: &TextRun, text_width: f32) -> f32 {
     }
 }
 
+fn snap_text_paint_origin(value: f32) -> f32 {
+    value.round()
+}
+
+fn text_paint_left_for_width(run: &TextRun, text_width: f32) -> f32 {
+    snap_text_paint_origin(text_left_for_width(run, text_width))
+}
+
 fn text_top_for_height(run: &TextRun) -> f32 {
-    text_top_for_parts(
+    text_render_top_for_parts(
         run.bounds,
         run.line_height,
         run.text_inset,
         run.vertical_align,
     )
+}
+
+fn text_paint_top_for_height(run: &TextRun) -> f32 {
+    snap_text_paint_origin(text_top_for_height(run))
 }
 
 fn text_line_height(font_size: f32) -> f32 {
@@ -1498,6 +1504,83 @@ fn text_top_for_parts(
         TextVerticalAlign::Top => bounds.y + 1.0,
         TextVerticalAlign::Center => bounds.y + ((bounds.height - line_height) / 2.0).max(0.0),
         TextVerticalAlign::Bottom => bounds.y + (bounds.height - line_height - text_inset).max(0.0),
+    }
+}
+
+fn text_render_top_for_parts(
+    bounds: Rect,
+    line_height: f32,
+    text_inset: f32,
+    vertical_align: TextVerticalAlign,
+) -> f32 {
+    let line_top = text_top_for_parts(bounds, line_height, text_inset, vertical_align);
+    if !matches!(vertical_align, TextVerticalAlign::Center) {
+        return line_top;
+    }
+    let optical_offset = (line_height * 0.15).min(bounds.height.max(1.0) * 0.09);
+    line_top + optical_offset
+}
+
+fn strikethrough_rect_for_item(
+    item: &DisplayItem,
+    text_layout: Option<&TextRunLayoutMetrics>,
+) -> Rect {
+    let text_columns = item
+        .text
+        .as_deref()
+        .map(|text| text.chars().count() as f32)
+        .unwrap_or_default();
+    let line_height = style_line_height(
+        &item.style,
+        style_number(&item.style, "size").unwrap_or(14.0),
+    );
+    let line_top = text_top_for_parts(
+        item.bounds,
+        line_height,
+        style_number(&item.style, "text_inset").unwrap_or(4.0),
+        text_vertical_align(&item.kind, &item.style),
+    );
+    let thickness = style_number(&item.style, "text_decoration_thickness").unwrap_or(1.6);
+    let x = text_layout
+        .map(|layout| layout.x_for_column(0.0))
+        .unwrap_or(item.bounds.x + 4.0);
+    let x1 = text_layout
+        .map(|layout| layout.x_for_column(text_columns))
+        .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
+    Rect {
+        x,
+        y: line_top + line_height * 0.5 - thickness * 0.5,
+        width: (x1 - x).max(1.0),
+        height: thickness,
+    }
+}
+
+fn underline_rect_for_item(item: &DisplayItem, text_layout: Option<&TextRunLayoutMetrics>) -> Rect {
+    let text_columns = item
+        .text
+        .as_deref()
+        .map(|text| text.chars().count() as f32)
+        .unwrap_or_default();
+    let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+    let line_height = style_line_height(&item.style, font_size).min(item.bounds.height.max(1.0));
+    let line_top = text_top_for_parts(
+        item.bounds,
+        line_height,
+        style_number(&item.style, "text_inset").unwrap_or(4.0),
+        text_vertical_align(&item.kind, &item.style),
+    );
+    let thickness = style_number(&item.style, "text_decoration_thickness").unwrap_or(1.0);
+    let x = text_layout
+        .map(|layout| layout.x_for_column(0.0))
+        .unwrap_or(item.bounds.x + 4.0);
+    let x1 = text_layout
+        .map(|layout| layout.x_for_column(text_columns))
+        .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
+    Rect {
+        x,
+        y: (line_top + line_height * 0.88).min(item.bounds.y + item.bounds.height - thickness),
+        width: (x1 - x).max(1.0),
+        height: thickness,
     }
 }
 
@@ -1583,8 +1666,9 @@ fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
                 || item.style.contains_key("caret_column")
                 || item.focused
                 || style_bool(&item.style, "focus") == Some(true)
-                || style_bool(&item.style, "strike_if") == Some(true)
+                || style_bool(&item.style, "strikethrough") == Some(true)
                 || style_bool(&item.style, "underline_if") == Some(true)
+                || style_bool(&item.style, "__hover_underline_if") == Some(true)
         })
         .map(|item| item.node.clone())
         .collect()
@@ -1639,7 +1723,7 @@ fn text_vertical_align(kind: &DocumentNodeKind, style: &StyleMap) -> TextVertica
 }
 
 fn style_number(style: &StyleMap, key: &str) -> Option<f32> {
-    match style.get(key)? {
+    match state_style_value(style, key)? {
         StyleValue::Number(value) => Some(*value as f32),
         StyleValue::Text(value) => value.parse::<f32>().ok(),
         StyleValue::Bool(_) => None,
@@ -1647,7 +1731,7 @@ fn style_number(style: &StyleMap, key: &str) -> Option<f32> {
 }
 
 fn style_bool(style: &StyleMap, key: &str) -> Option<bool> {
-    match style.get(key)? {
+    match state_style_value(style, key)? {
         StyleValue::Bool(value) => Some(*value),
         StyleValue::Text(value) => value.parse::<bool>().ok(),
         StyleValue::Number(_) => None,
@@ -1655,9 +1739,35 @@ fn style_bool(style: &StyleMap, key: &str) -> Option<bool> {
 }
 
 fn style_text<'a>(style: &'a StyleMap, key: &str) -> Option<&'a str> {
-    match style.get(key)? {
+    match state_style_value(style, key)? {
         StyleValue::Text(value) => Some(value.as_str()),
         StyleValue::Number(_) | StyleValue::Bool(_) => None,
+    }
+}
+
+fn state_style_value<'a>(style: &'a StyleMap, key: &str) -> Option<&'a StyleValue> {
+    if style_bool_raw(style, "__hover") == Some(true) {
+        let hover_key = format!("__hover_{key}");
+        if let Some(value) = style.get(&hover_key) {
+            return Some(value);
+        }
+    }
+    if style_bool_raw(style, "__focused") == Some(true)
+        || style_bool_raw(style, "focus") == Some(true)
+    {
+        let focus_key = format!("__focus_{key}");
+        if let Some(value) = style.get(&focus_key) {
+            return Some(value);
+        }
+    }
+    style.get(key)
+}
+
+fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
+    match style.get(key)? {
+        StyleValue::Bool(value) => Some(*value),
+        StyleValue::Text(value) => value.parse::<bool>().ok(),
+        StyleValue::Number(_) => None,
     }
 }
 
@@ -1717,7 +1827,7 @@ fn rect_vertices(
     {
         metrics.visible_display_item_count += 1;
         if style_bool(&item.style, "paint") == Some(false)
-            || (style_bool(&item.style, "hover_visible") == Some(true)
+            || (style_bool(&item.style, "__hover_visible") == Some(true)
                 && style_bool(&item.style, "__hover_paint") != Some(true))
         {
             continue;
@@ -1744,24 +1854,14 @@ fn rect_vertices(
             border_radius,
         );
         metrics.rendered_rect_count += 1;
-        let selected_border = (style_bool(&item.style, "selected") == Some(true))
-            .then(|| style_color_f32(&item.style, "selected_border"))
-            .flatten();
-        let focus_border = (item.focused || style_bool(&item.style, "focus") == Some(true))
-            .then(|| style_color_f32(&item.style, "focus_border"))
-            .flatten();
-        if let Some(border) = selected_border.or_else(|| style_color_f32(&item.style, "border")) {
+        if let Some(border) = style_color_f32(&item.style, "border") {
             push_styled_border_all(
                 &mut positions,
                 &mut colors,
                 item.bounds,
                 width,
                 height,
-                if item.focused && focus_border.is_none() {
-                    [0.098, 0.459, 0.824, 1.0]
-                } else {
-                    border
-                },
+                border,
                 fill,
                 style_number(&item.style, "border_width").unwrap_or(2.0),
                 border_radius,
@@ -1776,20 +1876,6 @@ fn rect_vertices(
             height,
             &item.style,
         );
-        if let Some(border) = focus_border {
-            push_styled_border_all(
-                &mut positions,
-                &mut colors,
-                item.bounds,
-                width,
-                height,
-                border,
-                fill,
-                style_number(&item.style, "focus_border_width").unwrap_or(2.0),
-                border_radius,
-            );
-            metrics.rendered_rect_count += 1;
-        }
         if matches!(item.kind, DocumentNodeKind::Text) {
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
@@ -1873,41 +1959,13 @@ fn rect_vertices(
                 metrics.rendered_rect_count += 1;
             }
         }
-        if style_bool(&item.style, "strike_if") == Some(true) {
+        if style_bool(&item.style, "strikethrough") == Some(true) {
             let color = style_color_f32(&item.style, "if_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
-            let text_columns = item
-                .text
-                .as_deref()
-                .map(|text| text.chars().count() as f32)
-                .unwrap_or_default();
-            let line_height = style_line_height(
-                &item.style,
-                style_number(&item.style, "size").unwrap_or(14.0),
-            );
-            let x = text_layout
-                .map(|layout| layout.x_for_column(0.0))
-                .unwrap_or(item.bounds.x + 4.0);
-            let x1 = text_layout
-                .map(|layout| layout.x_for_column(text_columns))
-                .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
-            push_rect(
-                &mut positions,
-                &mut colors,
-                Rect {
-                    x,
-                    y: item.bounds.y
-                        + ((item.bounds.height - line_height) / 2.0).max(0.0)
-                        + line_height * 0.58,
-                    width: (x1 - x).max(1.0),
-                    height: style_number(&item.style, "text_decoration_thickness").unwrap_or(1.6),
-                },
-                width,
-                height,
-                color,
-            );
+            let rect = strikethrough_rect_for_item(item, text_layout);
+            push_rect(&mut positions, &mut colors, rect, width, height, color);
             metrics.rendered_rect_count += 1;
         }
         if style_bool(&item.style, "underline_if") == Some(true) {
@@ -1915,26 +1973,10 @@ fn rect_vertices(
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
-            let text_columns = item
-                .text
-                .as_deref()
-                .map(|text| text.chars().count() as f32)
-                .unwrap_or_default();
-            let x = text_layout
-                .map(|layout| layout.x_for_column(0.0))
-                .unwrap_or(item.bounds.x + 4.0);
-            let x1 = text_layout
-                .map(|layout| layout.x_for_column(text_columns))
-                .unwrap_or(item.bounds.x + item.bounds.width - 4.0);
             push_rect(
                 &mut positions,
                 &mut colors,
-                Rect {
-                    x,
-                    y: item.bounds.y + item.bounds.height - 5.0,
-                    width: (x1 - x).max(1.0),
-                    height: 1.0,
-                },
+                underline_rect_for_item(item, text_layout),
                 width,
                 height,
                 color,
@@ -2289,15 +2331,15 @@ fn push_shadows(
     style: &StyleMap,
 ) {
     for index in 1..=6 {
-        let color_key = format!("shadow{index}_color");
+        let color_key = format!("box_shadow_{index}_color");
         let Some(color) = style_color_f32(style, &color_key) else {
             continue;
         };
-        let x = style_number(style, &format!("shadow{index}_x")).unwrap_or(0.0);
-        let y = style_number(style, &format!("shadow{index}_y")).unwrap_or(0.0);
-        let blur = style_number(style, &format!("shadow{index}_blur")).unwrap_or(0.0);
-        let spread = style_number(style, &format!("shadow{index}_spread")).unwrap_or(0.0);
-        let inset = style_bool(style, &format!("shadow{index}_inset")) == Some(true);
+        let x = style_number(style, &format!("box_shadow_{index}_x")).unwrap_or(0.0);
+        let y = style_number(style, &format!("box_shadow_{index}_y")).unwrap_or(0.0);
+        let blur = style_number(style, &format!("box_shadow_{index}_blur")).unwrap_or(0.0);
+        let spread = style_number(style, &format!("box_shadow_{index}_spread")).unwrap_or(0.0);
+        let inset = style_bool(style, &format!("box_shadow_{index}_inset")) == Some(true);
         if inset {
             let thickness = blur.max(1.0);
             push_rect(
@@ -2340,7 +2382,7 @@ fn push_shadows(
             for step in 0..steps {
                 let inner_expand = blur * step as f32 / steps as f32;
                 let outer_expand = blur * (step + 1) as f32 / steps as f32;
-                let t = (step + 1) as f32 / steps as f32;
+                let t = step as f32 / steps as f32;
                 push_shadow_halo(
                     positions,
                     colors,
@@ -2349,7 +2391,7 @@ fn push_shadows(
                     outer_expand,
                     width,
                     height,
-                    color_with_alpha_scale(color, (1.0 - t).max(0.04) / steps as f32),
+                    color_with_alpha_scale(color, (1.0 - t).max(0.08)),
                 );
             }
         }
@@ -2415,147 +2457,169 @@ fn expanded_rect(rect: Rect, amount: f32) -> Rect {
     }
 }
 
-fn push_circle(
+#[cfg(test)]
+fn circle_segments_for_radius(radius: f32) -> u32 {
+    if radius <= 3.0 {
+        24
+    } else if radius <= 10.0 {
+        96
+    } else {
+        192
+    }
+}
+
+fn checkbox_circle_center(rect: Rect) -> (f32, f32) {
+    (
+        (rect.x + rect.width * 0.5).floor() + 0.5,
+        (rect.y + rect.height * 0.5).floor() + 0.5,
+    )
+}
+
+fn checkbox_check_points(rect: Rect) -> ((f32, f32), (f32, f32), (f32, f32)) {
+    let point = |x: f32, y: f32| (rect.x + rect.width * x, rect.y + rect.height * y);
+    (point(0.33, 0.55), point(0.45, 0.67), point(0.70, 0.35))
+}
+
+fn distance_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f32::EPSILON {
+        return (point.0 - start.0).hypot(point.1 - start.1);
+    }
+    let t =
+        (((point.0 - start.0) * dx + (point.1 - start.1) * dy) / length_squared).clamp(0.0, 1.0);
+    let closest = (start.0 + dx * t, start.1 + dy * t);
+    (point.0 - closest.0).hypot(point.1 - closest.1)
+}
+
+fn circle_coverage(radius: f32, aa: f32, distance: f32) -> f32 {
+    if aa <= 0.0 {
+        return if distance <= radius { 1.0 } else { 0.0 };
+    }
+    let edge0 = radius - aa;
+    let edge1 = radius + aa;
+    let t = ((distance - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    1.0 - smooth
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_checkbox_check_raster(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    start: (f32, f32),
+    middle: (f32, f32),
+    end: (f32, f32),
+    thickness: f32,
+    aa: f32,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let half = thickness.max(1.0) * 0.5;
+    let aa = aa.max(0.0);
+    let margin = half + aa + 1.0;
+    let min_x = (start.0.min(middle.0).min(end.0) - margin).floor() as i32;
+    let max_x = (start.0.max(middle.0).max(end.0) + margin).ceil() as i32;
+    let min_y = (start.1.min(middle.1).min(end.1) - margin).floor() as i32;
+    let max_y = (start.1.max(middle.1).max(end.1) + margin).ceil() as i32;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let sample = (x as f32 + 0.5, y as f32 + 0.5);
+            let distance = distance_to_segment(sample, start, middle)
+                .min(distance_to_segment(sample, middle, end));
+            let coverage = if aa <= 0.0 {
+                if distance <= half { 1.0 } else { 0.0 }
+            } else {
+                let edge0 = half - aa;
+                let edge1 = half + aa;
+                let t = ((distance - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+                let smooth = t * t * (3.0 - 2.0 * t);
+                1.0 - smooth
+            };
+            if coverage <= 0.001 {
+                continue;
+            }
+            push_rect(
+                positions,
+                colors,
+                Rect {
+                    x: x as f32,
+                    y: y as f32,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                width,
+                height,
+                color_with_alpha_scale(color, coverage),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_checkbox_circle_raster(
     positions: &mut Vec<f32>,
     colors: &mut Vec<u8>,
     center_x: f32,
     center_y: f32,
     radius: f32,
+    border_width: f32,
+    aa: f32,
     width: f32,
     height: f32,
-    color: [f32; 4],
-) {
-    let color = rgba8_from_f32(color);
-    let segments = 128;
-    for index in 0..segments {
-        let a0 = std::f32::consts::TAU * index as f32 / segments as f32;
-        let a1 = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
-        for (x, y) in [
-            (center_x, center_y),
-            (center_x + radius * a0.cos(), center_y + radius * a0.sin()),
-            (center_x + radius * a1.cos(), center_y + radius * a1.sin()),
-        ] {
-            positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
-            positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
-            colors.extend_from_slice(&color);
-        }
-    }
-}
-
-fn push_annulus(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
-    center_x: f32,
-    center_y: f32,
-    outer_radius: f32,
-    inner_radius: f32,
-    width: f32,
-    height: f32,
-    color: [f32; 4],
-) {
-    push_annulus_gradient(
-        positions,
-        colors,
-        center_x,
-        center_y,
-        outer_radius,
-        inner_radius,
-        width,
-        height,
-        color,
-        color,
-    );
-}
-
-fn push_annulus_gradient(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
-    center_x: f32,
-    center_y: f32,
-    outer_radius: f32,
-    inner_radius: f32,
-    width: f32,
-    height: f32,
-    outer_color: [f32; 4],
+    ring_color: [f32; 4],
     inner_color: [f32; 4],
 ) {
-    if outer_radius <= 0.0 || inner_radius < 0.0 || inner_radius >= outer_radius {
-        return;
-    }
-    let outer_color = rgba8_from_f32(outer_color);
-    let inner_color = rgba8_from_f32(inner_color);
-    let segments = 128;
-    for index in 0..segments {
-        let a0 = std::f32::consts::TAU * index as f32 / segments as f32;
-        let a1 = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
-        let outer0 = (
-            center_x + outer_radius * a0.cos(),
-            center_y + outer_radius * a0.sin(),
-        );
-        let outer1 = (
-            center_x + outer_radius * a1.cos(),
-            center_y + outer_radius * a1.sin(),
-        );
-        let inner0 = (
-            center_x + inner_radius * a0.cos(),
-            center_y + inner_radius * a0.sin(),
-        );
-        let inner1 = (
-            center_x + inner_radius * a1.cos(),
-            center_y + inner_radius * a1.sin(),
-        );
-        for ((x, y), color) in [
-            (outer0, outer_color),
-            (outer1, outer_color),
-            (inner1, inner_color),
-            (outer0, outer_color),
-            (inner1, inner_color),
-            (inner0, inner_color),
-        ] {
-            positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
-            positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
-            colors.extend_from_slice(&color);
+    let inner_radius = (radius - border_width).max(0.0);
+    let min_x = (center_x - radius - aa).floor() as i32;
+    let max_x = (center_x + radius + aa).ceil() as i32;
+    let min_y = (center_y - radius - aa).floor() as i32;
+    let max_y = (center_y + radius + aa).ceil() as i32;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let distance = (sample_x - center_x).hypot(sample_y - center_y);
+            let outer = circle_coverage(radius, aa, distance);
+            if outer <= 0.001 {
+                continue;
+            }
+            let inner = circle_coverage(inner_radius, aa, distance);
+            let ring_alpha = (outer - inner).clamp(0.0, 1.0);
+            if inner > 0.001 {
+                push_rect(
+                    positions,
+                    colors,
+                    Rect {
+                        x: x as f32,
+                        y: y as f32,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    width,
+                    height,
+                    color_with_alpha_scale(inner_color, inner),
+                );
+            }
+            if ring_alpha > 0.001 {
+                push_rect(
+                    positions,
+                    colors,
+                    Rect {
+                        x: x as f32,
+                        y: y as f32,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    width,
+                    height,
+                    color_with_alpha_scale(ring_color, ring_alpha),
+                );
+            }
         }
     }
-}
-
-fn push_stroked_segment(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
-    from: (f32, f32),
-    to: (f32, f32),
-    thickness: f32,
-    width: f32,
-    height: f32,
-    color: [f32; 4],
-) {
-    let dx = to.0 - from.0;
-    let dy = to.1 - from.1;
-    let length = dx.hypot(dy);
-    if length <= f32::EPSILON {
-        return;
-    }
-    let half = thickness.max(1.0) * 0.5;
-    let px = -dy / length * half;
-    let py = dx / length * half;
-    let points = [
-        (from.0 + px, from.1 + py),
-        (to.0 + px, to.1 + py),
-        (to.0 - px, to.1 - py),
-        (from.0 - px, from.1 - py),
-    ];
-    let color_bytes = rgba8_from_f32(color);
-    for (x, y) in [
-        points[0], points[1], points[2], points[0], points[2], points[3],
-    ] {
-        positions.push((x / width.max(1.0)).mul_add(2.0, -1.0).clamp(-1.0, 1.0));
-        positions.push((1.0 - (y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0));
-        colors.extend_from_slice(&color_bytes);
-    }
-    push_circle(
-        positions, colors, from.0, from.1, half, width, height, color,
-    );
-    push_circle(positions, colors, to.0, to.1, half, width, height, color);
 }
 
 fn push_checkbox(
@@ -2567,11 +2631,11 @@ fn push_checkbox(
     style: &StyleMap,
 ) {
     let checked = style_bool(style, "checked") == Some(true);
-    let center_x = rect.x + rect.width * 0.5;
-    let center_y = rect.y + rect.height * 0.5;
+    let (center_x, center_y) = checkbox_circle_center(rect);
     let radius = (rect.width.min(rect.height) * 0.5
-        - style_number(style, "checkbox_inset").unwrap_or(2.0))
-    .max(1.0);
+        - style_number(style, "checkbox_inset").unwrap_or(2.0)
+        - 0.5)
+        .max(1.0);
     let border_width = style_number(style, "checkbox_border_width").unwrap_or(1.5);
     let ring_color = if checked {
         style_color_f32(style, "checked_border").unwrap_or([0.101, 0.356, 0.292, 1.0])
@@ -2580,100 +2644,30 @@ fn push_checkbox(
     };
     let inner_color = style_color_f32(style, "checkbox_background").unwrap_or([1.0, 1.0, 1.0, 1.0]);
     let aa = style_number(style, "checkbox_aa")
-        .unwrap_or(0.8)
-        .clamp(0.0, 1.5);
-    let inner_radius = (radius - border_width).max(0.0);
-    let inner_solid_radius = (inner_radius - aa).max(0.0);
-    push_annulus_gradient(
-        positions,
-        colors,
-        center_x,
-        center_y,
-        radius + aa,
-        radius,
-        width,
-        height,
-        color_with_alpha_scale(ring_color, 0.0),
-        ring_color,
-    );
-    push_annulus(
+        .unwrap_or(1.25)
+        .clamp(0.0, 2.0);
+    push_checkbox_circle_raster(
         positions,
         colors,
         center_x,
         center_y,
         radius,
-        inner_radius,
+        border_width,
+        aa,
         width,
         height,
         ring_color,
-    );
-    if inner_radius > inner_solid_radius {
-        push_annulus_gradient(
-            positions,
-            colors,
-            center_x,
-            center_y,
-            inner_radius,
-            inner_solid_radius,
-            width,
-            height,
-            color_with_alpha_scale(inner_color, 0.0),
-            inner_color,
-        );
-    }
-    push_circle(
-        positions,
-        colors,
-        center_x,
-        center_y,
-        inner_solid_radius,
-        width,
-        height,
         inner_color,
     );
     if checked {
-        let map_svg = |x: f32, y: f32| {
-            (
-                rect.x + ((x + 10.0) / 100.0) * rect.width,
-                rect.y + ((y + 18.0) / 135.0) * rect.height,
-            )
-        };
-        let start = map_svg(27.0, 56.0);
-        let middle = map_svg(42.0, 71.0);
-        let end = map_svg(72.0, 25.0);
+        let (start, middle, end) = checkbox_check_points(rect);
         let color = style_color_f32(style, "check_color").unwrap_or([0.108, 0.540, 0.432, 1.0]);
         let thickness = style_number(style, "check_width").unwrap_or(3.0);
         let check_aa = style_number(style, "check_aa")
-            .unwrap_or(0.8)
-            .clamp(0.0, 1.5);
-        if check_aa > 0.0 {
-            let aa_color = color_with_alpha_scale(color, 0.28);
-            push_stroked_segment(
-                positions,
-                colors,
-                start,
-                middle,
-                thickness + check_aa * 2.0,
-                width,
-                height,
-                aa_color,
-            );
-            push_stroked_segment(
-                positions,
-                colors,
-                middle,
-                end,
-                thickness + check_aa * 2.0,
-                width,
-                height,
-                aa_color,
-            );
-        }
-        push_stroked_segment(
-            positions, colors, start, middle, thickness, width, height, color,
-        );
-        push_stroked_segment(
-            positions, colors, middle, end, thickness, width, height, color,
+            .unwrap_or(0.9)
+            .clamp(0.0, 1.75);
+        push_checkbox_check_raster(
+            positions, colors, start, middle, end, thickness, check_aa, width, height, color,
         );
     }
 }
@@ -2815,7 +2809,7 @@ fn srgb_u8_to_linear_f32(channel: u8) -> f32 {
 }
 
 fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {
-    let StyleValue::Text(value) = style.get(key)? else {
+    let StyleValue::Text(value) = state_style_value(style, key)? else {
         return None;
     };
     parse_oklch_color(value).or_else(|| parse_hex_color(value))
@@ -3140,6 +3134,51 @@ mod tests {
     }
 
     #[test]
+    fn focused_borders_use_style_color_not_hard_coded_blue() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        style.insert("border".to_owned(), StyleValue::Text("#ff0000".to_owned()));
+        style.insert("border_width".to_owned(), StyleValue::Number(1.0));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("input".to_owned()),
+                kind: DocumentNodeKind::TextInput,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 32.0,
+                },
+                text: Some("abc".to_owned()),
+                style,
+                focused: true,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let text_layouts = test_text_layouts(&frame, 320, 120);
+        let (_, colors, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        assert!(
+            colors
+                .chunks_exact(4)
+                .any(|color| color == [255, 0, 0, 255]),
+            "focused border should keep the explicit style color"
+        );
+        assert!(
+            !colors
+                .chunks_exact(4)
+                .any(|color| color == [25, 117, 210, 255]),
+            "focused border must not fall back to the old hard-coded blue"
+        );
+    }
+
+    #[test]
     fn button_text_runs_are_centered_by_default() {
         let mut style = StyleMap::new();
         style.insert("size".to_owned(), StyleValue::Number(16.0));
@@ -3174,11 +3213,122 @@ mod tests {
         let line_width = shaped_line_width(&buffer).expect("button label should shape");
         let left = text_left_for_width(run, line_width);
         let top = text_top_for_height(run);
+        let paint_left = text_paint_left_for_width(run, line_width);
+        let paint_top = text_paint_top_for_height(run);
         assert!(
             left > run.bounds.x + run.text_inset,
             "centered button text should not use the left inset"
         );
-        assert!((top - 30.0).abs() <= 0.5, "button text top={top}");
+        assert_eq!(
+            paint_left.fract(),
+            0.0,
+            "button text should paint on a whole-pixel x origin"
+        );
+        let line_box_top = text_top_for_parts(
+            run.bounds,
+            run.line_height,
+            run.text_inset,
+            run.vertical_align,
+        );
+        assert!((line_box_top - 30.0).abs() <= 0.5);
+        assert!(
+            (top - 33.0).abs() <= 0.5,
+            "centered glyph paint should get a small downward optical correction, top={top}"
+        );
+        assert_eq!(
+            paint_top, 33.0,
+            "centered glyph paint origin should snap to whole pixels"
+        );
+    }
+
+    #[test]
+    fn strikethrough_uses_the_same_vertical_center_as_text() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(24.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert("strikethrough".to_owned(), StyleValue::Bool(true));
+        let item = DisplayItem {
+            node: DocumentNodeId("completed-title".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 405.0,
+                height: 42.0,
+            },
+            text: Some("Completed todo".to_owned()),
+            style,
+            focused: false,
+        };
+
+        let rect = strikethrough_rect_for_item(&item, None);
+        let center_y = rect.y + rect.height * 0.5;
+        let line_height = style_line_height(&item.style, 24.0);
+        let text_center_y =
+            text_top_for_parts(item.bounds, line_height, 0.0, TextVerticalAlign::Center)
+                + line_height * 0.5;
+        assert!(
+            (center_y - text_center_y).abs() <= 0.01,
+            "strikethrough center {center_y} should match text center {text_center_y}"
+        );
+    }
+
+    #[test]
+    fn checkbox_circle_snaps_to_pixel_center_for_smoother_edges() {
+        let rect = Rect {
+            x: 194.0,
+            y: 263.6,
+            width: 40.0,
+            height: 40.0,
+        };
+
+        assert_eq!(checkbox_circle_center(rect), (214.5, 283.5));
+        assert!(circle_segments_for_radius(17.5) >= 192);
+        assert!(circle_segments_for_radius(1.1) <= 24);
+    }
+
+    #[test]
+    fn checkbox_circle_coverage_feathers_edges() {
+        let radius = 17.5;
+        let aa = 1.25;
+
+        assert_eq!(circle_coverage(radius, aa, radius - aa - 0.1), 1.0);
+        assert_eq!(circle_coverage(radius, aa, radius + aa + 0.1), 0.0);
+        let edge = circle_coverage(radius, aa, radius);
+        assert!(
+            edge > 0.45 && edge < 0.55,
+            "edge coverage should be half-ish, got {edge}"
+        );
+    }
+
+    #[test]
+    fn checkbox_check_points_are_centered_inside_circle() {
+        let rect = Rect {
+            x: 194.0,
+            y: 263.6,
+            width: 40.0,
+            height: 40.0,
+        };
+        let (start, middle, end) = checkbox_check_points(rect);
+        let min_x = start.0.min(middle.0).min(end.0);
+        let max_x = start.0.max(middle.0).max(end.0);
+        let min_y = start.1.min(middle.1).min(end.1);
+        let max_y = start.1.max(middle.1).max(end.1);
+        let check_center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+        let circle_center = checkbox_circle_center(rect);
+
+        assert!(
+            (check_center.0 - circle_center.0).abs() <= 0.5,
+            "check x center {:?} should stay near circle center {:?}",
+            check_center,
+            circle_center
+        );
+        assert!(
+            (check_center.1 - circle_center.1).abs() <= 0.5,
+            "check y center {:?} should stay near circle center {:?}",
+            check_center,
+            circle_center
+        );
     }
 
     #[test]
@@ -3217,6 +3367,8 @@ mod tests {
         assert_eq!(run.vertical_align, TextVerticalAlign::Top);
         assert_eq!(text_left_for_width(run, 30.0), 14.0);
         assert_eq!(text_top_for_height(run), 21.0);
+        assert_eq!(text_paint_left_for_width(run, 30.0), 14.0);
+        assert_eq!(text_paint_top_for_height(run), 21.0);
     }
 
     #[test]
@@ -3262,6 +3414,133 @@ mod tests {
             TextRunPlacementSignature::from_run(&compact_run),
             TextRunPlacementSignature::from_run(&tall_run),
             "changing only line_height must invalidate placement caches"
+        );
+    }
+
+    #[test]
+    fn state_style_values_apply_hover_and_focus_variants() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.20]".to_owned()),
+        );
+        style.insert(
+            "__hover_color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.70]".to_owned()),
+        );
+        style.insert(
+            "__focus_color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.50]".to_owned()),
+        );
+        style.insert("underline_if".to_owned(), StyleValue::Bool(false));
+        style.insert("__hover_underline_if".to_owned(), StyleValue::Bool(true));
+        style.insert("__hover".to_owned(), StyleValue::Bool(true));
+        assert_eq!(style_bool(&style, "underline_if"), Some(true));
+        let hover_color = style_color_u8(&style, "color").expect("hover color");
+
+        style.insert("__hover".to_owned(), StyleValue::Bool(false));
+        style.insert("__focused".to_owned(), StyleValue::Bool(true));
+        assert_eq!(style_bool(&style, "underline_if"), Some(false));
+        let focus_color = style_color_u8(&style, "color").expect("focus color");
+        assert_ne!(hover_color, focus_color);
+
+        style.insert("__focused".to_owned(), StyleValue::Bool(false));
+        let base_color = style_color_u8(&style, "color").expect("base color");
+        assert_ne!(hover_color, base_color);
+        assert_ne!(focus_color, base_color);
+
+        let frame_for_style = |style: StyleMap| LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("hover-button".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 32.0,
+                },
+                text: Some("Clear completed".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let mut base_style = StyleMap::new();
+        base_style.insert(
+            "color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.20]".to_owned()),
+        );
+        base_style.insert(
+            "__hover_color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.70]".to_owned()),
+        );
+        base_style.insert("underline_if".to_owned(), StyleValue::Bool(false));
+        base_style.insert("__hover_underline_if".to_owned(), StyleValue::Bool(true));
+        let base_frame = frame_for_style(base_style.clone());
+        let base_run = text_runs(&base_frame, 320, 120)
+            .pop()
+            .expect("base text should render");
+
+        base_style.insert("__hover".to_owned(), StyleValue::Bool(true));
+        let hover_frame = frame_for_style(base_style);
+        let hover_run = text_runs(&hover_frame, 320, 120)
+            .pop()
+            .expect("hover text should render");
+        assert_ne!(
+            hover_run.color, base_run.color,
+            "__hover_color must affect the rendered text run, not only the style lookup helper"
+        );
+        let base_layouts = test_text_layouts(&base_frame, 320, 120);
+        let hover_layouts = test_text_layouts(&hover_frame, 320, 120);
+        let (_, _, base_metrics) = rect_vertices(&base_frame, 320.0, 120.0, Some(&base_layouts));
+        let (_, _, hover_metrics) = rect_vertices(&hover_frame, 320.0, 120.0, Some(&hover_layouts));
+        assert!(
+            hover_metrics.rendered_rect_count > base_metrics.rendered_rect_count,
+            "__hover_underline_if must add a rendered underline rect"
+        );
+    }
+
+    #[test]
+    fn underline_sits_below_compact_footer_text() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(11.0));
+        style.insert("line_height".to_owned(), StyleValue::Number(15.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert(
+            "vertical_align".to_owned(),
+            StyleValue::Text("Center".to_owned()),
+        );
+        let item = DisplayItem {
+            node: DocumentNodeId("footer-link".to_owned()),
+            kind: DocumentNodeKind::Text,
+            bounds: Rect {
+                x: 10.0,
+                y: 40.0,
+                width: 76.0,
+                height: 15.0,
+            },
+            text: Some("Martin Kavík".to_owned()),
+            style,
+            focused: false,
+        };
+
+        let underline = underline_rect_for_item(&item, None);
+        let line_height = style_line_height(&item.style, 11.0).min(item.bounds.height);
+        let line_top = text_top_for_parts(item.bounds, line_height, 0.0, TextVerticalAlign::Center);
+        let text_center_y = line_top + line_height * 0.5;
+        assert!(
+            underline.y > text_center_y,
+            "underline y={} should stay below the compact footer text center {}",
+            underline.y,
+            text_center_y
+        );
+        assert!(
+            underline.y + underline.height <= item.bounds.y + item.bounds.height,
+            "underline should remain inside the footer line box"
         );
     }
 
@@ -3450,9 +3729,24 @@ mod tests {
         let runs = text_runs(&frame, 320, 120);
         let run = runs.first().expect("focused input text should render");
         assert_eq!(run.vertical_align, TextVerticalAlign::Center);
+        let line_box_top = text_top_for_parts(
+            run.bounds,
+            run.line_height,
+            run.text_inset,
+            run.vertical_align,
+        );
         assert!(
-            (text_top_for_height(run) - 24.5).abs() <= 0.5,
-            "input text top should be vertically centered"
+            (line_box_top - 24.5).abs() <= 0.5,
+            "input line box top should stay geometrically centered"
+        );
+        assert!(
+            (text_top_for_height(run) - 26.75).abs() <= 0.5,
+            "input glyph paint should get a small downward optical correction"
+        );
+        assert_eq!(
+            text_paint_top_for_height(run),
+            27.0,
+            "input glyph paint origin should snap to whole pixels for sharper text"
         );
         let text_layouts = test_text_layouts(&frame, 320, 120);
         let expected_caret_x = text_layouts
@@ -3465,6 +3759,61 @@ mod tests {
         assert!(
             (caret_x - expected_caret_x).abs() <= 0.5,
             "input caret should use measured glyph edges"
+        );
+    }
+
+    #[test]
+    fn unfocused_empty_text_inputs_render_placeholder_text() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(24.0));
+        style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+        style.insert(
+            "placeholder".to_owned(),
+            StyleValue::Text("What needs to be done?".to_owned()),
+        );
+        style.insert(
+            "placeholder_color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.68]".to_owned()),
+        );
+        style.insert(
+            "placeholder_style".to_owned(),
+            StyleValue::Text("Italic".to_owned()),
+        );
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("input".to_owned()),
+                kind: DocumentNodeKind::TextInput,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 320.0,
+                    height: 65.0,
+                },
+                text: None,
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let run = text_runs(&frame, 640, 160)
+            .into_iter()
+            .find(|run| run.node.0 == "input")
+            .expect("unfocused empty text input should still render placeholder text");
+        assert_eq!(run.text, "What needs to be done?");
+        assert_eq!(run.font_style, Style::Italic);
+        assert_eq!(
+            run.color,
+            parse_oklch_color("Oklch[lightness:0.68]").expect("placeholder color should parse")
+        );
+        assert!(
+            run.color[0] <= 190 && run.color[1] <= 190 && run.color[2] <= 190,
+            "placeholder text should be readable gray, not washed-out near-white: {:?}",
+            run.color
         );
     }
 

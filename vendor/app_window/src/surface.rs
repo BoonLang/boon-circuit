@@ -18,6 +18,8 @@ pub struct SurfaceContentReport {
 pub enum SurfaceCursorIcon {
     Default,
     ColumnResize,
+    Pointer,
+    Text,
 }
 
 /// A type that can be drawn on, e.g. by wgpu.

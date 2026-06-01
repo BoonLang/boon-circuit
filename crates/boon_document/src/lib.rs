@@ -329,7 +329,7 @@ impl LayoutBuilder<'_, '_> {
             height,
         };
         self.display_list[display_index].bounds = rect;
-        if node.source_binding.is_some() || style_bool(&node.style, "hover_scope") == Some(true) {
+        if node.source_binding.is_some() || style_bool(&node.style, "__hover_scope") == Some(true) {
             self.hit_regions.push(HitRegion {
                 id: format!("hit:{}", node.id.0),
                 node: node.id.clone(),

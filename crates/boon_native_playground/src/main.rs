@@ -6,6 +6,7 @@ use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
 };
+use boon_typecheck::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -642,6 +643,12 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            let cursor_icon = {
+                let shared = poll_shared_render_state
+                    .lock()
+                    .map_err(|_| "preview render state mutex poisoned".to_owned())?;
+                preview_cursor_icon(&shared.layout_proof, &input_state)
+            };
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_poll_revision,
@@ -649,7 +656,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason,
                 next_wake_after_ms: input_state.focused_node.is_some().then_some(500),
                 wants_animation_frame: false,
-                cursor_icon: boon_native_app_window::NativeCursorIcon::Default,
+                cursor_icon,
             })
         });
         let render: boon_native_app_window::NativeRenderHook = Box::new(move |context| {
@@ -1597,6 +1604,7 @@ fn native_document_layout_proof_with_state_mode(
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: BTreeMap::new(),
+        passed: None,
     };
     let mut frame = boon_document_model::DocumentFrame::empty("root");
     let mut source_intents = Vec::new();
@@ -2098,6 +2106,11 @@ fn native_gpu_app_owned_render_hook(
     } else {
         layout_frame.clone()
     };
+    let render_frame = preview_frame_with_viewport_background(
+        &render_frame,
+        context.width as f32,
+        context.height as f32,
+    );
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
             context.device,
@@ -2115,25 +2128,29 @@ fn native_gpu_app_owned_render_hook(
         width: context.width,
         height: context.height,
     })?;
-    let app_owned_readback_reused = app_owned_proof.is_some();
-    let proof = match app_owned_proof {
-        Some(proof) => proof.clone(),
-        None => {
-            let proof =
-                boon_native_gpu::render_app_owned_pixels(boon_native_gpu::AppOwnedRenderRequest {
-                    device: context.device,
-                    queue: context.queue,
-                    frame: &render_frame,
-                    surface_id: context.surface_id.clone(),
-                    surface_epoch: context.surface_epoch,
-                    width: context.width,
-                    height: context.height,
-                    artifact_dir: Path::new("target/artifacts/native-gpu/renderer-frames"),
-                    artifact_label: "preview",
-                })?;
-            *app_owned_proof = Some(proof.clone());
-            proof
-        }
+    let app_owned_readback_reused = app_owned_proof
+        .as_ref()
+        .is_some_and(|proof| render_proof_matches_viewport(proof, context.width, context.height));
+    let proof = if app_owned_readback_reused {
+        app_owned_proof
+            .as_ref()
+            .expect("matching app-owned proof should exist")
+            .clone()
+    } else {
+        let proof =
+            boon_native_gpu::render_app_owned_pixels(boon_native_gpu::AppOwnedRenderRequest {
+                device: context.device,
+                queue: context.queue,
+                frame: &render_frame,
+                surface_id: context.surface_id.clone(),
+                surface_epoch: context.surface_epoch,
+                width: context.width,
+                height: context.height,
+                artifact_dir: Path::new("target/artifacts/native-gpu/renderer-frames"),
+                artifact_label: "preview",
+            })?;
+        *app_owned_proof = Some(proof.clone());
+        proof
     };
     Ok(json!({
         "status": "pass",
@@ -2173,6 +2190,46 @@ fn native_gpu_render_cache_stale(
     has_layout_frame_override: bool,
 ) -> bool {
     has_layout_frame_override || cached_layout_key != Some(layout_cache_key)
+}
+
+fn preview_frame_with_viewport_background(
+    frame: &boon_document::LayoutFrame,
+    width: f32,
+    height: f32,
+) -> boon_document::LayoutFrame {
+    let mut frame = frame.clone();
+    if width <= 0.0 || height <= 0.0 {
+        return frame;
+    }
+    if let Some(background) = frame.display_list.iter_mut().find(|item| {
+        item.bounds.x.abs() <= f32::EPSILON
+            && item.bounds.y.abs() <= f32::EPSILON
+            && item.style.get("paint") != Some(&boon_document_model::StyleValue::Bool(false))
+            && (item.style.contains_key("background") || item.style.contains_key("bg"))
+    }) {
+        background.bounds.width = background.bounds.width.max(width);
+        background.bounds.height = background.bounds.height.max(height);
+    }
+    frame
+}
+
+fn render_proof_matches_viewport(
+    proof: &boon_native_gpu::RenderProof,
+    width: u32,
+    height: u32,
+) -> bool {
+    match &proof.artifact {
+        boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+            width: proof_width,
+            height: proof_height,
+            ..
+        }
+        | boon_native_gpu::RenderProofArtifact::CopyToPresent {
+            width: proof_width,
+            height: proof_height,
+            ..
+        } => *proof_width == width && *proof_height == height,
+    }
 }
 
 fn preview_frame_with_status_overlay(
@@ -5722,6 +5779,7 @@ impl BoonLanguageService {
                     category: entry.category,
                     compact_label: entry.compact_label,
                     detail_label: entry.detail_label,
+                    display_tree: entry.display_tree,
                 })
                 .collect(),
         }
@@ -6383,6 +6441,8 @@ struct EditorTypeHint {
     category: String,
     compact_label: String,
     detail_label: String,
+    #[serde(skip_serializing)]
+    display_tree: TypeDisplayNode,
 }
 
 #[derive(Clone, Debug)]
@@ -8407,11 +8467,15 @@ impl DevWindowShell {
         token: &str,
         wrap_chars: usize,
     ) -> TypeInspectorContent {
-        let root = type_inspector_root_name(token);
+        let root = type_inspector_root_name_for_hint(
+            &self.workspace.selected_buffer.source_text,
+            active.hint,
+            token,
+        );
         let value_summary = self.runtime_value_summary(&root, wrap_chars);
         type_tree_lines_with_inline_values(
             &root,
-            &active.hint.detail_label,
+            &active.hint.display_tree,
             value_summary.as_ref(),
             &self.type_inspector_collapsed_paths,
             &self.type_inspector_list_item_limits,
@@ -10966,6 +11030,75 @@ fn type_inspector_root_name(token: &str) -> String {
     }
 }
 
+fn type_inspector_root_name_for_hint(source: &str, hint: &EditorTypeHint, token: &str) -> String {
+    let root = type_inspector_root_name(token);
+    if !type_inspector_root_name_needs_context(&root) {
+        return root;
+    }
+    contextual_type_inspector_root_name(source, hint.line).unwrap_or(root)
+}
+
+fn type_inspector_root_name_needs_context(root: &str) -> bool {
+    let trimmed = root.trim();
+    trimmed.is_empty()
+        || trimmed == "-"
+        || trimmed == "LIST"
+        || trimmed.starts_with("LIST[")
+        || trimmed.starts_with('[')
+        || trimmed == "SOURCE"
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains(',')
+        || trimmed.contains('|')
+        || trimmed.contains("=>")
+        || trimmed.chars().any(char::is_whitespace)
+}
+
+fn contextual_type_inspector_root_name(source: &str, line_number: usize) -> Option<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut search_indent = lines
+        .get(line_number.saturating_sub(1))
+        .map(|line| line_indent_columns(line))
+        .unwrap_or(usize::MAX);
+    for index in (0..line_number.min(lines.len())).rev() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        let indent = line_indent_columns(line);
+        if index + 1 != line_number && indent >= search_indent {
+            continue;
+        }
+        if let Some(field) = boon_field_name_from_line(trimmed) {
+            return Some(field.to_owned());
+        }
+        search_indent = indent;
+    }
+    None
+}
+
+fn line_indent_columns(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| character.is_whitespace())
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn boon_field_name_from_line(trimmed_line: &str) -> Option<&str> {
+    let (candidate, _) = trimmed_line.split_once(':')?;
+    let candidate = candidate.trim();
+    (!candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && candidate
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_'))
+    .then_some(candidate)
+}
+
 #[cfg(test)]
 fn runtime_value_response_detail_lines(
     response: &serde_json::Value,
@@ -11037,7 +11170,7 @@ fn runtime_value_summary_is_missing(summary: &serde_json::Value) -> bool {
 
 fn type_tree_lines_with_inline_values(
     root: &str,
-    type_label: &str,
+    display_tree: &TypeDisplayNode,
     value_summary: Option<&serde_json::Value>,
     collapsed_paths: &BTreeSet<String>,
     list_item_limits: &BTreeMap<String, usize>,
@@ -11047,7 +11180,7 @@ fn type_tree_lines_with_inline_values(
     let lines = render_named_type_tree(
         root,
         root,
-        type_label,
+        display_tree,
         value_summary,
         &TypeInspectorTreeView {
             collapsed_paths,
@@ -11089,7 +11222,7 @@ impl TypeInspectorLine {
 fn render_named_type_tree(
     name: &str,
     path: &str,
-    type_label: &str,
+    display_tree: &TypeDisplayNode,
     value_summary: Option<&serde_json::Value>,
     view: &TypeInspectorTreeView<'_>,
     indent_depth: usize,
@@ -11097,75 +11230,383 @@ fn render_named_type_tree(
     wrap_chars: usize,
 ) -> Vec<TypeInspectorLine> {
     let indent = " ".repeat(indent_depth * 4);
-    let trimmed_type = normalized_type_label(type_label);
-    if type_label_is_empty_object(&trimmed_type) {
-        return vec![TypeInspectorLine::plain(format!("{indent}{name}: []"))];
+    if let Some(inline) = inline_type_display_text(display_tree, value_summary, wrap_chars) {
+        return vec![TypeInspectorLine::plain(format!(
+            "{indent}{name}: {inline}"
+        ))];
     }
-    if let Some(item_type) = list_item_type_label(&trimmed_type) {
-        let collapsed = view.collapsed_paths.contains(path);
-        let marker = if collapsed { "▸" } else { "▾" };
-        let mut lines = vec![TypeInspectorLine::action(
-            append_inline_hint(
-                format!("{indent}{marker} {name}: LIST"),
-                runtime_list_item_hint(value_summary),
-            ),
-            TypeInspectorAction::TogglePath(path.to_owned()),
-        )];
-        if collapsed {
-            return lines;
+    match display_tree {
+        TypeDisplayNode::List { item } => {
+            let collapsed = view.collapsed_paths.contains(path);
+            let marker = if collapsed { "▸" } else { "▾" };
+            let mut lines = vec![TypeInspectorLine::action(
+                append_inline_hint(
+                    format!("{indent}{marker} {name}: LIST"),
+                    runtime_list_item_hint(value_summary),
+                ),
+                TypeInspectorAction::TogglePath(path.to_owned()),
+            )];
+            if collapsed {
+                return lines;
+            }
+            if expand_depth < 3 {
+                lines.extend(render_list_items(
+                    path,
+                    item,
+                    value_summary,
+                    view,
+                    indent_depth + 1,
+                    expand_depth + 1,
+                    wrap_chars,
+                ));
+            }
+            lines
         }
-        if expand_depth < 3 {
-            lines.extend(render_list_items(
-                path,
-                &item_type,
-                value_summary,
-                view,
-                indent_depth + 1,
-                expand_depth + 1,
-                wrap_chars,
-            ));
-        }
-        return lines;
-    }
-    if type_label_is_object(&trimmed_type) {
-        let collapsed = view.collapsed_paths.contains(path);
-        let marker = if collapsed { "▸" } else { "▾" };
-        let object_line = if collapsed {
-            append_inline_hint(format!("{indent}{marker} {name}: [...]"), None)
-        } else {
-            format!("{indent}{marker} {name}: [")
-        };
-        let mut lines = vec![TypeInspectorLine::action(
-            object_line,
-            TypeInspectorAction::TogglePath(path.to_owned()),
-        )];
-        if collapsed {
-            return lines;
-        }
-        lines.extend(render_type_object_fields(
-            &trimmed_type,
+        TypeDisplayNode::Object { fields, .. } => render_named_object_type_tree(
+            name,
+            path,
+            fields,
             value_summary,
             view,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+            None,
+        ),
+        TypeDisplayNode::TaggedObject { tag, fields, .. } => render_named_object_type_tree(
+            name,
             path,
+            fields,
+            value_summary,
+            view,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+            Some(tag),
+        ),
+        TypeDisplayNode::Scalar { label } => {
+            let label = display_type_alias_label(label);
+            let value_hint = value_summary
+                .map(|summary| runtime_value_hint_for_type(&label, summary))
+                .or_else(|| (indent_depth == 0).then_some("ABSENT".to_owned()));
+            vec![TypeInspectorLine::plain(append_inline_hint(
+                format!("{indent}{name}: {}", one_line(&label, wrap_chars)),
+                value_hint,
+            ))]
+        }
+        TypeDisplayNode::Union { variants } => render_named_union_type_tree(
+            name,
+            path,
+            variants,
+            value_summary,
+            view,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+        ),
+        TypeDisplayNode::Function {
+            name: function_name,
+            args,
+            result,
+        } => render_named_function_type_tree(
+            name,
+            path,
+            function_name.as_deref(),
+            args,
+            result,
+            view,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_named_union_type_tree(
+    name: &str,
+    path: &str,
+    variants: &[TypeDisplayNode],
+    value_summary: Option<&serde_json::Value>,
+    view: &TypeInspectorTreeView<'_>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+) -> Vec<TypeInspectorLine> {
+    if let [variant] = variants {
+        return render_named_type_tree(
+            name,
+            path,
+            variant,
+            value_summary,
+            view,
+            indent_depth,
+            expand_depth,
+            wrap_chars,
+        );
+    }
+    if variants
+        .iter()
+        .all(|variant| matches!(variant, TypeDisplayNode::Scalar { .. }))
+    {
+        let indent = " ".repeat(indent_depth * 4);
+        let type_text = variants
+            .iter()
+            .map(type_display_label)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let value_hint = value_summary
+            .map(|summary| runtime_value_hint_for_type(&type_text, summary))
+            .or_else(|| (indent_depth == 0).then_some("ABSENT".to_owned()));
+        return vec![TypeInspectorLine::plain(append_inline_hint(
+            format!("{indent}{name}: {}", one_line(&type_text, wrap_chars)),
+            value_hint,
+        ))];
+    }
+    let indent = " ".repeat(indent_depth * 4);
+    let mut lines = vec![TypeInspectorLine::plain(format!("{indent}{name}:"))];
+    for variant in variants {
+        let variant_name = type_display_variant_name(variant);
+        lines.extend(render_named_type_tree(
+            &variant_name,
+            &format!("{path}.{variant_name}"),
+            variant,
+            None,
+            view,
             indent_depth + 1,
             expand_depth + 1,
             wrap_chars,
         ));
-        lines.push(TypeInspectorLine::plain(format!("{indent}]")));
+    }
+    lines
+}
+
+fn type_display_variant_name(display_tree: &TypeDisplayNode) -> String {
+    match display_tree {
+        TypeDisplayNode::Scalar { label } => display_type_alias_label(label),
+        TypeDisplayNode::TaggedObject { tag, .. } => tag.clone(),
+        TypeDisplayNode::Object { .. } => "[]".to_owned(),
+        TypeDisplayNode::List { .. } => "LIST".to_owned(),
+        TypeDisplayNode::Union { .. } => "VALUE".to_owned(),
+        TypeDisplayNode::Function { name, .. } => {
+            name.clone().unwrap_or_else(|| "FUNCTION".to_owned())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_named_function_type_tree(
+    name: &str,
+    path: &str,
+    function_name: Option<&str>,
+    args: &[TypeDisplayFunctionArg],
+    result: &TypeDisplayNode,
+    view: &TypeInspectorTreeView<'_>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+) -> Vec<TypeInspectorLine> {
+    let indent = " ".repeat(indent_depth * 4);
+    let suffix = function_name
+        .filter(|function_name| *function_name != name)
+        .map(|function_name| format!(" {function_name}"))
+        .unwrap_or_default();
+    let mut lines = vec![TypeInspectorLine::plain(format!(
+        "{indent}{name}: FUNCTION{suffix}"
+    ))];
+    for (index, arg) in args.iter().enumerate() {
+        let arg_name = arg
+            .name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("arg_{}", index + 1));
+        lines.extend(render_named_type_tree(
+            &arg_name,
+            &format!("{path}.{arg_name}"),
+            &arg.ty,
+            None,
+            view,
+            indent_depth + 1,
+            expand_depth + 1,
+            wrap_chars,
+        ));
+    }
+    lines.extend(render_named_type_tree(
+        "returns",
+        &format!("{path}.returns"),
+        result,
+        None,
+        view,
+        indent_depth + 1,
+        expand_depth + 1,
+        wrap_chars,
+    ));
+    lines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_named_object_type_tree(
+    name: &str,
+    path: &str,
+    fields: &[TypeDisplayField],
+    value_summary: Option<&serde_json::Value>,
+    view: &TypeInspectorTreeView<'_>,
+    indent_depth: usize,
+    expand_depth: usize,
+    wrap_chars: usize,
+    tag: Option<&str>,
+) -> Vec<TypeInspectorLine> {
+    let indent = " ".repeat(indent_depth * 4);
+    if fields.is_empty() {
+        return vec![TypeInspectorLine::plain(format!(
+            "{indent}{name}: {}",
+            tag.map(|tag| format!("{tag}[]"))
+                .unwrap_or_else(|| "[]".to_owned())
+        ))];
+    }
+    let collapsed = view.collapsed_paths.contains(path);
+    let marker = if collapsed { "▸" } else { "▾" };
+    let opener = tag
+        .map(|tag| format!("{tag}["))
+        .unwrap_or_else(|| "[".to_owned());
+    let object_line = if collapsed {
+        format!("{indent}{marker} {name}: {opener}")
+    } else {
+        format!("{indent}{marker} {name}: {opener}")
+    };
+    let mut lines = vec![TypeInspectorLine::action(
+        object_line,
+        TypeInspectorAction::TogglePath(path.to_owned()),
+    )];
+    if collapsed {
         return lines;
     }
-    let value_hint = value_summary
-        .map(|summary| runtime_value_hint_for_type(&trimmed_type, summary))
-        .or_else(|| (indent_depth == 0).then_some("ABSENT".to_owned()));
-    let type_text = one_line(&trimmed_type, wrap_chars);
-    vec![TypeInspectorLine::plain(append_inline_hint(
-        format!("{indent}{name}: {type_text}"),
-        value_hint,
-    ))]
+    lines.extend(render_type_object_fields(
+        fields,
+        value_summary,
+        view,
+        path,
+        indent_depth + 1,
+        expand_depth + 1,
+        wrap_chars,
+    ));
+    lines.push(TypeInspectorLine::plain(format!("{indent}]")));
+    lines
+}
+
+fn type_display_label(display_tree: &TypeDisplayNode) -> String {
+    match display_tree {
+        TypeDisplayNode::Scalar { label } => display_type_alias_label(label),
+        TypeDisplayNode::Object { fields, .. } => {
+            if fields.is_empty() {
+                "[]".to_owned()
+            } else {
+                "[...]".to_owned()
+            }
+        }
+        TypeDisplayNode::TaggedObject { tag, fields, .. } => {
+            if fields.is_empty() {
+                format!("{tag}[]")
+            } else {
+                format!("{tag}[...]")
+            }
+        }
+        TypeDisplayNode::List { item } => format!("LIST<{}>", type_display_label(item)),
+        TypeDisplayNode::Union { variants } => variants
+            .iter()
+            .map(type_display_label)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        TypeDisplayNode::Function { name, args, result } => {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    let label = type_display_label(&arg.ty);
+                    arg.name
+                        .as_ref()
+                        .map(|name| format!("{name}: {label}"))
+                        .unwrap_or(label)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            match name {
+                Some(name) => format!("function {name}({args}) -> {}", type_display_label(result)),
+                None => format!("FUNCTION({args}) -> {}", type_display_label(result)),
+            }
+        }
+    }
+}
+
+fn inline_type_display_text(
+    display_tree: &TypeDisplayNode,
+    value_summary: Option<&serde_json::Value>,
+    wrap_chars: usize,
+) -> Option<String> {
+    let text = inline_type_display_text_unbounded(display_tree, value_summary)?;
+    (text.chars().count() <= wrap_chars.min(96)).then_some(text)
+}
+
+fn inline_type_display_text_unbounded(
+    display_tree: &TypeDisplayNode,
+    value_summary: Option<&serde_json::Value>,
+) -> Option<String> {
+    match display_tree {
+        TypeDisplayNode::Scalar { label } => {
+            let label = display_type_alias_label(label);
+            Some(append_inline_hint(
+                label.clone(),
+                value_summary.map(|summary| runtime_value_hint_for_type(&label, summary)),
+            ))
+        }
+        TypeDisplayNode::Object { fields, .. } => {
+            inline_object_type_display_text(fields, value_summary, None)
+        }
+        TypeDisplayNode::TaggedObject { tag, fields, .. } => {
+            inline_object_type_display_text(fields, value_summary, Some(tag))
+        }
+        TypeDisplayNode::Union { variants } => {
+            if variants
+                .iter()
+                .all(|variant| matches!(variant, TypeDisplayNode::Scalar { .. }))
+            {
+                let label = variants
+                    .iter()
+                    .map(type_display_label)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                Some(append_inline_hint(
+                    label.clone(),
+                    value_summary.map(|summary| runtime_value_hint_for_type(&label, summary)),
+                ))
+            } else {
+                None
+            }
+        }
+        TypeDisplayNode::Function { .. } => None,
+        TypeDisplayNode::List { .. } => None,
+    }
+}
+
+fn inline_object_type_display_text(
+    fields: &[TypeDisplayField],
+    value_summary: Option<&serde_json::Value>,
+    tag: Option<&str>,
+) -> Option<String> {
+    let prefix = tag.unwrap_or_default();
+    if fields.is_empty() {
+        return Some(format!("{prefix}[]"));
+    }
+    if fields.len() != 1 {
+        return None;
+    }
+    let field = &fields[0];
+    let field_value = value_summary_field(value_summary, &field.name);
+    let value = inline_type_display_text_unbounded(&field.ty, field_value)?;
+    Some(format!("{prefix}[{}: {value}]", field.name))
 }
 
 fn render_type_object_fields(
-    type_label: &str,
+    fields: &[TypeDisplayField],
     value_summary: Option<&serde_json::Value>,
     view: &TypeInspectorTreeView<'_>,
     path: &str,
@@ -11173,31 +11614,48 @@ fn render_type_object_fields(
     expand_depth: usize,
     wrap_chars: usize,
 ) -> Vec<TypeInspectorLine> {
-    let fields = split_type_object_fields(type_label);
     if fields.is_empty() {
         return Vec::new();
     }
     let mut lines = Vec::new();
+    let mut previous_expanded_group = false;
     for field in fields {
         let field_value = value_summary_field(value_summary, &field.name);
         let field_path = format!("{path}.{}", field.name);
+        let expanded_group = type_display_node_can_expand(&field.ty)
+            && inline_type_display_text(&field.ty, field_value, wrap_chars).is_none();
+        if previous_expanded_group && expanded_group {
+            lines.push(TypeInspectorLine::plain(String::new()));
+        }
         lines.extend(render_named_type_tree(
             &field.name,
             &field_path,
-            &field.type_label,
+            &field.ty,
             field_value,
             view,
             indent_depth,
             expand_depth,
             wrap_chars,
         ));
+        previous_expanded_group = expanded_group;
     }
     lines
 }
 
+fn type_display_node_can_expand(display_tree: &TypeDisplayNode) -> bool {
+    matches!(
+        display_tree,
+        TypeDisplayNode::Object { fields, .. }
+            | TypeDisplayNode::TaggedObject { fields, .. } if !fields.is_empty()
+    ) || matches!(
+        display_tree,
+        TypeDisplayNode::List { .. } | TypeDisplayNode::Function { .. }
+    )
+}
+
 fn render_list_items(
     list_path: &str,
-    item_type: &str,
+    item_type: &TypeDisplayNode,
     value_summary: Option<&serde_json::Value>,
     view: &TypeInspectorTreeView<'_>,
     indent_depth: usize,
@@ -11209,7 +11667,31 @@ fn render_list_items(
         .and_then(|summary| summary.get("sample"))
         .and_then(serde_json::Value::as_array)
     else {
-        return vec![TypeInspectorLine::plain(format!("{indent}[...]"))];
+        let item_path = format!("{list_path}[item]");
+        let mut lines = vec![TypeInspectorLine::plain(format!("{indent}[item]:"))];
+        if let TypeDisplayNode::Object { fields, .. } = item_type {
+            lines.extend(render_type_object_fields(
+                fields,
+                None,
+                view,
+                &item_path,
+                indent_depth + 1,
+                expand_depth + 1,
+                wrap_chars,
+            ));
+        } else {
+            lines.extend(render_named_type_tree(
+                "value",
+                &format!("{item_path}.value"),
+                item_type,
+                None,
+                view,
+                indent_depth + 1,
+                expand_depth + 1,
+                wrap_chars,
+            ));
+        }
+        return lines;
     };
     let requested_limit = view
         .list_item_limits
@@ -11230,9 +11712,9 @@ fn render_list_items(
         if collapsed {
             continue;
         }
-        if type_label_is_object(item_type.trim()) {
+        if let TypeDisplayNode::Object { fields, .. } = item_type {
             lines.extend(render_type_object_fields(
-                item_type,
+                fields,
                 Some(item),
                 view,
                 &item_path,
@@ -11283,111 +11765,11 @@ fn render_list_items(
     lines
 }
 
-#[derive(Clone, Debug)]
-struct TypeTreeField {
-    name: String,
-    type_label: String,
-}
-
-fn split_type_object_fields(type_label: &str) -> Vec<TypeTreeField> {
-    let lines = type_label.lines().collect::<Vec<_>>();
-    let Some(field_indent) = lines
-        .iter()
-        .filter_map(|line| {
-            parse_type_field_line(line).map(|_| {
-                line.chars()
-                    .take_while(|character| *character == ' ')
-                    .count()
-            })
-        })
-        .min()
-    else {
-        return Vec::new();
-    };
-    let mut fields = Vec::new();
-    let mut current_name = None::<String>;
-    let mut current_type_lines = Vec::<String>::new();
-    for line in lines {
-        let indent = line
-            .chars()
-            .take_while(|character| *character == ' ')
-            .count();
-        let parsed = (indent == field_indent)
-            .then(|| parse_type_field_line(line))
-            .flatten();
-        if let Some((name, first_type_line)) = parsed {
-            if let Some(name) = current_name.replace(name) {
-                fields.push(TypeTreeField {
-                    name,
-                    type_label: current_type_lines.join("\n").trim().to_owned(),
-                });
-                current_type_lines.clear();
-            }
-            current_type_lines.push(first_type_line);
-        } else if current_name.is_some() && indent >= field_indent {
-            current_type_lines.push(line.to_owned());
-        }
-    }
-    if let Some(name) = current_name {
-        fields.push(TypeTreeField {
-            name,
-            type_label: current_type_lines.join("\n").trim().to_owned(),
-        });
-    }
-    fields
-}
-
-fn parse_type_field_line(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim();
-    if trimmed.starts_with('[') || trimmed.starts_with(']') {
-        return None;
-    }
-    let (name, type_label) = trimmed.split_once(": ")?;
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-    {
-        return None;
-    }
-    Some((name.to_owned(), type_label.to_owned()))
-}
-
-fn list_item_type_label(type_label: &str) -> Option<String> {
-    let trimmed = type_label.trim();
-    let inner = trimmed.strip_prefix("LIST<")?.strip_suffix('>')?;
-    Some(inner.trim().to_owned())
-}
-
-fn type_label_is_object(type_label: &str) -> bool {
-    type_label.trim_start().starts_with('[')
-}
-
-fn normalized_type_label(type_label: &str) -> String {
-    let trimmed = type_label.trim();
-    let label = trimmed
-        .strip_prefix(':')
-        .map(str::trim_start)
-        .unwrap_or(trimmed);
-    display_type_alias_label(label)
-}
-
 fn display_type_alias_label(type_label: &str) -> String {
     match type_label.trim() {
         "False | True" | "True | False" => "BOOL".to_owned(),
         other => other.to_owned(),
     }
-}
-
-fn type_label_is_empty_object(type_label: &str) -> bool {
-    let trimmed = type_label.trim();
-    trimmed.starts_with('[')
-        && trimmed.ends_with(']')
-        && trimmed
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim()
-            .is_empty()
 }
 
 fn value_summary_field<'a>(
@@ -11439,7 +11821,7 @@ fn runtime_value_summary_inline_label_for_type(
 
 fn runtime_json_kind_label(summary: &serde_json::Value) -> String {
     match summary.get("kind").and_then(serde_json::Value::as_str) {
-        Some("object") => "[...]".to_owned(),
+        Some("object") => "[]".to_owned(),
         Some("list") => "LIST".to_owned(),
         Some(kind) => kind.to_owned(),
         None => "VALUE".to_owned(),
@@ -11572,7 +11954,7 @@ fn runtime_scalar_value_label(value: &serde_json::Value) -> String {
         serde_json::Value::Number(value) => value.to_string(),
         serde_json::Value::Null => "null".to_owned(),
         serde_json::Value::Array(_) => "LIST".to_owned(),
-        serde_json::Value::Object(_) => "[...]".to_owned(),
+        serde_json::Value::Object(_) => "[]".to_owned(),
     }
 }
 
@@ -11966,6 +12348,7 @@ fn document_function_call_context<'a>(
     DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        passed: context.passed.clone(),
     }
 }
 
@@ -11978,6 +12361,7 @@ fn document_function_args_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        passed: context.passed.clone(),
     };
     let formals = match &function.kind {
         AstStatementKind::Function { args, .. } => args.as_slice(),
@@ -11995,6 +12379,10 @@ fn document_function_args_context<'a>(
             let value = document_eval_expr_value(expr, expressions, context)
                 .or_else(|| document_expr_value(expr, expressions).map(Value::String));
             if let Some(value) = value {
+                if name == "PASS" {
+                    scoped.passed = Some(value);
+                    continue;
+                }
                 scoped.locals.insert(name.to_owned(), value);
             }
         }
@@ -12012,6 +12400,7 @@ fn document_function_item_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        passed: context.passed.clone(),
     };
     let first_formal = match &function.kind {
         AstStatementKind::Function { args, .. } => args.first().map(String::as_str),
@@ -12093,10 +12482,20 @@ fn lower_canonical_document_element(
 
     lower_canonical_element_style(statement, expressions, context, &mut node);
     lower_canonical_element_text(statement, expressions, context, &mut node);
+    if function == "Element/link" {
+        lower_canonical_link_metadata(statement, expressions, context, &mut node);
+    }
+    inherit_canonical_text_style(frame, parent, &mut node);
+    if matches!(node.kind, boon_document_model::DocumentNodeKind::Button) {
+        node.style
+            .entry("cursor".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Text("pointer".to_owned()));
+    }
     lower_canonical_element_sources(
         statement,
         expressions,
         context,
+        typecheck_report,
         &id,
         &mut node,
         source_intents,
@@ -12163,6 +12562,31 @@ fn lower_canonical_document_element(
     );
 }
 
+fn inherit_canonical_text_style(
+    frame: &boon_document_model::DocumentFrame,
+    parent: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(parent_node) = frame.nodes.get(parent) else {
+        return;
+    };
+    for key in [
+        "font",
+        "font_style",
+        "font_features",
+        "size",
+        "weight",
+        "color",
+        "line_height",
+    ] {
+        if !node.style.contains_key(key)
+            && let Some(value) = parent_node.style.get(key)
+        {
+            node.style.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
 fn canonical_document_node_kind(
     function: &str,
     statement: &AstStatement,
@@ -12227,6 +12651,7 @@ fn lower_mapped_document_children(
         let mut item_context = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            passed: context.passed.clone(),
         };
         item_context
             .locals
@@ -12398,13 +12823,18 @@ fn lower_canonical_element_style(
         match field.as_str() {
             "style" => lower_canonical_style_block(child, expressions, context, node),
             "gap" | "width" | "height" | "padding" | "size" | "scroll" | "scroll_x"
-            | "scroll_y" | "scrollbars" | "center" | "hover_visible" => {
+            | "scroll_y" | "scrollbars" | "center" => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert(field, value);
                 }
             }
             "checked" | "selected" | "visible" | "focus" => {
-                if let Some(value) = document_style_value(child, expressions, context) {
+                if field == "visible" && statement_expr_is_element_hovered(child, expressions) {
+                    node.style.insert(
+                        "__hover_visible".to_owned(),
+                        boon_document_model::StyleValue::Bool(true),
+                    );
+                } else if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert(field, value);
                 }
             }
@@ -12453,6 +12883,13 @@ fn lower_canonical_style_block(
                                 other => other,
                             };
                             node.style.insert(style_key.to_owned(), value);
+                        } else if font_field.name == "line" {
+                            lower_font_line_style_fields(
+                                font_field.value,
+                                expressions,
+                                context,
+                                node,
+                            );
                         }
                     }
                 }
@@ -12464,6 +12901,17 @@ fn lower_canonical_style_block(
                         font_field.as_str(),
                         "size" | "color" | "weight" | "family" | "style"
                     ) {
+                        if font_field == "color"
+                            && lower_hover_while_statement_style_value(
+                                font_child,
+                                "color",
+                                expressions,
+                                context,
+                                node,
+                            )
+                        {
+                            continue;
+                        }
                         if let Some(value) = document_style_value(font_child, expressions, context)
                         {
                             let style_key = match font_field.as_str() {
@@ -12473,6 +12921,8 @@ fn lower_canonical_style_block(
                             };
                             node.style.insert(style_key.to_owned(), value);
                         }
+                    } else if font_field == "line" {
+                        lower_font_line_style(font_child, expressions, context, node);
                     }
                 }
             }
@@ -12499,7 +12949,23 @@ fn lower_canonical_style_block(
                 }
             }
             "padding" => lower_spacing_style(child, "padding", expressions, context, node),
-            "outline" | "border" | "borders" | "selected_border" => {
+            "shadows" => lower_shadow_style(child, expressions, context, node),
+            "rounded_corners" => {
+                if let Some(value) = document_style_value(child, expressions, context) {
+                    node.style.insert("border_radius".to_owned(), value);
+                }
+            }
+            "transform" => {
+                if let Some(rotate) =
+                    document_child_style_value(child, "rotate", expressions, context)
+                {
+                    node.style.insert("rotate".to_owned(), rotate);
+                }
+            }
+            "outline" | "border" => {
+                if field == "outline" && lower_outline_style(child, expressions, context, node) {
+                    continue;
+                }
                 if let Some(color) =
                     statement_nested_style_value(child, "color", expressions, context)
                         .or_else(|| {
@@ -12507,18 +12973,504 @@ fn lower_canonical_style_block(
                         })
                         .or_else(|| document_style_value(child, expressions, context))
                 {
-                    let style_key = if field == "selected_border" {
-                        "selected_border"
-                    } else {
-                        "border"
-                    };
-                    node.style.insert(style_key.to_owned(), color);
+                    node.style.insert("border".to_owned(), color);
                 }
             }
+            "borders" => lower_borders_style(child, expressions, context, node),
             _ => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert(field, value);
                 }
+            }
+        }
+    }
+}
+
+fn statement_expr_is_element_hovered(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement.expr.is_some_and(|expr_id| {
+        matches!(
+            expressions.get(expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Path(parts))
+                if parts.len() == 2 && parts[0] == "element" && parts[1] == "hovered"
+        )
+    })
+}
+
+fn lower_font_line_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr {
+        lower_font_line_style_fields(expr_id, expressions, context, node);
+    }
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        let Some(mut value) = document_style_value(child, expressions, context) else {
+            continue;
+        };
+        match field.as_str() {
+            "strikethrough" => {
+                node.style.insert("strikethrough".to_owned(), value);
+            }
+            "underline" => {
+                let key = if statement_expr_is_element_hovered(child, expressions) {
+                    value = boon_document_model::StyleValue::Bool(true);
+                    "__hover_underline_if"
+                } else {
+                    "underline_if"
+                };
+                node.style.insert(key.to_owned(), value);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_font_line_style_fields(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(fields) = record_fields_for_expr(expr_id, expressions) else {
+        return;
+    };
+    for field in fields {
+        let Some(mut value) = document_style_value_for_expr(field.value, expressions, context)
+        else {
+            continue;
+        };
+        match field.name.as_str() {
+            "strikethrough" => {
+                node.style.insert("strikethrough".to_owned(), value);
+            }
+            "underline" => {
+                let key = if expr_is_element_hovered(field.value, expressions) {
+                    value = boon_document_model::StyleValue::Bool(true);
+                    "__hover_underline_if"
+                } else {
+                    "underline_if"
+                };
+                node.style.insert(key.to_owned(), value);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn expr_is_element_hovered(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    matches!(
+        expressions.get(expr_id).map(|expr| &expr.kind),
+        Some(AstExprKind::Path(parts))
+            if parts.len() == 2 && parts[0] == "element" && parts[1] == "hovered"
+    )
+}
+
+fn lower_hover_while_statement_style_value(
+    statement: &AstStatement,
+    style_key: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) -> bool {
+    let Some((expr_id, expr_children)) = document_direct_style_expr(statement, expressions) else {
+        return false;
+    };
+    let Some(AstExpr {
+        kind: AstExprKind::Pipe { input, op, .. },
+        ..
+    }) = expressions.get(expr_id)
+    else {
+        return false;
+    };
+    if op != "WHILE" || !expr_is_element_hovered(*input, expressions) {
+        return false;
+    }
+    let base = style_value_for_matching_bool_arm(false, expr_children, expressions, context);
+    let hover = style_value_for_matching_bool_arm(true, expr_children, expressions, context);
+    if let Some(base) = base {
+        node.style.insert(style_key.to_owned(), base);
+    }
+    if let Some(hover) = hover {
+        node.style.insert(format!("__hover_{style_key}"), hover);
+    }
+    node.style.contains_key(style_key) || node.style.contains_key(&format!("__hover_{style_key}"))
+}
+
+fn style_value_for_matching_bool_arm(
+    selector: bool,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    for arm in arms {
+        let Some(expr_id) = arm.expr else {
+            continue;
+        };
+        let Some(AstExpr {
+            kind: AstExprKind::MatchArm { pattern, output },
+            ..
+        }) = expressions.get(expr_id)
+        else {
+            continue;
+        };
+        if !outline_pattern_matches_bool(pattern, selector) {
+            continue;
+        }
+        if let Some(output) = output {
+            return document_style_value_for_expr(*output, expressions, context);
+        }
+        return first_child_style_value(&arm.children, expressions, context);
+    }
+    None
+}
+
+fn first_child_style_value(
+    children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    children
+        .iter()
+        .find_map(|child| document_style_value(child, expressions, context))
+}
+
+#[derive(Default)]
+struct LoweredOutlineStyle {
+    border: Option<boon_document_model::StyleValue>,
+    hover_border: Option<boon_document_model::StyleValue>,
+}
+
+impl LoweredOutlineStyle {
+    fn merge(&mut self, other: LoweredOutlineStyle) {
+        if other.border.is_some() {
+            self.border = other.border;
+        }
+        if other.hover_border.is_some() {
+            self.hover_border = other.hover_border;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.border.is_none() && self.hover_border.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OutlineTarget {
+    Base,
+    Hover,
+}
+
+fn lower_outline_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) -> bool {
+    let mut lowered = LoweredOutlineStyle::default();
+    if let Some(expr_id) = statement.expr {
+        lowered.merge(outline_style_for_expr(
+            expr_id,
+            &statement.children,
+            expressions,
+            context,
+            OutlineTarget::Base,
+        ));
+    }
+    for child in &statement.children {
+        if let Some(expr_id) = child.expr {
+            lowered.merge(outline_style_for_expr(
+                expr_id,
+                &child.children,
+                expressions,
+                context,
+                OutlineTarget::Base,
+            ));
+        }
+    }
+    apply_lowered_outline_style(lowered, node)
+}
+
+fn lower_outline_style_expr(
+    expr_id: usize,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) -> bool {
+    let lowered = outline_style_for_expr(expr_id, arms, expressions, context, OutlineTarget::Base);
+    apply_lowered_outline_style(lowered, node)
+}
+
+fn apply_lowered_outline_style(
+    lowered: LoweredOutlineStyle,
+    node: &mut boon_document_model::DocumentNode,
+) -> bool {
+    if lowered.is_empty() {
+        return false;
+    }
+    if let Some(border) = lowered.border {
+        node.style.insert("border".to_owned(), border);
+    }
+    if let Some(hover_border) = lowered.hover_border {
+        node.style.insert("__hover_border".to_owned(), hover_border);
+    }
+    true
+}
+
+fn outline_style_for_expr(
+    expr_id: usize,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    target: OutlineTarget,
+) -> LoweredOutlineStyle {
+    let Some(expr) = expressions.get(expr_id) else {
+        return LoweredOutlineStyle::default();
+    };
+    match &expr.kind {
+        AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
+            if expr_is_element_hovered(*input, expressions) {
+                return outline_style_for_matching_while_arm(
+                    true,
+                    arms,
+                    expressions,
+                    context,
+                    OutlineTarget::Hover,
+                );
+            }
+            let Some(selector) = document_eval_expr_bool(*input, expressions, context) else {
+                return LoweredOutlineStyle::default();
+            };
+            outline_style_for_matching_while_arm(selector, arms, expressions, context, target)
+        }
+        AstExprKind::Identifier(name) | AstExprKind::Enum(name) | AstExprKind::Tag(name)
+            if name == "NoOutline" =>
+        {
+            LoweredOutlineStyle::default()
+        }
+        _ => {
+            let Some(color) = outline_color_for_expr(expr_id, expressions, context) else {
+                return LoweredOutlineStyle::default();
+            };
+            match target {
+                OutlineTarget::Base => LoweredOutlineStyle {
+                    border: Some(color),
+                    hover_border: None,
+                },
+                OutlineTarget::Hover => LoweredOutlineStyle {
+                    border: None,
+                    hover_border: Some(color),
+                },
+            }
+        }
+    }
+}
+
+fn outline_style_for_matching_while_arm(
+    selector: bool,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    target: OutlineTarget,
+) -> LoweredOutlineStyle {
+    for arm in arms {
+        let Some(expr_id) = arm.expr else {
+            continue;
+        };
+        let Some(AstExpr {
+            kind: AstExprKind::MatchArm { pattern, output },
+            ..
+        }) = expressions.get(expr_id)
+        else {
+            continue;
+        };
+        if !outline_pattern_matches_bool(pattern, selector) {
+            continue;
+        }
+        if let Some(output) = output {
+            return outline_style_for_expr(*output, &arm.children, expressions, context, target);
+        }
+        return first_outline_child_style(&arm.children, expressions, context, target);
+    }
+    LoweredOutlineStyle::default()
+}
+
+fn first_outline_child_style(
+    children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    target: OutlineTarget,
+) -> LoweredOutlineStyle {
+    for child in children {
+        if let Some(expr_id) = child.expr {
+            let lowered =
+                outline_style_for_expr(expr_id, &child.children, expressions, context, target);
+            if !lowered.is_empty() {
+                return lowered;
+            }
+        }
+    }
+    LoweredOutlineStyle::default()
+}
+
+fn outline_pattern_matches_bool(pattern: &[String], selector: bool) -> bool {
+    match pattern {
+        [single] if single == "__" => true,
+        [single] if single == "True" => selector,
+        [single] if single == "False" => !selector,
+        _ => false,
+    }
+}
+
+fn document_eval_expr_bool(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<bool> {
+    match document_eval_expr_value(expressions.get(expr_id)?, expressions, context)? {
+        Value::Bool(value) => Some(value),
+        Value::String(value) if value == "True" => Some(true),
+        Value::String(value) if value == "False" => Some(false),
+        _ => None,
+    }
+}
+
+fn outline_color_for_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
+    record_fields_for_expr(expr_id, expressions).and_then(|fields| {
+        fields
+            .iter()
+            .find(|field| field.name == "color")
+            .and_then(|field| document_style_value_for_expr(field.value, expressions, context))
+    })
+}
+
+fn lower_shadow_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for (index, child) in statement.children.iter().enumerate() {
+        lower_shadow_item(index + 1, child.expr, expressions, context, node);
+    }
+}
+
+fn lower_shadow_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(fields) = record_fields_for_expr(field.value, expressions) {
+        for (index, item) in fields.iter().enumerate() {
+            lower_shadow_item(index + 1, Some(item.value), expressions, context, node);
+        }
+    }
+}
+
+fn lower_shadow_item(
+    index: usize,
+    expr_id: Option<usize>,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(expr_id) = expr_id else {
+        return;
+    };
+    let Some(fields) = record_fields_for_expr(expr_id, expressions) else {
+        return;
+    };
+    for field in fields {
+        let key = match field.name.as_str() {
+            "x" | "y" | "blur" | "spread" => format!("box_shadow_{index}_{}", field.name),
+            "color" => format!("box_shadow_{index}_color"),
+            "direction" => {
+                if document_expr_value_by_id(field.value, expressions).as_deref() == Some("Inwards")
+                {
+                    format!("box_shadow_{index}_inset")
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let value = if field.name == "direction" {
+            boon_document_model::StyleValue::Bool(true)
+        } else if let Some(value) = document_style_value_for_expr(field.value, expressions, context)
+        {
+            value
+        } else {
+            continue;
+        };
+        node.style.insert(key, value);
+    }
+}
+
+fn lower_borders_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr {
+        lower_borders_style_expr(expr_id, expressions, context, node);
+    }
+}
+
+fn lower_borders_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    lower_borders_style_expr(field.value, expressions, context, node);
+}
+
+fn lower_borders_style_expr(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(fields) = record_fields_for_expr(expr_id, expressions) else {
+        return;
+    };
+    for side in fields {
+        if !matches!(side.name.as_str(), "top" | "right" | "bottom" | "left") {
+            continue;
+        }
+        let Some(side_fields) = record_fields_for_expr(side.value, expressions) else {
+            continue;
+        };
+        for field in side_fields {
+            match field.name.as_str() {
+                "color" => {
+                    if let Some(value) =
+                        document_style_value_for_expr(field.value, expressions, context)
+                    {
+                        node.style.insert(format!("border_{}", side.name), value);
+                    }
+                }
+                "width" => {
+                    if let Some(value) =
+                        document_style_value_for_expr(field.value, expressions, context)
+                    {
+                        node.style
+                            .insert(format!("border_{}_width", side.name), value);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -12617,6 +13569,13 @@ fn lower_canonical_style_record(
                                 other => other,
                             };
                             node.style.insert(style_key.to_owned(), value);
+                        } else if font_field.name == "line" {
+                            lower_font_line_style_fields(
+                                font_field.value,
+                                expressions,
+                                context,
+                                node,
+                            );
                         }
                     }
                 }
@@ -12637,20 +13596,44 @@ fn lower_canonical_style_record(
                 }
             }
             "padding" => lower_spacing_style_field(field, "padding", expressions, context, node),
-            "outline" | "border" | "borders" | "selected_border" => {
+            "shadows" => lower_shadow_style_field(field, expressions, context, node),
+            "rounded_corners" => {
+                if let Some(value) =
+                    document_style_value_for_expr(field.value, expressions, context)
+                {
+                    node.style.insert("border_radius".to_owned(), value);
+                }
+            }
+            "transform" => {
+                if let Some(transform_fields) = record_fields_for_expr(field.value, expressions) {
+                    for transform_field in transform_fields {
+                        if transform_field.name == "rotate"
+                            && let Some(value) = document_style_value_for_expr(
+                                transform_field.value,
+                                expressions,
+                                context,
+                            )
+                        {
+                            node.style.insert("rotate".to_owned(), value);
+                        }
+                    }
+                }
+            }
+            "outline" | "border" => {
+                if field.name == "outline"
+                    && lower_outline_style_expr(field.value, &[], expressions, context, node)
+                {
+                    continue;
+                }
                 if let Some(value) =
                     record_field_nested_style_value(field, "color", expressions, context).or_else(
                         || document_style_value_for_expr(field.value, expressions, context),
                     )
                 {
-                    let style_key = if field.name == "selected_border" {
-                        "selected_border"
-                    } else {
-                        "border"
-                    };
-                    node.style.insert(style_key.to_owned(), value);
+                    node.style.insert("border".to_owned(), value);
                 }
             }
+            "borders" => lower_borders_style_field(field, expressions, context, node),
             _ => {
                 if let Some(value) =
                     document_style_value_for_expr(field.value, expressions, context)
@@ -12769,7 +13752,9 @@ fn lower_canonical_element_text(
                 }
             }
             "placeholder" => {
-                if let Some(text) = document_text_or_nested_text(child, expressions, context) {
+                if let Some(text) = document_text_or_nested_text(child, expressions, context)
+                    .filter(|text| !text.is_empty())
+                {
                     node.style.insert(
                         "placeholder".to_owned(),
                         boon_document_model::StyleValue::Text(text),
@@ -12790,18 +13775,48 @@ fn lower_canonical_element_text(
     }
 }
 
+fn lower_canonical_link_metadata(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(url) =
+        document_child_text_value(statement, "to", expressions, context).filter(|url| {
+            let trimmed = url.trim();
+            trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("mailto:")
+        })
+    else {
+        return;
+    };
+    node.style.insert(
+        "link_url".to_owned(),
+        boon_document_model::StyleValue::Text(url),
+    );
+    node.style
+        .entry("cursor".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Text("pointer".to_owned()));
+    node.style
+        .entry("__hover_scope".to_owned())
+        .or_insert(boon_document_model::StyleValue::Bool(true));
+}
+
 fn document_text_or_nested_text(
     statement: &AstStatement,
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<String> {
     document_text_value(statement, expressions, context, false)
+        .filter(|text| !text.is_empty())
         .or_else(|| {
             statement
                 .children
                 .iter()
                 .find(|child| document_field_name(child).as_deref() == Some("text"))
                 .and_then(|child| document_text_value(child, expressions, context, false))
+                .filter(|text| !text.is_empty())
         })
         .or_else(|| {
             record_fields_for_statement(statement, expressions).and_then(|fields| {
@@ -12813,6 +13828,7 @@ fn document_text_or_nested_text(
                             document_text_value_for_expr(expr, expressions, context)
                         })
                     })
+                    .filter(|text| !text.is_empty())
             })
         })
 }
@@ -12854,6 +13870,7 @@ fn lower_canonical_element_sources(
     statement: &AstStatement,
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     node_id: &boon_document_model::DocumentNodeId,
     node: &mut boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
@@ -12866,27 +13883,59 @@ fn lower_canonical_element_sources(
                         fields,
                         expressions,
                         context,
+                        typecheck_report,
                         node_id,
                         node,
                         source_intents,
                     );
                 }
                 for event in &child.children {
-                    if document_field_name(event).as_deref() == Some("event") {
-                        for source in &event.children {
-                            if let (Some(intent), Some(source_path)) = (
-                                document_field_name(source),
-                                document_source_value(source, expressions, context),
-                            ) {
-                                push_canonical_source_intent(
-                                    node_id,
-                                    node,
-                                    source_intents,
-                                    &intent,
-                                    &source_path,
-                                );
+                    match document_field_name(event).as_deref() {
+                        Some("hovered") => {
+                            node.style.insert(
+                                "__hover_scope".to_owned(),
+                                boon_document_model::StyleValue::Bool(true),
+                            );
+                        }
+                        Some("event") => {
+                            for source in &event.children {
+                                if let (Some(intent), Some(source_path)) = (
+                                    document_field_name(source),
+                                    document_source_value(source, expressions, context),
+                                ) {
+                                    push_canonical_source_intent(
+                                        node_id,
+                                        node,
+                                        source_intents,
+                                        &intent,
+                                        &source_path,
+                                    );
+                                }
                             }
                         }
+                        Some("events") => {
+                            if let Some(group_path) = event
+                                .expr
+                                .and_then(|expr_id| expressions.get(expr_id))
+                                .and_then(|expr| document_source_group_prefix(expr, expressions))
+                            {
+                                for source_path in
+                                    source_paths_for_event_group(typecheck_report, &group_path)
+                                {
+                                    let Some(intent) = source_path.rsplit('.').next() else {
+                                        continue;
+                                    };
+                                    push_canonical_source_intent(
+                                        node_id,
+                                        node,
+                                        source_intents,
+                                        intent,
+                                        &source_path,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -12913,12 +13962,18 @@ fn lower_canonical_element_source_record(
     fields: &[AstRecordField],
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     node_id: &boon_document_model::DocumentNodeId,
     node: &mut boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
 ) {
     for field in fields {
-        if field.name == "event" {
+        if field.name == "hovered" {
+            node.style.insert(
+                "__hover_scope".to_owned(),
+                boon_document_model::StyleValue::Bool(true),
+            );
+        } else if field.name == "event" {
             if let Some(event_fields) = record_fields_for_expr(field.value, expressions) {
                 for source_field in event_fields {
                     if let Some(source_path) =
@@ -12934,8 +13989,51 @@ fn lower_canonical_element_source_record(
                     }
                 }
             }
+        } else if field.name == "events"
+            && let Some(group_path) = expressions
+                .get(field.value)
+                .and_then(|expr| document_source_group_prefix(expr, expressions))
+        {
+            for source_path in source_paths_for_event_group(typecheck_report, &group_path) {
+                let Some(intent) = source_path.rsplit('.').next() else {
+                    continue;
+                };
+                push_canonical_source_intent(node_id, node, source_intents, intent, &source_path);
+            }
         }
     }
+}
+
+fn document_source_group_prefix(expr: &AstExpr, expressions: &[AstExpr]) -> Option<String> {
+    let raw = document_expr_value(expr, expressions)?;
+    let mut parts = raw
+        .split('.')
+        .filter(|part| *part != "PASSED" && *part != "events")
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.last() == Some(&"events") {
+        parts.pop();
+    }
+    Some(parts.join("."))
+}
+
+fn source_paths_for_event_group(
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    group_path: &str,
+) -> Vec<String> {
+    let prefix = format!("{group_path}.");
+    typecheck_report
+        .source_payload_shape_table
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .source_path
+                .starts_with(&prefix)
+                .then(|| entry.source_path.clone())
+        })
+        .collect()
 }
 
 fn document_source_value(
@@ -12952,9 +14050,21 @@ fn document_source_value_for_expr(
     context: &DocumentEvalContext<'_>,
 ) -> Option<String> {
     let expr = expressions.get(expr_id)?;
-    document_eval_expr_value(expr, expressions, context)
-        .map(|value| json_value_to_document_text(&value))
-        .or_else(|| document_expr_value(expr, expressions))
+    let value = if matches!(expr.kind, AstExprKind::Identifier(_) | AstExprKind::Path(_)) {
+        document_expr_value(expr, expressions)
+    } else {
+        document_eval_expr_value(expr, expressions, context)
+            .map(|value| json_value_to_document_text(&value))
+            .or_else(|| document_expr_value(expr, expressions))
+    }?;
+    Some(normalized_document_source_path(&value))
+}
+
+fn normalized_document_source_path(path: &str) -> String {
+    path.split('.')
+        .filter(|part| *part != "PASSED" && *part != "events")
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn push_canonical_source_intent(
@@ -13157,6 +14267,7 @@ fn lower_document_element(
 struct DocumentEvalContext<'a> {
     root: Option<&'a Value>,
     locals: BTreeMap<String, Value>,
+    passed: Option<Value>,
 }
 
 fn lower_document_for_each(
@@ -13181,6 +14292,7 @@ fn lower_document_for_each(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            passed: context.passed.clone(),
         };
         scoped.locals.insert(item_name.clone(), item.clone());
         let child_scope = if scope_key.is_empty() {
@@ -13268,6 +14380,19 @@ fn document_child_value(
         .iter()
         .find(|child| document_field_name(child).as_deref() == Some(field))
         .and_then(|child| document_statement_value(child, expressions))
+}
+
+fn document_child_text_value(
+    statement: &AstStatement,
+    field: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some(field))
+        .and_then(|child| document_text_value(child, expressions, context, false))
 }
 
 fn document_child_bool(
@@ -13409,7 +14534,15 @@ fn document_style_value(
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<boon_document_model::StyleValue> {
-    let expr = expressions.get(statement.expr?)?;
+    let (expr_id, expr_children) = document_direct_style_expr(statement, expressions)?;
+    let expr = expressions.get(expr_id)?;
+    if let AstExprKind::Pipe { input, op, .. } = &expr.kind
+        && op == "WHILE"
+        && let Some(resolved) =
+            document_eval_while_expr_value(*input, expr_children, expressions, context)
+    {
+        return Some(document_style_value_from_json(resolved));
+    }
     match &expr.kind {
         AstExprKind::Number(value) => value
             .parse::<f64>()
@@ -13424,19 +14557,95 @@ fn document_style_value(
         }
         _ => {
             if let Some(resolved) = document_eval_expr_value(expr, expressions, context) {
-                return Some(match resolved {
-                    Value::Bool(value) => boon_document_model::StyleValue::Bool(value),
-                    Value::Number(value) => {
-                        boon_document_model::StyleValue::Number(value.as_f64().unwrap_or_default())
-                    }
-                    _ => boon_document_model::StyleValue::Text(json_value_to_document_text(
-                        &resolved,
-                    )),
-                });
+                return Some(document_style_value_from_json(resolved));
             }
             let value = document_expr_value(expr, expressions)?;
             Some(boon_document_model::StyleValue::Text(value))
         }
+    }
+}
+
+fn document_direct_style_expr<'a>(
+    statement: &'a AstStatement,
+    expressions: &[AstExpr],
+) -> Option<(usize, &'a [AstStatement])> {
+    if let Some(expr_id) = statement.expr {
+        return Some((expr_id, statement.children.as_slice()));
+    }
+    statement.children.iter().find_map(|child| {
+        if !matches!(
+            child.kind,
+            AstStatementKind::Expression
+                | AstStatementKind::Hold { .. }
+                | AstStatementKind::List { field: None, .. }
+        ) {
+            return None;
+        }
+        let expr_id = child
+            .expr
+            .or_else(|| document_first_child_expr_id(child, expressions))?;
+        Some((expr_id, child.children.as_slice()))
+    })
+}
+
+fn document_first_child_expr_id(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    let _ = expressions;
+    statement.children.iter().find_map(|child| {
+        child
+            .expr
+            .or_else(|| document_first_child_expr_id(child, expressions))
+    })
+}
+
+fn document_style_value_from_json(value: Value) -> boon_document_model::StyleValue {
+    match value {
+        Value::Bool(value) => boon_document_model::StyleValue::Bool(value),
+        Value::Number(value) => {
+            boon_document_model::StyleValue::Number(value.as_f64().unwrap_or_default())
+        }
+        _ => boon_document_model::StyleValue::Text(json_value_to_document_text(&value)),
+    }
+}
+
+fn document_eval_while_expr_value(
+    input_expr_id: usize,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let selector = document_eval_expr_value(expressions.get(input_expr_id)?, expressions, context)?;
+    for arm in arms {
+        let expr = expressions.get(arm.expr?)?;
+        let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
+            continue;
+        };
+        if !document_match_pattern_matches_value(pattern, &selector) {
+            continue;
+        }
+        let output = output.and_then(|expr_id| expressions.get(expr_id))?;
+        return document_eval_expr_value(output, expressions, context)
+            .or_else(|| document_expr_value(output, expressions).map(Value::String));
+    }
+    None
+}
+
+fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bool {
+    match pattern {
+        [single] if single == "__" => true,
+        [single] if single == "True" => matches!(value, Value::Bool(true)),
+        [single] if single == "False" => matches!(value, Value::Bool(false)),
+        [single] => match value {
+            Value::String(value) => value == single,
+            Value::Number(value) => single
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|expected| value.as_f64() == Some(expected)),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -13460,6 +14669,22 @@ fn document_eval_expr_value(
         }
         AstExprKind::Number(value) => value.parse::<f64>().ok().map(|value| json!(value)),
         AstExprKind::Bool(value) => Some(Value::Bool(*value)),
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+            let mut object = serde_json::Map::new();
+            for field in fields {
+                let value = expressions
+                    .get(field.value)
+                    .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                    .or_else(|| {
+                        expressions.get(field.value).and_then(|expr| {
+                            document_expr_value(expr, expressions).map(Value::String)
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+                object.insert(field.name.clone(), value);
+            }
+            Some(Value::Object(object))
+        }
         AstExprKind::TaggedObject { tag, fields } => Some(Value::String(
             tagged_document_object_value(tag, fields, expressions),
         )),
@@ -13563,12 +14788,16 @@ fn document_resolved_value<'a>(
     }
     let mut parts = path.split('.');
     let first = parts.next()?;
-    let mut current = context.locals.get(first).or_else(|| {
-        context
-            .root
-            .and_then(|root| root.as_object())
-            .and_then(|object| object.get(first))
-    })?;
+    let mut current = if first == "PASSED" {
+        context.passed.as_ref()?
+    } else {
+        context.locals.get(first).or_else(|| {
+            context
+                .root
+                .and_then(|root| root.as_object())
+                .and_then(|object| object.get(first))
+        })?
+    };
     for part in parts {
         current = current.as_object()?.get(part)?;
     }
@@ -13590,6 +14819,7 @@ fn json_value_to_document_text(value: &Value) -> String {
 struct PreviewNativeInputState {
     last_mouse_button_event_count: u64,
     last_mouse_motion_event_count: u64,
+    last_hover_window_position: Option<(u64, u64, u64, u64)>,
     last_keyboard_event_sequence: u64,
     last_click_node: Option<String>,
     last_click_sequence: u64,
@@ -13640,12 +14870,27 @@ fn preview_input_has_unhandled_source_events(
         return false;
     }
     input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
+        || preview_mouse_position_key(input.mouse_window_pos)
+            != input_state.last_hover_window_position
         || !unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
             .is_empty()
         || input
             .keyboard_events
             .iter()
             .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
+}
+
+fn preview_mouse_position_key(
+    position: Option<boon_native_app_window::NativeMouseWindowPosition>,
+) -> Option<(u64, u64, u64, u64)> {
+    position.map(|position| {
+        (
+            position.x.to_bits(),
+            position.y.to_bits(),
+            position.window_width.to_bits(),
+            position.window_height.to_bits(),
+        )
+    })
 }
 
 fn deterministic_click_input(
@@ -13975,6 +15220,48 @@ fn preview_prepare_text_edit(input_state: &mut PreviewNativeInputState) {
     }
 }
 
+fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) {
+    input_state.focused_node = None;
+    input_state.focused_address = None;
+    input_state.focused_target_text = None;
+    input_state.focused_text.clear();
+    input_state.focused_caret_index = 0;
+    input_state.replace_focused_text_on_next_edit = false;
+    input_state.caret_blink_started_at = None;
+}
+
+fn preview_should_retain_focus_after_enter(
+    layout_proof: &Value,
+    focused_node: &str,
+    input_state: &PreviewNativeInputState,
+) -> bool {
+    input_state.focused_address.is_none()
+        && input_state.focused_target_text.is_none()
+        && document_hit_region_for_node(layout_proof, focused_node).is_some()
+        && live_source_for_node_intent(layout_proof, focused_node, "change").is_some()
+        && live_source_for_node_intent(layout_proof, focused_node, "focus").is_some()
+        && live_source_for_node_intent(layout_proof, focused_node, "blur").is_some()
+}
+
+fn preview_refresh_retained_focus_after_enter(
+    layout_proof: &Value,
+    focused_node: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    input_state: &mut PreviewNativeInputState,
+) {
+    input_state.focused_node = Some(focused_node.to_owned());
+    input_state.focused_address = focused_address(layout_proof, focused_node);
+    input_state.focused_target_text = focused_target_text(layout_proof, focused_node);
+    input_state.focused_text =
+        preview_focused_text_for_node(layout_proof, focused_node, live_runtime)
+            .or_else(|| document_value_for_node(layout_proof, focused_node))
+            .unwrap_or_default();
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit =
+        preview_text_input_should_replace_on_type(layout_proof, focused_node);
+    preview_reset_caret_blink(input_state);
+}
+
 fn preview_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
@@ -14020,19 +15307,21 @@ fn preview_apply_real_window_input(
         input_state.last_mouse_button_event_count = input_state
             .last_mouse_button_event_count
             .max(mouse_release.sequence);
-        if let Some(position) = input.mouse_window_pos
-            && let Some(hit_region) = document_hit_region_at(
-                latest_layout.as_ref().unwrap_or(&layout_proof),
-                position.x,
-                position.y,
-            )
-        {
-            let node = hit_region
-                .get("node")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+        let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+        let hit_region = input.mouse_window_pos.and_then(|position| {
+            document_hit_region_at(layout, position.x, position.y).map(|hit_region| {
+                (
+                    position,
+                    hit_region
+                        .get("node")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    hit_region,
+                )
+            })
+        });
+        if let Some((position, node, hit_region)) = hit_region {
             if live_source_for_node_intent(layout, &node, "change").is_some() {
                 let was_already_focused =
                     input_state.focused_node.as_deref() == Some(node.as_str());
@@ -14065,6 +15354,24 @@ fn preview_apply_real_window_input(
                 input_state.replace_focused_text_on_next_edit =
                     preview_text_input_should_replace_on_type(layout, &node);
                 preview_reset_caret_blink(input_state);
+                if !was_already_focused
+                    && let Some(source) = live_source_for_node_intent(layout, &node, "focus")
+                {
+                    pending_mouse_events.push(boon_runtime::LiveSourceEvent {
+                        source,
+                        text: None,
+                        key: None,
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, &node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, &node)),
+                        target_occurrence: None,
+                    });
+                }
                 if let Some(mut event) =
                     live_source_event_for_hit_region(layout, &hit_region, double_click)
                 {
@@ -14088,19 +15395,28 @@ fn preview_apply_real_window_input(
                 if let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime) {
                     pending_mouse_events.push(blur);
                 }
-                input_state.focused_node = None;
-                input_state.focused_address = None;
-                input_state.focused_target_text = None;
-                input_state.focused_text.clear();
-                input_state.focused_caret_index = 0;
-                input_state.replace_focused_text_on_next_edit = false;
-                input_state.caret_blink_started_at = None;
+                preview_clear_focused_input_state(input_state);
+                if let Some(url) = document_link_url_for_hit_region(layout, &hit_region) {
+                    open_document_link_url(&url)?;
+                    preview_record_noop_input(shared_render_state, 1)?;
+                    input_state.last_click_node = Some(node);
+                    input_state.last_click_sequence = mouse_release.sequence;
+                    continue;
+                }
                 if let Some(event) = live_source_event_for_hit_region(layout, &hit_region, false) {
                     pending_mouse_events.push(event);
                 }
                 input_state.last_click_node = Some(node);
                 input_state.last_click_sequence = mouse_release.sequence;
             }
+        } else {
+            let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+            if let Some(blur) = preview_focused_blur_event(layout, input_state, live_runtime) {
+                pending_mouse_events.push(blur);
+            }
+            preview_clear_focused_input_state(input_state);
+            input_state.last_click_node = None;
+            input_state.last_click_sequence = mouse_release.sequence;
         }
     }
     if !pending_mouse_events.is_empty() && defer_focusable_mouse_events {
@@ -14172,13 +15488,19 @@ fn preview_apply_real_window_input(
                         shared_render_state,
                         submit,
                     )?);
-                    input_state.focused_node = None;
-                    input_state.focused_address = None;
-                    input_state.focused_target_text = None;
-                    input_state.focused_text.clear();
-                    input_state.focused_caret_index = 0;
-                    input_state.replace_focused_text_on_next_edit = false;
-                    input_state.caret_blink_started_at = None;
+                    if latest_layout.as_ref().is_some_and(|layout| {
+                        preview_should_retain_focus_after_enter(layout, &focused_node, input_state)
+                    }) {
+                        let layout = latest_layout.as_ref().expect("checked above");
+                        preview_refresh_retained_focus_after_enter(
+                            layout,
+                            &focused_node,
+                            live_runtime,
+                            input_state,
+                        );
+                    } else {
+                        preview_clear_focused_input_state(input_state);
+                    }
                 }
             }
             "Escape" => {
@@ -14206,13 +15528,7 @@ fn preview_apply_real_window_input(
                         shared_render_state,
                         escape,
                     )?);
-                    input_state.focused_node = None;
-                    input_state.focused_address = None;
-                    input_state.focused_target_text = None;
-                    input_state.focused_text.clear();
-                    input_state.focused_caret_index = 0;
-                    input_state.replace_focused_text_on_next_edit = false;
-                    input_state.caret_blink_started_at = None;
+                    preview_clear_focused_input_state(input_state);
                 }
             }
             "Left" | "ArrowLeft" | "LeftArrow" => {
@@ -14333,6 +15649,11 @@ fn preview_apply_focus_overlay(
             item.focused = next_focused;
             changed = true;
         }
+        changed |= set_display_style_value(
+            &mut item.style,
+            "__focused",
+            boon_document_model::StyleValue::Bool(next_focused),
+        );
         if item.style.remove("caret_column").is_some() {
             changed = true;
         }
@@ -14380,12 +15701,19 @@ fn preview_update_hover_from_input(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if input.synthetic_input_probe
-        || input.mouse_motion_event_count <= input_state.last_mouse_motion_event_count
-    {
+    if input.synthetic_input_probe {
         return Ok(false);
     }
-    input_state.last_mouse_motion_event_count = input.mouse_motion_event_count;
+    let next_position_key = preview_mouse_position_key(input.mouse_window_pos);
+    let position_changed = next_position_key != input_state.last_hover_window_position;
+    let motion_changed = input.mouse_motion_event_count > input_state.last_mouse_motion_event_count;
+    if !position_changed && !motion_changed {
+        return Ok(false);
+    }
+    input_state.last_mouse_motion_event_count = input_state
+        .last_mouse_motion_event_count
+        .max(input.mouse_motion_event_count);
+    input_state.last_hover_window_position = next_position_key;
     let next = input
         .mouse_window_pos
         .and_then(|position| document_hit_region_at(layout_proof, position.x, position.y))
@@ -14421,39 +15749,45 @@ fn preview_apply_hover_overlay(
     let Some(frame) = shared.layout_frame_override.as_mut() else {
         return Ok(false);
     };
+    let hovered_scope = input_state.hovered_node.as_deref().and_then(|hovered| {
+        layout_proof
+            .pointer("/display_item_samples")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|sample| {
+                    (sample.get("node").and_then(serde_json::Value::as_str) == Some(hovered))
+                        .then(|| {
+                            sample
+                                .pointer("/style/__scope_key")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .flatten()
+                })
+            })
+    });
     let mut changed = false;
     for item in &mut frame.display_list {
-        if item.style.get("hover_visible") != Some(&boon_document_model::StyleValue::Bool(true)) {
-            changed |= remove_display_style_key(&mut item.style, "__hover_paint");
-            continue;
-        }
         let item_target = focused_target_text(&layout_proof, &item.node.0);
         let item_scope = display_style_text(&item.style, "__scope_key");
-        let hovered_scope = input_state.hovered_node.as_deref().and_then(|hovered| {
-            layout_proof
-                .pointer("/display_item_samples")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|items| {
-                    items.iter().find_map(|sample| {
-                        (sample.get("node").and_then(serde_json::Value::as_str) == Some(hovered))
-                            .then(|| {
-                                sample
-                                    .pointer("/style/__scope_key")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_owned)
-                            })
-                            .flatten()
-                    })
-                })
-        });
-        let active = input_state.hovered_node.as_deref() == Some(item.node.0.as_str())
+        let direct_hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
+        let reveal_active = direct_hover
             || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
             || (item_target.is_some()
                 && item_target.as_deref() == input_state.hovered_target_text.as_deref());
         changed |= set_display_style_value(
             &mut item.style,
+            "__hover",
+            boon_document_model::StyleValue::Bool(direct_hover),
+        );
+        if item.style.get("__hover_visible") != Some(&boon_document_model::StyleValue::Bool(true)) {
+            changed |= remove_display_style_key(&mut item.style, "__hover_paint");
+            continue;
+        }
+        changed |= set_display_style_value(
+            &mut item.style,
             "__hover_paint",
-            boon_document_model::StyleValue::Bool(active),
+            boon_document_model::StyleValue::Bool(reveal_active),
         );
     }
     if changed {
@@ -14474,6 +15808,90 @@ fn display_style_text<'a>(
             None
         }
     }
+}
+
+fn preview_cursor_icon(
+    layout_proof: &Value,
+    input_state: &PreviewNativeInputState,
+) -> boon_native_app_window::NativeCursorIcon {
+    let Some(node) = input_state.hovered_node.as_deref() else {
+        return boon_native_app_window::NativeCursorIcon::Default;
+    };
+    if document_node_wants_text_cursor(layout_proof, node) {
+        boon_native_app_window::NativeCursorIcon::Text
+    } else if document_node_wants_pointer_cursor(layout_proof, node) {
+        boon_native_app_window::NativeCursorIcon::Pointer
+    } else {
+        boon_native_app_window::NativeCursorIcon::Default
+    }
+}
+
+fn document_node_wants_text_cursor(layout_proof: &Value, node: &str) -> bool {
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                && document_item_is_text_input(item)
+                && !document_item_style_bool(item, "disabled")
+        })
+}
+
+fn document_item_is_text_input(item: &Value) -> bool {
+    item.get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("text_input") || kind == "TextInput")
+}
+
+fn document_item_style_bool(item: &Value, key: &str) -> bool {
+    item.get("style")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|style| style.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn document_node_wants_pointer_cursor(layout_proof: &Value, node: &str) -> bool {
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                && (item
+                    .pointer("/style/cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|cursor| cursor.eq_ignore_ascii_case("pointer"))
+                    || item
+                        .pointer("/style/link_url")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|url| {
+                            url.starts_with("http://")
+                                || url.starts_with("https://")
+                                || url.starts_with("mailto:")
+                        })
+                    || item
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("button")))
+        })
+        || layout_proof
+            .get("source_intent_assertions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|intent| {
+                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                    && matches!(
+                        intent.get("intent").and_then(serde_json::Value::as_str),
+                        Some("press" | "click" | "double_click")
+                    )
+            })
 }
 
 fn preview_resolved_focused_node(
@@ -15064,6 +16482,83 @@ fn document_hit_region_at(layout_proof: &Value, x: f64, y: f64) -> Option<Value>
             left_area.total_cmp(&right_area)
         })
         .cloned()
+}
+
+fn document_hit_region_for_node(layout_proof: &Value, node: &str) -> Option<Value> {
+    layout_proof
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|region| region.get("node").and_then(serde_json::Value::as_str) == Some(node))
+        .cloned()
+}
+
+fn document_link_url_for_hit_region(layout_proof: &Value, hit_region: &Value) -> Option<String> {
+    let node = hit_region.get("node")?.as_str()?;
+    document_link_url_for_node(layout_proof, node)
+}
+
+fn document_link_url_for_node(layout_proof: &Value, node: &str) -> Option<String> {
+    layout_proof
+        .get("display_item_samples")
+        .or_else(|| layout_proof.get("display_list"))
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|item| {
+            (item.get("node").and_then(serde_json::Value::as_str) == Some(node))
+                .then(|| {
+                    item.pointer("/style/link_url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|url| {
+                            url.starts_with("http://")
+                                || url.starts_with("https://")
+                                || url.starts_with("mailto:")
+                        })
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+}
+
+fn open_document_link_url(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = url.trim();
+    if url.is_empty()
+        || !(url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("mailto:"))
+    {
+        return Ok(());
+    }
+    if std::env::var_os("BOON_NATIVE_DISABLE_LINK_OPEN").is_some() {
+        return Ok(());
+    }
+    #[cfg(all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    {
+        Ok(())
+    }
+    #[cfg(all(not(test), target_os = "linux"))]
+    {
+        Command::new("xdg-open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        Command::new("open").arg(url).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Ok(())
+    }
 }
 
 fn document_bounds_contains(bounds: &Value, x: f64, y: f64) -> bool {
@@ -18063,6 +19558,37 @@ mod tests {
             .join(relative)
     }
 
+    fn test_type_scalar(label: &str) -> TypeDisplayNode {
+        TypeDisplayNode::Scalar {
+            label: label.to_owned(),
+        }
+    }
+
+    fn test_type_object(fields: Vec<(&str, TypeDisplayNode)>) -> TypeDisplayNode {
+        TypeDisplayNode::Object {
+            fields: fields
+                .into_iter()
+                .map(|(name, ty)| TypeDisplayField {
+                    name: name.to_owned(),
+                    ty,
+                })
+                .collect(),
+            open: false,
+        }
+    }
+
+    fn test_type_list(item: TypeDisplayNode) -> TypeDisplayNode {
+        TypeDisplayNode::List {
+            item: Box::new(item),
+        }
+    }
+
+    fn test_type_union(labels: &[&str]) -> TypeDisplayNode {
+        TypeDisplayNode::Union {
+            variants: labels.iter().map(|label| test_type_scalar(label)).collect(),
+        }
+    }
+
     #[test]
     fn parser_backed_syntax_tokens_classify_comments_and_invalid_reserved_tokens() {
         let model = CodeEditorModel::new(
@@ -18220,7 +19746,7 @@ mod tests {
     #[test]
     fn code_editor_view_attaches_virtual_type_hint_metadata_without_changing_source_spans() {
         let source = include_str!("../../../examples/counter.bn").to_owned();
-        let model = CodeEditorModel::new("examples/counter.bn", &source);
+        let mut model = CodeEditorModel::new("examples/counter.bn", &source);
         assert_eq!(model.type_hint_backend(), "boon_typecheck::TypeHintTable");
         assert!(model.type_hint_count() > 0);
         let call_line = source
@@ -18229,6 +19755,7 @@ mod tests {
             .map(|index| index + 1)
             .expect("counter source should contain a root function call");
         let call_line_source = model.line_text(call_line - 1);
+        model.scroll_line = call_line.saturating_sub(1);
 
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let parent = frame.root.clone();
@@ -18263,6 +19790,12 @@ mod tests {
         };
         let type_hints = serde_json::from_str::<Vec<serde_json::Value>>(type_hints_json)
             .expect("type hints should be valid JSON");
+        assert!(
+            type_hints
+                .iter()
+                .all(|hint| hint.get("display_tree").is_none()),
+            "inline renderer payload should not carry inspector-only display trees"
+        );
         assert!(type_hints.iter().any(|hint| {
             hint["compact_label"]
                 .as_str()
@@ -18440,13 +19973,19 @@ mod tests {
 
     #[test]
     fn type_inspector_merges_values_into_type_tree_with_boon_indices() {
-        let type_label = "[
-    selected_filter: Active | All | Completed
-    todos: LIST<[
-        completed: BOOL
-        title: TEXT
-    ]>
-]";
+        let display_tree = test_type_object(vec![
+            (
+                "selected_filter",
+                test_type_union(&["Active", "All", "Completed"]),
+            ),
+            (
+                "todos",
+                test_type_list(test_type_object(vec![
+                    ("completed", test_type_scalar("BOOL")),
+                    ("title", test_type_scalar("TEXT")),
+                ])),
+            ),
+        ]);
         let value_summary = json!({
             "kind": "object",
             "field_count": 2,
@@ -18482,7 +20021,7 @@ mod tests {
         });
         let content = type_tree_lines_with_inline_values(
             "store",
-            type_label,
+            &display_tree,
             Some(&value_summary),
             &BTreeSet::new(),
             &BTreeMap::new(),
@@ -18502,12 +20041,18 @@ mod tests {
         assert!(text.contains("title: TEXT"));
         assert!(text.contains("TEXT { Read documentation }"));
         assert!(!text.contains("LIST[2]"));
+        for forbidden in ["LIST {", "{:", "[...]"] {
+            assert!(
+                !text.contains(forbidden),
+                "inspector should not show old placeholder notation `{forbidden}`:\n{text}"
+            );
+        }
 
         let mut list_limits = BTreeMap::new();
         list_limits.insert("store.todos".to_owned(), 2);
         let loaded_text = type_tree_lines_with_inline_values(
             "store",
-            type_label,
+            &display_tree,
             Some(&value_summary),
             &BTreeSet::new(),
             &list_limits,
@@ -18522,7 +20067,7 @@ mod tests {
         collapsed.insert("store.todos[1]".to_owned());
         let collapsed_text = type_tree_lines_with_inline_values(
             "store",
-            type_label,
+            &display_tree,
             Some(&value_summary),
             &collapsed,
             &list_limits,
@@ -18535,17 +20080,120 @@ mod tests {
     }
 
     #[test]
+    fn type_inspector_list_without_runtime_sample_shows_item_type_not_placeholder() {
+        let display_tree = test_type_list(test_type_object(vec![
+            ("title", test_type_scalar("TEXT")),
+            ("completed", test_type_scalar("BOOL")),
+        ]));
+
+        let text = type_tree_lines_with_inline_values(
+            "todos",
+            &display_tree,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            160,
+        )
+        .detail_lines
+        .join("\n");
+
+        assert!(text.contains("▾ todos: LIST"));
+        assert!(text.contains("[item]:"));
+        assert!(text.contains("title: TEXT"));
+        assert!(text.contains("completed: BOOL"));
+        assert!(!text.contains("[...]"));
+        assert!(!text.contains("LIST {:"));
+    }
+
+    #[test]
+    fn todo_inspector_names_list_constructor_tokens_from_enclosing_field() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let (mut shell, _input_state, _document, _layout) = test_dev_editor_context(&source);
+        let list_line = source
+            .lines()
+            .enumerate()
+            .find_map(|(index, line)| {
+                (line.trim() == "LIST {"
+                    && source
+                        .lines()
+                        .nth(index.saturating_sub(1))
+                        .is_some_and(|previous| previous.trim() == "todos:"))
+                .then_some(index + 1)
+            })
+            .expect("TodoMVC should declare todos with a multiline LIST constructor");
+        let column = source
+            .lines()
+            .nth(list_line - 1)
+            .and_then(|line| line.find("LIST"))
+            .map(|column| column + 2)
+            .expect("LIST line should contain LIST");
+        let caret = EditorPosition {
+            line: list_line,
+            column,
+        };
+        shell
+            .workspace
+            .selected_buffer
+            .set_selection(caret.clone(), caret);
+
+        let text = shell
+            .type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .detail_lines
+            .join("\n");
+
+        assert!(text.contains("todos: LIST"), "{text}");
+        assert!(text.contains("[item]:"), "{text}");
+        assert!(text.contains("title: TEXT"), "{text}");
+        assert!(text.contains("completed: BOOL"), "{text}");
+        assert!(!text.contains("LIST {:"), "{text}");
+        assert!(!text.contains("[...]"), "{text}");
+    }
+
+    #[test]
+    fn todomvc_type_inspector_has_no_old_placeholder_notation_for_any_hint() {
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let (mut shell, _input_state, _document, _layout) = test_dev_editor_context(&source);
+        let hints = shell.workspace.selected_buffer.type_hints.clone();
+        assert!(!hints.is_empty(), "TodoMVC should expose type hints");
+
+        for hint in hints {
+            let position = shell
+                .workspace
+                .selected_buffer
+                .position_for_offset(hint.start);
+            shell
+                .workspace
+                .selected_buffer
+                .set_selection(position.clone(), position);
+            shell.hovered_editor_position = None;
+            let text = shell
+                .type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+                .detail_lines
+                .join("\n");
+            for forbidden in ["LIST {", "{:", "[...]"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "TodoMVC inspector leaked `{forbidden}` for hint {:?} at line {}:\n{text}",
+                    hint.category,
+                    hint.line
+                );
+            }
+        }
+    }
+
+    #[test]
     fn type_inspector_renders_empty_objects_without_placeholder_rows() {
-        let type_label = ": [
-    press: []
-    change: [
-        text: TEXT
-    ]
-]";
+        let display_tree = test_type_object(vec![
+            ("press", test_type_object(Vec::new())),
+            (
+                "change",
+                test_type_object(vec![("text", test_type_scalar("TEXT"))]),
+            ),
+        ]);
 
         let text = type_tree_lines_with_inline_values(
             "sources",
-            type_label,
+            &display_tree,
             None,
             &BTreeSet::new(),
             &BTreeMap::new(),
@@ -18555,9 +20203,65 @@ mod tests {
         .join("\n");
 
         assert!(text.contains("press: []"));
-        assert!(text.contains("▾ change: ["));
+        assert!(text.contains("change: [text: TEXT]"));
         assert!(!text.contains("-- empty"));
         assert!(!text.contains("sources: [: ["));
+    }
+
+    #[test]
+    fn type_inspector_inlines_tiny_payload_objects_inside_expanded_parent() {
+        let display_tree = test_type_object(vec![
+            (
+                "remove_todo_button",
+                test_type_object(vec![(
+                    "events",
+                    test_type_object(vec![("press", test_type_object(Vec::new()))]),
+                )]),
+            ),
+            (
+                "editing_todo_title_element",
+                test_type_object(vec![(
+                    "events",
+                    test_type_object(vec![
+                        (
+                            "change",
+                            test_type_object(vec![("text", test_type_scalar("TEXT"))]),
+                        ),
+                        (
+                            "key_down",
+                            test_type_object(vec![("key", test_type_scalar("TEXT"))]),
+                        ),
+                        ("blur", test_type_object(Vec::new())),
+                    ]),
+                )]),
+            ),
+            (
+                "todo_title_element",
+                test_type_object(vec![(
+                    "events",
+                    test_type_object(vec![("double_click", test_type_object(Vec::new()))]),
+                )]),
+            ),
+        ]);
+
+        let text = type_tree_lines_with_inline_values(
+            "sources",
+            &display_tree,
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            160,
+        )
+        .detail_lines
+        .join("\n");
+
+        assert!(text.contains("remove_todo_button: [events: [press: []]]"));
+        assert!(text.contains("▾ editing_todo_title_element: ["));
+        assert!(text.contains("▾ events: ["));
+        assert!(text.contains("change: [text: TEXT]"));
+        assert!(text.contains("key_down: [key: TEXT]"));
+        assert!(text.contains("blur: []"));
+        assert!(text.contains("todo_title_element: [events: [double_click: []]]"));
     }
 
     #[test]
@@ -20992,7 +22696,7 @@ mod tests {
         );
         assert_eq!(
             content.detail_lines.first().map(String::as_str),
-            Some("store: [")
+            Some("▾ store: [")
         );
         let inspector_bounds = layout
             .display_list
@@ -21108,8 +22812,89 @@ mod tests {
     fn todomvc_layout_uses_generic_visual_contracts() {
         let source_path = PathBuf::from("examples/todomvc.bn");
         let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let state = json!({
+            "store": {
+                "sources": {
+                    "new_todo_input": {"events": {"change": {}, "key_down": {}, "focus": {}, "blur": {}}},
+                    "toggle_all_checkbox": {"events": {"click": {}}},
+                    "clear_completed_button": {"events": {"press": {}}},
+                    "filter_all": {"events": {"press": {}}},
+                    "filter_active": {"events": {"press": {}}},
+                    "filter_completed": {"events": {"press": {}}}
+                },
+                "new_todo_text": "",
+                "title_to_add": "",
+                "selected_filter": "All",
+                "todos": [
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Read documentation",
+                        "edit_text": "Read documentation",
+                        "completed": false,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": true
+                    },
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Finish TodoMVC renderer",
+                        "edit_text": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": false
+                    }
+                ],
+                "visible_todos": [
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Read documentation",
+                        "edit_text": "Read documentation",
+                        "completed": false,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": true
+                    },
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Finish TodoMVC renderer",
+                        "edit_text": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": false
+                    }
+                ],
+                "active_count": 1,
+                "completed_count": 1,
+                "has_todos": true,
+                "has_completed": true,
+                "all_completed": false,
+                "new_todo_focused": true
+            }
+        });
         let (layout_proof, layout) =
-            native_document_layout_proof_with_state_embedded(&source_path, &source, None)
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
                 .expect("TodoMVC layout should lower");
 
         let title = layout
@@ -21129,18 +22914,483 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
         );
+        let active_todo_title = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Read documentation"))
+            .expect("active TodoMVC title should render");
+        assert_eq!(
+            active_todo_title.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.4017]".to_owned()
+            )),
+            "active todo titles should use the normal dark color"
+        );
+        assert_eq!(
+            active_todo_title.style.get("strikethrough"),
+            Some(&boon_document_model::StyleValue::Bool(false)),
+            "active todo titles should not be struck"
+        );
+        let completed_todo_title = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Finish TodoMVC renderer"))
+            .expect("completed TodoMVC title should render");
+        assert_eq!(
+            completed_todo_title.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.6665]".to_owned()
+            )),
+            "completed todo titles should lower to the gray font color"
+        );
+        assert_eq!(
+            completed_todo_title.style.get("strikethrough"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "completed todo titles should stay struck through"
+        );
         let panel = layout
             .display_list
             .iter()
             .find(|item| {
-                item.style.get("shadow1_color").is_some()
-                    && item.style.get("shadow2_color").is_some()
+                item.style.get("box_shadow_1_color").is_some()
+                    && item.style.get("box_shadow_2_color").is_some()
                     && item.bounds.width >= 540.0
             })
             .expect("TodoMVC panel should carry generic shadow styles");
         assert_eq!(
-            panel.style.get("shadow1_y"),
+            panel.style.get("box_shadow_1_y"),
             Some(&boon_document_model::StyleValue::Number(2.0))
+        );
+        let title_panel_gap = panel.bounds.y - (title.bounds.y + title.bounds.height);
+        assert!(
+            (20.0..=22.0).contains(&title_panel_gap),
+            "TodoMVC title should have a deliberate visual spacer before the white panel: gap={title_panel_gap}, title={:?}, panel={:?}",
+            title.bounds,
+            panel.bounds
+        );
+        let expanded_frame = preview_frame_with_viewport_background(&layout, 1180.0, 820.0);
+        let expanded_background = expanded_frame
+            .display_list
+            .iter()
+            .find(|item| {
+                item.bounds.x.abs() <= f32::EPSILON
+                    && item.bounds.y.abs() <= f32::EPSILON
+                    && item.style.get("background").is_some()
+            })
+            .expect("TodoMVC root background should be available for viewport fill");
+        assert!(
+            expanded_background.bounds.width >= 1180.0
+                && expanded_background.bounds.height >= 820.0,
+            "TodoMVC root background should fill resized preview viewport: {:?}",
+            expanded_background.bounds
+        );
+        assert_eq!(
+            viewport_fill_ratio(&expanded_frame, 1180, 820),
+            1.0,
+            "resized TodoMVC preview should not expose a bottom or right clear-color gutter"
+        );
+        let footer = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                    && item.bounds.width >= 540.0
+                    && item.bounds.height >= 44.0
+                    && item.bounds.height <= 45.0
+                    && item.style.get("border_top").is_some()
+            })
+            .expect("TodoMVC footer should render as the bottom row of the real panel");
+        let footer_padding_top = match footer.style.get("padding_top") {
+            Some(boon_document_model::StyleValue::Number(value)) => *value as f32,
+            _ => 0.0,
+        };
+        let footer_padding_bottom = match footer.style.get("padding_bottom") {
+            Some(boon_document_model::StyleValue::Number(value)) => *value as f32,
+            _ => 0.0,
+        };
+        assert!(
+            footer.bounds.height - footer_padding_top - footer_padding_bottom >= 24.4_f32,
+            "TodoMVC footer content box must be tall enough for 24.4px filter buttons without cutting their bottom outline: footer={:?}",
+            footer.bounds
+        );
+        assert_eq!(
+            footer.style.get("box_shadow_1_y"),
+            Some(&boon_document_model::StyleValue::Number(1.0)),
+            "footer should carry the classic TodoMVC stacked-panel shadow list"
+        );
+        assert_eq!(
+            footer.style.get("box_shadow_2_color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.973]".to_owned()
+            )),
+            "the first stacked sheet should be a light footer shadow, not an explicit element"
+        );
+        assert_eq!(
+            footer.style.get("box_shadow_2_spread"),
+            Some(&boon_document_model::StyleValue::Number(-3.0)),
+            "the first stacked sheet should be inset like the classic TodoMVC shadow"
+        );
+        assert_eq!(
+            footer.style.get("box_shadow_4_y"),
+            Some(&boon_document_model::StyleValue::Number(16.0)),
+            "the second stacked sheet should be expressed as a deeper footer shadow"
+        );
+        assert_eq!(
+            footer.style.get("box_shadow_4_spread"),
+            Some(&boon_document_model::StyleValue::Number(-6.0)),
+            "the second stacked sheet should be narrower than the first"
+        );
+        let stacked_panel_items = layout
+            .display_list
+            .iter()
+            .filter(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Stack)
+                    && item.bounds.height >= 4.0
+                    && item.bounds.height <= 6.0
+                    && matches!(item.bounds.width.round() as i32, 544 | 538)
+                    && item.style.get("border_top").is_some()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stacked_panel_items.is_empty(),
+            "TodoMVC should use public footer shadows instead of explicit under-sheet elements"
+        );
+
+        let new_todo_input = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && item.bounds.width >= 480.0
+                    && item.bounds.y >= 150.0
+                    && item.bounds.y <= 152.0
+            })
+            .expect("new TodoMVC text input should render even while unfocused");
+        assert_eq!(
+            new_todo_input.style.get("placeholder"),
+            Some(&boon_document_model::StyleValue::Text(
+                "What needs to be done?".to_owned()
+            )),
+            "placeholder: [text: ...] must lower to the text input placeholder style"
+        );
+        assert_eq!(
+            new_todo_input.style.get("placeholder_color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.68]".to_owned()
+            )),
+            "TodoMVC placeholder should use the readable reference color, not a near-white value"
+        );
+        assert!(
+            new_todo_input.text.is_none(),
+            "empty input value should keep the text slot empty so the placeholder can render"
+        );
+        assert!(
+            !new_todo_input.focused,
+            "placeholder visibility must not depend on initial focus"
+        );
+        let mut text_input_hover = deterministic_click_input(0, 0.0, 0.0);
+        text_input_hover.mouse_motion_event_count = 0;
+        text_input_hover.mouse_window_pos =
+            Some(boon_native_app_window::NativeMouseWindowPosition {
+                x: f64::from(new_todo_input.bounds.x + new_todo_input.bounds.width * 0.5),
+                y: f64::from(new_todo_input.bounds.y + new_todo_input.bounds.height * 0.5),
+                window_width: 920.0,
+                window_height: 720.0,
+            });
+        let text_input_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut text_input_state = PreviewNativeInputState::default();
+        assert!(
+            preview_update_hover_from_input(
+                &layout_proof,
+                &text_input_hover,
+                &text_input_shared_render_state,
+                &mut text_input_state
+            )
+            .expect("text input hover overlay should update")
+        );
+        assert_eq!(
+            preview_cursor_icon(&layout_proof, &text_input_state),
+            boon_native_app_window::NativeCursorIcon::Text,
+            "hovering an enabled text input should request the native text cursor"
+        );
+        let mut disabled_text_layout_proof = layout_proof.clone();
+        let disabled_text_node = text_input_state
+            .hovered_node
+            .as_deref()
+            .expect("text input hover should resolve a document node")
+            .to_owned();
+        disabled_text_layout_proof["display_item_samples"]
+            .as_array_mut()
+            .expect("layout proof should include display item samples")
+            .iter_mut()
+            .find(|item| {
+                item.get("node").and_then(serde_json::Value::as_str)
+                    == Some(disabled_text_node.as_str())
+            })
+            .expect("hovered text input should have a display sample")["style"]["disabled"] =
+            serde_json::Value::Bool(true);
+        assert_eq!(
+            preview_cursor_icon(&disabled_text_layout_proof, &text_input_state),
+            boon_native_app_window::NativeCursorIcon::Default,
+            "hovering a disabled text input should not request the native text cursor"
+        );
+
+        let toggle_all_button = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("∨")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .expect("TodoMVC toggle-all chevron should render as a button label");
+        assert_eq!(
+            toggle_all_button.style.get("size"),
+            Some(&boon_document_model::StyleValue::Number(30.0)),
+            "toggle-all chevron should use the bolder wedge at a deliberate reference-sized scale"
+        );
+        assert_eq!(
+            toggle_all_button.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.667,chroma:0.0181,hue:201.31]".to_owned()
+            )),
+            "toggle-all chevron should use the darker reference color instead of washed-out gray"
+        );
+        assert_eq!(
+            toggle_all_button.style.get("weight"),
+            Some(&boon_document_model::StyleValue::Text("Bolder".to_owned())),
+            "toggle-all chevron should be intentionally heavier than the surrounding light UI text"
+        );
+        assert_eq!(
+            new_todo_input.style.get("border"),
+            None,
+            "the text input itself must not carry a focus border; TodoMVC focus is drawn on the whole row"
+        );
+        assert_eq!(
+            new_todo_input.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Number(6.0)),
+            "new-todo input should keep the old TodoMVC left text padding"
+        );
+        let author_link = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Martin Kavík"))
+            .expect("TodoMVC author footer link should render");
+        assert!(
+            author_link.bounds.width < 100.0,
+            "only the author name should be the link target, not the full footer line"
+        );
+        assert_eq!(
+            author_link.style.get("link_url"),
+            Some(&boon_document_model::StyleValue::Text(
+                "https://kavik.cz/".to_owned()
+            )),
+            "Element/link should lower its `to` field into clickable URL metadata"
+        );
+        assert_eq!(
+            author_link.style.get("font"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Helvetica Neue, Helvetica, Arial, SansSerif".to_owned()
+            )),
+            "footer links should inherit the TodoMVC footer font family"
+        );
+        assert_eq!(
+            author_link.style.get("size"),
+            Some(&boon_document_model::StyleValue::Number(11.0)),
+            "footer links should inherit the TodoMVC footer font size"
+        );
+        assert_eq!(
+            author_link.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.4202]".to_owned()
+            )),
+            "footer links should inherit the TodoMVC footer color"
+        );
+        assert_eq!(
+            author_link.style.get("line_height"),
+            Some(&boon_document_model::StyleValue::Number(15.0)),
+            "footer links should keep the readable TodoMVC footer line height"
+        );
+        assert_eq!(
+            author_link.style.get("__hover_scope"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "footer links should be app-owned hover targets"
+        );
+        assert_eq!(
+            author_link.style.get("__hover_underline_if"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "footer links should expose underline only while hovered"
+        );
+        assert_eq!(
+            author_link.style.get("cursor"),
+            Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
+            "footer links should request a pointer cursor"
+        );
+        assert_eq!(
+            layout
+                .display_list
+                .iter()
+                .find(|item| item.text.as_deref() == Some("TodoMVC"))
+                .and_then(|item| item.style.get("link_url")),
+            Some(&boon_document_model::StyleValue::Text(
+                "http://todomvc.com".to_owned()
+            )),
+            "TodoMVC reference footer link should keep its target URL"
+        );
+        let reference_link = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("TodoMVC"))
+            .expect("TodoMVC reference footer link should render");
+        assert!(
+            reference_link.bounds.width < 70.0,
+            "only the TodoMVC word should be the reference link target"
+        );
+
+        let selected_filter_outline = boon_document_model::StyleValue::Text(
+            "Oklch[lightness:0.585,chroma:0.172,hue:24.1]".to_owned(),
+        );
+        let hover_filter_outline = boon_document_model::StyleValue::Text(
+            "Oklch[lightness:0.679,chroma:0.126,hue:20.9]".to_owned(),
+        );
+        let filter_button = |label: &str| {
+            layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    item.text.as_deref() == Some(label)
+                        && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                })
+                .unwrap_or_else(|| panic!("TodoMVC filter button `{label}` should render"))
+        };
+        let all_filter = filter_button("All");
+        assert_eq!(
+            all_filter.style.get("border"),
+            Some(&selected_filter_outline),
+            "selected filter should lower its public outline into a drawable border"
+        );
+        assert_eq!(
+            all_filter.style.get("__hover_border"),
+            None,
+            "selected filter border should not be weakened by the hover state"
+        );
+        let active_filter = filter_button("Active");
+        assert_eq!(
+            active_filter.style.get("border"),
+            None,
+            "inactive filter default state should not draw a border"
+        );
+        assert_eq!(
+            active_filter.style.get("cursor"),
+            Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
+            "Element/button should expose cursor: pointer in its lowered style"
+        );
+        assert_eq!(
+            active_filter.style.get("__hover_border"),
+            Some(&hover_filter_outline),
+            "inactive filter hover outline should lower into the renderer hover border"
+        );
+
+        let mut filter_hover = deterministic_click_input(0, 0.0, 0.0);
+        filter_hover.mouse_motion_event_count = 0;
+        filter_hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(active_filter.bounds.x + active_filter.bounds.width * 0.5),
+            y: f64::from(active_filter.bounds.y + active_filter.bounds.height * 0.5),
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        let filter_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut filter_input_state = PreviewNativeInputState::default();
+        assert!(
+            preview_update_hover_from_input(
+                &layout_proof,
+                &filter_hover,
+                &filter_shared_render_state,
+                &mut filter_input_state
+            )
+            .expect("filter hover overlay should update")
+        );
+        let hovered_active_filter = filter_shared_render_state
+            .lock()
+            .expect("render state")
+            .layout_frame_override
+            .as_ref()
+            .expect("hover overlay should install frame override")
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("Active")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .cloned()
+            .expect("hovered Active filter should still render");
+        assert_eq!(
+            hovered_active_filter.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "host hover should mark the filter display item"
+        );
+        assert_eq!(
+            preview_cursor_icon(&layout_proof, &filter_input_state),
+            boon_native_app_window::NativeCursorIcon::Pointer,
+            "hovering a button should request the native pointer cursor"
+        );
+        let mut link_hover = deterministic_click_input(0, 0.0, 0.0);
+        link_hover.mouse_motion_event_count = 0;
+        link_hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(author_link.bounds.x + author_link.bounds.width * 0.5),
+            y: f64::from(author_link.bounds.y + author_link.bounds.height * 0.5),
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        let link_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut link_input_state = PreviewNativeInputState::default();
+        assert!(
+            preview_update_hover_from_input(
+                &layout_proof,
+                &link_hover,
+                &link_shared_render_state,
+                &mut link_input_state
+            )
+            .expect("footer link hover overlay should update")
+        );
+        assert_eq!(
+            preview_cursor_icon(&layout_proof, &link_input_state),
+            boon_native_app_window::NativeCursorIcon::Pointer,
+            "hovering a footer link should request the native pointer cursor"
+        );
+        assert_eq!(
+            document_link_url_for_node(&layout_proof, &author_link.node.0).as_deref(),
+            Some("https://kavik.cz/"),
+            "link URL lookup should find the footer link from its document node"
         );
 
         let delete_buttons = layout
@@ -21153,7 +23403,21 @@ mod tests {
             "delete buttons should remain hit-testable"
         );
         assert!(delete_buttons.iter().all(|item| {
-            item.style.get("hover_visible") == Some(&boon_document_model::StyleValue::Bool(true))
+            item.style.get("__hover_visible") == Some(&boon_document_model::StyleValue::Bool(true))
+        }));
+        assert!(
+            delete_buttons
+                .iter()
+                .all(|item| { item.style.get("color").is_some() })
+        );
+        assert!(delete_buttons.iter().all(|item| {
+            item.style.get("__hover_color")
+                == Some(&boon_document_model::StyleValue::Text(
+                    "Oklch[lightness:0.57,chroma:0.109,hue:18.87]".to_owned(),
+                ))
+        }));
+        assert!(delete_buttons.iter().all(|item| {
+            item.style.get("line_height") == Some(&boon_document_model::StyleValue::Number(40.0))
         }));
         assert!(delete_buttons.iter().all(|item| {
             matches!(
@@ -21174,7 +23438,7 @@ mod tests {
             })
             .expect("first TodoMVC row should render");
         assert_eq!(
-            first_row.style.get("hover_scope"),
+            first_row.style.get("__hover_scope"),
             Some(&boon_document_model::StyleValue::Bool(true))
         );
         assert_eq!(
@@ -21185,6 +23449,7 @@ mod tests {
         );
 
         let mut hover = deterministic_click_input(0, 0.0, 0.0);
+        hover.mouse_motion_event_count = 0;
         hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
             x: f64::from(first_row.bounds.x + first_row.bounds.width - 12.0),
             y: f64::from(first_row.bounds.y + first_row.bounds.height * 0.5),
@@ -21192,7 +23457,7 @@ mod tests {
             window_height: 720.0,
         });
         let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-            layout_proof,
+            layout_proof: layout_proof.clone(),
             layout_frame_override: Some(layout.clone()),
             update_count: 0,
             scroll_x_px: 0.0,
@@ -21210,6 +23475,10 @@ mod tests {
                 .layout_proof
                 .clone()
         };
+        assert!(
+            preview_input_has_unhandled_source_events(&hover, &input_state),
+            "a changed app-owned mouse position must wake hover even without a new motion counter"
+        );
         assert!(
             preview_update_hover_from_input(&proof, &hover, &shared_render_state, &mut input_state)
                 .expect("hover overlay should update")
@@ -21229,6 +23498,285 @@ mod tests {
             })
             .count();
         assert_eq!(hovered_delete_count, 1);
+        let row_revealed_delete = shared
+            .layout_frame_override
+            .as_ref()
+            .expect("hover overlay should install frame override")
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("×")
+                    && item.style.get("__scope_key")
+                        == Some(&boon_document_model::StyleValue::Text("todo-0".to_owned()))
+            })
+            .expect("row hover should reveal the first delete button");
+        assert_eq!(
+            row_revealed_delete.style.get("__hover_paint"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "row hover should paint the scoped delete button"
+        );
+        assert_eq!(
+            row_revealed_delete.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(false)),
+            "row hover must not also apply direct delete-button hover color"
+        );
+        drop(shared);
+
+        let first_delete_button = delete_buttons
+            .iter()
+            .find(|item| {
+                item.style.get("__scope_key")
+                    == Some(&boon_document_model::StyleValue::Text("todo-0".to_owned()))
+            })
+            .expect("first delete button should have a stable TodoMVC scope");
+        let mut delete_hover = deterministic_click_input(0, 0.0, 0.0);
+        delete_hover.mouse_motion_event_count = 0;
+        delete_hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(first_delete_button.bounds.x + first_delete_button.bounds.width * 0.5),
+            y: f64::from(first_delete_button.bounds.y + first_delete_button.bounds.height * 0.5),
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        let delete_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut delete_input_state = PreviewNativeInputState::default();
+        assert!(
+            preview_update_hover_from_input(
+                &layout_proof,
+                &delete_hover,
+                &delete_shared_render_state,
+                &mut delete_input_state
+            )
+            .expect("delete hover overlay should update")
+        );
+        let direct_hover_delete = delete_shared_render_state
+            .lock()
+            .expect("delete render state")
+            .layout_frame_override
+            .as_ref()
+            .expect("delete hover overlay should install frame override")
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("×")
+                    && item.style.get("__scope_key")
+                        == Some(&boon_document_model::StyleValue::Text("todo-0".to_owned()))
+            })
+            .cloned()
+            .expect("directly hovered delete button should still render");
+        assert_eq!(
+            direct_hover_delete.style.get("__hover_paint"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "direct delete hover should keep the button painted"
+        );
+        assert_eq!(
+            direct_hover_delete.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "direct delete hover should apply the stronger X hover color"
+        );
+        assert_eq!(
+            preview_cursor_icon(&layout_proof, &delete_input_state),
+            boon_native_app_window::NativeCursorIcon::Pointer,
+            "hovering the delete button should request the native pointer cursor"
+        );
+    }
+
+    #[test]
+    fn todomvc_empty_state_keeps_only_new_todo_row_inside_white_panel() {
+        let source_path = PathBuf::from("examples/todomvc.bn");
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let state = json!({
+            "store": {
+                "sources": {
+                    "new_todo_input": {"events": {"change": {}, "key_down": {}, "focus": {}, "blur": {}}},
+                    "toggle_all_checkbox": {"events": {"click": {}}},
+                    "clear_completed_button": {"events": {"press": {}}},
+                    "filter_all": {"events": {"press": {}}},
+                    "filter_active": {"events": {"press": {}}},
+                    "filter_completed": {"events": {"press": {}}}
+                },
+                "new_todo_text": "",
+                "title_to_add": "",
+                "selected_filter": "All",
+                "todos": [],
+                "visible_todos": [],
+                "active_count": 0,
+                "completed_count": 0,
+                "has_todos": false,
+                "has_completed": false,
+                "all_completed": false,
+                "new_todo_focused": false
+            }
+        });
+        let (_layout_proof, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("empty TodoMVC layout should lower");
+        let panel = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.style.get("box_shadow_1_color").is_some()
+                    && item.style.get("box_shadow_2_color").is_some()
+                    && item.bounds.width >= 540.0
+            })
+            .expect("empty TodoMVC should still render the white input panel");
+        let new_todo_row = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                    && item.bounds.width >= 540.0
+                    && item.bounds.height >= 64.0
+                    && item.bounds.height <= 66.0
+            })
+            .expect("empty TodoMVC should keep the new-todo row");
+        assert!(
+            (panel.bounds.height - new_todo_row.bounds.height).abs() <= 1.0,
+            "empty TodoMVC panel should collapse to only the new-todo row: panel={:?}, row={:?}",
+            panel.bounds,
+            new_todo_row.bounds
+        );
+        let new_todo_input = layout
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .expect("empty TodoMVC should keep the new-todo input");
+        assert_eq!(
+            new_todo_input.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Number(51.0)),
+            "empty TodoMVC should keep the reference left text gutter even without the toggle-all chevron"
+        );
+        for absent_text in [
+            "∨",
+            "0 items left",
+            "All",
+            "Active",
+            "Completed",
+            "Clear completed",
+        ] {
+            assert!(
+                !layout
+                    .display_list
+                    .iter()
+                    .any(|item| item.text.as_deref() == Some(absent_text)),
+                "empty TodoMVC should not render `{absent_text}` inside the white panel"
+            );
+        }
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)),
+            "empty TodoMVC should not render todo row checkboxes"
+        );
+    }
+
+    #[test]
+    fn todomvc_clicking_empty_preview_space_blurs_focused_edit_input() {
+        let source_path = repo_path("examples/todomvc.bn");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let live_runtime = Arc::new(Mutex::new(
+            boon_runtime::LiveRuntime::from_source("native-todomvc-click-away-blur", &source)
+                .unwrap(),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&state_summary),
+        )
+        .unwrap();
+        let (title_x, title_y, _) = source_hit_center_for_target(
+            &layout_proof,
+            "todo.sources.todo_title_element.double_click",
+            Some("Read documentation"),
+        )
+        .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input(2, title_x, title_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert_eq!(
+            live_runtime.lock().unwrap().document_state_summary()["todos"][0]["editing"],
+            true,
+            "double-click should put the first todo into edit mode"
+        );
+
+        let edit_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (edit_x, edit_y, edit_node) = source_hit_center_for_target(
+            &edit_layout,
+            "todo.sources.editing_todo_title_element.change",
+            Some("Read documentation"),
+        )
+        .unwrap();
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(2, edit_x, edit_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert_eq!(
+            input_state.focused_node.as_deref(),
+            Some(edit_node.as_str())
+        );
+
+        let before_blur_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        assert!(
+            document_hit_region_at(&before_blur_layout, 900.0, 700.0).is_none(),
+            "test fixture should click empty preview background, not another control"
+        );
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(3, 900.0, 700.0),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            summary["todos"][0]["editing"], false,
+            "click-away blur should exit TodoMVC edit mode"
+        );
+        assert_eq!(input_state.focused_node, None);
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_caret_column_for_node(&frame, &edit_node),
+            None,
+            "blurred edit input must not keep a rendered caret"
+        );
     }
 
     #[test]
@@ -21288,6 +23836,28 @@ mod tests {
         assert_eq!(input_state.focused_text, "");
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["new_todo_text"], "");
+        assert_eq!(
+            summary["new_todo_focused"], true,
+            "focusing the new-todo input should update the public focus state"
+        );
+        let focused_frame = latest_preview_frame(&shared_render_state);
+        let focused_new_todo_row = focused_frame
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                    && item.bounds.width >= 540.0
+                    && item.bounds.height >= 64.0
+                    && item.bounds.height <= 66.0
+            })
+            .expect("focused new-todo row should render");
+        assert_eq!(
+            focused_new_todo_row.style.get("border"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.585,chroma:0.172,hue:24.1]".to_owned()
+            )),
+            "input focus should draw the TodoMVC red outline around the entire new-todo row"
+        );
 
         preview_apply_real_window_input(
             &test_keyboard_input(vec![test_key_press(1, "R")], Vec::new()),
@@ -21300,6 +23870,60 @@ mod tests {
         .unwrap();
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["new_todo_text"], "r");
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(2, "Return")], Vec::new()),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            summary["new_todo_text"], "",
+            "submitting a new todo should clear the input value"
+        );
+        assert_eq!(
+            summary["new_todo_focused"], true,
+            "submitting a new todo should not emit blur for the persistent title input"
+        );
+        assert!(
+            summary["todos"]
+                .as_array()
+                .expect("TodoMVC todos should remain a list")
+                .iter()
+                .any(|todo| todo.get("title").and_then(serde_json::Value::as_str) == Some("r")),
+            "Enter should append the typed todo"
+        );
+        assert_eq!(
+            input_state.focused_node.as_deref(),
+            Some(input_node.as_str()),
+            "Enter should keep the new-todo title input focused"
+        );
+        assert_eq!(input_state.focused_text, "");
+        assert_eq!(input_state.focused_caret_index, 0);
+        let submitted_frame = latest_preview_frame(&shared_render_state);
+        let submitted_input = submitted_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == input_node)
+            .expect("new-todo input should remain in the frame after submit");
+        assert!(
+            submitted_input.focused,
+            "new-todo input display item should remain focused after submit"
+        );
+        assert_eq!(
+            frame_text_for_node(&submitted_frame, &input_node).as_deref(),
+            Some(""),
+            "focused empty input should keep an editable empty text overlay"
+        );
+        assert_eq!(
+            frame_caret_column_for_node(&submitted_frame, &input_node),
+            Some(0.0),
+            "caret should return to the start of the cleared input"
+        );
     }
 
     #[test]
@@ -22405,8 +25029,8 @@ mod tests {
             Some(true)
         );
         assert!(
-            style.get("selected_border").is_some(),
-            "selected cell style should carry a selected border color"
+            style.get("border").is_some(),
+            "selected cell style should carry a public outline/border color"
         );
         assert!(
             nodes.values().any(|node| {

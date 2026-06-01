@@ -62,6 +62,22 @@ impl CursorRequest {
             hot_y: CURSOR_SIZE / 2,
         }
     }
+    pub fn pointer() -> Self {
+        CursorRequest {
+            name: "hand2",
+            fallback_names: &["pointer", "hand1", "left_ptr"],
+            hot_x: CURSOR_SIZE / 4,
+            hot_y: CURSOR_SIZE / 8,
+        }
+    }
+    pub fn text() -> Self {
+        CursorRequest {
+            name: "xterm",
+            fallback_names: &["text", "ibeam", "left_ptr"],
+            hot_x: CURSOR_SIZE / 2,
+            hot_y: CURSOR_SIZE / 2,
+        }
+    }
     pub fn bottom_right_corner() -> Self {
         CursorRequest {
             name: "bottom_right_corner",

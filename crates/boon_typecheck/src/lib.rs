@@ -41,6 +41,46 @@ pub struct ObjectShape {
     pub open: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypeDisplayNode {
+    Scalar {
+        label: String,
+    },
+    Object {
+        fields: Vec<TypeDisplayField>,
+        open: bool,
+    },
+    TaggedObject {
+        tag: String,
+        fields: Vec<TypeDisplayField>,
+        open: bool,
+    },
+    List {
+        item: Box<TypeDisplayNode>,
+    },
+    Union {
+        variants: Vec<TypeDisplayNode>,
+    },
+    Function {
+        name: Option<String>,
+        args: Vec<TypeDisplayFunctionArg>,
+        result: Box<TypeDisplayNode>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TypeDisplayField {
+    pub name: String,
+    pub ty: TypeDisplayNode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TypeDisplayFunctionArg {
+    pub name: Option<String>,
+    pub ty: TypeDisplayNode,
+}
+
 impl ObjectShape {
     fn new(fields: BTreeMap<String, Type>, open: bool) -> Self {
         let field_order = fields.keys().cloned().collect();
@@ -233,6 +273,7 @@ pub struct TypeHintEntry {
     pub category: String,
     pub compact_label: String,
     pub detail_label: String,
+    pub display_tree: TypeDisplayNode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -375,8 +416,11 @@ impl<'a> Checker<'a> {
             .collect();
         let object_bindings = object_bindings(program);
         let function_param_requirements = function_param_requirements(program);
-        let name_bindings =
+        let mut name_bindings =
             name_bindings(program, &source_payload_types, &function_param_requirements);
+        if let Some(passed_type) = passed_context_type(program, &name_bindings) {
+            name_bindings.insert("PASSED".to_owned(), passed_type);
+        }
         let flow_bindings = flow_bindings(program);
         let mut checker = Self {
             program,
@@ -1044,6 +1088,9 @@ impl<'a> Checker<'a> {
 
     fn type_for_path(&mut self, expr_id: usize, parts: &[String]) -> Type {
         let path = parts.join(".");
+        if path == "element.hovered" {
+            return true_false_type();
+        }
         if let Some(access) = source_payload_access(&self.source_paths, parts) {
             match access {
                 SourcePayloadAccess::Direct(source_path) => {
@@ -2054,6 +2101,13 @@ impl<'a> Checker<'a> {
     }
 
     fn check_style_field_value(&mut self, field_name: &str, value_expr_id: usize) {
+        if is_deleted_public_style_field(field_name) {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                value_expr_id,
+                format!("style field `{field_name}` is not public Boon API"),
+            ));
+            return;
+        }
         match field_name {
             "width" | "height" | "padding" | "gap" => {
                 let ty = self.ensure_expr(value_expr_id).ty;
@@ -2080,7 +2134,7 @@ impl<'a> Checker<'a> {
                 "color" => checker.check_style_color_field("font.color", nested.value),
                 _ => {}
             }),
-            "background" | "border" | "selected_border" => {
+            "background" | "border" | "outline" | "borders" => {
                 let prefix = field_name.to_owned();
                 self.check_style_nested_object(value_expr_id, |checker, nested| {
                     if nested.name == "color" {
@@ -2168,6 +2222,28 @@ fn diagnostic_for_statement(statement: Option<&AstStatement>, message: String) -
         end: statement.map(|statement| statement.end).unwrap_or_default(),
         message,
     }
+}
+
+fn is_deleted_public_style_field(field_name: &str) -> bool {
+    field_name.starts_with("shadow1_")
+        || field_name.starts_with("shadow2_")
+        || field_name.starts_with("shadow3_")
+        || field_name.starts_with("shadow4_")
+        || field_name.starts_with("shadow5_")
+        || matches!(
+            field_name,
+            "border_top"
+                | "selected_border"
+                | "strike_if"
+                | "color_if"
+                | "focus_border"
+                | "focus_border_width"
+                | "hover_visible"
+                | "hover_color"
+                | "hover_border"
+                | "hover_underline_if"
+                | "hover_scope"
+        )
 }
 
 #[derive(Clone, Debug)]
@@ -3012,6 +3088,117 @@ pub fn boon_facing_type_detail_label(ty: &Type) -> String {
 
 pub fn boon_facing_type_compact_label(ty: &Type) -> String {
     boon_facing_type_label_with_depth(ty, 0, true, 4)
+}
+
+pub fn boon_facing_type_display_tree(ty: &Type) -> TypeDisplayNode {
+    boon_facing_type_display_tree_with_depth(ty, 0, 12)
+}
+
+fn scalar_type_display_node(label: impl Into<String>) -> TypeDisplayNode {
+    TypeDisplayNode::Scalar {
+        label: label.into(),
+    }
+}
+
+fn object_shape_display_fields(
+    shape: &ObjectShape,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<TypeDisplayField> {
+    shape
+        .ordered_fields()
+        .into_iter()
+        .map(|(name, ty)| TypeDisplayField {
+            name: name.clone(),
+            ty: boon_facing_type_display_tree_with_depth(ty, depth + 1, max_depth),
+        })
+        .collect()
+}
+
+fn boon_facing_type_display_tree_with_depth(
+    ty: &Type,
+    depth: usize,
+    max_depth: usize,
+) -> TypeDisplayNode {
+    if depth >= max_depth {
+        return scalar_type_display_node("VALUE");
+    }
+    match ty {
+        Type::Text => scalar_type_display_node("TEXT"),
+        Type::Number => scalar_type_display_node("NUMBER"),
+        Type::Skip => scalar_type_display_node("ABSENT"),
+        Type::RenderContract => TypeDisplayNode::Object {
+            fields: vec![TypeDisplayField {
+                name: "kind".to_owned(),
+                ty: scalar_type_display_node(
+                    "Button | Checkbox | Document | Row | Stack | Text | TextInput",
+                ),
+            }],
+            open: false,
+        },
+        Type::Unknown | Type::Var(_) => scalar_type_display_node("VALUE"),
+        Type::UnresolvedShape { reason } => {
+            if reason.is_empty() {
+                scalar_type_display_node("VALUE")
+            } else {
+                scalar_type_display_node(format!("VALUE ({reason})"))
+            }
+        }
+        Type::List(item) => TypeDisplayNode::List {
+            item: Box::new(boon_facing_type_display_tree_with_depth(
+                item,
+                depth + 1,
+                max_depth,
+            )),
+        },
+        Type::Function { args, result } => TypeDisplayNode::Function {
+            name: None,
+            args: args
+                .iter()
+                .map(|arg| TypeDisplayFunctionArg {
+                    name: None,
+                    ty: boon_facing_type_display_tree_with_depth(arg, depth + 1, max_depth),
+                })
+                .collect(),
+            result: Box::new(boon_facing_type_display_tree_with_depth(
+                &result.ty,
+                depth + 1,
+                max_depth,
+            )),
+        },
+        Type::Object(shape) => {
+            if shape.fields.is_empty() && shape.open {
+                scalar_type_display_node("VALUE")
+            } else {
+                TypeDisplayNode::Object {
+                    fields: object_shape_display_fields(shape, depth, max_depth),
+                    open: shape.open,
+                }
+            }
+        }
+        Type::VariantSet(variants) => {
+            let variants = sorted_variants(variants);
+            if variants.is_empty() {
+                return scalar_type_display_node("VALUE");
+            }
+            if variants_are_bool_alias(&variants) {
+                return scalar_type_display_node("BOOL");
+            }
+            TypeDisplayNode::Union {
+                variants: variants
+                    .iter()
+                    .map(|variant| match variant {
+                        Variant::Tag(tag) => scalar_type_display_node(tag.clone()),
+                        Variant::Tagged { tag, fields } => TypeDisplayNode::TaggedObject {
+                            tag: tag.clone(),
+                            fields: object_shape_display_fields(fields, depth, max_depth),
+                            open: fields.open,
+                        },
+                    })
+                    .collect(),
+            }
+        }
+    }
 }
 
 fn sorted_variants(variants: &[Variant]) -> Vec<Variant> {
@@ -3945,6 +4132,77 @@ fn name_bindings(
     bindings
 }
 
+fn passed_context_type(program: &ParsedProgram, bindings: &BTreeMap<String, Type>) -> Option<Type> {
+    let mut context: Option<Type> = None;
+    for expr in &program.expressions {
+        let args = match &expr.kind {
+            AstExprKind::Call { args, .. } | AstExprKind::Pipe { args, .. } => args.as_slice(),
+            _ => continue,
+        };
+        for arg in args
+            .iter()
+            .filter(|arg| arg.name.as_deref() == Some("PASS"))
+        {
+            let Some(value_expr) = program.expressions.get(arg.value) else {
+                continue;
+            };
+            let Some(arg_type) =
+                static_expr_type_from_bindings(value_expr, &program.expressions, bindings)
+            else {
+                continue;
+            };
+            context = Some(match context {
+                Some(existing) => widen_structural_type(&existing, &arg_type),
+                None => arg_type,
+            });
+        }
+    }
+    context
+}
+
+fn static_expr_type_from_bindings(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    match &expr.kind {
+        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+            Some(Type::Object(ObjectShape::from_ordered_fields(
+                fields.iter().map(|field| {
+                    (
+                        field.name.clone(),
+                        expressions
+                            .get(field.value)
+                            .and_then(|field_expr| {
+                                static_expr_type_from_bindings(field_expr, expressions, bindings)
+                            })
+                            .unwrap_or_else(open_object_type),
+                    )
+                }),
+                false,
+            )))
+        }
+        AstExprKind::Identifier(name) => bindings.get(name).cloned(),
+        AstExprKind::Path(parts) => {
+            let path = parts.join(".");
+            bindings.get(&path).cloned().or_else(|| {
+                parts
+                    .first()
+                    .and_then(|base| bindings.get(base))
+                    .and_then(|base| type_for_nested_path(base, &parts[1..]))
+            })
+        }
+        AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
+        AstExprKind::Number(_) => Some(Type::Number),
+        AstExprKind::Bool(_) => Some(true_false_type()),
+        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
+            Some(Type::VariantSet(vec![Variant::Tag(tag.clone())]))
+        }
+        _ => None,
+    }
+}
+
 fn flow_bindings(program: &ParsedProgram) -> BTreeMap<String, FlowMode> {
     let mut bindings = BTreeMap::new();
     collect_flow_bindings(
@@ -4563,7 +4821,8 @@ fn source_payload_access(
     source_paths: &BTreeSet<String>,
     parts: &[String],
 ) -> Option<SourcePayloadAccess> {
-    let path = parts.join(".");
+    let normalized_parts = normalized_source_path_parts(parts);
+    let path = normalized_parts.join(".");
     for source_path in source_paths {
         let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
         for base in [source_path.as_str(), relative] {
@@ -4573,7 +4832,7 @@ fn source_payload_access(
             if let Some(suffix) = path.strip_prefix(&format!("{base}.")) {
                 return Some(source_payload_access_for_suffix(suffix));
             }
-            if let Some((field, base_without_field)) = parts.split_last() {
+            if let Some((field, base_without_field)) = normalized_parts.split_last() {
                 let base_without_field = base_without_field.join(".");
                 if !base_without_field.is_empty()
                     && base.ends_with(&format!(".{base_without_field}"))
@@ -4584,6 +4843,14 @@ fn source_payload_access(
         }
     }
     None
+}
+
+fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|part| part.as_str() != "PASSED" && part.as_str() != "events")
+        .cloned()
+        .collect()
 }
 
 fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
@@ -4730,6 +4997,7 @@ fn type_hint_entry_for_range(
         category,
         boon_facing_type_compact_label(ty),
         boon_facing_type_detail_label(ty),
+        boon_facing_type_display_tree(ty),
     )
 }
 
@@ -4742,6 +5010,7 @@ fn type_hint_entry_for_labels(
     category: &str,
     compact_label: String,
     detail_label: String,
+    display_tree: TypeDisplayNode,
 ) -> TypeHintEntry {
     TypeHintEntry {
         expr_id,
@@ -4752,6 +5021,7 @@ fn type_hint_entry_for_labels(
         category: category.to_owned(),
         compact_label,
         detail_label,
+        display_tree,
     }
 }
 
@@ -4893,6 +5163,7 @@ fn collect_statement_type_hints(
                                 "function_signature",
                                 compact_label,
                                 function_signature_detail_label(function),
+                                function_signature_display_tree(function),
                             ));
                         }
                         entries.push(type_hint_entry_for_range(
@@ -5159,6 +5430,22 @@ fn function_signature_detail_label(function: &FunctionTypeEntry) -> String {
     )
 }
 
+fn function_signature_display_tree(function: &FunctionTypeEntry) -> TypeDisplayNode {
+    TypeDisplayNode::Function {
+        name: Some(function.name.clone()),
+        args: function
+            .args
+            .iter()
+            .zip(function.arg_types.iter())
+            .map(|(name, ty)| TypeDisplayFunctionArg {
+                name: Some(name.clone()),
+                ty: boon_facing_type_display_tree(ty),
+            })
+            .collect(),
+        result: Box::new(boon_facing_type_display_tree(&function.result.ty)),
+    }
+}
+
 fn signature_type_compact_label(ty: &Type) -> String {
     match ty {
         Type::Object(shape) if shape.fields.is_empty() && !shape.open => "[]".to_owned(),
@@ -5396,15 +5683,22 @@ fn source_path_matches_parts(
     source_path: &str,
     parts: &[String],
 ) -> bool {
-    let path = parts.join(".");
+    let normalized_parts = normalized_source_path_parts(parts);
+    let path = normalized_parts.join(".");
     if !path_is_source_path(source_paths, &path) {
         return false;
     }
     let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
     path.starts_with(&format!("{source_path}."))
         || path.starts_with(&format!("{relative}."))
-        || source_path.ends_with(&format!(".{}", parts_without_payload(parts).join(".")))
-        || relative.ends_with(&format!(".{}", parts_without_payload(parts).join(".")))
+        || source_path.ends_with(&format!(
+            ".{}",
+            parts_without_payload(&normalized_parts).join(".")
+        ))
+        || relative.ends_with(&format!(
+            ".{}",
+            parts_without_payload(&normalized_parts).join(".")
+        ))
 }
 
 fn parts_without_payload(parts: &[String]) -> &[String] {
@@ -5437,16 +5731,21 @@ fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<&'static str> {
 }
 
 fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
+    let normalized_path = path
+        .split('.')
+        .filter(|part| *part != "PASSED" && *part != "events")
+        .collect::<Vec<_>>()
+        .join(".");
     source_paths.iter().any(|source_path| {
         let relative = source_path
             .strip_prefix("store.")
             .unwrap_or(source_path.as_str());
-        source_path == path
-            || source_path.ends_with(&format!(".{path}"))
-            || path.starts_with(&format!("{source_path}."))
-            || relative == path
-            || relative.ends_with(&format!(".{path}"))
-            || path.starts_with(&format!("{relative}."))
+        source_path.as_str() == normalized_path
+            || source_path.ends_with(&format!(".{normalized_path}"))
+            || normalized_path.starts_with(&format!("{source_path}."))
+            || relative == normalized_path
+            || relative.ends_with(&format!(".{normalized_path}"))
+            || normalized_path.starts_with(&format!("{relative}."))
     })
 }
 
@@ -6683,6 +6982,7 @@ FUNCTION row(todo) {
             "selected_filter: Active | All | Completed",
             "active_count: NUMBER",
             "completed_count: NUMBER",
+            "has_todos: BOOL",
             "has_completed: BOOL",
             "all_completed: BOOL",
             "todos: LIST<[",
@@ -6699,6 +6999,9 @@ FUNCTION row(todo) {
             "title_to_add: unresolved object shape",
             "todos: unresolved object shape",
             "visible_todos: unresolved object shape",
+            "LIST {",
+            "{:",
+            "[...]",
             "object ",
             "tag ",
         ] {
@@ -6761,8 +7064,8 @@ FUNCTION row(todo) {
         for (line_text, expected) in [
             ("change: SOURCE", "[\n    text: TEXT\n]"),
             ("key_down: SOURCE", "[\n    key: TEXT\n]"),
-            ("toggle_all_checkbox: [click: SOURCE]", "[]"),
-            ("clear_completed_button: [press: SOURCE]", "[]"),
+            ("toggle_all_checkbox: [events: [click: SOURCE]]", "[]"),
+            ("clear_completed_button: [events: [press: SOURCE]]", "[]"),
         ] {
             let line = source
                 .lines()

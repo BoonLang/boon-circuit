@@ -6,17 +6,29 @@
 
 store: [
     sources: [
-        increment_button: [press: SOURCE]
-        decrement_button: [press: SOURCE]
-        reset_button: [press: SOURCE]
+        increment_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+        decrement_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+        reset_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
     ]
 
     count:
         0 |> HOLD count {
             LATEST {
-                sources.increment_button.press |> THEN { count + 1 }
-                sources.decrement_button.press |> THEN { count - 1 }
-                sources.reset_button.press |> THEN { 0 }
+                sources.increment_button.events.press |> THEN { count + 1 }
+                sources.decrement_button.events.press |> THEN { count - 1 }
+                sources.reset_button.events.press |> THEN { 0 }
             }
         }
 
@@ -102,20 +114,20 @@ FUNCTION counter_controls() {
 }
 
 FUNCTION decrement_button() {
-    counter_button(press: store.sources.decrement_button.press, label: TEXT { - })
+    counter_button(events: store.sources.decrement_button.events, label: TEXT { - })
 }
 
 FUNCTION reset_button() {
-    counter_button(press: store.sources.reset_button.press, label: TEXT { Reset })
+    counter_button(events: store.sources.reset_button.events, label: TEXT { Reset })
 }
 
 FUNCTION increment_button() {
-    counter_button(press: store.sources.increment_button.press, label: TEXT { + })
+    counter_button(events: store.sources.increment_button.events, label: TEXT { + })
 }
 
-FUNCTION counter_button(press, label) {
+FUNCTION counter_button(events, label) {
     Element/button(
-        element: [event: [press: press]]
+        element: [events: events]
         style: [
             width: 96
             height: 40

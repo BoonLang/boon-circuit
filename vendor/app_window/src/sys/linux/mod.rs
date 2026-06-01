@@ -219,6 +219,8 @@ impl Surface {
             crate::surface::SurfaceCursorIcon::ColumnResize => {
                 Some(cursor::CursorRequest::column_resize())
             }
+            crate::surface::SurfaceCursorIcon::Pointer => Some(cursor::CursorRequest::pointer()),
+            crate::surface::SurfaceCursorIcon::Text => Some(cursor::CursorRequest::text()),
         };
         let (cursor_request, pointer, serial, pointer_over_client, app_state) = {
             let mut window_internal = self.window_internal.lock().unwrap();

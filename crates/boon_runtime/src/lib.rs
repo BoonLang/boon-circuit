@@ -4638,16 +4638,33 @@ impl GenericScheduledRuntime {
         for action in &actions {
             match action {
                 SourceAction::RootScalar => {
-                    if let Some(commit) = self.storage.apply_root_text_action_source(
-                        &self.source_routes,
-                        &self.scalar_equations,
-                        input.source,
-                        input.source_id,
-                        input.text,
-                        input.address,
-                        input.seq,
-                    )? {
-                        observe(GenericSourceMutation::RootText(commit))?;
+                    if let Some(target) = self
+                        .source_routes
+                        .single_root_scalar_target_for_source_id(input.source_id)?
+                        .map(str::to_owned)
+                    {
+                        if self.storage.root_bool_opt(&target).is_some() {
+                            if let Some(commit) = self.storage.apply_root_bool_source(
+                                &self.scalar_equations,
+                                &target,
+                                input.source,
+                                input.seq,
+                            )? {
+                                observe(GenericSourceMutation::RootBool(commit))?;
+                            }
+                        } else if let Some(commit) = self.storage.apply_root_text_source(
+                            &self.scalar_equations,
+                            &target,
+                            input.source,
+                            input.text,
+                            input.address,
+                            input.seq,
+                        )? {
+                            observe(GenericSourceMutation::RootText(GenericRootTextCommit {
+                                target,
+                                value: commit,
+                            }))?;
+                        }
                     }
                 }
                 SourceAction::DerivedText { .. } => {}
@@ -7000,6 +7017,20 @@ impl GenericCircuitRuntime {
         self.root.set_textlike(path, value)
     }
 
+    fn root_bool_opt(&self, path: &str) -> Option<bool> {
+        self.root.bool_value(path)
+    }
+
+    fn root_bool(&self, path: &str) -> RuntimeResult<bool> {
+        self.root.bool_value(path).ok_or_else(|| {
+            format!("generic runtime root value `{path}` is missing or non-bool").into()
+        })
+    }
+
+    fn set_root_bool(&mut self, path: &str, value: bool) -> RuntimeResult<()> {
+        self.root.set_bool(path, value)
+    }
+
     fn apply_root_text_source<'a>(
         &mut self,
         equations: &ScalarEquationPlan,
@@ -7023,6 +7054,34 @@ impl GenericCircuitRuntime {
             return Ok(None);
         };
         self.commit_root_text_candidate(target, candidate)
+    }
+
+    fn apply_root_bool_source(
+        &mut self,
+        equations: &ScalarEquationPlan,
+        target: &str,
+        source: &str,
+        seq: TickSeq,
+    ) -> RuntimeResult<Option<GenericRootBoolCommit>> {
+        let Some(value) =
+            equations.eval_bool_with_context(target, source, |path| self.root_bool(path).ok())?
+        else {
+            return Err(format!(
+                "no supported bool scalar update branch for `{target}` from `{source}`"
+            )
+            .into());
+        };
+        let Some(candidate) = then_value(EventPulse::present(seq), value) else {
+            return Ok(None);
+        };
+        let Some(value) = latest_value(target, &[candidate])? else {
+            return Ok(None);
+        };
+        self.set_root_bool(target, value)?;
+        Ok(Some(GenericRootBoolCommit {
+            target: target.to_owned(),
+            value,
+        }))
     }
 
     fn apply_root_text_action_source<'a>(
@@ -8915,6 +8974,12 @@ struct GenericRootTextCommit<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct GenericRootBoolCommit {
+    target: String,
+    value: bool,
+}
+
+#[derive(Clone, Debug)]
 struct GenericRenderLoweringPlan;
 
 #[derive(Clone, Debug, Default)]
@@ -9029,6 +9094,21 @@ impl<'a> GenericRootTextCommit<'a> {
     }
 }
 
+impl GenericRootBoolCommit {
+    fn semantic_delta(&self) -> SemanticDelta<'static> {
+        SemanticDelta {
+            kind: "FieldSet",
+            list_id: None,
+            key: None,
+            generation: None,
+            source_id: None,
+            bind_epoch: None,
+            field_path: Some(Cow::Owned(self.target.clone())),
+            value: ProtocolValue::Bool(self.value),
+        }
+    }
+}
+
 impl GenericRenderLoweringPlan {
     fn generic() -> Self {
         Self
@@ -9074,6 +9154,7 @@ impl<'a> GenericSourceMutation<'a> {
     fn semantic_delta(&self) -> Option<SemanticDelta<'a>> {
         match self {
             Self::RootText(commit) => Some(commit.semantic_delta()),
+            Self::RootBool(commit) => Some(commit.semantic_delta()),
             Self::TextField(commit) => Some(commit.semantic_delta()),
             Self::TextFieldIdentity(commit) => Some(
                 commit.semantic_delta_with_value(ProtocolValue::Text(Cow::Owned(
@@ -9116,6 +9197,9 @@ fn generic_document_invalidation_patch<'a>(
 ) -> RenderPatch<'a> {
     let value = match mutation {
         GenericSourceMutation::RootText(commit) => {
+            ProtocolValue::Text(Cow::Owned(commit.target.clone()))
+        }
+        GenericSourceMutation::RootBool(commit) => {
             ProtocolValue::Text(Cow::Owned(commit.target.clone()))
         }
         GenericSourceMutation::TextField(commit) => {
@@ -9215,6 +9299,7 @@ impl SourceActionKind {
 #[allow(dead_code)]
 enum GenericSourceMutation<'a> {
     RootText(GenericRootTextCommit<'a>),
+    RootBool(GenericRootBoolCommit),
     TextField(GenericTextFieldCommit<'a>),
     TextFieldIdentity(GenericTextFieldIdentity),
     ValueField(GenericValueFieldCommit<'a>),
@@ -9254,6 +9339,7 @@ impl<'a> GenericSourceMutationBatch<'a> {
             GenericSourceMutation::RootText(commit) => {
                 Self::insert_root_text(&mut self.root_texts, &commit.target, commit.clone())?;
             }
+            GenericSourceMutation::RootBool(_) => {}
             GenericSourceMutation::TextField(commit) => {
                 Self::insert_text(&mut self.text_fields, &commit.field, commit.clone())?;
             }

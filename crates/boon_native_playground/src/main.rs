@@ -491,11 +491,44 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
     let initial_runtime_units = project_units_for_source_text(Path::new(&code_file), &source);
+    let code_hash = boon_runtime::source_units_hash(&initial_runtime_units);
+    let live_runtime_result = live_runtime_from_source_text(
+        &format!("native-preview-live:{}", code_file),
+        Path::new(&code_file),
+        &source,
+    );
+    let (runtime_summary, document_state_summary, live_runtime) = match live_runtime_result {
+        Ok(mut runtime) => {
+            let state_summary = runtime.state_summary();
+            let document_state_summary = runtime.document_state_summary();
+            (
+                preview_runtime_summary_from_state_summary(
+                    Path::new(&code_file),
+                    &code_hash,
+                    state_summary,
+                ),
+                Some(document_state_summary),
+                Some(Arc::new(Mutex::new(runtime))),
+            )
+        }
+        Err(error) => (
+            json!({
+                "status": "fail",
+                "owns_live_runtime": false,
+                "reason": error.to_string(),
+                "source_path": code_file,
+                "source_sha256": code_hash,
+                "full_state_mirroring_allowed": false
+            }),
+            None,
+            None,
+        ),
+    };
     let (document_layout_proof, document_layout_frame) =
         native_document_layout_proof_with_project_state_mode(
             Path::new(&code_file),
             &initial_runtime_units,
-            None,
+            document_state_summary.as_ref(),
             true,
         )
         .unwrap_or_else(|error| {
@@ -515,15 +548,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
-    let code_hash = boon_runtime::source_units_hash(&initial_runtime_units);
-    let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
-    let live_runtime = live_runtime_from_source_text(
-        &format!("native-preview-live:{}", code_file),
-        Path::new(&code_file),
-        &source,
-    )
-    .ok()
-    .map(|runtime| Arc::new(Mutex::new(runtime)));
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
     let wake_handle = boon_native_app_window::NativeWakeHandle::new();
@@ -1823,13 +1847,61 @@ fn native_document_layout_proof_with_project_state_embedded(
     Ok((proof, layout_frame))
 }
 
+#[derive(Default)]
+struct DocumentLayoutProfile {
+    parse_cache_ms: f64,
+    typecheck_ms: f64,
+    ir_lower_source_binding_index_ms: f64,
+    runtime_state_ms: f64,
+    function_registry_ms: f64,
+    initial_locals_ms: f64,
+    document_eval_lower_ms: f64,
+    text_measure_and_layout_ms: f64,
+    artifact_serialize_ms: f64,
+    artifact_write_ms: f64,
+    source_unit_count: usize,
+    source_bytes: usize,
+    render_slot_count: usize,
+    source_binding_index_count: usize,
+    source_payload_shape_count: usize,
+}
+
+impl DocumentLayoutProfile {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "parse_cache_ms": self.parse_cache_ms,
+            "typecheck_ms": self.typecheck_ms,
+            "ir_lower_source_binding_index_ms": self.ir_lower_source_binding_index_ms,
+            "runtime_state_ms": self.runtime_state_ms,
+            "function_registry_ms": self.function_registry_ms,
+            "initial_locals_ms": self.initial_locals_ms,
+            "document_eval_lower_ms": self.document_eval_lower_ms,
+            "text_measure_and_layout_ms": self.text_measure_and_layout_ms,
+            "artifact_serialize_ms": self.artifact_serialize_ms,
+            "artifact_write_ms": self.artifact_write_ms,
+            "source_unit_count": self.source_unit_count,
+            "source_bytes": self.source_bytes,
+            "render_slot_count": self.render_slot_count,
+            "source_binding_index_count": self.source_binding_index_count,
+            "source_payload_shape_count": self.source_payload_shape_count,
+        })
+    }
+}
+
 fn native_document_layout_proof_with_project_state_mode(
     source_path: &Path,
     units: &[boon_runtime::RuntimeSourceUnit],
     runtime_state_override: Option<&serde_json::Value>,
     write_artifact: bool,
 ) -> Result<(serde_json::Value, Option<boon_document::LayoutFrame>), Box<dyn std::error::Error>> {
+    let mut profile = DocumentLayoutProfile {
+        source_unit_count: units.len(),
+        source_bytes: units.iter().map(|unit| unit.source.len()).sum(),
+        ..DocumentLayoutProfile::default()
+    };
+    let parse_started = Instant::now();
     let parsed = cached_document_project_program(source_path, units)?;
+    profile.parse_cache_ms = elapsed_ms(parse_started);
     let (document, render_root_kind) = if let Some(document) = boon_parser::parsed_document(&parsed)
     {
         (document, "document")
@@ -1838,15 +1910,27 @@ fn native_document_layout_proof_with_project_state_mode(
     } else {
         return Err("source does not contain a parseable document or scene block".into());
     };
-    let typecheck_report = boon_typecheck::check(&parsed);
-    let source_binding_index = boon_ir::lower(&parsed)
-        .map(|ir| source_binding_index_from_view_bindings(&ir.view_bindings))
-        .unwrap_or_default();
+    let typecheck_started = Instant::now();
+    let static_analysis = cached_document_static_analysis(source_path, units)?;
+    let typecheck_report = Arc::clone(&static_analysis.typecheck_report);
+    let source_binding_index = Arc::clone(&static_analysis.source_binding_index);
+    profile.typecheck_ms = elapsed_ms(typecheck_started);
+    profile.render_slot_count = typecheck_report.render_slot_count;
+    profile.source_payload_shape_count = typecheck_report.source_payload_shape_table.len();
+    profile.ir_lower_source_binding_index_ms = 0.0;
+    profile.source_binding_index_count = source_binding_index.values().map(Vec::len).sum::<usize>();
+    let runtime_state_started = Instant::now();
     let runtime_state = runtime_state_override
         .cloned()
         .or_else(|| runtime_document_state_summary_for_project(source_path, units).ok());
-    let document_functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
+    profile.runtime_state_ms = elapsed_ms(runtime_state_started);
+    let function_registry_started = Instant::now();
+    let document_functions =
+        DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
+    profile.function_registry_ms = elapsed_ms(function_registry_started);
+    let initial_locals_started = Instant::now();
     let initial_locals = document_initial_locals(&parsed.ast.statements, runtime_state.as_ref());
+    profile.initial_locals_ms = elapsed_ms(initial_locals_started);
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: initial_locals,
@@ -1858,15 +1942,12 @@ fn native_document_layout_proof_with_project_state_mode(
         eval_depth: 0,
         eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
     };
-    let source_binding_index_count = eval_context
-        .source_binding_index
-        .values()
-        .map(Vec::len)
-        .sum::<usize>();
+    let source_binding_index_count = profile.source_binding_index_count;
     let mut frame = boon_document_model::DocumentFrame::empty("root");
     let mut source_intents = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let root_id = frame.root.clone();
+    let document_eval_lower_started = Instant::now();
     if let Some(root_element) = canonical_document_root(&document.root, &document.expressions) {
         lower_canonical_document_entry(
             root_element,
@@ -1911,7 +1992,9 @@ fn native_document_layout_proof_with_project_state_mode(
             "",
         );
     }
+    profile.document_eval_lower_ms = elapsed_ms(document_eval_lower_started);
 
+    let text_measure_and_layout_started = Instant::now();
     static TEXT_MEASURER: OnceLock<Mutex<boon_native_gpu::GlyphonTextMeasurer>> = OnceLock::new();
     let mut measurer = TEXT_MEASURER
         .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
@@ -1928,6 +2011,7 @@ fn native_document_layout_proof_with_project_state_mode(
         text: &mut *measurer,
         capabilities: boon_document::RenderCapabilities::fake_portable(),
     });
+    profile.text_measure_and_layout_ms = elapsed_ms(text_measure_and_layout_started);
 
     let source_sha256 = boon_runtime::source_units_hash(units);
     let runtime_state_hash = runtime_state
@@ -1949,10 +2033,12 @@ fn native_document_layout_proof_with_project_state_mode(
     );
     let artifact_path =
         PathBuf::from("target/artifacts/native-gpu/document-layout").join(&artifact_name);
-    let typecheck_report_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&typecheck_report)?);
+    let typecheck_report_hash =
+        boon_runtime::sha256_bytes(&serde_json::to_vec(typecheck_report.as_ref())?);
     let render_slot_table_hash =
         boon_runtime::sha256_bytes(&serde_json::to_vec(&typecheck_report.render_slot_table)?);
     let (artifact_sha256, layout_frame_hash) = if write_artifact {
+        let artifact_serialize_started = Instant::now();
         let artifact = json!({
             "source_path": source_path,
             "source_sha256": source_sha256,
@@ -1966,13 +2052,16 @@ fn native_document_layout_proof_with_project_state_mode(
             "runtime_document_state_used": runtime_state.is_some(),
             "runtime_document_state_hash": runtime_state_hash.clone()
         });
+        let bytes = serde_json::to_vec_pretty(&artifact)?;
+        profile.artifact_serialize_ms = elapsed_ms(artifact_serialize_started);
+        let artifact_write_started = Instant::now();
         std::fs::create_dir_all(
             artifact_path
                 .parent()
                 .ok_or("document layout artifact path has no parent")?,
         )?;
-        let bytes = serde_json::to_vec_pretty(&artifact)?;
         std::fs::write(&artifact_path, &bytes)?;
+        profile.artifact_write_ms = elapsed_ms(artifact_write_started);
         (
             boon_runtime::sha256_bytes(&bytes),
             boon_runtime::sha256_file(&artifact_path)?,
@@ -2045,6 +2134,7 @@ fn native_document_layout_proof_with_project_state_mode(
         "source_intent_sample_count": source_intent_samples.len(),
         "source_intent_sample_limit": 256,
         "source_binding_index_count": source_binding_index_count,
+        "layout_profile": profile.to_json(),
         "hit_target_assertions": hit_target_assertion_total,
         "hit_target_samples": hit_target_samples,
         "source_intent_assertions": source_intent_assertions,
@@ -2130,6 +2220,43 @@ fn cached_document_project_program(
         .clone())
 }
 
+struct DocumentStaticAnalysis {
+    typecheck_report: Arc<boon_typecheck::TypeCheckReport>,
+    source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
+}
+
+fn cached_document_static_analysis(
+    source_path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Result<Arc<DocumentStaticAnalysis>, Box<dyn std::error::Error>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<DocumentStaticAnalysis>>>> = OnceLock::new();
+    let source_sha256 = boon_runtime::source_units_hash(units);
+    let key = format!("{}:{source_sha256}", source_path.display());
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(analysis) = cache.get(&key)
+    {
+        return Ok(Arc::clone(analysis));
+    }
+    let runtime_analysis = boon_runtime::cached_static_analysis_from_project(
+        &format!("native-document-static:{}", source_path.display()),
+        units,
+    )?;
+    let analysis = Arc::new(DocumentStaticAnalysis {
+        source_binding_index: Arc::new(source_binding_index_from_view_bindings(
+            &runtime_analysis.view_bindings,
+        )),
+        typecheck_report: Arc::new(runtime_analysis.typecheck_report),
+    });
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() > 16 {
+            cache.clear();
+        }
+        cache.insert(key, Arc::clone(&analysis));
+    }
+    Ok(analysis)
+}
+
 fn document_initial_locals(
     statements: &[AstStatement],
     root: Option<&Value>,
@@ -2179,27 +2306,6 @@ fn collect_document_alias_fields(
     }
 }
 
-fn preview_runtime_summary(
-    source_path: &Path,
-    source: &str,
-    source_sha256: &str,
-) -> serde_json::Value {
-    let state_summary = match runtime_state_summary_for_source(source_path, source) {
-        Ok(summary) => summary,
-        Err(error) => {
-            return json!({
-                "status": "fail",
-                "owns_live_runtime": false,
-                "reason": error,
-                "source_path": source_path,
-                "source_sha256": source_sha256,
-                "full_state_mirroring_allowed": false
-            });
-        }
-    };
-    preview_runtime_summary_from_state_summary(source_path, source_sha256, state_summary)
-}
-
 fn preview_runtime_summary_from_state_summary(
     source_path: &Path,
     source_sha256: &str,
@@ -2226,6 +2332,29 @@ fn preview_runtime_summary_from_state_summary(
     })
 }
 
+#[cfg(test)]
+fn preview_runtime_summary(
+    source_path: &Path,
+    source: &str,
+    source_sha256: &str,
+) -> serde_json::Value {
+    let state_summary = match runtime_state_summary_for_source(source_path, source) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return json!({
+                "status": "fail",
+                "owns_live_runtime": false,
+                "reason": error,
+                "source_path": source_path,
+                "source_sha256": source_sha256,
+                "full_state_mirroring_allowed": false
+            });
+        }
+    };
+    preview_runtime_summary_from_state_summary(source_path, source_sha256, state_summary)
+}
+
+#[cfg(test)]
 fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<Value, String> {
     let mut runtime = live_runtime_from_source_text(
         &format!("native-preview:{}", source_path.display()),
@@ -13344,7 +13473,7 @@ fn document_pipe_render_function<'a>(
     };
     functions
         .get(op)
-        .filter(|function| document_function_contains_render_constructor(function, expressions))
+        .filter(|function| functions.contains_render_constructor(function))
         .map(|_| (op.as_str(), *input, args.as_slice()))
 }
 
@@ -13358,13 +13487,31 @@ fn document_source_pipe_statement(statement: &AstStatement, expressions: &[AstEx
 #[derive(Debug)]
 struct DocumentFunctionRegistry<'a> {
     functions: BTreeMap<&'a str, &'a AstStatement>,
+    aliases: BTreeMap<&'a str, &'a str>,
+    render_constructor_statement_ids: BTreeSet<usize>,
 }
 
 impl<'a> DocumentFunctionRegistry<'a> {
-    fn new(statements: &'a [AstStatement]) -> Self {
+    fn new(statements: &'a [AstStatement], expressions: &[AstExpr]) -> Self {
         let mut functions = BTreeMap::new();
         Self::collect(statements, &mut functions);
-        Self { functions }
+        let mut aliases = BTreeMap::new();
+        for function_name in functions.keys().copied() {
+            aliases.entry(function_name).or_insert(function_name);
+            if let Some(short_name) = function_name.rsplit('/').next() {
+                aliases.entry(short_name).or_insert(function_name);
+            }
+        }
+        let render_constructor_statement_ids = functions
+            .values()
+            .filter(|function| document_function_contains_render_constructor(function, expressions))
+            .map(|function| function.id)
+            .collect();
+        Self {
+            functions,
+            aliases,
+            render_constructor_statement_ids,
+        }
     }
 
     fn collect(
@@ -13381,10 +13528,15 @@ impl<'a> DocumentFunctionRegistry<'a> {
 
     fn get(&self, name: &str) -> Option<&'a AstStatement> {
         self.functions.get(name).copied().or_else(|| {
-            self.functions.iter().find_map(|(function_name, function)| {
-                (function_name.rsplit('/').next() == Some(name)).then_some(*function)
-            })
+            self.aliases
+                .get(name)
+                .and_then(|alias| self.functions.get(alias))
+                .copied()
         })
+    }
+
+    fn contains_render_constructor(&self, function: &AstStatement) -> bool {
+        self.render_constructor_statement_ids.contains(&function.id)
     }
 }
 
@@ -13881,7 +14033,7 @@ fn document_function_call_context<'a>(
         locals: context.locals.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
-        source_binding_index: context.source_binding_index.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -13901,7 +14053,7 @@ fn document_function_args_context<'a>(
         locals: context.locals.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
-        source_binding_index: context.source_binding_index.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -13990,7 +14142,7 @@ fn document_function_item_context<'a>(
         locals: context.locals.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
-        source_binding_index: context.source_binding_index.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -14210,9 +14362,7 @@ fn lower_canonical_paragraph_contents(
         let direct_inline_element = canonical_element_function(child, expressions).is_some();
         let helper_inline_element = document_call_function(child, expressions)
             .and_then(|function_name| functions.get(function_name))
-            .is_some_and(|function| {
-                document_function_contains_render_constructor(function, expressions)
-            });
+            .is_some_and(|function| functions.contains_render_constructor(function));
         if direct_inline_element || helper_inline_element {
             if needs_space_before_inline_element {
                 insert_paragraph_inline_text_node(
@@ -14509,7 +14659,7 @@ fn lower_mapped_document_children(
             locals: context.locals.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
-            source_binding_index: context.source_binding_index.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -14886,7 +15036,7 @@ fn lower_canonical_list_map_children(
             locals: context.locals.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
-            source_binding_index: context.source_binding_index.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -17412,7 +17562,7 @@ struct DocumentEvalContext<'a> {
     locals: BTreeMap<String, Value>,
     render_args: BTreeMap<String, AstStatement>,
     passed: Option<Value>,
-    source_binding_index: BTreeMap<(String, String), Vec<String>>,
+    source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
     source_override: Option<String>,
     functions: Option<&'a DocumentFunctionRegistry<'a>>,
     eval_depth: usize,
@@ -17484,7 +17634,7 @@ fn lower_document_for_each(
             locals: context.locals.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
-            source_binding_index: context.source_binding_index.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -18280,8 +18430,9 @@ fn document_eval_function_call(
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
-    let function = context.functions?.get(function_name)?;
-    if document_function_contains_render_constructor(function, expressions) {
+    let functions = context.functions?;
+    let function = functions.get(function_name)?;
+    if functions.contains_render_constructor(function) {
         return None;
     }
     if context.eval_depth > 64 {
@@ -18386,7 +18537,9 @@ fn document_expr_may_render(
                     .functions
                     .and_then(|functions| functions.get(function))
                     .is_some_and(|function| {
-                        document_function_contains_render_constructor(function, expressions)
+                        context.functions.is_some_and(|functions| {
+                            functions.contains_render_constructor(function)
+                        })
                     })
         }
         AstExprKind::Pipe { input, op, args } => {
@@ -18396,7 +18549,9 @@ fn document_expr_may_render(
                     .functions
                     .and_then(|functions| functions.get(op))
                     .is_some_and(|function| {
-                        document_function_contains_render_constructor(function, expressions)
+                        context.functions.is_some_and(|functions| {
+                            functions.contains_render_constructor(function)
+                        })
                     })
                 || document_expr_may_render(*input, expressions, context)
                 || args
@@ -18419,7 +18574,7 @@ fn document_eval_statement_sequence(
         locals: context.locals.clone(),
         render_args: context.render_args.clone(),
         passed: context.passed.clone(),
-        source_binding_index: context.source_binding_index.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
         source_override: context.source_override.clone(),
         functions: context.functions,
         eval_depth: context.eval_depth,
@@ -18519,7 +18674,7 @@ fn document_eval_list_retain_with_statement_children(
             locals: context.locals.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
-            source_binding_index: context.source_binding_index.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -18562,7 +18717,7 @@ fn document_eval_list_quantifier(
             locals: context.locals.clone(),
             render_args: context.render_args.clone(),
             passed: context.passed.clone(),
-            source_binding_index: context.source_binding_index.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
             source_override: context.source_override.clone(),
             functions: context.functions,
             eval_depth: context.eval_depth,
@@ -22488,11 +22643,58 @@ fn preview_replace_code_response(
         .unwrap_or("<replace-code-ipc>");
     let runtime_units = project_units_for_source_text(Path::new(source_path), code);
     let project_hash = boon_runtime::source_units_hash(&runtime_units);
+    let (runtime_summary, document_state_summary) =
+        if code.len() <= REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX {
+            match live_runtime_from_source_text(
+                &format!("native-preview-replace:{source_path}"),
+                Path::new(source_path),
+                code,
+            ) {
+                Ok(mut runtime) => {
+                    let state_summary = runtime.state_summary();
+                    let document_state_summary = runtime.document_state_summary();
+                    (
+                        preview_runtime_summary_from_state_summary(
+                            Path::new(source_path),
+                            &project_hash,
+                            state_summary,
+                        ),
+                        Some(document_state_summary),
+                    )
+                }
+                Err(error) => (
+                    json!({
+                        "status": "fail",
+                        "owns_live_runtime": false,
+                        "reason": error.to_string(),
+                        "source_path": source_path,
+                        "source_sha256": actual_hash,
+                        "project_hash": project_hash,
+                        "full_state_mirroring_allowed": false
+                    }),
+                    None,
+                ),
+            }
+        } else {
+            (
+                json!({
+                    "status": "deferred",
+                    "reason": "source exceeds synchronous ReplaceCode IPC runtime-summary budget",
+                    "sync_layout_budget_bytes": REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX,
+                    "source_path": source_path,
+                    "source_sha256": actual_hash,
+                    "project_hash": project_hash,
+                    "source_bytes": code.len(),
+                    "full_state_mirroring_allowed": false
+                }),
+                None,
+            )
+        };
     let layout_proof = if code.len() <= REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX {
         native_document_layout_proof_with_project_state(
             Path::new(source_path),
             &runtime_units,
-            None,
+            document_state_summary.as_ref(),
         )
         .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}))
     } else {
@@ -22503,20 +22705,6 @@ fn preview_replace_code_response(
             "source_path": source_path,
             "source_sha256": actual_hash,
             "source_bytes": code.len()
-        })
-    };
-    let runtime_summary = if code.len() <= REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX {
-        preview_runtime_summary(Path::new(source_path), code, &project_hash)
-    } else {
-        json!({
-            "status": "deferred",
-            "reason": "source exceeds synchronous ReplaceCode IPC runtime-summary budget",
-            "sync_layout_budget_bytes": REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX,
-            "source_path": source_path,
-            "source_sha256": actual_hash,
-            "project_hash": project_hash,
-            "source_bytes": code.len(),
-            "full_state_mirroring_allowed": false
         })
     };
     let hash_matches = actual_hash == expected_hash;
@@ -22771,6 +22959,7 @@ fn preview_operator_host_input_response(
         let mut preview_shared_render_state_updated = false;
         let mut post_input_layout_artifact = serde_json::Value::Null;
         let mut post_input_layout_hash = serde_json::Value::Null;
+        let mut post_input_layout_profile = serde_json::Value::Null;
         let mut post_input_frame_method = "no-render-patch-or-layout-update";
         let layout_started = Instant::now();
         if host_route.get("pass").and_then(serde_json::Value::as_bool) != Some(true)
@@ -22849,6 +23038,10 @@ fn preview_operator_host_input_response(
                         .get("artifact_sha256")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
+                    post_input_layout_profile = post_input_layout
+                        .get("layout_profile")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     current_layout_proof = Some(post_input_layout);
                     post_input_frame_method =
                         "render-patch-state-delta-and-runtime-backed-layout-recompute";
@@ -22884,6 +23077,7 @@ fn preview_operator_host_input_response(
                 "preview_shared_render_update_count": shared_render_update_count,
                 "post_input_layout_artifact": post_input_layout_artifact,
                 "post_input_layout_artifact_sha256": post_input_layout_hash,
+                "post_input_layout_profile": post_input_layout_profile,
                 "post_input_frame_method": post_input_frame_method
             },
             "state_summary_hash": boon_runtime::sha256_bytes(&serde_json::to_vec(&output.state_summary)?),
@@ -24182,7 +24376,8 @@ mod tests {
                 .find_map(|child| find_theme_name_when_text(child, expressions))
         }
 
-        let functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
+        let functions =
+            DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
         let function = functions
             .get("theme_name_button")
             .or_else(|| {
@@ -24207,7 +24402,7 @@ mod tests {
                     "mode": "Light"
                 }
             })),
-            source_binding_index: BTreeMap::new(),
+            source_binding_index: Arc::new(BTreeMap::new()),
             source_override: None,
             functions: Some(&functions),
             eval_depth: 0,

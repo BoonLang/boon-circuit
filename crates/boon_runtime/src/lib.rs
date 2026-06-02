@@ -809,6 +809,28 @@ pub fn source_units_hash(units: &[RuntimeSourceUnit]) -> String {
     sha256_bytes(canonical.as_bytes())
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeStaticProgramAnalysis {
+    pub typecheck_report: boon_typecheck::TypeCheckReport,
+    pub view_bindings: Vec<boon_ir::ViewBinding>,
+}
+
+pub fn cached_static_analysis_from_project(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<RuntimeStaticProgramAnalysis> {
+    let plan = if units.len() == 1 {
+        let unit = &units[0];
+        cached_runtime_plan_from_source(&unit.path, &unit.source)?
+    } else {
+        cached_runtime_plan_from_project(source_label, units)?
+    };
+    Ok(RuntimeStaticProgramAnalysis {
+        typecheck_report: plan.ir.typecheck_report.clone(),
+        view_bindings: plan.ir.view_bindings.clone(),
+    })
+}
+
 impl LiveRuntime {
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;

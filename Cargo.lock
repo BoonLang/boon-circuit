@@ -669,6 +669,7 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_report_schema",
+ "boon_typecheck",
  "serde",
  "serde_json",
  "toml",

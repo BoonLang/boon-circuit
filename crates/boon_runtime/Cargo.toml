@@ -10,6 +10,7 @@ bitvec.workspace = true
 boon_ir.workspace = true
 boon_parser.workspace = true
 boon_report_schema.workspace = true
+boon_typecheck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

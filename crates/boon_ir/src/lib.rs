@@ -593,6 +593,26 @@ pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
     Ok(typed)
 }
 
+pub fn document_view_bindings_with_typecheck(
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<ViewBinding> {
+    let row_scopes = row_scopes(program);
+    let sources = program
+        .source_ports
+        .iter()
+        .enumerate()
+        .map(|(id, source)| SourcePort {
+            id: SourceId(id),
+            scoped: source.scoped,
+            scope_id: scope_id_for_path(&row_scopes, &source.path),
+            payload_schema: source_payload_schema(program, &source.path),
+            path: source.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    view_bindings(program, &row_scopes, &sources, typecheck_report)
+}
+
 pub fn verify_hidden_identity(program: &TypedProgram) -> Result<(), String> {
     if !program.hidden_identity_verified {
         return Err("hidden identity verification did not run".to_owned());

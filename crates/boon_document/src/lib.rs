@@ -306,7 +306,7 @@ impl LayoutBuilder<'_, '_> {
         height = constrain_dimension(height, &node.style, "height", available_height);
         let centered = style_bool(&node.style, "center").unwrap_or(false);
         let align_x = style_text(&node.style, "align_x").unwrap_or_default();
-        let node_x = if centered && width < available_width {
+        let mut node_x = if centered && width < available_width {
             x + (available_width - width) / 2.0
         } else if align_x.eq_ignore_ascii_case("right") && width < available_width {
             x + available_width - width
@@ -327,6 +327,8 @@ impl LayoutBuilder<'_, '_> {
             style: node.style.clone(),
             focused: self.document.focus.as_ref() == Some(&node.id),
         });
+        let subtree_hit_start = self.hit_regions.len();
+        let subtree_scroll_start = self.scroll_regions.len();
 
         if !node.children.is_empty() {
             let content_x = node_x + padding.left;
@@ -337,10 +339,58 @@ impl LayoutBuilder<'_, '_> {
                     let display_start = self.display_list.len();
                     let hit_start = self.hit_regions.len();
                     let scroll_start = self.scroll_regions.len();
+                    let child_count = node.children.len();
+                    let fill_child_count =
+                        node.children
+                            .iter()
+                            .filter(|child| {
+                                self.document.nodes.get(child).is_some_and(|child| {
+                                    style_dimension_is_fill(&child.style, "width")
+                                })
+                            })
+                            .count();
+                    let row_gap_total = if child_count > 0 {
+                        gap * child_count.saturating_sub(1) as f32
+                    } else {
+                        0.0
+                    };
+                    let fixed_child_width: f32 = if fill_child_count > 0 {
+                        node.children
+                            .iter()
+                            .filter_map(|child| self.document.nodes.get(child))
+                            .filter(|child| !style_dimension_is_fill(&child.style, "width"))
+                            .filter_map(|child| preferred_row_child_width(child, self.text))
+                            .sum()
+                    } else {
+                        0.0
+                    };
+                    let fill_child_width = if fill_child_count > 0 {
+                        ((content_width - row_gap_total - fixed_child_width)
+                            / fill_child_count as f32)
+                            .max(1.0)
+                    } else {
+                        0.0
+                    };
                     let mut cursor_x = content_x;
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
-                        let child_available_width = (content_x + content_width - cursor_x).max(1.0);
+                        let child_available_width = self
+                            .document
+                            .nodes
+                            .get(child)
+                            .and_then(|child_node| {
+                                style_dimension_is_fill(&child_node.style, "width")
+                                    .then_some(fill_child_width)
+                                    .or_else(|| {
+                                        (fill_child_count > 0)
+                                            .then(|| {
+                                                preferred_row_child_width(child_node, self.text)
+                                            })
+                                            .flatten()
+                                    })
+                            })
+                            .unwrap_or_else(|| (content_x + content_width - cursor_x).max(1.0))
+                            .max(1.0);
                         let child_rect = self.layout_node(
                             child,
                             cursor_x,
@@ -413,6 +463,27 @@ impl LayoutBuilder<'_, '_> {
                         );
                     }
                 }
+            }
+        }
+
+        let final_node_x = if centered && width < available_width {
+            x + (available_width - width) / 2.0
+        } else if align_x.eq_ignore_ascii_case("right") && width < available_width {
+            x + available_width - width
+        } else {
+            x
+        };
+        let node_delta_x = final_node_x - node_x;
+        if node_delta_x.abs() > f32::EPSILON {
+            node_x = final_node_x;
+            for item in &mut self.display_list[display_index..] {
+                item.bounds.x += node_delta_x;
+            }
+            for hit in &mut self.hit_regions[subtree_hit_start..] {
+                hit.bounds.x += node_delta_x;
+            }
+            for scroll in &mut self.scroll_regions[subtree_scroll_start..] {
+                scroll.bounds.x += node_delta_x;
             }
         }
 
@@ -509,6 +580,76 @@ fn style_dimension(
         StyleValue::Text(value) => value.parse::<f32>().ok(),
         StyleValue::Bool(_) => None,
     }
+}
+
+fn style_dimension_is_fill(style: &BTreeMap<String, StyleValue>, key: &str) -> bool {
+    matches!(
+        style.get(key),
+        Some(StyleValue::Text(value)) if value.eq_ignore_ascii_case("fill")
+    )
+}
+
+fn preferred_row_child_width(node: &DocumentNode, text: &mut dyn TextMeasurer) -> Option<f32> {
+    let padding = style_edges(&node.style, "padding");
+    let box_size = match node.kind {
+        DocumentNodeKind::Checkbox => {
+            style_spacing(&node.style, "box_size").or_else(|| style_spacing(&node.style, "size"))
+        }
+        DocumentNodeKind::Button | DocumentNodeKind::Stack | DocumentNodeKind::TableCell
+            if node.text.is_none() =>
+        {
+            style_spacing(&node.style, "box_size")
+        }
+        _ => None,
+    };
+    if style_text(&node.style, "width").is_some_and(|value| value.eq_ignore_ascii_case("auto")) {
+        let auto_padding = style_spacing(&node.style, "auto_padding")
+            .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
+        let measured_width = row_child_measurement_text(node)
+            .map(|value| {
+                text.measure_styled(
+                    value,
+                    style_spacing(&node.style, "size").unwrap_or(14.0),
+                    &node.style,
+                )
+                .width
+            })
+            .unwrap_or(0.0);
+        return Some((measured_width + auto_padding + padding.horizontal()).max(1.0));
+    }
+    style_dimension(&node.style, "width", 0.0)
+        .or(box_size)
+        .or_else(|| {
+            row_child_measurement_text(node).map(|value| {
+                let mut measured_width = text
+                    .measure_styled(
+                        value,
+                        style_spacing(&node.style, "size").unwrap_or(14.0),
+                        &node.style,
+                    )
+                    .width;
+                if matches!(node.kind, DocumentNodeKind::Text)
+                    && (node.style.contains_key("relief") || node.style.contains_key("depth"))
+                    && measured_width > 0.0
+                {
+                    measured_width += 8.0;
+                }
+                (measured_width + padding.horizontal()).max(1.0)
+            })
+        })
+}
+
+fn row_child_measurement_text(node: &DocumentNode) -> Option<&str> {
+    node.text
+        .as_ref()
+        .map(|value| value.text.as_str())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            matches!(node.kind, DocumentNodeKind::TextInput)
+                .then(|| style_text(&node.style, "placeholder"))
+                .flatten()
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn constrain_dimension(
@@ -662,6 +803,71 @@ mod tests {
         assert_eq!(fill.bounds.x, 58.0);
         assert_eq!(fill.bounds.width, 242.0);
         assert!(fill.bounds.x + fill.bounds.width <= 300.0);
+    }
+
+    #[test]
+    fn row_multiple_fill_children_share_remaining_width() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut row = DocumentNode::new("row", DocumentNodeKind::Row);
+        row.parent = Some(frame.root.clone());
+        row.style
+            .insert("width".to_owned(), StyleValue::Number(330.0));
+        row.style
+            .insert("height".to_owned(), StyleValue::Number(40.0));
+        row.style.insert("gap".to_owned(), StyleValue::Number(15.0));
+
+        for id in ["left", "middle", "right"] {
+            row.children.push(DocumentNodeId(id.to_owned()));
+            let mut child = DocumentNode::new(id, DocumentNodeKind::Stack);
+            child.parent = Some(row.id.clone());
+            child
+                .style
+                .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+            child
+                .style
+                .insert("height".to_owned(), StyleValue::Number(20.0));
+            frame.nodes.insert(child.id.clone(), child);
+        }
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(row.id.clone());
+        frame.nodes.insert(row.id.clone(), row);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 330.0,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let child = |id: &str| {
+            layout
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == id)
+                .unwrap_or_else(|| panic!("child `{id}` should be laid out"))
+        };
+        let left = child("left");
+        let middle = child("middle");
+        let right = child("right");
+
+        assert_eq!(left.bounds.width, 100.0);
+        assert_eq!(middle.bounds.width, 100.0);
+        assert_eq!(right.bounds.width, 100.0);
+        assert_eq!(middle.bounds.x, 115.0);
+        assert_eq!(right.bounds.x, 230.0);
+        assert!(right.bounds.x + right.bounds.width <= 330.0);
     }
 
     #[test]

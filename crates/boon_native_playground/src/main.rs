@@ -698,12 +698,21 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
                 preview_cursor_icon(&shared.layout_proof, &input_state)
             };
+            let preview_text_input_caret_active = {
+                let shared = poll_shared_render_state
+                    .lock()
+                    .map_err(|_| "preview render state mutex poisoned".to_owned())?;
+                preview_frame_has_active_text_input_caret(
+                    shared.layout_frame_override.as_ref(),
+                    &input_state,
+                )
+            };
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_poll_revision,
                 scheduler_reason,
                 role_dirty_reason,
-                next_wake_after_ms: input_state.focused_node.is_some().then_some(500),
+                next_wake_after_ms: preview_text_input_caret_active.then_some(500),
                 wants_animation_frame: false,
                 cursor_icon,
             })
@@ -14072,10 +14081,26 @@ fn document_function_args_context<'a>(
             continue;
         };
         if let Some(expr) = expressions.get(arg.value) {
-            if document_expr_may_render(arg.value, expressions, context) {
-                scoped.render_args.insert(
-                    name.to_owned(),
-                    AstStatement {
+            let render_statement = if document_expr_may_render(arg.value, expressions, context) {
+                Some(AstStatement {
+                    id: function
+                        .id
+                        .saturating_mul(1000)
+                        .saturating_add(arg.value)
+                        .saturating_add(index),
+                    line: expr.line,
+                    indent: function.indent,
+                    start: expr.start,
+                    end: expr.end,
+                    kind: AstStatementKind::Expression,
+                    expr: Some(arg.value),
+                    children: call_children.to_vec(),
+                })
+            } else {
+                call_children
+                    .iter()
+                    .any(|child| document_statement_may_render(child, expressions, context))
+                    .then(|| AstStatement {
                         id: function
                             .id
                             .saturating_mul(1000)
@@ -14088,8 +14113,10 @@ fn document_function_args_context<'a>(
                         kind: AstStatementKind::Expression,
                         expr: Some(arg.value),
                         children: call_children.to_vec(),
-                    },
-                );
+                    })
+            };
+            if let Some(render_statement) = render_statement {
+                scoped.render_args.insert(name.to_owned(), render_statement);
                 continue;
             }
             let value = document_eval_expr_value(expr, expressions, context)
@@ -14128,6 +14155,20 @@ fn document_function_args_context<'a>(
         }
     }
     scoped
+}
+
+fn document_statement_may_render(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> bool {
+    statement
+        .expr
+        .is_some_and(|expr_id| document_expr_may_render(expr_id, expressions, context))
+        || statement
+            .children
+            .iter()
+            .any(|child| document_statement_may_render(child, expressions, context))
 }
 
 fn document_function_item_context<'a>(
@@ -14808,6 +14849,36 @@ fn lower_canonical_child_elements(
             continue;
         }
         let field = document_field_name(child);
+        if let Some(input_expr_id) = child
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .and_then(document_when_input_expr_id)
+            && document_expr_depends_on_delimiter(input_expr_id, expressions)
+            && let Some(base_input) = statement.expr
+            && let Some(selector) = document_eval_expr_value_with_delimited_input(
+                input_expr_id,
+                base_input,
+                expressions,
+                context,
+            )
+            && lower_canonical_conditional_render_entry_with_input(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+                Some(input_expr_id),
+                Some(selector),
+            )
+        {
+            continue;
+        }
         if matches!(field.as_deref(), Some("items" | "children"))
             && lower_mapped_document_children(
                 child,
@@ -15289,6 +15360,36 @@ fn lower_canonical_sibling_condition_children(
     scope_key: &str,
 ) {
     for (index, child) in statement.children.iter().enumerate() {
+        if let Some(input_expr_id) = child
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .and_then(document_when_input_expr_id)
+            && document_expr_depends_on_delimiter(input_expr_id, expressions)
+            && let Some(base_input) = statement.expr
+            && let Some(selector) = document_eval_expr_value_with_delimited_input(
+                input_expr_id,
+                base_input,
+                expressions,
+                context,
+            )
+            && lower_canonical_conditional_render_entry_with_input(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+                Some(input_expr_id),
+                Some(selector),
+            )
+        {
+            continue;
+        }
         if document_conditional_input_is_delimiter(child, expressions)
             && let Some(input_expr_id) = statement.children[..index]
                 .iter()
@@ -16971,6 +17072,14 @@ fn document_text_or_nested_text(
         })
         .or_else(|| {
             statement.children.iter().find_map(|child| {
+                let expr = expressions.get(child.expr?)?;
+                document_when_input_expr_id(expr)?;
+                document_text_value(child, expressions, context, false)
+                    .filter(|text| !text.is_empty())
+            })
+        })
+        .or_else(|| {
+            statement.children.iter().find_map(|child| {
                 child.expr?;
                 document_text_value(child, expressions, context, false)
                     .filter(|text| !text.is_empty())
@@ -17823,6 +17932,14 @@ fn document_text_value(
     template: bool,
 ) -> Option<String> {
     let expr = expressions.get(statement.expr?)?;
+    if let Some(resolved) = document_eval_chained_statement_value(statement, expressions, context) {
+        let text = json_value_to_document_text(&resolved);
+        return Some(if text.contains('{') && text.contains('}') {
+            document_resolved_template(&text, context)
+        } else {
+            text
+        });
+    }
     if let Some(input) = document_when_input_expr_id(expr)
         && let Some(resolved) = document_eval_while_expr_value(
             input,
@@ -17875,6 +17992,51 @@ fn document_text_value(
             .map(|value| json_value_to_document_text(&value))
             .or_else(|| document_expr_value(expr, expressions)),
     }
+}
+
+fn document_eval_chained_statement_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let mut current =
+        document_eval_expr_value(expressions.get(statement.expr?)?, expressions, context)?;
+    let mut advanced = false;
+    for child in &statement.children {
+        let Some(expr_id) = child.expr else {
+            continue;
+        };
+        let Some(expr) = expressions.get(expr_id) else {
+            continue;
+        };
+        match &expr.kind {
+            AstExprKind::Pipe { input, op, args }
+                if expressions
+                    .get(*input)
+                    .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter)) =>
+            {
+                current =
+                    document_eval_pipe_value_from_input(current, op, args, expressions, context)?;
+                advanced = true;
+            }
+            AstExprKind::When { input }
+                if expressions
+                    .get(*input)
+                    .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter)) =>
+            {
+                current = document_eval_while_selector_value(
+                    current,
+                    child.children.as_slice(),
+                    expressions,
+                    context,
+                )?;
+                advanced = true;
+            }
+            AstExprKind::Delimiter => {}
+            _ => {}
+        }
+    }
+    advanced.then_some(current)
 }
 
 fn document_bool_value(
@@ -18006,6 +18168,38 @@ fn document_eval_while_expr_value(
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
     let selector = document_eval_expr_value(expressions.get(input_expr_id)?, expressions, context)?;
+    document_eval_while_selector_value(selector, arms, expressions, context)
+}
+
+fn document_eval_while_selector_value(
+    selector: Value,
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let has_match_arm = arms.iter().any(|arm| {
+        arm.expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
+    });
+    if !has_match_arm && !arms.is_empty() {
+        let mut locals = context.locals.clone();
+        locals.insert("count".to_owned(), selector.clone());
+        locals.insert("value".to_owned(), selector.clone());
+        locals.insert("it".to_owned(), selector);
+        let scoped = DocumentEvalContext {
+            root: context.root,
+            locals,
+            render_args: context.render_args.clone(),
+            passed: context.passed.clone(),
+            source_binding_index: Arc::clone(&context.source_binding_index),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
+        };
+        return document_eval_statement_sequence(arms, expressions, &scoped);
+    }
     for arm in arms {
         let expr = expressions.get(arm.expr?)?;
         let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
@@ -18014,6 +18208,25 @@ fn document_eval_while_expr_value(
         if !document_match_pattern_matches_value(pattern, &selector) {
             continue;
         }
+        let branch_context;
+        let context = if let Some(binding) = document_match_pattern_binding(pattern) {
+            let mut locals = context.locals.clone();
+            locals.insert(binding.to_owned(), selector.clone());
+            branch_context = DocumentEvalContext {
+                root: context.root,
+                locals,
+                render_args: context.render_args.clone(),
+                passed: context.passed.clone(),
+                source_binding_index: Arc::clone(&context.source_binding_index),
+                source_override: context.source_override.clone(),
+                functions: context.functions,
+                eval_depth: context.eval_depth,
+                eval_cache: Arc::clone(&context.eval_cache),
+            };
+            &branch_context
+        } else {
+            context
+        };
         if let Some(output) = output.and_then(|expr_id| expressions.get(expr_id))
             && let Some(value) = document_eval_expr_value(output, expressions, context)
                 .or_else(|| document_expr_value(output, expressions).map(Value::String))
@@ -18023,6 +18236,16 @@ fn document_eval_while_expr_value(
         return document_eval_statement_sequence(&arm.children, expressions, context);
     }
     None
+}
+
+fn document_match_pattern_binding(pattern: &[String]) -> Option<&str> {
+    let [single] = pattern else {
+        return None;
+    };
+    let first = single.chars().next()?;
+    (first == '_' || first.is_ascii_lowercase())
+        .then_some(single.as_str())
+        .filter(|value| *value != "__")
 }
 
 fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bool {
@@ -18038,6 +18261,7 @@ fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bo
             Value::String(value) => value == "False",
             _ => false,
         },
+        [single] if document_match_pattern_binding(pattern).is_some() => true,
         [single] => match value {
             Value::String(value) => {
                 value == single
@@ -18070,9 +18294,12 @@ fn document_eval_expr_value(
                 Some(Value::String(value.clone()))
             }
         }
-        AstExprKind::TextLiteral(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
-            Some(Value::String(value.clone()))
-        }
+        AstExprKind::TextLiteral(value) => Some(Value::String(if value.contains('{') {
+            document_resolved_template(value, context)
+        } else {
+            value.clone()
+        })),
+        AstExprKind::Enum(value) | AstExprKind::Tag(value) => Some(Value::String(value.clone())),
         AstExprKind::Number(value) => value.parse::<f64>().ok().map(|value| json!(value)),
         AstExprKind::Bool(value) => Some(Value::Bool(*value)),
         AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
@@ -18163,17 +18390,20 @@ fn document_builtin_value_call(
                 }
             ))
         }
-        "Theme/corners" => {
-            Some(json!(
-                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                    "Touch" => 2.0,
-                    "Comfort" => 4.0,
-                    "Soft" => 6.0,
-                    "Pill" | "Fully" => 999.0,
-                    _ => 0.0,
-                }
-            ))
-        }
+        "Theme/corners" => Some(json!(match (
+            document_theme_name(context),
+            document_call_arg_text(args, "of", expressions, context)?.as_str()
+        ) {
+            ("Neobrutalism", "Pill" | "Fully") => 2.0,
+            ("Neobrutalism", _) => 0.0,
+            ("Neumorphism", "Touch") => 10.0,
+            ("Neumorphism", "Comfort" | "Soft") => 12.0,
+            (_, "Touch") => 2.0,
+            (_, "Comfort") => 4.0,
+            (_, "Soft") => 6.0,
+            (_, "Pill" | "Fully") => 999.0,
+            _ => 0.0,
+        })),
         "Theme/sizing" => Some(json!(
             match document_call_arg_text(args, "of", expressions, context)?.as_str() {
                 "TouchTarget" => 40.0,
@@ -18240,20 +18470,42 @@ fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
     }
 }
 
+fn document_theme_name(context: &DocumentEvalContext<'_>) -> &'static str {
+    match document_resolved_value("PASSED.theme_options.name", context)
+        .and_then(Value::as_str)
+        .unwrap_or("Professional")
+    {
+        "Glassmorphism" => "Glassmorphism",
+        "Neobrutalism" => "Neobrutalism",
+        "Neumorphism" => "Neumorphism",
+        _ => "Professional",
+    }
+}
+
 fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'static str {
-    match (document_theme_mode(context), role) {
-        ("Light", "text") => "Oklch[lightness:0.42]",
-        ("Light", "text_secondary") => "Oklch[lightness:0.57]",
-        ("Light", "text_tertiary") => "Oklch[lightness:0.75]",
-        ("Light", "text_disabled") => "Oklch[lightness:0.75]",
-        ("Light", "text_header") => "Oklch[lightness:0.54,chroma:0.156,hue:21.24]",
-        ("Light", "danger") => "Oklch[lightness:0.6,chroma:0.109,hue:18.87]",
-        ("Dark", "text") => "Oklch[lightness:0.9]",
-        ("Dark", "text_secondary") => "Oklch[lightness:0.75]",
-        ("Dark", "text_tertiary") => "Oklch[lightness:0.65]",
-        ("Dark", "text_disabled") => "Oklch[lightness:0.5]",
-        ("Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.165,hue:25.36]",
-        ("Dark", "danger") => "Oklch[lightness:0.7,chroma:0.12,hue:18.87]",
+    match (
+        document_theme_name(context),
+        document_theme_mode(context),
+        role,
+    ) {
+        ("Glassmorphism", "Light", "text_header") => "Oklch[lightness:0.62,chroma:0.14,hue:250]",
+        ("Glassmorphism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.12,hue:250]",
+        ("Neobrutalism", "Light", "text_header") => "Oklch[lightness:0.55,chroma:0.18,hue:35]",
+        ("Neobrutalism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.18,hue:80]",
+        ("Neumorphism", "Light", "text_header") => "Oklch[lightness:0.52,chroma:0.08,hue:210]",
+        ("Neumorphism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.08,hue:210]",
+        (_, "Light", "text") => "Oklch[lightness:0.42]",
+        (_, "Light", "text_secondary") => "Oklch[lightness:0.57]",
+        (_, "Light", "text_tertiary") => "Oklch[lightness:0.75]",
+        (_, "Light", "text_disabled") => "Oklch[lightness:0.75]",
+        (_, "Light", "text_header") => "Oklch[lightness:0.54,chroma:0.156,hue:21.24]",
+        (_, "Light", "danger") => "Oklch[lightness:0.6,chroma:0.109,hue:18.87]",
+        (_, "Dark", "text") => "Oklch[lightness:0.9]",
+        (_, "Dark", "text_secondary") => "Oklch[lightness:0.75]",
+        (_, "Dark", "text_tertiary") => "Oklch[lightness:0.65]",
+        (_, "Dark", "text_disabled") => "Oklch[lightness:0.5]",
+        (_, "Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.165,hue:25.36]",
+        (_, "Dark", "danger") => "Oklch[lightness:0.7,chroma:0.12,hue:18.87]",
         _ => "Oklch[lightness:0.42]",
     }
 }
@@ -18340,21 +18592,44 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
 fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
     let light = document_theme_mode(context) == "Light";
-    let color = match tagged {
-        "Background" if light => "Oklch[lightness:0.96,chroma:0.01,hue:220]",
-        "Background" => "Oklch[lightness:0.08,chroma:0.005,hue:220]",
-        "Surface" if light => "Oklch[lightness:1]",
-        "Surface" => "Oklch[lightness:0.15]",
-        "SurfaceVariant" if light => "Oklch[lightness:0.985]",
-        "SurfaceVariant" => "Oklch[lightness:0.18]",
-        "SurfaceElevated" if light => "Oklch[lightness:0.99]",
-        "SurfaceElevated" => "Oklch[lightness:0.22]",
-        "Primary" if light => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
-        "Primary" => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
-        "PrimarySubtle" if light => "Oklch[lightness:0.98,chroma:0.01,hue:25.36]",
-        "PrimarySubtle" => "Oklch[lightness:0.25,chroma:0.08,hue:25.36]",
-        "Danger" if light => "Oklch[lightness:0.8,chroma:0.109,hue:18.87]",
-        "Danger" => "Oklch[lightness:0.8,chroma:0.12,hue:18.87]",
+    let color = match (document_theme_name(context), tagged, light) {
+        ("Glassmorphism", "Background", true) => "Oklch[lightness:0.94,chroma:0.035,hue:250]",
+        ("Glassmorphism", "Background", false) => "Oklch[lightness:0.10,chroma:0.025,hue:250]",
+        ("Glassmorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
+            "Oklch[lightness:0.985,chroma:0.025,hue:250]"
+        }
+        ("Glassmorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
+            "Oklch[lightness:0.20,chroma:0.035,hue:250]"
+        }
+        ("Neobrutalism", "Background", true) => "Oklch[lightness:0.93,chroma:0.05,hue:90]",
+        ("Neobrutalism", "Background", false) => "Oklch[lightness:0.11,chroma:0.04,hue:90]",
+        ("Neobrutalism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
+            "Oklch[lightness:0.97,chroma:0.045,hue:75]"
+        }
+        ("Neobrutalism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
+            "Oklch[lightness:0.18,chroma:0.045,hue:75]"
+        }
+        ("Neumorphism", "Background", true) => "Oklch[lightness:0.92,chroma:0.015,hue:210]",
+        ("Neumorphism", "Background", false) => "Oklch[lightness:0.09,chroma:0.012,hue:210]",
+        ("Neumorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
+            "Oklch[lightness:0.94,chroma:0.012,hue:210]"
+        }
+        ("Neumorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
+            "Oklch[lightness:0.17,chroma:0.018,hue:210]"
+        }
+        (_, "Background", true) => "Oklch[lightness:0.96,chroma:0.01,hue:220]",
+        (_, "Background", false) => "Oklch[lightness:0.08,chroma:0.005,hue:220]",
+        (_, "Surface", true) => "Oklch[lightness:1]",
+        (_, "Surface", false) => "Oklch[lightness:0.15]",
+        (_, "SurfaceVariant", true) => "Oklch[lightness:0.985]",
+        (_, "SurfaceVariant", false) => "Oklch[lightness:0.18]",
+        (_, "SurfaceElevated", true) => "Oklch[lightness:0.99]",
+        (_, "SurfaceElevated", false) => "Oklch[lightness:0.22]",
+        (_, "Primary", _) => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
+        (_, "PrimarySubtle", true) => "Oklch[lightness:0.98,chroma:0.01,hue:25.36]",
+        (_, "PrimarySubtle", false) => "Oklch[lightness:0.25,chroma:0.08,hue:25.36]",
+        (_, "Danger", true) => "Oklch[lightness:0.8,chroma:0.109,hue:18.87]",
+        (_, "Danger", false) => "Oklch[lightness:0.8,chroma:0.12,hue:18.87]",
         _ if light => "Oklch[lightness:0.985]",
         _ => "Oklch[lightness:0.18]",
     };
@@ -18383,26 +18658,68 @@ fn document_eval_expr_value_with_delimited_input(
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
     let expr = expressions.get(expr_id)?;
-    let AstExprKind::Pipe { input, op, args } = &expr.kind else {
-        return document_eval_expr_value(expr, expressions, context);
-    };
-    if !matches!(
-        expressions.get(*input).map(|expr| &expr.kind),
-        Some(AstExprKind::Delimiter)
-    ) {
-        return document_eval_expr_value(expr, expressions, context);
+    match &expr.kind {
+        AstExprKind::Pipe { input, op, args } => {
+            let input = if matches!(
+                expressions.get(*input).map(|expr| &expr.kind),
+                Some(AstExprKind::Delimiter)
+            ) {
+                document_eval_expr_value(expressions.get(input_override)?, expressions, context)?
+            } else if document_expr_depends_on_delimiter(*input, expressions) {
+                document_eval_expr_value_with_delimited_input(
+                    *input,
+                    input_override,
+                    expressions,
+                    context,
+                )?
+            } else {
+                document_eval_expr_value(expressions.get(*input)?, expressions, context)?
+            };
+            document_eval_pipe_value_from_input(input, op, args, expressions, context)
+        }
+        _ => document_eval_expr_value(expr, expressions, context),
     }
-    let input = document_eval_expr_value(expressions.get(input_override)?, expressions, context)?;
-    document_eval_pipe_value_from_input(input, op, args, expressions, context)
+}
+
+fn document_expr_depends_on_delimiter(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    match expressions.get(expr_id).map(|expr| &expr.kind) {
+        Some(AstExprKind::Delimiter) => true,
+        Some(AstExprKind::Pipe { input, args, .. }) => {
+            document_expr_depends_on_delimiter(*input, expressions)
+                || args
+                    .iter()
+                    .any(|arg| document_expr_depends_on_delimiter(arg.value, expressions))
+        }
+        Some(AstExprKind::When { input }) => {
+            document_expr_depends_on_delimiter(*input, expressions)
+        }
+        Some(AstExprKind::Then { input, output }) => {
+            document_expr_depends_on_delimiter(*input, expressions)
+                || output
+                    .is_some_and(|output| document_expr_depends_on_delimiter(output, expressions))
+        }
+        Some(AstExprKind::Infix { left, right, .. }) => {
+            document_expr_depends_on_delimiter(*left, expressions)
+                || document_expr_depends_on_delimiter(*right, expressions)
+        }
+        _ => false,
+    }
 }
 
 fn document_eval_pipe_value_from_input(
-    input: Value,
+    mut input: Value,
     op: &str,
     args: &[AstCallArg],
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
+    if matches!(
+        op,
+        "List/is_not_empty" | "List/count" | "List/retain" | "List/any" | "List/every" | "List/map"
+    ) && let Some(todos) = input.as_object().and_then(|object| object.get("todos"))
+    {
+        input = todos.clone();
+    }
     if let Some(field) = op.strip_prefix("Field/") {
         return input
             .as_object()
@@ -18822,12 +19139,24 @@ fn document_resolved_template(raw: &str, context: &DocumentEvalContext<'_>) -> S
         rendered.push_str(
             &document_resolved_value(key.trim(), context)
                 .map(json_value_to_document_text)
+                .or_else(|| document_template_fallback_value(key.trim(), context))
                 .unwrap_or_else(|| key.trim().to_owned()),
         );
         remaining = &tail[close + 1..];
     }
     rendered.push_str(remaining);
     rendered
+}
+
+fn document_template_fallback_value(
+    key: &str,
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    if key == "maybe_s" {
+        let count = document_resolved_value("count", context)?.as_i64()?;
+        return Some((count != 1).then_some("s").unwrap_or("").to_owned());
+    }
+    None
 }
 
 fn document_resolved_value<'a>(
@@ -19853,19 +20182,32 @@ fn preview_apply_focus_overlay(
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
-    let focused_node = input_state.focused_node.as_deref();
-    if focused_node.is_none() && shared.layout_frame_override.is_none() {
-        return Ok(false);
-    }
     let mut changed = false;
     if shared.layout_frame_override.is_none() {
-        shared.layout_frame_override = Some(layout_frame_from_layout_proof(&shared.layout_proof)?);
+        let frame = layout_frame_from_layout_proof(&shared.layout_proof)?;
+        if input_state.focused_node.is_none()
+            && !frame
+                .display_list
+                .iter()
+                .any(display_item_declares_text_input_focus)
+        {
+            return Ok(false);
+        }
+        shared.layout_frame_override = Some(frame);
         changed = true;
     }
-    let resolved_focused_node = preview_resolved_focused_node(&shared.layout_proof, input_state);
+    let runtime_resolved_focused_node =
+        preview_resolved_focused_node(&shared.layout_proof, input_state);
     let Some(frame) = shared.layout_frame_override.as_mut() else {
         return Ok(false);
     };
+    let resolved_focused_node = runtime_resolved_focused_node.or_else(|| {
+        frame
+            .display_list
+            .iter()
+            .find(|item| display_item_declares_text_input_focus(item))
+            .map(|item| item.node.0.clone())
+    });
     for item in &mut frame.display_list {
         let next_focused = resolved_focused_node.as_deref() == Some(item.node.0.as_str());
         if item.focused != next_focused {
@@ -19884,15 +20226,21 @@ fn preview_apply_focus_overlay(
             changed = true;
         }
         if item.focused && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            if !input_state.replace_focused_text_on_next_edit {
+            if input_state.focused_node.is_some() && !input_state.replace_focused_text_on_next_edit
+            {
                 let next_text = Some(input_state.focused_text.clone());
                 if item.text != next_text {
                     item.text = next_text;
                     changed = true;
                 }
             }
-            let caret_column =
-                boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64);
+            let caret_column = boon_document_model::StyleValue::Number(
+                input_state
+                    .focused_node
+                    .as_ref()
+                    .map(|_| input_state.focused_caret_index as f64)
+                    .unwrap_or(0.0),
+            );
             if item
                 .style
                 .insert("caret_column".to_owned(), caret_column.clone())
@@ -19916,6 +20264,27 @@ fn preview_apply_focus_overlay(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn display_item_declares_text_input_focus(item: &boon_document::DisplayItem) -> bool {
+    matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+        && matches!(
+            item.style.get("focus"),
+            Some(boon_document_model::StyleValue::Bool(true))
+        )
+}
+
+fn preview_frame_has_active_text_input_caret(
+    frame: Option<&boon_document::LayoutFrame>,
+    input_state: &PreviewNativeInputState,
+) -> bool {
+    input_state.focused_node.is_some()
+        || frame.is_some_and(|frame| {
+            frame.display_list.iter().any(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && (item.focused || display_item_declares_text_input_focus(item))
+            })
+        })
 }
 
 fn preview_update_hover_from_input(
@@ -24529,6 +24898,200 @@ mod tests {
             empty_source_paths, 0,
             "physical source lowering must not fabricate empty source paths"
         );
+    }
+
+    #[test]
+    fn physical_todomvc_active_count_text_lowers_full_label() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let state = json!({
+            "store": {
+                "elements": {
+                    "filter_buttons": {},
+                    "theme_switcher": {}
+                },
+                "selected_filter": "All",
+                "selected_todo_id": null,
+                "title_to_save": null,
+                "todos": [
+                    {"id": "todo-1", "title": "Active", "completed": false, "edited_title": "", "todo_elements": {}},
+                    {"id": "todo-2", "title": "Completed", "completed": true, "edited_title": "", "todo_elements": {}}
+                ]
+            },
+            "theme_options": {
+                "name": "Professional",
+                "mode": "Light"
+            }
+        });
+        fn find_text_field<'a>(statement: &'a AstStatement) -> Option<&'a AstStatement> {
+            if document_field_name(statement).as_deref() == Some("text") {
+                return Some(statement);
+            }
+            statement.children.iter().find_map(find_text_field)
+        }
+        let parsed = boon_parser::parse_source(source_path.display().to_string(), source.clone())
+            .expect("physical source should parse");
+        let functions =
+            DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
+        let active_count_function = functions
+            .get("active_items_count_text")
+            .expect("active count function should exist");
+        let context = DocumentEvalContext {
+            root: Some(&state),
+            locals: BTreeMap::new(),
+            render_args: BTreeMap::new(),
+            passed: Some(state.clone()),
+            source_binding_index: Arc::new(BTreeMap::new()),
+            source_override: None,
+            functions: Some(&functions),
+            eval_depth: 0,
+            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let text_statement =
+            find_text_field(active_count_function).expect("active count text field should exist");
+        assert_eq!(
+            document_text_value(text_statement, &parsed.ast.expressions, &context, false)
+                .as_deref(),
+            Some("1 item left")
+        );
+        let (_, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("physical TodoMVC layout should lower with seeded active count");
+        let labels = layout
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            labels.iter().any(|label| label == "1 item left"),
+            "active count should render the full label, labels={labels:?}"
+        );
+    }
+
+    #[test]
+    fn physical_todomvc_panel_footer_filters_stay_inside_panel() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let state = json!({
+            "store": {
+                "elements": {
+                    "filter_buttons": {
+                        "all": "store.elements.filter_buttons.all",
+                        "active": "store.elements.filter_buttons.active",
+                        "completed": "store.elements.filter_buttons.completed"
+                    },
+                    "remove_completed_button": "store.elements.remove_completed_button",
+                    "toggle_all_checkbox": "store.elements.toggle_all_checkbox",
+                    "new_todo_title_text_input": "store.elements.new_todo_title_text_input",
+                    "theme_switcher": {
+                        "professional": "store.elements.theme_switcher.professional",
+                        "glassmorphism": "store.elements.theme_switcher.glassmorphism",
+                        "neobrutalism": "store.elements.theme_switcher.neobrutalism",
+                        "neumorphism": "store.elements.theme_switcher.neumorphism",
+                        "mode_toggle": "store.elements.theme_switcher.mode_toggle"
+                    }
+                },
+                "selected_filter": "All",
+                "selected_todo_id": null,
+                "title_to_save": null,
+                "todos": [
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-1.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-1.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-1.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-1.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-1",
+                        "title": "Active physical todo",
+                        "completed": false,
+                        "edited_title": ""
+                    },
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-2.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-2.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-2.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-2.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-2",
+                        "title": "Completed physical todo",
+                        "completed": true,
+                        "edited_title": ""
+                    }
+                ]
+            },
+            "theme_options": {
+                "name": "Professional",
+                "mode": "Light"
+            }
+        });
+        let (_, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("physical TodoMVC layout should lower with seeded footer controls");
+
+        let text_item = |label: &str| {
+            layout
+                .display_list
+                .iter()
+                .find(|item| item.text.as_deref() == Some(label))
+                .unwrap_or_else(|| {
+                    let labels = layout
+                        .display_list
+                        .iter()
+                        .filter_map(|item| item.text.as_deref())
+                        .collect::<Vec<_>>();
+                    panic!("physical TodoMVC text `{label}` should render; labels={labels:?}")
+                })
+        };
+        let text_button = |label: &str| {
+            let text = text_item(label);
+            layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                        && item.bounds.x <= text.bounds.x + 0.5
+                        && item.bounds.y <= text.bounds.y + 0.5
+                        && item.bounds.x + item.bounds.width
+                            >= text.bounds.x + text.bounds.width - 0.5
+                        && item.bounds.y + item.bounds.height
+                            >= text.bounds.y + text.bounds.height - 0.5
+                })
+                .unwrap_or_else(|| panic!("button `{label}` should contain its label bounds"))
+        };
+        let input = layout
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .expect("physical new-todo input should define the panel width");
+        let panel_left = input.bounds.x;
+        let panel_right = input.bounds.x + input.bounds.width;
+        let active_count = text_item("1 item left");
+        assert!(
+            active_count.bounds.x >= panel_left
+                && active_count.bounds.x + active_count.bounds.width <= panel_right,
+            "active count should stay inside the main panel"
+        );
+
+        for label in ["All", "Active", "Completed", "Clear completed"] {
+            let button = text_button(label);
+            assert!(
+                button.bounds.x >= panel_left - 0.5,
+                "footer button `{label}` should not escape left of the panel"
+            );
+            assert!(
+                button.bounds.x + button.bounds.width <= panel_right + 0.5,
+                "footer button `{label}` should not escape right of the panel: button={:?}, panel=({panel_left}, {panel_right})",
+                button.bounds
+            );
+            assert!(
+                (text_item(label).bounds.y - active_count.bounds.y).abs() <= 10.0,
+                "footer label `{label}` should share the active-count text row"
+            );
+        }
     }
 
     #[test]

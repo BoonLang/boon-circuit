@@ -290,6 +290,9 @@ impl LayoutBuilder<'_, '_> {
             let content_width = (width - padding.horizontal()).max(1.0);
             match node.kind {
                 DocumentNodeKind::Row => {
+                    let display_start = self.display_list.len();
+                    let hit_start = self.hit_regions.len();
+                    let scroll_start = self.scroll_regions.len();
                     let mut cursor_x = content_x;
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
@@ -298,6 +301,21 @@ impl LayoutBuilder<'_, '_> {
                             self.layout_node(child, cursor_x, content_y, child_available_width);
                         cursor_x += child_rect.width + gap;
                         max_child_height = max_child_height.max(child_rect.height);
+                    }
+                    if style_bool(&node.style, "center").unwrap_or(false) {
+                        let total_child_width = (cursor_x - content_x - gap).max(0.0);
+                        let offset_x = ((content_width - total_child_width) / 2.0).max(0.0);
+                        if offset_x > f32::EPSILON {
+                            for item in &mut self.display_list[display_start..] {
+                                item.bounds.x += offset_x;
+                            }
+                            for hit in &mut self.hit_regions[hit_start..] {
+                                hit.bounds.x += offset_x;
+                            }
+                            for scroll in &mut self.scroll_regions[scroll_start..] {
+                                scroll.bounds.x += offset_x;
+                            }
+                        }
                     }
                     if explicit_height.is_none() {
                         height = (max_child_height + padding.vertical()).max(24.0);

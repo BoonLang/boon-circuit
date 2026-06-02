@@ -642,25 +642,15 @@ FUNCTION todo_info() {
 }
 
 FUNCTION todo_info_author() {
-    Element/stripe(
+    Element/paragraph(
         element: []
-        direction: Row
-        gap: 3
-        style: [width: Fill, height: 15, background: [color: Oklch[lightness:0.97]]]
-        items: LIST {
-            Element/container(
-                element: []
-                style: [width: 205, height: 15, background: [color: Oklch[lightness:0.97]]]
-                child: Text/empty()
-            )
-            Element/label(
-                element: []
-                style: [width: 60, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]]]
-                label: TEXT { Created by }
-            )
+        style: [width: Fill, height: 15, align: [row: Center], background: [color: Oklch[lightness:0.97]]]
+        contents: LIST {
+            TEXT { Created by }
+            Text/space()
             Element/link(
                 element: [hovered: True]
-                style: [width: 76, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
+                style: [width: Auto, auto_padding: 0, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
                 label: TEXT { Martin Kavík }
                 to: TEXT { https://kavik.cz/ }
             )
@@ -669,25 +659,15 @@ FUNCTION todo_info_author() {
 }
 
 FUNCTION todo_info_reference() {
-    Element/stripe(
+    Element/paragraph(
         element: []
-        direction: Row
-        gap: 3
-        style: [width: Fill, height: 15, background: [color: Oklch[lightness:0.97]]]
-        items: LIST {
-            Element/container(
-                element: []
-                style: [width: 225, height: 15, background: [color: Oklch[lightness:0.97]]]
-                child: Text/empty()
-            )
-            Element/label(
-                element: []
-                style: [width: 45, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]]]
-                label: TEXT { Part of }
-            )
+        style: [width: Fill, height: 15, align: [row: Center], background: [color: Oklch[lightness:0.97]]]
+        contents: LIST {
+            TEXT { Part of }
+            Text/space()
             Element/link(
                 element: [hovered: True]
-                style: [width: 52, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
+                style: [width: Auto, auto_padding: 0, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
                 label: TEXT { TodoMVC }
                 to: TEXT { http://todomvc.com }
             )

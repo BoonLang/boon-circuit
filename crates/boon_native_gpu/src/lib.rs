@@ -1370,7 +1370,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
         let rich_spans = rich_text_spans(&item.style, &text, color);
         runs.push(TextRun {
             node: item.node.clone(),
-            bounds: item.bounds,
+            bounds: text_content_bounds_for_item(item),
             text,
             rich_spans,
             font_family: font_family.to_owned(),
@@ -1772,12 +1772,17 @@ fn text_render_top_for_parts(
     text_inset: f32,
     vertical_align: TextVerticalAlign,
 ) -> f32 {
-    let line_top = text_top_for_parts(bounds, line_height, text_inset, vertical_align);
-    if !matches!(vertical_align, TextVerticalAlign::Center) {
-        return line_top;
+    text_top_for_parts(bounds, line_height, text_inset, vertical_align)
+}
+
+fn text_content_bounds_for_item(item: &DisplayItem) -> Rect {
+    let padding = style_edges(&item.style, "padding");
+    Rect {
+        x: item.bounds.x + padding.left,
+        y: item.bounds.y + padding.top,
+        width: (item.bounds.width - padding.horizontal()).max(1.0),
+        height: (item.bounds.height - padding.vertical()).max(1.0),
     }
-    let optical_offset = (line_height * 0.15).min(bounds.height.max(1.0) * 0.09);
-    line_top + optical_offset
 }
 
 fn strikethrough_rect_for_item(
@@ -2293,6 +2298,7 @@ fn rect_vertices(
             && (item.focused || style_bool(&item.style, "focus") == Some(true))
             && style_bool(&item.style, "caret_visible").unwrap_or(true)
         {
+            let text_bounds = text_content_bounds_for_item(item);
             let color = style_color_f32(&item.style, "caret_color")
                 .or_else(|| style_color_f32(&item.style, "color"))
                 .unwrap_or([0.22, 0.22, 0.22, 1.0]);
@@ -2300,13 +2306,13 @@ fn rect_vertices(
             let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
             let vertical_align = text_vertical_align(&item.kind, &item.style);
             let line_height =
-                style_line_height(&item.style, font_size).min(item.bounds.height.max(1.0));
-            let line_top = text_top_for_parts(item.bounds, line_height, text_inset, vertical_align);
+                style_line_height(&item.style, font_size).min(text_bounds.height.max(1.0));
+            let line_top = text_top_for_parts(text_bounds, line_height, text_inset, vertical_align);
             let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
             let caret_x = text_layouts
                 .and_then(|layouts| layouts.get(&item.node))
                 .map(|layout| layout.x_for_column(caret_column.max(0.0)))
-                .unwrap_or(item.bounds.x + text_inset);
+                .unwrap_or(text_bounds.x + text_inset);
             push_rect(
                 &mut positions,
                 &mut colors,
@@ -2589,7 +2595,7 @@ fn push_shadows(
     height: f32,
     style: &StyleMap,
 ) {
-    for index in 1..=6 {
+    for index in (1..=6).rev() {
         let color_key = format!("box_shadow_{index}_color");
         let Some(color) = style_color_f32(style, &color_key) else {
             continue;
@@ -2656,6 +2662,34 @@ fn push_shadows(
                 );
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeSpacing {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+impl EdgeSpacing {
+    fn horizontal(self) -> f32 {
+        self.left + self.right
+    }
+
+    fn vertical(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+fn style_edges(style: &StyleMap, prefix: &str) -> EdgeSpacing {
+    let all = style_number(style, prefix).unwrap_or(0.0);
+    EdgeSpacing {
+        top: style_number(style, &format!("{prefix}_top")).unwrap_or(all),
+        right: style_number(style, &format!("{prefix}_right")).unwrap_or(all),
+        bottom: style_number(style, &format!("{prefix}_bottom")).unwrap_or(all),
+        left: style_number(style, &format!("{prefix}_left")).unwrap_or(all),
     }
 }
 
@@ -3558,11 +3592,11 @@ mod tests {
         );
         assert!((line_box_top - 30.0).abs() <= 0.5);
         assert!(
-            (top - 33.0).abs() <= 0.5,
-            "centered glyph paint should get a small downward optical correction, top={top}"
+            (top - 30.0).abs() <= 0.5,
+            "centered glyph paint should use the line-box top without an optical offset, top={top}"
         );
         assert_eq!(
-            paint_top, 33.0,
+            paint_top, 30.0,
             "centered glyph paint origin should snap to whole pixels"
         );
     }
@@ -3645,6 +3679,47 @@ mod tests {
         assert!(y_bottom <= source.y + source.height + 5.5);
         assert!((x_left - (source.x + 3.0)).abs() <= 0.5);
         assert!((x_right - (source.x + source.width - 3.0)).abs() <= 0.5);
+    }
+
+    #[test]
+    fn css_shadow_list_order_paints_first_shadow_topmost() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "box_shadow_1_color".to_owned(),
+            StyleValue::Text("#ff0000".to_owned()),
+        );
+        style.insert("box_shadow_1_y".to_owned(), StyleValue::Number(1.0));
+        style.insert(
+            "box_shadow_2_color".to_owned(),
+            StyleValue::Text("#00ff00".to_owned()),
+        );
+        style.insert("box_shadow_2_y".to_owned(), StyleValue::Number(2.0));
+        let mut positions = Vec::new();
+        let mut colors = Vec::new();
+        push_shadows(
+            &mut positions,
+            &mut colors,
+            Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            160.0,
+            120.0,
+            &style,
+        );
+
+        assert_eq!(
+            colors.chunks_exact(4).next().unwrap(),
+            &[0, 255, 0, 255],
+            "later CSS shadows should be emitted first as the back layer"
+        );
+        assert_eq!(
+            colors.chunks_exact(4).last().unwrap(),
+            &[255, 0, 0, 255],
+            "the first CSS shadow should be emitted last so it remains topmost"
+        );
     }
 
     #[test]
@@ -4146,12 +4221,12 @@ mod tests {
             "input line box top should stay geometrically centered"
         );
         assert!(
-            (text_top_for_height(run) - 26.75).abs() <= 0.5,
-            "input glyph paint should get a small downward optical correction"
+            (text_top_for_height(run) - 24.5).abs() <= 0.5,
+            "input glyph paint should use the same line-box top as placeholder text"
         );
         assert_eq!(
             text_paint_top_for_height(run),
-            27.0,
+            25.0,
             "input glyph paint origin should snap to whole pixels for sharper text"
         );
         let text_layouts = test_text_layouts(&frame, 320, 120);
@@ -4220,6 +4295,50 @@ mod tests {
             run.color[0] <= 190 && run.color[1] <= 190 && run.color[2] <= 190,
             "placeholder text should be readable gray, not washed-out near-white: {:?}",
             run.color
+        );
+    }
+
+    #[test]
+    fn text_input_placeholder_and_value_share_line_box_top() {
+        let mut style = StyleMap::new();
+        style.insert("size".to_owned(), StyleValue::Number(24.0));
+        style.insert("line_height".to_owned(), StyleValue::Number(33.6));
+        style.insert("text_inset".to_owned(), StyleValue::Number(6.0));
+        style.insert(
+            "placeholder".to_owned(),
+            StyleValue::Text("What needs to be done?".to_owned()),
+        );
+        let frame_for_text = |text: Option<&str>| LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("new-todo-input".to_owned()),
+                kind: DocumentNodeKind::TextInput,
+                bounds: Rect {
+                    x: 55.0,
+                    y: 151.0,
+                    width: 495.0,
+                    height: 65.0,
+                },
+                text: text.map(str::to_owned),
+                style: style.clone(),
+                focused: text.is_some(),
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+        let placeholder_run = text_runs(&frame_for_text(None), 640, 240)
+            .pop()
+            .expect("placeholder should render");
+        let value_run = text_runs(&frame_for_text(Some("abc")), 640, 240)
+            .pop()
+            .expect("value should render");
+
+        assert_eq!(
+            text_paint_top_for_height(&placeholder_run),
+            text_paint_top_for_height(&value_run),
+            "placeholder and real text should use one vertical line-box calculation"
         );
     }
 

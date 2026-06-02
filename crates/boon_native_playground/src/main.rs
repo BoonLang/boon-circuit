@@ -12598,6 +12598,22 @@ fn lower_canonical_document_element(
         parent_node.children.push(id.clone());
     }
     frame.nodes.insert(id.clone(), node);
+    if function == "Element/paragraph"
+        && lower_canonical_paragraph_contents(
+            statement,
+            expressions,
+            functions,
+            &id,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            typecheck_report,
+            scope_key,
+        )
+    {
+        return;
+    }
     lower_canonical_child_elements(
         statement,
         expressions,
@@ -12610,6 +12626,118 @@ fn lower_canonical_document_element(
         typecheck_report,
         scope_key,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_paragraph_contents(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+) -> bool {
+    let Some(contents) = statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some("contents"))
+    else {
+        return false;
+    };
+    let mut lowered = false;
+    for (index, child) in contents.children.iter().enumerate() {
+        if canonical_element_function(child, expressions).is_some() {
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+            );
+            lowered = true;
+            continue;
+        }
+        let Some(text) = paragraph_inline_text(child, expressions, context) else {
+            continue;
+        };
+        let base_node_id = format!("doc-node-{}-inline-{index}", child.id);
+        let scoped_id = if scope_key.is_empty() {
+            base_node_id.clone()
+        } else {
+            format!("{base_node_id}-{scope_key}")
+        };
+        let mut node_id = scoped_id.clone();
+        let mut dedupe = 0usize;
+        while !seen_ids.insert(node_id.clone()) {
+            dedupe += 1;
+            node_id = format!("{scoped_id}-{dedupe}");
+        }
+        let id = boon_document_model::DocumentNodeId(node_id.clone());
+        let mut node = boon_document_model::DocumentNode::new(
+            node_id,
+            boon_document_model::DocumentNodeKind::Text,
+        );
+        node.parent = Some(parent.clone());
+        node.text = Some(boon_document_model::TextValue { text });
+        inherit_canonical_text_style(frame, parent, &mut node);
+        node.style
+            .entry("height".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Number(15.0));
+        node.style
+            .entry("width".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Text("Auto".to_owned()));
+        node.style
+            .entry("auto_padding".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
+        node.style
+            .entry("text_inset".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
+        node.style
+            .entry("vertical_align".to_owned())
+            .or_insert_with(|| boon_document_model::StyleValue::Text("Center".to_owned()));
+        if let Some(parent_node) = frame.nodes.get_mut(parent) {
+            parent_node.children.push(id.clone());
+        }
+        frame.nodes.insert(id, node);
+        lowered = true;
+    }
+    lowered
+}
+
+fn paragraph_inline_text(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    let expr = expressions.get(statement.expr?)?;
+    match &expr.kind {
+        AstExprKind::Call { function, .. } if function == "Text/space" => Some(" ".to_owned()),
+        AstExprKind::TextLiteral(_) | AstExprKind::StringLiteral(_) => {
+            document_text_value_for_expr(expr, expressions, context)
+        }
+        _ => document_text_value_for_expr(expr, expressions, context),
+    }
+    .filter(|text| !text.is_empty())
+}
+
+fn document_child_statement<'a>(
+    statement: &'a AstStatement,
+    field: &str,
+) -> Option<&'a AstStatement> {
+    statement
+        .children
+        .iter()
+        .find(|child| document_field_name(child).as_deref() == Some(field))
 }
 
 fn inherit_canonical_text_style(
@@ -12648,6 +12776,9 @@ fn canonical_document_node_kind(
                 Some("Row") => boon_document_model::DocumentNodeKind::Row,
                 _ => boon_document_model::DocumentNodeKind::Stack,
             }
+        }
+        "Element/paragraph" if document_child_statement(statement, "contents").is_some() => {
+            boon_document_model::DocumentNodeKind::Row
         }
         "Element/text" | "Element/label" | "Element/paragraph" | "Element/link" => {
             boon_document_model::DocumentNodeKind::Text
@@ -13556,10 +13687,8 @@ fn lower_spacing_style(
         let Some(field) = document_field_name(child) else {
             continue;
         };
-        if matches!(field.as_str(), "top" | "right" | "bottom" | "left")
-            && let Some(value) = document_style_value(child, expressions, context)
-        {
-            node.style.insert(format!("{prefix}_{field}"), value);
+        if let Some(value) = document_style_value(child, expressions, context) {
+            lower_spacing_named_field(prefix, &field, value, node);
         }
     }
 }
@@ -13576,16 +13705,34 @@ fn lower_spacing_style_field(
     }
     if let Some(nested) = record_fields_for_expr(field.value, expressions) {
         for nested_field in nested {
-            if matches!(
-                nested_field.name.as_str(),
-                "top" | "right" | "bottom" | "left"
-            ) && let Some(value) =
+            if let Some(value) =
                 document_style_value_for_expr(nested_field.value, expressions, context)
             {
-                node.style
-                    .insert(format!("{prefix}_{}", nested_field.name), value);
+                lower_spacing_named_field(prefix, &nested_field.name, value, node);
             }
         }
+    }
+}
+
+fn lower_spacing_named_field(
+    prefix: &str,
+    field: &str,
+    value: boon_document_model::StyleValue,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    match field {
+        "top" | "right" | "bottom" | "left" => {
+            node.style.insert(format!("{prefix}_{field}"), value);
+        }
+        "row" => {
+            node.style.insert(format!("{prefix}_left"), value.clone());
+            node.style.insert(format!("{prefix}_right"), value);
+        }
+        "column" => {
+            node.style.insert(format!("{prefix}_top"), value.clone());
+            node.style.insert(format!("{prefix}_bottom"), value);
+        }
+        _ => {}
     }
 }
 
@@ -14892,6 +15039,8 @@ struct PreviewNativeInputState {
     focused_caret_index: usize,
     replace_focused_text_on_next_edit: bool,
     caret_blink_started_at: Option<Instant>,
+    held_repeat_key: Option<String>,
+    held_repeat_next_at: Option<Instant>,
     pending_live_events: Vec<boon_runtime::LiveSourceEvent>,
 }
 
@@ -14938,6 +15087,10 @@ fn preview_input_has_unhandled_source_events(
             .keyboard_events
             .iter()
             .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
+        || input_state.held_repeat_key.as_ref().is_some_and(|key| {
+            input_state.held_repeat_next_at.is_some()
+                && input.pressed_keys.iter().any(|pressed| pressed == key)
+        })
 }
 
 fn preview_mouse_position_key(
@@ -15288,6 +15441,29 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
     input_state.focused_caret_index = 0;
     input_state.replace_focused_text_on_next_edit = false;
     input_state.caret_blink_started_at = None;
+    preview_clear_key_repeat(input_state);
+}
+
+fn preview_clear_key_repeat(input_state: &mut PreviewNativeInputState) {
+    input_state.held_repeat_key = None;
+    input_state.held_repeat_next_at = None;
+}
+
+fn preview_key_is_repeatable(key: &str) -> bool {
+    matches!(
+        key,
+        "Delete"
+            | "ForwardDelete"
+            | "Backspace"
+            | "Left"
+            | "ArrowLeft"
+            | "LeftArrow"
+            | "Right"
+            | "ArrowRight"
+            | "RightArrow"
+            | "Home"
+            | "End"
+    ) || keyboard_event_text(key, false).is_some()
 }
 
 fn preview_should_retain_focus_after_enter(
@@ -15320,6 +15496,110 @@ fn preview_refresh_retained_focus_after_enter(
     input_state.replace_focused_text_on_next_edit =
         preview_text_input_should_replace_on_type(layout_proof, focused_node);
     preview_reset_caret_blink(input_state);
+}
+
+fn preview_apply_repeatable_text_input_key(
+    key: &str,
+    shift_pressed: bool,
+    layout: &Value,
+    focused_node: &str,
+    source_path: &Path,
+    source_text: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    match key {
+        "Left" | "ArrowLeft" | "LeftArrow" => {
+            input_state.focused_caret_index = input_state.focused_caret_index.saturating_sub(1);
+            preview_reset_caret_blink(input_state);
+            Ok(None)
+        }
+        "Right" | "ArrowRight" | "RightArrow" => {
+            input_state.focused_caret_index = input_state
+                .focused_caret_index
+                .saturating_add(1)
+                .min(preview_text_char_count(&input_state.focused_text));
+            preview_reset_caret_blink(input_state);
+            Ok(None)
+        }
+        "Home" => {
+            input_state.focused_caret_index = 0;
+            preview_reset_caret_blink(input_state);
+            Ok(None)
+        }
+        "End" => {
+            input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+            preview_reset_caret_blink(input_state);
+            Ok(None)
+        }
+        "Delete" | "ForwardDelete" | "Backspace" => {
+            preview_prepare_text_edit(input_state);
+            if matches!(key, "Delete" | "Backspace") {
+                preview_delete_before_caret(input_state);
+            } else {
+                preview_delete_at_caret(input_state);
+            }
+            preview_reset_caret_blink(input_state);
+            if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+                let change = boon_runtime::LiveSourceEvent {
+                    source,
+                    text: Some(input_state.focused_text.clone()),
+                    key: None,
+                    address: input_state
+                        .focused_address
+                        .clone()
+                        .or_else(|| focused_address(layout, focused_node)),
+                    target_text: input_state
+                        .focused_target_text
+                        .clone()
+                        .or_else(|| focused_target_text(layout, focused_node)),
+                    target_occurrence: None,
+                };
+                return preview_apply_live_event(
+                    source_path,
+                    source_text,
+                    live_runtime,
+                    shared_render_state,
+                    change,
+                )
+                .map(Some);
+            }
+            Ok(None)
+        }
+        key => {
+            if let Some(character) = keyboard_event_text(key, shift_pressed) {
+                preview_prepare_text_edit(input_state);
+                preview_insert_char_at_caret(input_state, character);
+                preview_reset_caret_blink(input_state);
+                if let Some(source) = live_source_for_node_intent(layout, focused_node, "change") {
+                    let change = boon_runtime::LiveSourceEvent {
+                        source,
+                        text: Some(input_state.focused_text.clone()),
+                        key: None,
+                        address: input_state
+                            .focused_address
+                            .clone()
+                            .or_else(|| focused_address(layout, focused_node)),
+                        target_text: input_state
+                            .focused_target_text
+                            .clone()
+                            .or_else(|| focused_target_text(layout, focused_node)),
+                        target_occurrence: None,
+                    };
+                    return preview_apply_live_event(
+                        source_path,
+                        source_text,
+                        live_runtime,
+                        shared_render_state,
+                        change,
+                    )
+                    .map(Some);
+                }
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn preview_apply_real_window_input(
@@ -15400,6 +15680,7 @@ fn preview_apply_real_window_input(
                 input_state.focused_node = Some(node.clone());
                 input_state.focused_address = focused_address(layout, &node);
                 input_state.focused_target_text = focused_target_text(layout, &node);
+                preview_clear_key_repeat(input_state);
                 input_state.focused_text =
                     preview_focused_text_for_hit_region(layout, &hit_region, live_runtime)
                         .or_else(|| document_value_for_hit_region(layout, &hit_region))
@@ -15504,6 +15785,13 @@ fn preview_apply_real_window_input(
         .pressed_keys
         .iter()
         .any(|key| key == "Shift" || key == "RightShift");
+    let primary_modifier_pressed = input
+        .pressed_keys
+        .iter()
+        .any(|key| key_is_primary_modifier(key));
+    if primary_modifier_pressed {
+        preview_clear_key_repeat(input_state);
+    }
     let keyboard_events = input
         .keyboard_events
         .iter()
@@ -15513,7 +15801,18 @@ fn preview_apply_real_window_input(
     for event in keyboard_events {
         input_state.last_keyboard_event_sequence =
             input_state.last_keyboard_event_sequence.max(event.sequence);
+        if key_is_primary_modifier(event.key.as_str()) {
+            preview_clear_key_repeat(input_state);
+            continue;
+        }
         if !event.pressed {
+            if input_state.held_repeat_key.as_deref() == Some(event.key.as_str()) {
+                preview_clear_key_repeat(input_state);
+            }
+            continue;
+        }
+        if primary_modifier_pressed {
+            preview_clear_key_repeat(input_state);
             continue;
         }
         let Some(focused_node) = input_state.focused_node.clone() else {
@@ -15562,6 +15861,7 @@ fn preview_apply_real_window_input(
                         preview_clear_focused_input_state(input_state);
                     }
                 }
+                preview_clear_key_repeat(input_state);
             }
             "Escape" => {
                 if let Some(source) = live_source_for_node_intent(layout, &focused_node, "escape")
@@ -15591,91 +15891,78 @@ fn preview_apply_real_window_input(
                     preview_clear_focused_input_state(input_state);
                 }
             }
-            "Left" | "ArrowLeft" | "LeftArrow" => {
-                input_state.focused_caret_index = input_state.focused_caret_index.saturating_sub(1);
-                preview_reset_caret_blink(input_state);
-            }
-            "Right" | "ArrowRight" | "RightArrow" => {
-                input_state.focused_caret_index = input_state
-                    .focused_caret_index
-                    .saturating_add(1)
-                    .min(preview_text_char_count(&input_state.focused_text));
-                preview_reset_caret_blink(input_state);
-            }
-            "Home" => {
-                input_state.focused_caret_index = 0;
-                preview_reset_caret_blink(input_state);
-            }
-            "End" => {
-                input_state.focused_caret_index =
-                    preview_text_char_count(&input_state.focused_text);
-                preview_reset_caret_blink(input_state);
-            }
-            "Delete" | "ForwardDelete" | "Backspace" => {
-                preview_prepare_text_edit(input_state);
-                if matches!(event.key.as_str(), "Delete" | "Backspace") {
-                    preview_delete_before_caret(input_state);
-                } else {
-                    preview_delete_at_caret(input_state);
+            key if preview_key_is_repeatable(key) => {
+                if let Some(next_layout) = preview_apply_repeatable_text_input_key(
+                    key,
+                    shift_pressed,
+                    layout,
+                    &focused_node,
+                    source_path,
+                    source_text,
+                    live_runtime,
+                    shared_render_state,
+                    input_state,
+                )? {
+                    latest_layout = Some(next_layout);
                 }
-                preview_reset_caret_blink(input_state);
-                if let Some(source) = live_source_for_node_intent(layout, &focused_node, "change") {
-                    let change = boon_runtime::LiveSourceEvent {
-                        source,
-                        text: Some(input_state.focused_text.clone()),
-                        key: None,
-                        address: input_state
-                            .focused_address
-                            .clone()
-                            .or_else(|| focused_address(layout, &focused_node)),
-                        target_text: input_state
-                            .focused_target_text
-                            .clone()
-                            .or_else(|| focused_target_text(layout, &focused_node)),
-                        target_occurrence: None,
+                let now = Instant::now();
+                input_state.held_repeat_key = Some(event.key.clone());
+                input_state.held_repeat_next_at =
+                    now.checked_add(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_DELAY_MS));
+            }
+            _ => {
+                preview_clear_key_repeat(input_state);
+            }
+        }
+    }
+    if input_state.focused_node.is_some() && !primary_modifier_pressed {
+        if let Some(key) = input_state.held_repeat_key.clone() {
+            if input.pressed_keys.iter().any(|pressed| pressed == &key) {
+                let now = Instant::now();
+                let mut applied = 0usize;
+                while input_state
+                    .held_repeat_next_at
+                    .is_some_and(|next| now >= next)
+                    && applied < BOON_EDITOR_KEY_REPEAT_MAX_CATCH_UP
+                {
+                    let Some(focused_node) = input_state.focused_node.clone() else {
+                        preview_clear_key_repeat(input_state);
+                        break;
                     };
-                    latest_layout = Some(preview_apply_live_event(
+                    let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
+                    if let Some(next_layout) = preview_apply_repeatable_text_input_key(
+                        &key,
+                        shift_pressed,
+                        layout,
+                        &focused_node,
                         source_path,
                         source_text,
                         live_runtime,
                         shared_render_state,
-                        change,
-                    )?);
-                }
-            }
-            key => {
-                if let Some(character) = keyboard_event_text(key, shift_pressed) {
-                    preview_prepare_text_edit(input_state);
-                    preview_insert_char_at_caret(input_state, character);
-                    preview_reset_caret_blink(input_state);
-                    if let Some(source) =
-                        live_source_for_node_intent(layout, &focused_node, "change")
-                    {
-                        let change = boon_runtime::LiveSourceEvent {
-                            source,
-                            text: Some(input_state.focused_text.clone()),
-                            key: None,
-                            address: input_state
-                                .focused_address
-                                .clone()
-                                .or_else(|| focused_address(layout, &focused_node)),
-                            target_text: input_state
-                                .focused_target_text
-                                .clone()
-                                .or_else(|| focused_target_text(layout, &focused_node)),
-                            target_occurrence: None,
-                        };
-                        latest_layout = Some(preview_apply_live_event(
-                            source_path,
-                            source_text,
-                            live_runtime,
-                            shared_render_state,
-                            change,
-                        )?);
+                        input_state,
+                    )? {
+                        latest_layout = Some(next_layout);
                     }
+                    applied += 1;
+                    input_state.held_repeat_next_at = input_state
+                        .held_repeat_next_at
+                        .and_then(|next| {
+                            next.checked_add(Duration::from_millis(
+                                BOON_EDITOR_KEY_REPEAT_INTERVAL_MS,
+                            ))
+                        })
+                        .or_else(|| {
+                            now.checked_add(Duration::from_millis(
+                                BOON_EDITOR_KEY_REPEAT_INTERVAL_MS,
+                            ))
+                        });
                 }
+            } else {
+                preview_clear_key_repeat(input_state);
             }
         }
+    } else {
+        preview_clear_key_repeat(input_state);
     }
     preview_apply_hover_overlay(shared_render_state, input_state)?;
     preview_apply_focus_overlay(shared_render_state, input_state, true)?;
@@ -21584,6 +21871,50 @@ mod tests {
     }
 
     #[test]
+    fn spacing_row_and_column_lower_to_edges() {
+        let mut node = boon_document_model::DocumentNode::new(
+            "padding-target",
+            boon_document_model::DocumentNodeKind::Stack,
+        );
+        lower_spacing_named_field(
+            "padding",
+            "row",
+            boon_document_model::StyleValue::Number(12.0),
+            &mut node,
+        );
+        lower_spacing_named_field(
+            "padding",
+            "column",
+            boon_document_model::StyleValue::Number(7.0),
+            &mut node,
+        );
+        lower_spacing_named_field(
+            "padding",
+            "left",
+            boon_document_model::StyleValue::Number(3.0),
+            &mut node,
+        );
+
+        assert_eq!(
+            node.style.get("padding_left"),
+            Some(&boon_document_model::StyleValue::Number(3.0)),
+            "explicit edge padding should override old row shorthand on that edge"
+        );
+        assert_eq!(
+            node.style.get("padding_right"),
+            Some(&boon_document_model::StyleValue::Number(12.0))
+        );
+        assert_eq!(
+            node.style.get("padding_top"),
+            Some(&boon_document_model::StyleValue::Number(7.0))
+        );
+        assert_eq!(
+            node.style.get("padding_bottom"),
+            Some(&boon_document_model::StyleValue::Number(7.0))
+        );
+    }
+
+    #[test]
     fn fallback_tokenizer_keeps_malformed_buffers_renderable() {
         let tokens = BoonLanguageService::syntax_tokens_fallback("SOURCE @\n-- ok\n");
         assert!(
@@ -23250,6 +23581,24 @@ mod tests {
             .iter()
             .find(|item| item.text.as_deref() == Some("Martin Kavík"))
             .expect("TodoMVC author footer link should render");
+        let author_prefix = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Created by"))
+            .expect("TodoMVC author footer paragraph text should render");
+        let author_space = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some(" ")
+                    && (item.bounds.y - author_link.bounds.y).abs() <= 0.5
+            })
+            .expect("TodoMVC author footer should use a measured Text/space fragment");
+        assert!(
+            author_prefix.bounds.x + author_prefix.bounds.width <= author_space.bounds.x + 0.5
+                && author_space.bounds.x + author_space.bounds.width <= author_link.bounds.x + 0.5,
+            "footer paragraph fragments should flow as text, space, link without fixed spacer boxes"
+        );
         assert!(
             author_link.bounds.width < 100.0,
             "only the author name should be the link target, not the full footer line"
@@ -23319,6 +23668,15 @@ mod tests {
         assert!(
             reference_link.bounds.width < 70.0,
             "only the TodoMVC word should be the reference link target"
+        );
+        assert!(
+            !layout.display_list.iter().any(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Stack)
+                    && item.bounds.height >= 14.0
+                    && item.bounds.height <= 16.0
+                    && matches!(item.bounds.width.round() as i32, 205 | 225)
+            }),
+            "TodoMVC info footer should not use fixed spacer containers for inline centering"
         );
 
         let selected_filter_outline = boon_document_model::StyleValue::Text(
@@ -23985,7 +24343,7 @@ mod tests {
         );
 
         preview_apply_real_window_input(
-            &test_keyboard_input(vec![test_key_press(1, "R")], Vec::new()),
+            &test_keyboard_input(vec![test_key_press(1, "R")], vec!["R"]),
             &source_path,
             &source,
             Some(&live_runtime),
@@ -23995,9 +24353,83 @@ mod tests {
         .unwrap();
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["new_todo_text"], "r");
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(
+            BOON_EDITOR_KEY_REPEAT_INTERVAL_MS * 2,
+        ));
+        preview_apply_real_window_input(
+            &test_keyboard_input(Vec::new(), vec!["R"]),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let repeated_text = live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+            .as_str()
+            .expect("new todo text should be a string")
+            .to_owned();
+        assert!(
+            repeated_text.len() > 1,
+            "holding a printable preview key should repeat into the focused input"
+        );
 
         preview_apply_real_window_input(
-            &test_keyboard_input(vec![test_key_press(2, "Return")], Vec::new()),
+            &test_keyboard_input(vec![test_key_press(2, "Backspace")], vec!["Backspace"]),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let after_backspace =
+            live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+                .as_str()
+                .expect("new todo text should be a string")
+                .to_owned();
+        input_state.held_repeat_next_at =
+            Instant::now().checked_sub(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_INTERVAL_MS));
+        preview_apply_real_window_input(
+            &test_keyboard_input(Vec::new(), vec!["Backspace"]),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let after_held_backspace =
+            live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+                .as_str()
+                .expect("new todo text should be a string")
+                .to_owned();
+        assert!(
+            after_held_backspace.len() < after_backspace.len(),
+            "holding Backspace should continue deleting preview input text"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(3, "Z")], Vec::new()),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let submitted_title =
+            live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+                .as_str()
+                .expect("new todo text should be a string")
+                .to_owned();
+        assert!(
+            submitted_title.ends_with('z'),
+            "test should submit text produced after the final Z key"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(4, "Return")], vec!["Return"]),
             &source_path,
             &source,
             Some(&live_runtime),
@@ -24019,8 +24451,34 @@ mod tests {
                 .as_array()
                 .expect("TodoMVC todos should remain a list")
                 .iter()
-                .any(|todo| todo.get("title").and_then(serde_json::Value::as_str) == Some("r")),
+                .any(|todo| todo.get("title").and_then(serde_json::Value::as_str)
+                    == Some(submitted_title.as_str())),
             "Enter should append the typed todo"
+        );
+        let todo_count_after_enter = summary["todos"]
+            .as_array()
+            .expect("TodoMVC todos should remain a list")
+            .len();
+        input_state.held_repeat_next_at = Instant::now().checked_sub(Duration::from_millis(
+            BOON_EDITOR_KEY_REPEAT_INTERVAL_MS * 4,
+        ));
+        preview_apply_real_window_input(
+            &test_keyboard_input(Vec::new(), vec!["Return"]),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let held_enter_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(
+            held_enter_summary["todos"]
+                .as_array()
+                .expect("TodoMVC todos should remain a list")
+                .len(),
+            todo_count_after_enter,
+            "holding Enter must not repeat TodoMVC submissions"
         );
         assert_eq!(
             input_state.focused_node.as_deref(),

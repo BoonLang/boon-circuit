@@ -2114,7 +2114,9 @@ impl<'a> Checker<'a> {
                 if !style_dimension_accepts_type(&ty) {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         value_expr_id,
-                        format!("style field `{field_name}` must be a number or `Fill` tag"),
+                        format!(
+                            "style field `{field_name}` must be a number, `Fill` tag, or `Auto` tag"
+                        ),
                     ));
                 }
             }
@@ -2808,6 +2810,7 @@ impl Default for BuiltinSignatureRegistry {
         Self {
             text_functions: [
                 "Text/empty",
+                "Text/space",
                 "Text/trim",
                 "Text/concat",
                 "Text/substring",
@@ -3384,7 +3387,7 @@ fn style_dimension_accepts_type(ty: &Type) -> bool {
             ty,
             Type::VariantSet(variants)
                 if variants.iter().all(|variant| {
-                    matches!(variant, Variant::Tag(tag) if tag == "Fill")
+                    matches!(variant, Variant::Tag(tag) if tag == "Fill" || tag == "Auto")
                 })
         )
 }
@@ -3792,7 +3795,12 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if matches!(
                 function.as_str(),
-                "Text/empty" | "Text/trim" | "Text/concat" | "Text/substring" | "Error/text"
+                "Text/empty"
+                    | "Text/space"
+                    | "Text/trim"
+                    | "Text/concat"
+                    | "Text/substring"
+                    | "Error/text"
             ) =>
         {
             Type::Text
@@ -6495,7 +6503,7 @@ document:
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("style field `width` must be a number or `Fill` tag")
+                .contains("style field `width` must be a number, `Fill` tag, or `Auto` tag")
         }));
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic

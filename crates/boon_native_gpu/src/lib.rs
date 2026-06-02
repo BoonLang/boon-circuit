@@ -4,7 +4,8 @@ use boon_document::{
 };
 use boon_host::SurfaceId;
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, LayoutGlyph, Metrics, Resolution, Shaping,
+    Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, CustomGlyphId, Family, FontSystem,
+    LayoutGlyph, Metrics, RasterizeCustomGlyphRequest, RasterizedCustomGlyph, Resolution, Shaping,
     Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
     cosmic_text::{FeatureTag, FontFeatures, fontdb},
 };
@@ -643,6 +644,8 @@ struct GlyphonTextState {
     buffer_signatures: Vec<TextRunSignature>,
     prepared_signatures: Vec<TextRunPlacementSignature>,
     prepared_viewport: Option<(u32, u32)>,
+    custom_glyph_ids: BTreeMap<RotatedTextKey, CustomGlyphId>,
+    next_custom_glyph_id: CustomGlyphId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -718,6 +721,7 @@ struct TextRunSignature {
     color: [u8; 4],
     align: TextAlign,
     vertical_align: TextVerticalAlign,
+    rotate_degrees: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -739,6 +743,28 @@ struct TextRunPlacementSignature {
     color: [u8; 4],
     align: TextAlign,
     vertical_align: TextVerticalAlign,
+    rotate_degrees: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RotatedTextKey {
+    text: String,
+    font_family: String,
+    font_style: u8,
+    font_weight: u16,
+    font_features: String,
+    size: u32,
+    line_height: u32,
+    rotate_degrees: u32,
+}
+
+struct RotatedTextGlyph {
+    key: RotatedTextKey,
+    mask: Vec<u8>,
+    width: u16,
+    height: u16,
+    left: f32,
+    top: f32,
 }
 
 impl TextRunSignature {
@@ -759,6 +785,7 @@ impl TextRunSignature {
             color: run.color,
             align: run.align,
             vertical_align: run.vertical_align,
+            rotate_degrees: run.rotate_degrees,
         }
     }
 }
@@ -783,6 +810,7 @@ impl TextRunPlacementSignature {
             color: run.color,
             align: run.align,
             vertical_align: run.vertical_align,
+            rotate_degrees: run.rotate_degrees,
         }
     }
 }
@@ -806,6 +834,8 @@ impl GlyphonTextState {
             buffer_signatures: Vec::new(),
             prepared_signatures: Vec::new(),
             prepared_viewport: None,
+            custom_glyph_ids: BTreeMap::new(),
+            next_custom_glyph_id: 1,
         }
     }
 
@@ -823,16 +853,59 @@ impl GlyphonTextState {
             return Ok(0);
         }
         self.viewport.update(queue, Resolution { width, height });
-        self.ensure_buffers(&runs);
         let placement_signatures = runs
             .iter()
             .map(TextRunPlacementSignature::from_run)
             .collect::<Vec<_>>();
+        let mut normal_runs = Vec::new();
+        let mut rotated_runs = Vec::new();
+        for run in runs {
+            if is_rotated_quarter_text_run(&run) {
+                if let Some(glyph) = self.rotated_text_glyph(&run) {
+                    rotated_runs.push((run, glyph));
+                } else {
+                    normal_runs.push(run);
+                }
+            } else {
+                normal_runs.push(run);
+            }
+        }
+        self.ensure_buffers(&normal_runs);
         if self.prepared_signatures != placement_signatures
             || self.prepared_viewport != Some((width, height))
         {
-            let mut areas = Vec::with_capacity(self.buffers.len());
-            for (run, buffer) in runs.iter().zip(self.buffers.iter()) {
+            let mut custom_buffers = Vec::with_capacity(rotated_runs.len());
+            let mut custom_glyph_lists = Vec::with_capacity(rotated_runs.len());
+            let mut custom_rasters = BTreeMap::new();
+            for (run, glyph) in &rotated_runs {
+                let id = self.custom_glyph_id(glyph.key.clone());
+                custom_rasters.insert(
+                    id,
+                    RasterizedCustomGlyph {
+                        data: glyph.mask.clone(),
+                        content_type: ContentType::Mask,
+                    },
+                );
+                custom_glyph_lists.push(vec![CustomGlyph {
+                    id,
+                    left: glyph.left,
+                    top: glyph.top,
+                    width: f32::from(glyph.width),
+                    height: f32::from(glyph.height),
+                    color: Some(Color::rgba(
+                        run.color[0],
+                        run.color[1],
+                        run.color[2],
+                        run.color[3],
+                    )),
+                    snap_to_physical_pixel: true,
+                    metadata: 0,
+                }]);
+                custom_buffers.push(empty_custom_glyph_buffer(&mut self.font_system));
+            }
+
+            let mut areas = Vec::with_capacity(self.buffers.len() + custom_buffers.len());
+            for (run, buffer) in normal_runs.iter().zip(self.buffers.iter()) {
                 let line_width =
                     shaped_line_width(buffer).unwrap_or_else(|| estimated_text_width(run));
                 let left = text_paint_left_for_width(run, line_width);
@@ -852,8 +925,24 @@ impl GlyphonTextState {
                     custom_glyphs: &[],
                 });
             }
+            for (buffer, glyphs) in custom_buffers.iter().zip(custom_glyph_lists.iter()) {
+                areas.push(TextArea {
+                    buffer,
+                    left: 0.0,
+                    top: 0.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: height as i32,
+                    },
+                    default_color: Color::rgba(0, 0, 0, 255),
+                    custom_glyphs: glyphs,
+                });
+            }
             self.renderer
-                .prepare(
+                .prepare_with_custom(
                     device,
                     queue,
                     &mut self.font_system,
@@ -861,6 +950,7 @@ impl GlyphonTextState {
                     &self.viewport,
                     areas,
                     &mut self.swash_cache,
+                    |request: RasterizeCustomGlyphRequest| custom_rasters.get(&request.id).cloned(),
                 )
                 .map_err(|error| RenderError {
                     message: format!("glyphon prepare: {error}"),
@@ -891,7 +981,7 @@ impl GlyphonTextState {
                     message: format!("glyphon render: {error}"),
                 })?;
         }
-        Ok(self.buffers.len() as u32)
+        Ok((normal_runs.len() + rotated_runs.len()) as u32)
     }
 
     fn ensure_buffers(&mut self, runs: &[TextRun]) {
@@ -943,6 +1033,156 @@ impl GlyphonTextState {
                 )
             })
             .collect()
+    }
+
+    fn custom_glyph_id(&mut self, key: RotatedTextKey) -> CustomGlyphId {
+        if let Some(id) = self.custom_glyph_ids.get(&key) {
+            return *id;
+        }
+        let id = self.next_custom_glyph_id;
+        self.next_custom_glyph_id = self.next_custom_glyph_id.saturating_add(1).max(1);
+        self.custom_glyph_ids.insert(key, id);
+        id
+    }
+
+    fn rotated_text_glyph(&mut self, run: &TextRun) -> Option<RotatedTextGlyph> {
+        rotated_text_glyph_for_run(run, &mut self.font_system, &mut self.swash_cache)
+    }
+}
+
+fn rotated_text_glyph_for_run(
+    run: &TextRun,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+) -> Option<RotatedTextGlyph> {
+    let key = rotated_text_key(run)?;
+    let buffer = shape_text_run(font_system, run);
+    let mut samples = Vec::new();
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    buffer.draw(
+        font_system,
+        swash_cache,
+        Color::rgba(255, 255, 255, 255),
+        |x, y, w, h, color| {
+            let alpha = color.a();
+            if alpha == 0 {
+                return;
+            }
+            for dy in 0..h as i32 {
+                for dx in 0..w as i32 {
+                    let px = x + dx;
+                    let py = y + dy;
+                    min_x = min_x.min(px);
+                    min_y = min_y.min(py);
+                    max_x = max_x.max(px);
+                    max_y = max_y.max(py);
+                    samples.push((px, py, alpha));
+                }
+            }
+        },
+    );
+    if samples.is_empty() {
+        return None;
+    }
+    let raw_width = (max_x - min_x + 1).clamp(1, u16::MAX as i32) as u16;
+    let raw_height = (max_y - min_y + 1).clamp(1, u16::MAX as i32) as u16;
+    let mut raw_mask = vec![0; usize::from(raw_width) * usize::from(raw_height)];
+    for (x, y, alpha) in samples {
+        let x = (x - min_x) as usize;
+        let y = (y - min_y) as usize;
+        let index = y * usize::from(raw_width) + x;
+        raw_mask[index] = raw_mask[index].max(alpha);
+    }
+    let (mask, width, height) = rotate_mask(raw_mask, raw_width, raw_height, run.rotate_degrees);
+    let left = (run.bounds.x + (run.bounds.width - f32::from(width)) * 0.5).round();
+    let top = (run.bounds.y + (run.bounds.height - f32::from(height)) * 0.5).round();
+    Some(RotatedTextGlyph {
+        key,
+        mask,
+        width,
+        height,
+        left,
+        top,
+    })
+}
+
+fn empty_custom_glyph_buffer(font_system: &mut FontSystem) -> Buffer {
+    let mut buffer = Buffer::new(font_system, Metrics::new(1.0, 1.0));
+    buffer.set_size(font_system, Some(1.0), Some(1.0));
+    buffer.set_text(font_system, "", &Attrs::new(), Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+fn is_rotated_quarter_text_run(run: &TextRun) -> bool {
+    run.rotate_degrees != 0
+        && run.rich_spans.is_empty()
+        && !run.text.trim().is_empty()
+        && run.text.chars().count() <= 8
+}
+
+fn rotated_text_key(run: &TextRun) -> Option<RotatedTextKey> {
+    is_rotated_quarter_text_run(run).then(|| RotatedTextKey {
+        text: run.text.clone(),
+        font_family: run.font_family.clone(),
+        font_style: font_style_code(run.font_style),
+        font_weight: run.font_weight.0,
+        font_features: run.font_features.clone(),
+        size: run.size.to_bits(),
+        line_height: run.line_height.to_bits(),
+        rotate_degrees: run.rotate_degrees,
+    })
+}
+
+fn font_style_code(style: Style) -> u8 {
+    match style {
+        Style::Normal => 0,
+        Style::Italic => 1,
+        Style::Oblique => 2,
+    }
+}
+
+fn rotate_mask(mask: Vec<u8>, width: u16, height: u16, rotate_degrees: u32) -> (Vec<u8>, u16, u16) {
+    let width_usize = usize::from(width);
+    let height_usize = usize::from(height);
+    match rotate_degrees % 360 {
+        90 => {
+            let mut rotated = vec![0; width_usize * height_usize];
+            for y in 0..height_usize {
+                for x in 0..width_usize {
+                    let new_x = height_usize - 1 - y;
+                    let new_y = x;
+                    rotated[new_y * height_usize + new_x] = mask[y * width_usize + x];
+                }
+            }
+            (rotated, height, width)
+        }
+        180 => {
+            let mut rotated = vec![0; width_usize * height_usize];
+            for y in 0..height_usize {
+                for x in 0..width_usize {
+                    let new_x = width_usize - 1 - x;
+                    let new_y = height_usize - 1 - y;
+                    rotated[new_y * width_usize + new_x] = mask[y * width_usize + x];
+                }
+            }
+            (rotated, width, height)
+        }
+        270 => {
+            let mut rotated = vec![0; width_usize * height_usize];
+            for y in 0..height_usize {
+                for x in 0..width_usize {
+                    let new_x = y;
+                    let new_y = width_usize - 1 - x;
+                    rotated[new_y * height_usize + new_x] = mask[y * width_usize + x];
+                }
+            }
+            (rotated, height, width)
+        }
+        _ => (mask, width, height),
     }
 }
 
@@ -1049,6 +1289,7 @@ struct TextRun {
     line_height: f32,
     align: TextAlign,
     vertical_align: TextVerticalAlign,
+    rotate_degrees: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1151,6 +1392,7 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             line_height,
             align: text_align(&item.kind, &item.style),
             vertical_align: text_vertical_align(&item.kind, &item.style),
+            rotate_degrees: normalized_quarter_turn(style_number(&item.style, "rotate")),
         });
         runs.extend(editor_type_hint_runs(item, width, height));
     }
@@ -1229,6 +1471,7 @@ fn editor_type_hint_runs(item: &DisplayItem, _width: u32, _height: u32) -> Vec<T
                 line_height: item.bounds.height,
                 align: TextAlign::Left,
                 vertical_align: TextVerticalAlign::Center,
+                rotate_degrees: 0,
             })
         })
         .collect()
@@ -1491,6 +1734,22 @@ fn style_line_height(style: &StyleMap, font_size: f32) -> f32 {
         _ => fallback,
     }
     .max(1.0)
+}
+
+fn normalized_quarter_turn(value: Option<f32>) -> u32 {
+    let Some(value) = value else {
+        return 0;
+    };
+    let rounded = value.round();
+    if (value - rounded).abs() > 0.01 {
+        return 0;
+    }
+    match ((rounded as i32 % 360) + 360) % 360 {
+        90 => 90,
+        180 => 180,
+        270 => 270,
+        _ => 0,
+    }
 }
 
 fn text_top_for_parts(
@@ -2356,42 +2615,44 @@ fn push_shadows(
                 color,
             );
         } else {
-            if blur <= 0.0 {
-                push_rect(
-                    positions,
-                    colors,
-                    Rect {
-                        x: rect.x + x - spread,
-                        y: rect.y + y - spread,
-                        width: (rect.width + spread * 2.0).max(1.0),
-                        height: (rect.height + spread * 2.0).max(1.0),
-                    },
-                    width,
-                    height,
-                    color,
-                );
-                continue;
-            }
             let base = Rect {
                 x: rect.x + x - spread,
                 y: rect.y + y - spread,
                 width: (rect.width + spread * 2.0).max(1.0),
                 height: (rect.height + spread * 2.0).max(1.0),
             };
-            let steps = (blur / 4.0).ceil().clamp(2.0, 10.0) as u32;
+            if blur <= 0.0 {
+                push_rect_difference(positions, colors, base, rect, width, height, color);
+                continue;
+            }
+            push_rect_difference(
+                positions,
+                colors,
+                base,
+                rect,
+                width,
+                height,
+                color_with_alpha_scale(color, 0.78),
+            );
+            let steps = blur.ceil().clamp(2.0, 18.0) as u32;
             for step in 0..steps {
                 let inner_expand = blur * step as f32 / steps as f32;
                 let outer_expand = blur * (step + 1) as f32 / steps as f32;
-                let t = step as f32 / steps as f32;
+                let t = (step + 1) as f32 / steps as f32;
+                let alpha_scale = (1.0 - t).powi(2);
+                if alpha_scale < 0.01 {
+                    continue;
+                }
                 push_shadow_halo(
                     positions,
                     colors,
                     base,
+                    rect,
                     inner_expand,
                     outer_expand,
                     width,
                     height,
-                    color_with_alpha_scale(color, (1.0 - t).max(0.08)),
+                    color_with_alpha_scale(color, alpha_scale),
                 );
             }
         }
@@ -2402,6 +2663,7 @@ fn push_shadow_halo(
     positions: &mut Vec<f32>,
     colors: &mut Vec<u8>,
     rect: Rect,
+    occluder: Rect,
     inner_expand: f32,
     outer_expand: f32,
     width: f32,
@@ -2443,9 +2705,73 @@ fn push_shadow_halo(
         },
     ] {
         if band.width > 0.0 && band.height > 0.0 {
+            push_rect_difference(positions, colors, band, occluder, width, height, color);
+        }
+    }
+}
+
+fn push_rect_difference(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<u8>,
+    rect: Rect,
+    cutout: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let Some(overlap) = rect_intersection(rect, cutout) else {
+        push_rect(positions, colors, rect, width, height, color);
+        return;
+    };
+    let top_height = (overlap.y - rect.y).max(0.0);
+    let bottom_y = overlap.y + overlap.height;
+    let bottom_height = (rect.y + rect.height - bottom_y).max(0.0);
+    let left_width = (overlap.x - rect.x).max(0.0);
+    let right_x = overlap.x + overlap.width;
+    let right_width = (rect.x + rect.width - right_x).max(0.0);
+    for band in [
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: top_height,
+        },
+        Rect {
+            x: rect.x,
+            y: bottom_y,
+            width: rect.width,
+            height: bottom_height,
+        },
+        Rect {
+            x: rect.x,
+            y: overlap.y,
+            width: left_width,
+            height: overlap.height,
+        },
+        Rect {
+            x: right_x,
+            y: overlap.y,
+            width: right_width,
+            height: overlap.height,
+        },
+    ] {
+        if band.width > 0.0 && band.height > 0.0 {
             push_rect(positions, colors, band, width, height, color);
         }
     }
+}
+
+fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 > x0 && y1 > y0).then_some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 fn expanded_rect(rect: Rect, amount: f32) -> Rect {
@@ -3239,6 +3565,86 @@ mod tests {
             paint_top, 33.0,
             "centered glyph paint origin should snap to whole pixels"
         );
+    }
+
+    #[test]
+    fn quarter_turn_text_run_rasterizes_a_centered_rotated_mask() {
+        let run = TextRun {
+            node: DocumentNodeId("toggle-all".to_owned()),
+            bounds: Rect {
+                x: 75.0,
+                y: 130.0,
+                width: 45.0,
+                height: 65.0,
+            },
+            text: "❯".to_owned(),
+            rich_spans: Vec::new(),
+            font_family: "Helvetica Neue, Helvetica, Arial, SansSerif".to_owned(),
+            font_style: Style::Normal,
+            font_weight: Weight::NORMAL,
+            font_features: String::new(),
+            text_inset: 0.0,
+            text_clip_padding: 0.0,
+            color: [148, 148, 148, 255],
+            size: 22.0,
+            line_height: 27.5,
+            align: TextAlign::Center,
+            vertical_align: TextVerticalAlign::Center,
+            rotate_degrees: 90,
+        };
+        let mut font_system = editor_font_system();
+        let mut swash_cache = SwashCache::new();
+        let glyph = rotated_text_glyph_for_run(&run, &mut font_system, &mut swash_cache)
+            .expect("rotated chevron should rasterize through the generic custom glyph path");
+
+        assert!(glyph.mask.iter().any(|alpha| *alpha > 0));
+        assert!(
+            glyph.width > glyph.height,
+            "90-degree ❯ should become a wider down-chevron mask"
+        );
+        assert!(
+            (glyph.left - (run.bounds.x + (run.bounds.width - f32::from(glyph.width)) * 0.5)).abs()
+                <= 0.5
+        );
+        assert!(
+            (glyph.top - (run.bounds.y + (run.bounds.height - f32::from(glyph.height)) * 0.5))
+                .abs()
+                <= 0.5
+        );
+    }
+
+    #[test]
+    fn negative_spread_outer_shadow_draws_only_the_visible_sheet() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "box_shadow_1_color".to_owned(),
+            StyleValue::Text("Oklch[lightness:0.973]".to_owned()),
+        );
+        style.insert("box_shadow_1_y".to_owned(), StyleValue::Number(8.0));
+        style.insert("box_shadow_1_spread".to_owned(), StyleValue::Number(-3.0));
+        let source = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let mut positions = Vec::new();
+        let mut colors = Vec::new();
+        push_shadows(&mut positions, &mut colors, source, 160.0, 120.0, &style);
+
+        assert_eq!(
+            positions.len(),
+            12,
+            "the inset sheet should be a single bottom band, not a full source-sized slab"
+        );
+        let y_top = (1.0 - positions[1]) * 0.5 * 120.0;
+        let y_bottom = (1.0 - positions[5]) * 0.5 * 120.0;
+        let x_left = (positions[0] + 1.0) * 0.5 * 160.0;
+        let x_right = (positions[2] + 1.0) * 0.5 * 160.0;
+        assert!(y_top >= source.y + source.height);
+        assert!(y_bottom <= source.y + source.height + 5.5);
+        assert!((x_left - (source.x + 3.0)).abs() <= 0.5);
+        assert!((x_right - (source.x + source.width - 3.0)).abs() <= 0.5);
     }
 
     #[test]

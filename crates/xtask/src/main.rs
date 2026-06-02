@@ -8162,6 +8162,7 @@ fn verify_native_todomvc_reference_parity(
         preview_artifact_path.as_deref(),
     );
     let layout_evidence = todomvc_layout_reference_evidence(&layout_artifact);
+    let targeted_evidence = todomvc_targeted_chevron_shadow_evidence(&layout_artifact);
     let pixel_evidence = preview_artifact_path
         .as_deref()
         .and_then(|path| {
@@ -8316,6 +8317,37 @@ fn verify_native_todomvc_reference_parity(
     push_audit_check(
         &mut checks,
         &mut blockers,
+        "native-todomvc-reference-parity:toggle-all-chevron-contract",
+        targeted_evidence
+            .pointer("/toggle_all_chevron/pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!(
+            "toggle_all_chevron={}",
+            targeted_evidence["toggle_all_chevron"]
+        ),
+        Some("native TodoMVC toggle-all chevron does not match the reference contract".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-reference-parity:footer-stack-shadow-contract",
+        targeted_evidence
+            .pointer("/footer_stack_shadow/pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!(
+            "footer_stack_shadow={}",
+            targeted_evidence["footer_stack_shadow"]
+        ),
+        Some(
+            "native TodoMVC footer stacked-card shadows do not match the reference contract"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
         "native-todomvc-reference-parity:visual-comparator-not-placeholder",
         report
             .pointer("/preview_native_gpu_render_proof/proof/artifact/unique_rgba_values")
@@ -8344,6 +8376,7 @@ fn verify_native_todomvc_reference_parity(
             "preview_dimensions": preview_dimensions,
             "freshness_evidence": freshness_evidence,
             "layout_evidence": layout_evidence,
+            "targeted_evidence": targeted_evidence,
             "pixel_evidence": pixel_evidence,
             "artifact_sha256s": artifact_sha256s,
             "moonzoon_reference_source": "/home/martinkavik/repos/MoonZoon/examples/todomvc/frontend/src/main.rs",
@@ -9098,6 +9131,77 @@ fn todomvc_reference_todoapp_bounds(metadata: &serde_json::Value) -> Option<Json
         })
         .and_then(|element| element.get("bounds"))
         .and_then(parse_json_bounds)
+}
+
+fn todomvc_targeted_chevron_shadow_evidence(
+    layout_artifact: &serde_json::Value,
+) -> serde_json::Value {
+    let items = layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let chevron = items
+        .iter()
+        .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some("❯"));
+    let chevron_style = chevron.and_then(|item| item.get("style"));
+    let chevron_bounds = chevron
+        .and_then(|item| item.get("bounds"))
+        .and_then(parse_json_bounds);
+    let chevron_pass = chevron.is_some()
+        && chevron
+            .and_then(|item| item.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("button")
+        && style_number_json(chevron_style, "rotate") == Some(90.0)
+        && style_number_json(chevron_style, "size") == Some(22.0)
+        && style_text_json(chevron_style, "color") == Some("Oklch[lightness:0.667]")
+        && style_text_json(chevron_style, "weight") == Some("Normal")
+        && style_text_json(chevron_style, "cursor")
+            .is_some_and(|value| value.eq_ignore_ascii_case("pointer"))
+        && chevron_bounds.as_ref().is_some_and(|bounds| {
+            (bounds.width - 45.0).abs() <= 0.5 && (bounds.height - 65.0).abs() <= 0.5
+        });
+
+    let footer = items.iter().find(|item| {
+        item.get("kind").and_then(serde_json::Value::as_str) == Some("row")
+            && item.pointer("/style/box_shadow_2_spread").is_some()
+            && item.pointer("/style/box_shadow_4_spread").is_some()
+    });
+    let footer_style = footer.and_then(|item| item.get("style"));
+    let footer_pass = footer.is_some()
+        && style_number_json(footer_style, "box_shadow_1_y") == Some(1.0)
+        && style_number_json(footer_style, "box_shadow_2_y") == Some(8.0)
+        && style_number_json(footer_style, "box_shadow_2_spread") == Some(-3.0)
+        && style_text_json(footer_style, "box_shadow_2_color") == Some("Oklch[lightness:0.973]")
+        && style_number_json(footer_style, "box_shadow_4_y") == Some(16.0)
+        && style_number_json(footer_style, "box_shadow_4_spread") == Some(-6.0)
+        && style_text_json(footer_style, "box_shadow_5_color").is_some();
+
+    json!({
+        "toggle_all_chevron": {
+            "pass": chevron_pass,
+            "node": chevron.and_then(|item| item.get("node")).cloned(),
+            "bounds": chevron.and_then(|item| item.get("bounds")).cloned(),
+            "style": chevron_style.cloned(),
+            "contract": "classic TodoMVC unchecked chevron: ❯, rotate 90, 22px, gray, pointer, centered 45x65 hit area"
+        },
+        "footer_stack_shadow": {
+            "pass": footer_pass,
+            "node": footer.and_then(|item| item.get("node")).cloned(),
+            "bounds": footer.and_then(|item| item.get("bounds")).cloned(),
+            "style": footer_style.cloned(),
+            "contract": "classic TodoMVC footer stacked-card shadows encoded as five public box_shadow entries"
+        }
+    })
+}
+
+fn style_text_json<'a>(style: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    style?.get(key)?.as_str()
+}
+
+fn style_number_json(style: Option<&serde_json::Value>, key: &str) -> Option<f64> {
+    style?.get(key)?.as_f64()
 }
 
 fn parse_json_bounds(value: &serde_json::Value) -> Option<JsonBounds> {

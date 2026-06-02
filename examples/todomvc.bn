@@ -321,14 +321,23 @@ FUNCTION todo_new_entry() {
                     width: 45
                     height: 65
                     background: [color: Oklch[lightness:1,alpha:0]]
+                    cursor: Pointer
+                    text_align: Center
+                    vertical_align: Center
+                    text_inset: 0
+                    transform: [rotate: 90]
                     font: [
                         family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
-                        size: 30
-                        color: Oklch[lightness:0.667,chroma:0.0181,hue:201.31]
-                        weight: Bolder
+                        size: 22
+                        color:
+                            PASSED.store.all_completed |> WHILE {
+                                True => Oklch[lightness:0.4]
+                                False => Oklch[lightness:0.667]
+                            }
+                        weight: Normal
                     ]
                 ]
-                label: TEXT { ∨ }
+                label: TEXT { ❯ }
                 visible: PASSED.store.has_todos
             )
             Element/text_input(

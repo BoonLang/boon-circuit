@@ -1326,8 +1326,8 @@ impl LoadedRuntime {
         })
     }
 
-    fn generic_state_summary(&self) -> JsonValue {
-        let Some(generic) = self.generic.as_ref() else {
+    fn generic_state_summary(&mut self) -> JsonValue {
+        let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         let mut summary = generic.generic_summary();
@@ -1335,8 +1335,8 @@ impl LoadedRuntime {
         summary
     }
 
-    fn document_state_summary(&self) -> JsonValue {
-        let Some(generic) = self.generic.as_ref() else {
+    fn document_state_summary(&mut self) -> JsonValue {
+        let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.document_summary()
@@ -1349,13 +1349,13 @@ impl LoadedRuntime {
     }
 
     fn document_state_summary_for_window(
-        &self,
+        &mut self,
         row_start: usize,
         row_count: usize,
         column_start: usize,
         column_count: usize,
     ) -> JsonValue {
-        let Some(generic) = self.generic.as_ref() else {
+        let Some(generic) = self.generic.as_mut() else {
             return json!({ "error": "LoadedRuntime generic schedule was already borrowed" });
         };
         generic.document_summary_for_window(row_start, row_count, column_start, column_count)
@@ -5081,7 +5081,7 @@ impl GenericScheduledRuntime {
     }
 
     fn initialize_generic_derived_fields(&mut self) -> RuntimeResult<()> {
-        if self.generic_derived.is_empty() {
+        if !self.generic_derived.has_indexed_fields() {
             return Ok(());
         }
         self.generic_derived_state.clear_last_step();
@@ -5481,11 +5481,11 @@ impl GenericScheduledRuntime {
         {
             return self.read_list_field(&row.list, row.index, name, frame);
         }
-        if let Some(value) = self.storage.root.owned_value(name) {
+        if let Some(value) = self.runtime_scalar_boon_value(name) {
             frame.reads.insert(GenericReadKey::Root {
                 field: name.to_owned(),
             });
-            return Ok(field_value_to_boon(value));
+            return Ok(value);
         }
         Ok(BoonValue::Text(name.to_owned()))
     }
@@ -5511,11 +5511,11 @@ impl GenericScheduledRuntime {
             return self.read_list_field(&row.list, row.index, &parts[1], frame);
         }
         let full_path = parts.join(".");
-        if let Some(value) = self.storage.root.owned_value(&full_path) {
+        if let Some(value) = self.runtime_scalar_boon_value(&full_path) {
             frame
                 .reads
                 .insert(GenericReadKey::Root { field: full_path });
-            return Ok(field_value_to_boon(value));
+            return Ok(value);
         }
         Ok(BoonValue::Text(full_path))
     }
@@ -5651,8 +5651,11 @@ impl GenericScheduledRuntime {
                 Ok(BoonValue::Bool(!value.bool_value().unwrap_or(false)))
             }
             "Bool/and" => {
+                let piped = input.is_some();
                 let left = self.call_input_or_first(input, args, frame)?;
-                let right = self.named_or_positional_arg_value(args, "right", 1, frame)?;
+                let right_position = if piped { 0 } else { 1 };
+                let right =
+                    self.named_or_positional_arg_value(args, "right", right_position, frame)?;
                 Ok(BoonValue::Bool(
                     left.bool_value().unwrap_or(false) && right.bool_value().unwrap_or(false),
                 ))
@@ -6112,7 +6115,7 @@ impl GenericScheduledRuntime {
         active_count == 0 && completed_count > 0
     }
 
-    fn generic_summary(&self) -> JsonValue {
+    fn generic_summary(&mut self) -> JsonValue {
         self.generic_summary_with_limits(SummaryLimits::unlimited())
     }
 
@@ -6234,6 +6237,28 @@ impl GenericScheduledRuntime {
                 if let Some(value) = self.list_find_projection(&projection.list, field, &selected) {
                     return Some(JsonValue::Object(value));
                 }
+            }
+        }
+        None
+    }
+
+    fn runtime_scalar_boon_value(&self, path: &str) -> Option<BoonValue> {
+        if let Some(value) = self.storage.root.owned_value(path) {
+            return Some(field_value_to_boon(value));
+        }
+        if let Some(value) = self
+            .root_state_paths
+            .iter()
+            .find(|root_path| row_field_name(root_path) == path)
+            .and_then(|root_path| self.storage.root.owned_value(root_path))
+        {
+            return Some(field_value_to_boon(value));
+        }
+        for (list, target) in self.list_equations.count_targets() {
+            if runtime_path_matches_target(path, target)
+                && let Ok(count) = self.count_list_rows_for_target(list, target)
+            {
+                return Some(BoonValue::Number(count as i64));
             }
         }
         None
@@ -6489,7 +6514,23 @@ impl GenericScheduledRuntime {
         fields
     }
 
-    fn document_summary(&self) -> JsonValue {
+    fn root_derived_summary_values(&mut self) -> Vec<(String, JsonValue)> {
+        let fields = self.generic_derived.root_fields.clone();
+        let mut values = Vec::new();
+        for field in fields {
+            let mut frame = GenericEvalFrame::root();
+            let value = self
+                .eval_statement_value(&field.statement, &mut frame)
+                .unwrap_or_else(|error| BoonValue::Error(error.to_string()));
+            if matches!(value, BoonValue::Error(_) | BoonValue::Empty) {
+                continue;
+            }
+            values.push((field.path, boon_value_json(&value)));
+        }
+        values
+    }
+
+    fn document_summary(&mut self) -> JsonValue {
         let mut summary = self.generic_summary_with_limits(SummaryLimits::document_preview());
         self.insert_list_projection_summary_with_limits(
             &mut summary,
@@ -6499,7 +6540,7 @@ impl GenericScheduledRuntime {
     }
 
     fn document_summary_for_window(
-        &self,
+        &mut self,
         row_start: usize,
         row_count: usize,
         column_start: usize,
@@ -6516,7 +6557,7 @@ impl GenericScheduledRuntime {
         summary
     }
 
-    fn generic_summary_with_limits(&self, limits: SummaryLimits) -> JsonValue {
+    fn generic_summary_with_limits(&mut self, limits: SummaryLimits) -> JsonValue {
         let mut root = serde_json::Map::new();
         let mut flat_root = serde_json::Map::new();
         for path in &self.root_state_paths {
@@ -6537,6 +6578,11 @@ impl GenericScheduledRuntime {
                 root.entry(row_field_name(target).to_owned())
                     .or_insert(value);
             }
+        }
+        for (path, value) in self.root_derived_summary_values() {
+            insert_nested_json(&mut root, &path, value.clone());
+            root.entry(row_field_name(&path).to_owned())
+                .or_insert(value);
         }
         for (list, target) in self.list_equations.retain_targets() {
             let Some(summary) = self
@@ -8284,6 +8330,26 @@ fn field_value_json(value: FieldValue) -> JsonValue {
     }
 }
 
+fn boon_value_json(value: &BoonValue) -> JsonValue {
+    match value {
+        BoonValue::Empty => JsonValue::Null,
+        BoonValue::Text(value) => json!(value),
+        BoonValue::Number(value) => json!(value),
+        BoonValue::Bool(value) => json!(value),
+        BoonValue::Record(fields) => JsonValue::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), boon_value_json(value)))
+                .collect(),
+        ),
+        BoonValue::List(values) => JsonValue::Array(values.iter().map(boon_value_json).collect()),
+        BoonValue::RowRef { list, index } => json!({ "list": list, "index": index }),
+        BoonValue::ListRef(list) => json!(list),
+        BoonValue::NaN => JsonValue::Null,
+        BoonValue::Error(error) => json!({ "error": error }),
+    }
+}
+
 fn insert_nested_json(root: &mut serde_json::Map<String, JsonValue>, path: &str, value: JsonValue) {
     fn insert_parts(
         object: &mut serde_json::Map<String, JsonValue>,
@@ -9580,7 +9646,14 @@ struct DerivedEquationPlan {
 struct GenericDerivedPlan {
     expressions: Vec<AstExpr>,
     functions: BTreeMap<String, FunctionDefinition>,
+    root_fields: Vec<GenericDerivedRootField>,
     indexed_fields: Vec<GenericDerivedIndexedField>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericDerivedRootField {
+    path: String,
+    statement: AstStatement,
 }
 
 #[derive(Clone, Debug)]
@@ -10293,6 +10366,15 @@ impl GenericDerivedPlan {
             .cloned()
             .map(|function| (function.name.clone(), function))
             .collect::<BTreeMap<_, _>>();
+        let root_fields = ir
+            .derived_values
+            .iter()
+            .filter(|value| !value.indexed && value.kind == DerivedValueKind::Pure)
+            .map(|value| GenericDerivedRootField {
+                path: value.path.clone(),
+                statement: value.statement.clone(),
+            })
+            .collect();
         let indexed_fields = ir
             .derived_values
             .iter()
@@ -10329,12 +10411,13 @@ impl GenericDerivedPlan {
         Self {
             expressions: ir.expressions.clone(),
             functions,
+            root_fields,
             indexed_fields,
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.indexed_fields.is_empty()
+    fn has_indexed_fields(&self) -> bool {
+        !self.indexed_fields.is_empty()
     }
 
     fn field_plan(&self, key: &GenericDerivedKey) -> Option<&GenericDerivedIndexedField> {
@@ -10433,6 +10516,17 @@ impl GenericDerivedState {
 }
 
 impl GenericEvalFrame {
+    fn root() -> Self {
+        Self {
+            env: BTreeMap::new(),
+            row: None,
+            reads: BTreeSet::new(),
+            stack: Vec::new(),
+            call_depth: 0,
+            eval_budget: 20_000,
+        }
+    }
+
     fn for_row(list: &str, row_scope: &str, index: usize) -> Self {
         Self {
             env: BTreeMap::new(),

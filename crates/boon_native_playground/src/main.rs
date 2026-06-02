@@ -1601,9 +1601,10 @@ fn native_document_layout_proof_with_state_mode(
         .cloned()
         .or_else(|| runtime_document_state_summary_for_source(source_path, source).ok());
     let document_functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
+    let initial_locals = document_initial_locals(&parsed.ast.statements, runtime_state.as_ref());
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
-        locals: BTreeMap::new(),
+        locals: initial_locals,
         passed: None,
     };
     let mut frame = boon_document_model::DocumentFrame::empty("root");
@@ -1811,6 +1812,55 @@ fn cached_document_program(
         .entry(key)
         .or_insert_with(|| Arc::clone(&parsed))
         .clone())
+}
+
+fn document_initial_locals(
+    statements: &[AstStatement],
+    root: Option<&Value>,
+) -> BTreeMap<String, Value> {
+    let Some(root_object) = root.and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    let mut locals = BTreeMap::new();
+    for statement in statements {
+        let AstStatementKind::Field { name } = &statement.kind else {
+            continue;
+        };
+        if name == "document" {
+            continue;
+        }
+        if let Some(value) = root_object.get(name) {
+            locals.insert(name.clone(), value.clone());
+            continue;
+        }
+        let mut object = serde_json::Map::new();
+        collect_document_alias_fields(statement, root_object, &mut object);
+        if !object.is_empty() {
+            locals.insert(name.clone(), Value::Object(object));
+        }
+    }
+    locals
+}
+
+fn collect_document_alias_fields(
+    statement: &AstStatement,
+    root_object: &serde_json::Map<String, Value>,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    for child in &statement.children {
+        let AstStatementKind::Field { name } = &child.kind else {
+            continue;
+        };
+        if let Some(value) = root_object.get(name) {
+            object.insert(name.clone(), value.clone());
+            continue;
+        }
+        let mut nested = serde_json::Map::new();
+        collect_document_alias_fields(child, root_object, &mut nested);
+        if !nested.is_empty() {
+            object.insert(name.clone(), Value::Object(nested));
+        }
+    }
 }
 
 fn preview_runtime_summary(
@@ -12957,7 +13007,9 @@ fn lower_canonical_style_block(
             }
             "transform" => {
                 if let Some(rotate) =
-                    document_child_style_value(child, "rotate", expressions, context)
+                    statement_nested_style_value(child, "rotate", expressions, context).or_else(
+                        || document_child_style_value(child, "rotate", expressions, context),
+                    )
                 {
                     node.style.insert("rotate".to_owned(), rotate);
                 }
@@ -14635,8 +14687,16 @@ fn document_eval_while_expr_value(
 fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bool {
     match pattern {
         [single] if single == "__" => true,
-        [single] if single == "True" => matches!(value, Value::Bool(true)),
-        [single] if single == "False" => matches!(value, Value::Bool(false)),
+        [single] if single == "True" => match value {
+            Value::Bool(true) => true,
+            Value::String(value) => value == "True",
+            _ => false,
+        },
+        [single] if single == "False" => match value {
+            Value::Bool(false) => true,
+            Value::String(value) => value == "False",
+            _ => false,
+        },
         [single] => match value {
             Value::String(value) => value == single,
             Value::Number(value) => single
@@ -23149,26 +23209,31 @@ mod tests {
             .display_list
             .iter()
             .find(|item| {
-                item.text.as_deref() == Some("∨")
+                item.text.as_deref() == Some("❯")
                     && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
             })
             .expect("TodoMVC toggle-all chevron should render as a button label");
         assert_eq!(
             toggle_all_button.style.get("size"),
-            Some(&boon_document_model::StyleValue::Number(30.0)),
-            "toggle-all chevron should use the bolder wedge at a deliberate reference-sized scale"
+            Some(&boon_document_model::StyleValue::Number(22.0)),
+            "toggle-all chevron should use the classic TodoMVC pseudo-element scale"
         );
         assert_eq!(
             toggle_all_button.style.get("color"),
             Some(&boon_document_model::StyleValue::Text(
-                "Oklch[lightness:0.667,chroma:0.0181,hue:201.31]".to_owned()
+                "Oklch[lightness:0.667]".to_owned()
             )),
-            "toggle-all chevron should use the darker reference color instead of washed-out gray"
+            "unchecked toggle-all chevron should use the classic reference gray"
         );
         assert_eq!(
             toggle_all_button.style.get("weight"),
-            Some(&boon_document_model::StyleValue::Text("Bolder".to_owned())),
-            "toggle-all chevron should be intentionally heavier than the surrounding light UI text"
+            Some(&boon_document_model::StyleValue::Text("Normal".to_owned())),
+            "toggle-all chevron should use the glyph shape, not a renderer-heavy font workaround"
+        );
+        assert_eq!(
+            toggle_all_button.style.get("rotate"),
+            Some(&boon_document_model::StyleValue::Number(90.0)),
+            "toggle-all chevron should use the public transform.rotate style from the old TodoMVC source"
         );
         assert_eq!(
             new_todo_input.style.get("border"),
@@ -23587,6 +23652,66 @@ mod tests {
             preview_cursor_icon(&layout_proof, &delete_input_state),
             boon_native_app_window::NativeCursorIcon::Pointer,
             "hovering the delete button should request the native pointer cursor"
+        );
+    }
+
+    #[test]
+    fn todomvc_dynamic_style_while_resolves_from_live_document_summary() {
+        let source_path = PathBuf::from("examples/todomvc.bn");
+        let source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let state = runtime_document_state_summary_for_source(&source_path, &source)
+            .expect("TodoMVC live runtime should expose document state");
+        assert_eq!(
+            state.pointer("/store/all_completed"),
+            Some(&serde_json::Value::Bool(false)),
+            "live document summary should expose the nested store path used by PASSED.store.all_completed"
+        );
+        assert_eq!(
+            state.pointer("/all_completed"),
+            Some(&serde_json::Value::Bool(false)),
+            "live document summary should also expose the short display name for root derived values"
+        );
+        let (_, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("TodoMVC layout should lower from live document state");
+        let toggle_all_button = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("❯")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .expect("TodoMVC toggle-all chevron should render as a button label");
+        assert_eq!(
+            toggle_all_button.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.667]".to_owned()
+            )),
+            "dynamic WHILE font color must resolve from live document state, not serialize as a raw expression"
+        );
+        let mut checked_state = state.clone();
+        checked_state["all_completed"] = serde_json::Value::Bool(true);
+        checked_state["store"]["all_completed"] = serde_json::Value::Bool(true);
+        let (_, checked_layout) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&checked_state),
+        )
+        .expect("TodoMVC checked layout should lower from live document state");
+        let checked_toggle_all_button = checked_layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("❯")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .expect("TodoMVC checked toggle-all chevron should render as a button label");
+        assert_eq!(
+            checked_toggle_all_button.style.get("color"),
+            Some(&boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.4]".to_owned()
+            )),
+            "dynamic WHILE font color must also resolve the all-completed branch"
         );
     }
 

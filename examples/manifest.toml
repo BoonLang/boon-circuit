@@ -134,6 +134,78 @@ performance_thresholds = [
 ]
 
 [[example]]
+id = "todo_mvc_physical"
+label = "TodoMVC Physical"
+source = "examples/todo_mvc_physical/RUN.bn"
+source_files = [
+  "examples/todo_mvc_physical/Theme/Professional.bn",
+  "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+  "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
+  "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+  "examples/todo_mvc_physical/Theme/Theme.bn",
+  "examples/todo_mvc_physical/Generated/Assets.bn",
+  "examples/todo_mvc_physical/RUN.bn",
+]
+build_files = [
+  "examples/todo_mvc_physical/BUILD.bn",
+]
+asset_files = [
+  "examples/todo_mvc_physical/assets/icons/checkbox_active.svg",
+  "examples/todo_mvc_physical/assets/icons/checkbox_completed.svg",
+]
+scenario = "examples/todo_mvc_physical.scn"
+budget = "examples/todo_mvc_physical.budget.toml"
+category = "main"
+order = 25
+default_tab_order = 25
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "title-todos-visible",
+  "physical-panel-visible",
+  "scene-depth-visible",
+  "theme-switcher-visible",
+  "svg-checkbox-assets-visible",
+  "dev-window-editor-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "add-todo",
+  "reject-empty-todo",
+  "toggle-one-todo",
+  "toggle-all",
+  "filter-all-active-completed",
+  "filter-active",
+  "filter-completed",
+  "filter-all-before-edit",
+  "edit-todo",
+  "cancel-edit",
+  "edit-todo-commit-open",
+  "edit-todo-change",
+  "edit-todo-commit",
+  "toggle-edited-todo-completed",
+  "clear-completed",
+  "switch-theme-professional",
+  "switch-theme-glassmorphism",
+  "switch-theme-neobrutalism",
+  "switch-theme-neumorphism",
+  "toggle-light-dark-mode",
+]
+scroll_focus_scenarios = []
+visual_artifacts = [
+  "preview-app-owned-framebuffer-before-after",
+  "dev-app-owned-framebuffer",
+  "physical-scene-depth-crop",
+  "theme-switcher-crop",
+]
+performance_thresholds = [
+  "preview-interaction-p95-frame-ms <= 16.7",
+  "preview-interaction-p99-frame-ms <= 25.0",
+  "dev-editor-scroll-p95-frame-ms <= 16.7",
+]
+
+[[example]]
 id = "counter"
 label = "Counter"
 source = "examples/counter.bn"

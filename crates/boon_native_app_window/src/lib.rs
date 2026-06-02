@@ -479,9 +479,12 @@ impl NativeRenderHookResult {
                 scheduler_reason,
                 Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
             );
+        let scheduler_idle_same_content_repaint =
+            scheduler_reason.is_none() && role_dirty_reason.is_none() && !self.content_changed;
         if self.content_revision < dirty_revision
             && !same_content_surface_render
             && !scheduler_only_input_repaint
+            && !scheduler_idle_same_content_repaint
         {
             return Err(format!(
                 "render hook result content_revision {} is older than dirty_revision {}",
@@ -507,7 +510,10 @@ impl NativeRenderHookResult {
                 && matches!(
                     scheduler_reason,
                     Some(NativeSchedulerReason::HostInput | NativeSchedulerReason::Timer)
-                )))
+                ))
+                || (scheduler_reason.is_none()
+                    && role_dirty_reason.is_none()
+                    && !self.content_changed))
         {
             dirty_revision
         } else {
@@ -1748,7 +1754,9 @@ async fn run_surface_probe_inner(
             None,
         )?;
     }
-    let _ = callback_done_receiver.recv_timeout(Duration::from_secs(2));
+    let callback_done_timeout =
+        Duration::from_millis(options.hold_ms.max(2_000)).saturating_add(Duration::from_secs(240));
+    let _ = callback_done_receiver.recv_timeout(callback_done_timeout);
     drop(surface);
     drop(app_surface);
     drop(window);
@@ -2927,6 +2935,36 @@ mod tests {
                 )
                 .is_err(),
             "real runtime input must still advance the content revision"
+        );
+    }
+
+    #[test]
+    fn idle_same_content_frame_can_repaint_existing_content_revision() {
+        let render = NativeRenderHookResult {
+            proof: serde_json::json!({}),
+            content_revision: 4,
+            rendered: true,
+            content_changed: false,
+            role_dirty_reason: None,
+        };
+
+        assert!(
+            render
+                .validate_for_presented_revision_with_scheduler(5, None, None)
+                .is_ok(),
+            "continuous verifier frames may repaint unchanged already-presented content"
+        );
+        assert_eq!(render.presented_content_revision(5, None, None), 5);
+
+        let changed = NativeRenderHookResult {
+            content_changed: true,
+            ..render
+        };
+        assert!(
+            changed
+                .validate_for_presented_revision_with_scheduler(5, None, None)
+                .is_err(),
+            "new content without a scheduler/role reason must not be backdated"
         );
     }
 

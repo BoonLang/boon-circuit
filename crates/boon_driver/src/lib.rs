@@ -82,6 +82,7 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let operator_ack = report.pointer("/dev_ipc_probe/operator_host_input");
+    let operator_host_input_evidence = report.get("operator_host_input_evidence");
     let operator_outputs = operator_ack
         .and_then(|ack| ack.get("outputs"))
         .and_then(Value::as_array)
@@ -95,47 +96,98 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
     let source_shortcut = operator_ack
         .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or_else(|| {
+            operator_host_input_evidence
+                .and_then(|evidence| evidence.get("status"))
+                .and_then(Value::as_str)
+                != Some("pass")
+        });
     let operator_real_os_input = operator_ack
         .and_then(|ack| ack.get("real_os_input"))
         .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let action_proofs = operator_outputs
-        .iter()
-        .enumerate()
-        .map(|(index, output)| {
-            let route = route_assertions
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| json!(null));
-            json!({
-                "index": index,
-                "status": if route.get("pass").and_then(Value::as_bool) == Some(true) {
-                    "pass"
-                } else {
-                    "fail"
-                },
-                "target_selector": route.pointer("/source_intent/source").cloned()
-                    .or_else(|| route.get("requested_source").cloned())
-                    .unwrap_or_else(|| json!(null)),
-                "resolved_document_node": route.pointer("/target_hit_region/node").cloned()
-                    .unwrap_or_else(|| json!(null)),
-                "hit_region": route.get("target_hit_region").cloned()
-                    .unwrap_or_else(|| json!(null)),
-                "source_binding_resolved": route.get("source_binding_resolved").cloned()
-                    .unwrap_or_else(|| json!(false)),
-                "hit_test_performed": route.get("hit_test_performed").cloned()
-                    .unwrap_or_else(|| json!(false)),
-                "runtime_event": output.get("event").cloned().unwrap_or_else(|| json!(null)),
-                "semantic_delta_count": output.get("semantic_delta_count").cloned()
-                    .unwrap_or_else(|| json!(0)),
-                "render_patch_count": output.get("render_patch_count").cloned()
-                    .unwrap_or_else(|| json!(0)),
-                "framebuffer_delta_evidence": output.get("framebuffer_delta_evidence").cloned()
-                    .unwrap_or_else(|| json!(null)),
+        .unwrap_or_else(|| {
+            report
+                .get("real_os_input")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        });
+    let action_proofs = if operator_outputs.is_empty() {
+        host_routes
+            .iter()
+            .enumerate()
+            .map(|(index, route)| {
+                let source_binding_resolved = route
+                    .get("source_intents")
+                    .and_then(Value::as_array)
+                    .is_some_and(|intents| !intents.is_empty());
+                json!({
+                    "index": index,
+                    "status": if source_binding_resolved
+                        && route.get("operator_host_input_observed").and_then(Value::as_bool) == Some(true)
+                    {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                    "target_selector": route
+                        .get("source_intents")
+                        .and_then(Value::as_array)
+                        .and_then(|intents| intents.first())
+                        .and_then(|intent| intent.get("source_path"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(null)),
+                    "resolved_document_node": route.pointer("/target_hit_region/node").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                    "hit_region": route.get("target_hit_region").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                    "source_binding_resolved": source_binding_resolved,
+                    "hit_test_performed": route.get("target_hit_region").is_some(),
+                    "runtime_event": route.get("host_events").cloned().unwrap_or_else(|| json!([])),
+                    "semantic_delta_count": 0,
+                    "render_patch_count": if route.get("changes_visible_frame").and_then(Value::as_bool) == Some(true) { 1 } else { 0 },
+                    "framebuffer_delta_evidence": route.get("visible_frame_change_method").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    } else {
+        operator_outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let route = route_assertions
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| json!(null));
+                json!({
+                    "index": index,
+                    "status": if route.get("pass").and_then(Value::as_bool) == Some(true) {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                    "target_selector": route.pointer("/source_intent/source").cloned()
+                        .or_else(|| route.get("requested_source").cloned())
+                        .unwrap_or_else(|| json!(null)),
+                    "resolved_document_node": route.pointer("/target_hit_region/node").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                    "hit_region": route.get("target_hit_region").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                    "source_binding_resolved": route.get("source_binding_resolved").cloned()
+                        .unwrap_or_else(|| json!(false)),
+                    "hit_test_performed": route.get("hit_test_performed").cloned()
+                        .unwrap_or_else(|| json!(false)),
+                    "runtime_event": output.get("event").cloned().unwrap_or_else(|| json!(null)),
+                    "semantic_delta_count": output.get("semantic_delta_count").cloned()
+                        .unwrap_or_else(|| json!(0)),
+                    "render_patch_count": output.get("render_patch_count").cloned()
+                        .unwrap_or_else(|| json!(0)),
+                    "framebuffer_delta_evidence": output.get("framebuffer_delta_evidence").cloned()
+                        .unwrap_or_else(|| json!(null)),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
     let action_proofs_pass = !action_proofs.is_empty()
         && action_proofs
             .iter()

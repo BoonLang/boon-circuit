@@ -317,10 +317,297 @@ pub struct SurfaceRenderRequest<'a> {
     pub height: u32,
 }
 
+type TextureBindGroup = generated::shader_bindings::native_gpu_rect::WgpuBindGroup0;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AssetTextureKey {
+    url: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QuadTexture {
+    Solid,
+    Asset(AssetTextureKey),
+}
+
+#[derive(Debug)]
+struct QuadBatch {
+    texture: QuadTexture,
+    positions: Vec<f32>,
+    colors: Vec<u32>,
+    uvs: Vec<f32>,
+}
+
+struct GpuQuadBatch {
+    texture: QuadTexture,
+    vertex_count: u32,
+    position_buffer: wgpu::Buffer,
+    color_buffer: wgpu::Buffer,
+    uv_buffer: wgpu::Buffer,
+}
+
+#[derive(Debug, Default)]
+struct QuadBuilder {
+    batches: Vec<QuadBatch>,
+}
+
+impl QuadBuilder {
+    fn push_triangle(
+        &mut self,
+        texture: QuadTexture,
+        points: [[f32; 2]; 3],
+        uvs: [[f32; 2]; 3],
+        surface_width: f32,
+        surface_height: f32,
+        color: [f32; 4],
+    ) {
+        let batch = if self
+            .batches
+            .last()
+            .is_some_and(|batch| batch.texture == texture)
+        {
+            self.batches.last_mut().unwrap()
+        } else {
+            self.batches.push(QuadBatch {
+                texture,
+                positions: Vec::new(),
+                colors: Vec::new(),
+                uvs: Vec::new(),
+            });
+            self.batches.last_mut().unwrap()
+        };
+        for (point, uv) in points.into_iter().zip(uvs) {
+            batch.positions.extend_from_slice(&[
+                (point[0] / surface_width.max(1.0))
+                    .mul_add(2.0, -1.0)
+                    .clamp(-1.0, 1.0),
+                (1.0 - (point[1] / surface_height.max(1.0)) * 2.0).clamp(-1.0, 1.0),
+            ]);
+            batch.colors.push(pack_rgba8_from_f32(color));
+            batch.uvs.extend_from_slice(&uv);
+        }
+    }
+}
+
+struct TextureState {
+    sampler: wgpu::Sampler,
+    _white_texture: wgpu::Texture,
+    _white_view: wgpu::TextureView,
+    white_bind_group: TextureBindGroup,
+    assets: BTreeMap<AssetTextureKey, GpuTextureAsset>,
+}
+
+struct GpuTextureAsset {
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: TextureBindGroup,
+}
+
+impl TextureState {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("boon-native-gpu-texture-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let (white_texture, white_view) = upload_rgba_texture(
+            device,
+            queue,
+            "boon-native-gpu-white-texture",
+            1,
+            1,
+            &[255; 4],
+        );
+        let white_bind_group = TextureBindGroup::from_bindings(
+            device,
+            generated::shader_bindings::native_gpu_rect::WgpuBindGroup0Entries::new(
+                generated::shader_bindings::native_gpu_rect::WgpuBindGroup0EntriesParams {
+                    texture_sampler: &sampler,
+                    texture_image: &white_view,
+                },
+            ),
+        );
+        Self {
+            sampler,
+            _white_texture: white_texture,
+            _white_view: white_view,
+            white_bind_group,
+            assets: BTreeMap::new(),
+        }
+    }
+
+    fn prepare_assets(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batches: &[QuadBatch],
+    ) -> Result<(), RenderError> {
+        for batch in batches {
+            let QuadTexture::Asset(key) = &batch.texture else {
+                continue;
+            };
+            if self.assets.contains_key(key) {
+                continue;
+            }
+            let pixels = rasterize_svg_data_url(&key.url, key.width, key.height)?;
+            let (texture, view) = upload_rgba_texture(
+                device,
+                queue,
+                "boon-native-gpu-asset-texture",
+                key.width,
+                key.height,
+                &pixels,
+            );
+            let bind_group = TextureBindGroup::from_bindings(
+                device,
+                generated::shader_bindings::native_gpu_rect::WgpuBindGroup0Entries::new(
+                    generated::shader_bindings::native_gpu_rect::WgpuBindGroup0EntriesParams {
+                        texture_sampler: &self.sampler,
+                        texture_image: &view,
+                    },
+                ),
+            );
+            self.assets.insert(
+                key.clone(),
+                GpuTextureAsset {
+                    _texture: texture,
+                    _view: view,
+                    bind_group,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn bind_group_for(&self, texture: &QuadTexture) -> Option<&TextureBindGroup> {
+        match texture {
+            QuadTexture::Solid => Some(&self.white_bind_group),
+            QuadTexture::Asset(key) => self.assets.get(key).map(|asset| &asset.bind_group),
+        }
+    }
+}
+
+fn upload_rgba_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn rasterize_svg_data_url(url: &str, width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
+    let svg = decode_svg_data_url(url).ok_or_else(|| RenderError {
+        message: "native GPU asset URL is not a supported SVG data URL".to_owned(),
+    })?;
+    let options = resvg::usvg::Options::default();
+    let tree =
+        resvg::usvg::Tree::from_data(svg.as_bytes(), &options).map_err(|error| RenderError {
+            message: format!("parse SVG data URL asset: {error}"),
+        })?;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(width.max(1), height.max(1)).ok_or_else(|| RenderError {
+            message: format!("allocate SVG raster target {width}x{height}"),
+        })?;
+    let svg_size = tree.size();
+    let scale_x = width.max(1) as f32 / svg_size.width().max(1.0);
+    let scale_y = height.max(1) as f32 / svg_size.height().max(1.0);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale_x, scale_y),
+        &mut pixmap.as_mut(),
+    );
+    Ok(pixmap.take())
+}
+
+fn decode_svg_data_url(url: &str) -> Option<String> {
+    let (metadata, data) = url.split_once(',')?;
+    let metadata = metadata.trim().to_ascii_lowercase();
+    if !metadata.starts_with("data:image/svg+xml") || metadata.contains(";base64") {
+        return None;
+    }
+    percent_decode_utf8(data)
+}
+
+fn percent_decode_utf8(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let input = value.as_bytes();
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let high = input.get(index + 1).copied()?;
+            let low = input.get(index + 2).copied()?;
+            bytes.push(hex_pair(high, low)?);
+            index += 3;
+        } else {
+            bytes.push(input[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(hex_digit(high)? * 16 + hex_digit(low)?)
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub struct VisibleLayoutRenderer {
     pipeline: wgpu::RenderPipeline,
     frame_seq: u64,
     text: GlyphonTextState,
+    textures: TextureState,
 }
 
 impl VisibleLayoutRenderer {
@@ -329,6 +616,7 @@ impl VisibleLayoutRenderer {
         let module = shader.create_shader_module_embed_source(device);
         let layout = shader.create_pipeline_layout(device);
         let vertex_entry = generated::shader_bindings::native_gpu_rect::vs_main_entry(
+            wgpu::VertexStepMode::Vertex,
             wgpu::VertexStepMode::Vertex,
             wgpu::VertexStepMode::Vertex,
         );
@@ -360,6 +648,7 @@ impl VisibleLayoutRenderer {
             pipeline,
             frame_seq: 0,
             text: GlyphonTextState::new(device, queue, format),
+            textures: TextureState::new(device, queue),
         }
     }
 
@@ -372,6 +661,7 @@ impl VisibleLayoutRenderer {
             request,
             &self.pipeline,
             Some(&mut self.text),
+            &mut self.textures,
             self.frame_seq,
         )
     }
@@ -388,6 +678,7 @@ fn encode_layout_to_surface_with_pipeline(
     request: SurfaceRenderRequest<'_>,
     pipeline: &wgpu::RenderPipeline,
     mut text: Option<&mut GlyphonTextState>,
+    textures: &mut TextureState,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
@@ -402,29 +693,55 @@ fn encode_layout_to_surface_with_pipeline(
         None => None,
         Some(_) => None,
     };
-    let (positions, colors, rect_metrics) = rect_vertices(
+    let (quad_batches, rect_metrics) = rect_vertices(
         request.frame,
         width as f32,
         height as f32,
         text_layout_metrics.as_ref(),
     );
-    let vertex_count = (positions.len() / 2) as u32;
-    let position_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-visible-position-buffer"),
-        size: (positions.len() * std::mem::size_of::<f32>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let color_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-visible-color-buffer"),
-        size: colors.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    request
-        .queue
-        .write_buffer(&position_buffer, 0, &f32_slice_bytes(&positions));
-    request.queue.write_buffer(&color_buffer, 0, &colors);
+    textures.prepare_assets(request.device, request.queue, &quad_batches)?;
+    let mut gpu_batches = Vec::new();
+    let mut upload_bytes = 0u64;
+    for batch in quad_batches {
+        let vertex_count = (batch.positions.len() / 2) as u32;
+        if vertex_count == 0 {
+            continue;
+        }
+        let position_bytes = f32_slice_bytes(&batch.positions);
+        let color_bytes = u32_slice_bytes(&batch.colors);
+        let uv_bytes = f32_slice_bytes(&batch.uvs);
+        let position_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boon-native-gpu-visible-position-buffer"),
+            size: position_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let color_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boon-native-gpu-visible-color-buffer"),
+            size: color_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uv_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boon-native-gpu-visible-uv-buffer"),
+            size: uv_bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        request
+            .queue
+            .write_buffer(&position_buffer, 0, &position_bytes);
+        request.queue.write_buffer(&color_buffer, 0, &color_bytes);
+        request.queue.write_buffer(&uv_buffer, 0, &uv_bytes);
+        upload_bytes += (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
+        gpu_batches.push(GpuQuadBatch {
+            texture: batch.texture,
+            vertex_count,
+            position_buffer,
+            color_buffer,
+            uv_buffer,
+        });
+    }
     {
         let mut pass = request
             .encoder
@@ -450,9 +767,19 @@ fn encode_layout_to_surface_with_pipeline(
                 multiview_mask: None,
             });
         pass.set_pipeline(pipeline);
-        pass.set_vertex_buffer(0, position_buffer.slice(..));
-        pass.set_vertex_buffer(1, color_buffer.slice(..));
-        pass.draw(0..vertex_count, 0..1);
+        for batch in &gpu_batches {
+            let bind_group =
+                textures
+                    .bind_group_for(&batch.texture)
+                    .ok_or_else(|| RenderError {
+                        message: "native GPU asset texture was not prepared before draw".to_owned(),
+                    })?;
+            bind_group.set(&mut pass);
+            pass.set_vertex_buffer(0, batch.position_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.color_buffer.slice(..));
+            pass.set_vertex_buffer(2, batch.uv_buffer.slice(..));
+            pass.draw(0..batch.vertex_count, 0..1);
+        }
     }
     let rendered_text_runs = match text.as_mut() {
         Some(text) => text.render(
@@ -468,8 +795,8 @@ fn encode_layout_to_surface_with_pipeline(
     };
     Ok(FrameMetrics {
         frame_seq,
-        draw_calls: 1 + u32::from(rendered_text_runs > 0),
-        upload_bytes: ((positions.len() * std::mem::size_of::<f32>()) + colors.len()) as u64,
+        draw_calls: gpu_batches.len() as u32 + u32::from(rendered_text_runs > 0),
+        upload_bytes,
         visible_display_item_count: rect_metrics.visible_display_item_count,
         rendered_rect_count: rect_metrics.rendered_rect_count,
         rect_cap_hit: rect_metrics.cap_hit,
@@ -2057,16 +2384,14 @@ fn rect_vertices(
     width: f32,
     height: f32,
     text_layouts: Option<&TextRunLayoutMap>,
-) -> (Vec<f32>, Vec<u8>, RectVertexMetrics) {
-    let mut positions = Vec::new();
-    let mut colors = Vec::new();
+) -> (Vec<QuadBatch>, RectVertexMetrics) {
+    let mut builder = QuadBuilder::default();
     let mut metrics = RectVertexMetrics {
         rendered_rect_count: 1,
         ..RectVertexMetrics::default()
     };
     push_rect(
-        &mut positions,
-        &mut colors,
+        &mut builder,
         Rect {
             x: 0.0,
             y: 0.0,
@@ -2096,21 +2421,13 @@ fn rect_vertices(
         {
             continue;
         }
-        push_shadows(
-            &mut positions,
-            &mut colors,
-            item.bounds,
-            width,
-            height,
-            &item.style,
-        );
+        push_shadows(&mut builder, item.bounds, width, height, &item.style);
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
         let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
         push_styled_rect(
-            &mut positions,
-            &mut colors,
+            &mut builder,
             item.bounds,
             width,
             height,
@@ -2118,10 +2435,13 @@ fn rect_vertices(
             border_radius,
         );
         metrics.rendered_rect_count += 1;
+        if let Some(asset_url) = style_asset_url(&item.style) {
+            push_asset_rect(&mut builder, item.bounds, width, height, asset_url);
+            metrics.rendered_rect_count += 1;
+        }
         if let Some(border) = style_color_f32(&item.style, "border") {
             push_styled_border_all(
-                &mut positions,
-                &mut colors,
+                &mut builder,
                 item.bounds,
                 width,
                 height,
@@ -2132,14 +2452,7 @@ fn rect_vertices(
             );
             metrics.rendered_rect_count += 1;
         }
-        push_side_borders(
-            &mut positions,
-            &mut colors,
-            item.bounds,
-            width,
-            height,
-            &item.style,
-        );
+        push_side_borders(&mut builder, item.bounds, width, height, &item.style);
         if matches!(item.kind, DocumentNodeKind::Text) {
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
@@ -2157,8 +2470,7 @@ fn rect_vertices(
                 let start_x = text_layout.x_for_column(start);
                 let end_x = text_layout.x_for_column(end);
                 push_rect(
-                    &mut positions,
-                    &mut colors,
+                    &mut builder,
                     Rect {
                         x: start_x,
                         y: line_top,
@@ -2185,8 +2497,7 @@ fn rect_vertices(
                     let bracket_x = text_layout.x_for_column(column.max(0.0))
                         + (cell_width - bracket_width) * 0.5;
                     push_rect(
-                        &mut positions,
-                        &mut colors,
+                        &mut builder,
                         Rect {
                             x: bracket_x,
                             y: line_top,
@@ -2208,8 +2519,7 @@ fn rect_vertices(
                     .or_else(|| style_color_f32(&item.style, "color"))
                     .unwrap_or([0.09, 0.23, 1.0, 1.0]);
                 push_rect(
-                    &mut positions,
-                    &mut colors,
+                    &mut builder,
                     Rect {
                         x: text_layout.x_for_column(column.max(0.0)),
                         y: line_top,
@@ -2229,7 +2539,7 @@ fn rect_vertices(
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
             let rect = strikethrough_rect_for_item(item, text_layout);
-            push_rect(&mut positions, &mut colors, rect, width, height, color);
+            push_rect(&mut builder, rect, width, height, color);
             metrics.rendered_rect_count += 1;
         }
         if style_bool(&item.style, "underline_if") == Some(true) {
@@ -2238,8 +2548,7 @@ fn rect_vertices(
                 .unwrap_or([0.58, 0.58, 0.58, 1.0]);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
             push_rect(
-                &mut positions,
-                &mut colors,
+                &mut builder,
                 underline_rect_for_item(item, text_layout),
                 width,
                 height,
@@ -2248,14 +2557,7 @@ fn rect_vertices(
             metrics.rendered_rect_count += 1;
         }
         if matches!(item.kind, DocumentNodeKind::Checkbox) {
-            push_checkbox(
-                &mut positions,
-                &mut colors,
-                item.bounds,
-                width,
-                height,
-                &item.style,
-            );
+            push_checkbox(&mut builder, item.bounds, width, height, &item.style);
             metrics.rendered_rect_count += 1;
         }
         if matches!(item.kind, DocumentNodeKind::Button)
@@ -2267,8 +2569,7 @@ fn rect_vertices(
             let left = item.bounds.x + 9.0;
             let top = item.bounds.y + 12.0;
             push_rect(
-                &mut positions,
-                &mut colors,
+                &mut builder,
                 Rect {
                     x: left,
                     y: top + 11.0,
@@ -2280,8 +2581,7 @@ fn rect_vertices(
                 color,
             );
             push_rect(
-                &mut positions,
-                &mut colors,
+                &mut builder,
                 Rect {
                     x: left + 5.0,
                     y: top + 4.0,
@@ -2314,8 +2614,7 @@ fn rect_vertices(
                 .map(|layout| layout.x_for_column(caret_column.max(0.0)))
                 .unwrap_or(text_bounds.x + text_inset);
             push_rect(
-                &mut positions,
-                &mut colors,
+                &mut builder,
                 Rect {
                     x: caret_x,
                     y: line_top,
@@ -2329,43 +2628,91 @@ fn rect_vertices(
             metrics.rendered_rect_count += 1;
         }
     }
-    if positions.is_empty() {
-        positions.extend_from_slice(&[
-            -0.9, 0.9, -0.7, 0.9, -0.7, 0.7, -0.9, 0.9, -0.7, 0.7, -0.9, 0.7,
-        ]);
-        for _ in 0..6 {
-            colors.extend_from_slice(&rgba8_from_f32([0.2, 0.6, 0.9, 1.0]));
-        }
+    if builder.batches.is_empty() {
+        push_rect(
+            &mut builder,
+            Rect {
+                x: width * 0.05,
+                y: height * 0.05,
+                width: width * 0.1,
+                height: height * 0.1,
+            },
+            width,
+            height,
+            [0.2, 0.6, 0.9, 1.0],
+        );
     }
-    (positions, colors, metrics)
+    (builder.batches, metrics)
 }
 
-fn push_rect(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+fn push_rect(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, color: [f32; 4]) {
+    push_textured_rect(builder, QuadTexture::Solid, rect, width, height, color);
+}
+
+fn push_asset_rect(
+    builder: &mut QuadBuilder,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    asset_url: &str,
+) {
+    let texture_width = rect.width.ceil().clamp(1.0, 2048.0) as u32;
+    let texture_height = rect.height.ceil().clamp(1.0, 2048.0) as u32;
+    push_textured_rect(
+        builder,
+        QuadTexture::Asset(AssetTextureKey {
+            url: asset_url.to_owned(),
+            width: texture_width,
+            height: texture_height,
+        }),
+        rect,
+        width,
+        height,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+}
+
+fn push_textured_rect(
+    builder: &mut QuadBuilder,
+    texture: QuadTexture,
     rect: Rect,
     width: f32,
     height: f32,
     color: [f32; 4],
 ) {
-    let x0 = (rect.x / width.max(1.0))
-        .mul_add(2.0, -1.0)
-        .clamp(-1.0, 1.0);
-    let x1 = ((rect.x + rect.width) / width.max(1.0))
-        .mul_add(2.0, -1.0)
-        .clamp(-1.0, 1.0);
-    let y0 = (1.0 - (rect.y / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
-    let y1 = (1.0 - ((rect.y + rect.height) / height.max(1.0)) * 2.0).clamp(-1.0, 1.0);
-    positions.extend_from_slice(&[x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1]);
-    let color = rgba8_from_f32(color);
-    for _ in 0..6 {
-        colors.extend_from_slice(&color);
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
     }
+    let x0 = rect.x;
+    let x1 = rect.x + rect.width;
+    let y0 = rect.y;
+    let y1 = rect.y + rect.height;
+    builder.push_triangle(
+        texture.clone(),
+        [[x0, y0], [x1, y0], [x1, y1]],
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+        width,
+        height,
+        color,
+    );
+    builder.push_triangle(
+        texture,
+        [[x0, y0], [x1, y1], [x0, y1]],
+        [[0.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        width,
+        height,
+        color,
+    );
+}
+
+fn style_asset_url(style: &StyleMap) -> Option<&str> {
+    style_text(style, "asset_url")
+        .or_else(|| style_text(style, "background_url"))
+        .filter(|url| !url.trim().is_empty())
 }
 
 fn push_styled_rect(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
@@ -2374,15 +2721,14 @@ fn push_styled_rect(
 ) {
     let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
     if radius <= 0.25 {
-        push_rect(positions, colors, rect, width, height, color);
+        push_rect(builder, rect, width, height, color);
         return;
     }
-    push_rounded_rect(positions, colors, rect, width, height, color, radius);
+    push_rounded_rect(builder, rect, width, height, color, radius);
 }
 
 fn push_styled_border_all(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
@@ -2393,20 +2739,12 @@ fn push_styled_border_all(
 ) {
     let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
     if radius <= 0.25 {
-        push_border_all(
-            positions,
-            colors,
-            rect,
-            width,
-            height,
-            border_color,
-            thickness,
-        );
+        push_border_all(builder, rect, width, height, border_color, thickness);
         return;
     }
 
     let thickness = thickness.max(0.25).min(rect.width.min(rect.height) * 0.5);
-    push_rounded_rect(positions, colors, rect, width, height, border_color, radius);
+    push_rounded_rect(builder, rect, width, height, border_color, radius);
     let inner = Rect {
         x: rect.x + thickness,
         y: rect.y + thickness,
@@ -2415,8 +2753,7 @@ fn push_styled_border_all(
     };
     if inner.width > 0.0 && inner.height > 0.0 {
         push_rounded_rect(
-            positions,
-            colors,
+            builder,
             inner,
             width,
             height,
@@ -2427,8 +2764,7 @@ fn push_styled_border_all(
 }
 
 fn push_rounded_rect(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
@@ -2440,12 +2776,11 @@ fn push_rounded_rect(
     }
     let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
     if radius <= 0.25 {
-        push_rect(positions, colors, rect, width, height, color);
+        push_rect(builder, rect, width, height, color);
         return;
     }
     push_rect(
-        positions,
-        colors,
+        builder,
         Rect {
             x: rect.x + radius,
             y: rect.y,
@@ -2457,8 +2792,7 @@ fn push_rounded_rect(
         color,
     );
     push_rect(
-        positions,
-        colors,
+        builder,
         Rect {
             x: rect.x,
             y: rect.y + radius,
@@ -2470,8 +2804,7 @@ fn push_rounded_rect(
         color,
     );
     push_rect(
-        positions,
-        colors,
+        builder,
         Rect {
             x: rect.x + rect.width - radius,
             y: rect.y + radius,
@@ -2485,8 +2818,7 @@ fn push_rounded_rect(
 
     let segments = ((radius * 1.5).ceil() as usize).clamp(4, 12);
     push_corner_fan(
-        positions,
-        colors,
+        builder,
         [rect.x + radius, rect.y + radius],
         radius,
         std::f32::consts::PI,
@@ -2497,8 +2829,7 @@ fn push_rounded_rect(
         color,
     );
     push_corner_fan(
-        positions,
-        colors,
+        builder,
         [rect.x + rect.width - radius, rect.y + radius],
         radius,
         std::f32::consts::PI * 1.5,
@@ -2509,8 +2840,7 @@ fn push_rounded_rect(
         color,
     );
     push_corner_fan(
-        positions,
-        colors,
+        builder,
         [rect.x + rect.width - radius, rect.y + rect.height - radius],
         radius,
         0.0,
@@ -2521,8 +2851,7 @@ fn push_rounded_rect(
         color,
     );
     push_corner_fan(
-        positions,
-        colors,
+        builder,
         [rect.x + radius, rect.y + rect.height - radius],
         radius,
         std::f32::consts::PI * 0.5,
@@ -2536,8 +2865,7 @@ fn push_rounded_rect(
 
 #[allow(clippy::too_many_arguments)]
 fn push_corner_fan(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     center: [f32; 2],
     radius: f32,
     start: f32,
@@ -2551,8 +2879,7 @@ fn push_corner_fan(
         let a0 = start + (end - start) * (index as f32 / segments as f32);
         let a1 = start + (end - start) * ((index + 1) as f32 / segments as f32);
         push_triangle(
-            positions,
-            colors,
+            builder,
             center,
             [center[0] + a0.cos() * radius, center[1] + a0.sin() * radius],
             [center[0] + a1.cos() * radius, center[1] + a1.sin() * radius],
@@ -2564,8 +2891,7 @@ fn push_corner_fan(
 }
 
 fn push_triangle(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     a: [f32; 2],
     b: [f32; 2],
     c: [f32; 2],
@@ -2573,28 +2899,17 @@ fn push_triangle(
     height: f32,
     color: [f32; 4],
 ) {
-    for point in [a, b, c] {
-        positions.extend_from_slice(&[
-            (point[0] / width.max(1.0))
-                .mul_add(2.0, -1.0)
-                .clamp(-1.0, 1.0),
-            (1.0 - (point[1] / height.max(1.0)) * 2.0).clamp(-1.0, 1.0),
-        ]);
-    }
-    let color = rgba8_from_f32(color);
-    for _ in 0..3 {
-        colors.extend_from_slice(&color);
-    }
+    builder.push_triangle(
+        QuadTexture::Solid,
+        [a, b, c],
+        [[0.0, 0.0]; 3],
+        width,
+        height,
+        color,
+    );
 }
 
-fn push_shadows(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
-    rect: Rect,
-    width: f32,
-    height: f32,
-    style: &StyleMap,
-) {
+fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, style: &StyleMap) {
     for index in (1..=6).rev() {
         let color_key = format!("box_shadow_{index}_color");
         let Some(color) = style_color_f32(style, &color_key) else {
@@ -2608,8 +2923,7 @@ fn push_shadows(
         if inset {
             let thickness = blur.max(1.0);
             push_rect(
-                positions,
-                colors,
+                builder,
                 Rect {
                     x: rect.x,
                     y: rect.y + rect.height - thickness + y,
@@ -2628,12 +2942,11 @@ fn push_shadows(
                 height: (rect.height + spread * 2.0).max(1.0),
             };
             if blur <= 0.0 {
-                push_rect_difference(positions, colors, base, rect, width, height, color);
+                push_rect_difference(builder, base, rect, width, height, color);
                 continue;
             }
             push_rect_difference(
-                positions,
-                colors,
+                builder,
                 base,
                 rect,
                 width,
@@ -2650,8 +2963,7 @@ fn push_shadows(
                     continue;
                 }
                 push_shadow_halo(
-                    positions,
-                    colors,
+                    builder,
                     base,
                     rect,
                     inner_expand,
@@ -2694,8 +3006,7 @@ fn style_edges(style: &StyleMap, prefix: &str) -> EdgeSpacing {
 }
 
 fn push_shadow_halo(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     occluder: Rect,
     inner_expand: f32,
@@ -2739,14 +3050,13 @@ fn push_shadow_halo(
         },
     ] {
         if band.width > 0.0 && band.height > 0.0 {
-            push_rect_difference(positions, colors, band, occluder, width, height, color);
+            push_rect_difference(builder, band, occluder, width, height, color);
         }
     }
 }
 
 fn push_rect_difference(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     cutout: Rect,
     width: f32,
@@ -2754,7 +3064,7 @@ fn push_rect_difference(
     color: [f32; 4],
 ) {
     let Some(overlap) = rect_intersection(rect, cutout) else {
-        push_rect(positions, colors, rect, width, height, color);
+        push_rect(builder, rect, width, height, color);
         return;
     };
     let top_height = (overlap.y - rect.y).max(0.0);
@@ -2790,7 +3100,7 @@ fn push_rect_difference(
         },
     ] {
         if band.width > 0.0 && band.height > 0.0 {
-            push_rect(positions, colors, band, width, height, color);
+            push_rect(builder, band, width, height, color);
         }
     }
 }
@@ -2866,8 +3176,7 @@ fn circle_coverage(radius: f32, aa: f32, distance: f32) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn push_checkbox_check_raster(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     start: (f32, f32),
     middle: (f32, f32),
     end: (f32, f32),
@@ -2902,8 +3211,7 @@ fn push_checkbox_check_raster(
                 continue;
             }
             push_rect(
-                positions,
-                colors,
+                builder,
                 Rect {
                     x: x as f32,
                     y: y as f32,
@@ -2920,8 +3228,7 @@ fn push_checkbox_check_raster(
 
 #[allow(clippy::too_many_arguments)]
 fn push_checkbox_circle_raster(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     center_x: f32,
     center_y: f32,
     radius: f32,
@@ -2950,8 +3257,7 @@ fn push_checkbox_circle_raster(
             let ring_alpha = (outer - inner).clamp(0.0, 1.0);
             if inner > 0.001 {
                 push_rect(
-                    positions,
-                    colors,
+                    builder,
                     Rect {
                         x: x as f32,
                         y: y as f32,
@@ -2965,8 +3271,7 @@ fn push_checkbox_circle_raster(
             }
             if ring_alpha > 0.001 {
                 push_rect(
-                    positions,
-                    colors,
+                    builder,
                     Rect {
                         x: x as f32,
                         y: y as f32,
@@ -2982,14 +3287,7 @@ fn push_checkbox_circle_raster(
     }
 }
 
-fn push_checkbox(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
-    rect: Rect,
-    width: f32,
-    height: f32,
-    style: &StyleMap,
-) {
+fn push_checkbox(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, style: &StyleMap) {
     let checked = style_bool(style, "checked") == Some(true);
     let (center_x, center_y) = checkbox_circle_center(rect);
     let radius = (rect.width.min(rect.height) * 0.5
@@ -3007,8 +3305,7 @@ fn push_checkbox(
         .unwrap_or(1.25)
         .clamp(0.0, 2.0);
     push_checkbox_circle_raster(
-        positions,
-        colors,
+        builder,
         center_x,
         center_y,
         radius,
@@ -3027,14 +3324,13 @@ fn push_checkbox(
             .unwrap_or(0.9)
             .clamp(0.0, 1.75);
         push_checkbox_check_raster(
-            positions, colors, start, middle, end, thickness, check_aa, width, height, color,
+            builder, start, middle, end, thickness, check_aa, width, height, color,
         );
     }
 }
 
 fn push_border_all(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
@@ -3068,13 +3364,12 @@ fn push_border_all(
             height: rect.height,
         },
     ] {
-        push_rect(positions, colors, edge, width, height, color);
+        push_rect(builder, edge, width, height, color);
     }
 }
 
 fn push_side_borders(
-    positions: &mut Vec<f32>,
-    colors: &mut Vec<u8>,
+    builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
@@ -3115,12 +3410,27 @@ fn push_side_borders(
             },
             _ => unreachable!(),
         };
-        push_rect(positions, colors, edge, width, height, color);
+        push_rect(builder, edge, width, height, color);
     }
 }
 
 fn rgba8_from_f32(color: [f32; 4]) -> [u8; 4] {
     color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn pack_rgba8_from_f32(color: [f32; 4]) -> u32 {
+    let [r, g, b, a] = rgba8_from_f32(color);
+    u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16) | (u32::from(a) << 24)
+}
+
+#[cfg(test)]
+fn rgba8_from_packed(color: u32) -> [u8; 4] {
+    [
+        (color & 255) as u8,
+        ((color >> 8) & 255) as u8,
+        ((color >> 16) & 255) as u8,
+        ((color >> 24) & 255) as u8,
+    ]
 }
 
 fn color_with_alpha_scale(mut color: [f32; 4], scale: f32) -> [f32; 4] {
@@ -3237,6 +3547,18 @@ fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
 mod tests {
     use super::*;
     use boon_document::{AccessibilityTree, DisplayItem, DocumentNodeId, LayoutMetrics};
+
+    fn flatten_quad_batches(batches: &[QuadBatch]) -> (Vec<f32>, Vec<u8>) {
+        let mut positions = Vec::new();
+        let mut colors = Vec::new();
+        for batch in batches {
+            positions.extend_from_slice(&batch.positions);
+            for color in &batch.colors {
+                colors.extend_from_slice(&rgba8_from_packed(*color));
+            }
+        }
+        (positions, colors)
+    }
 
     fn shape_glyph_ids(text: &str, font_features: FontFeatures) -> Vec<u16> {
         shape_glyphs(text, font_features)
@@ -3462,13 +3784,14 @@ mod tests {
         };
 
         let text_layouts = test_text_layouts(&frame, 320, 120);
-        let (_, _, metrics) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (_, metrics) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
         assert!(
             metrics.rendered_rect_count >= 6,
             "background + item + selection + two brackets + caret should render"
         );
 
-        let (positions, colors, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (positions, colors) = flatten_quad_batches(&batches);
         let selection_rect = 2usize;
         assert_eq!(
             &colors[selection_rect * 24..selection_rect * 24 + 4],
@@ -3523,7 +3846,8 @@ mod tests {
             metrics: LayoutMetrics::default(),
         };
         let text_layouts = test_text_layouts(&frame, 320, 120);
-        let (_, colors, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (_, colors) = flatten_quad_batches(&batches);
         assert!(
             colors
                 .chunks_exact(4)
@@ -3536,6 +3860,97 @@ mod tests {
                 .any(|color| color == [25, 117, 210, 255]),
             "focused border must not fall back to the old hard-coded blue"
         );
+    }
+
+    #[test]
+    fn svg_asset_data_url_renders_into_app_owned_pixels() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!("skipping SVG asset readback test: request_adapter failed: {error}");
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-gpu-svg-asset-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let mut style = StyleMap::new();
+            style.insert(
+                "asset_url".to_owned(),
+                StyleValue::Text(
+                    "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%3E%3Crect%20x%3D%228%22%20y%3D%228%22%20width%3D%2224%22%20height%3D%2224%22%20fill%3D%22%2300ff00%22/%3E%3C/svg%3E".to_owned(),
+                ),
+            );
+            let frame = LayoutFrame {
+                display_list: vec![DisplayItem {
+                    node: DocumentNodeId("svg-asset".to_owned()),
+                    kind: DocumentNodeKind::Stack,
+                    bounds: Rect {
+                        x: 20.0,
+                        y: 20.0,
+                        width: 40.0,
+                        height: 40.0,
+                    },
+                    text: None,
+                    style,
+                    focused: false,
+                }],
+                hit_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                accessibility: AccessibilityTree::default(),
+                demands: Vec::new(),
+                metrics: LayoutMetrics::default(),
+            };
+            let artifact_dir = Path::new("target/artifacts/native-gpu/tests");
+            let proof = render_app_owned_pixels(AppOwnedRenderRequest {
+                device: &device,
+                queue: &queue,
+                frame: &frame,
+                surface_id: SurfaceId("svg-asset-test".to_owned()),
+                surface_epoch: 1,
+                width: 80,
+                height: 80,
+                artifact_dir,
+                artifact_label: "svg-asset-readback",
+            })
+            .expect("SVG asset frame should render to app-owned pixels");
+            let RenderProofArtifact::AppOwnedPixels { artifact_path, .. } = proof.artifact else {
+                panic!("expected app-owned pixel artifact");
+            };
+            let image = image::open(&artifact_path)
+                .expect("readback PNG should decode")
+                .to_rgba8();
+            let center = image.get_pixel(40, 40).0;
+            assert!(
+                center[1] > center[0].saturating_add(48)
+                    && center[1] > center[2].saturating_add(48),
+                "SVG asset center should be green-dominant after texture rendering, got {center:?}"
+            );
+            assert!(
+                proof.metrics.draw_calls >= 2,
+                "asset rendering should add a textured batch draw call"
+            );
+        });
     }
 
     #[test]
@@ -3662,9 +4077,9 @@ mod tests {
             width: 100.0,
             height: 40.0,
         };
-        let mut positions = Vec::new();
-        let mut colors = Vec::new();
-        push_shadows(&mut positions, &mut colors, source, 160.0, 120.0, &style);
+        let mut builder = QuadBuilder::default();
+        push_shadows(&mut builder, source, 160.0, 120.0, &style);
+        let (positions, _) = flatten_quad_batches(&builder.batches);
 
         assert_eq!(
             positions.len(),
@@ -3694,11 +4109,9 @@ mod tests {
             StyleValue::Text("#00ff00".to_owned()),
         );
         style.insert("box_shadow_2_y".to_owned(), StyleValue::Number(2.0));
-        let mut positions = Vec::new();
-        let mut colors = Vec::new();
+        let mut builder = QuadBuilder::default();
         push_shadows(
-            &mut positions,
-            &mut colors,
+            &mut builder,
             Rect {
                 x: 10.0,
                 y: 20.0,
@@ -3709,6 +4122,7 @@ mod tests {
             120.0,
             &style,
         );
+        let (_, colors) = flatten_quad_batches(&builder.batches);
 
         assert_eq!(
             colors.chunks_exact(4).next().unwrap(),
@@ -3977,8 +4391,8 @@ mod tests {
         );
         let base_layouts = test_text_layouts(&base_frame, 320, 120);
         let hover_layouts = test_text_layouts(&hover_frame, 320, 120);
-        let (_, _, base_metrics) = rect_vertices(&base_frame, 320.0, 120.0, Some(&base_layouts));
-        let (_, _, hover_metrics) = rect_vertices(&hover_frame, 320.0, 120.0, Some(&hover_layouts));
+        let (_, base_metrics) = rect_vertices(&base_frame, 320.0, 120.0, Some(&base_layouts));
+        let (_, hover_metrics) = rect_vertices(&hover_frame, 320.0, 120.0, Some(&hover_layouts));
         assert!(
             hover_metrics.rendered_rect_count > base_metrics.rendered_rect_count,
             "__hover_underline_if must add a rendered underline rect"
@@ -4234,7 +4648,8 @@ mod tests {
             .get(&DocumentNodeId("input".to_owned()))
             .unwrap()
             .x_for_column(1.0);
-        let (positions, _, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (positions, _) = flatten_quad_batches(&batches);
         let caret_rect = 2usize;
         let caret_x = ((positions[caret_rect * 12] + 1.0) * 0.5) * 320.0;
         assert!(
@@ -4403,6 +4818,14 @@ mod tests {
 }
 
 fn f32_slice_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn u32_slice_bytes(values: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         bytes.extend_from_slice(&value.to_ne_bytes());

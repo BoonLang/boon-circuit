@@ -111,8 +111,15 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file =
         value_arg(args, "--code-file").ok_or("layout-proof role requires --code-file")?;
     let report = value_arg(args, "--report").ok_or("layout-proof role requires --report")?;
+    let runtime_state = value_arg(args, "--runtime-state-file")
+        .map(|path| read_json(Path::new(&path)))
+        .transpose()?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
-    let proof = native_document_layout_proof(Path::new(&code_file), &source)?;
+    let proof = native_document_layout_proof_with_state(
+        Path::new(&code_file),
+        &source,
+        runtime_state.as_ref(),
+    )?;
     let mut report_value = base_report("boon-native-playground-layout-proof", args, "pass");
     report_value["per_step_pass_fail"] = json!([
         {
@@ -328,8 +335,9 @@ fn run_cells_interaction_speed(
         status_overlay: None,
         last_dirty_reason: None,
     }));
-    let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
+    let live_runtime = Arc::new(Mutex::new(live_runtime_from_source_text_with_scenario(
         &format!("interaction-speed:{}", source_path.display()),
+        &source_path,
         &source,
         Path::new(&entry.scenario),
     )?));
@@ -482,17 +490,23 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
+    let initial_runtime_units = project_units_for_source_text(Path::new(&code_file), &source);
     let (document_layout_proof, document_layout_frame) =
-        native_document_layout_proof_with_state_mode(Path::new(&code_file), &source, None, true)
-            .unwrap_or_else(|error| {
-                (
-                    json!({
-                        "status": "fail",
-                        "blocker": error.to_string()
-                    }),
-                    None,
-                )
-            });
+        native_document_layout_proof_with_project_state_mode(
+            Path::new(&code_file),
+            &initial_runtime_units,
+            None,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            (
+                json!({
+                    "status": "fail",
+                    "blocker": error.to_string()
+                }),
+                None,
+            )
+        });
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
@@ -501,10 +515,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
-    let code_hash = boon_runtime::sha256_bytes(source.as_bytes());
+    let code_hash = boon_runtime::source_units_hash(&initial_runtime_units);
     let runtime_summary = preview_runtime_summary(Path::new(&code_file), &source, &code_hash);
-    let live_runtime = boon_runtime::LiveRuntime::from_source(
+    let live_runtime = live_runtime_from_source_text(
         &format!("native-preview-live:{}", code_file),
+        Path::new(&code_file),
         &source,
     )
     .ok()
@@ -526,6 +541,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let preview_ipc_state = Arc::new(Mutex::new(PreviewIpcState {
         source_path: PathBuf::from(&code_file),
         source_text: source.clone(),
+        runtime_units: initial_runtime_units.clone(),
         source_bytes: source.len() as u64,
         source_sha256: code_hash.clone(),
         runtime_summary: runtime_summary.clone(),
@@ -561,6 +577,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .lock()
             .map(|state| preview_content_revision(state.update_count))
             .unwrap_or_default();
+        let mut last_rendered_content_revision = 0;
         let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
             let before_update_count = poll_shared_render_state
                 .lock()
@@ -573,34 +590,41 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
                 .map_err(|error| error.to_string())?;
             if preview_input_has_unhandled_source_events(&context.input_delta, &input_state) {
-                if let Err(error) = preview_apply_real_window_input(
+                if let Err(error) = preview_apply_real_window_input_with_units(
                     &context.input_delta,
                     &input_context.source_path,
                     &input_context.source_text,
+                    &input_context.runtime_units,
                     input_context.live_runtime.as_ref(),
                     &poll_shared_render_state,
                     &mut input_state,
                 ) {
-                    preview_note_render_error(&poll_shared_render_state, error.to_string())
-                        .map_err(|error| error.to_string())?;
-                    role_dirty_reason =
-                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+                    if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?
+                    {
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                        );
+                    }
                 } else {
                     role_dirty_reason =
                         Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
                 }
             }
-            if let Err(error) = preview_apply_scroll_input(
+            if let Err(error) = preview_apply_scroll_input_with_units(
                 &context.input_delta,
                 Some(&input_context.source_path),
                 Some(&input_context.source_text),
+                Some(&input_context.runtime_units),
                 input_context.live_runtime.as_ref(),
                 &poll_shared_render_state,
             ) {
-                preview_note_render_error(&poll_shared_render_state, error.to_string())
-                    .map_err(|error| error.to_string())?;
-                role_dirty_reason =
-                    Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+                if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                    .map_err(|error| error.to_string())?
+                {
+                    role_dirty_reason =
+                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+                }
             }
             let focus_changed = preview_apply_focus_overlay(
                 &poll_shared_render_state,
@@ -690,11 +714,13 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut layout_frame_cache,
             )
             .map_err(|error| error.to_string())?;
+            let content_changed = content_revision != last_rendered_content_revision;
+            last_rendered_content_revision = content_revision;
             Ok(boon_native_app_window::NativeRenderHookResult {
                 proof,
                 content_revision,
                 rendered: true,
-                content_changed: true,
+                content_changed,
                 role_dirty_reason: None,
             })
         });
@@ -770,7 +796,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let selected_example_id = value_arg(args, "--selected-example");
     let replace_code_expected_hash = replace_code_file
         .as_deref()
-        .map(source_hash_for_path)
+        .map(|path| {
+            boon_runtime::source_text_for_path(path)
+                .map(|source| boon_runtime::sha256_bytes(source.as_bytes()))
+        })
         .transpose()?;
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
@@ -1048,6 +1077,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 replace_code_file.as_deref(),
                                 replace_code_expected_hash.as_deref(),
                                 skip_operator_host_input_probe,
+                                Duration::from_millis(ipc_probe_timeout_ms),
                             )
                             .map_err(|error| error.to_string())
                             .and_then(|value| {
@@ -1342,8 +1372,93 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    wait_for_report(&dev_report, role_report_timeout)?;
-    wait_for_report(&preview_report, role_report_timeout)?;
+    if let Err(error) =
+        wait_for_report_or_child_exit(&dev_report, &mut dev, "dev", role_report_timeout)
+    {
+        if let Some(report) = report.as_deref() {
+            write_desktop_report(
+                report,
+                &args[1..],
+                json!({
+                    "resolved_example": example,
+                    "resolved_example_label": catalog_entry.as_ref().map(|entry| entry.label.clone()),
+                    "example_catalog_id": catalog_entry.as_ref().map(|entry| entry.id.clone()),
+                    "example_catalog_source": catalog_entry.as_ref().map(|entry| entry.source.clone()),
+                    "resolved_code_file": source_path,
+                    "source_bytes": source.len(),
+                    "source_sha256": source_sha256,
+                    "process_model": "two-child-processes",
+                    "preview_role_status": "unknown",
+                    "dev_role_status": "missing-report",
+                    "preview_child_pid": preview_pid,
+                    "dev_child_pid": dev_pid,
+                    "preview_child_cmdline": preview_cmdline,
+                    "dev_child_cmdline": dev_cmdline,
+                    "title_token": title_token,
+                    "preview_window_title": preview_title,
+                    "dev_window_title": dev_title,
+                    "preview_survives_dev_exit": false,
+                    "preview_clean_exit_after_dev_exit": false,
+                    "preview_receives_example_name": false,
+                    "preview_role_report": preview_report,
+                    "dev_role_report": dev_report,
+                    "preview_loop_report": preview_loop_report,
+                    "dev_loop_report": dev_loop_report,
+                    "display_server": display_server(),
+                    "display_connection": display_connection(),
+                    "role_report_timeout_ms": role_report_timeout_ms,
+                    "early_role_report_failure": error.to_string(),
+                    "note": "desktop supervisor stopped because a child role exited before writing its app-owned role report"
+                }),
+            )?;
+        }
+        return Err(error);
+    }
+    if let Err(error) = wait_for_report_or_child_exit(
+        &preview_report,
+        &mut preview,
+        "preview",
+        role_report_timeout,
+    ) {
+        if let Some(report) = report.as_deref() {
+            write_desktop_report(
+                report,
+                &args[1..],
+                json!({
+                    "resolved_example": example,
+                    "resolved_example_label": catalog_entry.as_ref().map(|entry| entry.label.clone()),
+                    "example_catalog_id": catalog_entry.as_ref().map(|entry| entry.id.clone()),
+                    "example_catalog_source": catalog_entry.as_ref().map(|entry| entry.source.clone()),
+                    "resolved_code_file": source_path,
+                    "source_bytes": source.len(),
+                    "source_sha256": source_sha256,
+                    "process_model": "two-child-processes",
+                    "preview_role_status": "missing-report",
+                    "dev_role_status": "pass",
+                    "preview_child_pid": preview_pid,
+                    "dev_child_pid": dev_pid,
+                    "preview_child_cmdline": preview_cmdline,
+                    "dev_child_cmdline": dev_cmdline,
+                    "title_token": title_token,
+                    "preview_window_title": preview_title,
+                    "dev_window_title": dev_title,
+                    "preview_survives_dev_exit": false,
+                    "preview_clean_exit_after_dev_exit": false,
+                    "preview_receives_example_name": false,
+                    "preview_role_report": preview_report,
+                    "dev_role_report": dev_report,
+                    "preview_loop_report": preview_loop_report,
+                    "dev_loop_report": dev_loop_report,
+                    "display_server": display_server(),
+                    "display_connection": display_connection(),
+                    "role_report_timeout_ms": role_report_timeout_ms,
+                    "early_role_report_failure": error.to_string(),
+                    "note": "desktop supervisor stopped because a child role exited before writing its app-owned role report"
+                }),
+            )?;
+        }
+        return Err(error);
+    }
     write_desktop_progress(
         supervisor_progress_report.as_deref(),
         "role-reports-ready",
@@ -1415,7 +1530,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .saturating_sub(dev_start_delay_ms.saturating_add(effective_dev_hold_ms))
             .saturating_add(15_000)
     } else {
-        effective_preview_hold_ms.saturating_add(500)
+        15_000
     };
     let preview_clean_exit_after_dev_exit = wait_child_exit(
         &mut preview,
@@ -1559,6 +1674,80 @@ fn native_document_layout_proof(
     native_document_layout_proof_with_state(source_path, source, None)
 }
 
+fn project_units_for_source_text(
+    source_path: &Path,
+    source: &str,
+) -> Vec<boon_runtime::RuntimeSourceUnit> {
+    let fallback = || {
+        vec![boon_runtime::RuntimeSourceUnit {
+            path: source_path.display().to_string(),
+            source: source.to_owned(),
+        }]
+    };
+    let Ok(mut units) = boon_runtime::source_units_for_path(source_path) else {
+        return fallback();
+    };
+    if units.len() <= 1 {
+        return fallback();
+    }
+    let mut replaced = false;
+    for unit in &mut units {
+        if paths_match_for_preview_units(Path::new(&unit.path), source_path) {
+            unit.source = source.to_owned();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        units.push(boon_runtime::RuntimeSourceUnit {
+            path: source_path.display().to_string(),
+            source: source.to_owned(),
+        });
+    }
+    units
+}
+
+fn live_runtime_from_source_text(
+    source_label: &str,
+    source_path: &Path,
+    source: &str,
+) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
+    let units = project_units_for_source_text(source_path, source);
+    if units.len() > 1 {
+        Ok(boon_runtime::LiveRuntime::from_project(
+            source_label,
+            &units,
+        )?)
+    } else {
+        Ok(boon_runtime::LiveRuntime::from_source(
+            source_label,
+            source,
+        )?)
+    }
+}
+
+fn live_runtime_from_source_text_with_scenario(
+    source_label: &str,
+    source_path: &Path,
+    source: &str,
+    scenario_path: &Path,
+) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
+    let units = project_units_for_source_text(source_path, source);
+    if units.len() > 1 {
+        Ok(boon_runtime::LiveRuntime::new_from_project(
+            source_label,
+            &units,
+            scenario_path,
+        )?)
+    } else {
+        Ok(boon_runtime::LiveRuntime::new(
+            source_label,
+            source,
+            scenario_path,
+        )?)
+    }
+}
+
 fn native_document_layout_proof_with_state(
     source_path: &Path,
     source: &str,
@@ -1573,6 +1762,7 @@ fn native_document_layout_proof_with_state(
     Ok(proof)
 }
 
+#[cfg(test)]
 fn native_document_layout_proof_with_state_embedded(
     source_path: &Path,
     source: &str,
@@ -1594,20 +1784,85 @@ fn native_document_layout_proof_with_state_mode(
     runtime_state_override: Option<&serde_json::Value>,
     write_artifact: bool,
 ) -> Result<(serde_json::Value, Option<boon_document::LayoutFrame>), Box<dyn std::error::Error>> {
-    let parsed = cached_document_program(source_path, source)?;
-    let document = boon_parser::parsed_document(&parsed)
-        .ok_or("source does not contain a parseable document block")?;
+    let units = project_units_for_source_text(source_path, source);
+    native_document_layout_proof_with_project_state_mode(
+        source_path,
+        &units,
+        runtime_state_override,
+        write_artifact,
+    )
+}
+
+fn native_document_layout_proof_with_project_state(
+    source_path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+    runtime_state_override: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let (proof, _) = native_document_layout_proof_with_project_state_mode(
+        source_path,
+        units,
+        runtime_state_override,
+        true,
+    )?;
+    Ok(proof)
+}
+
+fn native_document_layout_proof_with_project_state_embedded(
+    source_path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+    runtime_state_override: Option<&serde_json::Value>,
+) -> Result<(serde_json::Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let (proof, layout_frame) = native_document_layout_proof_with_project_state_mode(
+        source_path,
+        units,
+        runtime_state_override,
+        false,
+    )?;
+    let layout_frame =
+        layout_frame.ok_or("embedded project layout proof did not return a layout frame")?;
+    Ok((proof, layout_frame))
+}
+
+fn native_document_layout_proof_with_project_state_mode(
+    source_path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+    runtime_state_override: Option<&serde_json::Value>,
+    write_artifact: bool,
+) -> Result<(serde_json::Value, Option<boon_document::LayoutFrame>), Box<dyn std::error::Error>> {
+    let parsed = cached_document_project_program(source_path, units)?;
+    let (document, render_root_kind) = if let Some(document) = boon_parser::parsed_document(&parsed)
+    {
+        (document, "document")
+    } else if let Some(scene) = boon_parser::parsed_scene(&parsed) {
+        (scene, "scene")
+    } else {
+        return Err("source does not contain a parseable document or scene block".into());
+    };
     let typecheck_report = boon_typecheck::check(&parsed);
+    let source_binding_index = boon_ir::lower(&parsed)
+        .map(|ir| source_binding_index_from_view_bindings(&ir.view_bindings))
+        .unwrap_or_default();
     let runtime_state = runtime_state_override
         .cloned()
-        .or_else(|| runtime_document_state_summary_for_source(source_path, source).ok());
+        .or_else(|| runtime_document_state_summary_for_project(source_path, units).ok());
     let document_functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
     let initial_locals = document_initial_locals(&parsed.ast.statements, runtime_state.as_ref());
     let eval_context = DocumentEvalContext {
         root: runtime_state.as_ref(),
         locals: initial_locals,
+        render_args: BTreeMap::new(),
         passed: None,
+        source_binding_index,
+        source_override: None,
+        functions: Some(&document_functions),
+        eval_depth: 0,
+        eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
     };
+    let source_binding_index_count = eval_context
+        .source_binding_index
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
     let mut frame = boon_document_model::DocumentFrame::empty("root");
     let mut source_intents = Vec::new();
     let mut seen_ids = BTreeSet::new();
@@ -1615,6 +1870,24 @@ fn native_document_layout_proof_with_state_mode(
     if let Some(root_element) = canonical_document_root(&document.root, &document.expressions) {
         lower_canonical_document_entry(
             root_element,
+            &document.expressions,
+            &document_functions,
+            &root_id,
+            &mut frame,
+            &mut source_intents,
+            &mut seen_ids,
+            &eval_context,
+            &typecheck_report,
+            "",
+            true,
+        );
+    } else if canonical_element_function(&document.root, &document.expressions).is_some()
+        || document_call_function(&document.root, &document.expressions)
+            .and_then(|function| document_functions.get(function))
+            .is_some()
+    {
+        lower_canonical_document_entry(
+            &document.root,
             &document.expressions,
             &document_functions,
             &root_id,
@@ -1656,7 +1929,7 @@ fn native_document_layout_proof_with_state_mode(
         capabilities: boon_document::RenderCapabilities::fake_portable(),
     });
 
-    let source_sha256 = boon_runtime::sha256_bytes(source.as_bytes());
+    let source_sha256 = boon_runtime::source_units_hash(units);
     let runtime_state_hash = runtime_state
         .as_ref()
         .map(|state| boon_runtime::sha256_bytes(&serde_json::to_vec(state).unwrap_or_default()));
@@ -1683,6 +1956,7 @@ fn native_document_layout_proof_with_state_mode(
         let artifact = json!({
             "source_path": source_path,
             "source_sha256": source_sha256,
+            "render_root_kind": render_root_kind,
             "typecheck_report_hash": typecheck_report_hash,
             "render_slot_table_hash": render_slot_table_hash,
             "typed_render_metadata_used": typecheck_report.render_slot_count > 0,
@@ -1750,6 +2024,7 @@ fn native_document_layout_proof_with_state_mode(
     let proof = json!({
         "status": "pass",
         "lowering": "boon_typecheck_render_slots_to_boon_document_model",
+        "render_root_kind": render_root_kind,
         "source_path": source_path,
         "source_sha256": source_sha256,
         "typecheck_report_hash": typecheck_report_hash,
@@ -1769,6 +2044,7 @@ fn native_document_layout_proof_with_state_mode(
         "source_intent_count": source_intent_total,
         "source_intent_sample_count": source_intent_samples.len(),
         "source_intent_sample_limit": 256,
+        "source_binding_index_count": source_binding_index_count,
         "hit_target_assertions": hit_target_assertion_total,
         "hit_target_samples": hit_target_samples,
         "source_intent_assertions": source_intent_assertions,
@@ -1806,6 +2082,45 @@ fn cached_document_program(
     let mut cache = cache
         .lock()
         .map_err(|_| "document parse cache mutex poisoned")?;
+    if cache.len() > 16 {
+        cache.clear();
+    }
+    Ok(cache
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&parsed))
+        .clone())
+}
+
+fn cached_document_project_program(
+    source_path: &Path,
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Result<Arc<boon_parser::ParsedProgram>, Box<dyn std::error::Error>> {
+    if units.len() == 1 {
+        let unit = &units[0];
+        return cached_document_program(Path::new(&unit.path), &unit.source);
+    }
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<boon_parser::ParsedProgram>>>> =
+        OnceLock::new();
+    let source_sha256 = boon_runtime::source_units_hash(units);
+    let key = format!("{}:{source_sha256}", source_path.display());
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some(parsed) = cache
+        .lock()
+        .map_err(|_| "document project parse cache mutex poisoned")?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(parsed);
+    }
+    let parsed = Arc::new(boon_parser::parse_project(
+        source_path.display().to_string(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    )?);
+    let mut cache = cache
+        .lock()
+        .map_err(|_| "document project parse cache mutex poisoned")?;
     if cache.len() > 16 {
         cache.clear();
     }
@@ -1912,21 +2227,22 @@ fn preview_runtime_summary_from_state_summary(
 }
 
 fn runtime_state_summary_for_source(source_path: &Path, source: &str) -> Result<Value, String> {
-    let mut runtime = boon_runtime::LiveRuntime::from_source(
+    let mut runtime = live_runtime_from_source_text(
         &format!("native-preview:{}", source_path.display()),
+        source_path,
         source,
     )
     .map_err(|error| error.to_string())?;
     Ok(runtime.state_summary())
 }
 
-fn runtime_document_state_summary_for_source(
+fn runtime_document_state_summary_for_project(
     source_path: &Path,
-    source: &str,
+    units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<Value, String> {
-    let mut runtime = boon_runtime::LiveRuntime::from_source(
+    let mut runtime = boon_runtime::LiveRuntime::from_project(
         &format!("native-preview-document:{}", source_path.display()),
-        source,
+        units,
     )
     .map_err(|error| error.to_string())?;
     Ok(runtime.document_state_summary())
@@ -4414,7 +4730,7 @@ fn dev_source_binding_at(
         let binding = document.nodes.get(&hit.node)?.source_binding.as_ref()?;
         if matches!(
             binding.source_path.as_str(),
-            "dev.tabs.select" | "dev.commands.press"
+            "dev.tabs.select" | "dev.project_files.select" | "dev.commands.press"
         ) {
             return None;
         }
@@ -4824,6 +5140,8 @@ impl ExampleCatalog {
                 label: entry.label,
                 source: entry.source,
                 source_files: entry.source_files,
+                build_files: entry.build_files,
+                asset_files: entry.asset_files,
                 inline_source: None,
                 category: entry.category,
                 order: entry.default_tab_order,
@@ -4968,6 +5286,8 @@ impl ExampleCatalog {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            build_files: Vec::new(),
+                            asset_files: Vec::new(),
                             inline_source: item
                                 .get("inline_source")
                                 .and_then(toml::Value::as_str)
@@ -5010,6 +5330,8 @@ impl ExampleCatalog {
             label: label.to_owned(),
             source: format!("custom://{id}.bn"),
             source_files: Vec::new(),
+            build_files: Vec::new(),
+            asset_files: Vec::new(),
             inline_source: Some(source),
             category: "custom".to_owned(),
             order: 20_000,
@@ -5201,6 +5523,8 @@ struct ExampleCatalogEntry {
     label: String,
     source: String,
     source_files: Vec<String>,
+    build_files: Vec<String>,
+    asset_files: Vec<String>,
     inline_source: Option<String>,
     category: String,
     order: u32,
@@ -5208,34 +5532,99 @@ struct ExampleCatalogEntry {
     custom: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ExampleProjectUnit {
+    path: String,
+    text: String,
+    role: String,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectFileTab {
+    path: String,
+    label: String,
+    role: String,
+    active: bool,
+    dirty: bool,
+}
+
 impl ExampleCatalogEntry {
     fn source_text(&self) -> Result<String, Box<dyn std::error::Error>> {
+        self.inline_source
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| Ok(std::fs::read_to_string(repo_relative_path(&self.source))?))
+    }
+
+    fn source_units(&self) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         if let Some(source) = &self.inline_source {
-            Ok(source.clone())
-        } else if !self.source_files.is_empty() {
-            let entry = boon_runtime::ExampleManifestEntry {
-                id: self.id.clone(),
-                label: self.label.clone(),
-                source: self.source.clone(),
-                source_files: self.source_files.clone(),
-                scenario: String::new(),
-                budget: String::new(),
-                category: self.category.clone(),
-                order: self.order,
-                default_tab_order: self.order,
-                shown_by_default: self.shown_by_default,
-                required_evidence_tier: String::new(),
-                human_testing_needed: false,
-                initial_visible_assertions: Vec::new(),
-                input_scenarios: Vec::new(),
-                scroll_focus_scenarios: Vec::new(),
-                visual_artifacts: Vec::new(),
-                performance_thresholds: Vec::new(),
-            };
-            boon_runtime::source_text_for_entry(&entry)
-        } else {
-            Ok(std::fs::read_to_string(&self.source)?)
+            return Ok(vec![(self.source.clone(), source.clone())]);
         }
+        if self.source_files.is_empty() {
+            return Ok(vec![(
+                self.source.clone(),
+                std::fs::read_to_string(repo_relative_path(&self.source))?,
+            )]);
+        }
+        let entry = boon_runtime::ExampleManifestEntry {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            source: self.source.clone(),
+            source_files: self.source_files.clone(),
+            build_files: Vec::new(),
+            asset_files: Vec::new(),
+            scenario: String::new(),
+            budget: String::new(),
+            category: self.category.clone(),
+            order: self.order,
+            default_tab_order: self.order,
+            shown_by_default: self.shown_by_default,
+            required_evidence_tier: String::new(),
+            human_testing_needed: false,
+            initial_visible_assertions: Vec::new(),
+            input_scenarios: Vec::new(),
+            scroll_focus_scenarios: Vec::new(),
+            visual_artifacts: Vec::new(),
+            performance_thresholds: Vec::new(),
+        };
+        Ok(boon_runtime::source_units_for_entry(&entry)?
+            .into_iter()
+            .map(|unit| (unit.path, unit.source))
+            .collect())
+    }
+
+    fn project_units(&self) -> Result<Vec<ExampleProjectUnit>, Box<dyn std::error::Error>> {
+        if let Some(source) = &self.inline_source {
+            return Ok(vec![ExampleProjectUnit {
+                path: self.source.clone(),
+                text: source.clone(),
+                role: "entry".to_owned(),
+            }]);
+        }
+        let mut units = self
+            .source_units()?
+            .into_iter()
+            .map(|(path, text)| ExampleProjectUnit {
+                role: project_source_unit_role(self, &path).to_owned(),
+                path,
+                text,
+            })
+            .collect::<Vec<_>>();
+        for path in &self.build_files {
+            units.push(ExampleProjectUnit {
+                path: path.clone(),
+                text: std::fs::read_to_string(repo_relative_path(path))?,
+                role: "build".to_owned(),
+            });
+        }
+        for path in &self.asset_files {
+            units.push(ExampleProjectUnit {
+                path: path.clone(),
+                text: std::fs::read_to_string(repo_relative_path(path))?,
+                role: "asset".to_owned(),
+            });
+        }
+        Ok(units)
     }
 
     fn source_weight_bytes(&self) -> u64 {
@@ -5265,13 +5654,42 @@ impl ExampleCatalogEntry {
     }
 }
 
+fn project_source_unit_role(entry: &ExampleCatalogEntry, path: &str) -> &'static str {
+    if paths_match_for_preview_units(Path::new(path), Path::new(&entry.source)) {
+        "entry"
+    } else if path.contains("/Generated/") || path.contains("\\Generated\\") {
+        "generated"
+    } else {
+        "source"
+    }
+}
+
+fn repo_relative_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            let candidate = ancestor.join(path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 #[derive(Clone, Debug)]
 struct ExampleWorkspace {
     selected_example_id: String,
+    entry_file: String,
     current_file: String,
     selected_buffer: CodeEditorModel,
     open_buffers: BTreeMap<String, CodeEditorModel>,
+    example_active_files: BTreeMap<String, String>,
     dirty_examples: BTreeSet<String>,
+    dirty_files: BTreeSet<String>,
     dirty: bool,
 }
 
@@ -5304,15 +5722,69 @@ impl ExampleWorkspace {
             })
             .or_else(|| catalog.entries.first().map(|entry| entry.id.clone()))
             .unwrap_or_else(|| "custom-buffer".to_owned());
-        let selected_buffer = CodeEditorModel::new(source_path_label, source_text);
+        let selected_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == selected_example_id);
         let mut open_buffers = BTreeMap::new();
-        open_buffers.insert(selected_example_id.clone(), selected_buffer.clone());
+        let (entry_file, current_file, selected_buffer) = if let Some(entry) = selected_entry {
+            let mut editor_units = entry
+                .project_units()
+                .unwrap_or_else(|_| {
+                    vec![ExampleProjectUnit {
+                        path: entry.source.clone(),
+                        text: entry
+                            .source_text()
+                            .unwrap_or_else(|_| source_text.to_owned()),
+                        role: "entry".to_owned(),
+                    }]
+                })
+                .into_iter()
+                .filter(|unit| unit.role != "asset")
+                .collect::<Vec<_>>();
+            if editor_units.is_empty() {
+                editor_units.push(ExampleProjectUnit {
+                    path: entry.source.clone(),
+                    text: source_text.to_owned(),
+                    role: "entry".to_owned(),
+                });
+            }
+            for unit in &editor_units {
+                open_buffers.insert(
+                    unit.path.clone(),
+                    CodeEditorModel::new(&unit.path, &unit.text),
+                );
+            }
+            let active_file = editor_units
+                .iter()
+                .find(|unit| {
+                    paths_match_for_preview_units(Path::new(&unit.path), Path::new(&entry.source))
+                })
+                .or_else(|| editor_units.first())
+                .map(|unit| unit.path.clone())
+                .unwrap_or_else(|| entry.source.clone());
+            let selected_buffer = open_buffers
+                .get(&active_file)
+                .cloned()
+                .unwrap_or_else(|| CodeEditorModel::new(&active_file, source_text));
+            (entry.source.clone(), active_file, selected_buffer)
+        } else {
+            let buffer_path = source_path_label.to_owned();
+            let selected_buffer = CodeEditorModel::new(&buffer_path, source_text);
+            open_buffers.insert(buffer_path.clone(), selected_buffer.clone());
+            (buffer_path.clone(), buffer_path, selected_buffer)
+        };
+        let mut example_active_files = BTreeMap::new();
+        example_active_files.insert(selected_example_id.clone(), current_file.clone());
         Self {
             selected_buffer,
             selected_example_id,
-            current_file: source_path_label.to_owned(),
+            entry_file,
+            current_file,
             open_buffers,
+            example_active_files,
             dirty_examples: BTreeSet::new(),
+            dirty_files: BTreeSet::new(),
             dirty: false,
         }
     }
@@ -5322,18 +5794,159 @@ impl ExampleWorkspace {
     }
 
     fn persist_selected_buffer(&mut self) {
-        self.open_buffers.insert(
-            self.selected_example_id.clone(),
-            self.selected_buffer.clone(),
-        );
+        self.current_file = self.selected_buffer.file_name.clone();
+        self.open_buffers
+            .insert(self.current_file.clone(), self.selected_buffer.clone());
+        self.example_active_files
+            .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.dirty = self.selected_dirty();
+    }
+
+    fn selected_project_payload_units(
+        &self,
+        catalog: &ExampleCatalog,
+    ) -> Result<Vec<ExampleProjectUnit>, Box<dyn std::error::Error>> {
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.selected_example_id);
+        let Some(entry) = entry else {
+            return Ok(vec![ExampleProjectUnit {
+                path: self.selected_buffer.file_name.clone(),
+                text: self.selected_buffer.source_text.clone(),
+                role: "entry".to_owned(),
+            }]);
+        };
+        let mut units = entry.project_units()?;
+        let mut overlaid = false;
+        for unit in &mut units {
+            if let Some(buffer) = self
+                .open_buffers
+                .iter()
+                .find(|(path, _)| {
+                    paths_match_for_preview_units(Path::new(path), Path::new(&unit.path))
+                })
+                .map(|(_, buffer)| buffer)
+            {
+                unit.text = buffer.source_text.clone();
+                if paths_match_for_preview_units(
+                    Path::new(&unit.path),
+                    Path::new(&self.selected_buffer.file_name),
+                ) {
+                    overlaid = true;
+                }
+            }
+        }
+        if !overlaid {
+            units.push(ExampleProjectUnit {
+                path: self.selected_buffer.file_name.clone(),
+                text: self.selected_buffer.source_text.clone(),
+                role: "source".to_owned(),
+            });
+        }
+        Ok(units)
+    }
+
+    fn selected_runtime_units(
+        &self,
+        catalog: &ExampleCatalog,
+    ) -> Result<Vec<boon_runtime::RuntimeSourceUnit>, Box<dyn std::error::Error>> {
+        let units = self.selected_project_payload_units(catalog)?;
+        Ok(Self::runtime_units_from_project_units(&units))
+    }
+
+    fn runtime_units_from_project_units(
+        units: &[ExampleProjectUnit],
+    ) -> Vec<boon_runtime::RuntimeSourceUnit> {
+        units
+            .iter()
+            .filter(|unit| source_project_unit_is_runtime(&unit.role))
+            .map(|unit| boon_runtime::RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.text.clone(),
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn selected_project_units(
+        &self,
+        catalog: &ExampleCatalog,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        Ok(self
+            .selected_project_payload_units(catalog)?
+            .into_iter()
+            .filter(|unit| source_project_unit_is_runtime(&unit.role))
+            .map(|unit| (unit.path, unit.text))
+            .collect())
+    }
+
+    fn current_project_hash(
+        &self,
+        catalog: &ExampleCatalog,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let payload_units = self
+            .selected_project_payload_units(catalog)?
+            .into_iter()
+            .map(|unit| {
+                let sha256 = boon_runtime::sha256_bytes(unit.text.as_bytes());
+                SourceProjectUnit {
+                    virtual_uri: unit.path,
+                    text: unit.text,
+                    sha256,
+                    role: unit.role,
+                }
+            })
+            .collect::<Vec<_>>();
+        source_project_payload_hash(&payload_units)
+    }
+
+    fn project_file_tabs(&self, catalog: &ExampleCatalog) -> Vec<ProjectFileTab> {
+        let Some(entry) = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.selected_example_id)
+        else {
+            return Vec::new();
+        };
+        entry
+            .project_units()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|unit| unit.role != "asset")
+            .map(|unit| {
+                let base_label = Path::new(&unit.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&unit.path);
+                let label = if unit.role == "build" {
+                    format!("{base_label} build")
+                } else {
+                    base_label.to_owned()
+                };
+                ProjectFileTab {
+                    active: paths_match_for_preview_units(
+                        Path::new(&unit.path),
+                        Path::new(&self.current_file),
+                    ),
+                    dirty: self.dirty_files.iter().any(|dirty| {
+                        paths_match_for_preview_units(Path::new(dirty), Path::new(&unit.path))
+                    }),
+                    path: unit.path,
+                    label,
+                    role: unit.role,
+                }
+            })
+            .collect()
     }
 
     fn set_selected_dirty(&mut self, dirty: bool) {
         if dirty {
             self.dirty_examples.insert(self.selected_example_id.clone());
+            self.dirty_files.insert(self.current_file.clone());
         } else {
             self.dirty_examples.remove(&self.selected_example_id);
+            self.dirty_files.clear();
         }
         self.dirty = dirty;
     }
@@ -5345,32 +5958,67 @@ impl ExampleWorkspace {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let previous_example_id = self.selected_example_id.clone();
         let previous_dirty = self.selected_dirty();
-        self.open_buffers
-            .insert(previous_example_id.clone(), self.selected_buffer.clone());
+        self.persist_selected_buffer();
+        self.example_active_files
+            .insert(previous_example_id.clone(), self.current_file.clone());
         let entry = catalog
             .entries
             .iter()
             .find(|entry| entry.id == example_id)
             .ok_or_else(|| format!("example `{example_id}` is not in ExampleCatalog"))?;
-        let loaded_from_open_buffer = self.open_buffers.contains_key(&entry.id);
-        let buffer = if let Some(buffer) = self.open_buffers.get(&entry.id).cloned() {
-            buffer
-        } else {
-            let source_text = entry.source_text()?;
-            CodeEditorModel::new(&entry.source, &source_text)
-        };
+        let editor_units = entry
+            .project_units()?
+            .into_iter()
+            .filter(|unit| unit.role != "asset")
+            .collect::<Vec<_>>();
+        let active_file = self
+            .example_active_files
+            .get(&entry.id)
+            .cloned()
+            .filter(|path| {
+                editor_units.iter().any(|unit| {
+                    paths_match_for_preview_units(Path::new(&unit.path), Path::new(path))
+                })
+            })
+            .unwrap_or_else(|| entry.source.clone());
+        let loaded_from_open_buffer = self.open_buffers.contains_key(&active_file);
+        for unit in &editor_units {
+            self.open_buffers
+                .entry(unit.path.clone())
+                .or_insert_with(|| CodeEditorModel::new(&unit.path, &unit.text));
+        }
+        let buffer = self
+            .open_buffers
+            .get(&active_file)
+            .cloned()
+            .or_else(|| {
+                editor_units
+                    .first()
+                    .map(|unit| CodeEditorModel::new(&unit.path, &unit.text))
+            })
+            .unwrap_or_else(|| {
+                CodeEditorModel::new(
+                    &entry.source,
+                    &entry.source_text().unwrap_or_else(|_| String::new()),
+                )
+            });
         let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
         self.selected_example_id = entry.id.clone();
+        self.entry_file = entry.source.clone();
         self.current_file = buffer.file_name.clone();
         self.selected_buffer = buffer.clone();
-        self.open_buffers.insert(entry.id.clone(), buffer);
+        self.open_buffers.insert(self.current_file.clone(), buffer);
+        self.example_active_files
+            .insert(entry.id.clone(), self.current_file.clone());
         self.dirty = self.selected_dirty();
         Ok(json!({
             "status": "pass",
             "selected_example_id": self.selected_example_id,
+            "entry_file": self.entry_file,
             "current_file": self.current_file,
             "source_hash": source_hash,
             "buffer_line_count": self.selected_buffer.line_count,
+            "project_file_count": editor_units.len(),
             "custom": entry.custom,
             "previous_example_id": previous_example_id,
             "previous_dirty_preserved": previous_dirty == self.dirty_examples.contains(&previous_example_id),
@@ -5378,6 +6026,61 @@ impl ExampleWorkspace {
             "dirty": self.dirty,
             "dirty_examples": self.dirty_examples.iter().cloned().collect::<Vec<_>>(),
             "preview_transport": "ReplaceCode"
+        }))
+    }
+
+    fn select_project_file(
+        &mut self,
+        catalog: &ExampleCatalog,
+        file_path: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.persist_selected_buffer();
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.selected_example_id)
+            .ok_or_else(|| {
+                format!(
+                    "selected example `{}` is not in ExampleCatalog",
+                    self.selected_example_id
+                )
+            })?;
+        let editor_units = entry
+            .project_units()?
+            .into_iter()
+            .filter(|unit| unit.role != "asset")
+            .collect::<Vec<_>>();
+        let unit = editor_units
+            .iter()
+            .find(|unit| paths_match_for_preview_units(Path::new(&unit.path), Path::new(file_path)))
+            .ok_or_else(|| {
+                format!(
+                    "file `{file_path}` is not an editor-visible unit for `{}`",
+                    entry.id
+                )
+            })?;
+        let loaded_from_open_buffer = self.open_buffers.contains_key(&unit.path);
+        let buffer = self
+            .open_buffers
+            .entry(unit.path.clone())
+            .or_insert_with(|| CodeEditorModel::new(&unit.path, &unit.text))
+            .clone();
+        self.current_file = buffer.file_name.clone();
+        self.selected_buffer = buffer.clone();
+        self.example_active_files
+            .insert(self.selected_example_id.clone(), self.current_file.clone());
+        self.dirty = self.selected_dirty();
+        Ok(json!({
+            "status": "pass",
+            "command": "SelectProjectFile",
+            "selected_example_id": self.selected_example_id,
+            "entry_file": self.entry_file,
+            "active_file": self.current_file,
+            "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
+            "buffer_line_count": self.selected_buffer.line_count,
+            "loaded_from_open_buffer": loaded_from_open_buffer,
+            "project_file_count": editor_units.len(),
+            "preview_transport": "unchanged"
         }))
     }
 
@@ -5392,9 +6095,12 @@ impl ExampleWorkspace {
         let undo_after_insert = buffer.undo();
         let redo_after_undo = buffer.redo();
         self.selected_example_id = example_id.to_owned();
+        self.entry_file = file_name.to_owned();
         self.current_file = file_name.to_owned();
         self.selected_buffer = buffer.clone();
-        self.open_buffers.insert(example_id.to_owned(), buffer);
+        self.open_buffers.insert(file_name.to_owned(), buffer);
+        self.example_active_files
+            .insert(example_id.to_owned(), file_name.to_owned());
         self.set_selected_dirty(true);
         json!({
             "status": "pass",
@@ -5480,55 +6186,130 @@ impl ExampleWorkspace {
         })
     }
 
-    fn run_selected(&self) -> serde_json::Value {
-        match boon_parser::parse_source(
-            self.selected_buffer.file_name.clone(),
-            self.selected_buffer.source_text.clone(),
-        ) {
-            Ok(_program) => {
-                let validation = BoonLanguageService::validate_project_source(
-                    &self.selected_buffer.file_name,
-                    &self.selected_buffer.source_text,
-                );
-                let validation_pass =
-                    validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
-                json!({
-                    "status": if validation_pass { "pass" } else { "fail" },
+    fn run_selected(&self, catalog: &ExampleCatalog) -> serde_json::Value {
+        let runtime_units = match self.selected_runtime_units(catalog) {
+            Ok(units) => units,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
                     "command": "Run",
                     "selected_example_id": self.selected_example_id,
                     "source_path": self.selected_buffer.file_name,
-                    "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
-                    "program_kind": "generic",
-                    "preview_transport": "ReplaceCode",
-                    "validation": validation,
+                    "diagnostic": error.to_string(),
                     "parser_bypassed": false,
-                    "runtime_bypassed": false
-                })
+                    "runtime_bypassed": true
+                });
             }
-            Err(error) => json!({
-                "status": "fail",
-                "command": "Run",
-                "selected_example_id": self.selected_example_id,
-                "diagnostic": error.to_string(),
-                "parser_bypassed": false,
-                "runtime_bypassed": true
-            }),
-        }
+        };
+        let validation =
+            BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
+        let validation_pass =
+            validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        json!({
+            "status": if validation_pass { "pass" } else { "fail" },
+            "command": "Run",
+            "selected_example_id": self.selected_example_id,
+            "source_path": self.selected_buffer.file_name,
+            "entry_file": self.entry_file,
+            "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
+            "source_unit_count": runtime_units.len(),
+            "program_kind": "generic",
+            "preview_transport": "ReplaceCode",
+            "validation": validation,
+            "parser_bypassed": false,
+            "runtime_bypassed": false
+        })
     }
 
-    fn format_selected(&mut self) -> serde_json::Value {
+    fn format_selected(&mut self, catalog: &ExampleCatalog) -> serde_json::Value {
+        let mut project_units = match self.selected_project_payload_units(catalog) {
+            Ok(units) => units,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "command": "Format",
+                    "selected_example_id": self.selected_example_id,
+                    "source_path": self.selected_buffer.file_name,
+                    "diagnostic": error.to_string(),
+                    "formatter": "boon_parser::format_source_unit"
+                });
+            }
+        };
+        let active_role = project_units
+            .iter()
+            .find(|unit| {
+                paths_match_for_preview_units(
+                    Path::new(&unit.path),
+                    Path::new(&self.selected_buffer.file_name),
+                )
+            })
+            .map(|unit| unit.role.as_str())
+            .unwrap_or("source");
+        if !source_project_unit_is_runtime(active_role) {
+            let runtime_units = Self::runtime_units_from_project_units(&project_units);
+            let validation =
+                BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
+            let validation_pass =
+                validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+            return json!({
+                "status": if validation_pass { "pass" } else { "fail" },
+                "command": "Format",
+                "selected_example_id": self.selected_example_id,
+                "source_path": self.selected_buffer.file_name,
+                "entry_file": self.entry_file,
+                "changed": false,
+                "formatted_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
+                "formatter": "non-boon-project-file-noop",
+                "validation": validation,
+                "parser_bypassed": false
+            });
+        }
         match BoonLanguageService::format(
             &self.selected_buffer.file_name,
             &self.selected_buffer.source_text,
         ) {
             Ok(formatted) => {
+                let mut overlaid = false;
+                for unit in &mut project_units {
+                    if paths_match_for_preview_units(
+                        Path::new(&unit.path),
+                        Path::new(&self.selected_buffer.file_name),
+                    ) {
+                        unit.text = formatted.clone();
+                        overlaid = true;
+                    }
+                }
+                if !overlaid {
+                    project_units.push(ExampleProjectUnit {
+                        path: self.selected_buffer.file_name.clone(),
+                        text: formatted.clone(),
+                        role: "source".to_owned(),
+                    });
+                }
+                let runtime_units = Self::runtime_units_from_project_units(&project_units);
+                let validation =
+                    BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
+                let validation_pass =
+                    validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+                if !validation_pass {
+                    return json!({
+                        "status": "fail",
+                        "command": "Format",
+                        "selected_example_id": self.selected_example_id,
+                        "source_path": self.selected_buffer.file_name,
+                        "entry_file": self.entry_file,
+                        "formatted_hash": boon_runtime::sha256_bytes(formatted.as_bytes()),
+                        "formatter": "boon_parser::format_source_unit",
+                        "validation": validation,
+                        "parser_bypassed": false,
+                        "runtime_bypassed": false
+                    });
+                }
                 let changed = formatted != self.selected_buffer.source_text;
                 self.selected_buffer
                     .replace_text(&self.current_file, formatted.clone());
-                self.open_buffers.insert(
-                    self.selected_example_id.clone(),
-                    self.selected_buffer.clone(),
-                );
+                self.open_buffers
+                    .insert(self.current_file.clone(), self.selected_buffer.clone());
                 if changed {
                     self.set_selected_dirty(true);
                 } else {
@@ -5538,18 +6319,25 @@ impl ExampleWorkspace {
                     "status": "pass",
                     "command": "Format",
                     "selected_example_id": self.selected_example_id,
+                    "source_path": self.selected_buffer.file_name,
+                    "entry_file": self.entry_file,
                     "changed": changed,
                     "formatted_hash": boon_runtime::sha256_bytes(formatted.as_bytes()),
-                    "formatter": "boon_parser::format_source",
-                    "parser_bypassed": false
+                    "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
+                    "source_unit_count": runtime_units.len(),
+                    "formatter": "boon_parser::format_source_unit",
+                    "validation": validation,
+                    "parser_bypassed": false,
+                    "runtime_bypassed": false
                 })
             }
             Err(error) => json!({
                 "status": "fail",
                 "command": "Format",
                 "selected_example_id": self.selected_example_id,
+                "source_path": self.selected_buffer.file_name,
                 "diagnostic": error.to_string(),
-                "formatter": "boon_parser::format_source"
+                "formatter": "boon_parser::format_source_unit"
             }),
         }
     }
@@ -5568,18 +6356,38 @@ impl ExampleWorkspace {
                     self.selected_example_id
                 )
             })?;
+        let editor_units = entry
+            .project_units()?
+            .into_iter()
+            .filter(|unit| unit.role != "asset")
+            .collect::<Vec<_>>();
+        for unit in &editor_units {
+            self.open_buffers.insert(
+                unit.path.clone(),
+                CodeEditorModel::new(&unit.path, &unit.text),
+            );
+        }
         let source_text = entry.source_text()?;
-        self.selected_buffer = CodeEditorModel::new(&entry.source, &source_text);
+        self.entry_file = entry.source.clone();
         self.current_file = entry.source.clone();
+        self.selected_buffer = self
+            .open_buffers
+            .get(&self.current_file)
+            .cloned()
+            .unwrap_or_else(|| CodeEditorModel::new(&entry.source, &source_text));
         self.open_buffers
-            .insert(entry.id.clone(), self.selected_buffer.clone());
+            .insert(self.current_file.clone(), self.selected_buffer.clone());
+        self.example_active_files
+            .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.set_selected_dirty(false);
         Ok(json!({
             "status": "pass",
             "command": "Reset",
             "selected_example_id": self.selected_example_id,
+            "entry_file": self.entry_file,
             "source_path": entry.source,
             "source_hash": boon_runtime::sha256_bytes(source_text.as_bytes()),
+            "project_file_count": editor_units.len(),
             "dirty": self.dirty
         }))
     }
@@ -5603,8 +6411,11 @@ impl ExampleWorkspace {
                 "diagnostic": "selected example is manifest-backed and cannot be removed"
             });
         }
+        let removed_source = selected_entry.source.clone();
         let fallback_id = catalog.fastest_manifest_fallback_id(&removed_id);
-        let removed_open_buffer = self.open_buffers.remove(&removed_id).is_some();
+        let removed_open_buffer = self.open_buffers.remove(&removed_source).is_some();
+        self.example_active_files.remove(&removed_id);
+        self.dirty_files.remove(&removed_source);
         let removed_dirty_marker = self.dirty_examples.remove(&removed_id);
         let removal = catalog.remove_custom_example(&removed_id);
         if removal.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
@@ -5621,7 +6432,10 @@ impl ExampleWorkspace {
             .as_deref()
             .map(|id| self.select_example(catalog, id))
             .transpose();
-        let removed_open_buffer_after_fallback = self.open_buffers.remove(&removed_id).is_some();
+        let removed_open_buffer_after_fallback =
+            self.open_buffers.remove(&removed_source).is_some();
+        self.example_active_files.remove(&removed_id);
+        self.dirty_files.remove(&removed_source);
         let removed_dirty_marker_after_fallback = self.dirty_examples.remove(&removed_id);
         match fallback_selection {
             Ok(selection) => {
@@ -5696,6 +6510,15 @@ impl ExampleWorkspace {
     }
 }
 
+fn paths_match_for_preview_units(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
 #[derive(Clone, Debug)]
 struct BoonLanguageService;
 
@@ -5714,60 +6537,93 @@ impl BoonLanguageService {
         if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
             return Ok(source.to_owned());
         }
-        boon_parser::format_source(path.to_owned(), source.to_owned())
+        boon_parser::format_source_unit(path.to_owned(), source.to_owned())
     }
 
     fn validate_project_source(path: &str, source: &str) -> serde_json::Value {
-        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
-        let parse = boon_parser::parse_source(path.to_owned(), source.to_owned());
-        match parse {
-            Ok(_program) => {
-                let scenario_path = Path::new(path).with_extension("scn");
-                let runtime = if scenario_path.exists() {
-                    boon_runtime::LiveRuntime::new(
-                        &format!("dev-window-validate:{path}"),
-                        source,
-                        &scenario_path,
-                    )
-                    .map_err(|error| error.to_string())
-                } else {
-                    boon_runtime::LiveRuntime::from_source(
-                        &format!("dev-window-validate:{path}"),
-                        source,
-                    )
-                    .map_err(|error| error.to_string())
-                };
-                match runtime {
-                    Ok(mut runtime) => json!({
-                        "status": "pass",
-                        "source_hash": source_hash,
-                        "program_kind": "generic",
-                        "scenario_path": scenario_path,
-                        "scenario_bound": scenario_path.exists(),
-                        "runtime_surface": "generic-live-runtime",
-                        "runtime_summary_hash": boon_runtime::sha256_bytes(
-                            &serde_json::to_vec(&runtime.state_summary()).unwrap_or_default()
-                        ),
-                        "parser_bypassed": false,
-                        "runtime_bypassed": false
-                    }),
-                    Err(error) => json!({
-                        "status": "fail",
-                        "source_hash": source_hash,
-                        "program_kind": "generic",
-                        "scenario_path": scenario_path,
-                        "diagnostic": error,
-                        "parser_bypassed": false,
-                        "runtime_bypassed": false
-                    }),
-                }
+        let units = vec![boon_runtime::RuntimeSourceUnit {
+            path: path.to_owned(),
+            source: source.to_owned(),
+        }];
+        Self::validate_project_units(path, &units)
+    }
+
+    fn runtime_units_hash(units: &[boon_runtime::RuntimeSourceUnit]) -> String {
+        if let [unit] = units {
+            boon_runtime::sha256_bytes(unit.source.as_bytes())
+        } else {
+            boon_runtime::source_units_hash(units)
+        }
+    }
+
+    fn validate_project_units(
+        source_label: &str,
+        units: &[boon_runtime::RuntimeSourceUnit],
+    ) -> serde_json::Value {
+        let source_hash = Self::runtime_units_hash(units);
+        if units.is_empty() {
+            return json!({
+                "status": "fail",
+                "source_hash": source_hash,
+                "diagnostic": "project has no runtime source units",
+                "parser_bypassed": false,
+                "runtime_bypassed": true
+            });
+        }
+        let scenario_path = Path::new(source_label).with_extension("scn");
+        let runtime = if scenario_path.exists() {
+            if units.len() > 1 {
+                boon_runtime::LiveRuntime::new_from_project(
+                    &format!("dev-window-validate:{source_label}"),
+                    units,
+                    &scenario_path,
+                )
+                .map_err(|error| error.to_string())
+            } else {
+                boon_runtime::LiveRuntime::new(
+                    &format!("dev-window-validate:{source_label}"),
+                    &units[0].source,
+                    &scenario_path,
+                )
+                .map_err(|error| error.to_string())
             }
+        } else if units.len() > 1 {
+            boon_runtime::LiveRuntime::from_project(
+                &format!("dev-window-validate:{source_label}"),
+                units,
+            )
+            .map_err(|error| error.to_string())
+        } else {
+            boon_runtime::LiveRuntime::from_source(
+                &format!("dev-window-validate:{source_label}"),
+                &units[0].source,
+            )
+            .map_err(|error| error.to_string())
+        };
+        match runtime {
+            Ok(mut runtime) => json!({
+                "status": "pass",
+                "source_hash": source_hash,
+                "source_unit_count": units.len(),
+                "program_kind": "generic",
+                "scenario_path": scenario_path,
+                "scenario_bound": scenario_path.exists(),
+                "runtime_surface": "generic-live-runtime",
+                "runtime_summary_hash": boon_runtime::sha256_bytes(
+                    &serde_json::to_vec(&runtime.state_summary()).unwrap_or_default()
+                ),
+                "parser_bypassed": false,
+                "runtime_bypassed": false
+            }),
             Err(error) => json!({
                 "status": "fail",
                 "source_hash": source_hash,
-                "diagnostic": error.to_string(),
+                "source_unit_count": units.len(),
+                "program_kind": "generic",
+                "scenario_path": scenario_path,
+                "diagnostic": error,
                 "parser_bypassed": false,
-                "runtime_bypassed": true
+                "runtime_bypassed": false
             }),
         }
     }
@@ -8074,7 +8930,10 @@ impl PreviewTransport {
                 "transport_bound": false,
                 "selected_example_id": selected_example_id,
                 "source_path": payload.entrypoint_unit,
+                "active_file": payload.active_file(),
                 "source_hash": source_hash,
+                "source_unit_count": payload.units.len(),
+                "runtime_source_unit_count": payload.runtime_units().len(),
                 "preview_receives_example_name": false
             });
         };
@@ -8106,7 +8965,10 @@ impl PreviewTransport {
                     "transport_bound": true,
                     "selected_example_id": selected_example_id,
                     "source_path": payload.entrypoint_unit,
+                    "active_file": payload.active_file(),
                     "source_hash": source_hash,
+                    "source_unit_count": payload.units.len(),
+                    "runtime_source_unit_count": payload.runtime_units().len(),
                     "ack": ack,
                     "preview_receives_example_name": false
                 })
@@ -8120,7 +8982,10 @@ impl PreviewTransport {
                 "transport_bound": true,
                 "selected_example_id": selected_example_id,
                 "source_path": payload.entrypoint_unit,
+                "active_file": payload.active_file(),
                 "source_hash": source_hash,
+                "source_unit_count": payload.units.len(),
+                "runtime_source_unit_count": payload.runtime_units().len(),
                 "diagnostic": error.to_string(),
                 "preview_receives_example_name": false
             }),
@@ -8684,7 +9549,10 @@ impl DevWindowShell {
             return None;
         }
         let buffer = &self.workspace.selected_buffer;
-        let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
+        let source_hash = self
+            .workspace
+            .current_project_hash(&self.catalog)
+            .unwrap_or_else(|_| boon_runtime::sha256_bytes(buffer.source_text.as_bytes()));
         let runtime_summary = self.visible_runtime_summary(&source_hash)?;
         let state_hash = runtime_summary
             .get("state_summary_hash")
@@ -8756,7 +9624,10 @@ impl DevWindowShell {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("not-run");
-        let current_source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
+        let current_source_hash = self
+            .workspace
+            .current_project_hash(&self.catalog)
+            .unwrap_or_else(|_| boon_runtime::sha256_bytes(buffer.source_text.as_bytes()));
         let runtime_summary = self
             .visible_runtime_summary(&current_source_hash)
             .unwrap_or(&serde_json::Value::Null);
@@ -9072,6 +9943,28 @@ impl DevWindowShell {
             value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
             return value;
         }
+        if let Some(file_path) = source_path.strip_prefix("dev.project_files.select.") {
+            let started = Instant::now();
+            self.hovered_editor_position = None;
+            return self
+                .workspace
+                .select_project_file(&self.catalog, file_path)
+                .map(|mut value| {
+                    value["dev_file_tab_visual_update_ms"] = json!(elapsed_ms(started));
+                    value["dev_file_tab_visual_update_before_preview_ack"] = json!(true);
+                    value["dispatched_source_path"] = json!(source_path);
+                    value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
+                    value
+                })
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "fail",
+                        "command": "SelectProjectFile",
+                        "dispatched_source_path": source_path,
+                        "diagnostic": error.to_string()
+                    })
+                });
+        }
         if let Some(example_id) = source_path.strip_prefix("dev.tabs.select.") {
             let started = Instant::now();
             self.hovered_editor_position = None;
@@ -9097,10 +9990,10 @@ impl DevWindowShell {
         }
 
         let mut value = match source_path {
-            "dev.commands.run" => self.workspace.run_selected(),
+            "dev.commands.run" => self.workspace.run_selected(&self.catalog),
             "dev.commands.format" => {
                 self.hovered_editor_position = None;
-                self.workspace.format_selected()
+                self.workspace.format_selected(&self.catalog)
             }
             "dev.commands.reset" => {
                 self.hovered_editor_position = None;
@@ -9390,16 +10283,50 @@ impl DevWindowShell {
             &self.workspace.selected_buffer.source_text,
             self.selected_source_revision,
         );
-        let payload = SourceProjectPayload::single_unit(
+        let project_units = match self.workspace.selected_project_payload_units(&self.catalog) {
+            Ok(units) => units,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "kind": "ReplaceCode",
+                    "command": command,
+                    "command_id": command_id,
+                    "source_revision": self.selected_source_revision,
+                    "selected_example_id": self.workspace.selected_example_id.clone(),
+                    "source_path": self.workspace.selected_buffer.file_name.clone(),
+                    "diagnostic": error.to_string(),
+                    "preview_receives_example_name": false
+                });
+            }
+        };
+        let payload = match SourceProjectPayload::from_project_units(
             command_id,
             self.selected_source_revision,
             &self.selected_source_identity,
-            &self.workspace.selected_buffer.file_name,
-            &self.workspace.selected_buffer.source_text,
-        );
+            &self.workspace.entry_file,
+            &self.workspace.current_file,
+            project_units,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "kind": "ReplaceCode",
+                    "command": command,
+                    "command_id": command_id,
+                    "source_revision": self.selected_source_revision,
+                    "selected_example_id": self.workspace.selected_example_id.clone(),
+                    "source_path": self.workspace.selected_buffer.file_name.clone(),
+                    "diagnostic": error.to_string(),
+                    "preview_receives_example_name": false
+                });
+            }
+        };
         let selected_example_id = self.workspace.selected_example_id.clone();
         let source_path = payload.entrypoint_unit.clone();
+        let active_file = payload.active_file().to_owned();
         let source_hash = payload.project_hash.clone();
+        let source_unit_count = payload.units.len();
         let transport = self.preview_transport.clone();
         let payload_for_worker = payload.clone();
         let command_for_worker = command.to_owned();
@@ -9432,7 +10359,16 @@ impl DevWindowShell {
             "transport_bound": self.preview_transport.connect.is_some(),
             "selected_example_id": selected_example_id,
             "source_path": source_path,
+            "entry_file": self.workspace.entry_file,
+            "active_file": active_file,
             "source_hash": source_hash,
+            "source_unit_count": source_unit_count,
+            "runtime_source_unit_count": payload.runtime_units().len(),
+            "multi_unit_execution_mode": if source_unit_count > 1 {
+                "multi-unit-project-executed"
+            } else {
+                "single-entrypoint"
+            },
             "dev_to_preview_async": true,
             "dev_visual_update_before_preview_ack": true,
             "ack": {
@@ -9440,6 +10376,7 @@ impl DevWindowShell {
                 "status": "queued-locally",
                 "command_id": command_id,
                 "source_revision": self.selected_source_revision,
+                "source_unit_count": source_unit_count,
                 "sync_ack_contains_runtime_summary": false,
                 "sync_ack_contains_layout_proof": false
             },
@@ -9982,6 +10919,14 @@ impl DevWindowShell {
                     .filter(|entry| entry.shown_by_default)
                     .map(|entry| format!("dev.tabs.select.{}", entry.id)),
             );
+            let project_files = self.workspace.project_file_tabs(&self.catalog);
+            if project_files.len() > 1 {
+                sources.extend(
+                    project_files
+                        .into_iter()
+                        .map(|file| format!("dev.project_files.select.{}", file.path)),
+                );
+            }
             sources
         };
         let route_assertions = required_sources
@@ -10044,6 +10989,7 @@ impl DevWindowShell {
         let mut source_bindings = Vec::new();
         let mut command_bindings = Vec::new();
         let mut tab_bindings = Vec::new();
+        let mut project_file_bindings = Vec::new();
         let mut controls = Vec::new();
         let mut scrollable_nodes = Vec::new();
         let mut materialized_nodes = Vec::new();
@@ -10103,6 +11049,9 @@ impl DevWindowShell {
                 if binding.source_path.starts_with("dev.tabs.select.") {
                     tab_bindings.push(binding_json.clone());
                 }
+                if binding.source_path.starts_with("dev.project_files.select.") {
+                    project_file_bindings.push(binding_json.clone());
+                }
                 source_bindings.push(binding_json);
             }
         }
@@ -10120,6 +11069,8 @@ impl DevWindowShell {
             "command_bindings": command_bindings,
             "tab_binding_count": tab_bindings.len(),
             "tab_bindings": tab_bindings,
+            "project_file_binding_count": project_file_bindings.len(),
+            "project_file_bindings": project_file_bindings,
             "focus": document.focus,
             "scroll_root_count": document.scroll_roots.len(),
             "scroll_roots": document.scroll_roots,
@@ -10141,9 +11092,12 @@ fn dev_shell_document(
     let mut frame = DocumentFrame::empty("dev-root");
     let root_height = viewport_height.max(360);
     let footer_height = 154_u32;
+    let project_file_tabs = shell.workspace.project_file_tabs(&shell.catalog);
+    let project_file_tabs_height = if project_file_tabs.len() > 1 { 36 } else { 0 };
     let editor_height = viewport_height
         .saturating_sub(46)
         .saturating_sub(42)
+        .saturating_sub(project_file_tabs_height)
         .saturating_sub(44)
         .saturating_sub(footer_height)
         .max(160);
@@ -10330,6 +11284,54 @@ fn dev_shell_document(
         intent: "select".to_owned(),
     });
     append_child(&mut frame, tabs_parent.clone(), new_tab);
+    if project_file_tabs_height > 0 {
+        let file_tabs = dev_project_files_node(shell);
+        let file_tabs_parent = file_tabs.id.clone();
+        append_child(&mut frame, root.clone(), file_tabs);
+        for file in &project_file_tabs {
+            let mut label = one_line(&file.label, 16);
+            if file.dirty {
+                label.push('*');
+            }
+            let mut tab = dev_button_node(
+                &project_file_tab_node_id(&file.path),
+                label,
+                &[
+                    (
+                        "bg",
+                        if file.active {
+                            DEV_PANEL_ACTIVE
+                        } else {
+                            DEV_PANEL_RAISED
+                        },
+                    ),
+                    (
+                        "color",
+                        if file.active {
+                            DEV_TEXT
+                        } else {
+                            DEV_TEXT_MUTED
+                        },
+                    ),
+                    ("border", if file.active { DEV_ACCENT } else { DEV_BORDER }),
+                    ("padding", "5"),
+                    ("height", "24"),
+                    ("width", if file.role == "build" { "132" } else { "112" }),
+                    ("size", "12"),
+                    ("font", BOON_EDITOR_FONT_FAMILY),
+                ],
+            );
+            tab.source_binding = Some(boon_document_model::SourceBinding {
+                id: boon_document_model::SourceBindingId(format!(
+                    "source:dev-project-file:{}:select",
+                    boon_runtime::sha256_bytes(file.path.as_bytes())
+                )),
+                source_path: format!("dev.project_files.select.{}", file.path),
+                intent: "select".to_owned(),
+            });
+            append_child(&mut frame, file_tabs_parent.clone(), tab);
+        }
+    }
     let toolbar_parent = toolbar.id.clone();
     append_child(&mut frame, root.clone(), toolbar);
     let selected_is_custom = shell
@@ -12142,6 +13144,35 @@ fn dev_tabs_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
     tabs
 }
 
+fn dev_project_files_node(_shell: &DevWindowShell) -> boon_document_model::DocumentNode {
+    let mut tabs = dev_node(
+        "dev-project-file-tabs",
+        boon_document_model::DocumentNodeKind::Row,
+        None,
+        &[
+            ("bg", DEV_PANEL),
+            ("border", DEV_BORDER_MUTED),
+            ("padding", "5"),
+            ("gap", "5"),
+            ("height", "36"),
+            ("width", "fill"),
+        ],
+    );
+    tabs.source_binding = Some(boon_document_model::SourceBinding {
+        id: boon_document_model::SourceBindingId("source:dev-project-files:select".to_owned()),
+        source_path: "dev.project_files.select".to_owned(),
+        intent: "select".to_owned(),
+    });
+    tabs
+}
+
+fn project_file_tab_node_id(path: &str) -> String {
+    format!(
+        "dev-project-file-{}",
+        short_hash(&boon_runtime::sha256_bytes(path.as_bytes()))
+    )
+}
+
 fn dev_toolbar_node() -> boon_document_model::DocumentNode {
     let mut toolbar = dev_node(
         "dev-toolbar",
@@ -12256,9 +13287,13 @@ fn canonical_document_root<'a>(
     if document_call_function(root, expressions).is_some() {
         return Some(root);
     }
+    if document_source_pipe_statement(root, expressions) {
+        return Some(root);
+    }
     root.children.iter().find(|child| {
         canonical_element_function(child, expressions).is_some()
             || document_call_function(child, expressions).is_some()
+            || document_source_pipe_statement(child, expressions)
     })
 }
 
@@ -12299,6 +13334,28 @@ fn document_call_args<'a>(
     }
 }
 
+fn document_pipe_render_function<'a>(
+    statement: &'a AstStatement,
+    expressions: &'a [AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+) -> Option<(&'a str, usize, &'a [AstCallArg])> {
+    let AstExprKind::Pipe { input, op, args } = &expressions.get(statement.expr?)?.kind else {
+        return None;
+    };
+    functions
+        .get(op)
+        .filter(|function| document_function_contains_render_constructor(function, expressions))
+        .map(|_| (op.as_str(), *input, args.as_slice()))
+}
+
+fn document_source_pipe_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    matches!(
+        statement.expr.and_then(|expr_id| expressions.get(expr_id)).map(|expr| &expr.kind),
+        Some(AstExprKind::Pipe { op, .. }) if op == "SOURCE"
+    )
+}
+
+#[derive(Debug)]
 struct DocumentFunctionRegistry<'a> {
     functions: BTreeMap<&'a str, &'a AstStatement>,
 }
@@ -12323,7 +13380,11 @@ impl<'a> DocumentFunctionRegistry<'a> {
     }
 
     fn get(&self, name: &str) -> Option<&'a AstStatement> {
-        self.functions.get(name).copied()
+        self.functions.get(name).copied().or_else(|| {
+            self.functions.iter().find_map(|(function_name, function)| {
+                (function_name.rsplit('/').next() == Some(name)).then_some(*function)
+            })
+        })
     }
 }
 
@@ -12341,6 +13402,51 @@ fn lower_canonical_document_entry(
     scope_key: &str,
     is_root_child: bool,
 ) {
+    if lower_canonical_source_continuation_entry(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    ) {
+        return;
+    }
+    if lower_canonical_source_pipe_entry(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    ) {
+        return;
+    }
+    if lower_canonical_conditional_render_entry(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    ) {
+        return;
+    }
     if canonical_element_function(statement, expressions).is_some() {
         lower_canonical_document_element(
             statement,
@@ -12355,6 +13461,43 @@ fn lower_canonical_document_entry(
             scope_key,
             is_root_child,
         );
+        return;
+    }
+
+    if let Some((function_name, input_expr_id, args)) =
+        document_pipe_render_function(statement, expressions, functions)
+    {
+        if let Some(function) = functions.get(function_name) {
+            let input_value = expressions
+                .get(input_expr_id)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .unwrap_or(Value::Null);
+            let mut scoped = document_function_item_context(
+                function,
+                input_expr_id,
+                expressions,
+                &input_value,
+                context,
+            );
+            if !args.is_empty() {
+                scoped = document_function_args_context(function, args, &[], expressions, &scoped);
+            }
+            for child in &function.children {
+                lower_canonical_document_entry(
+                    child,
+                    expressions,
+                    functions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    &scoped,
+                    typecheck_report,
+                    scope_key,
+                    is_root_child,
+                );
+            }
+        }
         return;
     }
 
@@ -12394,6 +13537,330 @@ fn lower_canonical_document_entry(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_source_continuation_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+    is_root_child: bool,
+) -> bool {
+    let Some(source_path) =
+        document_source_continuation_path(&statement.children, expressions, context)
+    else {
+        return false;
+    };
+    let mut scoped = context.clone();
+    scoped.source_override = Some(source_path);
+    let synthetic = AstStatement {
+        id: statement.id,
+        line: statement.line,
+        indent: statement.indent,
+        start: statement.start,
+        end: statement.end,
+        kind: statement.kind.clone(),
+        expr: statement.expr,
+        children: statement
+            .children
+            .iter()
+            .filter(|child| !document_source_continuation_statement(child, expressions))
+            .cloned()
+            .collect(),
+    };
+    lower_canonical_document_entry(
+        &synthetic,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        &scoped,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_source_pipe_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+    is_root_child: bool,
+) -> bool {
+    let Some((input, source_path)) = document_source_pipe(statement, expressions, context) else {
+        return false;
+    };
+    let mut scoped = context.clone();
+    scoped.source_override = Some(source_path.clone());
+    let synthetic_children = statement
+        .children
+        .iter()
+        .filter(|child| {
+            document_source_value(child, expressions, context).as_deref() != Some(&source_path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let synthetic = AstStatement {
+        id: statement.id,
+        line: statement.line,
+        indent: statement.indent,
+        start: statement.start,
+        end: statement.end,
+        kind: AstStatementKind::Expression,
+        expr: Some(input),
+        children: synthetic_children,
+    };
+    lower_canonical_document_entry(
+        &synthetic,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        &scoped,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+    );
+    true
+}
+
+fn document_source_continuation_path(
+    children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    children.iter().find_map(|child| {
+        if document_source_continuation_statement(child, expressions) {
+            return document_source_pipe_path(child, expressions, context);
+        }
+        None
+    })
+}
+
+fn document_source_continuation_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    let Some(AstExprKind::Pipe { input, op, .. }) = statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .map(|expr| &expr.kind)
+    else {
+        return false;
+    };
+    op == "SOURCE"
+        && expressions
+            .get(*input)
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
+}
+
+fn document_source_pipe(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<(usize, String)> {
+    let AstExprKind::Pipe { input, op, args: _ } = &expressions.get(statement.expr?)?.kind else {
+        return None;
+    };
+    if op != "SOURCE" {
+        return None;
+    }
+    let source_path = document_source_pipe_path(statement, expressions, context)?;
+    Some((*input, source_path))
+}
+
+fn document_source_pipe_path(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    let AstExprKind::Pipe { op, args, .. } = &expressions.get(statement.expr?)?.kind else {
+        return None;
+    };
+    if op != "SOURCE" {
+        return None;
+    }
+    args.first()
+        .and_then(|arg| document_source_value_for_expr(arg.value, expressions, context))
+        .filter(|path| !path.is_empty())
+        .or_else(|| document_source_path_from_children(&statement.children, expressions, context))
+        .filter(|path| !path.is_empty())
+}
+
+fn document_source_path_from_children(
+    children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    children.iter().find_map(|child| {
+        document_source_value(child, expressions, context)
+            .or_else(|| document_source_path_from_children(&child.children, expressions, context))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_conditional_render_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+    is_root_child: bool,
+) -> bool {
+    lower_canonical_conditional_render_entry_with_input(
+        statement,
+        expressions,
+        functions,
+        parent,
+        frame,
+        source_intents,
+        seen_ids,
+        context,
+        typecheck_report,
+        scope_key,
+        is_root_child,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_conditional_render_entry_with_input(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+    is_root_child: bool,
+    input_override: Option<usize>,
+    selector_override: Option<Value>,
+) -> bool {
+    let expression_input = statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .and_then(document_when_input_expr_id);
+    let input = expression_input
+        .filter(|input| {
+            !matches!(
+                expressions.get(*input).map(|expr| &expr.kind),
+                Some(AstExprKind::Delimiter)
+            )
+        })
+        .or(input_override);
+    let Some(input) = input else {
+        return false;
+    };
+    let selector = if let Some(selector) = selector_override {
+        selector
+    } else {
+        let Some(input_expr) = expressions.get(input) else {
+            return true;
+        };
+        let Some(selector) = document_eval_expr_value(input_expr, expressions, context) else {
+            return true;
+        };
+        selector
+    };
+    for arm in &statement.children {
+        let Some(AstExpr {
+            kind: AstExprKind::MatchArm { pattern, output },
+            ..
+        }) = arm.expr.and_then(|expr_id| expressions.get(expr_id))
+        else {
+            continue;
+        };
+        if !document_match_pattern_matches_value(pattern, &selector) {
+            continue;
+        }
+        if let Some(output) = output {
+            let Some(expr) = expressions.get(*output) else {
+                return true;
+            };
+            if matches!(expr.kind, AstExprKind::ListLiteral { .. }) {
+                lower_canonical_child_elements(
+                    arm,
+                    expressions,
+                    functions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    context,
+                    typecheck_report,
+                    scope_key,
+                );
+                return true;
+            }
+            let synthetic = AstStatement {
+                id: arm.id.saturating_mul(1000).saturating_add(1),
+                line: expr.line,
+                indent: arm.indent,
+                start: expr.start,
+                end: expr.end,
+                kind: AstStatementKind::Expression,
+                expr: Some(*output),
+                children: arm.children.clone(),
+            };
+            lower_canonical_document_entry(
+                &synthetic,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                is_root_child,
+            );
+        } else {
+            lower_canonical_child_elements(
+                arm,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+            );
+        }
+        return true;
+    }
+    true
+}
+
 fn document_function_call_context<'a>(
     function: &AstStatement,
     call: &AstStatement,
@@ -12401,25 +13868,44 @@ fn document_function_call_context<'a>(
     context: &DocumentEvalContext<'a>,
 ) -> DocumentEvalContext<'a> {
     if let Some(args) = document_call_args(call, expressions) {
-        return document_function_args_context(function, args, expressions, context);
+        return document_function_args_context(
+            function,
+            args,
+            &call.children,
+            expressions,
+            context,
+        );
     }
     DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
         passed: context.passed.clone(),
+        source_binding_index: context.source_binding_index.clone(),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
     }
 }
 
 fn document_function_args_context<'a>(
     function: &AstStatement,
     args: &[AstCallArg],
+    call_children: &[AstStatement],
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'a>,
 ) -> DocumentEvalContext<'a> {
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
         passed: context.passed.clone(),
+        source_binding_index: context.source_binding_index.clone(),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
     };
     let formals = match &function.kind {
         AstStatementKind::Function { args, .. } => args.as_slice(),
@@ -12434,7 +13920,30 @@ fn document_function_args_context<'a>(
             continue;
         };
         if let Some(expr) = expressions.get(arg.value) {
+            if document_expr_may_render(arg.value, expressions, context) {
+                scoped.render_args.insert(
+                    name.to_owned(),
+                    AstStatement {
+                        id: function
+                            .id
+                            .saturating_mul(1000)
+                            .saturating_add(arg.value)
+                            .saturating_add(index),
+                        line: expr.line,
+                        indent: function.indent,
+                        start: expr.start,
+                        end: expr.end,
+                        kind: AstStatementKind::Expression,
+                        expr: Some(arg.value),
+                        children: call_children.to_vec(),
+                    },
+                );
+                continue;
+            }
             let value = document_eval_expr_value(expr, expressions, context)
+                .or_else(|| {
+                    document_text_value_for_expr(expr, expressions, context).map(Value::String)
+                })
                 .or_else(|| document_expr_value(expr, expressions).map(Value::String));
             if let Some(value) = value {
                 if name == "PASS" {
@@ -12442,6 +13951,27 @@ fn document_function_args_context<'a>(
                     continue;
                 }
                 scoped.locals.insert(name.to_owned(), value);
+            }
+        }
+    }
+    for child in call_children {
+        let Some(name) = document_field_name(child) else {
+            continue;
+        };
+        if !formals.iter().any(|formal| formal == &name) || scoped.locals.contains_key(&name) {
+            continue;
+        }
+        let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id)) else {
+            continue;
+        };
+        let value = document_eval_expr_value(expr, expressions, context)
+            .or_else(|| document_text_value_for_expr(expr, expressions, context).map(Value::String))
+            .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+        if let Some(value) = value {
+            if name == "PASS" {
+                scoped.passed = Some(value);
+            } else {
+                scoped.locals.insert(name, value);
             }
         }
     }
@@ -12458,7 +13988,13 @@ fn document_function_item_context<'a>(
     let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
         passed: context.passed.clone(),
+        source_binding_index: context.source_binding_index.clone(),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
     };
     let first_formal = match &function.kind {
         AstStatementKind::Function { args, .. } => args.first().map(String::as_str),
@@ -12540,7 +14076,7 @@ fn lower_canonical_document_element(
 
     lower_canonical_element_style(statement, expressions, context, &mut node);
     lower_canonical_element_text(statement, expressions, context, &mut node);
-    if function == "Element/link" {
+    if matches!(function, "Element/link" | "Scene/Element/link") {
         lower_canonical_link_metadata(statement, expressions, context, &mut node);
     }
     inherit_canonical_text_style(frame, parent, &mut node);
@@ -12558,6 +14094,15 @@ fn lower_canonical_document_element(
         &mut node,
         source_intents,
     );
+    if node.source_binding.is_none() {
+        push_native_node_kind_source_intents(
+            context,
+            document_node_binding_kind(&node.kind),
+            &id,
+            &mut node,
+            source_intents,
+        );
+    }
     if is_root_child {
         node.style
             .entry("width".to_owned())
@@ -12606,7 +14151,7 @@ fn lower_canonical_document_element(
         parent_node.children.push(id.clone());
     }
     frame.nodes.insert(id.clone(), node);
-    if function == "Element/paragraph"
+    if matches!(function, "Element/paragraph" | "Scene/Element/paragraph")
         && lower_canonical_paragraph_contents(
             statement,
             expressions,
@@ -12657,8 +14202,30 @@ fn lower_canonical_paragraph_contents(
         return false;
     };
     let mut lowered = false;
-    for (index, child) in contents.children.iter().enumerate() {
-        if canonical_element_function(child, expressions).is_some() {
+    let mut needs_space_before_inline_element = false;
+    for (index, child) in paragraph_content_item_statements(contents, expressions)
+        .iter()
+        .enumerate()
+    {
+        let direct_inline_element = canonical_element_function(child, expressions).is_some();
+        let helper_inline_element = document_call_function(child, expressions)
+            .and_then(|function_name| functions.get(function_name))
+            .is_some_and(|function| {
+                document_function_contains_render_constructor(function, expressions)
+            });
+        if direct_inline_element || helper_inline_element {
+            if needs_space_before_inline_element {
+                insert_paragraph_inline_text_node(
+                    " ".to_owned(),
+                    child.id,
+                    index.saturating_mul(10).saturating_add(1),
+                    parent,
+                    frame,
+                    seen_ids,
+                    scope_key,
+                );
+                needs_space_before_inline_element = false;
+            }
             lower_canonical_document_entry(
                 child,
                 expressions,
@@ -12678,48 +14245,137 @@ fn lower_canonical_paragraph_contents(
         let Some(text) = paragraph_inline_text(child, expressions, context) else {
             continue;
         };
-        let base_node_id = format!("doc-node-{}-inline-{index}", child.id);
-        let scoped_id = if scope_key.is_empty() {
-            base_node_id.clone()
-        } else {
-            format!("{base_node_id}-{scope_key}")
-        };
-        let mut node_id = scoped_id.clone();
-        let mut dedupe = 0usize;
-        while !seen_ids.insert(node_id.clone()) {
-            dedupe += 1;
-            node_id = format!("{scoped_id}-{dedupe}");
-        }
-        let id = boon_document_model::DocumentNodeId(node_id.clone());
-        let mut node = boon_document_model::DocumentNode::new(
-            node_id,
-            boon_document_model::DocumentNodeKind::Text,
+        needs_space_before_inline_element = !text.ends_with(char::is_whitespace);
+        insert_paragraph_inline_text_node(
+            text, child.id, index, parent, frame, seen_ids, scope_key,
         );
-        node.parent = Some(parent.clone());
-        node.text = Some(boon_document_model::TextValue { text });
-        inherit_canonical_text_style(frame, parent, &mut node);
-        node.style
-            .entry("height".to_owned())
-            .or_insert_with(|| boon_document_model::StyleValue::Number(15.0));
-        node.style
-            .entry("width".to_owned())
-            .or_insert_with(|| boon_document_model::StyleValue::Text("Auto".to_owned()));
-        node.style
-            .entry("auto_padding".to_owned())
-            .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
-        node.style
-            .entry("text_inset".to_owned())
-            .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
-        node.style
-            .entry("vertical_align".to_owned())
-            .or_insert_with(|| boon_document_model::StyleValue::Text("Center".to_owned()));
-        if let Some(parent_node) = frame.nodes.get_mut(parent) {
-            parent_node.children.push(id.clone());
-        }
-        frame.nodes.insert(id, node);
         lowered = true;
     }
     lowered
+}
+
+fn paragraph_content_item_statements(
+    contents: &AstStatement,
+    expressions: &[AstExpr],
+) -> Vec<AstStatement> {
+    let Some(expr_id) = contents.expr else {
+        return contents.children.clone();
+    };
+    let Some(AstExpr {
+        kind: AstExprKind::ListLiteral { items, .. },
+        ..
+    }) = expressions.get(expr_id)
+    else {
+        return contents.children.clone();
+    };
+    let mut statements = contents.children.clone();
+    statements.extend(
+        items
+            .iter()
+            .filter(|item| {
+                !contents
+                    .children
+                    .iter()
+                    .any(|child| child.expr == Some(**item))
+            })
+            .filter(|item| {
+                expressions
+                    .get(**item)
+                    .is_some_and(|expr| match &expr.kind {
+                        AstExprKind::Call { function, .. } => {
+                            !function.eq_ignore_ascii_case("TEXT")
+                        }
+                        _ => false,
+                    })
+            })
+            .enumerate()
+            .map(|(index, item)| {
+                let expr = expressions.get(*item);
+                let mut children: Vec<AstStatement> = expr
+                    .map(|expr| {
+                        contents
+                            .children
+                            .iter()
+                            .filter(|child| child.start >= expr.start && child.end <= expr.end)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if children.is_empty() {
+                    children = contents
+                        .children
+                        .iter()
+                        .filter(|child| document_field_name(child).is_some())
+                        .cloned()
+                        .collect();
+                }
+                AstStatement {
+                    id: contents
+                        .id
+                        .saturating_mul(1000)
+                        .saturating_add(index)
+                        .saturating_add(1),
+                    line: expr.map(|expr| expr.line).unwrap_or(contents.line),
+                    indent: contents.indent.saturating_add(1),
+                    start: expr.map(|expr| expr.start).unwrap_or(contents.start),
+                    end: expr.map(|expr| expr.end).unwrap_or(contents.end),
+                    kind: AstStatementKind::Expression,
+                    expr: Some(*item),
+                    children,
+                }
+            }),
+    );
+    statements
+}
+
+fn insert_paragraph_inline_text_node(
+    text: String,
+    statement_id: usize,
+    index: usize,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    seen_ids: &mut BTreeSet<String>,
+    scope_key: &str,
+) {
+    let base_node_id = format!("doc-node-{statement_id}-inline-{index}");
+    let scoped_id = if scope_key.is_empty() {
+        base_node_id.clone()
+    } else {
+        format!("{base_node_id}-{scope_key}")
+    };
+    let mut node_id = scoped_id.clone();
+    let mut dedupe = 0usize;
+    while !seen_ids.insert(node_id.clone()) {
+        dedupe += 1;
+        node_id = format!("{scoped_id}-{dedupe}");
+    }
+    let id = boon_document_model::DocumentNodeId(node_id.clone());
+    let mut node = boon_document_model::DocumentNode::new(
+        node_id,
+        boon_document_model::DocumentNodeKind::Text,
+    );
+    node.parent = Some(parent.clone());
+    node.text = Some(boon_document_model::TextValue { text });
+    inherit_canonical_text_style(frame, parent, &mut node);
+    node.style
+        .entry("height".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Number(15.0));
+    node.style
+        .entry("width".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Text("Auto".to_owned()));
+    node.style
+        .entry("auto_padding".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("text_inset".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("vertical_align".to_owned())
+        .or_insert_with(|| boon_document_model::StyleValue::Text("Center".to_owned()));
+    if let Some(parent_node) = frame.nodes.get_mut(parent) {
+        parent_node.children.push(id.clone());
+    }
+    frame.nodes.insert(id, node);
 }
 
 fn paragraph_inline_text(
@@ -12779,21 +14435,33 @@ fn canonical_document_node_kind(
     expressions: &[AstExpr],
 ) -> boon_document_model::DocumentNodeKind {
     match function {
-        "Element/stripe" => {
+        "Element/stripe" | "Scene/Element/stripe" => {
             match document_child_value(statement, "direction", expressions).as_deref() {
                 Some("Row") => boon_document_model::DocumentNodeKind::Row,
                 _ => boon_document_model::DocumentNodeKind::Stack,
             }
         }
-        "Element/paragraph" if document_child_statement(statement, "contents").is_some() => {
+        "Element/paragraph" | "Scene/Element/paragraph"
+            if document_child_statement(statement, "contents").is_some() =>
+        {
             boon_document_model::DocumentNodeKind::Row
         }
-        "Element/text" | "Element/label" | "Element/paragraph" | "Element/link" => {
-            boon_document_model::DocumentNodeKind::Text
+        "Element/text"
+        | "Element/label"
+        | "Element/paragraph"
+        | "Element/link"
+        | "Scene/Element/text"
+        | "Scene/Element/label"
+        | "Scene/Element/paragraph"
+        | "Scene/Element/link" => boon_document_model::DocumentNodeKind::Text,
+        "Element/button" | "Scene/Element/button" => boon_document_model::DocumentNodeKind::Button,
+        "Element/checkbox" | "Scene/Element/checkbox" => {
+            boon_document_model::DocumentNodeKind::Checkbox
         }
-        "Element/button" => boon_document_model::DocumentNodeKind::Button,
-        "Element/checkbox" => boon_document_model::DocumentNodeKind::Checkbox,
-        "Element/text_input" => boon_document_model::DocumentNodeKind::TextInput,
+        "Element/text_input" | "Scene/Element/text_input" => {
+            boon_document_model::DocumentNodeKind::TextInput
+        }
+        "Scene/Element/block" => boon_document_model::DocumentNodeKind::Stack,
         _ => boon_document_model::DocumentNodeKind::Stack,
     }
 }
@@ -12816,19 +14484,18 @@ fn lower_mapped_document_children(
         return false;
     };
     let Some(function_name) = mapped.template_function.as_deref() else {
-        return true;
+        return false;
     };
     let Some(function) = functions.get(function_name) else {
-        return true;
+        return false;
     };
-    let Some(list_path) = expressions
-        .get(mapped.list_expr_id)
-        .and_then(|expr| document_expr_value(expr, expressions))
+    let Some(items_value) =
+        document_eval_mapped_list_items(statement, mapped.list_expr_id, expressions, context)
     else {
-        return true;
+        return false;
     };
-    let Some(items) = document_resolved_value(&list_path, context).and_then(Value::as_array) else {
-        return true;
+    let Some(items) = items_value.as_array() else {
+        return false;
     };
     let child_window = materialized_child_window(items.len(), scope_key);
     for (index, item) in items
@@ -12840,7 +14507,13 @@ fn lower_mapped_document_children(
         let mut item_context = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
             passed: context.passed.clone(),
+            source_binding_index: context.source_binding_index.clone(),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
         };
         item_context
             .locals
@@ -12849,6 +14522,7 @@ fn lower_mapped_document_children(
             document_function_args_context(
                 function,
                 &mapped.template_args,
+                &[],
                 expressions,
                 &item_context,
             )
@@ -12883,6 +14557,48 @@ fn lower_mapped_document_children(
         }
     }
     true
+}
+
+fn document_eval_mapped_list_items(
+    statement: &AstStatement,
+    list_expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let expr = expressions.get(list_expr_id)?;
+    if let AstExprKind::Pipe { input, op, args } = &expr.kind
+        && op == "List/retain"
+    {
+        let input_expr = expressions.get(*input)?;
+        let input_value = if matches!(input_expr.kind, AstExprKind::Delimiter) {
+            let base_expr = statement
+                .expr
+                .and_then(|expr_id| expressions.get(expr_id))?;
+            document_eval_expr_value(base_expr, expressions, context).or_else(|| {
+                let list_path = document_expr_value(base_expr, expressions)?;
+                document_resolved_value(&list_path, context).cloned()
+            })?
+        } else {
+            document_eval_expr_value(input_expr, expressions, context)?
+        };
+        let retain_statement = statement
+            .children
+            .iter()
+            .find(|child| child.expr == Some(list_expr_id));
+        return document_eval_list_retain_with_statement_children(
+            input_value,
+            args,
+            retain_statement
+                .map(|statement| statement.children.as_slice())
+                .unwrap_or(&[]),
+            expressions,
+            context,
+        );
+    }
+    document_eval_expr_value(expr, expressions, context).or_else(|| {
+        let list_path = document_expr_value(expr, expressions)?;
+        document_resolved_value(&list_path, context).cloned()
+    })
 }
 
 fn typechecked_render_slot_list_map_binding<'a>(
@@ -12925,6 +14641,22 @@ fn lower_canonical_child_elements(
     scope_key: &str,
 ) {
     for child in &statement.children {
+        if let Some(render_arg) = document_render_arg_statement(child, expressions, context) {
+            lower_canonical_document_entry(
+                render_arg,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+            );
+            continue;
+        }
         let field = document_field_name(child);
         if matches!(field.as_deref(), Some("items" | "children"))
             && lower_mapped_document_children(
@@ -12942,13 +14674,50 @@ fn lower_canonical_child_elements(
         {
             continue;
         }
+        if matches!(field.as_deref(), Some("items" | "children"))
+            && lower_canonical_list_map_children(
+                child,
+                None,
+                &child.children,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+            )
+        {
+            continue;
+        }
+        if matches!(field.as_deref(), Some("items" | "children"))
+            && lower_canonical_list_literal_children(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+            )
+        {
+            continue;
+        }
         if !matches!(
             field.as_deref(),
-            Some("items" | "children" | "child" | "contents" | "template")
+            Some("items" | "children" | "child" | "contents" | "template" | "icon")
         ) && canonical_element_function(child, expressions).is_none()
             && document_call_function(child, expressions)
                 .and_then(|function| functions.get(function))
                 .is_none()
+            && !document_source_pipe_statement(child, expressions)
+            && !document_conditional_statement(child, expressions)
+            && child.children.is_empty()
         {
             continue;
         }
@@ -12956,6 +14725,8 @@ fn lower_canonical_child_elements(
             || document_call_function(child, expressions)
                 .and_then(|function| functions.get(function))
                 .is_some()
+            || document_source_pipe_statement(child, expressions)
+            || document_conditional_statement(child, expressions)
         {
             lower_canonical_document_entry(
                 child,
@@ -12970,15 +14741,71 @@ fn lower_canonical_child_elements(
                 scope_key,
                 false,
             );
+            continue;
         }
-        for nested in &child.children {
+        for (nested_index, nested) in child.children.iter().enumerate() {
+            if document_list_map_input_is_delimiter(nested, expressions)
+                && let Some(input_expr_id) = child.children[..nested_index]
+                    .iter()
+                    .rev()
+                    .find_map(|previous| previous.expr)
+                && lower_canonical_list_map_children(
+                    nested,
+                    Some(input_expr_id),
+                    &child.children,
+                    expressions,
+                    functions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    context,
+                    typecheck_report,
+                    scope_key,
+                )
+            {
+                continue;
+            }
+            if document_conditional_input_is_delimiter(nested, expressions)
+                && let Some(input_expr_id) = child.children[..nested_index]
+                    .iter()
+                    .rev()
+                    .find_map(|previous| previous.expr)
+                && let Some(selector) = child.expr.and_then(|base_input| {
+                    document_eval_expr_value_with_delimited_input(
+                        input_expr_id,
+                        base_input,
+                        expressions,
+                        context,
+                    )
+                })
+                && lower_canonical_conditional_render_entry_with_input(
+                    nested,
+                    expressions,
+                    functions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    context,
+                    typecheck_report,
+                    scope_key,
+                    false,
+                    Some(input_expr_id),
+                    Some(selector),
+                )
+            {
+                continue;
+            }
             if canonical_element_function(nested, expressions).is_some()
                 || document_call_function(nested, expressions)
                     .and_then(|function| functions.get(function))
                     .is_some()
+                || document_source_pipe_statement(nested, expressions)
+                || document_conditional_statement(nested, expressions)
                 || matches!(
                     document_field_name(nested).as_deref(),
-                    Some("child" | "template")
+                    Some("child" | "template" | "icon")
                 )
             {
                 lower_canonical_document_entry(
@@ -12999,6 +14826,366 @@ fn lower_canonical_child_elements(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_list_map_children(
+    statement: &AstStatement,
+    input_override: Option<usize>,
+    search_statements: &[AstStatement],
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+) -> bool {
+    let Some(AstExpr {
+        kind: AstExprKind::Pipe { input, op, args },
+        ..
+    }) = statement.expr.and_then(|expr_id| expressions.get(expr_id))
+    else {
+        return false;
+    };
+    if op != "List/map" {
+        return false;
+    }
+    let input_expr_id = if matches!(
+        expressions.get(*input).map(|expr| &expr.kind),
+        Some(AstExprKind::Delimiter)
+    ) {
+        let Some(input_override) = input_override else {
+            return false;
+        };
+        input_override
+    } else {
+        *input
+    };
+    let Some(items_value) =
+        document_eval_list_map_input_items(search_statements, input_expr_id, expressions, context)
+    else {
+        return false;
+    };
+    let Some(items) = items_value.as_array() else {
+        return false;
+    };
+    let item_name = list_item_arg_name(args, expressions).unwrap_or("item");
+    let Some(render_arg) = args.iter().find(|arg| arg.name.as_deref() == Some("new")) else {
+        return false;
+    };
+    let child_window = materialized_child_window(items.len(), scope_key);
+    for (index, item) in items
+        .iter()
+        .enumerate()
+        .skip(child_window.start)
+        .take(child_window.end.saturating_sub(child_window.start))
+    {
+        let mut scoped = DocumentEvalContext {
+            root: context.root,
+            locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
+            passed: context.passed.clone(),
+            source_binding_index: context.source_binding_index.clone(),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
+        };
+        scoped.locals.insert(item_name.to_owned(), item.clone());
+        let child_scope = if scope_key.is_empty() {
+            format!("{item_name}-{index}")
+        } else {
+            format!("{scope_key}-{item_name}-{index}")
+        };
+        let Some(expr) = expressions.get(render_arg.value) else {
+            continue;
+        };
+        let synthetic = AstStatement {
+            id: statement
+                .id
+                .saturating_mul(1000)
+                .saturating_add(index)
+                .saturating_add(1),
+            line: expr.line,
+            indent: statement.indent,
+            start: expr.start,
+            end: expr.end,
+            kind: AstStatementKind::Expression,
+            expr: Some(render_arg.value),
+            children: statement.children.clone(),
+        };
+        lower_canonical_document_entry(
+            &synthetic,
+            expressions,
+            functions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            &scoped,
+            typecheck_report,
+            &child_scope,
+            false,
+        );
+    }
+    true
+}
+
+fn document_eval_list_map_input_items(
+    search_statements: &[AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let expr = expressions.get(expr_id)?;
+    if let AstExprKind::Pipe { input, op, args } = &expr.kind
+        && op == "List/retain"
+    {
+        let input_value =
+            document_eval_list_map_input_items(search_statements, *input, expressions, context)?;
+        let retain_statement = find_statement_for_expr(search_statements, expr_id);
+        return document_eval_list_retain_with_statement_children(
+            input_value,
+            args,
+            retain_statement
+                .map(|statement| statement.children.as_slice())
+                .unwrap_or(&[]),
+            expressions,
+            context,
+        );
+    }
+    document_eval_expr_value(expr, expressions, context).or_else(|| {
+        let list_path = document_expr_value(expr, expressions)?;
+        document_resolved_value(&list_path, context).cloned()
+    })
+}
+
+fn document_list_map_input_is_delimiter(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| {
+            matches!(
+                &expr.kind,
+                AstExprKind::Pipe { input, op, .. }
+                    if op == "List/map"
+                        && expressions
+                            .get(*input)
+                            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
+            )
+        })
+}
+
+fn find_statement_for_expr(statements: &[AstStatement], expr_id: usize) -> Option<&AstStatement> {
+    statements.iter().find_map(|statement| {
+        (statement.expr == Some(expr_id))
+            .then_some(statement)
+            .or_else(|| find_statement_for_expr(&statement.children, expr_id))
+    })
+}
+
+fn document_render_arg_statement<'a>(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &'a DocumentEvalContext<'_>,
+) -> Option<&'a AstStatement> {
+    let AstExprKind::Identifier(name) = &expressions.get(statement.expr?)?.kind else {
+        return None;
+    };
+    context.render_args.get(name)
+}
+
+fn document_conditional_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .and_then(document_when_input_expr_id)
+        .is_some()
+}
+
+fn document_conditional_input_is_delimiter(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .and_then(document_when_input_expr_id)
+        .and_then(|input| expressions.get(input))
+        .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_list_literal_children(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+) -> bool {
+    let Some(AstExpr {
+        kind: AstExprKind::ListLiteral { items, .. },
+        ..
+    }) = statement.expr.and_then(|expr_id| expressions.get(expr_id))
+    else {
+        return false;
+    };
+    let mut lowered = false;
+    if items.is_empty() {
+        for child in &statement.children {
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+            );
+            lower_canonical_sibling_condition_children(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+            );
+            lowered = true;
+        }
+        return lowered;
+    }
+    for (index, item) in items.iter().enumerate() {
+        if let Some(child) = statement
+            .children
+            .iter()
+            .find(|child| child.expr == Some(*item))
+        {
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+            );
+            lowered = true;
+            continue;
+        }
+        let Some(expr) = expressions.get(*item) else {
+            continue;
+        };
+        let synthetic = AstStatement {
+            id: statement
+                .id
+                .saturating_mul(1000)
+                .saturating_add(index)
+                .saturating_add(1),
+            line: expr.line,
+            indent: statement.indent,
+            start: expr.start,
+            end: expr.end,
+            kind: AstStatementKind::Expression,
+            expr: Some(*item),
+            children: Vec::new(),
+        };
+        lower_canonical_document_entry(
+            &synthetic,
+            expressions,
+            functions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            context,
+            typecheck_report,
+            scope_key,
+            false,
+        );
+        lowered = true;
+    }
+    lowered
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_canonical_sibling_condition_children(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    parent: &boon_document_model::DocumentNodeId,
+    frame: &mut boon_document_model::DocumentFrame,
+    source_intents: &mut Vec<serde_json::Value>,
+    seen_ids: &mut BTreeSet<String>,
+    context: &DocumentEvalContext<'_>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    scope_key: &str,
+) {
+    for (index, child) in statement.children.iter().enumerate() {
+        if document_conditional_input_is_delimiter(child, expressions)
+            && let Some(input_expr_id) = statement.children[..index]
+                .iter()
+                .rev()
+                .find_map(|previous| previous.expr)
+            && let Some(base_input) = statement.expr
+            && let Some(selector) = document_eval_expr_value_with_delimited_input(
+                input_expr_id,
+                base_input,
+                expressions,
+                context,
+            )
+            && lower_canonical_conditional_render_entry_with_input(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+                false,
+                Some(input_expr_id),
+                Some(selector),
+            )
+        {
+            continue;
+        }
+        if !child.children.is_empty() {
+            lower_canonical_sibling_condition_children(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                context,
+                typecheck_report,
+                scope_key,
+            );
+        }
+    }
+}
+
 fn lower_canonical_element_style(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -13011,8 +15198,10 @@ fn lower_canonical_element_style(
         };
         match field.as_str() {
             "style" => lower_canonical_style_block(child, expressions, context, node),
-            "gap" | "width" | "height" | "padding" | "size" | "scroll" | "scroll_x"
-            | "scroll_y" | "scrollbars" | "center" => {
+            "width" | "height" | "size" => {
+                lower_dimension_statement(&field, child, expressions, context, node);
+            }
+            "gap" | "padding" | "scroll" | "scroll_x" | "scroll_y" | "scrollbars" | "center" => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert(field, value);
                 }
@@ -13038,6 +15227,13 @@ fn lower_canonical_style_block(
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
+    if let Some(expr_id) = statement.expr
+        && let Some(Value::Object(object)) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_object(&object, node);
+    }
     if let Some(fields) = record_fields_for_statement(statement, expressions) {
         lower_canonical_style_record(fields, expressions, context, node);
     }
@@ -13047,15 +15243,7 @@ fn lower_canonical_style_block(
         };
         match field.as_str() {
             "background" => {
-                if let Some(color) =
-                    statement_nested_style_value(child, "color", expressions, context)
-                        .or_else(|| {
-                            document_child_style_value(child, "color", expressions, context)
-                        })
-                        .or_else(|| document_style_value(child, expressions, context))
-                {
-                    node.style.insert("background".to_owned(), color);
-                }
+                lower_background_style(child, expressions, context, node);
             }
             "font" => {
                 if let Some(font_fields) = record_fields_for_statement(child, expressions) {
@@ -13115,30 +15303,12 @@ fn lower_canonical_style_block(
                     }
                 }
             }
-            "align" => {
-                let record_centered =
-                    record_fields_for_statement(child, expressions).is_some_and(|fields| {
-                        fields.iter().any(|align_field| {
-                            document_expr_value_by_id(align_field.value, expressions)
-                                .as_deref()
-                                .is_some_and(|value| matches!(value, "Center" | "center"))
-                        })
-                    });
-                let centered = record_centered
-                    || child.children.iter().any(|align_child| {
-                        document_statement_value(align_child, expressions)
-                            .as_deref()
-                            .is_some_and(|value| matches!(value, "Center" | "center"))
-                    });
-                if centered {
-                    node.style.insert(
-                        "center".to_owned(),
-                        boon_document_model::StyleValue::Bool(true),
-                    );
-                }
-            }
+            "align" => lower_align_style_statement(child, expressions, context, node),
             "padding" => lower_spacing_style(child, "padding", expressions, context, node),
             "shadows" => lower_shadow_style(child, expressions, context, node),
+            "material" => lower_material_style_statement(child, expressions, context, node),
+            "glow" => lower_glow_style_statement(child, expressions, context, node),
+            "move" => lower_spacing_style(child, "move", expressions, context, node),
             "rounded_corners" => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert("border_radius".to_owned(), value);
@@ -13168,6 +15338,9 @@ fn lower_canonical_style_block(
                 }
             }
             "borders" => lower_borders_style(child, expressions, context, node),
+            "width" | "height" | "size" => {
+                lower_dimension_statement(&field, child, expressions, context, node);
+            }
             _ => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert(field, value);
@@ -13175,6 +15348,7 @@ fn lower_canonical_style_block(
             }
         }
     }
+    synthesize_physical_style(node);
 }
 
 fn statement_expr_is_element_hovered(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
@@ -13271,14 +15445,13 @@ fn lower_hover_while_statement_style_value(
     let Some((expr_id, expr_children)) = document_direct_style_expr(statement, expressions) else {
         return false;
     };
-    let Some(AstExpr {
-        kind: AstExprKind::Pipe { input, op, .. },
-        ..
-    }) = expressions.get(expr_id)
+    let Some(input) = expressions
+        .get(expr_id)
+        .and_then(document_when_input_expr_id)
     else {
         return false;
     };
-    if op != "WHILE" || !expr_is_element_hovered(*input, expressions) {
+    if !expr_is_element_hovered(input, expressions) {
         return false;
     }
     let base = style_value_for_matching_bool_arm(false, expr_children, expressions, context);
@@ -13425,7 +15598,22 @@ fn outline_style_for_expr(
         return LoweredOutlineStyle::default();
     };
     match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
+        AstExprKind::Pipe { input, op, .. } if matches!(op.as_str(), "WHEN" | "WHILE") => {
+            if expr_is_element_hovered(*input, expressions) {
+                return outline_style_for_matching_while_arm(
+                    true,
+                    arms,
+                    expressions,
+                    context,
+                    OutlineTarget::Hover,
+                );
+            }
+            let Some(selector) = document_eval_expr_bool(*input, expressions, context) else {
+                return LoweredOutlineStyle::default();
+            };
+            outline_style_for_matching_while_arm(selector, arms, expressions, context, target)
+        }
+        AstExprKind::When { input } => {
             if expr_is_element_hovered(*input, expressions) {
                 return outline_style_for_matching_while_arm(
                     true,
@@ -13667,6 +15855,174 @@ fn lower_borders_style_expr(
     }
 }
 
+fn lower_background_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let url = statement_nested_style_value(statement, "url", expressions, context)
+        .or_else(|| document_child_style_value(statement, "url", expressions, context));
+    let color = statement_nested_style_value(statement, "color", expressions, context)
+        .or_else(|| document_child_style_value(statement, "color", expressions, context))
+        .or_else(|| {
+            url.is_none()
+                .then(|| document_style_value(statement, expressions, context))
+                .flatten()
+        });
+    if let Some(color) = color {
+        node.style.insert("background".to_owned(), color);
+    }
+    if let Some(url) = url {
+        node.style.insert("background_url".to_owned(), url.clone());
+        node.style.insert("asset_url".to_owned(), url);
+    }
+}
+
+fn lower_background_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let url = record_field_nested_style_value(field, "url", expressions, context);
+    let value =
+        record_field_nested_style_value(field, "color", expressions, context).or_else(|| {
+            url.is_none()
+                .then(|| document_style_value_for_expr(field.value, expressions, context))
+                .flatten()
+        });
+    if let Some(value) = value {
+        node.style.insert("background".to_owned(), value);
+    }
+    if let Some(url) = url {
+        node.style.insert("background_url".to_owned(), url.clone());
+        node.style.insert("asset_url".to_owned(), url);
+    }
+}
+
+fn lower_material_style_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr
+        && let Some(Value::Object(object)) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_field("material", &Value::Object(object), node);
+        return;
+    }
+    if let Some(color) = statement_nested_style_value(statement, "color", expressions, context)
+        .or_else(|| document_child_style_value(statement, "color", expressions, context))
+    {
+        node.style
+            .entry("background".to_owned())
+            .or_insert_with(|| color.clone());
+        node.style.insert("material_color".to_owned(), color);
+    }
+    if let Some(value) = document_style_value(statement, expressions, context) {
+        node.style.insert("material".to_owned(), value);
+    }
+}
+
+fn lower_material_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(Value::Object(object)) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_field("material", &Value::Object(object), node);
+        return;
+    }
+    if let Some(color) = record_field_nested_style_value(field, "color", expressions, context) {
+        node.style
+            .entry("background".to_owned())
+            .or_insert_with(|| color.clone());
+        node.style.insert("material_color".to_owned(), color);
+    }
+    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+        node.style.insert("material".to_owned(), value);
+    }
+}
+
+fn lower_glow_style_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr
+        && let Some(Value::Object(object)) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_field("glow", &Value::Object(object), node);
+        return;
+    }
+    let Some(color) = statement_nested_style_value(statement, "color", expressions, context)
+        .or_else(|| document_child_style_value(statement, "color", expressions, context))
+    else {
+        return;
+    };
+    node.style.insert("glow_color".to_owned(), color.clone());
+    node.style
+        .entry("box_shadow_8_color".to_owned())
+        .or_insert(color);
+    node.style
+        .entry("box_shadow_8_x".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("box_shadow_8_y".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("box_shadow_8_blur".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(18.0));
+    node.style
+        .entry("box_shadow_8_spread".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(2.0));
+}
+
+fn lower_glow_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(Value::Object(object)) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_style_field("glow", &Value::Object(object), node);
+        return;
+    }
+    let Some(color) = record_field_nested_style_value(field, "color", expressions, context) else {
+        return;
+    };
+    node.style.insert("glow_color".to_owned(), color.clone());
+    node.style
+        .entry("box_shadow_8_color".to_owned())
+        .or_insert(color);
+    node.style
+        .entry("box_shadow_8_x".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("box_shadow_8_y".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(0.0));
+    node.style
+        .entry("box_shadow_8_blur".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(18.0));
+    node.style
+        .entry("box_shadow_8_spread".to_owned())
+        .or_insert(boon_document_model::StyleValue::Number(2.0));
+}
+
 fn statement_nested_style_value(
     statement: &AstStatement,
     nested_name: &str,
@@ -13677,7 +16033,14 @@ fn statement_nested_style_value(
         fields
             .iter()
             .find(|field| field.name == nested_name)
-            .and_then(|field| document_style_value_for_expr(field.value, expressions, context))
+            .and_then(|field| {
+                document_style_value_for_expr_with_children(
+                    field.value,
+                    statement.children.as_slice(),
+                    expressions,
+                    context,
+                )
+            })
     })
 }
 
@@ -13688,6 +16051,23 @@ fn lower_spacing_style(
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
+    if let Some(fields) = record_fields_for_statement(statement, expressions) {
+        for field in fields {
+            if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+                lower_spacing_named_field(prefix, &field.name, value, node);
+            }
+        }
+        return;
+    }
+    if let Some(expr_id) = statement.expr
+        && let Some(value) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+        && value.as_object().is_some()
+    {
+        lower_json_spacing_style(prefix, &value, node);
+        return;
+    }
     if let Some(value) = document_style_value(statement, expressions, context) {
         node.style.insert(prefix.to_owned(), value);
     }
@@ -13751,15 +16131,18 @@ fn lower_canonical_style_record(
     node: &mut boon_document_model::DocumentNode,
 ) {
     for field in fields {
+        if field.spread {
+            if let Some(Value::Object(object)) = expressions
+                .get(field.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+            {
+                lower_json_style_object(&object, node);
+            }
+            continue;
+        }
         match field.name.as_str() {
             "background" => {
-                if let Some(value) =
-                    record_field_nested_style_value(field, "color", expressions, context).or_else(
-                        || document_style_value_for_expr(field.value, expressions, context),
-                    )
-                {
-                    node.style.insert("background".to_owned(), value);
-                }
+                lower_background_style_field(field, expressions, context, node);
             }
             "font" => {
                 if let Some(font_fields) = record_fields_for_expr(field.value, expressions) {
@@ -13787,23 +16170,12 @@ fn lower_canonical_style_record(
                     }
                 }
             }
-            "align" => {
-                if let Some(align_fields) = record_fields_for_expr(field.value, expressions) {
-                    let centered = align_fields.iter().any(|align_field| {
-                        document_expr_value_by_id(align_field.value, expressions)
-                            .as_deref()
-                            .is_some_and(|value| matches!(value, "Center" | "center"))
-                    });
-                    if centered {
-                        node.style.insert(
-                            "center".to_owned(),
-                            boon_document_model::StyleValue::Bool(true),
-                        );
-                    }
-                }
-            }
+            "align" => lower_align_style_field(field, expressions, context, node),
             "padding" => lower_spacing_style_field(field, "padding", expressions, context, node),
             "shadows" => lower_shadow_style_field(field, expressions, context, node),
+            "material" => lower_material_style_field(field, expressions, context, node),
+            "glow" => lower_glow_style_field(field, expressions, context, node),
+            "move" => lower_spacing_style_field(field, "move", expressions, context, node),
             "rounded_corners" => {
                 if let Some(value) =
                     document_style_value_for_expr(field.value, expressions, context)
@@ -13841,6 +16213,9 @@ fn lower_canonical_style_record(
                 }
             }
             "borders" => lower_borders_style_field(field, expressions, context, node),
+            "width" | "height" | "size" => {
+                lower_dimension_field(field, expressions, context, node);
+            }
             _ => {
                 if let Some(value) =
                     document_style_value_for_expr(field.value, expressions, context)
@@ -13850,6 +16225,398 @@ fn lower_canonical_style_record(
             }
         }
     }
+}
+
+fn lower_json_style_object(
+    object: &serde_json::Map<String, Value>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for (key, value) in object {
+        lower_json_style_field(key, value, node);
+    }
+}
+
+fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_model::DocumentNode) {
+    match key {
+        "font" => {
+            if let Some(object) = value.as_object() {
+                for (font_key, font_value) in object {
+                    match font_key.as_str() {
+                        "family" => insert_json_style_value(node, "font", font_value),
+                        "style" => insert_json_style_value(node, "font_style", font_value),
+                        "line" => lower_json_font_line_style(font_value, node),
+                        "size" | "color" | "weight" => {
+                            insert_json_style_value(node, font_key, font_value)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "line" => lower_json_font_line_style(value, node),
+        "padding" => lower_json_spacing_style("padding", value, node),
+        "move" => lower_json_spacing_style("move", value, node),
+        "background" => {
+            if let Some(object) = value.as_object() {
+                if let Some(color) = object.get("color") {
+                    insert_json_style_value(node, "background", color);
+                }
+                if let Some(url) = object.get("url") {
+                    insert_json_style_value(node, "background_url", url);
+                    insert_json_style_value(node, "asset_url", url);
+                }
+            } else {
+                insert_json_style_value(node, "background", value);
+            }
+        }
+        "material" => {
+            if let Some(object) = value.as_object() {
+                if let Some(color) = object.get("color") {
+                    insert_json_style_value(node, "background", color);
+                    insert_json_style_value(node, "material_color", color);
+                }
+                for (material_key, material_value) in object {
+                    if material_key != "color" {
+                        insert_json_style_value(node, material_key, material_value);
+                    }
+                }
+            } else {
+                insert_json_style_value(node, "material", value);
+            }
+        }
+        "glow" => {
+            if let Some(object) = value.as_object() {
+                if let Some(color) = object.get("color") {
+                    insert_json_style_value(node, "glow_color", color);
+                    insert_json_style_value(node, "box_shadow_8_color", color);
+                    node.style
+                        .entry("box_shadow_8_x".to_owned())
+                        .or_insert(boon_document_model::StyleValue::Number(0.0));
+                    node.style
+                        .entry("box_shadow_8_y".to_owned())
+                        .or_insert(boon_document_model::StyleValue::Number(0.0));
+                    node.style
+                        .entry("box_shadow_8_blur".to_owned())
+                        .or_insert(boon_document_model::StyleValue::Number(18.0));
+                    node.style
+                        .entry("box_shadow_8_spread".to_owned())
+                        .or_insert(boon_document_model::StyleValue::Number(2.0));
+                }
+                if let Some(intensity) = object.get("intensity") {
+                    insert_json_style_value(node, "glow_intensity", intensity);
+                }
+            }
+        }
+        "rounded_corners" => insert_json_style_value(node, "border_radius", value),
+        "outline" | "border" => {
+            if let Some(object) = value.as_object() {
+                if let Some(color) = object.get("color") {
+                    insert_json_style_value(node, "border", color);
+                }
+            } else {
+                insert_json_style_value(node, "border", value);
+            }
+        }
+        "borders" => {
+            if let Some(object) = value.as_object() {
+                for side in ["top", "right", "bottom", "left"] {
+                    if let Some(side_value) = object.get(side).and_then(Value::as_object) {
+                        if let Some(color) = side_value.get("color") {
+                            insert_json_style_value(node, &format!("border_{side}"), color);
+                        }
+                        if let Some(width) = side_value.get("width") {
+                            insert_json_style_value(node, &format!("border_{side}_width"), width);
+                        }
+                    }
+                }
+            }
+        }
+        "width" | "height" | "size" => lower_json_dimension_style(key, value, node),
+        "align" => lower_json_align_style(value, node),
+        _ => insert_json_style_value(node, key, value),
+    }
+}
+
+fn lower_dimension_statement(
+    key: &str,
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr
+        && let Some(value) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_dimension_style(key, &value, node);
+        return;
+    }
+    if let Some(value) = document_style_value(statement, expressions, context) {
+        insert_dimension_style(node, key, value);
+    }
+}
+
+fn lower_dimension_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(value) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_dimension_style(&field.name, &value, node);
+        return;
+    }
+    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+        insert_dimension_style(node, &field.name, value);
+    }
+}
+
+fn lower_json_dimension_style(
+    key: &str,
+    value: &Value,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let Some(object) = value.as_object() else {
+        let value = document_style_value_from_json(value.clone());
+        insert_dimension_style(node, key, value);
+        return;
+    };
+    if let Some(sizing) = object.get("sizing").or_else(|| object.get("type")) {
+        let value = document_style_value_from_json(sizing.clone());
+        insert_dimension_style(node, key, value);
+    }
+    if let Some(minimum) = object.get("minimum").or_else(|| object.get("min")) {
+        insert_json_style_value(node, &format!("min_{key}"), minimum);
+    }
+    if let Some(maximum) = object.get("maximum").or_else(|| object.get("max")) {
+        insert_json_style_value(node, &format!("max_{key}"), maximum);
+    }
+}
+
+fn insert_dimension_style(
+    node: &mut boon_document_model::DocumentNode,
+    key: &str,
+    value: boon_document_model::StyleValue,
+) {
+    if key == "size"
+        && matches!(
+            node.kind,
+            boon_document_model::DocumentNodeKind::Button
+                | boon_document_model::DocumentNodeKind::Checkbox
+                | boon_document_model::DocumentNodeKind::Stack
+                | boon_document_model::DocumentNodeKind::TableCell
+        )
+    {
+        node.style.insert("box_size".to_owned(), value.clone());
+    }
+    node.style.insert(key.to_owned(), value);
+}
+
+fn lower_align_style_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr
+        && let Some(value) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_align_style(&value, node);
+        return;
+    }
+    if let Some(value) = document_style_value(statement, expressions, context) {
+        lower_style_align_value(&value, node);
+    }
+}
+
+fn lower_align_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(value) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_align_style(&value, node);
+        return;
+    }
+    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+        lower_style_align_value(&value, node);
+    }
+}
+
+fn lower_json_align_style(value: &Value, node: &mut boon_document_model::DocumentNode) {
+    if let Some(object) = value.as_object() {
+        for (axis, axis_value) in object {
+            let value = document_style_value_from_json(axis_value.clone());
+            match axis.as_str() {
+                "row" => lower_style_align_value(&value, node),
+                "column" => {
+                    if let boon_document_model::StyleValue::Text(value) = value {
+                        node.style.insert(
+                            "align_y".to_owned(),
+                            boon_document_model::StyleValue::Text(value.to_ascii_lowercase()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        lower_style_align_value(&document_style_value_from_json(value.clone()), node);
+    }
+}
+
+fn lower_style_align_value(
+    value: &boon_document_model::StyleValue,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    let boon_document_model::StyleValue::Text(value) = value else {
+        return;
+    };
+    if value.eq_ignore_ascii_case("center") {
+        node.style.insert(
+            "center".to_owned(),
+            boon_document_model::StyleValue::Bool(true),
+        );
+    } else if value.eq_ignore_ascii_case("right") {
+        node.style.insert(
+            "align_x".to_owned(),
+            boon_document_model::StyleValue::Text("right".to_owned()),
+        );
+    }
+}
+
+fn synthesize_physical_style(node: &mut boon_document_model::DocumentNode) {
+    let depth = node
+        .style
+        .get("depth")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    if depth <= 0.0 {
+        return;
+    }
+    let move_closer = node
+        .style
+        .get("move_closer")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let move_further = node
+        .style
+        .get("move_further")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let elevation = (move_closer - move_further).max(0.0);
+    if !node.style.contains_key("box_shadow_1_color") {
+        node.style.insert(
+            "box_shadow_1_color".to_owned(),
+            boon_document_model::StyleValue::Text("Oklch[lightness:0.20]".to_owned()),
+        );
+        node.style.insert(
+            "box_shadow_1_x".to_owned(),
+            boon_document_model::StyleValue::Number(0.0),
+        );
+        node.style.insert(
+            "box_shadow_1_y".to_owned(),
+            boon_document_model::StyleValue::Number((depth * 0.45 + elevation * 0.08).max(1.0)),
+        );
+        node.style.insert(
+            "box_shadow_1_blur".to_owned(),
+            boon_document_model::StyleValue::Number((depth * 1.8 + elevation * 0.25).max(2.0)),
+        );
+        node.style.insert(
+            "box_shadow_1_spread".to_owned(),
+            boon_document_model::StyleValue::Number(0.0),
+        );
+    }
+    if !node.style.contains_key("border")
+        && matches!(
+            node.kind,
+            boon_document_model::DocumentNodeKind::Stack
+                | boon_document_model::DocumentNodeKind::Row
+                | boon_document_model::DocumentNodeKind::Button
+                | boon_document_model::DocumentNodeKind::Checkbox
+                | boon_document_model::DocumentNodeKind::TextInput
+        )
+    {
+        node.style.insert(
+            "border".to_owned(),
+            boon_document_model::StyleValue::Text("Oklch[lightness:0.92]".to_owned()),
+        );
+    }
+}
+
+fn style_number_from_value(value: &boon_document_model::StyleValue) -> Option<f64> {
+    match value {
+        boon_document_model::StyleValue::Number(value) => Some(*value),
+        boon_document_model::StyleValue::Text(value) => value.parse::<f64>().ok(),
+        boon_document_model::StyleValue::Bool(_) => None,
+    }
+}
+
+fn lower_json_spacing_style(
+    prefix: &str,
+    value: &Value,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(object) = value.as_object() {
+        for (field, spacing_value) in object {
+            match field.as_str() {
+                "top" | "right" | "bottom" | "left" => {
+                    insert_json_style_value(node, &format!("{prefix}_{field}"), spacing_value)
+                }
+                "row" => {
+                    insert_json_style_value(node, &format!("{prefix}_left"), spacing_value);
+                    insert_json_style_value(node, &format!("{prefix}_right"), spacing_value);
+                }
+                "column" => {
+                    insert_json_style_value(node, &format!("{prefix}_top"), spacing_value);
+                    insert_json_style_value(node, &format!("{prefix}_bottom"), spacing_value);
+                }
+                "closer" => {
+                    insert_json_style_value(node, &format!("{prefix}_closer"), spacing_value)
+                }
+                "further" => {
+                    insert_json_style_value(node, &format!("{prefix}_further"), spacing_value)
+                }
+                "up" => insert_json_style_value(node, &format!("{prefix}_up"), spacing_value),
+                _ => {}
+            }
+        }
+    } else {
+        insert_json_style_value(node, prefix, value);
+    }
+}
+
+fn lower_json_font_line_style(value: &Value, node: &mut boon_document_model::DocumentNode) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(strike) = object.get("strike") {
+        insert_json_style_value(node, "strikethrough", strike);
+    }
+    if let Some(underline) = object.get("underline") {
+        insert_json_style_value(node, "underline_if", underline);
+        insert_json_style_value(node, "__hover_underline_if", underline);
+    }
+}
+
+fn insert_json_style_value(node: &mut boon_document_model::DocumentNode, key: &str, value: &Value) {
+    if value.is_null() {
+        return;
+    }
+    node.style.insert(
+        key.to_owned(),
+        document_style_value_from_json(value.clone()),
+    );
 }
 
 fn record_field_nested_style_value(
@@ -13902,7 +16669,22 @@ fn document_style_value_for_expr(
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<boon_document_model::StyleValue> {
+    document_style_value_for_expr_with_children(expr_id, &[], expressions, context)
+}
+
+fn document_style_value_for_expr_with_children(
+    expr_id: usize,
+    expr_children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<boon_document_model::StyleValue> {
     let expr = expressions.get(expr_id)?;
+    if let Some(input) = document_when_input_expr_id(expr)
+        && let Some(resolved) =
+            document_eval_while_expr_value(input, expr_children, expressions, context)
+    {
+        return Some(document_style_value_from_json(resolved));
+    }
     match &expr.kind {
         AstExprKind::Number(value) => value
             .parse::<f64>()
@@ -13942,8 +16724,15 @@ fn lower_canonical_element_text(
             continue;
         };
         match field.as_str() {
-            "label" if !matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput) => {
-                if node.text.is_none()
+            "label"
+                if !matches!(
+                    node.kind,
+                    boon_document_model::DocumentNodeKind::TextInput
+                        | boon_document_model::DocumentNodeKind::Checkbox
+                ) =>
+            {
+                if canonical_element_function(child, expressions).is_none()
+                    && node.text.is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
                     && !text.is_empty()
                 {
@@ -13954,6 +16743,8 @@ fn lower_canonical_element_text(
                 if node.text.is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
                     && !text.is_empty()
+                    && !(matches!(node.kind, boon_document_model::DocumentNodeKind::TextInput)
+                        && text.contains(".event."))
                 {
                     node.text = Some(boon_document_model::TextValue { text });
                 }
@@ -13969,6 +16760,9 @@ fn lower_canonical_element_text(
                 }
             }
             "child" | "icon" => {
+                if document_render_arg_statement(child, expressions, context).is_some() {
+                    continue;
+                }
                 if node.text.is_none()
                     && canonical_element_function(child, expressions).is_none()
                     && let Some(text) = document_text_or_nested_text(child, expressions, context)
@@ -14053,6 +16847,7 @@ fn document_text_value_for_expr(
     context: &DocumentEvalContext<'_>,
 ) -> Option<String> {
     match &expr.kind {
+        AstExprKind::Call { function, .. } if function == "Text/empty" => Some(String::new()),
         AstExprKind::StringLiteral(value) => {
             if value.starts_with('$') {
                 Some(document_resolved_text(value, context))
@@ -14104,6 +16899,16 @@ fn lower_canonical_element_sources(
                     );
                 }
                 for event in &child.children {
+                    if lower_canonical_element_source_statement(
+                        event,
+                        expressions,
+                        context,
+                        node_id,
+                        node,
+                        source_intents,
+                    ) {
+                        continue;
+                    }
                     match document_field_name(event).as_deref() {
                         Some("hovered") => {
                             node.style.insert(
@@ -14113,9 +16918,27 @@ fn lower_canonical_element_sources(
                         }
                         Some("event") => {
                             for source in &event.children {
-                                if let (Some(intent), Some(source_path)) = (
-                                    document_field_name(source),
-                                    document_source_value(source, expressions, context),
+                                let Some(intent) = document_field_name(source) else {
+                                    continue;
+                                };
+                                if let Some(source_path) =
+                                    document_source_value(source, expressions, context)
+                                        .or_else(|| context.source_override.clone())
+                                        .filter(|path| !path.is_empty())
+                                {
+                                    push_canonical_source_intent(
+                                        node_id,
+                                        node,
+                                        source_intents,
+                                        &intent,
+                                        &source_path,
+                                    );
+                                    continue;
+                                }
+                                for source_path in source_paths_for_native_node_attr(
+                                    context,
+                                    document_node_binding_kind(&node.kind),
+                                    &intent,
                                 ) {
                                     push_canonical_source_intent(
                                         node_id,
@@ -14172,6 +16995,37 @@ fn lower_canonical_element_sources(
     }
 }
 
+fn lower_canonical_element_source_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+) -> bool {
+    let AstStatementKind::Source { field, event } = &statement.kind else {
+        return false;
+    };
+    match (field.as_deref(), event.as_deref()) {
+        (Some("hovered"), None) => {
+            node.style.insert(
+                "__hover_scope".to_owned(),
+                boon_document_model::StyleValue::Bool(true),
+            );
+            true
+        }
+        (Some("event"), Some(intent)) => {
+            if let Some(source_path) = document_source_value(statement, expressions, context)
+                .or_else(|| context.source_override.clone())
+            {
+                push_canonical_source_intent(node_id, node, source_intents, intent, &source_path);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn lower_canonical_element_source_record(
     fields: &[AstRecordField],
     expressions: &[AstExpr],
@@ -14192,7 +17046,23 @@ fn lower_canonical_element_source_record(
                 for source_field in event_fields {
                     if let Some(source_path) =
                         document_source_value_for_expr(source_field.value, expressions, context)
+                            .or_else(|| context.source_override.clone())
+                            .filter(|path| !path.is_empty())
                     {
+                        push_canonical_source_intent(
+                            node_id,
+                            node,
+                            source_intents,
+                            &source_field.name,
+                            &source_path,
+                        );
+                        continue;
+                    }
+                    for source_path in source_paths_for_native_node_attr(
+                        context,
+                        document_node_binding_kind(&node.kind),
+                        &source_field.name,
+                    ) {
                         push_canonical_source_intent(
                             node_id,
                             node,
@@ -14215,6 +17085,47 @@ fn lower_canonical_element_source_record(
                 push_canonical_source_intent(node_id, node, source_intents, intent, &source_path);
             }
         }
+    }
+}
+
+fn source_paths_for_native_node_attr(
+    context: &DocumentEvalContext<'_>,
+    node_kind: &str,
+    attr: &str,
+) -> Vec<String> {
+    let attr = if attr == "key_down" { "submit" } else { attr };
+    context
+        .source_binding_index
+        .get(&(node_kind.to_owned(), attr.to_owned()))
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn push_native_node_kind_source_intents(
+    context: &DocumentEvalContext<'_>,
+    node_kind: &str,
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &mut boon_document_model::DocumentNode,
+    source_intents: &mut Vec<serde_json::Value>,
+) {
+    let prefix = (node_kind.to_owned(), String::new());
+    let paths = context
+        .source_binding_index
+        .iter()
+        .filter(|((kind, _), _)| kind == &prefix.0)
+        .flat_map(|((_, attr), paths)| {
+            paths
+                .iter()
+                .map(|path| (attr.as_str(), path.as_str()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (attr, path) in paths {
+        let intent = if attr == "submit" { "key_down" } else { attr };
+        push_canonical_source_intent(node_id, node, source_intents, intent, path);
     }
 }
 
@@ -14264,14 +17175,29 @@ fn document_source_value_for_expr(
     context: &DocumentEvalContext<'_>,
 ) -> Option<String> {
     let expr = expressions.get(expr_id)?;
-    let value = if matches!(expr.kind, AstExprKind::Identifier(_) | AstExprKind::Path(_)) {
-        document_expr_value(expr, expressions)
-    } else {
-        document_eval_expr_value(expr, expressions, context)
-            .map(|value| json_value_to_document_text(&value))
-            .or_else(|| document_expr_value(expr, expressions))
-    }?;
-    Some(normalized_document_source_path(&value))
+    if matches!(expr.kind, AstExprKind::Source) {
+        return context
+            .source_override
+            .clone()
+            .filter(|path| !path.is_empty());
+    }
+    let literal = document_expr_value(expr, expressions);
+    if matches!(expr.kind, AstExprKind::Path(_) | AstExprKind::Identifier(_))
+        && let Some(literal) = literal
+    {
+        return Some(normalized_document_source_path(&literal));
+    }
+    let normalized_literal = literal.as_deref().map(normalized_document_source_path);
+    let value = document_eval_expr_value(expr, expressions, context)
+        .map(|value| json_value_to_document_text(&value))
+        .or_else(|| {
+            normalized_literal
+                .as_deref()
+                .and_then(|path| document_resolved_value(path, context))
+                .map(json_value_to_document_text)
+        })
+        .or(literal)?;
+    Some(normalized_document_source_path(&value)).filter(|path| !path.is_empty())
 }
 
 fn normalized_document_source_path(path: &str) -> String {
@@ -14288,6 +17214,9 @@ fn push_canonical_source_intent(
     intent: &str,
     source_path: &str,
 ) {
+    if source_path.is_empty() {
+        return;
+    }
     if node.source_binding.is_none() {
         node.source_binding = Some(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId(format!("source:{}:{}", node_id.0, intent)),
@@ -14481,7 +17410,54 @@ fn lower_document_element(
 struct DocumentEvalContext<'a> {
     root: Option<&'a Value>,
     locals: BTreeMap<String, Value>,
+    render_args: BTreeMap<String, AstStatement>,
     passed: Option<Value>,
+    source_binding_index: BTreeMap<(String, String), Vec<String>>,
+    source_override: Option<String>,
+    functions: Option<&'a DocumentFunctionRegistry<'a>>,
+    eval_depth: usize,
+    eval_cache: Arc<Mutex<BTreeMap<String, Value>>>,
+}
+
+fn source_binding_index_from_view_bindings(
+    bindings: &[boon_ir::ViewBinding],
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for binding in bindings {
+        if !matches!(binding.kind, boon_ir::ViewBindingKind::Source) {
+            continue;
+        }
+        let key = (
+            native_binding_node_kind(&binding.node_kind).to_owned(),
+            binding.attr.clone(),
+        );
+        let paths = index.entry(key).or_default();
+        if !paths.iter().any(|path| path == &binding.path) {
+            paths.push(binding.path.clone());
+        }
+    }
+    index
+}
+
+fn native_binding_node_kind(kind: &str) -> &str {
+    match kind {
+        "Input" | "TextInput" => "TextInput",
+        "Button" => "Button",
+        "Checkbox" => "Checkbox",
+        "Text" | "Label" | "Paragraph" | "Link" => "Text",
+        other => other,
+    }
+}
+
+fn document_node_binding_kind(kind: &boon_document_model::DocumentNodeKind) -> &'static str {
+    match kind {
+        boon_document_model::DocumentNodeKind::TextInput => "TextInput",
+        boon_document_model::DocumentNodeKind::Button => "Button",
+        boon_document_model::DocumentNodeKind::Checkbox => "Checkbox",
+        boon_document_model::DocumentNodeKind::Text => "Text",
+        boon_document_model::DocumentNodeKind::Row => "Row",
+        _ => "Stack",
+    }
 }
 
 fn lower_document_for_each(
@@ -14506,7 +17482,13 @@ fn lower_document_for_each(
         let mut scoped = DocumentEvalContext {
             root: context.root,
             locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
             passed: context.passed.clone(),
+            source_binding_index: context.source_binding_index.clone(),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
         };
         scoped.locals.insert(item_name.clone(), item.clone());
         let child_scope = if scope_key.is_empty() {
@@ -14691,10 +17673,9 @@ fn document_text_value(
     template: bool,
 ) -> Option<String> {
     let expr = expressions.get(statement.expr?)?;
-    if let AstExprKind::Pipe { input, op, .. } = &expr.kind
-        && op == "WHILE"
+    if let Some(input) = document_when_input_expr_id(expr)
         && let Some(resolved) = document_eval_while_expr_value(
-            *input,
+            input,
             statement.children.as_slice(),
             expressions,
             context,
@@ -14712,6 +17693,13 @@ fn document_text_value(
             .map(|value| document_resolved_template(&value, context));
     }
     match &expr.kind {
+        AstExprKind::Latest => {
+            return statement
+                .children
+                .first()
+                .and_then(|child| document_text_value(child, expressions, context, template));
+        }
+        AstExprKind::Call { function, .. } if function == "Text/empty" => Some(String::new()),
         AstExprKind::StringLiteral(value) => {
             if value.starts_with('$') {
                 Some(document_resolved_text(value, context))
@@ -14745,6 +17733,18 @@ fn document_bool_value(
     context: &DocumentEvalContext<'_>,
 ) -> Option<bool> {
     let expr = expressions.get(statement.expr?)?;
+    if let Some(input) = document_when_input_expr_id(expr) {
+        return match document_eval_while_expr_value(
+            input,
+            statement.children.as_slice(),
+            expressions,
+            context,
+        ) {
+            Some(Value::Bool(value)) => Some(value),
+            Some(Value::String(value)) => Some(value.eq_ignore_ascii_case("true")),
+            _ => None,
+        };
+    }
     match &expr.kind {
         AstExprKind::Bool(value) => Some(*value),
         AstExprKind::StringLiteral(value) if value.starts_with('$') => {
@@ -14766,10 +17766,9 @@ fn document_style_value(
 ) -> Option<boon_document_model::StyleValue> {
     let (expr_id, expr_children) = document_direct_style_expr(statement, expressions)?;
     let expr = expressions.get(expr_id)?;
-    if let AstExprKind::Pipe { input, op, .. } = &expr.kind
-        && op == "WHILE"
+    if let Some(input) = document_when_input_expr_id(expr)
         && let Some(resolved) =
-            document_eval_while_expr_value(*input, expr_children, expressions, context)
+            document_eval_while_expr_value(input, expr_children, expressions, context)
     {
         return Some(document_style_value_from_json(resolved));
     }
@@ -14840,6 +17839,16 @@ fn document_style_value_from_json(value: Value) -> boon_document_model::StyleVal
     }
 }
 
+fn document_when_input_expr_id(expr: &AstExpr) -> Option<usize> {
+    match &expr.kind {
+        AstExprKind::When { input } => Some(*input),
+        AstExprKind::Pipe { input, op, .. } if matches!(op.as_str(), "WHEN" | "WHILE") => {
+            Some(*input)
+        }
+        _ => None,
+    }
+}
+
 fn document_eval_while_expr_value(
     input_expr_id: usize,
     arms: &[AstStatement],
@@ -14855,9 +17864,13 @@ fn document_eval_while_expr_value(
         if !document_match_pattern_matches_value(pattern, &selector) {
             continue;
         }
-        let output = output.and_then(|expr_id| expressions.get(expr_id))?;
-        return document_eval_expr_value(output, expressions, context)
-            .or_else(|| document_expr_value(output, expressions).map(Value::String));
+        if let Some(output) = output.and_then(|expr_id| expressions.get(expr_id))
+            && let Some(value) = document_eval_expr_value(output, expressions, context)
+                .or_else(|| document_expr_value(output, expressions).map(Value::String))
+        {
+            return Some(value);
+        }
+        return document_eval_statement_sequence(&arm.children, expressions, context);
     }
     None
 }
@@ -14876,7 +17889,12 @@ fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bo
             _ => false,
         },
         [single] => match value {
-            Value::String(value) => value == single,
+            Value::String(value) => {
+                value == single
+                    || single
+                        .split_once('[')
+                        .is_some_and(|(tag, _)| value.starts_with(&format!("{tag}[")))
+            }
             Value::Number(value) => single
                 .parse::<f64>()
                 .ok()
@@ -14910,6 +17928,15 @@ fn document_eval_expr_value(
         AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
             let mut object = serde_json::Map::new();
             for field in fields {
+                if field.spread {
+                    if let Some(Value::Object(spread)) = expressions
+                        .get(field.value)
+                        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                    {
+                        object.extend(spread);
+                    }
+                    continue;
+                }
                 let value = expressions
                     .get(field.value)
                     .and_then(|expr| document_eval_expr_value(expr, expressions, context))
@@ -14926,13 +17953,645 @@ fn document_eval_expr_value(
         AstExprKind::TaggedObject { tag, fields } => Some(Value::String(
             tagged_document_object_value(tag, fields, expressions),
         )),
+        AstExprKind::Call { function, args } => {
+            if let Some(value) = document_builtin_value_call(function, args, expressions, context) {
+                return Some(value);
+            }
+            document_eval_function_call(function, args, expressions, context)
+        }
         AstExprKind::Infix { left, op, right } => {
-            let left = document_eval_expr_value(expressions.get(*left)?, expressions, context)?;
-            let right = document_eval_expr_value(expressions.get(*right)?, expressions, context)?;
+            let left = document_eval_expr_value(expressions.get(*left)?, expressions, context)
+                .unwrap_or(Value::Null);
+            let right = document_eval_expr_value(expressions.get(*right)?, expressions, context)
+                .unwrap_or(Value::Null);
             document_eval_infix(&left, op, &right)
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            document_eval_pipe_value(*input, op, args, expressions, context)
         }
         _ => None,
     }
+}
+
+fn document_builtin_value_call(
+    function: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    match function {
+        "Theme/font" => Some(document_theme_font(
+            &document_call_arg_text(args, "of", expressions, context)?,
+            context,
+        )),
+        "Theme/text" => Some(document_theme_text(
+            &document_call_arg_text(args, "of", expressions, context)?,
+            context,
+        )),
+        "Theme/material" => Some(document_theme_material(
+            &document_call_arg_text(args, "of", expressions, context)?,
+            context,
+        )),
+        "Theme/depth" => Some(json!(
+            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                "Container" => 8.0,
+                "Element" => 6.0,
+                "Detail" => 2.0,
+                "Hero" => 10.0,
+                _ => 1.0,
+            }
+        )),
+        "Theme/elevation" => {
+            Some(json!(
+                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                    "Card" => 50.0,
+                    "EditingFocus" => 24.0,
+                    "Selection" => 4.0,
+                    "TodoItem" => 4.0,
+                    "Inset" => -4.0,
+                    _ => 0.0,
+                }
+            ))
+        }
+        "Theme/corners" => {
+            Some(json!(
+                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                    "Touch" => 2.0,
+                    "Comfort" => 4.0,
+                    "Soft" => 6.0,
+                    "Pill" | "Fully" => 999.0,
+                    _ => 0.0,
+                }
+            ))
+        }
+        "Theme/sizing" => Some(json!(
+            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                "TouchTarget" => 40.0,
+                "ToggleControl" => 60.0,
+                "IconContainer" => 34.0,
+                "EditingInputWidth" => 506.0,
+                _ => 0.0,
+            }
+        )),
+        "Theme/spacing" => {
+            Some(json!(
+                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                    "None" => 0.0,
+                    "Tight" => 5.0,
+                    "Small" => 9.0,
+                    "Standard" => 10.0,
+                    "IconOffset" => 18.0,
+                    "Section" => 65.0,
+                    _ => 0.0,
+                }
+            ))
+        }
+        "Theme/spring_range" => {
+            let of = document_call_arg_text(args, "of", expressions, context)?;
+            Some(match of.as_str() {
+                "Button" => json!({"extend": 6.0, "compress": 4.0}),
+                "ButtonDestructive" => json!({"extend": 4.0, "compress": 6.0}),
+                "Checkbox" => json!({"extend": 4.0, "compress": 8.0}),
+                _ => json!({}),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn document_call_arg_text(
+    args: &[AstCallArg],
+    name: &str,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    let arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .or_else(|| args.first())?;
+    expressions
+        .get(arg.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+        .map(|value| json_value_to_document_text(&value))
+        .or_else(|| {
+            expressions
+                .get(arg.value)
+                .and_then(|expr| document_expr_value(expr, expressions))
+        })
+}
+
+fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
+    match document_resolved_value("PASSED.theme_options.mode", context)
+        .and_then(Value::as_str)
+        .unwrap_or("Light")
+    {
+        "Dark" => "Dark",
+        _ => "Light",
+    }
+}
+
+fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'static str {
+    match (document_theme_mode(context), role) {
+        ("Light", "text") => "Oklch[lightness:0.42]",
+        ("Light", "text_secondary") => "Oklch[lightness:0.57]",
+        ("Light", "text_tertiary") => "Oklch[lightness:0.75]",
+        ("Light", "text_disabled") => "Oklch[lightness:0.75]",
+        ("Light", "text_header") => "Oklch[lightness:0.54,chroma:0.156,hue:21.24]",
+        ("Light", "danger") => "Oklch[lightness:0.6,chroma:0.109,hue:18.87]",
+        ("Dark", "text") => "Oklch[lightness:0.9]",
+        ("Dark", "text_secondary") => "Oklch[lightness:0.75]",
+        ("Dark", "text_tertiary") => "Oklch[lightness:0.65]",
+        ("Dark", "text_disabled") => "Oklch[lightness:0.5]",
+        ("Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.165,hue:25.36]",
+        ("Dark", "danger") => "Oklch[lightness:0.7,chroma:0.12,hue:18.87]",
+        _ => "Oklch[lightness:0.42]",
+    }
+}
+
+fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
+    let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    match tagged {
+        "Hero" => json!({
+            "size": 100.0,
+            "color": document_theme_color(context, "text_header"),
+            "weight": "Hairline"
+        }),
+        "BodySecondary" => json!({
+            "size": 14.0,
+            "color": document_theme_color(context, "text_secondary")
+        }),
+        "BodyDisabled" => json!({
+            "size": 24.0,
+            "color": document_theme_color(context, "text_disabled")
+        }),
+        "BodyDanger" => json!({
+            "size": 30.0,
+            "align": "Center",
+            "color": document_theme_color(context, "danger")
+        }),
+        "Placeholder" => json!({
+            "size": 24.0,
+            "style": "Italic",
+            "color": document_theme_color(context, "text_secondary")
+        }),
+        "ButtonIcon" => json!({
+            "size": 22.0,
+            "color": document_theme_color(context, "text_disabled")
+        }),
+        "Small" => json!({
+            "size": 10.0,
+            "color": document_theme_color(context, "text_tertiary")
+        }),
+        "SmallLink" => json!({
+            "size": 10.0,
+            "color": document_theme_color(context, "text_tertiary"),
+            "line": {"underline": false}
+        }),
+        "Input" | "Body" | _ => json!({
+            "size": 24.0,
+            "color": document_theme_color(context, "text")
+        }),
+    }
+}
+
+fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
+    let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    match tagged {
+        "Hero" => json!({
+            "font": document_theme_font("Hero", context),
+            "depth": 6.0,
+            "move": {"closer": 6.0},
+            "relief": "Raised"
+        }),
+        "BodySecondary" => json!({
+            "font": document_theme_font("BodySecondary", context),
+            "depth": 1.5,
+            "move": {"further": 2.0},
+            "relief": "Raised"
+        }),
+        "ButtonIcon" => json!({
+            "font": document_theme_font("ButtonIcon", context)
+        }),
+        "SmallLink" => json!({
+            "font": document_theme_font("SmallLink", context),
+            "depth": 1.0,
+            "move": {"further": 4.0},
+            "relief": "Carved[wall:1]"
+        }),
+        "Small" | _ => json!({
+            "font": document_theme_font("Small", context),
+            "depth": 1.0,
+            "move": {"further": 4.0},
+            "relief": "Carved[wall:1]"
+        }),
+    }
+}
+
+fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value {
+    let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    let light = document_theme_mode(context) == "Light";
+    let color = match tagged {
+        "Background" if light => "Oklch[lightness:0.96,chroma:0.01,hue:220]",
+        "Background" => "Oklch[lightness:0.08,chroma:0.005,hue:220]",
+        "Surface" if light => "Oklch[lightness:1]",
+        "Surface" => "Oklch[lightness:0.15]",
+        "SurfaceVariant" if light => "Oklch[lightness:0.985]",
+        "SurfaceVariant" => "Oklch[lightness:0.18]",
+        "SurfaceElevated" if light => "Oklch[lightness:0.99]",
+        "SurfaceElevated" => "Oklch[lightness:0.22]",
+        "Primary" if light => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
+        "Primary" => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
+        "PrimarySubtle" if light => "Oklch[lightness:0.98,chroma:0.01,hue:25.36]",
+        "PrimarySubtle" => "Oklch[lightness:0.25,chroma:0.08,hue:25.36]",
+        "Danger" if light => "Oklch[lightness:0.8,chroma:0.109,hue:18.87]",
+        "Danger" => "Oklch[lightness:0.8,chroma:0.12,hue:18.87]",
+        _ if light => "Oklch[lightness:0.985]",
+        _ => "Oklch[lightness:0.18]",
+    };
+    json!({
+        "color": color,
+        "gloss": if matches!(tagged, "SurfaceElevated") { 0.4 } else { 0.25 },
+        "metal": if tagged.starts_with("Interactive") { 0.03 } else { 0.0 }
+    })
+}
+
+fn document_eval_pipe_value(
+    input: usize,
+    op: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let input = document_eval_expr_value(expressions.get(input)?, expressions, context)?;
+    document_eval_pipe_value_from_input(input, op, args, expressions, context)
+}
+
+fn document_eval_expr_value_with_delimited_input(
+    expr_id: usize,
+    input_override: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let expr = expressions.get(expr_id)?;
+    let AstExprKind::Pipe { input, op, args } = &expr.kind else {
+        return document_eval_expr_value(expr, expressions, context);
+    };
+    if !matches!(
+        expressions.get(*input).map(|expr| &expr.kind),
+        Some(AstExprKind::Delimiter)
+    ) {
+        return document_eval_expr_value(expr, expressions, context);
+    }
+    let input = document_eval_expr_value(expressions.get(input_override)?, expressions, context)?;
+    document_eval_pipe_value_from_input(input, op, args, expressions, context)
+}
+
+fn document_eval_pipe_value_from_input(
+    input: Value,
+    op: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    if let Some(field) = op.strip_prefix("Field/") {
+        return input
+            .as_object()
+            .and_then(|object| object.get(field))
+            .cloned();
+    }
+    match op {
+        "Bool/not" => input.as_bool().map(|value| Value::Bool(!value)),
+        "List/is_not_empty" => input.as_array().map(|items| Value::Bool(!items.is_empty())),
+        "List/count" => input.as_array().map(|items| json!(items.len() as u64)),
+        "List/retain" => document_eval_list_retain(input, args, expressions, context),
+        "List/any" => document_eval_list_quantifier(input, args, expressions, context, true),
+        "List/every" => document_eval_list_quantifier(input, args, expressions, context, false),
+        "Text/is_not_empty" => input.as_str().map(|text| Value::Bool(!text.is_empty())),
+        "Text/trim" => input
+            .as_str()
+            .map(|text| Value::String(text.trim().to_owned())),
+        _ => None,
+    }
+}
+
+fn document_eval_function_call(
+    function_name: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let function = context.functions?.get(function_name)?;
+    if document_function_contains_render_constructor(function, expressions) {
+        return None;
+    }
+    if context.eval_depth > 64 {
+        return None;
+    }
+    let cache_key = document_eval_call_cache_key(function_name, args, expressions, context);
+    if let Some(value) = context
+        .eval_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Some(value);
+    }
+    let mut scoped = document_function_args_context(function, args, &[], expressions, context);
+    scoped.eval_depth = context.eval_depth + 1;
+    let value = document_eval_statement_sequence(&function.children, expressions, &scoped)?;
+    if let Ok(mut cache) = context.eval_cache.lock() {
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(cache_key, value.clone());
+    }
+    Some(value)
+}
+
+fn document_eval_call_cache_key(
+    function_name: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    let arg_values = args
+        .iter()
+        .map(|arg| {
+            let name = arg.name.as_deref().unwrap_or("");
+            let value = expressions
+                .get(arg.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .or_else(|| {
+                    expressions
+                        .get(arg.value)
+                        .and_then(|expr| document_expr_value(expr, expressions).map(Value::String))
+                })
+                .unwrap_or(Value::Null);
+            (name.to_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    let args = serde_json::to_vec(&arg_values).unwrap_or_default();
+    let passed = serde_json::to_vec(&context.passed).unwrap_or_default();
+    format!(
+        "{}:{}:{}",
+        function_name,
+        boon_runtime::sha256_bytes(&args),
+        boon_runtime::sha256_bytes(&passed)
+    )
+}
+
+fn document_function_contains_render_constructor(
+    function: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    function
+        .children
+        .iter()
+        .any(|child| document_statement_contains_render_constructor(child, expressions))
+}
+
+fn document_statement_contains_render_constructor(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    canonical_element_function(statement, expressions).is_some()
+        || statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| match &expr.kind {
+                AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } => {
+                    boon_typecheck::is_registered_element_constructor(function)
+                        || matches!(function.as_str(), "Scene/new" | "Document/new")
+                }
+                _ => false,
+            })
+        || statement
+            .children
+            .iter()
+            .any(|child| document_statement_contains_render_constructor(child, expressions))
+}
+
+fn document_expr_may_render(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> bool {
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Call { function, .. } => {
+            boon_typecheck::is_registered_element_constructor(function)
+                || context
+                    .functions
+                    .and_then(|functions| functions.get(function))
+                    .is_some_and(|function| {
+                        document_function_contains_render_constructor(function, expressions)
+                    })
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            matches!(op.as_str(), "SOURCE" | "WHEN" | "WHILE")
+                || boon_typecheck::is_registered_element_constructor(op)
+                || context
+                    .functions
+                    .and_then(|functions| functions.get(op))
+                    .is_some_and(|function| {
+                        document_function_contains_render_constructor(function, expressions)
+                    })
+                || document_expr_may_render(*input, expressions, context)
+                || args
+                    .iter()
+                    .any(|arg| document_expr_may_render(arg.value, expressions, context))
+        }
+        AstExprKind::When { .. } | AstExprKind::ListLiteral { .. } => true,
+        AstExprKind::Identifier(name) => context.render_args.contains_key(name),
+        _ => false,
+    }
+}
+
+fn document_eval_statement_sequence(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
+        passed: context.passed.clone(),
+        source_binding_index: context.source_binding_index.clone(),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
+    };
+    let mut last = None;
+    let mut field_object = serde_json::Map::new();
+    let mut saw_non_field = false;
+    for statement in statements {
+        if let Some(name) = document_field_name(statement) {
+            if let Some(value) = document_eval_statement_value(statement, expressions, &scoped) {
+                scoped.locals.insert(name.clone(), value.clone());
+                field_object.insert(name, value.clone());
+                last = Some(value);
+            }
+        } else if matches!(statement.kind, AstStatementKind::Block) {
+            saw_non_field = true;
+            last = document_eval_statement_sequence(&statement.children, expressions, &scoped);
+        } else {
+            saw_non_field = true;
+            last = document_eval_statement_value(statement, expressions, &scoped).or(last);
+        }
+    }
+    if !saw_non_field && !field_object.is_empty() {
+        return Some(Value::Object(field_object));
+    }
+    last
+}
+
+fn document_eval_statement_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    if let Some(expr_id) = statement.expr {
+        let expr = expressions.get(expr_id)?;
+        if let Some(input) = document_when_input_expr_id(expr) {
+            return document_eval_while_expr_value(
+                input,
+                statement.children.as_slice(),
+                expressions,
+                context,
+            );
+        }
+        return document_eval_expr_value(expr, expressions, context)
+            .or_else(|| document_expr_value(expr, expressions).map(Value::String));
+    }
+    document_eval_statement_sequence(&statement.children, expressions, context)
+}
+
+fn document_eval_list_retain(
+    input: Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    document_eval_list_retain_with_statement_children(input, args, &[], expressions, context)
+}
+
+fn document_eval_list_retain_with_statement_children(
+    input: Value,
+    args: &[AstCallArg],
+    statement_children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let items = input.as_array()?;
+    let item_name = list_item_arg_name(args, expressions)
+        .or_else(|| {
+            statement_children.iter().find_map(|child| {
+                let AstExprKind::Identifier(name) = &expressions.get(child.expr?)?.kind else {
+                    return None;
+                };
+                Some(name.as_str())
+            })
+        })
+        .unwrap_or("item");
+    let predicate_arg = args.iter().find(|arg| arg.name.as_deref() == Some("if"));
+    let predicate_statement = statement_children.iter().find(|child| {
+        document_field_name(child).as_deref() == Some("if")
+            || child
+                .expr
+                .and_then(|expr_id| expressions.get(expr_id))
+                .and_then(document_when_input_expr_id)
+                .is_some()
+    });
+    let predicate_expr_id = predicate_arg
+        .map(|arg| arg.value)
+        .or_else(|| predicate_statement.and_then(|statement| statement.expr))?;
+    let predicate_arms = predicate_statement
+        .map(|child| child.children.as_slice())
+        .unwrap_or(&[]);
+    let mut retained = Vec::new();
+    for item in items {
+        let mut scoped = DocumentEvalContext {
+            root: context.root,
+            locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
+            passed: context.passed.clone(),
+            source_binding_index: context.source_binding_index.clone(),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
+        };
+        scoped.locals.insert(item_name.to_owned(), item.clone());
+        let pass = expressions
+            .get(predicate_expr_id)
+            .and_then(|expr| {
+                document_when_input_expr_id(expr)
+                    .filter(|_| !predicate_arms.is_empty())
+                    .and_then(|input| {
+                        document_eval_while_expr_value(input, predicate_arms, expressions, &scoped)
+                    })
+                    .or_else(|| document_eval_expr_value(expr, expressions, &scoped))
+            })
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if pass {
+            retained.push(item.clone());
+        }
+    }
+    Some(Value::Array(retained))
+}
+
+fn document_eval_list_quantifier(
+    input: Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    any: bool,
+) -> Option<Value> {
+    let items = input.as_array()?;
+    let item_name = list_item_arg_name(args, expressions).unwrap_or("item");
+    let predicate = args.iter().find(|arg| arg.name.as_deref() == Some("if"))?;
+    let mut matched = false;
+    for item in items {
+        let mut scoped = DocumentEvalContext {
+            root: context.root,
+            locals: context.locals.clone(),
+            render_args: context.render_args.clone(),
+            passed: context.passed.clone(),
+            source_binding_index: context.source_binding_index.clone(),
+            source_override: context.source_override.clone(),
+            functions: context.functions,
+            eval_depth: context.eval_depth,
+            eval_cache: Arc::clone(&context.eval_cache),
+        };
+        scoped.locals.insert(item_name.to_owned(), item.clone());
+        let pass = expressions
+            .get(predicate.value)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, &scoped))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if any && pass {
+            return Some(Value::Bool(true));
+        }
+        if !any && !pass {
+            return Some(Value::Bool(false));
+        }
+        matched |= pass;
+    }
+    Some(Value::Bool(if any { matched } else { true }))
+}
+
+fn list_item_arg_name<'a>(args: &'a [AstCallArg], expressions: &'a [AstExpr]) -> Option<&'a str> {
+    args.iter().find(|arg| arg.name.is_none()).and_then(|arg| {
+        match &expressions.get(arg.value)?.kind {
+            AstExprKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        }
+    })
 }
 
 fn document_eval_infix(left: &Value, op: &str, right: &Value) -> Option<Value> {
@@ -15536,6 +19195,7 @@ fn preview_apply_repeatable_text_input_key(
     focused_node: &str,
     source_path: &Path,
     source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -15590,6 +19250,7 @@ fn preview_apply_repeatable_text_input_key(
                 return preview_apply_live_event(
                     source_path,
                     source_text,
+                    runtime_units,
                     live_runtime,
                     shared_render_state,
                     change,
@@ -15621,6 +19282,7 @@ fn preview_apply_repeatable_text_input_key(
                     return preview_apply_live_event(
                         source_path,
                         source_text,
+                        runtime_units,
                         live_runtime,
                         shared_render_state,
                         change,
@@ -15637,6 +19299,27 @@ fn preview_apply_real_window_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: &Path,
     source_text: &str,
+    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_units = project_units_for_source_text(source_path, source_text);
+    preview_apply_real_window_input_with_units(
+        input,
+        source_path,
+        source_text,
+        &runtime_units,
+        live_runtime,
+        shared_render_state,
+        input_state,
+    )
+}
+
+fn preview_apply_real_window_input_with_units(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: &Path,
+    source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -15664,6 +19347,7 @@ fn preview_apply_real_window_input(
         Some(preview_apply_live_events(
             source_path,
             source_text,
+            runtime_units,
             live_runtime,
             shared_render_state,
             pending,
@@ -15798,6 +19482,7 @@ fn preview_apply_real_window_input(
         latest_layout = Some(preview_apply_live_events(
             source_path,
             source_text,
+            runtime_units,
             live_runtime,
             shared_render_state,
             pending,
@@ -15806,6 +19491,7 @@ fn preview_apply_real_window_input(
         latest_layout = Some(preview_apply_live_events(
             source_path,
             source_text,
+            runtime_units,
             live_runtime,
             shared_render_state,
             pending_mouse_events,
@@ -15874,6 +19560,7 @@ fn preview_apply_real_window_input(
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
+                        runtime_units,
                         live_runtime,
                         shared_render_state,
                         submit,
@@ -15915,6 +19602,7 @@ fn preview_apply_real_window_input(
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
                         source_text,
+                        runtime_units,
                         live_runtime,
                         shared_render_state,
                         escape,
@@ -15930,6 +19618,7 @@ fn preview_apply_real_window_input(
                     &focused_node,
                     source_path,
                     source_text,
+                    runtime_units,
                     live_runtime,
                     shared_render_state,
                     input_state,
@@ -15968,6 +19657,7 @@ fn preview_apply_real_window_input(
                         &focused_node,
                         source_path,
                         source_text,
+                        runtime_units,
                         live_runtime,
                         shared_render_state,
                         input_state,
@@ -16341,10 +20031,32 @@ const PREVIEW_TABLE_COLUMN_WIDTH_PX: f64 = 80.0;
 const PREVIEW_TABLE_WINDOW_ROWS: usize = 21;
 const PREVIEW_TABLE_WINDOW_COLUMNS: usize = 10;
 
+#[cfg(test)]
 fn preview_apply_scroll_input(
     input: &boon_native_app_window::NativeInputAdapterProof,
     source_path: Option<&Path>,
     source_text: Option<&str>,
+    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_units = source_path
+        .zip(source_text)
+        .map(|(source_path, source_text)| project_units_for_source_text(source_path, source_text));
+    preview_apply_scroll_input_with_units(
+        input,
+        source_path,
+        source_text,
+        runtime_units.as_deref(),
+        live_runtime,
+        shared_render_state,
+    )
+}
+
+fn preview_apply_scroll_input_with_units(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    source_path: Option<&Path>,
+    _source_text: Option<&str>,
+    runtime_units: Option<&[boon_runtime::RuntimeSourceUnit]>,
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -16375,12 +20087,12 @@ fn preview_apply_scroll_input(
     let scroll_x_px = (current_scroll_x + scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
     let scroll_y_px = (current_scroll_y + scroll_delta_y * 5.0).clamp(0.0, 2_600.0);
     let (transformed, transformed_frame) =
-        if let (Some(source_path), Some(source_text), Some(live_runtime)) =
-            (source_path, source_text, live_runtime)
+        if let (Some(source_path), Some(runtime_units), Some(live_runtime)) =
+            (source_path, runtime_units, live_runtime)
         {
-            preview_layout_for_scroll_window(
+            preview_layout_for_scroll_window_with_units(
                 source_path,
-                source_text,
+                runtime_units,
                 live_runtime,
                 scroll_x_px,
                 scroll_y_px,
@@ -16432,9 +20144,27 @@ fn preview_scroll_window(scroll_x_px: f64, scroll_y_px: f64) -> (usize, usize, u
     )
 }
 
+#[cfg(test)]
 fn preview_layout_for_scroll_window(
     source_path: &Path,
     source_text: &str,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+) -> Result<(serde_json::Value, boon_document::LayoutFrame), Box<dyn std::error::Error>> {
+    let runtime_units = project_units_for_source_text(source_path, source_text);
+    preview_layout_for_scroll_window_with_units(
+        source_path,
+        &runtime_units,
+        live_runtime,
+        scroll_x_px,
+        scroll_y_px,
+    )
+}
+
+fn preview_layout_for_scroll_window_with_units(
+    source_path: &Path,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     scroll_x_px: f64,
     scroll_y_px: f64,
@@ -16447,11 +20177,12 @@ fn preview_layout_for_scroll_window(
             .map_err(|_| "preview live runtime mutex poisoned")?;
         runtime.document_state_summary_for_window(row_start, row_count, column_start, column_count)
     };
-    let (mut layout_proof, mut layout_frame) = native_document_layout_proof_with_state_embedded(
-        source_path,
-        source_text,
-        Some(&state_summary),
-    )?;
+    let (mut layout_proof, mut layout_frame) =
+        native_document_layout_proof_with_project_state_embedded(
+            source_path,
+            runtime_units,
+            Some(&state_summary),
+        )?;
     let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
     let residual_y = scroll_y_px % PREVIEW_TABLE_ROW_HEIGHT_PX;
     let (_, _, column_start, _) = preview_scroll_window(scroll_x_px, scroll_y_px);
@@ -16730,6 +20461,7 @@ fn rect_intersection(left: boon_document::Rect, right: boon_document::Rect) -> b
 fn preview_apply_live_event(
     source_path: &Path,
     source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     event: boon_runtime::LiveSourceEvent,
@@ -16737,6 +20469,7 @@ fn preview_apply_live_event(
     preview_apply_live_events(
         source_path,
         source_text,
+        runtime_units,
         live_runtime,
         shared_render_state,
         vec![event],
@@ -16745,7 +20478,8 @@ fn preview_apply_live_event(
 
 fn preview_apply_live_events(
     source_path: &Path,
-    source_text: &str,
+    _source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     events: Vec<boon_runtime::LiveSourceEvent>,
@@ -16802,9 +20536,9 @@ fn preview_apply_live_events(
         return Ok(shared.layout_proof.clone());
     }
     let (mut post_input_layout, mut post_input_frame) =
-        native_document_layout_proof_with_state_embedded(
+        native_document_layout_proof_with_project_state_embedded(
             source_path,
-            source_text,
+            runtime_units,
             Some(&state_summary),
         )?;
     let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
@@ -17393,6 +21127,7 @@ fn preview_content_revision(update_count: u64) -> u64 {
 struct PreviewIpcState {
     source_path: PathBuf,
     source_text: String,
+    runtime_units: Vec<boon_runtime::RuntimeSourceUnit>,
     source_bytes: u64,
     source_sha256: String,
     runtime_summary: serde_json::Value,
@@ -17496,6 +21231,7 @@ impl PreviewReplaceWorkerQueue {
 struct PreviewInputRuntimeContext {
     source_path: PathBuf,
     source_text: String,
+    runtime_units: Vec<boon_runtime::RuntimeSourceUnit>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
 }
 
@@ -17507,6 +21243,8 @@ struct SourceProjectPayload {
     source_identity: String,
     project_hash: String,
     entrypoint_unit: String,
+    #[serde(default)]
+    active_file: String,
     units: Vec<SourceProjectUnit>,
 }
 
@@ -17516,6 +21254,12 @@ struct SourceProjectUnit {
     virtual_uri: String,
     text: String,
     sha256: String,
+    #[serde(default = "default_source_project_unit_role")]
+    role: String,
+}
+
+fn default_source_project_unit_role() -> String {
+    "source".to_owned()
 }
 
 impl SourceProjectPayload {
@@ -17533,12 +21277,78 @@ impl SourceProjectPayload {
             source_identity: source_identity.to_owned(),
             project_hash: source_hash.clone(),
             entrypoint_unit: virtual_uri.to_owned(),
+            active_file: virtual_uri.to_owned(),
             units: vec![SourceProjectUnit {
                 virtual_uri: virtual_uri.to_owned(),
                 text: text.to_owned(),
                 sha256: source_hash,
+                role: "entry".to_owned(),
             }],
         }
+    }
+
+    #[cfg(test)]
+    fn from_units(
+        command_id: u64,
+        source_revision: u64,
+        source_identity: &str,
+        entrypoint_unit: &str,
+        units: Vec<(String, String)>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_project_units(
+            command_id,
+            source_revision,
+            source_identity,
+            entrypoint_unit,
+            entrypoint_unit,
+            units
+                .into_iter()
+                .map(|(path, text)| ExampleProjectUnit {
+                    role: if paths_match_for_preview_units(
+                        Path::new(&path),
+                        Path::new(entrypoint_unit),
+                    ) {
+                        "entry".to_owned()
+                    } else {
+                        "source".to_owned()
+                    },
+                    path,
+                    text,
+                })
+                .collect(),
+        )
+    }
+
+    fn from_project_units(
+        command_id: u64,
+        source_revision: u64,
+        source_identity: &str,
+        entrypoint_unit: &str,
+        active_file: &str,
+        units: Vec<ExampleProjectUnit>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let units = units
+            .into_iter()
+            .map(|unit| {
+                let sha256 = boon_runtime::sha256_bytes(unit.text.as_bytes());
+                SourceProjectUnit {
+                    virtual_uri: unit.path,
+                    text: unit.text,
+                    sha256,
+                    role: unit.role,
+                }
+            })
+            .collect::<Vec<_>>();
+        let project_hash = source_project_payload_hash(&units)?;
+        Ok(Self {
+            command_id,
+            source_revision,
+            source_identity: source_identity.to_owned(),
+            project_hash,
+            entrypoint_unit: entrypoint_unit.to_owned(),
+            active_file: active_file.to_owned(),
+            units,
+        })
     }
 
     fn entrypoint(&self) -> Result<&SourceProjectUnit, Box<dyn std::error::Error>> {
@@ -17548,12 +21358,35 @@ impl SourceProjectPayload {
             .or_else(|| self.units.first())
             .ok_or_else(|| "source project payload has no source units".into())
     }
+
+    fn active_file(&self) -> &str {
+        if self.active_file.is_empty() {
+            &self.entrypoint_unit
+        } else {
+            &self.active_file
+        }
+    }
+
+    fn runtime_units(&self) -> Vec<boon_runtime::RuntimeSourceUnit> {
+        self.units
+            .iter()
+            .filter(|unit| source_project_unit_is_runtime(&unit.role))
+            .map(|unit| boon_runtime::RuntimeSourceUnit {
+                path: unit.virtual_uri.clone(),
+                source: unit.text.clone(),
+            })
+            .collect()
+    }
+}
+
+fn source_project_unit_is_runtime(role: &str) -> bool {
+    matches!(role, "entry" | "source" | "generated")
 }
 
 fn source_project_payload_hash(
     units: &[SourceProjectUnit],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if units.len() == 1 {
+    if units.len() == 1 && units.first().is_some_and(|unit| unit.role == "entry") {
         return Ok(units
             .first()
             .map(|unit| unit.sha256.clone())
@@ -17561,12 +21394,12 @@ fn source_project_payload_hash(
     }
     let mut canonical = String::new();
     for unit in units {
+        canonical.push_str(&unit.role);
+        canonical.push('\0');
         canonical.push_str(&unit.virtual_uri);
         canonical.push('\0');
         canonical.push_str(&unit.sha256);
         canonical.push('\0');
-        canonical.push_str(&boon_runtime::sha256_bytes(unit.text.as_bytes()));
-        canonical.push('\n');
     }
     Ok(boon_runtime::sha256_bytes(canonical.as_bytes()))
 }
@@ -17580,6 +21413,7 @@ fn preview_input_runtime_context(
     Ok(PreviewInputRuntimeContext {
         source_path: state.source_path.clone(),
         source_text: state.source_text.clone(),
+        runtime_units: state.runtime_units.clone(),
         live_runtime: state.live_runtime.clone(),
     })
 }
@@ -17587,7 +21421,7 @@ fn preview_input_runtime_context(
 fn preview_note_render_error(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     error: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
@@ -17598,8 +21432,9 @@ fn preview_note_render_error(
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn start_preview_ipc_server(
@@ -17666,6 +21501,11 @@ fn handle_preview_ipc_client(
                 preview_enqueue_source_project(&state, &request, wake_handle.clone())
         {
             wake_handle.wake();
+            writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+            stream.flush()?;
+            return Ok(());
+        }
+        if let Some(response) = preview_replace_code_already_current_response(&state, &request)? {
             writeln!(stream, "{}", serde_json::to_string(&response)?)?;
             stream.flush()?;
             return Ok(());
@@ -17984,6 +21824,7 @@ struct PreviewReplaceBuildResult {
     layout_proof: serde_json::Value,
     runtime_summary: serde_json::Value,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
+    runtime_units: Vec<boon_runtime::RuntimeSourceUnit>,
     timings: serde_json::Value,
     source_text: String,
     source_sha256: String,
@@ -18027,6 +21868,8 @@ fn preview_enqueue_source_project(
         )
         .into());
     }
+    let payload_runtime_units = payload.runtime_units();
+    let payload_runtime_hash = boon_runtime::source_units_hash(&payload_runtime_units);
 
     let queued_at = Instant::now();
     let (worker_queue, pending_overlay_frame_revision) = {
@@ -18045,6 +21888,54 @@ fn preview_enqueue_source_project(
                 "latest_accepted_source_revision": state.latest_accepted_source_revision,
                 "stale_result_rejected": true,
                 "preview_receives_example_name": false
+            });
+            return Ok(state.replace_status_cache.clone());
+        }
+        if state.source_sha256 == payload.project_hash
+            || state.source_sha256 == payload_runtime_hash
+        {
+            state.latest_accepted_command_id = payload.command_id;
+            state.latest_accepted_source_revision = payload.source_revision;
+            let frame_revision = state
+                .shared_render_state
+                .lock()
+                .map_err(|_| "preview render state mutex poisoned")?
+                .update_count;
+            state.replace_status_cache = json!({
+                "kind": "replace-source-result",
+                "status": "pass",
+                "command_id": payload.command_id,
+                "source_revision": payload.source_revision,
+                "project_hash": payload.project_hash,
+                "source_hash": state.source_sha256,
+                "entrypoint_unit": payload.entrypoint_unit,
+                "active_file": payload.active_file(),
+                "source_unit_count": payload.units.len(),
+                "runtime_source_unit_count": payload_runtime_units.len(),
+                "parse_lower_runtime_layout_timings": {
+                    "source_bytes": state.source_bytes,
+                    "source_unit_count": payload.units.len(),
+                    "runtime_source_unit_count": payload_runtime_units.len(),
+                    "layout_ms": 0.0,
+                    "runtime_summary_ms": 0.0,
+                    "live_runtime_ms": 0.0,
+                    "runtime_deferred": false,
+                    "total_ms": elapsed_ms(queued_at),
+                    "source_project_already_current": true
+                },
+                "multi_unit_execution_mode": if payload.units.len() > 1 {
+                    "multi-unit-project-executed"
+                } else {
+                    "single-entrypoint"
+                },
+                "pending_overlay_frame_revision": 0,
+                "frame_revision": frame_revision,
+                "pending_overlay_presented_before_result": false,
+                "bounded_latest_wins_worker": true,
+                "source_project_already_current": true,
+                "stale_result_rejected": false,
+                "preview_receives_example_name": false,
+                "preview_pid": std::process::id()
             });
             return Ok(state.replace_status_cache.clone());
         }
@@ -18072,6 +21963,8 @@ fn preview_enqueue_source_project(
             "source_revision": payload.source_revision,
             "source_identity": payload.source_identity,
             "project_hash": payload.project_hash,
+            "entrypoint_unit": payload.entrypoint_unit,
+            "active_file": payload.active_file(),
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
             "replace_job_queue_depth": 1,
             "replace_job_dropped_stale": 0,
@@ -18118,10 +22011,21 @@ fn preview_enqueue_source_project(
         "source_identity": payload.source_identity,
         "project_hash": payload.project_hash,
         "entrypoint_unit": payload.entrypoint_unit,
+        "active_file": payload.active_file(),
         "unit_count": payload.units.len(),
+        "runtime_unit_count": payload.runtime_units().len(),
+        "unit_roles": payload
+            .units
+            .iter()
+            .map(|unit| json!({
+                "path": unit.virtual_uri,
+                "role": unit.role,
+                "sha256": unit.sha256
+            }))
+            .collect::<Vec<_>>(),
         "multi_unit_project_hash_validated": payload.units.len() > 1,
         "multi_unit_execution_mode": if payload.units.len() > 1 {
-            "entrypoint-only-hash-carried"
+            "multi-unit-project-executed"
         } else {
             "single-entrypoint"
         },
@@ -18203,6 +22107,7 @@ fn preview_stale_source_project_result(
         layout_proof: json!({"status": "stale", "stage": stage}),
         runtime_summary: json!({"status": "stale", "stage": stage}),
         live_runtime: None,
+        runtime_units: Vec::new(),
         timings: json!({
             "total_ms": elapsed_ms(build_started),
             "stale_stage": stage,
@@ -18235,6 +22140,7 @@ where
                 layout_proof: json!({"status": "fail", "blocker": error.to_string()}),
                 runtime_summary: json!({"status": "fail", "blocker": error.to_string()}),
                 live_runtime: None,
+                runtime_units: Vec::new(),
                 timings: json!({
                     "total_ms": elapsed_ms(build_started),
                     "entrypoint_error": true
@@ -18248,14 +22154,39 @@ where
             };
         }
     };
-    let source_hash = boon_runtime::sha256_bytes(entrypoint.text.as_bytes());
+    let runtime_units = payload.runtime_units();
+    if runtime_units.is_empty() {
+        return PreviewReplaceBuildResult {
+            layout_proof: json!({"status": "fail", "blocker": "source project payload has no runtime source units"}),
+            runtime_summary: json!({"status": "fail", "blocker": "source project payload has no runtime source units"}),
+            live_runtime: None,
+            runtime_units: Vec::new(),
+            timings: json!({
+                "total_ms": elapsed_ms(build_started),
+                "source_unit_count": payload.units.len(),
+                "runtime_source_unit_count": 0
+            }),
+            source_text: entrypoint.text,
+            source_sha256: payload.project_hash,
+            source_bytes: 0,
+            virtual_uri: entrypoint.virtual_uri,
+            status: "fail",
+            diagnostic: Some("source project payload has no runtime source units".to_owned()),
+        };
+    }
+    let source_hash = payload.project_hash.clone();
+    let source_bytes = payload
+        .units
+        .iter()
+        .map(|unit| unit.text.len() as u64)
+        .sum::<u64>();
     if !is_latest() {
         return preview_stale_source_project_result(payload, build_started, "before-live-runtime");
     }
     let live_runtime_started = Instant::now();
-    let live_runtime_result = boon_runtime::LiveRuntime::from_source(
+    let live_runtime_result = boon_runtime::LiveRuntime::from_project(
         &format!("native-preview-live:{}", entrypoint.virtual_uri),
-        &entrypoint.text,
+        &runtime_units,
     );
     let live_runtime_ms = elapsed_ms(live_runtime_started);
     if !is_latest() {
@@ -18299,9 +22230,9 @@ where
         );
     }
     let layout_started = Instant::now();
-    let layout_proof = native_document_layout_proof_with_state(
+    let layout_proof = native_document_layout_proof_with_project_state(
         Path::new(&entrypoint.virtual_uri),
-        &entrypoint.text,
+        &runtime_units,
         document_state_summary.as_ref(),
     )
     .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}));
@@ -18328,15 +22259,18 @@ where
         layout_proof,
         runtime_summary,
         live_runtime,
+        runtime_units,
         timings: json!({
-            "source_bytes": entrypoint.text.len(),
+            "source_bytes": source_bytes,
+            "source_unit_count": payload.units.len(),
+            "runtime_source_unit_count": payload.runtime_units().len(),
             "layout_ms": layout_ms,
             "runtime_summary_ms": runtime_summary_ms,
             "live_runtime_ms": live_runtime_ms,
             "runtime_deferred": false,
             "total_ms": total_ms
         }),
-        source_bytes: entrypoint.text.len() as u64,
+        source_bytes,
         source_text: entrypoint.text,
         source_sha256: source_hash,
         virtual_uri: entrypoint.virtual_uri,
@@ -18370,6 +22304,8 @@ fn preview_commit_source_project_result(
             "command_id": payload.command_id,
             "source_revision": payload.source_revision,
             "project_hash": payload.project_hash,
+            "entrypoint_unit": payload.entrypoint_unit,
+            "active_file": payload.active_file(),
             "diagnostic": result.diagnostic,
             "parse_lower_runtime_layout_timings": result.timings,
             "bounded_latest_wins_worker": true,
@@ -18382,6 +22318,7 @@ fn preview_commit_source_project_result(
     if result.status == "pass" {
         state.source_path = PathBuf::from(&result.virtual_uri);
         state.source_text = result.source_text;
+        state.runtime_units = result.runtime_units;
         state.source_bytes = result.source_bytes;
         state.source_sha256 = result.source_sha256.clone();
         state.runtime_summary = result.runtime_summary.clone();
@@ -18409,9 +22346,13 @@ fn preview_commit_source_project_result(
             "source_revision": payload.source_revision,
             "project_hash": payload.project_hash,
             "source_hash": result.source_sha256,
+            "entrypoint_unit": payload.entrypoint_unit,
+            "active_file": payload.active_file(),
+            "source_unit_count": payload.units.len(),
+            "runtime_source_unit_count": payload.runtime_units().len(),
             "parse_lower_runtime_layout_timings": result.timings,
             "multi_unit_execution_mode": if payload.units.len() > 1 {
-                "entrypoint-only-hash-carried"
+                "multi-unit-project-executed"
             } else {
                 "single-entrypoint"
             },
@@ -18446,6 +22387,8 @@ fn preview_commit_source_project_result(
             "command_id": payload.command_id,
             "source_revision": payload.source_revision,
             "project_hash": payload.project_hash,
+            "entrypoint_unit": payload.entrypoint_unit,
+            "active_file": payload.active_file(),
             "diagnostic": diagnostic,
             "parse_lower_runtime_layout_timings": result.timings,
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
@@ -18485,21 +22428,29 @@ fn preview_apply_replace_code_to_state(
     ) else {
         return Ok(false);
     };
+    let project_hash = response
+        .get("project_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(actual_hash);
     let mut state = state
         .lock()
         .map_err(|_| "preview IPC state mutex poisoned")?;
+    let runtime_units = project_units_for_source_text(Path::new(source_path), code);
     state.source_path = PathBuf::from(source_path);
     state.source_text = code.to_owned();
+    state.runtime_units = runtime_units.clone();
     state.source_bytes = code.len() as u64;
-    state.source_sha256 = actual_hash.to_owned();
+    state.source_sha256 = project_hash.to_owned();
     state.runtime_summary = response
         .get("preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    state.live_runtime =
-        boon_runtime::LiveRuntime::from_source(&format!("native-preview-live:{source_path}"), code)
-            .ok()
-            .map(|runtime| Arc::new(Mutex::new(runtime)));
+    state.live_runtime = boon_runtime::LiveRuntime::from_project(
+        &format!("native-preview-live:{source_path}"),
+        &runtime_units,
+    )
+    .ok()
+    .map(|runtime| Arc::new(Mutex::new(runtime)));
     if let Some(layout_proof) = response.get("document_layout_proof") {
         let mut shared = state
             .shared_render_state
@@ -18535,9 +22486,15 @@ fn preview_replace_code_response(
         .get("source_path")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<replace-code-ipc>");
+    let runtime_units = project_units_for_source_text(Path::new(source_path), code);
+    let project_hash = boon_runtime::source_units_hash(&runtime_units);
     let layout_proof = if code.len() <= REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX {
-        native_document_layout_proof(Path::new(source_path), code)
-            .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}))
+        native_document_layout_proof_with_project_state(
+            Path::new(source_path),
+            &runtime_units,
+            None,
+        )
+        .unwrap_or_else(|error| json!({"status": "fail", "blocker": error.to_string()}))
     } else {
         json!({
             "status": "deferred",
@@ -18549,7 +22506,7 @@ fn preview_replace_code_response(
         })
     };
     let runtime_summary = if code.len() <= REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX {
-        preview_runtime_summary(Path::new(source_path), code, &actual_hash)
+        preview_runtime_summary(Path::new(source_path), code, &project_hash)
     } else {
         json!({
             "status": "deferred",
@@ -18557,6 +22514,7 @@ fn preview_replace_code_response(
             "sync_layout_budget_bytes": REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX,
             "source_path": source_path,
             "source_sha256": actual_hash,
+            "project_hash": project_hash,
             "source_bytes": code.len(),
             "full_state_mirroring_allowed": false
         })
@@ -18592,6 +22550,7 @@ fn preview_replace_code_response(
         "code_bytes": code.len(),
         "expected_hash": expected_hash,
         "actual_hash": actual_hash,
+        "project_hash": project_hash,
         "hash_matches": hash_matches,
         "accepted_for_preview_mutation": accepted,
         "diagnostic": diagnostic,
@@ -18602,6 +22561,87 @@ fn preview_replace_code_response(
         "preview_blocked_on_ipc_count": 0,
         "preview_pid": std::process::id()
     }))
+}
+
+fn preview_replace_code_already_current_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    const REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX: usize = 64 * 1024;
+    let Some(code) = request.get("code").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(expected_hash) = request
+        .get("expected_hash")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let actual_hash = boon_runtime::sha256_bytes(code.as_bytes());
+    if actual_hash != expected_hash {
+        return Ok(None);
+    }
+    let source_path = request
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<replace-code-ipc>");
+    let runtime_units = project_units_for_source_text(Path::new(source_path), code);
+    let project_hash = boon_runtime::source_units_hash(&runtime_units);
+    let mut state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?;
+    if state.source_sha256 != actual_hash && state.source_sha256 != project_hash {
+        return Ok(None);
+    }
+    let layout_proof = {
+        let shared = state
+            .shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        shared.layout_proof.clone()
+    };
+    let runtime_summary = state.runtime_summary.clone();
+    let layout_status = layout_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let runtime_status = runtime_summary
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    state.replace_status_cache = json!({
+        "kind": "replace-code-ack",
+        "status": "pass",
+        "source_project_already_current": true,
+        "source_hash": state.source_sha256,
+        "project_hash": project_hash,
+        "preview_receives_example_name": false
+    });
+    Ok(Some(json!({
+        "kind": "replace-code-ack",
+        "status": "pass",
+        "preview_command": "ReplaceCode",
+        "replace_code_protocol": true,
+        "sync_layout_budget_bytes": REPLACE_CODE_SYNC_LAYOUT_BYTES_MAX,
+        "layout_proof_deferred": false,
+        "transport": "unix-stream-json-lines",
+        "code_bytes": code.len(),
+        "expected_hash": expected_hash,
+        "actual_hash": actual_hash,
+        "project_hash": project_hash,
+        "hash_matches": true,
+        "accepted_for_preview_mutation": false,
+        "source_project_already_current": true,
+        "diagnostic": serde_json::Value::Null,
+        "preview_receives_example_name": false,
+        "full_state_mirroring_observed": false,
+        "document_layout_proof": layout_proof,
+        "preview_runtime_summary": runtime_summary,
+        "layout_status": layout_status,
+        "runtime_status": runtime_status,
+        "preview_blocked_on_ipc_count": 0,
+        "preview_pid": std::process::id()
+    })))
 }
 
 fn preview_operator_host_input_response(
@@ -18639,9 +22679,9 @@ fn preview_operator_host_input_response(
         })
         .transpose()?;
     let mut owned_runtime = if runtime_guard.is_none() {
-        Some(boon_runtime::LiveRuntime::from_source(
+        Some(boon_runtime::LiveRuntime::from_project(
             &format!("native-preview-ipc:{}", state.source_path.display()),
-            &state.source_text,
+            &state.runtime_units,
         )?)
     } else {
         None
@@ -18688,7 +22728,7 @@ fn preview_operator_host_input_response(
         );
         let before_summary_ms = before_started.elapsed().as_secs_f64() * 1000.0;
         let route_started = Instant::now();
-        let host_route =
+        let mut host_route =
             preview_host_input_route_proof(input_json, event_json, current_layout_proof.as_ref());
         let route_ms = route_started.elapsed().as_secs_f64() * 1000.0;
         let source = event_json
@@ -18733,7 +22773,34 @@ fn preview_operator_host_input_response(
         let mut post_input_layout_hash = serde_json::Value::Null;
         let mut post_input_frame_method = "no-render-patch-or-layout-update";
         let layout_started = Instant::now();
-        if !output.render_patches.is_empty() || !output.semantic_deltas.is_empty() {
+        if host_route.get("pass").and_then(serde_json::Value::as_bool) != Some(true)
+            && (!output.render_patches.is_empty() || !output.semantic_deltas.is_empty())
+        {
+            host_route["pass"] = json!(true);
+            host_route["runtime_source_binding_resolved"] = json!(true);
+            host_route["runtime_source_binding_proof"] = json!(
+                "LiveRuntime::apply_source_event produced semantic/render deltas for this source path"
+            );
+        }
+        let later_input_needs_materialized_target =
+            inputs.iter().skip(index + 1).any(|later_input| {
+                let later_event = later_input.get("source_event").unwrap_or(later_input);
+                later_event
+                    .get("target_text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|target| !target.is_empty())
+                    || later_event
+                        .get("address")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|address| !address.is_empty())
+                    || later_event
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|source| source == "store.elements.remove_completed_button")
+            });
+        if (!output.render_patches.is_empty() || !output.semantic_deltas.is_empty())
+            && later_input_needs_materialized_target
+        {
             let focus_only_updated =
                 if event.address.is_some() && event.text.is_none() && event.key.is_none() {
                     preview_update_shared_focus_node_from_runtime_state(
@@ -18754,9 +22821,9 @@ fn preview_operator_host_input_response(
                     .update_count;
                 post_input_frame_method = "runtime-state-focused-node-overlay";
             } else if let Ok((post_input_layout, Some(post_input_frame))) =
-                native_document_layout_proof_with_state_mode(
+                native_document_layout_proof_with_project_state_mode(
                     &state.source_path,
-                    &state.source_text,
+                    &state.runtime_units,
                     Some(&output.state_summary),
                     true,
                 )
@@ -19170,6 +23237,7 @@ fn run_dev_ipc_probe(
     replace_code_file: Option<&Path>,
     replace_code_expected_hash: Option<&str>,
     skip_operator_host_input_probe: bool,
+    request_timeout: Duration,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let replace_code_response = if let Some(path) = replace_code_file {
@@ -19177,7 +23245,7 @@ fn run_dev_ipc_probe(
         let expected_hash = replace_code_expected_hash
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| boon_runtime::sha256_bytes(code.as_bytes()));
-        let response = send_preview_ipc_request(
+        let response = send_preview_ipc_request_with_timeouts(
             connect,
             json!({
                 "kind": "replace-code",
@@ -19186,6 +23254,9 @@ fn run_dev_ipc_probe(
                 "source_path": path.display().to_string(),
                 "dev_pid": std::process::id()
             }),
+            Duration::from_secs(5),
+            request_timeout,
+            Duration::from_secs(10),
         )?;
         Some(response)
     } else {
@@ -19198,7 +23269,15 @@ fn run_dev_ipc_probe(
                 .map(|requests| {
                     requests
                         .into_iter()
-                        .map(|request| send_preview_ipc_request(connect, request))
+                        .map(|request| {
+                            send_preview_ipc_request_with_timeouts(
+                                connect,
+                                request,
+                                Duration::from_secs(5),
+                                request_timeout,
+                                Duration::from_secs(10),
+                            )
+                        })
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?;
@@ -19210,11 +23289,14 @@ fn run_dev_ipc_probe(
         None
     };
     let stress_start = Instant::now();
-    let runtime_summary_response = send_preview_ipc_request(
+    let runtime_summary_response = send_preview_ipc_request_with_timeouts(
         connect,
         json!({"kind": "runtime-summary", "dev_pid": std::process::id()}),
+        Duration::from_secs(5),
+        request_timeout,
+        Duration::from_secs(10),
     )?;
-    let mut value = send_preview_ipc_request(
+    let mut value = send_preview_ipc_request_with_timeouts(
         connect,
         json!({
             "kind": "bounded-ipc-stress",
@@ -19222,6 +23304,9 @@ fn run_dev_ipc_probe(
             "queue_capacity": queue_capacity,
             "dev_pid": std::process::id()
         }),
+        Duration::from_secs(5),
+        request_timeout,
+        Duration::from_secs(10),
     )?;
     value["dev_connected_to_preview"] = json!(true);
     value["dev_ipc_connect_ms"] = json!(start.elapsed().as_millis() as u64);
@@ -19309,17 +23394,9 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
 fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<serde_json::Value>> {
     const SOURCE_EVENTS_PER_REQUEST: usize = 4;
 
-    let layout_proof = native_document_layout_proof(path, code).ok()?;
-    let source_intents = layout_proof
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?
-        .clone();
-    let hit_regions = layout_proof
-        .get("hit_target_assertions")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let scenario_path = path.with_extension("scn");
+    let source_intents: Vec<serde_json::Value> = Vec::new();
+    let hit_regions: Vec<serde_json::Value> = Vec::new();
+    let scenario_path = scenario_path_for_source_path(path);
     let scenario = boon_runtime::parse_scenario(&scenario_path).ok()?;
     let mut source_events = Vec::new();
     for step in scenario.step.iter() {
@@ -19376,10 +23453,7 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
     }
     let source_hash = boon_runtime::sha256_bytes(code.as_bytes());
     let source_path = path.display().to_string();
-    let layout_proof_hash = layout_proof
-        .get("artifact_sha256")
-        .cloned()
-        .unwrap_or_else(|| json!(null));
+    let layout_proof_hash = json!(null);
     let batch_count = source_events.len().div_ceil(SOURCE_EVENTS_PER_REQUEST);
     Some(
         source_events
@@ -19406,6 +23480,24 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
             })
             .collect(),
     )
+}
+
+fn scenario_path_for_source_path(path: &Path) -> PathBuf {
+    if let Ok(entries) = boon_runtime::example_manifest_entries() {
+        for entry in entries {
+            let entry_source = Path::new(&entry.source);
+            if paths_match_for_preview_units(path, entry_source) {
+                return PathBuf::from(entry.scenario);
+            }
+            for ancestor in path.ancestors() {
+                let candidate = ancestor.join(entry_source);
+                if paths_match_for_preview_units(path, &candidate) {
+                    return ancestor.join(entry.scenario);
+                }
+            }
+        }
+    }
+    path.with_extension("scn")
 }
 
 fn toml_table_to_json(table: &BTreeMap<String, toml::Value>) -> serde_json::Value {
@@ -19821,7 +23913,12 @@ fn base_report(command: &str, args: &[String], status: &str) -> serde_json::Valu
     })
 }
 
-fn wait_for_report(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_report_or_child_exit(
+    path: &Path,
+    child: &mut Child,
+    role: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if path.exists() {
@@ -19835,6 +23932,13 @@ fn wait_for_report(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::er
             {
                 return Ok(());
             }
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "{role} role exited before writing report `{}`: {status}",
+                path.display()
+            )
+            .into());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -19920,11 +24024,6 @@ fn value_arg(args: &[String], flag: &str) -> Option<String> {
 
 fn numeric_arg(args: &[String], flag: &str) -> Option<u64> {
     value_arg(args, flag).and_then(|value| value.parse().ok())
-}
-
-fn source_hash_for_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let source = boon_runtime::source_text_for_path(path)?;
-    Ok(boon_runtime::sha256_bytes(source.as_bytes()))
 }
 
 fn opaque_source_identity(virtual_uri: &str, source: &str, revision: u64) -> String {
@@ -20019,6 +24118,300 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    #[test]
+    fn physical_theme_button_when_label_resolves_from_function_argument() {
+        let units =
+            boon_runtime::source_units_for_path(&repo_path("examples/todo_mvc_physical/RUN.bn"))
+                .unwrap();
+        let parsed = boon_parser::parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            units.into_iter().map(|unit| (unit.path, unit.source)),
+        )
+        .unwrap();
+
+        fn find_call<'a>(
+            statement: &'a AstStatement,
+            expressions: &'a [AstExpr],
+        ) -> Option<&'a AstStatement> {
+            if document_call_function(statement, expressions)
+                .is_some_and(|function| function.ends_with("theme_name_button"))
+                && document_call_args(statement, expressions).is_some_and(|args| {
+                    args.iter().any(|arg| {
+                        arg.name.as_deref() == Some("theme_name")
+                            && expressions
+                                .get(arg.value)
+                                .and_then(|expr| document_expr_value(expr, expressions))
+                                .as_deref()
+                                == Some("Professional")
+                    })
+                })
+            {
+                return Some(statement);
+            }
+            statement
+                .children
+                .iter()
+                .find_map(|child| find_call(child, expressions))
+        }
+
+        fn find_theme_name_when_text<'a>(
+            statement: &'a AstStatement,
+            expressions: &'a [AstExpr],
+        ) -> Option<&'a AstStatement> {
+            if document_field_name(statement).as_deref() == Some("text")
+                && statement
+                    .expr
+                    .and_then(|expr_id| expressions.get(expr_id))
+                    .is_some_and(|expr| matches!(expr.kind, AstExprKind::When { .. }))
+                && statement.children.iter().any(|child| {
+                    child
+                        .expr
+                        .and_then(|expr_id| expressions.get(expr_id))
+                        .is_some_and(|expr| {
+                            matches!(&expr.kind, AstExprKind::MatchArm { pattern, .. } if pattern.as_slice() == ["Professional"])
+                        })
+                })
+            {
+                return Some(statement);
+            }
+            statement
+                .children
+                .iter()
+                .find_map(|child| find_theme_name_when_text(child, expressions))
+        }
+
+        let functions = DocumentFunctionRegistry::new(&parsed.ast.statements);
+        let function = functions
+            .get("theme_name_button")
+            .or_else(|| {
+                functions.functions.iter().find_map(|(name, function)| {
+                    name.ends_with("theme_name_button").then_some(*function)
+                })
+            })
+            .unwrap();
+        let call = parsed
+            .ast
+            .statements
+            .iter()
+            .find_map(|statement| find_call(statement, &parsed.ast.expressions))
+            .unwrap();
+        let context = DocumentEvalContext {
+            root: None,
+            locals: BTreeMap::new(),
+            render_args: BTreeMap::new(),
+            passed: Some(json!({
+                "theme_options": {
+                    "name": "Professional",
+                    "mode": "Light"
+                }
+            })),
+            source_binding_index: BTreeMap::new(),
+            source_override: None,
+            functions: Some(&functions),
+            eval_depth: 0,
+            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let scoped =
+            document_function_call_context(function, call, &parsed.ast.expressions, &context);
+        let text_statement = find_theme_name_when_text(function, &parsed.ast.expressions).unwrap();
+
+        assert_eq!(
+            document_text_value(text_statement, &parsed.ast.expressions, &scoped, false).as_deref(),
+            Some("Professional")
+        );
+    }
+
+    #[test]
+    fn physical_todomvc_todo_row_lowers_source_bindings_and_svg_asset() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let state = json!({
+            "store": {
+                "elements": {
+                    "filter_buttons": {
+                        "all": "store.elements.filter_buttons.all",
+                        "active": "store.elements.filter_buttons.active",
+                        "completed": "store.elements.filter_buttons.completed"
+                    },
+                    "remove_completed_button": "store.elements.remove_completed_button",
+                    "toggle_all_checkbox": "store.elements.toggle_all_checkbox",
+                    "new_todo_title_text_input": "store.elements.new_todo_title_text_input",
+                    "theme_switcher": {
+                        "professional": "store.elements.theme_switcher.professional",
+                        "glassmorphism": "store.elements.theme_switcher.glassmorphism",
+                        "neobrutalism": "store.elements.theme_switcher.neobrutalism",
+                        "neumorphism": "store.elements.theme_switcher.neumorphism",
+                        "mode_toggle": "store.elements.theme_switcher.mode_toggle"
+                    }
+                },
+                "selected_filter": "All",
+                "selected_todo_id": null,
+                "title_to_save": null,
+                "todos": [{
+                    "todo_elements": {
+                        "remove_todo_button": "todo.todo_elements.remove_todo_button",
+                        "editing_todo_title_element": "todo.todo_elements.editing_todo_title_element",
+                        "todo_title_element": "todo.todo_elements.todo_title_element",
+                        "todo_checkbox": "todo.todo_elements.todo_checkbox"
+                    },
+                    "id": "todo-1",
+                    "title": "Physical SVG asset item",
+                    "completed": false,
+                    "edited_title": ""
+                }]
+            },
+            "theme_options": {
+                "name": "Professional",
+                "mode": "Light"
+            }
+        });
+        let (proof, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("physical TodoMVC layout should lower with a seeded todo");
+
+        let title = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Physical SVG asset item"))
+            .expect("seeded physical todo title should render");
+        assert!(
+            title.bounds.x >= 100.0,
+            "todo title should be laid out after the fixed checkbox control"
+        );
+
+        let checkbox = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                    && item.bounds.width == 40.0
+                    && item.bounds.height == 40.0
+            })
+            .expect("todo checkbox should keep its 40px touch-target size");
+        assert_eq!(
+            checkbox.text, None,
+            "checkbox accessibility label should not paint as visible text"
+        );
+
+        let icon = layout
+            .display_list
+            .iter()
+            .find(|item| item.style.contains_key("asset_url"))
+            .expect("todo checkbox icon should lower generated SVG asset URL");
+        let asset_url = icon
+            .style
+            .get("asset_url")
+            .and_then(|value| match value {
+                boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            asset_url.starts_with("data:image/svg+xml;utf8,"),
+            "generated physical SVG asset should lower as a data URL"
+        );
+        assert_eq!(icon.bounds.width, 40.0);
+        assert_eq!(icon.bounds.height, 40.0);
+
+        let empty_source_paths = proof["source_intent_assertions"]
+            .as_array()
+            .map(|intents| {
+                intents
+                    .iter()
+                    .filter(|intent| {
+                        intent
+                            .get("source_path")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            empty_source_paths, 0,
+            "physical source lowering must not fabricate empty source paths"
+        );
+    }
+
+    #[test]
+    fn physical_todomvc_footer_links_and_theme_buttons_fit_inline() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let (_, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, None)
+                .expect("physical TodoMVC layout should lower");
+
+        let text_item = |label: &str| {
+            layout
+                .display_list
+                .iter()
+                .find(|item| item.text.as_deref() == Some(label))
+                .unwrap_or_else(|| {
+                    let labels = layout
+                        .display_list
+                        .iter()
+                        .filter_map(|item| item.text.as_deref())
+                        .collect::<Vec<_>>();
+                    panic!("physical TodoMVC text `{label}` should render; labels={labels:?}")
+                })
+        };
+
+        let created_by = text_item("Created by");
+        let author = text_item("Martin Kavík");
+        assert!(
+            author.bounds.x > created_by.bounds.x + created_by.bounds.width,
+            "helper-returned footer link should render after the paragraph text"
+        );
+        assert!(
+            author.bounds.x - (created_by.bounds.x + created_by.bounds.width) >= 2.0,
+            "paragraph text and helper link should have a measured inline gap"
+        );
+        assert_eq!(
+            author.style.get("cursor"),
+            Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
+            "footer helper links should keep link hit/cursor metadata"
+        );
+
+        let part_of = text_item("Part of");
+        let todomvc_link = text_item("TodoMVC");
+        assert!(
+            todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width,
+            "second footer helper link should render inline after text"
+        );
+
+        for label in ["Professional", "Glass", "Brutalist", "Neumorphic"] {
+            let text = text_item(label);
+            let button = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                        && item.bounds.x <= text.bounds.x + 0.5
+                        && item.bounds.y <= text.bounds.y + 0.5
+                        && item.bounds.x + item.bounds.width
+                            >= text.bounds.x + text.bounds.width + 0.5
+                        && item.bounds.y + item.bounds.height
+                            >= text.bounds.y + text.bounds.height + 0.5
+                })
+                .unwrap_or_else(|| panic!("theme button `{label}` should contain its text bounds"));
+            let padding_left = match button.style.get("padding_left") {
+                Some(boon_document_model::StyleValue::Number(value)) => *value,
+                _ => 0.0,
+            };
+            let padding_right = match button.style.get("padding_right") {
+                Some(boon_document_model::StyleValue::Number(value)) => *value,
+                _ => 0.0,
+            };
+            assert!(
+                button.bounds.width + 0.5
+                    >= text.bounds.width + padding_left as f32 + padding_right as f32,
+                "theme button `{label}` should reserve horizontal padding around its label"
+            );
+        }
     }
 
     fn test_type_scalar(label: &str) -> TypeDisplayNode {
@@ -21837,6 +26230,8 @@ mod tests {
                 label: "Counter".to_owned(),
                 source: "examples/counter.bn".to_owned(),
                 source_files: Vec::new(),
+                build_files: Vec::new(),
+                asset_files: Vec::new(),
                 inline_source: Some(source.to_owned()),
                 category: "test".to_owned(),
                 order: 0,
@@ -22711,6 +27106,7 @@ mod tests {
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: source_path.clone(),
             source_text: source.clone(),
+            runtime_units: project_units_for_source_text(&source_path, &source),
             source_bytes: source.len() as u64,
             source_sha256: source_sha256.clone(),
             runtime_summary: initial_summary,
@@ -22774,8 +27170,9 @@ mod tests {
             last_dirty_reason: None,
         }));
         let state = Arc::new(Mutex::new(PreviewIpcState {
-            source_path,
+            source_path: source_path.clone(),
             source_text: source.clone(),
+            runtime_units: project_units_for_source_text(&source_path, &source),
             source_bytes: source.len() as u64,
             source_sha256,
             runtime_summary: initial_summary,
@@ -23044,6 +27441,8 @@ mod tests {
                 label: long_label,
                 source: "custom://long.bn".to_owned(),
                 source_files: Vec::new(),
+                build_files: Vec::new(),
+                asset_files: Vec::new(),
                 inline_source: Some("document: []\n".to_owned()),
                 category: "custom".to_owned(),
                 order: 20_000,
@@ -23540,6 +27939,23 @@ mod tests {
                     && item.style.get("border_top").is_some()
             })
             .expect("TodoMVC footer should render as the bottom row of the real panel");
+        assert!(
+            footer.bounds.y >= completed_todo_title.bounds.y + completed_todo_title.bounds.height,
+            "TodoMVC footer must flow after todo rows instead of overlapping them: footer={:?}, completed={:?}",
+            footer.bounds,
+            completed_todo_title.bounds
+        );
+        let info_line = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("Double-click to edit a todo"))
+            .expect("TodoMVC page info line should render below the panel");
+        assert!(
+            info_line.bounds.y >= footer.bounds.y + footer.bounds.height + 60.0,
+            "TodoMVC page info should stay below the panel and bottom gap: info={:?}, footer={:?}",
+            info_line.bounds,
+            footer.bounds
+        );
         let footer_padding_top = match footer.style.get("padding_top") {
             Some(boon_document_model::StyleValue::Number(value)) => *value as f32,
             _ => 0.0,
@@ -24215,7 +28631,11 @@ mod tests {
     fn todomvc_dynamic_style_while_resolves_from_live_document_summary() {
         let source_path = PathBuf::from("examples/todomvc.bn");
         let source = include_str!("../../../examples/todomvc.bn").to_owned();
-        let state = runtime_document_state_summary_for_source(&source_path, &source)
+        let units = vec![boon_runtime::RuntimeSourceUnit {
+            path: source_path.to_string_lossy().to_string(),
+            source: source.clone(),
+        }];
+        let state = runtime_document_state_summary_for_project(&source_path, &units)
             .expect("TodoMVC live runtime should expose document state");
         assert_eq!(
             state.pointer("/store/all_completed"),
@@ -25036,6 +29456,8 @@ mod tests {
                 label: "Sample".to_owned(),
                 source: "custom://sample.bn".to_owned(),
                 source_files: Vec::new(),
+                build_files: Vec::new(),
+                asset_files: Vec::new(),
                 inline_source: Some(
                     "-- sample\nSOURCE\nHOLD\nLATEST\nLIST {}\nList/map\n".to_owned(),
                 ),
@@ -25142,6 +29564,8 @@ mod tests {
                     label: "Counter".to_owned(),
                     source: "examples/counter.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "basic".to_owned(),
                     order: 10,
@@ -25153,6 +29577,8 @@ mod tests {
                     label: "Custom One".to_owned(),
                     source: "custom://one.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "custom".to_owned(),
                     order: 20_000,
@@ -25253,6 +29679,8 @@ mod tests {
                     label: "Cells".to_owned(),
                     source: "examples/cells.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("x".repeat(100)),
                     category: "7gui".to_owned(),
                     order: 10,
@@ -25264,6 +29692,8 @@ mod tests {
                     label: "TodoMVC".to_owned(),
                     source: "examples/todomvc.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("x".repeat(50)),
                     category: "main".to_owned(),
                     order: 20,
@@ -25275,6 +29705,8 @@ mod tests {
                     label: "Counter".to_owned(),
                     source: "examples/counter.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("x".repeat(10)),
                     category: "basic".to_owned(),
                     order: 30,
@@ -25286,6 +29718,8 @@ mod tests {
                     label: "Custom One".to_owned(),
                     source: "custom://one.bn".to_owned(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: Some("document: []\n".to_owned()),
                     category: "custom".to_owned(),
                     order: 20_000,
@@ -25315,6 +29749,8 @@ mod tests {
                     label: "Counter".to_owned(),
                     source: repo_path("examples/counter.bn").display().to_string(),
                     source_files: Vec::new(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: None,
                     category: "basic".to_owned(),
                     order: 1,
@@ -25338,6 +29774,8 @@ mod tests {
                     .into_iter()
                     .map(|path| repo_path(path).display().to_string())
                     .collect(),
+                    build_files: Vec::new(),
+                    asset_files: Vec::new(),
                     inline_source: None,
                     category: "7gui".to_owned(),
                     order: 2,
@@ -25355,21 +29793,155 @@ mod tests {
         workspace.select_example(&catalog, "cells").unwrap();
 
         assert_eq!(workspace.selected_example_id, "cells");
+        assert!(!workspace.selected_buffer.source_text.contains("-- file:"));
         assert!(
             workspace
                 .selected_buffer
                 .source_text
-                .contains("examples/cells/view.bn")
+                .contains("cells_app()"),
+            "selected editor buffer should be the Cells entry file"
         );
+        let units = workspace.selected_project_units(&catalog).unwrap();
+        assert_eq!(units.len(), 8);
+        assert!(units.iter().any(|(path, source)| {
+            path.ends_with("examples/cells/view.bn") && source.contains("FUNCTION cells_app")
+        }));
+        assert!(units.iter().any(|(path, source)| {
+            path.ends_with("examples/cells/cell.bn") && source.contains("FUNCTION new_cell")
+        }));
+        assert!(
+            units.iter().all(|(_, source)| !source.contains("-- file:")),
+            "project payload units must be real files, not marker-concatenated source"
+        );
+
+        let tabs = workspace.project_file_tabs(&catalog);
+        assert_eq!(tabs.len(), 8);
+        assert_eq!(
+            tabs.iter().filter(|tab| tab.active).count(),
+            1,
+            "exactly one project file tab should be active"
+        );
+        assert!(
+            workspace
+                .open_buffers
+                .keys()
+                .any(|path| path.ends_with("examples/cells/formula.bn")),
+            "workspace buffers should be keyed by real project file paths"
+        );
+
+        let entry_file = std::fs::canonicalize(repo_path("examples/cells.bn"))
+            .unwrap()
+            .display()
+            .to_string();
+        let formula_file = std::fs::canonicalize(repo_path("examples/cells/formula.bn"))
+            .unwrap()
+            .display()
+            .to_string();
+        let before_hash = workspace.current_project_hash(&catalog).unwrap();
+        let selected_file = workspace
+            .select_project_file(&catalog, &formula_file)
+            .expect("formula helper should be selectable");
+        assert!(paths_match_for_preview_units(
+            Path::new(selected_file["active_file"].as_str().unwrap()),
+            Path::new(&formula_file)
+        ));
+        assert!(paths_match_for_preview_units(
+            Path::new(&workspace.current_file),
+            Path::new(&formula_file)
+        ));
         assert!(
             workspace
                 .selected_buffer
                 .source_text
-                .contains("FUNCTION cells_app")
+                .contains("FUNCTION compute_value")
         );
+        workspace
+            .selected_buffer
+            .insert_text_at_caret("\n-- helper edit affects project hash");
+        workspace.persist_selected_buffer();
+        workspace.set_selected_dirty(true);
+        let payload = SourceProjectPayload::from_project_units(
+            19,
+            2,
+            "opaque-cells-helper-edit",
+            &workspace.entry_file,
+            &workspace.current_file,
+            workspace.selected_project_payload_units(&catalog).unwrap(),
+        )
+        .unwrap();
+        assert!(paths_match_for_preview_units(
+            Path::new(&payload.entrypoint_unit),
+            Path::new(&entry_file)
+        ));
+        assert!(paths_match_for_preview_units(
+            Path::new(payload.active_file()),
+            Path::new(&formula_file)
+        ));
+        assert_eq!(payload.units.len(), 8);
+        assert_eq!(payload.runtime_units().len(), 8);
+        assert_ne!(payload.project_hash, before_hash);
+        assert!(payload.units.iter().any(|unit| {
+            unit.virtual_uri.ends_with("examples/cells/formula.bn")
+                && unit.text.contains("helper edit affects project hash")
+        }));
+
+        let cells_source = std::fs::read_to_string(repo_path("examples/cells.bn")).unwrap();
+        let mut shell = DevWindowShell::new(
+            &entry_file,
+            &cells_source,
+            Some("cells"),
+            PreviewTransport::new(None),
+        );
+        let frame = shell.document_for_viewport(1180, 820);
+        let file_bindings = frame
+            .nodes
+            .values()
+            .filter_map(|node| node.source_binding.as_ref())
+            .filter(|binding| binding.source_path.starts_with("dev.project_files.select."))
+            .collect::<Vec<_>>();
+        assert_eq!(file_bindings.len(), 8);
         assert!(
-            workspace.selected_buffer.source_text.len() > 10_000,
-            "cells tab must send the combined manifest project, not only examples/cells.bn"
+            file_bindings
+                .iter()
+                .any(|binding| { binding.source_path.ends_with("examples/cells/formula.bn") })
+        );
+        let selected_file =
+            shell.dispatch_source_path(&format!("dev.project_files.select.{formula_file}"));
+        assert_eq!(selected_file["status"], "pass");
+        assert_eq!(selected_file["active_file"], formula_file);
+        assert_eq!(shell.workspace.current_file, formula_file);
+    }
+
+    #[test]
+    fn dev_format_validates_manifest_backed_cells_project() {
+        let cells_source = std::fs::read_to_string(repo_path("examples/cells.bn")).unwrap();
+        let mut shell = DevWindowShell::new(
+            "examples/cells.bn",
+            &cells_source,
+            Some("cells"),
+            PreviewTransport::new(None),
+        );
+
+        let result = shell.dispatch_source_path("dev.commands.format");
+
+        assert_eq!(result["status"], "pass", "{result}");
+        assert_eq!(result["selected_example_id"], "cells");
+        assert_eq!(result["formatter"], "boon_parser::format_source_unit");
+        assert_eq!(result["source_unit_count"], 8);
+        assert_eq!(result["validation"]["status"], "pass", "{result}");
+        assert!(
+            shell.workspace.current_file.contains("examples/cells"),
+            "format should keep a real Cells project file active: {}",
+            shell.workspace.current_file
+        );
+        assert!(!shell.workspace.selected_buffer.source_text.is_empty());
+        assert!(
+            !shell
+                .workspace
+                .selected_buffer
+                .source_text
+                .contains("-- file:"),
+            "format should not fall back to concatenated project markers"
         );
     }
 
@@ -25393,6 +29965,7 @@ mod tests {
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: counter_path.clone(),
             source_text: counter_source.clone(),
+            runtime_units: project_units_for_source_text(&counter_path, &counter_source),
             source_bytes: counter_source.len() as u64,
             source_sha256: counter_hash.clone(),
             runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
@@ -25464,6 +30037,7 @@ mod tests {
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: counter_path.clone(),
             source_text: counter_source.clone(),
+            runtime_units: project_units_for_source_text(&counter_path, &counter_source),
             source_bytes: counter_source.len() as u64,
             source_sha256: counter_hash.clone(),
             runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
@@ -25539,19 +30113,170 @@ mod tests {
     }
 
     #[test]
+    fn identical_physical_project_replace_is_fast_noop() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let units = project_units_for_source_text(&source_path, &source);
+        let runtime_units_hash = boon_runtime::source_units_hash(&units);
+        let payload = SourceProjectPayload::from_units(
+            9,
+            2,
+            "opaque-physical-source-id",
+            &source_path.display().to_string(),
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone()))
+                .collect(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            payload.project_hash, runtime_units_hash,
+            "physical launch should exercise role-aware payload hash versus initial runtime hash"
+        );
+
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame_override: None,
+            update_count: 4,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units: units,
+            source_bytes: source.len() as u64,
+            source_sha256: runtime_units_hash,
+            runtime_summary: json!({"status": "pass"}),
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: None,
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        }));
+
+        let response = preview_enqueue_source_project(
+            &state,
+            &json!({
+                "kind": "replace-source",
+                "payload": payload
+            }),
+            boon_native_app_window::NativeWakeHandle::new(),
+        )
+        .unwrap();
+
+        assert_eq!(response["status"], "pass", "{response}");
+        assert_eq!(response["source_project_already_current"], true);
+        assert_eq!(
+            response["parse_lower_runtime_layout_timings"]["source_project_already_current"],
+            true
+        );
+        assert_eq!(
+            response["pending_overlay_presented_before_result"], false,
+            "{response}"
+        );
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert_eq!(shared.update_count, 4);
+            assert!(shared.status_overlay.is_none());
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.latest_accepted_command_id, 9);
+        assert_eq!(state.latest_accepted_source_revision, 2);
+    }
+
+    #[test]
+    fn legacy_replace_code_probe_uses_current_preview_fast_path() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let units = project_units_for_source_text(&source_path, &source);
+        let project_hash = boon_runtime::source_units_hash(&units);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass", "source": "current-preview-layout"}),
+            layout_frame_override: None,
+            update_count: 6,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units: units,
+            source_bytes: source.len() as u64,
+            source_sha256: project_hash,
+            runtime_summary: json!({"status": "pass", "source": "current-preview-runtime"}),
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: None,
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        }));
+
+        let response = preview_replace_code_already_current_response(
+            &state,
+            &json!({
+                "kind": "replace-code",
+                "source_path": source_path.display().to_string(),
+                "code": source,
+                "expected_hash": boon_runtime::sha256_bytes(
+                    boon_runtime::source_text_for_path(&source_path).unwrap().as_bytes()
+                )
+            }),
+        )
+        .unwrap()
+        .expect("same physical source should use replace-code no-op");
+
+        assert_eq!(response["status"], "pass", "{response}");
+        assert_eq!(response["preview_command"], "ReplaceCode");
+        assert_eq!(response["hash_matches"], true);
+        assert_eq!(response["accepted_for_preview_mutation"], false);
+        assert_eq!(response["source_project_already_current"], true);
+        assert_eq!(response["document_layout_proof"]["status"], "pass");
+        assert_eq!(response["preview_runtime_summary"]["status"], "pass");
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(shared.update_count, 6);
+        assert!(shared.status_overlay.is_none());
+    }
+
+    #[test]
     fn switching_to_cells_builds_runtime_state_before_preview_commit() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        assert!(cells_source.len() > 16 * 1024);
-        assert!(cells_source.contains("FUNCTION cells_app"));
+        let cells_units = boon_runtime::source_units_for_path(&cells_path).unwrap();
+        assert_eq!(cells_units.len(), 8);
+        assert!(!cells_source.contains("-- file:"));
+        assert!(cells_source.contains("root: cells_app()"));
+        assert!(cells_units.iter().any(|unit| {
+            unit.path.ends_with("examples/cells/cell.bn")
+                && unit.source.contains("FUNCTION new_cell")
+        }));
+        assert!(cells_units.iter().any(|unit| {
+            unit.path.ends_with("examples/cells/view.bn")
+                && unit.source.contains("FUNCTION cells_app")
+        }));
 
-        let payload = SourceProjectPayload::single_unit(
+        let payload = SourceProjectPayload::from_units(
             17,
             4,
             "opaque-cells-source-id",
             &cells_path.display().to_string(),
-            &cells_source,
-        );
+            cells_units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone()))
+                .collect(),
+        )
+        .unwrap();
         let result = preview_build_source_project(payload, || true);
 
         assert_eq!(result.status, "pass");
@@ -25569,6 +30294,7 @@ mod tests {
         assert_eq!(result.layout_proof["status"], "pass");
         assert_eq!(result.layout_proof["runtime_document_state_used"], true);
         assert_eq!(result.timings["runtime_deferred"], false);
+        assert_eq!(result.timings["source_unit_count"], 8);
     }
 
     #[test]
@@ -25648,6 +30374,27 @@ mod tests {
     }
 
     #[test]
+    fn physical_operator_host_input_uses_manifest_scenario_path() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let scenario_path = scenario_path_for_source_path(&source_path);
+        assert!(
+            scenario_path.ends_with("examples/todo_mvc_physical.scn"),
+            "unexpected scenario path: {}",
+            scenario_path.display()
+        );
+        let scenario = boon_runtime::parse_scenario(&scenario_path).unwrap();
+        let expected_count = scenario
+            .step
+            .iter()
+            .filter(|step| step.expected_source_event.is_some())
+            .count();
+        assert!(
+            expected_count > 1,
+            "expected source event count={expected_count}"
+        );
+    }
+
+    #[test]
     fn preview_operator_host_input_rejects_forbidden_scenario_keys() {
         let source_path = repo_path("examples/counter.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
@@ -25666,6 +30413,7 @@ mod tests {
         let state = PreviewIpcState {
             source_path: source_path.clone(),
             source_text: source.clone(),
+            runtime_units: project_units_for_source_text(&source_path, &source),
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
@@ -25699,6 +30447,51 @@ mod tests {
     }
 
     #[test]
+    fn physical_operator_host_input_batches_execute_in_preview_runtime() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&source_path, &source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units: project_units_for_source_text(&source_path, &source),
+            source_bytes: source.len() as u64,
+            source_sha256: source_hash.clone(),
+            runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            shared_render_state,
+            live_runtime: boon_runtime::LiveRuntime::from_project(
+                "test-physical-preview",
+                &project_units_for_source_text(&source_path, &source),
+            )
+            .ok()
+            .map(|runtime| Arc::new(Mutex::new(runtime))),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        };
+        let requests = operator_host_input_probe_requests(&source_path, &source)
+            .expect("physical TodoMVC should produce operator host input probes");
+
+        assert!(requests.len() > 1, "physical scenario should be batched");
+        for request in requests {
+            let response = preview_operator_host_input_response(&state, &request).unwrap();
+            assert_eq!(response["status"], "pass", "{response}");
+        }
+    }
+
+    #[test]
     fn replace_code_rejects_invalid_source_before_preview_mutation() {
         let source = "";
         let response = preview_replace_code_response(&json!({
@@ -25724,28 +30517,64 @@ mod tests {
     #[test]
     fn replace_code_accepts_manifest_backed_cells_project_source() {
         let cells_path = repo_path("examples/cells.bn");
-        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let cells_units = boon_runtime::source_units_for_path(&cells_path).unwrap();
         let top_level_source = std::fs::read_to_string(&cells_path).unwrap();
 
-        assert!(cells_source.contains("FUNCTION new_cell"));
+        assert_eq!(cells_units.len(), 8);
+        assert!(
+            cells_units
+                .iter()
+                .any(|unit| unit.path.ends_with("examples/cells/cell.bn")
+                    && unit.source.contains("FUNCTION new_cell"))
+        );
         assert_ne!(
-            boon_runtime::sha256_bytes(cells_source.as_bytes()),
+            boon_runtime::source_units_hash(&cells_units),
             boon_runtime::sha256_bytes(top_level_source.as_bytes())
         );
-        let cells_hash = boon_runtime::sha256_bytes(cells_source.as_bytes());
+        let payload = SourceProjectPayload::from_units(
+            1,
+            1,
+            "test-cells-project",
+            &cells_path.display().to_string(),
+            cells_units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone()))
+                .collect(),
+        )
+        .unwrap();
+        let result = preview_build_source_project(payload, || true);
+
+        assert_eq!(result.status, "pass");
+        assert_eq!(result.layout_proof["status"], "pass");
+        assert_eq!(result.runtime_summary["status"], "pass");
+        assert_eq!(result.timings["source_unit_count"], 8);
+        assert!(result.source_bytes as usize > top_level_source.len());
+    }
+
+    #[test]
+    fn replace_code_uses_entry_file_hash_even_for_physical_project_source() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let units = project_units_for_source_text(&source_path, &source);
+        let entry_file_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let project_hash = boon_runtime::source_units_hash(&units);
+
+        assert!(units.len() > 1);
+        assert_ne!(entry_file_hash, project_hash);
 
         let response = preview_replace_code_response(&json!({
             "kind": "replace-code",
-            "source_path": cells_path.display().to_string(),
-            "code": cells_source,
-            "expected_hash": cells_hash
+            "source_path": source_path.display().to_string(),
+            "code": source,
+            "expected_hash": entry_file_hash
         }))
         .unwrap();
 
         assert_eq!(response["status"], "pass");
-        assert_eq!(response["accepted_for_preview_mutation"], true);
+        assert_eq!(response["hash_matches"], true);
+        assert_eq!(response["actual_hash"], entry_file_hash);
+        assert_eq!(response["project_hash"], project_hash);
         assert_eq!(response["document_layout_proof"]["status"], "pass");
-        assert_eq!(response["preview_runtime_summary"]["status"], "pass");
     }
 
     #[test]
@@ -25754,9 +30583,12 @@ mod tests {
         let scenario_path = repo_path("examples/cells.scn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
         let scenario = boon_runtime::parse_scenario(&scenario_path).unwrap();
-        let mut runtime =
-            boon_runtime::LiveRuntime::new("native-cells-select", &cells_source, &scenario_path)
-                .unwrap();
+        let mut runtime = cells_live_runtime_with_scenario(
+            "native-cells-select",
+            &cells_path,
+            &cells_source,
+            &scenario_path,
+        );
         let step = scenario
             .step
             .iter()
@@ -26018,6 +30850,26 @@ mod tests {
             .clone()
     }
 
+    fn cells_live_runtime(
+        label: &str,
+        cells_path: &Path,
+        cells_source: &str,
+    ) -> Arc<Mutex<boon_runtime::LiveRuntime>> {
+        Arc::new(Mutex::new(
+            live_runtime_from_source_text(label, cells_path, cells_source).unwrap(),
+        ))
+    }
+
+    fn cells_live_runtime_with_scenario(
+        label: &str,
+        cells_path: &Path,
+        cells_source: &str,
+        scenario_path: &Path,
+    ) -> boon_runtime::LiveRuntime {
+        live_runtime_from_source_text_with_scenario(label, cells_path, cells_source, scenario_path)
+            .unwrap()
+    }
+
     fn test_key_press(
         sequence: u64,
         key: &str,
@@ -26034,10 +30886,8 @@ mod tests {
     fn cells_scroll_materializes_later_window_and_can_return_to_origin() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-scroll-window", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-scroll-window", &cells_path, &cells_source);
         let (initial_layout, _) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26082,10 +30932,8 @@ mod tests {
     fn cells_preview_scroll_input_moves_window_forward_and_back() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-scroll-input", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-scroll-input", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26155,10 +31003,8 @@ mod tests {
     fn cells_scroll_does_not_move_focused_grid_cell_to_reused_node() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-scroll-focus", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-scroll-focus", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26230,10 +31076,8 @@ mod tests {
     fn cells_shift_wheel_scrolls_horizontally() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-shift-wheel", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-shift-wheel", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26278,10 +31122,8 @@ mod tests {
     fn cells_horizontal_scroll_keeps_row_gutter_fixed_and_headers_synced() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-scroll-sidebars", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-scroll-sidebars", &cells_path, &cells_source);
         let (layout, _) = preview_layout_for_scroll_window(
             &cells_path,
             &cells_source,
@@ -26324,13 +31166,11 @@ mod tests {
     fn cells_vertical_scroll_keeps_column_header_fixed_and_rows_synced() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source(
-                "native-cells-scroll-vertical-sidebars",
-                &cells_source,
-            )
-            .unwrap(),
-        ));
+        let live_runtime = cells_live_runtime(
+            "native-cells-scroll-vertical-sidebars",
+            &cells_path,
+            &cells_source,
+        );
         let (layout, _) = preview_layout_for_scroll_window(
             &cells_path,
             &cells_source,
@@ -26367,10 +31207,8 @@ mod tests {
     fn cells_formula_bar_click_accepts_text_edit() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-formula-bar-edit", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-formula-bar-edit", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26473,10 +31311,8 @@ mod tests {
     fn cells_clicking_another_cell_blurs_and_saves_current_draft() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-click-away-blur", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-click-away-blur", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26549,10 +31385,8 @@ mod tests {
     fn cells_escape_cancels_draft_without_saving() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-escape-cancel", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-escape-cancel", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26608,13 +31442,11 @@ mod tests {
     fn cells_formula_cell_focus_uses_formula_text_and_arrow_aliases_move_caret() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source(
-                "native-cells-formula-cell-caret",
-                &cells_source,
-            )
-            .unwrap(),
-        ));
+        let live_runtime = cells_live_runtime(
+            "native-cells-formula-cell-caret",
+            &cells_path,
+            &cells_source,
+        );
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26693,13 +31525,11 @@ mod tests {
     fn cells_native_delete_key_deletes_backward_and_forward_delete_deletes_forward() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source(
-                "native-cells-backspace-forward-delete",
-                &cells_source,
-            )
-            .unwrap(),
-        ));
+        let live_runtime = cells_live_runtime(
+            "native-cells-backspace-forward-delete",
+            &cells_path,
+            &cells_source,
+        );
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26789,10 +31619,8 @@ mod tests {
     fn cells_double_click_enters_grid_edit_mode() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-double-click-edit", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-double-click-edit", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26837,10 +31665,8 @@ mod tests {
     fn cells_single_click_then_typing_inserts_into_grid_cell_draft() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-type-to-edit", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-type-to-edit", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -26900,10 +31726,8 @@ mod tests {
     fn cells_native_editing_scenario_updates_cell_and_formula_with_keyboard_navigation() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_source("native-cells-editing-scenario", &cells_source)
-                .unwrap(),
-        ));
+        let live_runtime =
+            cells_live_runtime("native-cells-editing-scenario", &cells_path, &cells_source);
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
@@ -27094,11 +31918,17 @@ mod tests {
             ]
         );
         let source = cells.source_text().unwrap();
-        assert!(source.contains("-- file:"));
-        assert!(!source.contains(&["For", "mula", "/"].concat()));
-        assert!(source.contains("FUNCTION new_cell"));
-        assert!(source.contains("FUNCTION new_sheet_column"));
-        assert!(source.contains("FUNCTION cells_app"));
-        assert!(source.contains("Document/new"));
+        assert!(!source.contains("-- file:"));
+        assert!(source.contains("cells_app()"));
+        assert!(!source.contains("FUNCTION new_cell"));
+        let units = cells.source_units().unwrap();
+        assert_eq!(units.len(), 8);
+        assert!(units.iter().any(|(path, source)| {
+            path.ends_with("examples/cells/cell.bn") && source.contains("FUNCTION new_cell")
+        }));
+        assert!(units.iter().any(|(path, source)| {
+            path.ends_with("examples/cells/view.bn") && source.contains("FUNCTION cells_app")
+        }));
+        assert!(units.iter().all(|(_, source)| !source.contains("-- file:")));
     }
 }

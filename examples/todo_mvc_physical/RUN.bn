@@ -1,0 +1,918 @@
+-- TodoMVC - Physical 3D UI Example
+
+------------------------------------------------------------------------
+-- STORE AND STATE
+------------------------------------------------------------------------
+
+store: [
+    elements: [
+        filter_buttons: [
+            all: SOURCE
+            active: SOURCE
+            completed: SOURCE
+        ]
+        remove_completed_button: SOURCE
+        toggle_all_checkbox: SOURCE
+        new_todo_title_text_input: SOURCE
+        theme_switcher: [
+            professional: SOURCE
+            glassmorphism: SOURCE
+            neobrutalism: SOURCE
+            neumorphism: SOURCE
+            mode_toggle: SOURCE
+        ]
+    ]
+    selected_filter: Router/route() |> WHILE {
+        TEXT { / } => All
+        TEXT { /active } => Active
+        TEXT { /completed } => Completed
+        __ => All
+    }
+    go_to_result:
+        LATEST {
+            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
+            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
+            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
+        }
+        |> Router/go_to()
+    title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
+        Enter => BLOCK {
+            new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
+            new_todo_title
+                |> Text/is_not_empty()
+                |> WHEN { True => new_todo_title, False => SKIP }
+        }
+        __ => SKIP
+    }
+    todos: LIST {}
+        |> List/append(item: title_to_save |> new_todo())
+        |> List/retain(item, if: LATEST {
+            True
+            item.todo_elements.remove_todo_button.event.press
+                |> THEN { False }
+            elements.remove_completed_button.event.press
+                |> THEN { item.completed |> Bool/not() }
+        })
+    selected_todo_id: LATEST {
+        None
+        todos
+            |> List/map(old, new: LATEST {
+                old.todo_elements.editing_todo_title_element.event.key_down.key
+                    |> WHEN { Escape => None, __ => SKIP }
+                old.title_to_update
+                    |> THEN { None }
+                old.todo_elements.todo_title_element.event.double_click
+                    |> THEN { old.id }
+            })
+            |> List/latest()
+    }
+]
+
+------------------------------------------------------------------------
+-- TODO ITEM CONSTRUCTOR
+------------------------------------------------------------------------
+
+FUNCTION new_todo(title) {
+    [
+        todo_elements: [
+            remove_todo_button: SOURCE
+            editing_todo_title_element: SOURCE
+            todo_title_element: SOURCE
+            todo_checkbox: SOURCE
+        ]
+        id: TodoId[id: Ulid/generate()]
+        title_to_update:
+            LATEST {
+                todo_elements.editing_todo_title_element.event.blur
+                    |> THEN { [] }
+                todo_elements.editing_todo_title_element.event.key_down.key
+                    |> WHEN { Enter => [], __ => SKIP }
+            }
+            |> THEN { todo_elements.editing_todo_title_element.text }
+        title: LATEST {
+            title
+            title_to_update
+        }
+        completed:
+            LATEST {
+                False
+                store.elements.toggle_all_checkbox.event.click |> THEN {
+                    store.todos
+                        |> List/every(item, if: item.completed)
+                        |> Bool/not()
+                }
+            }
+            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
+        edited_title: BLOCK {
+            edited_title: LATEST {
+                Text/empty()
+                todo_elements.editing_todo_title_element.event.change.text
+                title_to_update |> THEN { Text/empty() }
+            }
+            LATEST {
+                edited_title
+                todo_elements.todo_title_element.event.double_click |> THEN {
+                    edited_title
+                        |> Text/is_empty()
+                        |> WHEN { True => title, False => SKIP }
+                }
+            }
+        }
+    ]
+}
+
+------------------------------------------------------------------------
+-- THEME
+------------------------------------------------------------------------
+
+theme_options: [
+    name: LATEST {
+        Professional
+        store.elements.theme_switcher.professional.event.press
+            |> THEN { Professional }
+        store.elements.theme_switcher.glassmorphism.event.press
+            |> THEN { Glassmorphism }
+        store.elements.theme_switcher.neobrutalism.event.press
+            |> THEN { Neobrutalism }
+        store.elements.theme_switcher.neumorphism.event.press
+            |> THEN { Neumorphism }
+    }
+    mode: Light |> HOLD state {
+        store.elements.theme_switcher.mode_toggle.event.press
+            |> THEN {
+                state |> WHEN {
+                    Light => Dark
+                    Dark => Light
+                }
+            }
+    }
+]
+
+------------------------------------------------------------------------
+-- COMPONENT STYLES
+------------------------------------------------------------------------
+
+FUNCTION delete_button_material(hovered) {
+    [
+        ...Theme/material(of: SurfaceElevated)
+        glow: hovered |> WHEN {
+            True => [
+                color: Theme/material(of: Danger).color
+                intensity: 0.08
+            ]
+            False => None
+        }
+    ]
+}
+
+FUNCTION filter_button_material(selected, hovered) {
+    [
+        ...selected |> WHEN {
+            True => Theme/material(of: PrimarySubtle)
+            False => Theme/material(of: SurfaceVariant)
+        }
+        gloss: selected |> WHEN {
+            False => 0.35
+            True => 0.2
+        }
+        metal: 0.03
+        glow: LIST { selected, hovered } |> WHEN {
+            LIST { True, __ } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.05
+            ]
+            LIST { False, True } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.025
+            ]
+            LIST { False, False } => None
+        }
+    ]
+}
+
+FUNCTION clear_button_font(hovered) {
+    [
+        ...Theme/font(of: BodySecondary)
+        line: [underline: hovered]
+    ]
+}
+
+FUNCTION clear_button_text(hovered) {
+    [
+        font: clear_button_font(hovered: hovered)
+        depth: 1.5
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+FUNCTION todo_title_font(completed) {
+    [
+        ...Theme/font(of: Body)
+        line: [strike: completed]
+        ...completed |> WHEN {
+            True => [color: Theme/font(of: BodyDisabled).color]
+            False => []
+        }
+    ]
+}
+
+FUNCTION todo_title_text(completed) {
+    [
+        font: todo_title_font(completed: completed)
+        depth: completed |> WHEN {
+            True => 1
+            False => 2
+        }
+        move: completed |> WHEN {
+            True => [further: 4]
+            False => [further: 0]
+        }
+        relief: completed |> WHEN {
+            True => Carved[wall: 1]
+            False => Raised
+        }
+    ]
+}
+
+FUNCTION delete_button_text() {
+    [
+        font: Theme/font(of: BodyDanger)
+        depth: 2
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+FUNCTION filter_button_text() {
+    [
+        font: Theme/font(of: BodySecondary)
+        depth: 1.5
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+------------------------------------------------------------------------
+-- SCENE
+------------------------------------------------------------------------
+
+scene: main_scene(PASS: [store: store, theme_options: theme_options])
+
+FUNCTION main_scene() {
+    Scene/new(
+        root: root_element()
+        lights: Theme/lights()
+        geometry: Theme/geometry()
+    )
+}
+
+------------------------------------------------------------------------
+-- ROOT ELEMENT
+------------------------------------------------------------------------
+
+FUNCTION root_element() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            height: [sizing: Fill, minimum: Screen]
+            align: [row: Center]
+            material: Theme/material(of: Background)
+        ]
+        items: LIST { content_element() }
+    )
+}
+
+------------------------------------------------------------------------
+-- CONTENT CONTAINER
+------------------------------------------------------------------------
+
+FUNCTION content_element() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: Theme/spacing(of: None)
+        style: [
+            width: [sizing: Fill, minimum: 230, maximum: 550]
+            align: [row: Center]
+        ]
+        items: LIST {
+            header()
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: Theme/spacing(of: Section)
+                style: [width: Fill]
+                items: LIST { main_panel(), footer() }
+            )
+            theme_switcher()
+        }
+    )
+}
+
+------------------------------------------------------------------------
+-- HEADER
+------------------------------------------------------------------------
+
+FUNCTION header() {
+    Scene/Element/block(
+        element: [tag: Header]
+        style: [
+            padding: [top: 10]
+            align: [row: Center]
+            height: 130
+        ]
+        child: Scene/Element/text(
+            element: [tag: H1]
+            style: Theme/text(of: Hero)
+            text: TEXT { todos }
+        )
+    )
+}
+
+------------------------------------------------------------------------
+-- MAIN PANEL
+------------------------------------------------------------------------
+
+FUNCTION main_panel() {
+    Scene/Element/stripe(
+        element: [tag: Section]
+        direction: Column
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            depth: Theme/depth(of: Container)
+            move: [closer: Theme/elevation(of: Card)]
+            rounded_corners: Theme/corners(of: Comfort)
+            material: Theme/material(of: Surface)
+        ]
+        items: LIST {
+            new_todo_title_text_input()
+                |> SOURCE { PASSED.store.elements.new_todo_title_text_input }
+            PASSED.store.todos
+                |> List/is_not_empty()
+                |> WHILE {
+                    True => Scene/Element/stripe(
+                        element: []
+                        direction: Column
+                        gap: Theme/spacing(of: None)
+                        style: []
+                        items: LIST {
+                            todos_element()
+                            panel_footer()
+                        }
+                    )
+                    False => NoElement
+                }
+        }
+    )
+}
+
+------------------------------------------------------------------------
+-- NEW TODO INPUT
+------------------------------------------------------------------------
+
+FUNCTION new_todo_title_text_input() {
+    Scene/Element/text_input(
+        element:[
+            event: [
+                change: SOURCE
+                key_down: SOURCE
+            ]
+        ]
+        style: [
+            padding: [column: 19, left: 60, right: 16]
+            font: Theme/font(of: Input)
+            depth: Theme/depth(of: Element)
+            move: [further: Theme/elevation(of: Inset)]
+            rounded_corners: Theme/corners(of: Touch)
+            material: Theme/material(of: InteractiveRecessed[focus: False])
+        ]
+        label: Hidden[text: TEXT { What needs to be done? }]
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.title_to_save |> THEN { Text/empty() }
+        }
+        placeholder: [
+            style: [font: Theme/font(of: Placeholder)]
+            text: TEXT { What needs to be done? }
+        ]
+        focus: True
+    )
+}
+
+------------------------------------------------------------------------
+-- TODOS LIST
+------------------------------------------------------------------------
+
+FUNCTION todos_element() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            material: Theme/material(of: SurfaceVariant)
+        ]
+        items: LIST {
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: Theme/sizing(of: ToggleControl)
+                    align: [row: Left, column: Top]
+                ]
+                child: toggle_all_checkbox()
+                    |> SOURCE { PASSED.store.elements.toggle_all_checkbox }
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: Theme/spacing(of: None)
+                style: [width: Fill]
+                items: PASSED.store.todos
+                    |> List/retain(
+                        item
+                        if: PASSED.store.selected_filter |> WHILE {
+                            All => True
+                            Active => item.completed |> Bool/not()
+                            Completed => item.completed
+                        }
+                    )
+                    |> List/map(old, new: old |> todo_element())
+            )
+        }
+    )
+}
+
+------------------------------------------------------------------------
+-- TODO ITEM
+------------------------------------------------------------------------
+
+FUNCTION todo_element(todo) {
+    Scene/Element/stripe(
+        element: [
+            hovered: SOURCE
+        ]
+        direction: Row
+        gap: Theme/spacing(of: Tight)
+        style: [
+            width: Fill
+            depth: Theme/depth(of: Detail)
+            move: [closer: Theme/elevation(of: TodoItem)]
+            material: Theme/material(of: Interactive[hovered: element.hovered])
+        ]
+        items: PASSED.store.selected_todo_id == todo.id |> WHILE {
+            True => LIST {
+                editing_todo_title_element(todo: todo)
+                    |> SOURCE { todo.todo_elements.editing_todo_title_element }
+            }
+            False => LIST {
+                todo_checkbox(todo: todo)
+                    |> SOURCE { todo.todo_elements.todo_checkbox }
+                todo_title_element(todo: todo)
+                    |> SOURCE { todo.todo_elements.todo_title_element }
+                element.hovered |> WHILE {
+                    True => remove_todo_button()
+                        |> SOURCE { todo.todo_elements.remove_todo_button }
+                    False => NoElement
+                }
+            }
+        }
+    )
+}
+
+------------------------------------------------------------------------
+-- TOGGLE ALL CHECKBOX
+------------------------------------------------------------------------
+
+FUNCTION toggle_all_checkbox() {
+    BLOCK {
+        checked: PASSED.store.todos |> List/every(item, if: item.completed)
+
+        Scene/Element/checkbox(
+            element: [
+                event: [click: SOURCE]
+                hovered: SOURCE
+            ]
+            style: [
+                width: Theme/sizing(of: ToggleControl)
+                height: Fill
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Touch)
+                spring_range: Theme/spring_range(of: Checkbox)
+                material: Theme/material(of: Interactive[hovered: element.hovered])
+            ]
+            label: Hidden[text: TEXT { Toggle all }]
+            checked: checked
+            icon: Scene/Element/block(
+                style: [
+                    height: Theme/sizing(of: IconContainer)
+                    padding: [row: 27, column: 6]
+                    rotate: 90
+                    move: [up: Theme/spacing(of: IconOffset)]
+                ]
+                child: Scene/Element/text(
+                    style: Theme/text(of: ButtonIcon[checked: checked])
+                    text: TEXT { > }
+                )
+            )
+        )
+    }
+}
+
+------------------------------------------------------------------------
+-- EDITING TODO INPUT
+------------------------------------------------------------------------
+
+FUNCTION editing_todo_title_element(todo) {
+    Scene/Element/text_input(
+        element: [
+            event: [
+                blur: SOURCE
+                change: SOURCE
+                key_down: SOURCE
+            ]
+        ]
+        style: [
+            width: Theme/sizing(of: EditingInputWidth)
+            padding: [row: 17, top: 17, bottom: 16]
+            align: Right
+            font: Theme/font(of: Input)
+            depth: Theme/depth(of: Element)
+            rounded_corners: Theme/corners(of: Touch)
+            move: [closer: Theme/elevation(of: EditingFocus)]
+            material: Theme/material(of: InteractiveRecessed[focus: True])
+        ]
+        label: Hidden[text: TEXT { selected todo title }]
+        text: todo.edited_title
+        placeholder: []
+        focus: True
+    )
+}
+
+------------------------------------------------------------------------
+-- TODO CHECKBOX
+------------------------------------------------------------------------
+
+FUNCTION todo_checkbox(todo) {
+    BLOCK {
+        Scene/Element/checkbox(
+            element: [
+                event: [click: SOURCE]
+                hovered: SOURCE
+            ]
+            style: [
+                size: Theme/sizing(of: TouchTarget)
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Pill)
+                spring_range: Theme/spring_range(of: Checkbox)
+                material: Theme/material(of: Interactive[hovered: element.hovered])
+            ]
+            label: Reference[element: todo.todo_elements.todo_title_element]
+            checked: todo.completed
+            icon: Scene/Element/block(
+                element: []
+                style: [
+                    size: Theme/sizing(of: TouchTarget)
+                    background: [url: todo.completed |> WHEN {
+                        True => Assets/icon().checkbox_completed
+                        False => Assets/icon().checkbox_active
+                    }]
+                ]
+            )
+        )
+    }
+}
+
+------------------------------------------------------------------------
+-- TODO TITLE LABEL
+------------------------------------------------------------------------
+
+FUNCTION todo_title_element(todo) {
+    Scene/Element/label(
+        element: [
+            event: [double_click: SOURCE]
+        ]
+        style: [
+            width: Fill
+            padding: [column: 15, left: 15, right: 60]
+        ]
+        label: Scene/Element/text(
+            style: todo_title_text(completed: todo.completed)
+            text: todo.title
+        )
+    )
+}
+
+------------------------------------------------------------------------
+-- REMOVE TODO BUTTON
+------------------------------------------------------------------------
+
+FUNCTION remove_todo_button() {
+    Scene/Element/button(
+        element:[
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            size: Theme/sizing(of: TouchTarget)
+            depth: Theme/depth(of: Hero)
+            rounded_corners: Theme/corners(of: Pill)
+            spring_range: Theme/spring_range(of: ButtonDestructive)
+            material: delete_button_material(hovered: element.hovered)
+        ]
+        label: Scene/Element/text(
+            style: delete_button_text()
+            text: TEXT { × }
+        )
+    )
+}
+
+------------------------------------------------------------------------
+-- PANEL FOOTER
+------------------------------------------------------------------------
+
+FUNCTION panel_footer() {
+    Scene/Element/stripe(
+        element: [tag: Footer]
+        direction: Row
+        gap: Theme/spacing(of: None)
+        style: [
+            padding: [row: 15, column: 8]
+            material: Theme/material(of: SurfaceElevated)
+        ]
+        items: LIST {
+            footer_section(child: active_items_count_text())
+            footer_section(child: filters_element())
+            footer_section(child: PASSED.store.todos
+                |> List/any(item, if: item.completed) |> WHILE {
+                    True => remove_completed_button()
+                        |> SOURCE { PASSED.store.elements.remove_completed_button }
+                    False => NoElement
+                }
+            )
+        }
+    )
+}
+
+FUNCTION footer_section(child) {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill]
+        child: child
+    )
+}
+
+------------------------------------------------------------------------
+-- ACTIVE ITEMS COUNTER
+------------------------------------------------------------------------
+
+FUNCTION active_items_count_text() {
+    Scene/Element/text(
+        element: []
+        style: Theme/text(of: BodySecondary)
+        text: PASSED.store.todos
+            |> List/retain(item, if: item.completed |> Bool/not())
+            |> List/count()
+            |> WHEN { count => BLOCK {
+                maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty() }
+                TEXT { {count} item{maybe_s} left }
+            }}
+    )
+}
+
+------------------------------------------------------------------------
+-- FILTER BUTTONS
+------------------------------------------------------------------------
+
+FUNCTION filters_element() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: Theme/spacing(of: Standard)
+        style: []
+        items: LIST {
+            filter_button(filter: All)
+                |> SOURCE { PASSED.store.elements.filter_buttons.all }
+            filter_button(filter: Active)
+                |> SOURCE { PASSED.store.elements.filter_buttons.active }
+            filter_button(filter: Completed)
+                |> SOURCE { PASSED.store.elements.filter_buttons.completed }
+        }
+    )
+}
+
+FUNCTION filter_button(filter) {
+    BLOCK {
+        selected: PASSED.store.selected_filter == filter
+
+        Scene/Element/button(
+            element: [
+                event: [press: SOURCE]
+                hovered: SOURCE
+            ]
+            style: [
+                padding: [row: 8, column: 4]
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Soft)
+                spring_range: Theme/spring_range(of: Button)
+                move: [closer: selected |> WHEN {
+                    True => Theme/elevation(of: Selection)
+                    False => 0
+                }]
+                material: filter_button_material(selected: selected, hovered: element.hovered)
+            ]
+            label: Scene/Element/text(
+                style: filter_button_text()
+                text: filter |> WHEN {
+                    All => TEXT { All }
+                    Active => TEXT { Active }
+                    Completed => TEXT { Completed }
+                }
+            )
+        )
+    }
+}
+
+------------------------------------------------------------------------
+-- CLEAR COMPLETED BUTTON
+------------------------------------------------------------------------
+
+FUNCTION remove_completed_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            align: Right
+            padding: [row: 4, column: 2]
+            depth: Theme/depth(of: Element)
+            rounded_corners: Theme/corners(of: Comfort)
+            spring_range: Theme/spring_range(of: Button)
+            material: Theme/material(of: SurfaceElevated)
+        ]
+        label: Scene/Element/text(
+            style: clear_button_text(hovered: element.hovered)
+            text: TEXT { Clear completed }
+        )
+    )
+}
+
+------------------------------------------------------------------------
+-- FOOTER
+------------------------------------------------------------------------
+
+FUNCTION footer() {
+    Scene/Element/stripe(
+        element: [tag: Footer]
+        direction: Column
+        gap: Theme/spacing(of: Small)
+        style: [align: [row: Center]]
+        items: LIST {
+            Scene/Element/paragraph(
+                element: []
+                style: Theme/text(of: Small)
+                contents: LIST { TEXT { Double-click to edit a todo } }
+            )
+            Scene/Element/paragraph(
+                element: []
+                style: Theme/text(of: Small)
+                contents: LIST {
+                    TEXT { Created by }
+                    footer_link(
+                        label: TEXT { Martin Kavík }
+                        to: TEXT { https://github.com/MartinKavik }
+                    )
+                }
+            )
+            Scene/Element/paragraph(
+                element: []
+                style: Theme/text(of: Small)
+                contents: LIST {
+                    TEXT { Part of }
+                    footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
+                }
+            )
+        }
+    )
+}
+
+FUNCTION footer_link(label, to) {
+    Scene/Element/link(
+        element: [hovered: SOURCE]
+        style: Theme/text(of: SmallLink[hovered: element.hovered])
+        label: label
+        to: to
+        new_tab: []
+    )
+}
+
+------------------------------------------------------------------------
+-- THEME SWITCHER
+------------------------------------------------------------------------
+
+FUNCTION theme_switcher() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: Theme/spacing(of: Small)
+        style: [padding: [top: 20], align: [row: Center]]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: Theme/spacing(of: Small)
+                style: []
+                items: LIST {
+                    theme_name_button(theme_name: Professional)
+                        |> SOURCE { PASSED.store.elements.theme_switcher.professional }
+                    theme_name_button(theme_name: Glassmorphism)
+                        |> SOURCE { PASSED.store.elements.theme_switcher.glassmorphism }
+                    theme_name_button(theme_name: Neobrutalism)
+                        |> SOURCE { PASSED.store.elements.theme_switcher.neobrutalism }
+                    theme_name_button(theme_name: Neumorphism)
+                        |> SOURCE { PASSED.store.elements.theme_switcher.neumorphism }
+                }
+            )
+            Scene/Element/block(
+                element: []
+                style: [align: [row: Center]]
+                child: mode_toggle_button()
+                    |> SOURCE { PASSED.store.elements.theme_switcher.mode_toggle }
+            )
+        }
+    )
+}
+
+FUNCTION theme_name_button(theme_name) {
+    BLOCK {
+        selected: PASSED.theme_options.name == theme_name
+
+        Scene/Element/button(
+            element: [
+                event: [press: SOURCE]
+                hovered: SOURCE
+            ]
+            style: [
+                padding: [row: 6, column: 3]
+                depth: Theme/depth(of: Detail)
+                rounded_corners: Theme/corners(of: Soft)
+                spring_range: Theme/spring_range(of: Button)
+                move: [closer: selected |> WHEN {
+                    True => Theme/elevation(of: Selection)
+                    False => 0
+                }]
+                material: filter_button_material(
+                    selected: selected
+                    hovered: element.hovered
+                )
+            ]
+            label: Scene/Element/text(
+                style: [
+                    font: Theme/font(of: Small)
+                    depth: 1
+                    move: [further: 2]
+                    relief: Raised
+                ]
+                text: theme_name |> WHEN {
+                    Professional => TEXT { Professional }
+                    Glassmorphism => TEXT { Glass }
+                    Neobrutalism => TEXT { Brutalist }
+                    Neumorphism => TEXT { Neumorphic }
+                }
+            )
+        )
+    }
+}
+
+FUNCTION mode_toggle_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            padding: [row: 6, column: 3]
+            depth: Theme/depth(of: Detail)
+            rounded_corners: Theme/corners(of: Pill)
+            spring_range: Theme/spring_range(of: Button)
+            material: Theme/material(of: Interactive[hovered: element.hovered])
+        ]
+        label: Scene/Element/text(
+            style: [
+                font: Theme/font(of: Small)
+                depth: 1
+                relief: Raised
+            ]
+            text: PASSED.theme_options.mode |> WHEN {
+                Light => TEXT { Dark mode }
+                Dark => TEXT { Light mode }
+            }
+        )
+    )
+}

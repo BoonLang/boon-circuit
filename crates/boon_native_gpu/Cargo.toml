@@ -13,4 +13,8 @@ serde_json.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 image.workspace = true
+resvg.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

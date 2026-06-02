@@ -183,7 +183,13 @@ pub fn layout(input: LayoutInput<'_>) -> LayoutFrame {
     if let Some(root) = input.document.nodes.get(&input.document.root).cloned() {
         let mut cursor_y = 0.0;
         for child in root.children {
-            let rect = builder.layout_node(&child, 0.0, cursor_y, input.viewport.width);
+            let rect = builder.layout_node(
+                &child,
+                0.0,
+                cursor_y,
+                input.viewport.width,
+                input.viewport.height,
+            );
             cursor_y += rect.height;
         }
     }
@@ -216,7 +222,14 @@ struct LayoutBuilder<'a, 'b> {
 }
 
 impl LayoutBuilder<'_, '_> {
-    fn layout_node(&mut self, id: &DocumentNodeId, x: f32, y: f32, available_width: f32) -> Rect {
+    fn layout_node(
+        &mut self,
+        id: &DocumentNodeId,
+        x: f32,
+        y: f32,
+        available_width: f32,
+        available_height: f32,
+    ) -> Rect {
         let Some(node) = self.document.nodes.get(id).cloned() else {
             return Rect {
                 x,
@@ -227,20 +240,30 @@ impl LayoutBuilder<'_, '_> {
         };
         let padding = style_edges(&node.style, "padding");
         let gap = style_spacing(&node.style, "gap").unwrap_or(0.0);
-        let control_size = style_spacing(&node.style, "size").filter(|_| {
-            matches!(
-                node.kind,
-                DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::TableCell
-            ) && node.text.is_none()
-        });
+        let box_size = match node.kind {
+            DocumentNodeKind::Checkbox => style_spacing(&node.style, "box_size")
+                .or_else(|| style_spacing(&node.style, "size")),
+            DocumentNodeKind::Button | DocumentNodeKind::Stack | DocumentNodeKind::TableCell
+                if node.text.is_none() =>
+            {
+                style_spacing(&node.style, "box_size")
+            }
+            _ => None,
+        };
         let auto_width = style_text(&node.style, "width")
             .is_some_and(|value| value.eq_ignore_ascii_case("auto"));
-        let explicit_width =
-            style_dimension(&node.style, "width", available_width).or(control_size);
-        let explicit_height = style_dimension(&node.style, "height", 0.0).or(control_size);
+        let explicit_width = style_dimension(&node.style, "width", available_width).or(box_size);
+        let explicit_height = style_dimension(&node.style, "height", available_height).or(box_size);
         let text = node.text.as_ref().map(|value| value.text.clone());
-        let measured = text
+        let measurement_text = text
             .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                matches!(node.kind, DocumentNodeKind::TextInput)
+                    .then(|| style_text(&node.style, "placeholder"))
+                    .flatten()
+            });
+        let mut measured = measurement_text
             .filter(|value| !value.is_empty())
             .map(|value| {
                 self.text.measure_styled(
@@ -253,19 +276,40 @@ impl LayoutBuilder<'_, '_> {
                 width: 0.0,
                 height: 0.0,
             });
+        if matches!(node.kind, DocumentNodeKind::Text)
+            && (node.style.contains_key("relief") || node.style.contains_key("depth"))
+            && measured.width > 0.0
+        {
+            measured.width += 8.0;
+        }
+        let shrink_to_child_width = explicit_width.is_none()
+            && text.is_none()
+            && !node.children.is_empty()
+            && matches!(
+                node.kind,
+                DocumentNodeKind::Button | DocumentNodeKind::Checkbox
+            );
         let mut width = if auto_width {
             let auto_padding = style_spacing(&node.style, "auto_padding")
                 .unwrap_or_else(|| style_spacing(&node.style, "size").unwrap_or(14.0) * 0.9);
             (measured.width + auto_padding + padding.horizontal()).max(1.0)
+        } else if shrink_to_child_width {
+            padding.horizontal().max(1.0)
         } else {
             explicit_width
                 .unwrap_or_else(|| measured.width.max(available_width))
                 .max(1.0)
         };
-        let mut height = explicit_height.unwrap_or_else(|| measured.height.max(24.0));
+        width = constrain_dimension(width, &node.style, "width", available_width);
+        let mut height =
+            explicit_height.unwrap_or_else(|| measured.height.max(24.0) + padding.vertical());
+        height = constrain_dimension(height, &node.style, "height", available_height);
         let centered = style_bool(&node.style, "center").unwrap_or(false);
+        let align_x = style_text(&node.style, "align_x").unwrap_or_default();
         let node_x = if centered && width < available_width {
             x + (available_width - width) / 2.0
+        } else if align_x.eq_ignore_ascii_case("right") && width < available_width {
+            x + available_width - width
         } else {
             x
         };
@@ -297,8 +341,13 @@ impl LayoutBuilder<'_, '_> {
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
                         let child_available_width = (content_x + content_width - cursor_x).max(1.0);
-                        let child_rect =
-                            self.layout_node(child, cursor_x, content_y, child_available_width);
+                        let child_rect = self.layout_node(
+                            child,
+                            cursor_x,
+                            content_y,
+                            child_available_width,
+                            (height - padding.vertical()).max(1.0),
+                        );
                         cursor_x += child_rect.width + gap;
                         max_child_height = max_child_height.max(child_rect.height);
                     }
@@ -325,16 +374,43 @@ impl LayoutBuilder<'_, '_> {
                     let mut cursor_y = content_y;
                     let mut max_child_width: f32 = 0.0;
                     for child in &node.children {
-                        let child_rect =
-                            self.layout_node(child, content_x, cursor_y, content_width);
+                        let child_rect = self.layout_node(
+                            child,
+                            content_x,
+                            cursor_y,
+                            content_width,
+                            (content_y + height - cursor_y).max(1.0),
+                        );
                         cursor_y += child_rect.height + gap;
                         max_child_width = max_child_width.max(child_rect.width);
                     }
                     if explicit_width.is_none() {
-                        width = max_child_width.max(width).max(1.0) + padding.horizontal();
+                        width = if shrink_to_child_width {
+                            let padded_button_safety =
+                                if matches!(node.kind, DocumentNodeKind::Button)
+                                    && padding.horizontal() > 0.0
+                                {
+                                    16.0
+                                } else {
+                                    0.0
+                                };
+                            (max_child_width + padding.horizontal() + padded_button_safety).max(1.0)
+                        } else {
+                            constrain_dimension(
+                                max_child_width.max(width).max(1.0) + padding.horizontal(),
+                                &node.style,
+                                "width",
+                                available_width,
+                            )
+                        };
                     }
                     if explicit_height.is_none() {
-                        height = (cursor_y - y - gap).max(24.0) + padding.bottom;
+                        height = constrain_dimension(
+                            (cursor_y - y - gap).max(24.0) + padding.bottom,
+                            &node.style,
+                            "height",
+                            available_height,
+                        );
                     }
                 }
             }
@@ -433,6 +509,24 @@ fn style_dimension(
         StyleValue::Text(value) => value.parse::<f32>().ok(),
         StyleValue::Bool(_) => None,
     }
+}
+
+fn constrain_dimension(
+    value: f32,
+    style: &BTreeMap<String, StyleValue>,
+    key: &str,
+    fill_extent: f32,
+) -> f32 {
+    let min = style_dimension(style, &format!("min_{key}"), fill_extent);
+    let max = style_dimension(style, &format!("max_{key}"), fill_extent);
+    let mut constrained = value;
+    if let Some(min) = min {
+        constrained = constrained.max(min);
+    }
+    if let Some(max) = max {
+        constrained = constrained.min(max);
+    }
+    constrained.max(1.0)
 }
 
 #[derive(Default)]
@@ -568,5 +662,183 @@ mod tests {
         assert_eq!(fill.bounds.x, 58.0);
         assert_eq!(fill.bounds.width, 242.0);
         assert!(fill.bounds.x + fill.bounds.width <= 300.0);
+    }
+
+    #[test]
+    fn button_with_element_label_shrinks_to_label_child() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut row = DocumentNode::new("row", DocumentNodeKind::Row);
+        row.parent = Some(frame.root.clone());
+        row.style
+            .insert("width".to_owned(), StyleValue::Number(300.0));
+        row.style.insert("gap".to_owned(), StyleValue::Number(10.0));
+        row.children.push(DocumentNodeId("one-button".to_owned()));
+        row.children.push(DocumentNodeId("two-button".to_owned()));
+
+        let mut one_button = DocumentNode::new("one-button", DocumentNodeKind::Button);
+        one_button.parent = Some(row.id.clone());
+        one_button
+            .children
+            .push(DocumentNodeId("one-label".to_owned()));
+
+        let mut one_label = DocumentNode::new("one-label", DocumentNodeKind::Text);
+        one_label.parent = Some(one_button.id.clone());
+        one_label.text = Some(TextValue {
+            text: "One".to_owned(),
+        });
+
+        let mut two_button = DocumentNode::new("two-button", DocumentNodeKind::Button);
+        two_button.parent = Some(row.id.clone());
+        two_button
+            .children
+            .push(DocumentNodeId("two-label".to_owned()));
+
+        let mut two_label = DocumentNode::new("two-label", DocumentNodeKind::Text);
+        two_label.parent = Some(two_button.id.clone());
+        two_label.text = Some(TextValue {
+            text: "Two".to_owned(),
+        });
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(row.id.clone());
+        frame.nodes.insert(row.id.clone(), row);
+        frame.nodes.insert(one_button.id.clone(), one_button);
+        frame.nodes.insert(one_label.id.clone(), one_label);
+        frame.nodes.insert(two_button.id.clone(), two_button);
+        frame.nodes.insert(two_label.id.clone(), two_label);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let one_button = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "one-button")
+            .expect("first button should be laid out");
+        let one_label = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "one-label")
+            .expect("first label should be laid out");
+        let two_button = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "two-button")
+            .expect("second button should be laid out");
+
+        assert_eq!(one_label.bounds.width, 42.0);
+        assert_eq!(one_button.bounds.width, one_label.bounds.width);
+        assert_eq!(two_button.bounds.x, one_button.bounds.width + 10.0);
+        assert!(two_button.bounds.x + two_button.bounds.width < 300.0);
+    }
+
+    #[test]
+    fn checkbox_size_wins_over_accessibility_label_text() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut checkbox = DocumentNode::new("checkbox", DocumentNodeKind::Checkbox);
+        checkbox.parent = Some(frame.root.clone());
+        checkbox
+            .style
+            .insert("size".to_owned(), StyleValue::Number(40.0));
+        checkbox.text = Some(TextValue {
+            text: "Reference[element:todo.title]".to_owned(),
+        });
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(checkbox.id.clone());
+        frame.nodes.insert(checkbox.id.clone(), checkbox);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let checkbox = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "checkbox")
+            .expect("checkbox should be laid out");
+
+        assert_eq!(checkbox.bounds.width, 40.0);
+        assert_eq!(checkbox.bounds.height, 40.0);
+    }
+
+    #[test]
+    fn inherited_font_size_does_not_force_stack_box_size() {
+        let mut frame = DocumentFrame::empty("root");
+
+        let mut stack = DocumentNode::new("stack", DocumentNodeKind::Stack);
+        stack.parent = Some(frame.root.clone());
+        stack
+            .style
+            .insert("size".to_owned(), StyleValue::Number(14.0));
+        stack.children.push(DocumentNodeId("child".to_owned()));
+
+        let mut child = DocumentNode::new("child", DocumentNodeKind::Text);
+        child.parent = Some(stack.id.clone());
+        child
+            .style
+            .insert("width".to_owned(), StyleValue::Number(100.0));
+        child
+            .style
+            .insert("height".to_owned(), StyleValue::Number(50.0));
+
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(stack.id.clone());
+        frame.nodes.insert(stack.id.clone(), stack);
+        frame.nodes.insert(child.id.clone(), child);
+
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width: 300.0,
+                height: 100.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+
+        let stack = layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "stack")
+            .expect("stack should be laid out");
+
+        assert_eq!(stack.bounds.height, 50.0);
     }
 }

@@ -6,12 +6,12 @@ use bitvec::prelude::*;
 use boon_ir::{
     DerivedValueKind, FieldId, FunctionDefinition, InitialValue, ListId, ListInitializer,
     ListOperationKind, ListPredicate, ListProjectionKind, SourceId, SourcePayloadField,
-    TypedProgram, UpdateExpression, debug_tables, lower, verify_hidden_identity,
+    TypedProgram, UpdateExpression, UpdateMatchArm, debug_tables, lower, verify_hidden_identity,
     verify_static_schedule,
 };
 use boon_parser::{
-    AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, DocumentAst, ParsedProgram,
-    parse_project, parse_source,
+    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, DocumentAst,
+    ParsedProgram, parse_project, parse_source,
 };
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
@@ -470,19 +470,18 @@ pub fn load_and_lower(source_path: &Path) -> RuntimeResult<(ParsedProgram, Typed
 }
 
 fn parse_source_path_or_manifest_project(source_path: &Path) -> RuntimeResult<ParsedProgram> {
-    let files = source_files_for_path(source_path)?;
-    if files.len() <= 1 {
-        let source = fs::read_to_string(source_path)?;
+    let units = source_units_for_path(source_path)?;
+    if units.len() <= 1 {
+        let source = units
+            .first()
+            .map(|unit| unit.source.clone())
+            .unwrap_or_else(String::new);
         return Ok(parse_source(source_path.display().to_string(), source)?);
     }
-    let files = files
-        .into_iter()
-        .map(|path| {
-            let source = fs::read_to_string(&path)?;
-            Ok((path.display().to_string(), source))
-        })
-        .collect::<RuntimeResult<Vec<_>>>()?;
-    Ok(parse_project(source_path.display().to_string(), files)?)
+    Ok(parse_project(
+        source_path.display().to_string(),
+        units.into_iter().map(|unit| (unit.path, unit.source)),
+    )?)
 }
 
 pub fn ir_debug_report(source_path: &Path) -> RuntimeResult<JsonValue> {
@@ -519,7 +518,7 @@ pub fn run_scenario(
     enrich_report(
         &mut report,
         &source_path.display().to_string(),
-        &sha256_bytes(parsed.source.as_bytes()),
+        &report_source_hash_for_parsed(&parsed),
         scenario_path,
         report_path,
         &parsed,
@@ -587,7 +586,7 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     enrich_report(
         &mut report,
         source_label,
-        &sha256_bytes(source_text.as_bytes()),
+        &report_source_hash_for_parsed(&parsed),
         scenario_path,
         None,
         &parsed,
@@ -714,6 +713,12 @@ pub struct LiveRuntime {
     next_step: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeSourceUnit {
+    pub path: String,
+    pub source: String,
+}
+
 #[derive(Clone)]
 struct CachedRuntimePlan {
     ir: Arc<TypedProgram>,
@@ -753,6 +758,57 @@ fn cached_runtime_plan_from_source(
     Ok(plan)
 }
 
+fn cached_runtime_plan_from_project(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<CachedRuntimePlan> {
+    if units.len() == 1 {
+        let unit = &units[0];
+        return cached_runtime_plan_from_source(&unit.path, &unit.source);
+    }
+    let key = source_units_hash(units);
+    if let Some(plan) = runtime_plan_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok(plan);
+    }
+
+    let parsed = parse_project(
+        source_label.to_owned(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    )?;
+    let ir = lower(&parsed)?;
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let compiled = CompiledProgram::from_ir(&ir)?;
+    let plan = CachedRuntimePlan {
+        ir: Arc::new(ir),
+        compiled: Arc::new(compiled),
+    };
+    if let Ok(mut cache) = runtime_plan_cache().lock() {
+        cache.insert(key, plan.clone());
+    }
+    Ok(plan)
+}
+
+pub fn source_units_hash(units: &[RuntimeSourceUnit]) -> String {
+    if let [unit] = units {
+        return sha256_bytes(unit.source.as_bytes());
+    }
+    let mut canonical = String::new();
+    for unit in units {
+        canonical.push_str(&unit.path);
+        canonical.push('\0');
+        canonical.push_str(&sha256_bytes(unit.source.as_bytes()));
+        canonical.push('\0');
+    }
+    sha256_bytes(canonical.as_bytes())
+}
+
 impl LiveRuntime {
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
@@ -765,8 +821,32 @@ impl LiveRuntime {
         })
     }
 
+    pub fn new_from_project(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        scenario_path: &Path,
+    ) -> RuntimeResult<Self> {
+        let plan = cached_runtime_plan_from_project(source_label, units)?;
+        let scenario = parse_scenario(scenario_path)?;
+        let mut runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        runtime.prepare_for_scenario(&scenario)?;
+        Ok(Self {
+            runtime,
+            next_step: 1,
+        })
+    }
+
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
+        let runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        Ok(Self {
+            runtime,
+            next_step: 1,
+        })
+    }
+
+    pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
+        let plan = cached_runtime_plan_from_project(source_label, units)?;
         let runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
         Ok(Self {
             runtime,
@@ -1062,6 +1142,10 @@ pub struct ExampleManifestEntry {
     pub source: String,
     #[serde(default)]
     pub source_files: Vec<String>,
+    #[serde(default)]
+    pub build_files: Vec<String>,
+    #[serde(default)]
+    pub asset_files: Vec<String>,
     pub scenario: String,
     pub budget: String,
     #[serde(default)]
@@ -1179,6 +1263,17 @@ fn validate_example_manifest(path: &Path, manifest: &ExampleManifest) -> Runtime
                 .into());
             }
         }
+        for relative in entry.build_files.iter().chain(entry.asset_files.iter()) {
+            let resolved = resolve_repo_file(relative);
+            if !resolved.exists() {
+                return Err(format!(
+                    "example `{}` references missing project file `{}`",
+                    entry.id,
+                    resolved.display()
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }
@@ -1188,42 +1283,346 @@ pub fn example_source_files(name: &str) -> RuntimeResult<Vec<PathBuf>> {
     Ok(source_files_for_entry(&entry))
 }
 
+pub fn example_source_units(name: &str) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
+    let entry = example_manifest_entry(name)?;
+    source_units_for_entry(&entry)
+}
+
 pub fn example_source_text(name: &str) -> RuntimeResult<String> {
     let entry = example_manifest_entry(name)?;
     source_text_for_entry(&entry)
 }
 
+pub fn source_units_for_path(path: &Path) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
+    source_files_for_path(path)?
+        .into_iter()
+        .map(|path| {
+            let source = fs::read_to_string(&path)?;
+            Ok(RuntimeSourceUnit {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .collect()
+}
+
+pub fn source_units_for_entry(
+    entry: &ExampleManifestEntry,
+) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
+    source_files_for_entry(entry)
+        .into_iter()
+        .map(|path| {
+            let source = fs::read_to_string(&path)?;
+            Ok(RuntimeSourceUnit {
+                path: path.display().to_string(),
+                source,
+            })
+        })
+        .collect()
+}
+
 pub fn source_text_for_path(path: &Path) -> RuntimeResult<String> {
-    let files = source_files_for_path(path)?;
-    if files.len() <= 1 {
-        return Ok(fs::read_to_string(resolve_repo_file(path))?);
+    let source_path = resolve_repo_file(path);
+    let entries = example_manifest_entries().unwrap_or_default();
+    for entry in entries {
+        let entry_source = resolve_repo_file(&entry.source);
+        if paths_match(&entry_source, &source_path) {
+            return Ok(fs::read_to_string(entry_source)?);
+        }
     }
-    combined_source_text(files)
+    Ok(fs::read_to_string(source_path)?)
 }
 
 pub fn source_text_for_entry(entry: &ExampleManifestEntry) -> RuntimeResult<String> {
-    let files = source_files_for_entry(entry);
-    if files.len() <= 1 {
-        return Ok(fs::read_to_string(resolve_repo_file(&entry.source))?);
-    }
-    combined_source_text(files)
+    Ok(fs::read_to_string(resolve_repo_file(&entry.source))?)
 }
 
-fn combined_source_text(files: Vec<PathBuf>) -> RuntimeResult<String> {
-    let mut combined = String::new();
-    for path in files {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str("-- file: ");
-        combined.push_str(&path.display().to_string());
-        combined.push('\n');
-        combined.push_str(&fs::read_to_string(path)?);
-        if !combined.ends_with('\n') {
-            combined.push('\n');
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildExecutionResult {
+    pub status: String,
+    pub build_file: String,
+    pub project_root: String,
+    pub write_output: bool,
+    pub icons_directory: String,
+    pub output_file: String,
+    pub output_binding: String,
+    pub operator_evidence: Vec<String>,
+    pub input_files: Vec<String>,
+    pub output_sha256: String,
+    pub output_bytes: usize,
+    pub written_files: Vec<String>,
+    pub logs: Vec<BuildLogEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuildLogEntry {
+    pub level: String,
+    pub message: String,
+}
+
+pub fn run_project_build_file(
+    project_root: &Path,
+    build_file: &Path,
+    write_output: bool,
+) -> RuntimeResult<BuildExecutionResult> {
+    let root = canonical_existing_dir(project_root)?;
+    let build_path = sandbox_existing_file(&root, build_file)?;
+    let source = fs::read_to_string(&build_path)?;
+    let operator_evidence = physical_asset_build_operator_evidence(&source);
+    let missing = required_physical_asset_build_operators()
+        .into_iter()
+        .filter(|operator| !operator_evidence.iter().any(|seen| seen == operator))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "build file `{}` is missing required operators: {}",
+            build_path.display(),
+            missing.join(", ")
+        )
+        .into());
+    }
+
+    let icons_directory = build_text_binding(&source, "icons_directory")
+        .ok_or("BUILD.bn does not define `icons_directory: TEXT { ... }`")?;
+    let output_file = build_text_binding(&source, "output_file")
+        .ok_or("BUILD.bn does not define `output_file: TEXT { ... }`")?;
+    let output_binding = build_output_binding(&source).unwrap_or_else(|| "icon".to_owned());
+    let icons_dir = sandbox_existing_dir(&root, Path::new(&icons_directory))?;
+    let output_path = sandbox_output_file(&root, Path::new(&output_file))?;
+
+    let mut icon_files = fs::read_dir(&icons_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    icon_files.retain(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    });
+    icon_files.sort_by_key(|path| path.strip_prefix(&root).unwrap_or(path).to_path_buf());
+
+    let mut icon_entries = String::new();
+    for (index, path) in icon_files.iter().enumerate() {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| format!("asset path `{}` has no UTF-8 file stem", path.display()))?;
+        let svg = fs::read_to_string(path)?;
+        icon_entries.push_str(&format!(
+            "        {stem}: TEXT {{\n            data:image/svg+xml;utf8,{}\n        }}\n",
+            build_url_encode(svg.trim_end())
+        ));
+        if index + 1 < icon_files.len() {
+            icon_entries.push('\n');
         }
     }
-    Ok(combined)
+
+    let generated = format!(
+        "-- GENERATED CODE - DO NOT EDIT\n-- Generated by BUILD.bn from assets/icons/\n-- Generated at: 2025-01-01T00:00:00Z\n\nFUNCTION {output_binding}() {{\n    [\n{icon_entries}    ]\n}}\n"
+    );
+    if write_output {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&output_path, generated.as_bytes())?;
+    }
+    let input_files = icon_files
+        .iter()
+        .map(|path| repo_relative_or_display(&root, path))
+        .collect::<Vec<_>>();
+    let output_sha256 = sha256_bytes(generated.as_bytes());
+    let mut logs = Vec::new();
+    logs.push(BuildLogEntry {
+        level: "info".to_owned(),
+        message: format!("Included {} icons", icon_files.len()),
+    });
+    Ok(BuildExecutionResult {
+        status: "pass".to_owned(),
+        build_file: repo_relative_or_display(&root, &build_path),
+        project_root: root.display().to_string(),
+        write_output,
+        icons_directory,
+        output_file: output_file.clone(),
+        output_binding,
+        operator_evidence,
+        input_files,
+        output_sha256,
+        output_bytes: generated.len(),
+        written_files: if write_output {
+            vec![repo_relative_or_display(&root, &output_path)]
+        } else {
+            Vec::new()
+        },
+        logs,
+    })
+}
+
+pub fn generated_output_for_project_build_file(
+    project_root: &Path,
+    build_file: &Path,
+) -> RuntimeResult<String> {
+    let result = run_project_build_file(project_root, build_file, false)?;
+    let root = canonical_existing_dir(project_root)?;
+    let output_path = sandbox_output_file(&root, Path::new(&result.output_file))?;
+    let expected = fs::read_to_string(output_path)?;
+    let expected_hash = sha256_bytes(expected.as_bytes());
+    if result.output_sha256 != expected_hash {
+        return Err(format!(
+            "BUILD.bn output hash {} does not match checked generated file hash {}",
+            result.output_sha256, expected_hash
+        )
+        .into());
+    }
+    Ok(expected)
+}
+
+fn canonical_existing_dir(path: &Path) -> RuntimeResult<PathBuf> {
+    let canonical = path.canonicalize()?;
+    if !canonical.is_dir() {
+        return Err(format!("`{}` is not a directory", path.display()).into());
+    }
+    Ok(canonical)
+}
+
+fn sandbox_existing_dir(root: &Path, path: &Path) -> RuntimeResult<PathBuf> {
+    let resolved = sandbox_join(root, path)?;
+    let canonical = resolved.canonicalize()?;
+    if !canonical.starts_with(root) || !canonical.is_dir() {
+        return Err(format!(
+            "build directory `{}` escapes project root `{}`",
+            path.display(),
+            root.display()
+        )
+        .into());
+    }
+    Ok(canonical)
+}
+
+fn sandbox_existing_file(root: &Path, path: &Path) -> RuntimeResult<PathBuf> {
+    let resolved = sandbox_join(root, path)?;
+    let canonical = resolved.canonicalize()?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err(format!(
+            "build file `{}` escapes project root `{}`",
+            path.display(),
+            root.display()
+        )
+        .into());
+    }
+    Ok(canonical)
+}
+
+fn sandbox_output_file(root: &Path, path: &Path) -> RuntimeResult<PathBuf> {
+    let resolved = sandbox_join(root, path)?;
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| format!("output path `{}` has no parent", path.display()))?;
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(root) {
+        return Err(format!(
+            "build output `{}` escapes project root `{}`",
+            path.display(),
+            root.display()
+        )
+        .into());
+    }
+    Ok(resolved)
+}
+
+fn sandbox_join(root: &Path, path: &Path) -> RuntimeResult<PathBuf> {
+    if path.is_absolute() {
+        return Err(format!("build path `{}` must be project-relative", path.display()).into());
+    }
+    let mut resolved = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => resolved.push(part),
+            std::path::Component::ParentDir => {
+                return Err(format!(
+                    "build path `{}` may not contain parent-directory segments",
+                    path.display()
+                )
+                .into());
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("build path `{}` is not relative", path.display()).into());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn repo_relative_or_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn required_physical_asset_build_operators() -> Vec<&'static str> {
+    vec![
+        "Directory/entries",
+        "File/read_text",
+        "File/write_text",
+        "Url/encode",
+        "Text/join_lines",
+        "List/retain",
+        "List/sort_by",
+        "List/map",
+        "Build/succeed",
+        "Build/fail",
+        "FLUSH",
+    ]
+}
+
+fn physical_asset_build_operator_evidence(source: &str) -> Vec<String> {
+    required_physical_asset_build_operators()
+        .into_iter()
+        .filter(|operator| source.contains(operator))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn build_text_binding(source: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}:");
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let rest = rest.trim();
+        let value = rest
+            .strip_prefix("TEXT {")?
+            .strip_suffix('}')?
+            .trim()
+            .to_owned();
+        return Some(value);
+    }
+    None
+}
+
+fn build_output_binding(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let name = trimmed.strip_suffix(": [")?;
+        (!name.is_empty()
+            && name
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric()))
+        .then(|| name.to_owned())
+    })
+}
+
+fn build_url_encode(input: &str) -> String {
+    let mut output = String::new();
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
 }
 
 fn source_files_for_path(source_path: &Path) -> RuntimeResult<Vec<PathBuf>> {
@@ -1400,6 +1799,8 @@ impl LoadedRuntime {
             TickSeq(0),
             |list, event| generic.resolve_generic_step_index(list, step, event),
         )?;
+        let source_list = input.list.clone();
+        let source_index = input.index;
         let bool_context = generic.generic_bool_contexts();
         generic
             .apply_source_actions(
@@ -1414,6 +1815,16 @@ impl LoadedRuntime {
                 },
             )
             .map_err(|error| format!("{}: {error}", step.id))?;
+        if source_event.key == Some("Enter")
+            && let (Some(list), Some(index)) = (source_list.as_deref(), source_index)
+            && let Some(commit) = generic.commit_edit_draft_title_for_index(list, index)?
+        {
+            let mutation = GenericSourceMutation::TextField(commit);
+            if let Some(delta) = mutation.semantic_delta() {
+                deltas.push(delta);
+            }
+            patches.push(generic_document_invalidation_patch(&mutation));
+        }
         let changed_reads = generic.read_keys_from_deltas(&deltas[delta_start..])?;
         let (derived_commits, recompute_metrics) =
             generic.recompute_generic_derived_after_changes(changed_reads)?;
@@ -1525,6 +1936,13 @@ impl RuntimeSymbols {
                 UpdateExpression::NumberInfix { left, right, .. } => {
                     symbols.intern(left);
                     symbols.intern(right);
+                }
+                UpdateExpression::MatchConst { input, arms } => {
+                    symbols.intern(input);
+                    for arm in arms {
+                        symbols.intern(&arm.pattern);
+                        symbols.intern(&arm.output);
+                    }
                 }
                 UpdateExpression::Unknown { summary } => {
                     symbols.intern(summary);
@@ -2230,7 +2648,7 @@ fn base_example_report(
     let total_alloc_count: u64 = allocation_deltas.iter().map(|delta| delta.count).sum();
     let total_alloc_bytes: u64 = allocation_deltas.iter().map(|delta| delta.bytes).sum();
     let list_slot_count = report_list_slot_count(&state_summary);
-    let program_hash = sha256_bytes(parsed.source.as_bytes());
+    let program_hash = report_source_hash_for_parsed(parsed);
     let semantic_delta_protocol_batches =
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
     let implementation = "static_graph_interpreter";
@@ -2878,6 +3296,22 @@ fn slice_bool(slices: &serde_json::Map<String, JsonValue>, key: &str) -> Option<
     slices.get(key).and_then(JsonValue::as_bool)
 }
 
+fn report_source_hash_for_parsed(parsed: &ParsedProgram) -> String {
+    if parsed.files.len() <= 1 {
+        return sha256_bytes(parsed.source.as_bytes());
+    }
+    source_units_hash(
+        &parsed
+            .files
+            .iter()
+            .map(|file| RuntimeSourceUnit {
+                path: file.path.clone(),
+                source: file.source.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn enrich_report(
     report: &mut JsonValue,
     source_path: &str,
@@ -2902,10 +3336,7 @@ fn enrich_report(
     object.insert("source_path".to_owned(), json!(source_path));
     object.insert("source_hash".to_owned(), json!(source_hash));
     object.insert("expected_source_hash".to_owned(), json!(source_hash));
-    object.insert(
-        "program_hash".to_owned(),
-        json!(sha256_bytes(parsed.source.as_bytes())),
-    );
+    object.insert("program_hash".to_owned(), json!(source_hash));
     object.insert("program_file_count".to_owned(), json!(parsed.files.len()));
     object.insert(
         "source_files".to_owned(),
@@ -4187,6 +4618,7 @@ impl RuntimeListStore {
 #[derive(Clone, Debug)]
 struct GenericScheduledRuntime {
     storage: GenericCircuitRuntime,
+    router_route: String,
     scalar_equations: ScalarEquationPlan,
     derived_equations: DerivedEquationPlan,
     generic_derived: GenericDerivedPlan,
@@ -4249,6 +4681,7 @@ impl GenericScheduledRuntime {
     fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
         let mut runtime = Self {
             storage: GenericCircuitRuntime::new(ir)?,
+            router_route: "/".to_owned(),
             scalar_equations: compiled.scalar_equations.clone(),
             derived_equations: compiled.derived_equations.clone(),
             generic_derived: compiled.generic_derived.clone(),
@@ -4434,6 +4867,18 @@ impl GenericScheduledRuntime {
             if has_root_scalar {
                 return Ok(SourceActionKind::RootScalar);
             }
+            if actions
+                .iter()
+                .any(|action| matches!(action, SourceAction::RouterRoute { .. }))
+            {
+                return Ok(SourceActionKind::RouterRoute);
+            }
+            if actions
+                .iter()
+                .any(|action| matches!(action, SourceAction::RootTextTransform { .. }))
+            {
+                return Ok(SourceActionKind::RootText);
+            }
         } else {
             if has_list_remove {
                 return Ok(SourceActionKind::ListRemove);
@@ -4591,7 +5036,10 @@ impl GenericScheduledRuntime {
         let mut list = None;
         for action in actions {
             let action_list = match action {
-                SourceAction::RootScalar | SourceAction::DerivedText { .. } => None,
+                SourceAction::RootScalar
+                | SourceAction::DerivedText { .. }
+                | SourceAction::RouterRoute { .. }
+                | SourceAction::RootTextTransform { .. } => None,
                 SourceAction::ListRemove { list } | SourceAction::ListAppend { list, .. } => {
                     Some(list.clone())
                 }
@@ -4668,6 +5116,26 @@ impl GenericScheduledRuntime {
                     }
                 }
                 SourceAction::DerivedText { .. } => {}
+                SourceAction::RootTextTransform { target, value } => {
+                    let current = self.storage.root.textlike(target);
+                    if current != Some(value.as_str()) {
+                        self.storage
+                            .root
+                            .insert_value(target.clone(), FieldValue::Text(value.clone()));
+                        observe(GenericSourceMutation::RootText(GenericRootTextCommit {
+                            target: target.clone(),
+                            value: Cow::Owned(value.clone()),
+                        }))?;
+                    }
+                }
+                SourceAction::RouterRoute { path, .. } => {
+                    if self.router_route != *path {
+                        self.router_route.clone_from(path);
+                        for commit in self.materialize_root_derived_field_commits()? {
+                            observe(GenericSourceMutation::RootText(commit))?;
+                        }
+                    }
+                }
                 SourceAction::ListAppend { list, trigger } => {
                     let source_paths = self.list_source_bindings.source_paths(list)?;
                     let Some(value) = self.storage.eval_derived_text_transform(
@@ -5081,6 +5549,7 @@ impl GenericScheduledRuntime {
     }
 
     fn initialize_generic_derived_fields(&mut self) -> RuntimeResult<()> {
+        self.materialize_root_derived_fields()?;
         if !self.generic_derived.has_indexed_fields() {
             return Ok(());
         }
@@ -5091,6 +5560,82 @@ impl GenericScheduledRuntime {
         }
         self.generic_derived_state.clear_last_step();
         Ok(())
+    }
+
+    fn materialize_root_derived_fields(&mut self) -> RuntimeResult<()> {
+        let _ = self.materialize_root_derived_field_commits()?;
+        Ok(())
+    }
+
+    fn materialize_root_derived_field_commits(
+        &mut self,
+    ) -> RuntimeResult<Vec<GenericRootTextCommit<'static>>> {
+        let fields = self.generic_derived.root_fields.clone();
+        let mut commits = Vec::new();
+        for field in fields {
+            if field.kind == DerivedValueKind::SourceEventTransform
+                && self.storage.root.textlike(&field.path).is_some()
+            {
+                continue;
+            }
+            let mut frame = GenericEvalFrame::root();
+            let value = self.eval_root_derived_initial_value(&field.statement, &mut frame)?;
+            if matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+                continue;
+            }
+            if let Some(value) = value.as_text() {
+                let current = self.storage.root.textlike(&field.path).map(str::to_owned);
+                if current.as_deref() == Some(value.as_str()) {
+                    continue;
+                }
+                self.storage
+                    .root
+                    .insert_value(field.path.clone(), FieldValue::Text(value.clone()));
+                commits.push(GenericRootTextCommit {
+                    target: field.path,
+                    value: Cow::Owned(value),
+                });
+            }
+        }
+        Ok(commits)
+    }
+
+    fn eval_root_derived_initial_value(
+        &mut self,
+        statement: &AstStatement,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(latest_statement) = self.root_derived_latest_statement(statement) {
+            for child in &latest_statement.children {
+                let value = self.eval_statement_value(child, frame)?;
+                if !matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+                    return Ok(value);
+                }
+            }
+            return Ok(BoonValue::Empty);
+        }
+        self.eval_statement_value(statement, frame)
+    }
+
+    fn root_derived_latest_statement<'a>(
+        &self,
+        statement: &'a AstStatement,
+    ) -> Option<&'a AstStatement> {
+        if statement.expr.is_some_and(|expr_id| {
+            matches!(
+                self.generic_derived
+                    .expressions
+                    .get(expr_id)
+                    .map(|expr| &expr.kind),
+                Some(AstExprKind::Latest)
+            )
+        }) {
+            return Some(statement);
+        }
+        statement
+            .children
+            .iter()
+            .find_map(|child| self.root_derived_latest_statement(child))
     }
 
     fn read_keys_from_deltas(
@@ -5303,13 +5848,30 @@ impl GenericScheduledRuntime {
             let input = self.eval_expr(*input, frame)?;
             return self.eval_while(input, children, frame);
         }
+        if let AstExprKind::Pipe { input, op, args: _ } = &expr.kind
+            && op == "WHEN"
+        {
+            let input = self.eval_expr(*input, frame)?;
+            return self.eval_while(input, children, frame);
+        }
+        if let AstExprKind::When { input } = &expr.kind {
+            let input = self.eval_expr(*input, frame)?;
+            return self.eval_while(input, children, frame);
+        }
         if let AstExprKind::Call { function, args } = &expr.kind
             && function == "WHILE"
         {
             let input = self.eval_first_arg(args, frame)?;
             return self.eval_while(input, children, frame);
         }
-        self.eval_expr(expr_id, frame)
+        if let AstExprKind::Record(fields) | AstExprKind::Object(fields) = &expr.kind {
+            return self.eval_object_expr(fields, Some(children), frame);
+        }
+        let mut value = self.eval_expr(expr_id, frame)?;
+        for child in self.pipe_continuation_children(children) {
+            value = self.eval_pipe_continuation_chain(&child, value, frame)?;
+        }
+        Ok(value)
     }
 
     fn eval_pipe_continuation(
@@ -5325,14 +5887,53 @@ impl GenericScheduledRuntime {
             .get(expr_id)
             .cloned()
             .ok_or_else(|| format!("generic pipe expression id {expr_id} is missing"))?;
-        let AstExprKind::Pipe { op, args, .. } = expr.kind else {
+        match expr.kind {
+            AstExprKind::Pipe { op, args: _, .. } if op == "WHILE" || op == "WHEN" => {
+                self.eval_while(input, children, frame)
+            }
+            AstExprKind::Pipe { op, args, .. } => self.eval_call(&op, &args, Some(input), frame),
+            AstExprKind::When { .. } => self.eval_while(input, children, frame),
+            AstExprKind::Then { output, .. } => {
+                if matches!(input, BoonValue::Empty) {
+                    return Ok(BoonValue::Empty);
+                }
+                if let Some(output) = output {
+                    self.eval_expr_with_children(output, children, frame)
+                } else {
+                    self.eval_statement_block(children, frame)
+                }
+            }
+            _ => Ok(input),
+        }
+    }
+
+    fn eval_pipe_continuation_chain(
+        &mut self,
+        statement: &AstStatement,
+        input: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let Some(expr_id) = statement.expr else {
             return Ok(input);
         };
-        if op == "WHILE" {
-            self.eval_while(input, children, frame)
-        } else {
-            self.eval_call(&op, &args, Some(input), frame)
+        let mut value = self.eval_pipe_continuation(expr_id, input, &statement.children, frame)?;
+        for child in self.pipe_continuation_children(&statement.children) {
+            value = self.eval_pipe_continuation_chain(&child, value, frame)?;
         }
+        Ok(value)
+    }
+
+    fn pipe_continuation_children(&self, children: &[AstStatement]) -> Vec<AstStatement> {
+        children
+            .iter()
+            .filter(|child| {
+                matches!(child.kind, AstStatementKind::Expression)
+                    && child.expr.is_some_and(|expr_id| {
+                        self.generic_derived.expr_is_pipe_continuation(expr_id)
+                    })
+            })
+            .cloned()
+            .collect()
     }
 
     fn eval_expr(
@@ -5362,6 +5963,9 @@ impl GenericScheduledRuntime {
             AstExprKind::TaggedObject { tag, fields } => {
                 let mut body = Vec::new();
                 for field in fields {
+                    if field.spread {
+                        continue;
+                    }
                     let value = boon_value_scalar_text(&self.eval_expr(field.value, frame)?);
                     body.push(format!("{}:{}", field.name, value));
                 }
@@ -5387,12 +5991,7 @@ impl GenericScheduledRuntime {
                 Ok(generic_infix_value(left, &op, right))
             }
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-                let mut record = BTreeMap::new();
-                for field in fields {
-                    let value = self.eval_expr(field.value, frame)?;
-                    record.insert(field.name, value);
-                }
-                Ok(BoonValue::Record(record))
+                self.eval_object_expr(&fields, None, frame)
             }
             AstExprKind::ListLiteral { .. } => Ok(BoonValue::List(Vec::new())),
             AstExprKind::Source
@@ -5403,6 +6002,51 @@ impl GenericScheduledRuntime {
             | AstExprKind::MatchArm { .. }
             | AstExprKind::Delimiter
             | AstExprKind::Unknown(_) => Ok(BoonValue::Empty),
+        }
+    }
+
+    fn eval_object_expr(
+        &mut self,
+        fields: &[AstRecordField],
+        attached_children: Option<&[AstStatement]>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        for field in fields {
+            let value = if let Some(children) = attached_children
+                && self.expr_accepts_attached_children(field.value)
+            {
+                self.eval_expr_with_children(field.value, children, frame)?
+            } else {
+                self.eval_expr(field.value, frame)?
+            };
+            if field.spread {
+                match value {
+                    BoonValue::Record(fields) => {
+                        record.extend(fields);
+                    }
+                    BoonValue::Empty => {}
+                    BoonValue::Text(value) if value == "UNPLUGGED" => {}
+                    _ => return Ok(BoonValue::Error("type_error".to_owned())),
+                }
+            } else {
+                record.insert(field.name.clone(), value);
+            }
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn expr_accepts_attached_children(&self, expr_id: usize) -> bool {
+        let Some(expr) = self.generic_derived.expressions.get(expr_id) else {
+            return false;
+        };
+        match &expr.kind {
+            AstExprKind::When { .. } => true,
+            AstExprKind::Pipe { op, .. } if op == "WHEN" || op == "WHILE" => true,
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => fields
+                .iter()
+                .any(|field| self.expr_accepts_attached_children(field.value)),
+            _ => false,
         }
     }
 
@@ -5581,7 +6225,24 @@ impl GenericScheduledRuntime {
         input: Option<BoonValue>,
         frame: &mut GenericEvalFrame,
     ) -> RuntimeResult<BoonValue> {
+        if is_generic_render_constructor(function) {
+            return self.eval_generic_constructor(function, args, input, frame);
+        }
+        if is_light_constructor(function) {
+            return self.eval_generic_constructor(function, args, input, frame);
+        }
+        if let Some(field) = function.strip_prefix("Field/") {
+            let value = self.call_input_or_first(input, args, frame)?;
+            return Ok(match value {
+                BoonValue::Record(fields) => fields
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| BoonValue::Error("missing_ref".to_owned())),
+                _ => BoonValue::Error("type_error".to_owned()),
+            });
+        }
         match function {
+            "SOURCE" => self.call_input_or_first(input, args, frame),
             "Text/empty" => Ok(BoonValue::Text(String::new())),
             "Text/trim" => {
                 let value = self.call_input_or_first(input, args, frame)?;
@@ -5646,9 +6307,29 @@ impl GenericScheduledRuntime {
                     value.as_text().unwrap_or_default().is_empty(),
                 ))
             }
+            "Text/is_not_empty" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(
+                    !value.as_text().unwrap_or_default().is_empty(),
+                ))
+            }
             "Bool/not" => {
                 let value = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Bool(!value.bool_value().unwrap_or(false)))
+            }
+            "Bool/toggle" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                let toggle_requested = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("when"))
+                    .map(|arg| self.eval_expr(arg.value, frame))
+                    .transpose()?
+                    .is_some_and(|value| !matches!(value, BoonValue::Empty));
+                Ok(BoonValue::Bool(if toggle_requested {
+                    !value.bool_value().unwrap_or(false)
+                } else {
+                    value.bool_value().unwrap_or(false)
+                }))
             }
             "Bool/and" => {
                 let piped = input.is_some();
@@ -5673,6 +6354,12 @@ impl GenericScheduledRuntime {
                     _ => String::new(),
                 }))
             }
+            "Router/route" => Ok(BoonValue::Text(self.router_route.clone())),
+            "Router/go_to" => {
+                let value = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Text(value.as_text().unwrap_or_default()))
+            }
+            "Ulid/generate" => Ok(BoonValue::Text("01J00000000000000000000000".to_owned())),
             "List/range" => {
                 let from = self
                     .named_arg_value(args, "from", frame)?
@@ -5723,6 +6410,10 @@ impl GenericScheduledRuntime {
                 let list = self.call_input_or_first(input, args, frame)?;
                 Ok(BoonValue::Number(self.list_len_for_value(list)? as i64))
             }
+            "List/is_not_empty" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                Ok(BoonValue::Bool(self.list_len_for_value(list)? > 0))
+            }
             "List/map" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 let binding = args
@@ -5736,12 +6427,82 @@ impl GenericScheduledRuntime {
                     .ok_or("List/map requires new expression")?;
                 self.list_map(list, &binding, new_arg.value, frame)
             }
+            "List/retain" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(|arg| self.raw_arg_name(arg))
+                    .ok_or("List/retain requires an item binding")?;
+                let predicate_arg = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/retain requires if expression")?;
+                self.list_retain(list, &binding, predicate_arg.value, frame)
+            }
+            "List/every" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(|arg| self.raw_arg_name(arg))
+                    .ok_or("List/every requires an item binding")?;
+                let predicate_arg = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/every requires if expression")?;
+                self.list_every(list, &binding, predicate_arg.value, frame)
+            }
+            "List/any" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                let binding = args
+                    .iter()
+                    .find(|arg| arg.name.is_none())
+                    .and_then(|arg| self.raw_arg_name(arg))
+                    .ok_or("List/any requires an item binding")?;
+                let predicate_arg = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or("List/any requires if expression")?;
+                self.list_any(list, &binding, predicate_arg.value, frame)
+            }
+            "List/latest" => {
+                let list = self.call_input_or_first(input, args, frame)?;
+                self.list_latest(list, frame)
+            }
             "List/sum" => {
                 let list = self.call_input_or_first(input, args, frame)?;
                 self.list_sum(list)
             }
             _ => self.eval_user_function(function, args, input, frame),
         }
+    }
+
+    fn eval_generic_constructor(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        record.insert(
+            "kind".to_owned(),
+            BoonValue::Text(generic_constructor_kind(function).to_owned()),
+        );
+        record.insert(
+            "constructor".to_owned(),
+            BoonValue::Text(function.to_owned()),
+        );
+        if let Some(input) = input {
+            record.insert("input".to_owned(), input);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let value = self.eval_expr(arg.value, frame)?;
+            let name = arg.name.clone().unwrap_or_else(|| format!("arg_{index}"));
+            record.insert(name, value);
+        }
+        Ok(BoonValue::Record(record))
     }
 
     fn eval_user_function(
@@ -5771,6 +6532,9 @@ impl GenericScheduledRuntime {
                 .clone()
                 .or_else(|| definition.args.get(position).cloned())
                 .ok_or_else(|| format!("generic function `{function}` has too many arguments"))?;
+            if name == "PASS" {
+                child.env.insert("PASSED".to_owned(), value.clone());
+            }
             child.env.insert(name, value);
         }
         let value = self.eval_statement_block(&definition.statement.children, &mut child)?;
@@ -5947,6 +6711,163 @@ impl GenericScheduledRuntime {
             frame.env.remove(binding);
         }
         Ok(BoonValue::List(output))
+    }
+
+    fn list_retain(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = match list {
+            BoonValue::List(values) => values,
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                (0..len)
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .collect()
+            }
+            _ => return Ok(BoonValue::Error("type_error".to_owned())),
+        };
+        let mut output = Vec::new();
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value.clone());
+            if self
+                .eval_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                output.push(value);
+            }
+        }
+        if let Some(previous) = previous {
+            frame.env.insert(binding.to_owned(), previous);
+        } else {
+            frame.env.remove(binding);
+        }
+        Ok(BoonValue::List(output))
+    }
+
+    fn list_every(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = match list {
+            BoonValue::List(values) => values,
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                (0..len)
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .collect()
+            }
+            _ => return Ok(BoonValue::Error("type_error".to_owned())),
+        };
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if !self
+                .eval_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                if let Some(previous) = previous.clone() {
+                    frame.env.insert(binding.to_owned(), previous);
+                } else {
+                    frame.env.remove(binding);
+                }
+                return Ok(BoonValue::Bool(false));
+            }
+        }
+        if let Some(previous) = previous {
+            frame.env.insert(binding.to_owned(), previous);
+        } else {
+            frame.env.remove(binding);
+        }
+        Ok(BoonValue::Bool(true))
+    }
+
+    fn list_any(
+        &mut self,
+        list: BoonValue,
+        binding: &str,
+        predicate_expr: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = match list {
+            BoonValue::List(values) => values,
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                (0..len)
+                    .map(|index| BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    })
+                    .collect()
+            }
+            _ => return Ok(BoonValue::Error("type_error".to_owned())),
+        };
+        let previous = frame.env.get(binding).cloned();
+        for value in values {
+            frame.env.insert(binding.to_owned(), value);
+            if self
+                .eval_expr(predicate_expr, frame)?
+                .bool_value()
+                .unwrap_or(false)
+            {
+                if let Some(previous) = previous.clone() {
+                    frame.env.insert(binding.to_owned(), previous);
+                } else {
+                    frame.env.remove(binding);
+                }
+                return Ok(BoonValue::Bool(true));
+            }
+        }
+        if let Some(previous) = previous {
+            frame.env.insert(binding.to_owned(), previous);
+        } else {
+            frame.env.remove(binding);
+        }
+        Ok(BoonValue::Bool(false))
+    }
+
+    fn list_latest(
+        &mut self,
+        list: BoonValue,
+        _frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let values = match list {
+            BoonValue::List(values) => values,
+            BoonValue::ListRef(list) => {
+                let len = self.storage.list_len(&list)?;
+                let mut values = Vec::new();
+                for index in 0..len {
+                    values.push(BoonValue::RowRef {
+                        list: list.clone(),
+                        index,
+                    });
+                }
+                values
+            }
+            _ => return Ok(BoonValue::Error("type_error".to_owned())),
+        };
+        let mut latest = BoonValue::Empty;
+        for value in values {
+            if !matches!(value, BoonValue::Empty) {
+                latest = value;
+            }
+        }
+        Ok(latest)
     }
 
     fn list_sum(&self, list: BoonValue) -> RuntimeResult<BoonValue> {
@@ -6930,13 +7851,20 @@ fn generic_pattern_binding(
         && pattern.get(1).map(String::as_str) == Some("{")
         && pattern.last().map(String::as_str) == Some("}")
     {
-        let expected = pattern[2..pattern.len() - 1].join(" ");
+        let expected = text_match_pattern_value(&pattern[2..pattern.len() - 1]);
         return input
             .as_text()
             .filter(|value| value == &expected)
             .map(|_| None);
     }
     None
+}
+
+fn text_match_pattern_value(tokens: &[String]) -> String {
+    if tokens.first().map(String::as_str) == Some("/") {
+        return format!("/{}", tokens[1..].join(""));
+    }
+    tokens.join(" ")
 }
 
 fn statement_is_row_initial_passthrough(
@@ -7088,7 +8016,7 @@ impl GenericCircuitRuntime {
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) =
             equations.eval_text(target, source, payload_text, payload_address, |path| {
-                self.root_textlike(path).ok()?.parse::<i64>().ok()
+                self.root_textlike(path).ok()
             })?
         else {
             return Err(format!(
@@ -7524,6 +8452,29 @@ impl GenericCircuitRuntime {
         }))
     }
 
+    fn commit_edit_draft_title_for_index<'a>(
+        &mut self,
+        list: &str,
+        index: usize,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        let Some(value) = self
+            .list_row_textlike_opt(list, index, "edit_text")
+            .or_else(|| self.list_row_textlike_opt(list, index, "edited_title"))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let (key, generation) = self.commit_indexed_text_field(list, index, "title", &value)?;
+        Ok(Some(GenericTextFieldCommit {
+            list: list.to_owned(),
+            key,
+            generation,
+            field: "title".to_owned(),
+            value: Cow::Owned(value),
+        }))
+    }
+
     fn commit_indexed_bool_source(
         &mut self,
         equations: &ScalarEquationPlan,
@@ -7693,6 +8644,7 @@ impl GenericCircuitRuntime {
             ScalarUpdateExpression::Const(_)
             | ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::BoolNot(_)
+            | ScalarUpdateExpression::MatchConst { .. }
             | ScalarUpdateExpression::Unsupported => Err(format!(
                 "text branch for `{target}` from `{source}` is not a supported indexed text expression"
             )
@@ -8943,6 +9895,10 @@ enum ScalarUpdateExpression {
         previous: String,
     },
     BoolNot(String),
+    MatchConst {
+        input: String,
+        arms: Vec<UpdateMatchArm>,
+    },
     Unsupported,
 }
 
@@ -9333,6 +10289,7 @@ enum GenericVisibleRowOccurrence {
 enum SourceActionKind {
     RootText,
     RootScalar,
+    RouterRoute,
     ListAppend,
     ListRemove,
     IndexedTextChange,
@@ -9349,6 +10306,7 @@ impl SourceActionKind {
         match self {
             Self::RootText => "root_text",
             Self::RootScalar => "root_scalar",
+            Self::RouterRoute => "router_route",
             Self::ListAppend => "list_append",
             Self::ListRemove => "list_remove",
             Self::IndexedTextChange => "indexed_text_change",
@@ -9653,6 +10611,7 @@ struct GenericDerivedPlan {
 #[derive(Clone, Debug)]
 struct GenericDerivedRootField {
     path: String,
+    kind: DerivedValueKind,
     statement: AstStatement,
 }
 
@@ -9724,6 +10683,60 @@ fn boon_value_scalar_text(value: &BoonValue) -> String {
         | BoonValue::List(_)
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_) => String::new(),
+    }
+}
+
+fn is_generic_render_constructor(function: &str) -> bool {
+    matches!(
+        function,
+        "Document/new"
+            | "Element/container"
+            | "Element/stripe"
+            | "Element/text"
+            | "Element/label"
+            | "Element/paragraph"
+            | "Element/link"
+            | "Element/button"
+            | "Element/checkbox"
+            | "Element/text_input"
+            | "Scene/new"
+            | "Scene/Element/stripe"
+            | "Scene/Element/block"
+            | "Scene/Element/text"
+            | "Scene/Element/text_input"
+            | "Scene/Element/checkbox"
+            | "Scene/Element/label"
+            | "Scene/Element/button"
+            | "Scene/Element/paragraph"
+            | "Scene/Element/link"
+    )
+}
+
+fn is_light_constructor(function: &str) -> bool {
+    matches!(
+        function,
+        "Light/directional" | "Light/ambient" | "Light/spot"
+    )
+}
+
+fn generic_constructor_kind(function: &str) -> &'static str {
+    match function {
+        "Document/new" => "Document",
+        "Element/container" => "Stack",
+        "Element/stripe" | "Scene/Element/stripe" => "Stripe",
+        "Element/text" | "Scene/Element/text" => "Text",
+        "Element/label" | "Scene/Element/label" => "Label",
+        "Element/paragraph" | "Scene/Element/paragraph" => "Paragraph",
+        "Element/link" | "Scene/Element/link" => "Link",
+        "Element/button" | "Scene/Element/button" => "Button",
+        "Element/checkbox" | "Scene/Element/checkbox" => "Checkbox",
+        "Element/text_input" | "Scene/Element/text_input" => "TextInput",
+        "Scene/new" => "Scene",
+        "Scene/Element/block" => "Block",
+        "Light/directional" => "DirectionalLight",
+        "Light/ambient" => "AmbientLight",
+        "Light/spot" => "SpotLight",
+        _ => "Record",
     }
 }
 
@@ -10010,6 +11023,8 @@ struct SourceRoute {
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
     derived_text_targets: Vec<String>,
+    router_route_targets: Vec<SourceRouteRouterRoute>,
+    root_text_transform_targets: Vec<SourceRouteRootTextTransform>,
     list_append_targets: Vec<SourceRouteListAppend>,
     list_remove_targets: Vec<SourceRouteListRemove>,
     actions: Vec<SourceAction>,
@@ -10034,10 +11049,32 @@ struct SourceRouteListAppend {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceRouteRouterRoute {
+    source: String,
+    target: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceRouteRootTextTransform {
+    source: String,
+    target: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceAction {
     RootScalar,
     DerivedText {
         target: String,
+    },
+    RouterRoute {
+        target: String,
+        path: String,
+    },
+    RootTextTransform {
+        target: String,
+        value: String,
     },
     ListRemove {
         list: String,
@@ -10153,6 +11190,12 @@ impl ScalarEquationPlan {
                     UpdateExpression::BoolNot { path } => {
                         ScalarUpdateExpression::BoolNot(path.clone())
                     }
+                    UpdateExpression::MatchConst { input, arms } => {
+                        ScalarUpdateExpression::MatchConst {
+                            input: input.clone(),
+                            arms: arms.clone(),
+                        }
+                    }
                     _ => ScalarUpdateExpression::Unsupported,
                 },
             })
@@ -10166,10 +11209,10 @@ impl ScalarEquationPlan {
         source: &str,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
-        read_number: impl Fn(&str) -> Option<i64> + Copy,
+        read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
         let Some(value) =
-            self.eval_text_value(target, source, payload_text, payload_address, read_number)?
+            self.eval_text_value(target, source, payload_text, payload_address, read_textlike)?
         else {
             return Ok(None);
         };
@@ -10185,7 +11228,7 @@ impl ScalarEquationPlan {
         source: &str,
         payload_text: Option<&'a str>,
         payload_address: Option<&'a str>,
-        read_number: impl Fn(&str) -> Option<i64> + Copy,
+        read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<ScalarTextValue<'a>>> {
         let Some(branch) = self
             .branches
@@ -10211,10 +11254,10 @@ impl ScalarEquationPlan {
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.clone()))))
             }
             ScalarUpdateExpression::NumberInfix { left, op, right } => {
-                let left = scalar_number_operand_value(left, read_number).ok_or_else(|| {
+                let left = scalar_number_operand_value(left, read_textlike).ok_or_else(|| {
                     format!("source `{source}` for `{target}` cannot read numeric operand `{left}`")
                 })?;
-                let right = scalar_number_operand_value(right, read_number).ok_or_else(|| {
+                let right = scalar_number_operand_value(right, read_textlike).ok_or_else(|| {
                     format!(
                         "source `{source}` for `{target}` cannot read numeric operand `{right}`"
                     )
@@ -10230,6 +11273,15 @@ impl ScalarEquationPlan {
                     }
                 };
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.to_string()))))
+            }
+            ScalarUpdateExpression::MatchConst { input, arms } => {
+                let current = read_textlike(input).ok_or_else(|| {
+                    format!("source `{source}` for `{target}` cannot read match input `{input}`")
+                })?;
+                Ok(arms
+                    .iter()
+                    .find(|arm| arm.pattern == current)
+                    .map(|arm| ScalarTextValue::Text(Cow::Owned(arm.output.clone()))))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
             ScalarUpdateExpression::TextTrimOrPrevious { .. }
@@ -10277,9 +11329,12 @@ impl ScalarEquationPlan {
 
 fn scalar_number_operand_value(
     operand: &str,
-    read_number: impl Fn(&str) -> Option<i64> + Copy,
+    read_textlike: impl Fn(&str) -> Option<String> + Copy,
 ) -> Option<i64> {
-    operand.parse::<i64>().ok().or_else(|| read_number(operand))
+    operand
+        .parse::<i64>()
+        .ok()
+        .or_else(|| read_textlike(operand)?.parse::<i64>().ok())
 }
 
 impl DerivedEquationPlan {
@@ -10369,9 +11424,16 @@ impl GenericDerivedPlan {
         let root_fields = ir
             .derived_values
             .iter()
-            .filter(|value| !value.indexed && value.kind == DerivedValueKind::Pure)
+            .filter(|value| {
+                !value.indexed
+                    && matches!(
+                        value.kind,
+                        DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
+                    )
+            })
             .map(|value| GenericDerivedRootField {
                 path: value.path.clone(),
+                kind: value.kind.clone(),
                 statement: value.statement.clone(),
             })
             .collect();
@@ -10449,12 +11511,26 @@ impl GenericDerivedPlan {
         let Some(expr) = self.expressions.get(expr_id) else {
             return false;
         };
-        let AstExprKind::Pipe { input, .. } = &expr.kind else {
-            return false;
+        let input = match &expr.kind {
+            AstExprKind::Pipe { input, .. }
+            | AstExprKind::Then { input, .. }
+            | AstExprKind::When { input } => *input,
+            _ => return false,
         };
-        self.expressions
-            .get(*input)
-            .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+        self.expr_chain_starts_with_pipe_placeholder(input)
+    }
+
+    fn expr_chain_starts_with_pipe_placeholder(&self, expr_id: usize) -> bool {
+        match self.expressions.get(expr_id).map(|expr| &expr.kind) {
+            Some(AstExprKind::Delimiter) => true,
+            Some(AstExprKind::Unknown(tokens)) => !unknown_tokens_are_quoted_text(tokens),
+            Some(AstExprKind::Pipe { input, .. })
+            | Some(AstExprKind::Then { input, .. })
+            | Some(AstExprKind::When { input }) => {
+                self.expr_chain_starts_with_pipe_placeholder(*input)
+            }
+            _ => false,
+        }
     }
 
     fn keys_for_runtime(
@@ -10473,6 +11549,12 @@ impl GenericDerivedPlan {
         }
         Ok(keys)
     }
+}
+
+fn unknown_tokens_are_quoted_text(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.trim_start().starts_with('"'))
 }
 
 impl GenericDerivedState {
@@ -10688,6 +11770,20 @@ impl SourceRoutePlan {
                 .derived_text_targets
                 .push(transform.target.clone());
         }
+        for target in router_route_targets_from_ir(ir)? {
+            let source_id = source_id_for_path(ir, &target.source)?;
+            routes
+                .route_mut(&target.source, source_id)
+                .router_route_targets
+                .push(target);
+        }
+        for target in root_text_transform_targets_from_ir(ir)? {
+            let source_id = source_id_for_path(ir, &target.source)?;
+            routes
+                .route_mut(&target.source, source_id)
+                .root_text_transform_targets
+                .push(target);
+        }
         for operation in &lists.operations {
             match &operation.kind {
                 RuntimeListOperationKind::Append { trigger, .. } => {
@@ -10853,6 +11949,8 @@ impl SourceRoutePlan {
             indexed_text_targets: Vec::new(),
             indexed_bool_targets: Vec::new(),
             derived_text_targets: Vec::new(),
+            router_route_targets: Vec::new(),
+            root_text_transform_targets: Vec::new(),
             list_append_targets: Vec::new(),
             list_remove_targets: Vec::new(),
             actions: Vec::new(),
@@ -10888,6 +11986,141 @@ fn source_id_for_path(ir: &TypedProgram, path: &str) -> RuntimeResult<SourceId> 
         .ok_or_else(|| format!("source route `{path}` has no typed IR SourceId").into())
 }
 
+fn router_route_targets_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<SourceRouteRouterRoute>> {
+    let mut targets = Vec::new();
+    for value in &ir.derived_values {
+        if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
+            continue;
+        }
+        let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
+        if !statement_calls_router_go_to(&exprs) {
+            continue;
+        }
+        for source in &value.sources {
+            let Some(path) = source_then_text_value(&exprs, source) else {
+                continue;
+            };
+            targets.push(SourceRouteRouterRoute {
+                source: source.clone(),
+                target: value.path.clone(),
+                path,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+fn root_text_transform_targets_from_ir(
+    ir: &TypedProgram,
+) -> RuntimeResult<Vec<SourceRouteRootTextTransform>> {
+    let mut targets = Vec::new();
+    for value in &ir.derived_values {
+        if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
+            continue;
+        }
+        let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
+        if statement_calls_router_go_to(&exprs) {
+            continue;
+        }
+        for source in &value.sources {
+            if source_is_scoped(ir, source) {
+                continue;
+            }
+            let Some(output) = source_then_text_value(&exprs, source) else {
+                continue;
+            };
+            targets.push(SourceRouteRootTextTransform {
+                source: source.clone(),
+                target: value.path.clone(),
+                value: output,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+fn statement_calls_router_go_to(exprs: &[AstExpr]) -> bool {
+    exprs.iter().any(|expr| match &expr.kind {
+        AstExprKind::Pipe { op, .. } => op == "Router/go_to",
+        AstExprKind::Call { function, .. } => function == "Router/go_to",
+        _ => false,
+    })
+}
+
+fn source_then_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
+    exprs.iter().find_map(|expr| {
+        let AstExprKind::Then { input, output } = expr.kind else {
+            return None;
+        };
+        let input_path = ast_argument_value_in_exprs(exprs, input)?;
+        if !source_event_path_matches(&input_path, source)
+            && !source_path_before_line_matches(exprs, expr.line, source)
+        {
+            return None;
+        }
+        output
+            .and_then(|output| ast_argument_value_in_exprs(exprs, output))
+            .or_else(|| simple_value_after_line(exprs, expr.line))
+    })
+}
+
+fn source_path_before_line_matches(exprs: &[AstExpr], line: usize, source: &str) -> bool {
+    exprs
+        .iter()
+        .filter(|expr| expr.line < line)
+        .rev()
+        .find_map(|expr| match &expr.kind {
+            AstExprKind::Path(parts) => Some(parts.join(".")),
+            _ => None,
+        })
+        .is_some_and(|path| source_event_path_matches(&path, source))
+}
+
+fn simple_value_after_line(exprs: &[AstExpr], line: usize) -> Option<String> {
+    exprs
+        .iter()
+        .filter(|expr| expr.line > line)
+        .find_map(|expr| ast_simple_text_value_in_exprs(exprs, expr.id))
+}
+
+fn ast_simple_text_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(value)
+        | AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
+        | AstExprKind::StringLiteral(value)
+        | AstExprKind::TextLiteral(value) => Some(value.clone()),
+        AstExprKind::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
+fn source_is_scoped(ir: &TypedProgram, source: &str) -> bool {
+    ir.sources
+        .iter()
+        .find(|candidate| candidate.path == source)
+        .is_some_and(|candidate| candidate.scoped)
+}
+
+fn source_event_path_matches(path: &str, source: &str) -> bool {
+    source_event_ref_variants(source).iter().any(|variant| {
+        path == variant
+            || path
+                .strip_prefix(variant)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+fn source_event_ref_variants(source: &str) -> Vec<String> {
+    let mut variants = vec![source.to_owned()];
+    if let Some((_, suffix)) = source.split_once('.') {
+        variants.push(suffix.to_owned());
+        variants.push(format!("item.{suffix}"));
+    }
+    variants
+}
+
 impl ListSourceBindingPlan {
     fn from_ir(ir: &TypedProgram) -> Self {
         let mut list_slots = Vec::new();
@@ -10899,7 +12132,7 @@ impl ListSourceBindingPlan {
                 continue;
             };
             let row_scope = row_scope.row_scope.clone();
-            let prefix = format!("{row_scope}.sources.");
+            let prefix = format!("{row_scope}.");
             let source_paths = ir
                 .sources
                 .iter()
@@ -10950,6 +12183,22 @@ impl SourceRoute {
         );
         self.actions
             .extend(
+                self.router_route_targets
+                    .iter()
+                    .map(|target| SourceAction::RouterRoute {
+                        target: target.target.clone(),
+                        path: target.path.clone(),
+                    }),
+            );
+        self.actions
+            .extend(self.root_text_transform_targets.iter().map(|target| {
+                SourceAction::RootTextTransform {
+                    target: target.target.clone(),
+                    value: target.value.clone(),
+                }
+            }));
+        self.actions
+            .extend(
                 self.list_remove_targets
                     .iter()
                     .map(|target| SourceAction::ListRemove {
@@ -10984,6 +12233,7 @@ impl SourceRoute {
                     | ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::SourceAddress
                     | ScalarUpdateExpression::BoolNot(_)
+                    | ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
                 Some(SourceAction::IndexedText {
@@ -11007,6 +12257,7 @@ impl SourceRoute {
                     | ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                    | ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,
                 };
                 Some(SourceAction::IndexedBool {
@@ -11426,7 +12677,10 @@ impl ListScenarioHarness {
                 }
             }
             ListScenarioEvent::Source(routed)
-                if routed.route_kind == SourceActionKind::RootScalar =>
+                if matches!(
+                    routed.route_kind,
+                    SourceActionKind::RootScalar | SourceActionKind::RouterRoute
+                ) =>
             {
                 let seq = self.next_source_seq();
                 let input = self.generic.source_action_input_for_event(
@@ -11602,7 +12856,10 @@ impl ListScenarioHarness {
                         |_| Ok(()),
                     )?;
                     if key == "Enter" {
-                        if let Some(title) = batch.text("title") {
+                        if let Some(title) = batch
+                            .text("title")
+                            .or_else(|| self.edit_draft_title_commit(index).ok().flatten())
+                        {
                             emit_list_default_protocol_mutation(
                                 GenericSourceMutation::TextField(title),
                                 deltas,
@@ -11649,7 +12906,10 @@ impl ListScenarioHarness {
                     },
                     |_| Ok(()),
                 )?;
-                if let Some(title) = batch.text("title") {
+                if let Some(title) = batch
+                    .text("title")
+                    .or_else(|| self.edit_draft_title_commit(index).ok().flatten())
+                {
                     emit_list_default_protocol_mutation(
                         GenericSourceMutation::TextField(title),
                         deltas,
@@ -11771,6 +13031,7 @@ impl ListScenarioHarness {
             match route_kind {
                 SourceActionKind::ListAppend
                 | SourceActionKind::RootText
+                | SourceActionKind::RouterRoute
                 | SourceActionKind::ListRemove
                 | SourceActionKind::IndexedBoolBulk
                 | SourceActionKind::RootScalar => {
@@ -12037,6 +13298,32 @@ impl ListScenarioHarness {
 
     fn find_index(&self, title: &str) -> RuntimeResult<usize> {
         self.find_index_at_occurrence(title, 1)
+    }
+
+    fn edit_draft_title_commit<'a>(
+        &self,
+        index: usize,
+    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
+        let Some(value) = self
+            .generic
+            .list_row_textlike_opt("todos", index, "edit_text")
+            .or_else(|| {
+                self.generic
+                    .list_row_textlike_opt("todos", index, "edited_title")
+            })
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let (key, generation) = self.generic.row_identity("todos", index)?;
+        Ok(Some(GenericTextFieldCommit {
+            list: "todos".to_owned(),
+            key,
+            generation,
+            field: "title".to_owned(),
+            value: Cow::Owned(value),
+        }))
     }
 
     fn list_row_identity_for_test(&self, index: usize) -> RuntimeResult<(u64, u64)> {
@@ -12546,6 +13833,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_units_hash_preserves_single_file_hash_compatibility() {
+        let source = "document: Document/new(child: TEXT { ok })";
+        assert_eq!(
+            source_units_hash(&[RuntimeSourceUnit {
+                path: "examples/single.bn".to_owned(),
+                source: source.to_owned(),
+            }]),
+            sha256_bytes(source.as_bytes())
+        );
+        assert_ne!(
+            source_units_hash(&[
+                RuntimeSourceUnit {
+                    path: "examples/a.bn".to_owned(),
+                    source: source.to_owned(),
+                },
+                RuntimeSourceUnit {
+                    path: "examples/b.bn".to_owned(),
+                    source: source.to_owned(),
+                },
+            ]),
+            sha256_bytes(format!("{source}{source}").as_bytes())
+        );
+    }
+
+    #[test]
     fn cells_sources_do_not_use_legacy_formula_operators() {
         let legacy_operator_prefix = ["For", "mula", "/"].concat();
         for (path, source) in [
@@ -12632,8 +13944,342 @@ mod tests {
         ListScenarioHarness::from_generic(generic).unwrap()
     }
 
+    fn physical_todomvc_project_for_test() -> ParsedProgram {
+        parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            [
+                (
+                    "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Glassmorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Glassmorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neobrutalism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neobrutalism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neumorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neumorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Theme.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Theme.bn").to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Generated/Assets.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Generated/Assets.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/RUN.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/RUN.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn physical_todomvc_project_root_for_test() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo_mvc_physical")
+    }
+
+    #[test]
+    fn physical_todomvc_source_preserves_original_except_source_rename() {
+        let original_root = Path::new(
+            "/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc_physical",
+        );
+        assert!(
+            original_root.exists(),
+            "original physical TodoMVC checkout is required for source preservation proof"
+        );
+        let migrated_root = physical_todomvc_project_root_for_test();
+        for relative in [
+            "BUILD.bn",
+            "Generated/Assets.bn",
+            "RUN.bn",
+            "Theme/Glassmorphism.bn",
+            "Theme/Neobrutalism.bn",
+            "Theme/Neumorphism.bn",
+            "Theme/Professional.bn",
+            "Theme/Theme.bn",
+            "assets/icons/checkbox_active.svg",
+            "assets/icons/checkbox_completed.svg",
+        ] {
+            let original = std::fs::read_to_string(original_root.join(relative)).unwrap();
+            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
+            let expected = if relative.ends_with(".bn") {
+                original.replace("LINK", "SOURCE")
+            } else {
+                original
+            };
+            assert_eq!(
+                migrated, expected,
+                "{relative} changed beyond LINK to SOURCE"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_todomvc_build_assets_match_generated_file() {
+        let root = physical_todomvc_project_root_for_test();
+        let temp_root =
+            std::env::temp_dir().join(format!("boon-physical-build-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        copy_dir_for_test(&root, &temp_root);
+        std::fs::write(temp_root.join("Generated/Assets.bn"), "").unwrap();
+
+        let result = run_project_build_file(&temp_root, Path::new("BUILD.bn"), true).unwrap();
+        assert_eq!(result.status, "pass");
+        assert_eq!(result.output_file, "./Generated/Assets.bn");
+        assert_eq!(result.output_binding, "icon");
+        assert_eq!(
+            result.input_files,
+            vec![
+                "assets/icons/checkbox_active.svg".to_owned(),
+                "assets/icons/checkbox_completed.svg".to_owned()
+            ]
+        );
+        assert_eq!(result.written_files, vec!["Generated/Assets.bn".to_owned()]);
+
+        let generated = std::fs::read_to_string(temp_root.join("Generated/Assets.bn")).unwrap();
+        let expected = std::fs::read_to_string(root.join("Generated/Assets.bn")).unwrap();
+        assert_eq!(generated, expected);
+        assert_eq!(result.output_sha256, sha256_bytes(expected.as_bytes()));
+
+        let verified = generated_output_for_project_build_file(&root, Path::new("BUILD.bn"))
+            .expect("checked generated assets should match BUILD.bn output");
+        assert_eq!(verified, expected);
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn build_file_runner_rejects_paths_that_escape_project_root() {
+        let root =
+            std::env::temp_dir().join(format!("boon-build-sandbox-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/icons")).unwrap();
+        std::fs::create_dir_all(root.join("Generated")).unwrap();
+        std::fs::write(
+            root.join("assets/icons/checkbox_active.svg"),
+            "<svg><circle /></svg>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("BUILD.bn"),
+            r#"icons_directory: TEXT { ../assets/icons }
+output_file: TEXT { ./Generated/Assets.bn }
+svg_files: icons_directory |> Directory/entries() |> List/retain(item, if: item.extension == TEXT { svg }) |> List/sort_by(item, key: item.path)
+generation_result: svg_files |> List/map(old, new: old |> icon_code()) |> Text/join_lines() |> File/write_text(path: output_file)
+generation_error_handling: generation_result |> WHEN { Ok => Build/succeed() error => Build/fail() }
+FUNCTION icon_code(item) {
+    item.path |> File/read_text() |> Url/encode() |> WHEN { encoded => Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }] }
+}
+-- FLUSH
+"#,
+        )
+        .unwrap();
+        let error = run_project_build_file(&root, Path::new("BUILD.bn"), true)
+            .expect_err("parent-directory paths must be rejected");
+        assert!(
+            error.to_string().contains("parent-directory"),
+            "unexpected sandbox error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn copy_dir_for_test(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let target = destination.join(entry.file_name());
+            if path.is_dir() {
+                copy_dir_for_test(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
     fn list_row_index(runtime: &ListScenarioHarness, title: &str) -> usize {
         runtime.find_index(title).unwrap()
+    }
+
+    #[test]
+    fn physical_todomvc_root_source_event_default_materializes() {
+        let parsed = physical_todomvc_project_for_test();
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            ir.derived_values.iter().any(|value| {
+                value.path == "theme_options.name"
+                    && value.kind == DerivedValueKind::SourceEventTransform
+                    && !value.indexed
+            }),
+            "{:#?}",
+            ir.derived_values
+                .iter()
+                .map(|value| format!("{} {:?} indexed={}", value.path, value.kind, value.indexed))
+                .collect::<Vec<_>>()
+        );
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        assert_eq!(
+            generic.root_textlike_ref("theme_options.name").unwrap(),
+            "Professional"
+        );
+    }
+
+    #[test]
+    fn physical_todomvc_theme_source_event_updates_latest_root_text() {
+        let parsed = physical_todomvc_project_for_test();
+        let ir = lower(&parsed).unwrap();
+        let theme_targets = root_text_transform_targets_from_ir(&ir).unwrap();
+        let theme_debug = ir
+            .derived_values
+            .iter()
+            .filter(|value| value.path == "theme_options.name")
+            .map(|value| {
+                let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
+                (
+                    value.sources.clone(),
+                    exprs
+                        .iter()
+                        .map(|expr| (expr.id, expr.line, format!("{:?}", expr.kind)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            theme_targets.iter().any(|target| {
+                target.source == "store.elements.theme_switcher.glassmorphism"
+                    && target.target == "theme_options.name"
+                    && target.value == "Glassmorphism"
+            }),
+            "{theme_targets:#?}\n{theme_debug:#?}"
+        );
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("theme_options.name")
+                .unwrap(),
+            "Professional"
+        );
+
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("theme glassmorphism".to_owned()),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.theme_switcher.glassmorphism".to_owned()),
+        );
+        let step = ScenarioStep {
+            id: "physical-theme-glassmorphism".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..ScenarioStep::default()
+        };
+        let mut deltas = Vec::new();
+        let mut patches = Vec::new();
+        runtime
+            .apply_step_into(&step, &mut deltas, &mut patches)
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("theme_options.name")
+                .unwrap(),
+            "Glassmorphism"
+        );
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("theme_options.name")
+        }));
+    }
+
+    #[test]
+    fn physical_todomvc_router_filter_source_updates_selected_filter() {
+        let parsed = physical_todomvc_project_for_test();
+        let ir = lower(&parsed).unwrap();
+        let router_targets = router_route_targets_from_ir(&ir).unwrap();
+        assert!(
+            router_targets.iter().any(|target| {
+                target.source == "store.elements.filter_buttons.completed"
+                    && target.path == "/completed"
+            }),
+            "{router_targets:#?}"
+        );
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("store.selected_filter")
+                .unwrap(),
+            "All"
+        );
+
+        let mut action = BTreeMap::new();
+        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        action.insert(
+            "target".to_owned(),
+            toml::Value::String("completed filter".to_owned()),
+        );
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.filter_buttons.completed".to_owned()),
+        );
+        let step = ScenarioStep {
+            id: "physical-router-filter".to_owned(),
+            user_action: Some(action),
+            expected_source_event: Some(expected),
+            ..ScenarioStep::default()
+        };
+        let mut deltas = Vec::new();
+        let mut patches = Vec::new();
+        runtime
+            .apply_step_into(&step, &mut deltas, &mut patches)
+            .unwrap();
+
+        assert_eq!(runtime.generic.router_route, "/completed");
+        let selected_filter_field = runtime
+            .generic
+            .generic_derived
+            .root_fields
+            .iter()
+            .find(|field| field.path == "store.selected_filter")
+            .cloned()
+            .unwrap();
+        let selected_filter_value = runtime
+            .generic
+            .eval_statement_value(
+                &selected_filter_field.statement,
+                &mut GenericEvalFrame::root(),
+            )
+            .unwrap()
+            .as_text();
+        assert_eq!(selected_filter_value.as_deref(), Some("Completed"));
+        assert_eq!(
+            runtime
+                .generic
+                .root_textlike_ref("store.selected_filter")
+                .unwrap(),
+            "Completed"
+        );
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.selected_filter")
+        }));
     }
 
     #[test]
@@ -15291,6 +16937,10 @@ FUNCTION new_entry(entry) {
             .replace("change: SOURCE", "input: SOURCE")
             .replace("commit: SOURCE", "apply: SOURCE")
             .replace("cancel: SOURCE", "revert: SOURCE")
+            .replace(
+                "sources.editor.events.change",
+                "sources.editor.events.input",
+            )
             .replace("sources.editor.change", "sources.editor.input")
             .replace("sources.editor.commit", "sources.editor.apply")
             .replace("sources.editor.cancel", "sources.editor.revert");

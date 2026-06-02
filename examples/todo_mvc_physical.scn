@@ -1,0 +1,116 @@
+name = "todo_mvc_physical"
+source = "examples/todo_mvc_physical/RUN.bn"
+
+[[step]]
+id = "initial"
+expect_root_text = { "theme_options.name" = "Professional" }
+
+[[step]]
+id = "add-todo"
+user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "Ship physical TodoMVC" }
+expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "Ship physical TodoMVC" }
+expect_root_text = { "theme_options.name" = "Professional" }
+
+[[step]]
+id = "reject-empty-todo"
+user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "   " }
+expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "   " }
+
+[[step]]
+id = "toggle-one-todo"
+user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC" }
+
+[[step]]
+id = "toggle-all"
+user_action = { kind = "click", target = "toggle all" }
+expected_source_event = { source = "store.elements.toggle_all_checkbox" }
+
+[[step]]
+id = "filter-all-active-completed"
+user_action = { kind = "click", target = "all filter" }
+expected_source_event = { source = "store.elements.filter_buttons.all" }
+expect_root_text = { "store.selected_filter" = "All" }
+
+[[step]]
+id = "filter-active"
+user_action = { kind = "click", target = "active filter" }
+expected_source_event = { source = "store.elements.filter_buttons.active" }
+expect_root_text = { "store.selected_filter" = "Active" }
+
+[[step]]
+id = "filter-completed"
+user_action = { kind = "click", target = "completed filter" }
+expected_source_event = { source = "store.elements.filter_buttons.completed" }
+expect_root_text = { "store.selected_filter" = "Completed" }
+
+[[step]]
+id = "filter-all-before-edit"
+user_action = { kind = "click", target = "all filter" }
+expected_source_event = { source = "store.elements.filter_buttons.all" }
+expect_root_text = { "store.selected_filter" = "All" }
+
+[[step]]
+id = "edit-todo"
+user_action = { kind = "double_click", target = "todo title", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_title_element", target_text = "Ship physical TodoMVC" }
+
+[[step]]
+id = "cancel-edit"
+user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Escape" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Escape" }
+
+[[step]]
+id = "edit-todo-commit-open"
+user_action = { kind = "double_click", target = "todo title", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_title_element", target_text = "Ship physical TodoMVC" }
+
+[[step]]
+id = "edit-todo-change"
+user_action = { kind = "type_text", target = "editing todo title", target_text = "Ship physical TodoMVC", text = "Ship physical TodoMVC edited" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", text = "Ship physical TodoMVC edited" }
+
+[[step]]
+id = "edit-todo-commit"
+user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Enter" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Enter" }
+expect_titles = ["Ship physical TodoMVC edited"]
+
+[[step]]
+id = "toggle-edited-todo-completed"
+user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC edited" }
+expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC edited" }
+
+[[step]]
+id = "clear-completed"
+user_action = { kind = "click", target = "clear completed" }
+expected_source_event = { source = "store.elements.remove_completed_button" }
+
+[[step]]
+id = "switch-theme-professional"
+user_action = { kind = "click", target = "theme professional" }
+expected_source_event = { source = "store.elements.theme_switcher.professional" }
+expect_root_text = { "theme_options.name" = "Professional" }
+
+[[step]]
+id = "switch-theme-glassmorphism"
+user_action = { kind = "click", target = "theme glassmorphism" }
+expected_source_event = { source = "store.elements.theme_switcher.glassmorphism" }
+expect_root_text = { "theme_options.name" = "Glassmorphism" }
+
+[[step]]
+id = "switch-theme-neobrutalism"
+user_action = { kind = "click", target = "theme neobrutalism" }
+expected_source_event = { source = "store.elements.theme_switcher.neobrutalism" }
+expect_root_text = { "theme_options.name" = "Neobrutalism" }
+
+[[step]]
+id = "switch-theme-neumorphism"
+user_action = { kind = "click", target = "theme neumorphism" }
+expected_source_event = { source = "store.elements.theme_switcher.neumorphism" }
+expect_root_text = { "theme_options.name" = "Neumorphism" }
+
+[[step]]
+id = "toggle-light-dark-mode"
+user_action = { kind = "click", target = "theme mode toggle" }
+expected_source_event = { source = "store.elements.theme_switcher.mode_toggle" }

@@ -1,0 +1,356 @@
+-- Glassmorphism Theme
+-- Transparent glass-like surfaces with physical refraction
+-- High transparency + lower gloss (= higher roughness) creates frosted glass effect
+-- Renderer approximates this with backdrop blur for performance
+-- Soft diffuse lighting, subtle colors
+
+FUNCTION get(from, of) {
+    from |> WHEN {
+        Material => of |> material()
+        Font => of |> font()
+        Text => of |> text()
+        Depth => of |> depth()
+        Elevation => of |> elevation()
+        Corners => of |> corners()
+        Lights => lights()
+        Geometry => geometry()
+        Sizing => of |> sizing()
+        Spacing => of |> spacing()
+        SpringRange => of |> spring_range()
+    }
+}
+
+FUNCTION material(material) {
+    BLOCK {
+        background_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
+                Dark => Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
+            }
+        ]
+
+        surface_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.2, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.9
+            refraction: 1.5
+            gloss: 0.65
+        ]
+
+        surface_variant_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.9
+            refraction: 1.5
+            gloss: 0.65
+        ]
+
+        surface_elevated_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+        ]
+
+        interactive_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.65
+            metal: 0.03
+        ]
+
+        primary_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
+                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+            }
+            transparency: 0.8
+            refraction: 1.5
+        ]
+
+        primary_subtle_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 260]
+                Dark => Oklch[lightness: 0.3, chroma: 0.08, hue: 260]
+            }
+            transparency: 0.9
+            refraction: 1.5
+        ]
+
+        danger_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 10]
+                Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 10]
+            }
+        ]
+
+        material |> WHEN {
+            Background => background_base
+
+            Surface => surface_base
+
+            SurfaceVariant => surface_variant_base
+
+            SurfaceElevated => surface_elevated_base
+
+            Interactive[hovered] => interactive_base
+
+            InteractiveRecessed[focus] => [
+                ...surface_base
+                transparency: 0.7
+                gloss: focus |> WHEN {
+                    False => 0.8
+                    True => 0.6
+                }
+                glow: focus |> WHEN {
+                    True => [
+                        color: PASSED.mode |> WHEN {
+                            Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                            Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
+                        }
+                        intensity: 0.15
+                    ]
+                    False => None
+                }
+            ]
+
+            Primary => primary_base
+
+            PrimarySubtle => primary_subtle_base
+
+            Danger => danger_base
+        }
+    }
+}
+
+FUNCTION font(font) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text: Oklch[lightness: 0.25, chroma: 0.02, hue: 240]
+                text_secondary: Oklch[lightness: 0.45, chroma: 0.02, hue: 240]
+                text_tertiary: Oklch[lightness: 0.55, chroma: 0.015, hue: 240]
+                text_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240]
+                text_header: Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
+                danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10]
+            ]
+            Dark => [
+                text: Oklch[lightness: 0.9, chroma: 0.01, hue: 240]
+                text_secondary: Oklch[lightness: 0.75, chroma: 0.01, hue: 240]
+                text_tertiary: Oklch[lightness: 0.65, chroma: 0.01, hue: 240]
+                text_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240]
+                text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+                danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10]
+            ]
+        }
+
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
+        font |> WHEN {
+            Hero => [
+                size: 100
+                color: colors.text_header
+                weight: Hairline
+            ]
+
+            Body => body_base
+
+            BodySecondary => [
+                size: 14
+                color: colors.text_secondary
+            ]
+
+            BodyDisabled => [
+                ...body_base
+                color: colors.text_disabled
+            ]
+
+            BodyDanger => [
+                size: 30
+                align: Center
+                color: colors.danger
+            ]
+
+            Input => [...body_base]
+
+            Placeholder => [
+                ...body_base
+                style: Italic
+                color: colors.text_secondary
+            ]
+
+            ButtonIcon[checked] => [
+                size: 22
+                color: checked |> WHEN {
+                    True => colors.text
+                    False => colors.text_disabled
+                }
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                line: [underline: hovered]
+            ]
+        }
+    }
+}
+
+FUNCTION text(of) {
+    BLOCK {
+        small_base: [
+            font: font(of: Small)
+            depth: 1
+            move: [further: 3]
+            relief: Carved[wall: 1]
+        ]
+
+        of |> WHEN {
+            Hero => [
+                font: font(of: Hero)
+                depth: 4
+                move: [closer: 4]
+                relief: Raised
+            ]
+
+            BodySecondary => [
+                font: font(of: BodySecondary)
+                depth: 1.5
+                move: [further: 2]
+                relief: Raised
+            ]
+
+            ButtonIcon[checked] => [
+                font: font(of: ButtonIcon[checked: checked])
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                font: font(of: SmallLink[hovered: hovered])
+            ]
+        }
+    }
+}
+
+FUNCTION depth(of) {
+    of |> WHEN {
+        Container => 6
+        Element => 4
+        Detail => 2
+        Hero => 8
+    }
+}
+
+FUNCTION elevation(of) {
+    of |> WHEN {
+        Card => 40
+        EditingFocus => 20
+        Selection => 4
+        TodoItem => 4
+        Inset => -4
+    }
+}
+
+FUNCTION corners(of) {
+    of |> WHEN {
+        Touch => 3
+        Comfort => 6
+        Soft => 8
+        Pill => Fully
+    }
+}
+
+FUNCTION lights() {
+    LIST {
+        Light/directional(
+            azimuth: 345
+            altitude: 40
+            spread: 1.5
+            intensity: 1.1
+            color: Oklch[lightness: 0.97, chroma: 0.02, hue: 200]
+        )
+        Light/ambient(
+            intensity: 0.45
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.82, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.35, chroma: 0.02, hue: 220]
+            }
+        )
+        Light/spot(
+            target: FocusedElement
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
+            }
+            intensity: 0.35
+            radius: 80
+            softness: 0.95
+        )
+    }
+}
+
+FUNCTION geometry() {
+    [
+        edge_radius: 2
+        bevel_angle: 45
+    ]
+}
+
+FUNCTION sizing(of) {
+    of |> WHEN {
+        TouchTarget => 40
+        ToggleControl => 60
+        IconContainer => 34
+        EditingInputWidth => 506
+    }
+}
+
+FUNCTION spacing(of) {
+    of |> WHEN {
+        None => 0
+        Tight => 5
+        Small => 9
+        Standard => 10
+        IconOffset => 18
+        Section => 65
+    }
+}
+
+FUNCTION spring_range(of) {
+    of |> WHEN {
+        Button => [
+            extend: 0
+            compress: 0
+        ]
+        ButtonDestructive => [
+            extend: 0
+            compress: 0
+        ]
+        Checkbox => [
+            extend: 0
+            compress: 0
+        ]
+    }
+}

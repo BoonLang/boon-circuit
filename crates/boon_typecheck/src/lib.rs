@@ -422,11 +422,17 @@ impl<'a> Checker<'a> {
             name_bindings.insert("PASSED".to_owned(), passed_type);
         }
         let flow_bindings = flow_bindings(program);
+        let render_contracts =
+            RenderContractRegistry::default().with_active_root(if scene_root(program).is_some() {
+                "scene"
+            } else {
+                "document"
+            });
         let mut checker = Self {
             program,
             vars: TypeVarStore::default(),
             builtins: BuiltinSignatureRegistry::default(),
-            render_contracts: RenderContractRegistry::default(),
+            render_contracts,
             source_paths,
             source_payload_shape_table,
             source_payload_types,
@@ -450,6 +456,11 @@ impl<'a> Checker<'a> {
 
     fn refresh_static_row_scope_bindings(&mut self) {
         for row_scope in &self.program.row_scope_functions {
+            let return_type =
+                self.user_function_return_type(&row_scope.function, &mut BTreeSet::new());
+            if return_type.as_ref().is_some_and(is_renderable_type) {
+                continue;
+            }
             let Some(row_type) = canonical_row_scope_type(
                 self.program,
                 &self.name_bindings,
@@ -457,7 +468,7 @@ impl<'a> Checker<'a> {
                 &row_scope.function,
                 &row_scope.list,
                 &row_scope.row_scope,
-                self.user_function_return_type(&row_scope.function, &mut BTreeSet::new()),
+                return_type,
             ) else {
                 continue;
             };
@@ -469,7 +480,11 @@ impl<'a> Checker<'a> {
             );
             if let Type::Object(shape) = &row_type {
                 for (field, ty) in shape.ordered_fields() {
-                    self.name_bindings.insert(field.clone(), ty.clone());
+                    insert_simple_binding_preserving_renderable(
+                        &mut self.name_bindings,
+                        field,
+                        ty.clone(),
+                    );
                     self.name_bindings
                         .insert(format!("{}.{}", row_scope.row_scope, field), ty.clone());
                 }
@@ -553,6 +568,7 @@ impl<'a> Checker<'a> {
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
+            || statement_field(statement).as_deref() == Some("scene")
             || self.statement_enters_render_context(statement);
         if let Some(expr_id) = statement.expr {
             let flow = self.ensure_expr(expr_id);
@@ -568,9 +584,7 @@ impl<'a> Checker<'a> {
                 self.check_render_constructor_fields(statement, &function);
             }
         }
-        if statement_field(statement).as_deref() == Some("style") {
-            self.check_style_statement(statement);
-        }
+        self.check_pipeline_continuation_compatibility(statement);
         self.check_pattern_constraints(statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
@@ -669,7 +683,8 @@ impl<'a> Checker<'a> {
         let slot_name = statement_field(statement).unwrap_or_else(|| "items".to_owned());
         let expected_contract = self.render_contracts.slot_contract(&slot_name).to_owned();
         let mut value_expr_id =
-            direct_statement_value_expr_id(statement, &self.program.expressions);
+            statement_pipeline_final_expr_id(statement, &self.program.expressions)
+                .or_else(|| direct_statement_value_expr_id(statement, &self.program.expressions));
         let mut optional_list_map_binding_id = None;
         let mut item_scope_id = None;
         let mut template_function = None;
@@ -683,6 +698,12 @@ impl<'a> Checker<'a> {
                     open_object_type()
                 }
             });
+        if let Some(static_type) = self
+            .static_statement_type(statement, &mut BTreeSet::new())
+            .filter(|ty| render_slot_accepts_type(&slot_name, ty))
+        {
+            actual_type = static_type;
+        }
         if let Some(static_list_type) = self.render_slot_static_list_type(statement) {
             actual_type = static_list_type;
         }
@@ -777,6 +798,9 @@ impl<'a> Checker<'a> {
             let Some(field) = statement_field(child) else {
                 continue;
             };
+            if field == "style" {
+                self.check_style_statement(child);
+            }
             let Some(expected) = render_arg_expected_type(function, Some(&field)) else {
                 continue;
             };
@@ -905,6 +929,7 @@ impl<'a> Checker<'a> {
                 let shape = ObjectShape::from_ordered_fields(
                     fields
                         .iter()
+                        .filter(|field| !field.spread)
                         .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
                     false,
                 );
@@ -915,12 +940,7 @@ impl<'a> Checker<'a> {
                 }])
             }
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-                Type::Object(ObjectShape::from_ordered_fields(
-                    fields
-                        .iter()
-                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
-                    false,
-                ))
+                Type::Object(self.infer_record_shape(fields))
             }
             AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
             AstExprKind::Call { function, args } => {
@@ -932,7 +952,7 @@ impl<'a> Checker<'a> {
                     self.check_style_args(args);
                     self.check_render_constructor_call_args(expr.id, function, None, args);
                 }
-                if function == "Bool/not" {
+                if function == "Bool/not" || function == "Bool/toggle" {
                     let input_flow = args
                         .first()
                         .map(|arg| self.ensure_expr(arg.value))
@@ -956,15 +976,26 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Pipe { input, op, args } => {
                 let input_flow = self.ensure_expr(*input);
+                let input_is_placeholder = self.expr_id_is_pipe_placeholder(*input);
                 for arg in args {
                     self.ensure_expr(arg.value);
                 }
-                self.check_user_function_arguments(expr.id, op, Some(*input), args);
+                if !op.starts_with("Field/") {
+                    self.check_user_function_arguments(expr.id, op, Some(*input), args);
+                }
                 if self.render_contracts.is_render_constructor(op) {
                     self.check_style_args(args);
                     self.check_render_constructor_call_args(expr.id, op, Some(&input_flow), args);
                 }
-                if op == "List/map" {
+                if let Some(field) = op.strip_prefix("Field/") {
+                    match &input_flow.ty {
+                        Type::Object(shape) => {
+                            shape.fields.get(field).cloned().unwrap_or(Type::Unknown)
+                        }
+                        Type::Unknown => Type::Unknown,
+                        _ => Type::Unknown,
+                    }
+                } else if op == "List/map" {
                     if let Some(new_expr_id) = list_map_new_expr_id(args) {
                         let item_type = self.ensure_expr(new_expr_id).ty;
                         if type_contains_skip(&item_type) {
@@ -976,8 +1007,25 @@ impl<'a> Checker<'a> {
                     }
                     self.record_runtime_list_map(expr.id, *input, args);
                     Type::List(Box::new(self.list_map_result_item_type(args)))
-                } else if matches!(op.as_str(), "List/retain" | "List/remove") {
+                } else if op == "List/every" {
+                    true_false_type()
+                } else if matches!(op.as_str(), "List/any" | "List/is_not_empty") {
+                    true_false_type()
+                } else if op == "List/latest" {
+                    if input_is_placeholder {
+                        open_object_type()
+                    } else {
+                        list_item_type_from_list_type(&input_flow.ty)
+                            .unwrap_or_else(open_object_type)
+                    }
+                } else if op == "SOURCE" {
                     input_flow.ty
+                } else if matches!(op.as_str(), "List/retain" | "List/remove") {
+                    if input_is_placeholder {
+                        Type::List(Box::new(open_object_type()))
+                    } else {
+                        input_flow.ty
+                    }
                 } else if op == "List/append" {
                     let append_item = args
                         .iter()
@@ -1003,14 +1051,19 @@ impl<'a> Checker<'a> {
                             "`WHILE` requires a continuous selector".to_owned(),
                         ));
                     }
-                    self.type_for_call_expr(expr.id, op)
+                    self.when_result_type(expr.id)
+                        .unwrap_or_else(|| self.type_for_call_expr(expr.id, op))
                 } else if self.render_contracts.is_render_constructor(op) {
                     self.render_constructor_type_for_args(op, Some(&input_flow), args)
-                } else if op == "Bool/not" {
-                    self.check_true_false_input(expr, op, &input_flow);
+                } else if op == "Bool/not" || op == "Bool/toggle" {
+                    if !input_is_placeholder {
+                        self.check_true_false_input(expr, op, &input_flow);
+                    }
                     true_false_type()
                 } else if op == "Bool/and" {
-                    self.check_true_false_input(expr, op, &input_flow);
+                    if !input_is_placeholder {
+                        self.check_true_false_input(expr, op, &input_flow);
+                    }
                     for arg in args {
                         let arg_flow = self.ensure_expr(arg.value);
                         self.check_true_false_input(expr, op, &arg_flow);
@@ -1030,7 +1083,9 @@ impl<'a> Checker<'a> {
                 if !matches!(
                     input_flow.mode,
                     FlowMode::TickPresent | FlowMode::PresentOrAbsent
-                ) && !matches!(input_flow.ty, Type::Unknown)
+                ) && !self.expr_id_is_event_payload_path(*input)
+                    && !self.expr_id_is_pipe_placeholder(*input)
+                    && !matches!(input_flow.ty, Type::Unknown)
                     && !is_open_object_type(&input_flow.ty)
                 {
                     self.diagnostics.push(self.diagnostic_for_expr(
@@ -1068,9 +1123,7 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Delimiter => Type::List(Box::new(open_object_type())),
-            AstExprKind::Unknown(tokens) if tokens.iter().any(|token| token.starts_with('"')) => {
-                Type::Text
-            }
+            AstExprKind::Unknown(tokens) if unknown_tokens_are_quoted_text(tokens) => Type::Text,
             AstExprKind::Unknown(tokens) => {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr.id,
@@ -1083,6 +1136,49 @@ impl<'a> Checker<'a> {
         FlowType {
             mode: self.flow_mode_for_expr(expr),
             ty,
+        }
+    }
+
+    fn infer_record_shape(&mut self, fields: &[AstRecordField]) -> ObjectShape {
+        let mut shape_fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        let mut explicit_fields = BTreeSet::new();
+        for field in fields {
+            let ty = self.ensure_expr(field.value).ty;
+            if field.spread {
+                match ty {
+                    Type::Object(shape) => {
+                        merge_shape_override(&mut shape_fields, &mut field_order, &shape);
+                    }
+                    Type::VariantSet(ref variants)
+                        if variants.iter().any(
+                            |variant| matches!(variant, Variant::Tag(tag) if tag == "UNPLUGGED"),
+                        ) => {}
+                    Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => {}
+                    _ => self.diagnostics.push(self.diagnostic_for_expr(
+                        field.value,
+                        "record spread expects a record value".to_owned(),
+                    )),
+                }
+                continue;
+            }
+            if !explicit_fields.insert(field.name.clone()) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    field.value,
+                    format!("duplicate explicit record field `{}`", field.name),
+                ));
+            }
+            insert_shape_field_override(
+                &mut shape_fields,
+                &mut field_order,
+                field.name.clone(),
+                ty,
+            );
+        }
+        ObjectShape {
+            fields: shape_fields,
+            field_order,
+            open: false,
         }
     }
 
@@ -1102,7 +1198,7 @@ impl<'a> Checker<'a> {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         expr_id,
                         format!(
-                            "unknown source payload field `{field}`\nknown fields here: text: TEXT, key: TEXT, address: TEXT"
+                            "unknown source payload field `{field}`\nknown fields here: text: TEXT, key: TEXT, address: TEXT, event.press, event.click, event.double_click, event.blur, event.key_down.key"
                         ),
                     ));
                     return self.expr_type_var(expr_id);
@@ -1111,6 +1207,21 @@ impl<'a> Checker<'a> {
         }
         if let Some(ty) = self.name_bindings.get(&path) {
             return ty.clone();
+        }
+        if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
+            let passed_path = parts[1..].join(".");
+            if let Some(ty) = self.name_bindings.get(&passed_path) {
+                return ty.clone();
+            }
+            if let Some(base) = parts.get(1).and_then(|part| self.name_bindings.get(part))
+                && parts.len() > 2
+                && let Some(ty) = type_for_nested_path(base, &parts[2..])
+            {
+                return ty;
+            }
+            if let Some(ty) = parts.last().and_then(|field| self.name_bindings.get(field)) {
+                return ty.clone();
+            }
         }
         if let Some(base) = parts.first().and_then(|part| self.name_bindings.get(part))
             && parts.len() > 1
@@ -1224,7 +1335,11 @@ impl<'a> Checker<'a> {
     }
 
     fn when_result_type(&mut self, expr_id: usize) -> Option<Type> {
-        let arm_expr_ids = when_arm_expr_ids(&self.program.ast.statements, expr_id);
+        let arm_expr_ids = when_arm_expr_ids(
+            &self.program.ast.statements,
+            expr_id,
+            &self.program.expressions,
+        );
         let mut result: Option<Type> = None;
         for arm_expr_id in arm_expr_ids {
             let arm_type = self.ensure_expr(arm_expr_id).ty;
@@ -1287,11 +1402,35 @@ impl<'a> Checker<'a> {
                     })
             }
             AstExprKind::Pipe { input, op, args } => {
-                if op == "List/map" {
+                if let Some(field) = op.strip_prefix("Field/") {
+                    self.program
+                        .expressions
+                        .get(*input)
+                        .and_then(|input_expr| self.static_expr_type(input_expr, active_functions))
+                        .and_then(|ty| match ty {
+                            Type::Object(shape) => shape.fields.get(field).cloned(),
+                            _ => None,
+                        })
+                } else if op == "List/map" {
                     Some(Type::List(Box::new(
                         self.static_list_map_result_item_type(args, active_functions),
                     )))
+                } else if matches!(op.as_str(), "List/any" | "List/every" | "List/is_not_empty") {
+                    Some(true_false_type())
+                } else if op == "List/latest" {
+                    self.program
+                        .expressions
+                        .get(*input)
+                        .and_then(|input_expr| self.static_expr_type(input_expr, active_functions))
+                        .and_then(|ty| list_item_type_from_list_type(&ty))
+                } else if op == "WHILE" {
+                    self.static_when_result_type(expr.id, active_functions)
                 } else if matches!(op.as_str(), "List/retain" | "List/remove") {
+                    self.program
+                        .expressions
+                        .get(*input)
+                        .and_then(|input_expr| self.static_expr_type(input_expr, active_functions))
+                } else if op == "SOURCE" {
                     self.program
                         .expressions
                         .get(*input)
@@ -1330,28 +1469,14 @@ impl<'a> Checker<'a> {
                         })
                 }
             }
-            AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-                Some(Type::Object(ObjectShape::from_ordered_fields(
-                    fields.iter().map(|field| {
-                        (
-                            field.name.clone(),
-                            self.program
-                                .expressions
-                                .get(field.value)
-                                .and_then(|field_expr| {
-                                    self.static_expr_type(field_expr, active_functions)
-                                })
-                                .unwrap_or_else(open_object_type),
-                        )
-                    }),
-                    false,
-                )))
-            }
+            AstExprKind::Object(fields) | AstExprKind::Record(fields) => Some(Type::Object(
+                self.static_record_shape(fields, active_functions),
+            )),
             AstExprKind::TaggedObject { tag, fields } => {
                 Some(Type::VariantSet(vec![Variant::Tagged {
                     tag: tag.clone(),
                     fields: ObjectShape::from_ordered_fields(
-                        fields.iter().map(|field| {
+                        fields.iter().filter(|field| !field.spread).map(|field| {
                             (
                                 field.name.clone(),
                                 self.program
@@ -1393,6 +1518,23 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.name_bindings.get(&path).cloned().or_else(|| {
+                    if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
+                        let passed_path = parts[1..].join(".");
+                        if let Some(ty) = self.name_bindings.get(&passed_path) {
+                            return Some(ty.clone());
+                        }
+                        if let Some(base) =
+                            parts.get(1).and_then(|part| self.name_bindings.get(part))
+                            && parts.len() > 2
+                        {
+                            return type_for_nested_path(base, &parts[2..]);
+                        }
+                        if let Some(ty) =
+                            parts.last().and_then(|field| self.name_bindings.get(field))
+                        {
+                            return Some(ty.clone());
+                        }
+                    }
                     parts
                         .first()
                         .and_then(|base| self.name_bindings.get(base))
@@ -1460,13 +1602,12 @@ impl<'a> Checker<'a> {
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
         let mut result = None;
-        for arm_expr_id in when_arm_expr_ids(&self.program.ast.statements, expr_id) {
-            let Some(arm_type) = self
-                .program
-                .expressions
-                .get(arm_expr_id)
-                .and_then(|expr| self.static_expr_type(expr, active_functions))
-            else {
+        for arm in when_arm_statements(
+            &self.program.ast.statements,
+            expr_id,
+            &self.program.expressions,
+        ) {
+            let Some(arm_type) = self.static_statement_type(arm, active_functions) else {
                 continue;
             };
             result = Some(match result {
@@ -1475,6 +1616,40 @@ impl<'a> Checker<'a> {
             });
         }
         result
+    }
+
+    fn static_record_shape(
+        &self,
+        fields: &[AstRecordField],
+        active_functions: &mut BTreeSet<String>,
+    ) -> ObjectShape {
+        let mut shape_fields = BTreeMap::new();
+        let mut field_order = Vec::new();
+        for field in fields {
+            let ty = self
+                .program
+                .expressions
+                .get(field.value)
+                .and_then(|field_expr| self.static_expr_type(field_expr, active_functions))
+                .unwrap_or_else(open_object_type);
+            if field.spread {
+                if let Type::Object(shape) = ty {
+                    merge_shape_override(&mut shape_fields, &mut field_order, &shape);
+                }
+                continue;
+            }
+            insert_shape_field_override(
+                &mut shape_fields,
+                &mut field_order,
+                field.name.clone(),
+                ty,
+            );
+        }
+        ObjectShape {
+            fields: shape_fields,
+            field_order,
+            open: false,
+        }
     }
 
     fn static_list_map_result_item_type(
@@ -1586,6 +1761,9 @@ impl<'a> Checker<'a> {
         statement: &AstStatement,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
+        if let Some(arm_type) = self.static_match_arm_statement_type(statement, active_functions) {
+            return Some(arm_type);
+        }
         match &statement.kind {
             AstStatementKind::Source { .. } => Some(source_statement_value_type(
                 statement,
@@ -1594,7 +1772,8 @@ impl<'a> Checker<'a> {
             AstStatementKind::List { .. } => {
                 self.static_list_statement_type(statement, active_functions)
             }
-            _ => direct_statement_value_expr_id(statement, &self.program.expressions)
+            _ => statement_pipeline_final_expr_id(statement, &self.program.expressions)
+                .or_else(|| direct_statement_value_expr_id(statement, &self.program.expressions))
                 .and_then(|expr_id| self.program.expressions.get(expr_id))
                 .and_then(|expr| self.static_expr_type(expr, active_functions))
                 .or_else(|| {
@@ -1615,6 +1794,28 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn static_match_arm_statement_type(
+        &self,
+        statement: &AstStatement,
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let expr = self.program.expressions.get(statement.expr?)?;
+        let AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } = &expr.kind
+        else {
+            return None;
+        };
+        let output_expr = self.program.expressions.get(*output)?;
+        if !matches!(output_expr.kind, AstExprKind::ListLiteral { .. }) {
+            return None;
+        }
+        (!statement.children.is_empty())
+            .then(|| self.static_list_statement_type(statement, active_functions))
+            .flatten()
+    }
+
     fn static_list_statement_type(
         &self,
         statement: &AstStatement,
@@ -1622,13 +1823,7 @@ impl<'a> Checker<'a> {
     ) -> Option<Type> {
         let mut item_type = None;
         for child in &statement.children {
-            let Some(expr_id) = child.expr else {
-                continue;
-            };
-            let Some(expr) = self.program.expressions.get(expr_id) else {
-                continue;
-            };
-            let ty = self.static_expr_type(expr, active_functions)?;
+            let ty = self.static_statement_type(child, active_functions)?;
             item_type = Some(match item_type {
                 Some(existing) => widen_structural_type(&existing, &ty),
                 None => ty,
@@ -1675,7 +1870,11 @@ impl<'a> Checker<'a> {
                 let path = parts.join(".");
                 if let Some(mode) = self.flow_bindings.get(&path) {
                     *mode
-                } else if path_is_source_path(&self.source_paths, &path) {
+                } else if path == "element.hovered" || path.ends_with(".element.hovered") {
+                    FlowMode::Continuous
+                } else if path_is_source_path(&self.source_paths, &path)
+                    || path_is_event_payload_parts(parts)
+                {
                     FlowMode::PresentOrAbsent
                 } else {
                     FlowMode::Continuous
@@ -1722,6 +1921,20 @@ impl<'a> Checker<'a> {
             .unwrap_or(FlowMode::Continuous)
     }
 
+    fn expr_id_is_event_payload_path(&self, expr_id: usize) -> bool {
+        matches!(
+            self.program.expressions.get(expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Path(parts)) if path_is_event_payload_parts(parts)
+        )
+    }
+
+    fn expr_id_is_pipe_placeholder(&self, expr_id: usize) -> bool {
+        self.program
+            .expressions
+            .get(expr_id)
+            .is_some_and(expr_is_pipe_placeholder)
+    }
+
     fn expr_is_direct_data_list(&self, expr_id: usize) -> bool {
         expr_path(
             self.program.expressions.get(expr_id),
@@ -1746,13 +1959,7 @@ impl<'a> Checker<'a> {
         let child_types = statement
             .children
             .iter()
-            .filter_map(|child| child.expr)
-            .filter_map(|expr_id| {
-                self.program
-                    .expressions
-                    .get(expr_id)
-                    .and_then(|expr| self.static_expr_type(expr, &mut BTreeSet::new()))
-            })
+            .filter_map(|child| self.static_statement_type(child, &mut BTreeSet::new()))
             .collect::<Vec<_>>();
         let item_type = if child_types.iter().any(type_contains_skip) {
             Type::Skip
@@ -1827,6 +2034,49 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    fn check_pipeline_continuation_compatibility(&mut self, statement: &AstStatement) {
+        let Some(expr_ids) = statement_pipeline_expr_ids(statement, &self.program.expressions)
+        else {
+            return;
+        };
+        for pair in expr_ids.windows(2) {
+            let [previous_expr_id, expr_id] = pair else {
+                continue;
+            };
+            let Some(expr) = self.program.expressions.get(*expr_id).cloned() else {
+                continue;
+            };
+            let AstExprKind::Pipe { input, op, args } = &expr.kind else {
+                continue;
+            };
+            if !self.expr_id_is_pipe_placeholder(*input) {
+                continue;
+            }
+            let previous_flow = self.ensure_expr(*previous_expr_id);
+            if op == "Bool/not" || op == "Bool/toggle" {
+                self.check_true_false_input(&expr, op, &previous_flow);
+            } else if op == "Bool/and" {
+                self.check_true_false_input(&expr, op, &previous_flow);
+                for arg in args {
+                    let arg_flow = self.ensure_expr(arg.value);
+                    self.check_true_false_input(&expr, op, &arg_flow);
+                }
+            } else if op == "WHILE" && !matches!(previous_flow.mode, FlowMode::Continuous) {
+                self.constraints.push(Constraint::FlowCompatible {
+                    actual: previous_flow.clone(),
+                    expected: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: previous_flow.ty.clone(),
+                    },
+                });
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    *previous_expr_id,
+                    "`WHILE` requires a continuous selector".to_owned(),
+                ));
+            }
+        }
+    }
+
     fn check_pattern_constraints(&mut self, statement: &AstStatement) {
         let Some(expr_id) = statement.expr else {
             return;
@@ -1889,6 +2139,23 @@ impl<'a> Checker<'a> {
             });
             if type_is_assignable_to(&actual, &expected) {
                 continue;
+            }
+            let continuation_final = statement_pipeline_final_expr_id_containing_expr(
+                &self.program.ast.statements,
+                actual_expr_id,
+                &self.program.expressions,
+            );
+            if let Some(final_expr_id) = continuation_final
+                && final_expr_id != actual_expr_id
+            {
+                let final_actual = self.ensure_expr(final_expr_id).ty;
+                self.constraints.push(Constraint::Assignable {
+                    actual: final_actual.clone(),
+                    expected: expected.clone(),
+                });
+                if type_is_assignable_to(&final_actual, &expected) {
+                    continue;
+                }
             }
             let message = if let Some(field) = missing_field_name(&actual, &expected) {
                 format!(
@@ -2070,6 +2337,17 @@ impl<'a> Checker<'a> {
         }
         let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
             let ty = self.ensure_expr(expr_id).ty;
+            if !matches!(
+                expr.kind,
+                AstExprKind::StringLiteral(_)
+                    | AstExprKind::TextLiteral(_)
+                    | AstExprKind::Number(_)
+                    | AstExprKind::Bool(_)
+                    | AstExprKind::Enum(_)
+                    | AstExprKind::Tag(_)
+            ) {
+                return;
+            }
             if !is_open_object_type(&ty) {
                 self.diagnostics
                     .push(self.diagnostic_for_expr(expr_id, "style must be an object".to_owned()));
@@ -2087,11 +2365,15 @@ impl<'a> Checker<'a> {
             self.check_style_expr(expr_id);
         }
         for child in &statement.children {
-            let Some(name) = statement_field(child) else {
+            let Some(field) = statement_field(child) else {
                 continue;
             };
-            if let Some(expr_id) = child.expr {
-                self.check_style_field_value(&name, expr_id);
+            if let Some(value_expr_id) =
+                direct_statement_value_expr_id(child, &self.program.expressions)
+            {
+                self.check_style_field_value(&field, value_expr_id);
+            } else {
+                self.check_style_statement(child);
             }
         }
     }
@@ -2157,6 +2439,13 @@ impl<'a> Checker<'a> {
             return;
         };
         let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
+            let ty = self.ensure_expr(expr_id).ty;
+            if matches!(
+                ty,
+                Type::Object(_) | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+            ) {
+                return;
+            }
             self.diagnostics.push(
                 self.diagnostic_for_expr(
                     expr_id,
@@ -2612,6 +2901,9 @@ fn direct_statement_value_expr_id(
     statement: &AstStatement,
     expressions: &[AstExpr],
 ) -> Option<usize> {
+    if let Some(expr_id) = statement_pipeline_final_expr_id(statement, expressions) {
+        return Some(expr_id);
+    }
     statement.expr.or_else(|| {
         let expression_children = statement
             .children
@@ -2638,16 +2930,50 @@ fn direct_statement_value_expr_id(
 
 fn expression_sequence_is_pipeline(expr_ids: &[usize], expressions: &[AstExpr]) -> bool {
     expr_ids.len() > 1
-        && expr_ids.iter().skip(1).all(|expr_id| {
-            matches!(
-                expressions.get(*expr_id).map(|expr| &expr.kind),
-                Some(AstExprKind::Pipe { input, .. })
-                    if expressions.get(*input).is_some_and(|expr| matches!(
-                        expr.kind,
-                        AstExprKind::Delimiter | AstExprKind::Unknown(_)
-                    ))
-            )
-        })
+        && expr_ids
+            .iter()
+            .skip(1)
+            .all(|expr_id| expr_is_pipeline_continuation(*expr_id, expressions))
+}
+
+fn expr_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    let input = match expressions.get(expr_id).map(|expr| &expr.kind) {
+        Some(AstExprKind::Pipe { input, .. })
+        | Some(AstExprKind::Then { input, .. })
+        | Some(AstExprKind::When { input }) => *input,
+        _ => return false,
+    };
+    expr_chain_starts_with_pipe_placeholder(input, expressions)
+}
+
+fn expr_chain_starts_with_pipe_placeholder(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Delimiter => true,
+        AstExprKind::Unknown(tokens) => !unknown_tokens_are_quoted_text(tokens),
+        AstExprKind::Pipe { input, .. }
+        | AstExprKind::Then { input, .. }
+        | AstExprKind::When { input } => {
+            expr_chain_starts_with_pipe_placeholder(*input, expressions)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_pipe_placeholder(expr: &AstExpr) -> bool {
+    match &expr.kind {
+        AstExprKind::Delimiter => true,
+        AstExprKind::Unknown(tokens) => !unknown_tokens_are_quoted_text(tokens),
+        _ => false,
+    }
+}
+
+fn unknown_tokens_are_quoted_text(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.trim_start().starts_with('"'))
 }
 
 fn mapped_children_expr(
@@ -2717,9 +3043,11 @@ fn pipe_input_expr(
     expressions: &[AstExpr],
     fallback_input: Option<usize>,
 ) -> Option<usize> {
-    match &expressions.get(input)?.kind {
-        AstExprKind::Delimiter | AstExprKind::Unknown(_) => fallback_input,
-        _ => Some(input),
+    let expr = expressions.get(input)?;
+    if expr_is_pipe_placeholder(expr) {
+        fallback_input
+    } else {
+        Some(input)
     }
 }
 
@@ -2743,6 +3071,17 @@ fn expr_single_name(expr: &AstExpr) -> Option<&str> {
 fn child_template(expr: &AstExpr) -> Option<(String, Vec<AstCallArg>)> {
     match &expr.kind {
         AstExprKind::Call { function, args } => Some((function.clone(), args.clone())),
+        AstExprKind::Pipe { input, op, args } => {
+            let mut template_args = Vec::with_capacity(args.len() + 1);
+            template_args.push(AstCallArg {
+                name: None,
+                value: *input,
+                start: expr.start,
+                end: expr.end,
+            });
+            template_args.extend(args.iter().cloned());
+            Some((op.clone(), template_args))
+        }
         AstExprKind::Identifier(function) => Some((function.clone(), Vec::new())),
         _ => None,
     }
@@ -2795,6 +3134,15 @@ fn document_root(program: &ParsedProgram) -> Option<&AstStatement> {
     })
 }
 
+fn scene_root(program: &ParsedProgram) -> Option<&AstStatement> {
+    program.ast.statements.iter().find(|statement| {
+        matches!(
+            &statement.kind,
+            AstStatementKind::Field { name } if name == "scene"
+        )
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
@@ -2815,6 +3163,9 @@ impl Default for BuiltinSignatureRegistry {
                 "Text/concat",
                 "Text/substring",
                 "Error/text",
+                "Router/route",
+                "Router/go_to",
+                "Ulid/generate",
             ]
             .into_iter()
             .collect(),
@@ -2829,9 +3180,19 @@ impl Default for BuiltinSignatureRegistry {
             ]
             .into_iter()
             .collect(),
-            true_false_functions: ["Bool/not", "Bool/and", "Text/is_empty", "Text/starts_with"]
-                .into_iter()
-                .collect(),
+            true_false_functions: [
+                "Bool/not",
+                "Bool/and",
+                "Bool/toggle",
+                "Text/is_empty",
+                "Text/is_not_empty",
+                "Text/starts_with",
+                "List/every",
+                "List/any",
+                "List/is_not_empty",
+            ]
+            .into_iter()
+            .collect(),
             list_functions: [
                 "List/map",
                 "List/retain",
@@ -2842,12 +3203,20 @@ impl Default for BuiltinSignatureRegistry {
             ]
             .into_iter()
             .collect(),
-            list_item_functions: ["List/find", "List/find_value", "List/get"]
+            list_item_functions: ["List/find", "List/find_value", "List/get", "List/latest"]
                 .into_iter()
                 .collect(),
-            open_object_functions: ["WHILE", "Widget/table", "Widget/selected", "Widget/rows"]
-                .into_iter()
-                .collect(),
+            open_object_functions: [
+                "WHILE",
+                "Widget/table",
+                "Widget/selected",
+                "Widget/rows",
+                "Light/directional",
+                "Light/ambient",
+                "Light/spot",
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 }
@@ -2906,9 +3275,12 @@ impl Default for RenderContractRegistry {
     fn default() -> Self {
         Self {
             active_root: "document",
-            roots: [("document", RuntimeRootContract::document())]
-                .into_iter()
-                .collect(),
+            roots: [
+                ("document", RuntimeRootContract::document()),
+                ("scene", RuntimeRootContract::scene()),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 }
@@ -2961,6 +3333,32 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Element/button", "Button")
         .with_fixed_constructor("Element/checkbox", "Checkbox")
         .with_fixed_constructor("Element/text_input", "TextInput")
+    }
+
+    fn scene() -> Self {
+        Self::new([
+            "Block",
+            "Button",
+            "Checkbox",
+            "Label",
+            "Link",
+            "Paragraph",
+            "Row",
+            "Scene",
+            "Stack",
+            "Text",
+            "TextInput",
+        ])
+        .with_fixed_constructor("Scene/new", "Scene")
+        .with_stripe_direction_constructor("Scene/Element/stripe")
+        .with_fixed_constructor("Scene/Element/block", "Block")
+        .with_fixed_constructor("Scene/Element/text", "Text")
+        .with_fixed_constructor("Scene/Element/text_input", "TextInput")
+        .with_fixed_constructor("Scene/Element/checkbox", "Checkbox")
+        .with_fixed_constructor("Scene/Element/label", "Label")
+        .with_fixed_constructor("Scene/Element/button", "Button")
+        .with_fixed_constructor("Scene/Element/paragraph", "Paragraph")
+        .with_fixed_constructor("Scene/Element/link", "Link")
     }
 }
 
@@ -3027,6 +3425,27 @@ impl RenderContractRegistry {
                 })
         )
     }
+
+    fn is_any_renderable_object_type(&self, ty: &Type) -> bool {
+        if self.is_renderable_object_type(ty) {
+            return true;
+        }
+        let Type::Object(shape) = ty else {
+            return false;
+        };
+        self.roots.values().any(|root| {
+            matches!(
+                shape.fields.get("kind"),
+                Some(Type::VariantSet(variants))
+                    if variants.iter().all(|variant| {
+                        matches!(
+                            variant,
+                            Variant::Tag(tag) if root.renderable_kinds.contains(tag.as_str())
+                        )
+                    })
+            )
+        })
+    }
 }
 
 impl RenderConstructorContract {
@@ -3049,6 +3468,16 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Element/button",
     "Element/checkbox",
     "Element/text_input",
+    "Scene/new",
+    "Scene/Element/stripe",
+    "Scene/Element/block",
+    "Scene/Element/text",
+    "Scene/Element/text_input",
+    "Scene/Element/checkbox",
+    "Scene/Element/label",
+    "Scene/Element/button",
+    "Scene/Element/paragraph",
+    "Scene/Element/link",
 ];
 
 pub fn is_registered_render_constructor(function: &str) -> bool {
@@ -3382,14 +3811,16 @@ fn tagged_object_shape_label(
 }
 
 fn style_dimension_accepts_type(ty: &Type) -> bool {
-    matches!(ty, Type::Number)
-        || matches!(
-            ty,
-            Type::VariantSet(variants)
-                if variants.iter().all(|variant| {
-                    matches!(variant, Variant::Tag(tag) if tag == "Fill" || tag == "Auto")
-                })
-        )
+    matches!(
+        ty,
+        Type::Number | Type::Object(_) | Type::Unknown | Type::UnresolvedShape { .. }
+    ) || matches!(
+        ty,
+        Type::VariantSet(variants)
+            if variants.iter().all(|variant| {
+                matches!(variant, Variant::Tag(tag) if tag == "Fill" || tag == "Auto" || tag == "Screen")
+            })
+    )
 }
 
 fn style_color_accepts_type(ty: &Type) -> bool {
@@ -3548,21 +3979,168 @@ fn hold_update_exprs_for_expr(
     Vec::new()
 }
 
-fn when_arm_expr_ids(statements: &[AstStatement], expr_id: usize) -> Vec<usize> {
+fn when_arm_expr_ids(
+    statements: &[AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Vec<usize> {
     for statement in statements {
-        if statement.expr == Some(expr_id) {
+        if statement.expr == Some(expr_id)
+            || statement.expr.is_some_and(|statement_expr_id| {
+                expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+            })
+        {
             return statement
                 .children
                 .iter()
                 .filter_map(|child| child.expr)
                 .collect();
         }
-        let nested = when_arm_expr_ids(&statement.children, expr_id);
+        let nested = when_arm_expr_ids(&statement.children, expr_id, expressions);
         if !nested.is_empty() {
             return nested;
         }
     }
     Vec::new()
+}
+
+fn when_arm_statements<'a>(
+    statements: &'a [AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Vec<&'a AstStatement> {
+    for statement in statements {
+        if statement.expr == Some(expr_id)
+            || statement.expr.is_some_and(|statement_expr_id| {
+                expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+            })
+        {
+            return statement.children.iter().collect();
+        }
+        let nested = when_arm_statements(&statement.children, expr_id, expressions);
+        if !nested.is_empty() {
+            return nested;
+        }
+    }
+    Vec::new()
+}
+
+fn statement_pipeline_final_expr_id_containing_expr(
+    statements: &[AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    for (index, statement) in statements.iter().enumerate() {
+        if statement.expr == Some(expr_id)
+            || statement.expr.is_some_and(|statement_expr_id| {
+                expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+            })
+        {
+            return statement_pipeline_final_expr_id(statement, expressions)
+                .or_else(|| {
+                    let mut expr_ids = Vec::new();
+                    if let Some(statement_expr_id) = statement.expr {
+                        expr_ids.push(statement_expr_id);
+                    }
+                    collect_pipe_continuation_expr_ids(statement, expressions, &mut expr_ids);
+                    collect_following_sibling_pipe_continuation_expr_ids(
+                        &statements[index + 1..],
+                        expressions,
+                        &mut expr_ids,
+                    );
+                    expression_sequence_is_pipeline(&expr_ids, expressions)
+                        .then(|| *expr_ids.last().unwrap())
+                })
+                .or_else(|| {
+                    let mut continuations = Vec::new();
+                    collect_pipe_continuation_expr_ids(statement, expressions, &mut continuations);
+                    collect_following_sibling_pipe_continuation_expr_ids(
+                        &statements[index + 1..],
+                        expressions,
+                        &mut continuations,
+                    );
+                    continuations.last().copied()
+                });
+        }
+        if let Some(found) = statement_pipeline_final_expr_id_containing_expr(
+            &statement.children,
+            expr_id,
+            expressions,
+        ) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn collect_following_sibling_pipe_continuation_expr_ids(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    expr_ids: &mut Vec<usize>,
+) {
+    for statement in statements {
+        if !matches!(statement.kind, AstStatementKind::Expression)
+            || !statement
+                .expr
+                .is_some_and(|expr_id| expr_is_pipeline_continuation(expr_id, expressions))
+        {
+            break;
+        }
+        if let Some(expr_id) = statement.expr {
+            expr_ids.push(expr_id);
+        }
+        collect_pipe_continuation_expr_ids(statement, expressions, expr_ids);
+    }
+}
+
+fn expr_contains_expr_id(root: usize, needle: usize, expressions: &[AstExpr]) -> bool {
+    if root == needle {
+        return true;
+    }
+    let Some(expr) = expressions.get(root) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| expr_contains_expr_id(arg.value, needle, expressions)),
+        AstExprKind::Pipe { input, args, .. } => {
+            expr_contains_expr_id(*input, needle, expressions)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_expr_id(arg.value, needle, expressions))
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            expr_contains_expr_id(*initial, needle, expressions)
+        }
+        AstExprKind::Then {
+            input,
+            output: Some(output),
+            ..
+        } => {
+            expr_contains_expr_id(*input, needle, expressions)
+                || expr_contains_expr_id(*output, needle, expressions)
+        }
+        AstExprKind::Then {
+            input,
+            output: None,
+            ..
+        } => expr_contains_expr_id(*input, needle, expressions),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expr_contains_expr_id(*output, needle, expressions),
+        AstExprKind::Infix { left, right, .. } => {
+            expr_contains_expr_id(*left, needle, expressions)
+                || expr_contains_expr_id(*right, needle, expressions)
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .any(|field| expr_contains_expr_id(field.value, needle, expressions)),
+        _ => false,
+    }
 }
 
 fn collect_hold_update_exprs(
@@ -3585,6 +4163,16 @@ fn collect_hold_update_exprs(
 }
 
 fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<usize> {
+    if let Some(expr_id) = statement_pipeline_final_expr_id(statement, expressions) {
+        if let Some(AstExprKind::Then {
+            output: Some(output),
+            ..
+        }) = expressions.get(expr_id).map(|expr| &expr.kind)
+        {
+            return vec![*output];
+        }
+        return vec![expr_id];
+    }
     if let Some(expr_id) = statement.expr {
         if let Some(AstExprKind::Then {
             output: Some(output),
@@ -3613,6 +4201,43 @@ fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr
         .iter()
         .flat_map(|child| statement_update_value_exprs(child, expressions))
         .collect()
+}
+
+fn statement_pipeline_expr_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<Vec<usize>> {
+    let mut expr_ids = Vec::new();
+    if let Some(expr_id) = statement.expr {
+        expr_ids.push(expr_id);
+    }
+    collect_pipe_continuation_expr_ids(statement, expressions, &mut expr_ids);
+    expression_sequence_is_pipeline(&expr_ids, expressions).then_some(expr_ids)
+}
+
+fn statement_pipeline_final_expr_id(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    statement_pipeline_expr_ids(statement, expressions).map(|expr_ids| *expr_ids.last().unwrap())
+}
+
+fn collect_pipe_continuation_expr_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    expr_ids: &mut Vec<usize>,
+) {
+    for child in statement.children.iter().filter(|child| {
+        matches!(child.kind, AstStatementKind::Expression)
+            && child
+                .expr
+                .is_some_and(|expr_id| expr_is_pipeline_continuation(expr_id, expressions))
+    }) {
+        if let Some(expr_id) = child.expr {
+            expr_ids.push(expr_id);
+        }
+        collect_pipe_continuation_expr_ids(child, expressions, expr_ids);
+    }
 }
 
 fn object_bindings(program: &ParsedProgram) -> BTreeMap<String, ObjectShape> {
@@ -3742,18 +4367,7 @@ fn object_shape_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<Obje
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => fields,
         _ => return None,
     };
-    Some(ObjectShape::from_ordered_fields(
-        fields.iter().map(|field| {
-            (
-                field.name.clone(),
-                expressions
-                    .get(field.value)
-                    .map(|expr| simple_expr_type(expr, expressions))
-                    .unwrap_or_else(open_object_type),
-            )
-        }),
-        false,
-    ))
+    Some(simple_record_shape(fields, expressions))
 }
 
 fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
@@ -3770,18 +4384,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
             Type::VariantSet(vec![Variant::Tag(value.clone())])
         }
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-            Type::Object(ObjectShape::from_ordered_fields(
-                fields.iter().map(|field| {
-                    (
-                        field.name.clone(),
-                        expressions
-                            .get(field.value)
-                            .map(|expr| simple_expr_type(expr, expressions))
-                            .unwrap_or_else(open_object_type),
-                    )
-                }),
-                false,
-            ))
+            Type::Object(simple_record_shape(fields, expressions))
         }
         AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
@@ -3801,6 +4404,9 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Text/concat"
                     | "Text/substring"
                     | "Error/text"
+                    | "Router/route"
+                    | "Router/go_to"
+                    | "Ulid/generate"
             ) =>
         {
             Type::Text
@@ -3818,7 +4424,11 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
             ))))
         }
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
-            if function == "Bool/not" || function == "Bool/and" =>
+            if function == "Bool/not"
+                || function == "Bool/and"
+                || function == "Bool/toggle"
+                || function == "Text/is_not_empty"
+                || function == "List/every" =>
         {
             true_false_type()
         }
@@ -3956,6 +4566,7 @@ fn collect_param_requirements_expr(
             let arg_expected = argument_expected_type(function);
             for arg in args {
                 let expected = render_arg_expected_type(function, arg.name.as_deref())
+                    .or_else(|| list_argument_expected_type(function, arg.name.as_deref()))
                     .or_else(|| arg_expected.clone());
                 collect_param_requirements_expr(
                     arg.value,
@@ -3978,6 +4589,7 @@ fn collect_param_requirements_expr(
             let arg_expected = argument_expected_type(op);
             for arg in args {
                 let expected = render_arg_expected_type(op, arg.name.as_deref())
+                    .or_else(|| list_argument_expected_type(op, arg.name.as_deref()))
                     .or_else(|| arg_expected.clone());
                 collect_param_requirements_expr(
                     arg.value,
@@ -3988,8 +4600,11 @@ fn collect_param_requirements_expr(
                 );
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. } => {
             collect_param_requirements_expr(*initial, expressions, params, requirements, expected);
+        }
+        AstExprKind::When { input } => {
+            collect_param_requirements_expr(*input, expressions, params, requirements, None);
         }
         AstExprKind::Then { input, output } => {
             collect_param_requirements_expr(*input, expressions, params, requirements, None);
@@ -4075,13 +4690,23 @@ fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -
 }
 
 fn pipe_input_expected_type(function: &str) -> Option<Type> {
-    if function == "List/map" || matches!(function, "List/retain" | "List/count") {
+    if function == "List/map"
+        || matches!(
+            function,
+            "List/retain"
+                | "List/count"
+                | "List/every"
+                | "List/any"
+                | "List/is_not_empty"
+                | "List/latest"
+        )
+    {
         Some(Type::List(Box::new(open_object_type())))
     } else if function.starts_with("Text/") {
         Some(Type::Text)
     } else if function.starts_with("Number/") {
         Some(Type::Number)
-    } else if function == "Bool/not" || function == "Bool/and" {
+    } else if function == "Bool/not" || function == "Bool/and" || function == "Bool/toggle" {
         Some(true_false_type())
     } else {
         None
@@ -4089,7 +4714,7 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
 }
 
 fn argument_expected_type(function: &str) -> Option<Type> {
-    if function == "Bool/not" || function == "Bool/and" {
+    if function == "Bool/not" || function == "Bool/and" || function == "Bool/toggle" {
         Some(true_false_type())
     } else if function.starts_with("Text/") {
         Some(Type::Text)
@@ -4097,6 +4722,13 @@ fn argument_expected_type(function: &str) -> Option<Type> {
         Some(Type::Number)
     } else {
         None
+    }
+}
+
+fn list_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
+    match (function, arg_name) {
+        ("List/retain" | "List/every" | "List/any", Some("if")) => Some(true_false_type()),
+        _ => None,
     }
 }
 
@@ -4105,7 +4737,7 @@ fn render_arg_expected_type(function: &str, arg_name: Option<&str>) -> Option<Ty
         return None;
     }
     match arg_name {
-        Some("input" | "root") => Some(Type::RenderContract),
+        Some("input" | "root" | "child") => Some(Type::RenderContract),
         Some("items" | "children") => Some(Type::List(Box::new(Type::RenderContract))),
         Some(
             "label" | "text" | "value" | "display_value" | "edit_value" | "placeholder" | "target",
@@ -4137,7 +4769,34 @@ fn name_bindings(
         &mut bindings,
     );
     collect_row_scope_bindings(program, function_param_requirements, &mut bindings);
+    collect_state_cell_path_bindings(program, &mut bindings);
     bindings
+}
+
+fn collect_state_cell_path_bindings(
+    program: &ParsedProgram,
+    bindings: &mut BTreeMap<String, Type>,
+) {
+    for cell in &program.state_cells {
+        let ty = bindings
+            .get(cell.hold_name.as_str())
+            .cloned()
+            .unwrap_or_else(open_object_type);
+        bindings.insert(cell.path.clone(), ty.clone());
+        if let Some(last) = cell.path.rsplit('.').next() {
+            bindings.entry(last.to_owned()).or_insert(ty);
+        }
+    }
+    for item in &program.ast.items {
+        let (Some(field), Some(hold_name)) = (item.field.as_ref(), item.hold.as_ref()) else {
+            continue;
+        };
+        let ty = bindings
+            .get(hold_name.as_str())
+            .cloned()
+            .unwrap_or_else(open_object_type);
+        bindings.entry(field.clone()).or_insert(ty);
+    }
 }
 
 fn passed_context_type(program: &ParsedProgram, bindings: &BTreeMap<String, Type>) -> Option<Type> {
@@ -4159,13 +4818,27 @@ fn passed_context_type(program: &ParsedProgram, bindings: &BTreeMap<String, Type
             else {
                 continue;
             };
-            context = Some(match context {
-                Some(existing) => widen_structural_type(&existing, &arg_type),
-                None => arg_type,
-            });
+            for context_type in passed_context_candidates(arg_type) {
+                context = Some(match context {
+                    Some(existing) => widen_structural_type(&existing, &context_type),
+                    None => context_type,
+                });
+            }
         }
     }
     context
+}
+
+fn passed_context_candidates(ty: Type) -> Vec<Type> {
+    let mut candidates = vec![ty.clone()];
+    if let Type::Object(shape) = ty {
+        for field_ty in shape.fields.values() {
+            if matches!(field_ty, Type::Object(_)) {
+                candidates.push(field_ty.clone());
+            }
+        }
+    }
+    candidates
 }
 
 fn static_expr_type_from_bindings(
@@ -4176,7 +4849,7 @@ fn static_expr_type_from_bindings(
     match &expr.kind {
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
             Some(Type::Object(ObjectShape::from_ordered_fields(
-                fields.iter().map(|field| {
+                fields.iter().filter(|field| !field.spread).map(|field| {
                     (
                         field.name.clone(),
                         expressions
@@ -4243,7 +4916,9 @@ fn collect_flow_bindings(
                 collect_flow_bindings(&statement.children, expressions, scope, bindings);
                 scope.pop();
             }
-            AstStatementKind::Hold { name: Some(name) } => {
+            AstStatementKind::Hold {
+                name: Some(name), ..
+            } => {
                 bindings.insert(name.clone(), FlowMode::Continuous);
                 collect_flow_bindings(&statement.children, expressions, scope, bindings);
             }
@@ -4287,8 +4962,10 @@ fn collect_name_bindings(
                 let ty = simple_statement_value_type(statement, expressions).unwrap_or_else(|| {
                     Type::Object(object_shape_for_statement(statement, expressions))
                 });
-                bindings.insert(name.clone(), ty.clone());
-                bindings.insert(path, ty);
+                insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
+                if path != *name {
+                    bindings.insert(path, ty);
+                }
                 scope.push(name.clone());
                 collect_name_bindings(
                     &statement.children,
@@ -4300,7 +4977,9 @@ fn collect_name_bindings(
                 );
                 scope.pop();
             }
-            AstStatementKind::Hold { name: Some(name) } => {
+            AstStatementKind::Hold {
+                name: Some(name), ..
+            } => {
                 if let Some(ty) = simple_statement_value_type(statement, expressions) {
                     bindings.insert(name.clone(), ty);
                 }
@@ -4317,8 +4996,11 @@ fn collect_name_bindings(
                 field: Some(name), ..
             } => {
                 let ty = simple_list_statement_type(statement, expressions);
-                bindings.insert(name.clone(), ty.clone());
-                bindings.insert(scoped_path(scope, name), ty);
+                insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
+                let path = scoped_path(scope, name);
+                if path != *name {
+                    bindings.insert(path, ty);
+                }
                 collect_name_bindings(
                     &statement.children,
                     expressions,
@@ -4334,8 +5016,10 @@ fn collect_name_bindings(
                 let source_path = scoped_path(scope, name);
                 let ty = source_payload_type_for_path(source_payload_types, &source_path)
                     .unwrap_or_else(exact_empty_object_type);
-                bindings.insert(name.clone(), ty.clone());
-                bindings.insert(scoped_path(scope, name), ty);
+                insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
+                if source_path != *name {
+                    bindings.insert(source_path, ty);
+                }
                 collect_name_bindings(
                     &statement.children,
                     expressions,
@@ -4352,10 +5036,14 @@ fn collect_name_bindings(
                         .and_then(|requirements| requirements.get(arg))
                         .cloned()
                         .unwrap_or_else(|| unresolved_shape(format!("parameter `{arg}`")));
-                    bindings
-                        .entry(arg.clone())
-                        .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
-                        .or_insert(ty);
+                    let next = if type_contains_renderable(&ty) {
+                        ty
+                    } else if let Some(existing) = bindings.get(arg) {
+                        widen_structural_type(existing, &ty)
+                    } else {
+                        ty
+                    };
+                    bindings.insert(arg.clone(), next);
                 }
                 collect_name_bindings(
                     &statement.children,
@@ -4386,6 +5074,12 @@ fn collect_row_scope_bindings(
     bindings.insert("if".to_owned(), open_object_type());
     bindings.insert("when".to_owned(), open_object_type());
     for row_scope in &program.row_scope_functions {
+        let return_type = function_result_shape(program, &row_scope.function)
+            .map(Type::Object)
+            .unwrap_or_else(open_object_type);
+        if is_renderable_type(&return_type) {
+            continue;
+        }
         bindings
             .entry(row_scope.row_scope.clone())
             .or_insert_with(open_object_type);
@@ -4396,11 +5090,11 @@ fn collect_row_scope_bindings(
             &row_scope.function,
             &row_scope.list,
             &row_scope.row_scope,
-            function_result_shape(program, &row_scope.function).map(Type::Object),
+            Some(return_type),
         ) {
             if let Type::Object(shape) = &item_ty {
                 for (field, ty) in shape.ordered_fields() {
-                    bindings.insert(field.clone(), ty.clone());
+                    insert_simple_binding_preserving_renderable(bindings, field, ty.clone());
                     bindings.insert(format!("{}.{}", row_scope.row_scope, field), ty.clone());
                 }
             }
@@ -4415,22 +5109,45 @@ fn collect_row_scope_bindings(
     }
     for expr in &program.expressions {
         if let AstExprKind::Pipe { op, args, .. } = &expr.kind
-            && op == "List/map"
+            && list_row_binding_operator(op)
         {
             for arg in args.iter().filter(|arg| arg.name.is_none()) {
                 if let Some(name) = program
                     .expressions
                     .get(arg.value)
                     .and_then(expr_single_name)
-                    && !bindings.contains_key(name)
                 {
-                    bindings.insert(name.to_owned(), open_object_type());
+                    let mut item_ty = bindings.get(name).cloned().unwrap_or_else(open_object_type);
+                    if let Some(predicate_expr) = args
+                        .iter()
+                        .find(|arg| arg.name.as_deref() == Some("if"))
+                        .map(|arg| arg.value)
+                        && let Some(requirement) = row_binding_requirement_for_expr(
+                            program,
+                            predicate_expr,
+                            name,
+                            Some(true_false_type()),
+                        )
+                    {
+                        item_ty = widen_structural_type(&item_ty, &requirement);
+                    }
+                    if let Type::Object(shape) = &item_ty {
+                        for (field, ty) in shape.ordered_fields() {
+                            insert_simple_binding_preserving_renderable(
+                                bindings,
+                                field,
+                                ty.clone(),
+                            );
+                            bindings.insert(format!("{name}.{field}"), ty.clone());
+                        }
+                    }
+                    bindings.insert(name.to_owned(), item_ty);
                 }
             }
         }
         if let AstExprKind::MatchArm { pattern, .. } = &expr.kind {
             for name in pattern_variable_names(pattern) {
-                bindings.insert(name, Type::Text);
+                bindings.entry(name).or_insert(Type::Text);
             }
         }
         if let AstExprKind::Call { function, args }
@@ -4465,6 +5182,132 @@ fn collect_row_scope_bindings(
         {
             bindings.insert(name.to_owned(), open_object_type());
         }
+    }
+    for item in &program.ast.items {
+        for name in parser_item_pattern_variable_names(&item.symbols) {
+            bindings.entry(name).or_insert(Type::Text);
+        }
+    }
+}
+
+fn parser_item_pattern_variable_names(symbols: &[String]) -> Vec<String> {
+    let Some(arrow) = symbols.iter().position(|symbol| symbol == "=>") else {
+        return Vec::new();
+    };
+    pattern_variable_names(&symbols[..arrow])
+}
+
+fn insert_simple_binding_preserving_renderable(
+    bindings: &mut BTreeMap<String, Type>,
+    name: &str,
+    ty: Type,
+) {
+    if bindings.get(name).is_some_and(type_contains_renderable) && !type_contains_renderable(&ty) {
+        return;
+    }
+    bindings.insert(name.to_owned(), ty);
+}
+
+fn list_row_binding_operator(op: &str) -> bool {
+    matches!(op, "List/map" | "List/retain" | "List/every" | "List/any")
+}
+
+fn row_binding_requirement_for_expr(
+    program: &ParsedProgram,
+    expr_id: usize,
+    binding: &str,
+    expected: Option<Type>,
+) -> Option<Type> {
+    let expr = program.expressions.get(expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(name) if name == binding => expected,
+        AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == binding) => {
+            Some(object_type_for_path_requirement(&parts[1..], expected))
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            let input_expected = pipe_input_expected_type(op);
+            let mut requirement =
+                row_binding_requirement_for_expr(program, *input, binding, input_expected);
+            let arg_expected = argument_expected_type(op);
+            for arg in args {
+                let expected = render_arg_expected_type(op, arg.name.as_deref())
+                    .or_else(|| list_argument_expected_type(op, arg.name.as_deref()))
+                    .or_else(|| arg_expected.clone());
+                if let Some(arg_requirement) =
+                    row_binding_requirement_for_expr(program, arg.value, binding, expected)
+                {
+                    requirement = Some(match requirement {
+                        Some(existing) => widen_structural_type(&existing, &arg_requirement),
+                        None => arg_requirement,
+                    });
+                }
+            }
+            requirement
+        }
+        AstExprKind::Call { function, args } => {
+            let mut requirement = None;
+            let arg_expected = argument_expected_type(function);
+            for arg in args {
+                let expected = render_arg_expected_type(function, arg.name.as_deref())
+                    .or_else(|| list_argument_expected_type(function, arg.name.as_deref()))
+                    .or_else(|| arg_expected.clone());
+                if let Some(arg_requirement) =
+                    row_binding_requirement_for_expr(program, arg.value, binding, expected)
+                {
+                    requirement = Some(match requirement {
+                        Some(existing) => widen_structural_type(&existing, &arg_requirement),
+                        None => arg_requirement,
+                    });
+                }
+            }
+            requirement
+        }
+        AstExprKind::Infix { left, right, op } => {
+            let expected = if matches!(op.as_str(), "-" | "*" | "/" | ">" | "<" | ">=" | "<=") {
+                Some(Type::Number)
+            } else {
+                None
+            };
+            let left_requirement =
+                row_binding_requirement_for_expr(program, *left, binding, expected.clone());
+            let right_requirement =
+                row_binding_requirement_for_expr(program, *right, binding, expected);
+            match (left_requirement, right_requirement) {
+                (Some(left), Some(right)) => Some(widen_structural_type(&left, &right)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            }
+        }
+        AstExprKind::When { input } | AstExprKind::Hold { initial: input, .. } => {
+            row_binding_requirement_for_expr(program, *input, binding, expected)
+        }
+        AstExprKind::Then { input, output } => {
+            let input_requirement =
+                row_binding_requirement_for_expr(program, *input, binding, None);
+            let output_requirement = output.and_then(|output| {
+                row_binding_requirement_for_expr(program, output, binding, expected)
+            });
+            match (input_requirement, output_requirement) {
+                (Some(left), Some(right)) => Some(widen_structural_type(&left, &right)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            }
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .filter_map(|field| {
+                row_binding_requirement_for_expr(program, field.value, binding, None)
+            })
+            .reduce(|left, right| widen_structural_type(&left, &right)),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => row_binding_requirement_for_expr(program, *output, binding, expected),
+        _ => None,
     }
 }
 
@@ -4659,6 +5502,9 @@ fn list_item_shape(program: &ParsedProgram, list_name: &str) -> Option<ObjectSha
             continue;
         };
         for field in object_fields {
+            if field.spread {
+                continue;
+            }
             let ty = program
                 .expressions
                 .get(field.value)
@@ -4744,6 +5590,8 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             Type::VariantSet(variants)
         }
         (Type::Skip, ty) | (ty, Type::Skip) => ty.clone(),
+        (ty, no_element) if is_no_element_type(no_element) => ty.clone(),
+        (no_element, ty) if is_no_element_type(no_element) => ty.clone(),
         (Type::Text, Type::Text) => Type::Text,
         (Type::Number, Type::Number) => Type::Number,
         (Type::List(left), Type::List(right)) => {
@@ -4798,6 +5646,28 @@ fn insert_ordered_shape_field(
         .entry(field)
         .and_modify(|existing| *existing = widen_structural_type(existing, &ty))
         .or_insert(ty);
+}
+
+fn merge_shape_override(
+    fields: &mut BTreeMap<String, Type>,
+    field_order: &mut Vec<String>,
+    shape: &ObjectShape,
+) {
+    for (field, ty) in shape.ordered_fields() {
+        insert_shape_field_override(fields, field_order, field.clone(), ty.clone());
+    }
+}
+
+fn insert_shape_field_override(
+    fields: &mut BTreeMap<String, Type>,
+    field_order: &mut Vec<String>,
+    field: String,
+    ty: Type,
+) {
+    if !fields.contains_key(&field) {
+        field_order.push(field.clone());
+    }
+    fields.insert(field, ty);
 }
 
 fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
@@ -4856,7 +5726,7 @@ fn source_payload_access(
 fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
     parts
         .iter()
-        .filter(|part| part.as_str() != "PASSED" && part.as_str() != "events")
+        .filter(|part| !matches!(part.as_str(), "PASSED" | "event" | "events"))
         .cloned()
         .collect()
 }
@@ -4864,13 +5734,44 @@ fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
 fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
     match suffix {
         "text" | "key" | "address" => SourcePayloadAccess::Field(suffix.to_owned()),
+        "change.text" => SourcePayloadAccess::Field("text".to_owned()),
+        "key_down.key" => SourcePayloadAccess::Field("key".to_owned()),
+        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
+            SourcePayloadAccess::Field(suffix.to_owned())
+        }
         _ => SourcePayloadAccess::UnknownField(suffix.to_owned()),
+    }
+}
+
+fn simple_record_shape(fields: &[AstRecordField], expressions: &[AstExpr]) -> ObjectShape {
+    let mut shape_fields = BTreeMap::new();
+    let mut field_order = Vec::new();
+    for field in fields {
+        let ty = expressions
+            .get(field.value)
+            .map(|expr| simple_expr_type(expr, expressions))
+            .unwrap_or_else(open_object_type);
+        if field.spread {
+            if let Type::Object(shape) = ty {
+                merge_shape_override(&mut shape_fields, &mut field_order, &shape);
+            }
+            continue;
+        }
+        insert_shape_field_override(&mut shape_fields, &mut field_order, field.name.clone(), ty);
+    }
+    ObjectShape {
+        fields: shape_fields,
+        field_order,
+        open: false,
     }
 }
 
 fn source_payload_field_type(field: &str) -> Type {
     match field {
         "text" | "key" | "address" => Type::Text,
+        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
+            exact_empty_object_type()
+        }
         _ => unresolved_shape(format!("unknown source payload field `{field}`")),
     }
 }
@@ -5340,7 +6241,7 @@ fn statement_pipeline_hint_type(
             continue;
         };
         ty = match op.as_str() {
-            "List/retain" | "List/remove" => ty,
+            "List/retain" | "List/remove" | "SOURCE" => ty,
             "List/count" | "List/sum" => Type::Number,
             "List/append" => {
                 let append_ty = args
@@ -5359,7 +6260,16 @@ fn statement_pipeline_hint_type(
             "List/map" => {
                 hint_type_for_expr_id(program, *expr_id, expr_types, name_bindings).unwrap_or(ty)
             }
-            "Bool/not" | "Bool/and" => true_false_type(),
+            "Bool/not" | "Bool/and" | "Bool/toggle" | "Text/is_not_empty" | "List/every"
+            | "List/any" | "List/is_not_empty" => true_false_type(),
+            "List/latest" => list_item_type_from_list_type(&ty).unwrap_or_else(open_object_type),
+            _ if op.starts_with("Field/") => {
+                if let (Type::Object(shape), Some(field)) = (&ty, op.strip_prefix("Field/")) {
+                    shape.fields.get(field).cloned().unwrap_or(Type::Unknown)
+                } else {
+                    Type::Unknown
+                }
+            }
             _ => hint_type_for_expr_id(program, *expr_id, expr_types, name_bindings).unwrap_or(ty),
         };
     }
@@ -5610,7 +6520,7 @@ fn source_payload_fields_for_path(
                 if source_path_matches_parts(source_paths, source_path, parts)
                     && let Some(field) = source_payload_field_name(parts)
                 {
-                    fields.insert(field.to_owned(), Type::Text);
+                    fields.insert(field.to_owned(), source_payload_field_type(field));
                 }
             }
             _ => {}
@@ -5651,7 +6561,7 @@ fn collect_payload_pattern_fields_for_source(
                 }) = child.expr.and_then(|expr_id| expressions.get(expr_id))
                 {
                     for field in source_payload_fields_from_pattern(pattern) {
-                        fields.insert(field.to_owned(), Type::Text);
+                        fields.insert(field.to_owned(), source_payload_field_type(field));
                     }
                 }
             }
@@ -5711,7 +6621,9 @@ fn source_path_matches_parts(
 
 fn parts_without_payload(parts: &[String]) -> &[String] {
     match parts.last().map(String::as_str) {
-        Some("text" | "key" | "address") => &parts[..parts.len().saturating_sub(1)],
+        Some("text" | "key" | "address" | "press" | "click" | "double_click" | "blur") => {
+            &parts[..parts.len().saturating_sub(1)]
+        }
         _ => parts,
     }
 }
@@ -5719,6 +6631,9 @@ fn parts_without_payload(parts: &[String]) -> &[String] {
 fn source_payload_field_name(parts: &[String]) -> Option<&str> {
     match parts.last().map(String::as_str) {
         Some(field @ ("text" | "key" | "address")) => Some(field),
+        Some(field @ ("press" | "click" | "double_click" | "blur")) => Some(field),
+        Some("change") => Some("change"),
+        Some("key_down") => Some("key_down"),
         _ => None,
     }
 }
@@ -5726,11 +6641,19 @@ fn source_payload_field_name(parts: &[String]) -> Option<&str> {
 fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<&'static str> {
     let mut fields = Vec::new();
     for window in pattern.windows(2) {
-        if matches!(window[0].as_str(), "text" | "key" | "address") && window[1].as_str() == ":" {
+        if matches!(
+            window[0].as_str(),
+            "text" | "key" | "address" | "press" | "click" | "double_click" | "blur"
+        ) && window[1].as_str() == ":"
+        {
             fields.push(match window[0].as_str() {
                 "text" => "text",
                 "key" => "key",
                 "address" => "address",
+                "press" => "press",
+                "click" => "click",
+                "double_click" => "double_click",
+                "blur" => "blur",
                 _ => unreachable!(),
             });
         }
@@ -5741,7 +6664,7 @@ fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<&'static str> {
 fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
     let normalized_path = path
         .split('.')
-        .filter(|part| *part != "PASSED" && *part != "events")
+        .filter(|part| !matches!(*part, "PASSED" | "event" | "events"))
         .collect::<Vec<_>>()
         .join(".");
     source_paths.iter().any(|source_path| {
@@ -5754,6 +6677,16 @@ fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
             || relative == normalized_path
             || relative.ends_with(&format!(".{normalized_path}"))
             || normalized_path.starts_with(&format!("{relative}."))
+    })
+}
+
+fn path_is_event_payload_parts(parts: &[String]) -> bool {
+    parts.windows(2).any(|window| {
+        window[0] == "event"
+            && matches!(
+                window[1].as_str(),
+                "press" | "click" | "double_click" | "blur" | "change" | "key_down"
+            )
     })
 }
 
@@ -5838,12 +6771,12 @@ fn render_slot_type_error(slot_name: &str, actual_type: &Type) -> String {
 
 fn is_renderable_type(ty: &Type) -> bool {
     matches!(ty, Type::RenderContract)
-        || RenderContractRegistry::default().is_renderable_object_type(ty)
+        || RenderContractRegistry::default().is_any_renderable_object_type(ty)
         || is_no_element_type(ty)
 }
 
 fn is_document_render_object_type(ty: &Type) -> bool {
-    RenderContractRegistry::default().is_renderable_object_type(ty)
+    RenderContractRegistry::default().is_any_renderable_object_type(ty)
 }
 
 fn is_no_element_type(ty: &Type) -> bool {
@@ -6044,6 +6977,90 @@ document:
                 Type::VariantSet(variants)
                     if variants == &vec![Variant::Tag("True".to_owned())]
             )
+        }));
+    }
+
+    #[test]
+    fn record_spread_fields_are_typed_and_later_fields_override() {
+        let parsed = boon_parser::parse_source(
+            "record-spread-type.bn",
+            r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+base: [a: 1, b: TEXT { old }]
+merged: [...base, b: 2, c: TEXT { ok }]
+"#,
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "unexpected diagnostics: {:?}",
+            report.diagnostics
+        );
+        let merged_expr_id = parsed
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::Object(fields) | AstExprKind::Record(fields)
+                    if fields.iter().any(|field| field.spread)
+                        && fields.iter().any(|field| field.name == "c") =>
+                {
+                    Some(expr.id)
+                }
+                _ => None,
+            })
+            .expect("fixture should contain merged spread object");
+        let merged_type = report
+            .expr_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.expr_id == merged_expr_id)
+            .expect("merged object should be typed");
+        let Type::Object(shape) = &merged_type.flow_type.ty else {
+            panic!(
+                "merged object should infer an object shape: {:?}",
+                merged_type
+            );
+        };
+        assert_eq!(shape.fields.get("a"), Some(&Type::Number));
+        assert_eq!(shape.fields.get("b"), Some(&Type::Number));
+        assert_eq!(shape.fields.get("c"), Some(&Type::Text));
+        assert_eq!(
+            shape.field_order,
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn record_spread_rejects_non_record_values() {
+        let parsed = boon_parser::parse_source(
+            "bad-record-spread.bn",
+            "SOURCE\nHOLD\nLATEST\nLIST {}\nmerged: [...1]\n",
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("record spread expects a record value")
+        }));
+    }
+
+    #[test]
+    fn duplicate_explicit_record_fields_are_reported() {
+        let parsed = boon_parser::parse_source(
+            "duplicate-record-field.bn",
+            "SOURCE\nHOLD\nLATEST\nLIST {}\nmerged: [a: 1, a: 2]\n",
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("duplicate explicit record field `a`")
         }));
     }
 
@@ -7412,5 +8429,62 @@ document: []
             assert_eq!(report.render_slot_failure_count, 0, "{}", parsed.path);
             assert!(report.full_document_typecheck_coverage, "{}", parsed.path);
         }
+    }
+
+    #[test]
+    fn physical_todomvc_project_typechecks() {
+        let parsed = boon_parser::parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            [
+                (
+                    "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Glassmorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Glassmorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neobrutalism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neobrutalism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neumorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neumorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Theme.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Theme.bn").to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Generated/Assets.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Generated/Assets.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/RUN.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/RUN.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "{}",
+            report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!(
+                    "{}:{}-{} {}",
+                    diagnostic.line, diagnostic.start, diagnostic.end, diagnostic.message
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }

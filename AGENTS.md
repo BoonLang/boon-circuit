@@ -21,6 +21,15 @@ cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_
 cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example cells
 ```
 
+After finishing native playground work that the user should manually test,
+build and launch the latest playground in release mode in the `boon-circuit`
+COSMIC background workspace unless the user explicitly says not to:
+
+```bash
+cargo build --release -p boon_native_playground
+cosmic-background-launch --workspace boon-circuit -- ./target/release/boon_native_playground --role desktop --example todo_mvc_physical
+```
+
 The native desktop launch must create two native windows: a production-style
 preview window and a dev/debug window. The preview process/window receives Boon
 source, not example names or example-specific render shortcuts.

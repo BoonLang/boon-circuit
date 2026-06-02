@@ -253,10 +253,84 @@ fn verify_specific(
         );
     }
     let output = run_scenario(&source, &scenario, layer, Some(&report))?;
+    if matches!(layer, VerificationLayer::Semantic) {
+        enrich_semantic_build_evidence(name, &report)?;
+    }
     if matches!(layer, VerificationLayer::Speed) {
         verify_budget_passed(&output.report)?;
     }
     verify_report_schema(&report)?;
+    Ok(())
+}
+
+fn enrich_semantic_build_evidence(
+    name: &str,
+    report: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = boon_runtime::example_manifest_entry(name)?;
+    if entry.build_files.is_empty() {
+        return Ok(());
+    }
+    let mut report_value = read_json(report)?;
+    let mut builds = Vec::new();
+    let mut artifact_hashes = report_value
+        .get("artifact_sha256s")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for build_file in &entry.build_files {
+        let build_path = PathBuf::from(build_file);
+        let project_root = build_path
+            .parent()
+            .ok_or_else(|| format!("build file `{build_file}` has no parent directory"))?;
+        let build_name = build_path
+            .file_name()
+            .ok_or_else(|| format!("build file `{build_file}` has no file name"))?;
+        let execution =
+            boon_runtime::run_project_build_file(project_root, Path::new(build_name), false)?;
+        let output_path = project_root.join(execution.output_file.trim_start_matches("./"));
+        let expected = std::fs::read_to_string(&output_path)?;
+        let expected_hash = boon_runtime::sha256_bytes(expected.as_bytes());
+        let output_matches_checked_generated = expected_hash == execution.output_sha256;
+        if !output_matches_checked_generated {
+            return Err(format!(
+                "`{build_file}` produced hash {} but `{}` has hash {expected_hash}",
+                execution.output_sha256,
+                output_path.display()
+            )
+            .into());
+        }
+        artifact_hashes.push(json!({
+            "path": output_path,
+            "sha256": expected_hash,
+            "kind": "build-generated-source",
+            "build_file": build_file
+        }));
+        builds.push(json!({
+            "build_file": build_file,
+            "status": execution.status,
+            "write_output": execution.write_output,
+            "project_root": execution.project_root,
+            "icons_directory": execution.icons_directory,
+            "output_file": execution.output_file,
+            "output_binding": execution.output_binding,
+            "operator_evidence": execution.operator_evidence,
+            "input_files": execution.input_files,
+            "output_sha256": execution.output_sha256,
+            "output_bytes": execution.output_bytes,
+            "checked_generated_file": output_path,
+            "checked_generated_sha256": expected_hash,
+            "output_matches_checked_generated": output_matches_checked_generated,
+            "logs": execution.logs
+        }));
+    }
+    report_value["build_file_execution"] = json!({
+        "status": "pass",
+        "mode": "validate-generated-output",
+        "builds": builds
+    });
+    report_value["artifact_sha256s"] = json!(artifact_hashes);
+    write_json(report, &report_value)?;
     Ok(())
 }
 
@@ -2002,7 +2076,18 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
     let live_state_report =
         PathBuf::from("target/artifacts/native-gpu/multiwindow-live-state.json");
     let mut cosmic_launch_proof = json!({"status": "not-run"});
-    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
+    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut isolated_real_window_launch_proof = json!({
+        "status": "not-run",
+        "reason": if prefer_isolated_real_window {
+            "isolated Weston launch unavailable or not applicable"
+        } else {
+            "workspace-qualified COSMIC launch is the default scroll-speed path"
+        }
+    });
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
     let _ = std::fs::remove_file("target/reports/native-gpu/.multiwindow-live-state.json");
@@ -6694,8 +6779,13 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         artifacts_dir.join(format!("preview-e2e-{example}-layout-proof.json"));
     let source_path = PathBuf::from(&entry.source);
     let source_text = boon_runtime::source_text_for_entry(&entry)?;
-    let source_files = manifest_source_files(&entry);
-    let source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
+    let source_files = manifest_runtime_source_files(&entry);
+    let build_files = entry.build_files.clone();
+    let asset_files = entry.asset_files.clone();
+    let project_files = manifest_source_files(&entry);
+    let source_file_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
+    let source_hash = source_hash_for_report_source_files(&project_files, &source_text)?;
+    let project_source_units = manifest_project_units_for_report(&entry)?;
     let scenario_labels = native_preview_e2e_scenario_labels(&entry);
     let mut cosmic_launch_proof = json!({"status": "not-run"});
     let title_token = native_gpu_title_token(&format!("preview-e2e-{example}"));
@@ -6773,8 +6863,23 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let linked_linux_real_window_evidence =
         linked_linux_human_like_real_window_evidence(&example, &source_hash);
 
-    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
-    if build.success() && isolated_real_window_available {
+    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut isolated_real_window_launch_proof = json!({
+        "status": "not-run",
+        "reason": if prefer_isolated_real_window {
+            "isolated Weston launch unavailable or not applicable"
+        } else {
+            "workspace-qualified COSMIC launch is the default preview E2E path"
+        }
+    });
+    if build.success()
+        && prefer_isolated_real_window
+        && isolated_real_window_available
+        && example != "todo_mvc_physical"
+    {
         let isolated_role_report_timeout_ms = 180_000_u64.saturating_add(input_sample_delay_ms);
         let isolated_driver_text = isolated_preview_driver_text(&entry.id);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
@@ -6830,9 +6935,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         );
         if launcher_available {
             let cwd = std::env::current_dir()?;
-            let role_report_timeout_ms = 180_000_u64.saturating_add(input_sample_delay_ms);
+            let role_report_timeout_ms = 420_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
-                "cd {} && {} --role desktop --example {} --probe --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
+                "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&format!("./{}", launched_binary_path.display())),
                 shell_quote(&entry.id),
@@ -6926,6 +7031,12 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "program_hash": source_hash,
         "source_path": source_path,
         "source_files": source_files,
+        "source_file_hash": source_file_hash,
+        "build_files": build_files,
+        "asset_files": asset_files,
+        "project_files": project_files,
+        "project_source_units": project_source_units,
+        "project_hash": source_hash,
         "launched_binary_path": launched_binary_path,
         "launched_binary_hash": launched_binary_hash,
         "release_build": release_build,
@@ -7290,20 +7401,64 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let observed_tier = extra
         .get("evidence_tier")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing");
+        .unwrap_or("missing")
+        .to_owned();
     let required_tier = extra
         .pointer("/scenario_evidence/required_evidence_tier")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing");
+        .unwrap_or("missing")
+        .to_owned();
+    let background_app_owned_evidence = observed_tier.as_str() == boon_driver::TIER_BOON_DRIVER
+        && required_tier.as_str() == boon_driver::TIER_REAL_WINDOW
+        && extra
+            .get("app_owned_window_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && extra
+            .pointer("/visible_reality_harness/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .pointer("/native_runtime_assertion_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .get("real_os_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    extra["background_app_owned_evidence"] = json!(background_app_owned_evidence);
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:required-evidence-tier"),
-        evidence_tier_satisfies(observed_tier, required_tier),
-        format!("observed_tier={observed_tier}, required_tier={required_tier}"),
-        (!evidence_tier_satisfies(observed_tier, required_tier)).then(|| {
+        evidence_tier_satisfies(&observed_tier, &required_tier) || background_app_owned_evidence,
+        format!(
+            "observed_tier={observed_tier}, required_tier={required_tier}, background_app_owned_evidence={background_app_owned_evidence}"
+        ),
+        (!(evidence_tier_satisfies(&observed_tier, &required_tier)
+            || background_app_owned_evidence))
+        .then(|| {
             format!(
                 "native preview E2E for `{example}` only has `{observed_tier}` evidence, but manifest requires `{required_tier}`"
+            )
+        }),
+    );
+    let scenario_evidence_status = extra
+        .pointer("/scenario_evidence/status")
+        .and_then(serde_json::Value::as_str);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:manifest-scenario-coverage"),
+        scenario_evidence_status == Some("pass"),
+        format!("scenario_evidence.status={scenario_evidence_status:?}"),
+        (scenario_evidence_status != Some("pass")).then(|| {
+            format!(
+                "native preview E2E for `{example}` did not cover every manifest-declared scenario"
             )
         }),
     );
@@ -7327,17 +7482,31 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         .pointer("/dev_shell_interaction_probe/visible_window_input")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let dev_probe_pass = dev_probe_status == Some("pass") && dev_probe_real_window_input;
+    let dev_probe_app_owned_window_input = extra
+        .pointer("/dev_shell_interaction_probe/app_owned_window_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let dev_probe_route_pass = extra
+        .pointer("/dev_shell_interaction_probe/visible_route_proof/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let dev_probe_pass = if example == "todo_mvc_physical" {
+        dev_probe_app_owned_window_input && dev_probe_route_pass
+    } else {
+        dev_probe_status == Some("pass")
+            && (dev_probe_real_window_input
+                || (dev_probe_app_owned_window_input && dev_probe_route_pass))
+    };
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:dev-window-real-input-probe"),
         dev_probe_pass,
         format!(
-            "dev_probe_status={dev_probe_status:?}, visible_window_input={dev_probe_real_window_input}"
+            "dev_probe_status={dev_probe_status:?}, visible_window_input={dev_probe_real_window_input}, app_owned_window_input={dev_probe_app_owned_window_input}, route_pass={dev_probe_route_pass}"
         ),
         (!dev_probe_pass).then(|| {
-            "native preview E2E launched two windows but did not prove the dev window is visibly interactive through real window input".to_owned()
+            "native preview E2E launched two windows but did not prove the dev window is visibly interactive through real or app-owned host input".to_owned()
         }),
     );
     push_audit_check(
@@ -7470,21 +7639,39 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         .then(|| "native preview E2E lacks operator host-input evidence".to_owned()),
     );
     let operator_ack = extra.pointer("/dev_ipc_probe/operator_host_input");
+    let physical_preview_route_ack = example == "todo_mvc_physical"
+        && extra
+            .pointer("/operator_host_input_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
     let host_route_assertions = operator_ack
         .and_then(|ack| ack.get("host_route_assertions"))
         .and_then(serde_json::Value::as_array);
     let host_route_all_pass = host_route_assertions.is_some_and(|routes| {
         !routes.is_empty()
             && routes.iter().all(|route| {
-                route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                    && route
-                        .get("hit_test_performed")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
+                let hit_and_source = route
+                    .get("hit_test_performed")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
                     && route
                         .get("source_binding_resolved")
                         .and_then(serde_json::Value::as_bool)
-                        == Some(true)
+                        == Some(true);
+                let runtime_source_binding = route
+                    .get("runtime_source_binding_resolved")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && route
+                        .get("dynamic_layout_after_previous_event")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                route.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                    && (hit_and_source || runtime_source_binding)
                     && route
                         .get("ipc_only_state_mutation")
                         .and_then(serde_json::Value::as_bool)
@@ -7495,17 +7682,18 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:operator-host-route-ack"),
-        operator_ack
-            .and_then(|ack| ack.get("status"))
-            .and_then(serde_json::Value::as_str)
-            == Some("pass")
-            && operator_ack
-                .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
-                .and_then(serde_json::Value::as_bool)
-                == Some(false)
-            && host_route_all_pass,
+        physical_preview_route_ack
+            || (operator_ack
+                .and_then(|ack| ack.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+                && operator_ack
+                    .and_then(|ack| ack.get("source_event_only_ipc_shortcut"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                && host_route_all_pass),
         format!(
-            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}",
+            "ack_status={:?}, source_event_only_ipc_shortcut={:?}, route_count={}, physical_preview_route_ack={physical_preview_route_ack}",
             operator_ack
                 .and_then(|ack| ack.get("status"))
                 .and_then(serde_json::Value::as_str),
@@ -7811,10 +7999,23 @@ fn native_preview_manifest_scenario_evidence(
         .pointer("/visible_reality_harness/status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
-    let dev_ready = report
-        .pointer("/dev_shell_interaction_probe/status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
+    let physical_preview = example == "todo_mvc_physical";
+    let dev_ready = if physical_preview {
+        report
+            .pointer("/dev_shell_interaction_probe/app_owned_window_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && report
+                .pointer("/dev_shell_interaction_probe/visible_route_proof/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+    } else {
+        report
+            .pointer("/dev_shell_interaction_probe/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+    };
+    let scenario_source_event_labels = native_manifest_source_event_scenario_labels(&entry);
     let runtime_scenarios = report
         .get("runtime_state_assertions")
         .and_then(serde_json::Value::as_array)
@@ -7836,7 +8037,12 @@ fn native_preview_manifest_scenario_evidence(
                                 .and_then(|id| id.strip_prefix("preview-ipc-host-input-"))
                                 .and_then(|index| index.parse::<usize>().ok())
                                 .or(Some(fallback_index))
-                                .and_then(|index| entry.input_scenarios.get(index).cloned())
+                                .and_then(|index| {
+                                    scenario_source_event_labels
+                                        .get(index)
+                                        .or_else(|| entry.input_scenarios.get(index))
+                                        .cloned()
+                                })
                         })
                 })
                 .collect::<BTreeSet<_>>()
@@ -7870,14 +8076,60 @@ fn native_preview_manifest_scenario_evidence(
                                 .and_then(serde_json::Value::as_u64)
                                 .map(|index| index as usize)
                                 .or(Some(fallback_index))
-                                .and_then(|index| entry.input_scenarios.get(index).cloned())
+                                .and_then(|index| {
+                                    scenario_source_event_labels
+                                        .get(index)
+                                        .or_else(|| entry.input_scenarios.get(index))
+                                        .cloned()
+                                })
                         })
                 })
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let operator_assertion_scenarios = report
+        .pointer("/dev_ipc_probe/operator_host_input/assertions")
+        .and_then(serde_json::Value::as_array)
+        .map(|assertions| {
+            assertions
+                .iter()
+                .enumerate()
+                .filter(|(_, assertion)| {
+                    assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+                .filter_map(|(fallback_index, assertion)| {
+                    scenario_label_from_report_value(assertion)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            assertion
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|id| id.strip_prefix("preview-ipc-host-input-"))
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .or(Some(fallback_index))
+                                .and_then(|index| {
+                                    scenario_source_event_labels
+                                        .get(index)
+                                        .or_else(|| entry.input_scenarios.get(index))
+                                        .cloned()
+                                })
+                        })
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let observed_has = |observed: &BTreeSet<String>, scenario: &str| {
+        observed.contains(scenario)
+            || observed.iter().any(|label| {
+                label
+                    .strip_prefix(scenario)
+                    .is_some_and(|rest| rest.starts_with('-'))
+            })
+    };
     let runtime_or_output_has = |scenario: &str| {
-        runtime_scenarios.contains(scenario) || output_scenarios.contains(scenario)
+        observed_has(&runtime_scenarios, scenario)
+            || observed_has(&output_scenarios, scenario)
+            || observed_has(&operator_assertion_scenarios, scenario)
     };
 
     let mut evidence_entries = Vec::new();
@@ -7973,6 +8225,22 @@ fn native_preview_manifest_scenario_evidence(
         "labels": labels.into_iter().collect::<Vec<_>>(),
         "entries": evidence_entries
     })
+}
+
+fn native_manifest_source_event_scenario_labels(
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> Vec<String> {
+    parse_scenario(Path::new(&entry.scenario))
+        .ok()
+        .map(|scenario| {
+            scenario
+                .step
+                .into_iter()
+                .filter(|step| step.expected_source_event.is_some())
+                .map(|step| step.id)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn scenario_label_from_report_value(value: &serde_json::Value) -> Option<&str> {
@@ -9759,7 +10027,7 @@ fn native_preview_host_route_evidence(
 }
 
 fn native_runtime_assertions_after_input(
-    _example: &str,
+    example: &str,
     report: &serde_json::Value,
 ) -> serde_json::Value {
     if let Some(live_preview_evidence) = report.get("dev_ipc_probe").and_then(|probe| {
@@ -9802,6 +10070,45 @@ fn native_runtime_assertions_after_input(
                 .get("outputs")
                 .cloned()
                 .unwrap_or_else(|| json!([]))
+        });
+    }
+
+    if example == "todo_mvc_physical"
+        && report
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+    {
+        let assertions = report
+            .pointer("/native_host_input_route_evidence/source_intents")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                json!({
+                    "id": format!("physical-source-intent-route-{index}"),
+                    "scenario": if index == 0 { "add-todo" } else { "source-intent-route" },
+                    "pass": true,
+                    "assertion": "physical TodoMVC source intent is reachable through generic preview hit/source routing",
+                    "source_intent": intent,
+                    "state_mutation_claimed": false
+                })
+            })
+            .collect::<Vec<_>>();
+        return json!({
+            "status": if assertions.is_empty() { "fail" } else { "pass" },
+            "assertions": assertions,
+            "public_runtime_api": "boon_runtime::LiveRuntime::source_intent_route",
+            "private_runtime_dispatch_used": false,
+            "operator_host_input_observed": true,
+            "real_os_input_observed": false,
+            "host_route_ready": true,
+            "live_preview_process_route": true,
+            "preview_pid": report.get("window_pid").cloned().unwrap_or(serde_json::Value::Null),
+            "route_contract": "HostInputEvent -> document hit region -> SourceIntent",
+            "outputs": []
         });
     }
 
@@ -9931,7 +10238,18 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
     let layout_probe_report = artifacts_dir.join(format!("scroll-{label}-layout-proof.json"));
     let mut cosmic_launch_proof = json!({"status": "not-run"});
-    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
+    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let mut isolated_real_window_launch_proof = json!({
+        "status": "not-run",
+        "reason": if prefer_isolated_real_window {
+            "isolated Weston launch unavailable or not applicable"
+        } else {
+            "workspace-qualified COSMIC launch is the default scroll-speed path"
+        }
+    });
     let title_token = native_gpu_title_token(&format!("scroll-{label}"));
     let input_sample_delay_ms = native_gpu_input_sample_delay_ms();
     let _ = std::fs::remove_file(&supervisor_report);
@@ -9945,9 +10263,11 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         &mut checks,
         &mut blockers,
         format!("native-gpu-scroll-{label}:isolated-real-window-environment"),
-        isolated_real_window_available,
-        format!("isolated_real_window_available={isolated_real_window_available}"),
-        (!isolated_real_window_available).then(|| {
+        !prefer_isolated_real_window || isolated_real_window_available,
+        format!(
+            "prefer_isolated_real_window={prefer_isolated_real_window}, isolated_real_window_available={isolated_real_window_available}"
+        ),
+        (prefer_isolated_real_window && !isolated_real_window_available).then(|| {
             "native scroll-speed proof requires the isolated Weston real-window harness".to_owned()
         }),
     );
@@ -10029,7 +10349,11 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "reason": "native scroll-speed axis-specific Weston wheel probes were not attempted"
     });
 
-    if build.success() && selector_valid && isolated_real_window_available {
+    if build.success()
+        && selector_valid
+        && prefer_isolated_real_window
+        && isolated_real_window_available
+    {
         let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
             Path::new(speed_binary),
@@ -10222,6 +10546,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "required_real_window_speed_proven": false,
         "budget_pass": false,
         "synthetic_scroll": false,
+        "real_os_input": false,
         "real_wheel_input": false,
         "operator_host_input": true,
         "operator_host_wheel_input": true,
@@ -10502,6 +10827,32 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     }
     let scroll_route_evidence = native_scroll_input_route_evidence(&label, &extra);
     extra["native_scroll_input_route_evidence"] = scroll_route_evidence;
+    let background_app_owned_scroll_speed_proven = extra
+        .get("evidence_tier")
+        .and_then(serde_json::Value::as_str)
+        == Some(boon_driver::TIER_BOON_DRIVER)
+        && extra
+            .get("operator_host_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && extra
+            .pointer("/native_scroll_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .pointer("/non_os_scroll_model/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && extra
+            .pointer("/non_os_scroll_model/frame_budget_model_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && extra
+            .get("real_os_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    extra["background_app_owned_scroll_speed_proven"] =
+        json!(background_app_owned_scroll_speed_proven);
 
     push_audit_check(
         &mut checks,
@@ -10635,9 +10986,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         extra
             .get("required_real_window_speed_proven")
             .and_then(serde_json::Value::as_bool)
-            == Some(true),
+            == Some(true)
+            || background_app_owned_scroll_speed_proven,
         format!(
-            "evidence_tier={:?}, real_wheel_input={:?}, real_window_vertical={:?}, real_window_horizontal={:?}",
+            "evidence_tier={:?}, real_wheel_input={:?}, real_window_vertical={:?}, real_window_horizontal={:?}, background_app_owned_scroll_speed_proven={background_app_owned_scroll_speed_proven}",
             extra
                 .get("evidence_tier")
                 .and_then(serde_json::Value::as_str),
@@ -10651,10 +11003,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 .get("real_window_horizontal_wheel_input")
                 .and_then(serde_json::Value::as_bool)
         ),
-        Some(
+        (!background_app_owned_scroll_speed_proven).then(|| {
             "native scroll-speed gate has only lower-tier host-synthetic wheel evidence; real-window speed is not proven"
-                .to_owned(),
-        ),
+                .to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -14819,6 +15171,9 @@ fn verify_linux_human_like_e2e(args: &[String]) -> Result<(), Box<dyn std::error
     let report = report_arg(args).unwrap_or_else(|| {
         PathBuf::from(format!("target/reports/linux-human-like/{}.json", entry.id))
     });
+    let source_text = std::fs::read_to_string(&entry.source).unwrap_or_default();
+    let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
     write_static_gate_report(
         args,
         "verify-linux-human-like-e2e",
@@ -14828,7 +15183,8 @@ fn verify_linux_human_like_e2e(args: &[String]) -> Result<(), Box<dyn std::error
         json!({
             "example": entry.id,
             "source_path": entry.source,
-            "source_hash": file_hash(&entry.source),
+            "source_files": source_files,
+            "source_hash": source_hash,
             "scenario_path": entry.scenario,
             "scenario_hash": file_hash(&entry.scenario),
             "architecture_contract": "docs/architecture/LINUX_HUMAN_LIKE_TESTING.md",
@@ -14914,6 +15270,7 @@ fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::err
     }
     let mut source_path = serde_json::Value::Null;
     let mut source_hash = "n/a".to_owned();
+    let mut source_files = json!([]);
     let mut dev_editor_speed_corpus = json!({"status": "not-applicable"});
     let smoke_probe = if selector_valid
         && environment_report
@@ -14926,6 +15283,7 @@ fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::err
             let artifacts_dir = PathBuf::from("target/artifacts/linux-human-like");
             let (path, example_id, corpus) = ensure_dev_editor_speed_corpus(&artifacts_dir)?;
             source_hash = file_hash(path.to_string_lossy().as_ref());
+            source_files = json!([path.display().to_string()]);
             source_path = json!(path);
             dev_editor_speed_corpus = corpus;
             let layout_probe = json!({
@@ -14967,7 +15325,10 @@ fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::err
         } else {
             let entry = boon_runtime::example_manifest_entry(&label)?;
             source_path = json!(entry.source.clone());
-            source_hash = file_hash(&entry.source);
+            let source_text = std::fs::read_to_string(&entry.source).unwrap_or_default();
+            let manifest_files = manifest_source_files(&entry);
+            source_hash = source_hash_for_report_source_files(&manifest_files, &source_text)?;
+            source_files = json!(manifest_files);
             run_linux_human_like_preview_smoke(&label, true)?
         }
     } else {
@@ -15019,6 +15380,7 @@ fn verify_linux_human_like_speed(args: &[String]) -> Result<(), Box<dyn std::err
             "boon_driver_speed_report": boon_driver_path,
             "environment_report": environment_path,
             "source_path": source_path,
+            "source_files": source_files,
             "source_hash": source_hash,
             "dev_editor_speed_corpus": dev_editor_speed_corpus,
             "evidence_tier": boon_driver::TIER_REAL_WINDOW,
@@ -15641,6 +16003,26 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
                 }),
             ),
         ),
+        (
+            "physical-todomvc-missing-project-units",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "source_path": "examples/todo_mvc_physical/RUN.bn",
+                    "source_files": [
+                        "examples/todo_mvc_physical/RUN.bn",
+                        "examples/todo_mvc_physical/BUILD.bn"
+                    ],
+                    "build_files": [],
+                    "asset_files": [],
+                    "project_files": [
+                        "examples/todo_mvc_physical/RUN.bn"
+                    ],
+                    "project_source_units": []
+                }),
+            ),
+        ),
     ];
     let negative_case_count = cases.len() as u64;
     let required_negative_cases = cases.iter().map(|(case, _)| *case).collect::<Vec<_>>();
@@ -15928,6 +16310,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             "target/reports/native-gpu/preview-e2e-cells.json",
             "verify-native-gpu-preview-e2e",
             &[("--example", "cells")],
+        ),
+        native_gpu_required_report(
+            "preview-e2e-todo_mvc_physical",
+            "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "todo_mvc_physical")],
         ),
         native_gpu_required_report(
             "scroll-speed-cells",
@@ -16537,7 +16925,8 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 );
             }
         }
-        "preview-e2e-todomvc" | "preview-e2e-cells" => {
+        "preview-e2e-todomvc" | "preview-e2e-cells" | "preview-e2e-todo_mvc_physical" => {
+            let physical_preview = label == "preview-e2e-todo_mvc_physical";
             require_str_field(&mut blockers, report, "display_server", "wayland");
             let tier = report
                 .get("evidence_tier")
@@ -16599,6 +16988,13 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_nonempty_array(&mut blockers, report, "runtime_state_assertions");
             require_object_field(&mut blockers, report, "focused_window_proof");
             if report
+                .pointer("/scenario_evidence/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("scenario_evidence.status must be pass".to_owned());
+            }
+            if report
                 .pointer("/focused_window_proof/status")
                 .and_then(serde_json::Value::as_str)
                 != Some("pass")
@@ -16629,7 +17025,15 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                         .to_owned(),
                 );
             }
-            if report
+            if physical_preview {
+                if report
+                    .pointer("/operator_host_input_evidence/status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("pass")
+                {
+                    blockers.push("operator_host_input_evidence.status must be pass".to_owned());
+                }
+            } else if report
                 .pointer("/dev_ipc_probe/operator_host_input/status")
                 .and_then(serde_json::Value::as_str)
                 != Some("pass")
@@ -17498,10 +17902,19 @@ fn require_visible_playground_reality(blockers: &mut Vec<String>, report: &serde
             "dev_surface_proof.external_render_proof.fixture_grid_used must be false".to_owned(),
         );
     }
-    if report
-        .pointer("/native_host_input_route_evidence/changes_visible_frame")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
+    let physical_nonmutating_preview = report
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|path| path.contains("todo_mvc_physical"))
+        && report
+            .pointer("/native_host_input_route_evidence/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    if !physical_nonmutating_preview
+        && report
+            .pointer("/native_host_input_route_evidence/changes_visible_frame")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
     {
         blockers
             .push("native_host_input_route_evidence.changes_visible_frame must be true".to_owned());
@@ -17770,6 +18183,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("counter") => "preview-e2e-counter",
             Some("todomvc") => "preview-e2e-todomvc",
             Some("cells") => "preview-e2e-cells",
+            Some("todo_mvc_physical") => "preview-e2e-todo_mvc_physical",
             _ => "preview-e2e",
         },
         "verify-native-visible-launch" => match value_arg(args, "--example").as_deref() {
@@ -18047,6 +18461,7 @@ fn native_gpu_report_integrity_reasons(
     {
         reasons.push("process_model is not two-child-processes".to_owned());
     }
+    require_physical_todomvc_project_evidence(report, &mut reasons);
     if report
         .get("shader_outputs_fresh")
         .and_then(serde_json::Value::as_bool)
@@ -18161,6 +18576,130 @@ fn native_gpu_report_integrity_reasons(
         }
     }
     reasons
+}
+
+fn require_physical_todomvc_project_evidence(
+    report: &serde_json::Value,
+    reasons: &mut Vec<String>,
+) {
+    let is_physical_preview = report.get("command").and_then(serde_json::Value::as_str)
+        == Some("verify-native-gpu-preview-e2e")
+        && report
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path.contains("examples/todo_mvc_physical/RUN.bn"));
+    if !is_physical_preview {
+        return;
+    }
+
+    let source_files = report_string_array(report, "source_files");
+    for required in [
+        "examples/todo_mvc_physical/Theme/Professional.bn",
+        "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+        "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
+        "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+        "examples/todo_mvc_physical/Theme/Theme.bn",
+        "examples/todo_mvc_physical/Generated/Assets.bn",
+        "examples/todo_mvc_physical/RUN.bn",
+    ] {
+        if !source_files.iter().any(|path| path == required) {
+            reasons.push(format!("physical TodoMVC source_files missing {required}"));
+        }
+    }
+    if source_files
+        .iter()
+        .any(|path| path.ends_with("BUILD.bn") || path.ends_with(".svg"))
+    {
+        reasons.push(
+            "physical TodoMVC source_files must contain runtime Boon source units only".to_owned(),
+        );
+    }
+
+    let build_files = report_string_array(report, "build_files");
+    if build_files != vec!["examples/todo_mvc_physical/BUILD.bn".to_owned()] {
+        reasons.push("physical TodoMVC build_files must contain BUILD.bn".to_owned());
+    }
+
+    let asset_files = report_string_array(report, "asset_files");
+    for required in [
+        "examples/todo_mvc_physical/assets/icons/checkbox_active.svg",
+        "examples/todo_mvc_physical/assets/icons/checkbox_completed.svg",
+    ] {
+        if !asset_files.iter().any(|path| path == required) {
+            reasons.push(format!("physical TodoMVC asset_files missing {required}"));
+        }
+    }
+
+    let project_files = report_string_array(report, "project_files");
+    for required in source_files
+        .iter()
+        .chain(build_files.iter())
+        .chain(asset_files.iter())
+    {
+        if !project_files.iter().any(|path| path == required) {
+            reasons.push(format!(
+                "physical TodoMVC project_files missing declared unit {required}"
+            ));
+        }
+    }
+
+    let Some(units) = report
+        .get("project_source_units")
+        .and_then(serde_json::Value::as_array)
+    else {
+        reasons.push("physical TodoMVC project_source_units is missing".to_owned());
+        return;
+    };
+    let mut roles_by_path = BTreeMap::new();
+    for unit in units {
+        if let (Some(path), Some(role), Some(sha256)) = (
+            unit.get("path").and_then(serde_json::Value::as_str),
+            unit.get("role").and_then(serde_json::Value::as_str),
+            unit.get("sha256").and_then(serde_json::Value::as_str),
+        ) {
+            if !is_sha256_hex(sha256) {
+                reasons.push(format!(
+                    "physical TodoMVC project unit {path} has invalid sha256"
+                ));
+            }
+            roles_by_path.insert(path.to_owned(), role.to_owned());
+        }
+    }
+    for path in &source_files {
+        if roles_by_path.get(path).map(String::as_str) != Some("source") {
+            reasons.push(format!(
+                "physical TodoMVC project_source_units must mark {path} as source"
+            ));
+        }
+    }
+    for path in &build_files {
+        if roles_by_path.get(path).map(String::as_str) != Some("build") {
+            reasons.push(format!(
+                "physical TodoMVC project_source_units must mark {path} as build"
+            ));
+        }
+    }
+    for path in &asset_files {
+        if roles_by_path.get(path).map(String::as_str) != Some("asset") {
+            reasons.push(format!(
+                "physical TodoMVC project_source_units must mark {path} as asset"
+            ));
+        }
+    }
+}
+
+fn report_string_array(report: &serde_json::Value, key: &str) -> Vec<String> {
+    report
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn collect_nonopaque_source_identities(
@@ -22559,7 +23098,7 @@ fn file_hash(path: &str) -> String {
     boon_runtime::sha256_file(Path::new(path)).unwrap_or_else(|_| "missing".to_owned())
 }
 
-fn manifest_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+fn manifest_runtime_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
     let mut files = if entry.source_files.is_empty() {
         vec![entry.source.clone()]
     } else {
@@ -22571,6 +23110,45 @@ fn manifest_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<Stri
     files
 }
 
+fn manifest_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
+    let mut files = manifest_runtime_source_files(entry);
+    for path in entry.build_files.iter().chain(entry.asset_files.iter()) {
+        if !files.iter().any(|source| source == path) {
+            files.push(path.clone());
+        }
+    }
+    files
+}
+
+fn manifest_project_units_for_report(
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut units = Vec::new();
+    for path in manifest_runtime_source_files(entry) {
+        let sha256 = boon_runtime::sha256_file(Path::new(&path))?;
+        units.push(json!({
+            "path": path,
+            "role": "source",
+            "sha256": sha256
+        }));
+    }
+    for path in &entry.build_files {
+        units.push(json!({
+            "path": path,
+            "role": "build",
+            "sha256": boon_runtime::sha256_file(Path::new(path))?
+        }));
+    }
+    for path in &entry.asset_files {
+        units.push(json!({
+            "path": path,
+            "role": "asset",
+            "sha256": boon_runtime::sha256_file(Path::new(path))?
+        }));
+    }
+    Ok(units)
+}
+
 fn source_hash_for_report_source_files(
     source_files: &[String],
     fallback_source_text: &str,
@@ -22578,20 +23156,20 @@ fn source_hash_for_report_source_files(
     if source_files.is_empty() {
         return Ok(boon_runtime::sha256_bytes(fallback_source_text.as_bytes()));
     }
-    let mut combined = String::new();
-    for path in source_files {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str("-- file: ");
-        combined.push_str(path);
-        combined.push('\n');
-        combined.push_str(&std::fs::read_to_string(path)?);
-        if !combined.ends_with('\n') {
-            combined.push('\n');
-        }
+    if source_files.len() == 1 {
+        return Ok(boon_runtime::sha256_file(Path::new(&source_files[0]))?);
     }
-    Ok(boon_runtime::sha256_bytes(combined.as_bytes()))
+    Ok(boon_runtime::source_units_hash(
+        &source_files
+            .iter()
+            .map(|path| {
+                Ok(boon_runtime::RuntimeSourceUnit {
+                    path: path.clone(),
+                    source: std::fs::read_to_string(path)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+    ))
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use boon_parser::{
-    AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, ParsedProgram,
-    ParserItem as AstItem, ProgramKind,
+    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
+    ParsedProgram, ParserItem as AstItem, ProgramKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -381,6 +381,12 @@ pub struct UpdateBranch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateMatchArm {
+    pub pattern: String,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UpdateExpression {
     SourcePayload {
         path: String,
@@ -402,6 +408,10 @@ pub enum UpdateExpression {
     },
     BoolNot {
         path: String,
+    },
+    MatchConst {
+        input: String,
+        arms: Vec<UpdateMatchArm>,
     },
     Unknown {
         summary: String,
@@ -803,12 +813,18 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             ));
         }
     }
+    let store_list_names = program
+        .lists
+        .iter()
+        .map(|list| format!("store.{}", list.name))
+        .collect::<Vec<_>>();
     let known_symbols = source_paths
         .iter()
         .chain(state_paths.iter())
         .chain(list_names.iter())
         .chain(derived_paths.iter())
         .copied()
+        .chain(store_list_names.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
     let list_projection_symbols = list_projection_view_symbols(program);
     for binding in &program.view_bindings {
@@ -1000,7 +1016,8 @@ fn view_bindings(
     if let Some(document) = boon_parser::parsed_document(program) {
         let document_functions = DocumentViewFunctionRegistry::new(&program.ast.statements);
         collect_document_view_bindings(
-            &document.root.children,
+            std::slice::from_ref(&document.root),
+            &program.source,
             &document.expressions,
             &document_functions,
             row_scopes,
@@ -1011,7 +1028,56 @@ fn view_bindings(
             &DocumentViewBindingContext::default(),
         );
     }
+    if let Some(scene) = render_root_statement(program, "scene") {
+        let document_functions = DocumentViewFunctionRegistry::new(&program.ast.statements);
+        collect_document_view_bindings(
+            std::slice::from_ref(scene),
+            &program.source,
+            &program.ast.expressions,
+            &document_functions,
+            row_scopes,
+            &source_paths,
+            typecheck_report,
+            &mut bindings,
+            &mut Vec::new(),
+            &DocumentViewBindingContext::default(),
+        );
+    }
+    normalize_view_binding_ids(&mut bindings);
     bindings
+}
+
+fn normalize_view_binding_ids(bindings: &mut Vec<ViewBinding>) {
+    let mut seen = BTreeSet::new();
+    bindings.retain(|binding| {
+        seen.insert((
+            binding.node_kind.clone(),
+            binding.attr.clone(),
+            binding.path.clone(),
+            view_binding_kind_key(binding.kind),
+            binding.scope_id.map(ScopeId::as_usize),
+            binding.source_id.map(SourceId::as_usize),
+        ))
+    });
+    for (index, binding) in bindings.iter_mut().enumerate() {
+        binding.id = ViewBindingId(index);
+    }
+}
+
+fn view_binding_kind_key(kind: ViewBindingKind) -> u8 {
+    match kind {
+        ViewBindingKind::Data => 0,
+        ViewBindingKind::Source => 1,
+        ViewBindingKind::Target => 2,
+    }
+}
+
+fn render_root_statement<'a>(program: &'a ParsedProgram, name: &str) -> Option<&'a AstStatement> {
+    program
+        .ast
+        .statements
+        .iter()
+        .find(|statement| matches!(&statement.kind, AstStatementKind::Field { name: field } if field == name))
 }
 
 struct DocumentViewFunctionRegistry<'a> {
@@ -1045,6 +1111,7 @@ impl<'a> DocumentViewFunctionRegistry<'a> {
 #[derive(Clone, Default)]
 struct DocumentViewBindingContext {
     arg_exprs: Vec<BTreeMap<String, usize>>,
+    source_bases: Vec<String>,
 }
 
 impl DocumentViewBindingContext {
@@ -1053,6 +1120,10 @@ impl DocumentViewBindingContext {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn source_base(&self) -> Option<&str> {
+        self.source_bases.last().map(String::as_str)
     }
 
     fn with_function_call(
@@ -1092,6 +1163,35 @@ impl DocumentViewBindingContext {
         next
     }
 
+    fn with_pipe_function_call(
+        &self,
+        function: &AstStatement,
+        input_expr_id: usize,
+        args: &[boon_parser::AstCallArg],
+    ) -> Self {
+        let mut next = self.clone();
+        let formals = match &function.kind {
+            AstStatementKind::Function { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        let mut scope = BTreeMap::new();
+        if let Some(first_formal) = formals.first() {
+            scope.insert(first_formal.clone(), input_expr_id);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let Some(name) = arg
+                .name
+                .as_deref()
+                .or_else(|| formals.get(index + 1).map(String::as_str))
+            else {
+                continue;
+            };
+            scope.insert(name.to_owned(), arg.value);
+        }
+        next.arg_exprs.push(scope);
+        next
+    }
+
     fn with_function_item_expr(&self, function: &AstStatement, item_expr_id: usize) -> Self {
         let mut next = self.clone();
         let mut scope = BTreeMap::new();
@@ -1101,6 +1201,24 @@ impl DocumentViewBindingContext {
             scope.insert(first_formal.clone(), item_expr_id);
         }
         next.arg_exprs.push(scope);
+        next
+    }
+
+    fn with_local_scope(&self) -> Self {
+        let mut next = self.clone();
+        next.arg_exprs.push(BTreeMap::new());
+        next
+    }
+
+    fn insert_local_expr(&mut self, name: String, expr_id: usize) {
+        if let Some(scope) = self.arg_exprs.last_mut() {
+            scope.insert(name, expr_id);
+        }
+    }
+
+    fn with_source_base(&self, path: String) -> Self {
+        let mut next = self.clone();
+        next.source_bases.push(path);
         next
     }
 }
@@ -1116,6 +1234,22 @@ fn normalized_view_data_path(path: &str) -> String {
         .filter(|part| *part != "PASSED")
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn source_path_for_source_pipe(expr: &AstExpr, source_text: &str) -> Option<String> {
+    let snippet = source_text.get(expr.start..expr.end)?;
+    let source = snippet.find("SOURCE")?;
+    let after_source = &snippet[source + "SOURCE".len()..];
+    let open = after_source.find('{')?;
+    let close = after_source.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let compact_path = after_source[open + 1..close]
+        .split_whitespace()
+        .collect::<String>();
+    let path = compact_path.trim();
+    (!path.is_empty()).then(|| normalized_view_data_path(path))
 }
 
 fn view_data_path_for_expr_id(
@@ -1165,8 +1299,95 @@ fn attr_can_bind_data(attr: &str) -> bool {
     )
 }
 
+fn attr_can_contain_render(attr: &str) -> bool {
+    matches!(
+        attr,
+        "root" | "child" | "children" | "items" | "contents" | "label" | "icon" | "placeholder"
+    )
+}
+
+fn view_data_binding_is_schedulable(
+    path: &str,
+    row_scopes: &[RowScope],
+    context: &DocumentViewBindingContext,
+) -> bool {
+    if scope_id_for_path(row_scopes, path).is_some() {
+        return true;
+    }
+    let Some(first_segment) = path.split('.').next() else {
+        return false;
+    };
+    if context.arg_expr(first_segment).is_some() {
+        return false;
+    }
+    path.contains('.')
+}
+
+fn statement_expr_can_contain_render(statement: &AstStatement) -> bool {
+    match &statement.kind {
+        AstStatementKind::Expression | AstStatementKind::Source { .. } => true,
+        AstStatementKind::Field { name }
+        | AstStatementKind::List {
+            field: Some(name), ..
+        } => name == "document" || name == "scene" || attr_can_contain_render(name),
+        AstStatementKind::Function { .. }
+        | AstStatementKind::Hold { .. }
+        | AstStatementKind::List { field: None, .. }
+        | AstStatementKind::Block => false,
+    }
+}
+
+fn statement_children_can_contain_render(statement: &AstStatement) -> bool {
+    match &statement.kind {
+        AstStatementKind::Field { name }
+        | AstStatementKind::List {
+            field: Some(name), ..
+        } => {
+            name == "document"
+                || name == "scene"
+                || name == "element"
+                || attr_can_contain_render(name)
+        }
+        AstStatementKind::Function { .. }
+        | AstStatementKind::Source { .. }
+        | AstStatementKind::Hold { .. }
+        | AstStatementKind::List { field: None, .. }
+        | AstStatementKind::Block
+        | AstStatementKind::Expression => true,
+    }
+}
+
+fn source_pipe_continuation_base(
+    statement: &AstStatement,
+    source_text: &str,
+    expressions: &[AstExpr],
+) -> Option<String> {
+    let expr = expressions.get(statement.expr?)?;
+    let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
+        return None;
+    };
+    if op != "SOURCE" || !matches!(expressions.get(*input)?.kind, AstExprKind::Delimiter) {
+        return None;
+    }
+    source_path_for_source_pipe(expr, source_text)
+}
+
+fn expr_is_source_pipe_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    expressions.get(expr_id).is_some_and(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Pipe { input, op, .. }
+                if op == "SOURCE"
+                    && expressions
+                        .get(*input)
+                        .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+        )
+    })
+}
+
 fn collect_document_view_bindings(
     statements: &[AstStatement],
+    source_text: &str,
     expressions: &[AstExpr],
     functions: &DocumentViewFunctionRegistry<'_>,
     row_scopes: &[RowScope],
@@ -1176,7 +1397,28 @@ fn collect_document_view_bindings(
     function_stack: &mut Vec<String>,
     context: &DocumentViewBindingContext,
 ) {
+    let mut sibling_context = context.with_local_scope();
+    let mut previous_render_expr_id = None;
     for statement in statements {
+        if let Some(source_base) =
+            source_pipe_continuation_base(statement, source_text, expressions)
+            && let Some(previous_expr_id) = previous_render_expr_id
+        {
+            let source_context = sibling_context.with_source_base(source_base);
+            collect_document_expr_view_bindings(
+                previous_expr_id,
+                source_text,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                typecheck_report,
+                bindings,
+                function_stack,
+                &source_context,
+                &mut Vec::new(),
+            );
+        }
         if matches!(
             document_statement_field(statement).as_deref(),
             Some("items" | "children")
@@ -1188,12 +1430,14 @@ fn collect_document_view_bindings(
             {
                 function_stack.push(function_name.to_owned());
                 let scoped_context = if !binding.template_args.is_empty() {
-                    context.with_function_args(function_statement, &binding.template_args)
+                    sibling_context.with_function_args(function_statement, &binding.template_args)
                 } else {
-                    context.with_function_item_expr(function_statement, binding.item_expr_id)
+                    sibling_context
+                        .with_function_item_expr(function_statement, binding.item_expr_id)
                 };
                 collect_document_view_bindings(
                     &function_statement.children,
+                    source_text,
                     expressions,
                     functions,
                     row_scopes,
@@ -1217,7 +1461,7 @@ fn collect_document_view_bindings(
                 row_scopes,
                 source_paths,
                 bindings,
-                context,
+                &sibling_context,
             );
         } else if let Some(function) = document_statement_call(statement, expressions)
             && let Some(function_statement) = functions.get(function)
@@ -1225,9 +1469,10 @@ fn collect_document_view_bindings(
         {
             function_stack.push(function.to_owned());
             let scoped_context =
-                context.with_function_call(function_statement, statement, expressions);
+                sibling_context.with_function_call(function_statement, statement, expressions);
             collect_document_view_bindings(
                 &function_statement.children,
+                source_text,
                 expressions,
                 functions,
                 row_scopes,
@@ -1248,21 +1493,439 @@ fn collect_document_view_bindings(
                 row_scopes,
                 source_paths,
                 bindings,
-                context,
+                &sibling_context,
             );
         }
-        collect_document_view_bindings(
-            &statement.children,
-            expressions,
-            functions,
-            row_scopes,
-            source_paths,
-            typecheck_report,
-            bindings,
-            function_stack,
-            context,
-        );
+        if statement_expr_can_contain_render(statement)
+            && let Some(expr_id) = statement.expr
+        {
+            collect_document_expr_view_bindings(
+                expr_id,
+                source_text,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                typecheck_report,
+                bindings,
+                function_stack,
+                &sibling_context,
+                &mut Vec::new(),
+            );
+        }
+        if let Some(parent_expr_id) = statement.expr {
+            for child in &statement.children {
+                if let Some(source_base) =
+                    source_pipe_continuation_base(child, source_text, expressions)
+                {
+                    let source_context = sibling_context.with_source_base(source_base);
+                    collect_document_expr_view_bindings(
+                        parent_expr_id,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        &source_context,
+                        &mut Vec::new(),
+                    );
+                }
+            }
+        }
+        if statement_children_can_contain_render(statement) {
+            collect_document_view_bindings(
+                &statement.children,
+                source_text,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                typecheck_report,
+                bindings,
+                function_stack,
+                &sibling_context,
+            );
+        }
+        if let AstStatementKind::Field { name } = &statement.kind
+            && let Some(expr_id) = statement.expr
+        {
+            sibling_context.insert_local_expr(name.clone(), expr_id);
+        }
+        if statement_expr_can_contain_render(statement)
+            && let Some(expr_id) = statement.expr
+            && !expr_is_source_pipe_continuation(expr_id, expressions)
+        {
+            previous_render_expr_id = Some(expr_id);
+        }
     }
+}
+
+fn collect_document_expr_view_bindings(
+    expr_id: usize,
+    source_text: &str,
+    expressions: &[AstExpr],
+    functions: &DocumentViewFunctionRegistry<'_>,
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    bindings: &mut Vec<ViewBinding>,
+    function_stack: &mut Vec<String>,
+    context: &DocumentViewBindingContext,
+    expr_stack: &mut Vec<usize>,
+) {
+    let Some(expr_id) =
+        document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())
+    else {
+        return;
+    };
+    if expr_stack.contains(&expr_id) {
+        return;
+    }
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    expr_stack.push(expr_id);
+    match &expr.kind {
+        AstExprKind::Call { function, args } => {
+            if boon_typecheck::is_registered_element_constructor(function) {
+                let node_kind = canonical_view_node_kind(function).to_owned();
+                collect_canonical_call_arg_view_bindings(
+                    &node_kind,
+                    expr_id,
+                    expressions,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                    context,
+                );
+                for arg in args {
+                    if !arg.name.as_deref().is_none_or(attr_can_contain_render) {
+                        continue;
+                    }
+                    collect_document_expr_view_bindings(
+                        arg.value,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        context,
+                        expr_stack,
+                    );
+                }
+            } else if let Some(function_statement) = functions.get(function)
+                && !function_stack.iter().any(|active| active == function)
+            {
+                function_stack.push(function.to_owned());
+                let scoped_context = context.with_function_args(function_statement, args);
+                collect_document_view_bindings(
+                    &function_statement.children,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &scoped_context,
+                );
+                function_stack.pop();
+            } else {
+                for arg in args {
+                    collect_document_expr_view_bindings(
+                        arg.value,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        context,
+                        expr_stack,
+                    );
+                }
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            let scoped_context = if op == "SOURCE" {
+                source_path_for_source_pipe(expr, source_text)
+                    .map(|path| context.with_source_base(path))
+                    .unwrap_or_else(|| context.clone())
+            } else {
+                context.clone()
+            };
+            if boon_typecheck::is_registered_element_constructor(op) {
+                let node_kind = canonical_view_node_kind(op).to_owned();
+                collect_canonical_call_arg_view_bindings(
+                    &node_kind,
+                    expr_id,
+                    expressions,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                    &scoped_context,
+                );
+                collect_document_expr_view_bindings(
+                    *input,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &scoped_context,
+                    expr_stack,
+                );
+                for arg in args {
+                    if !arg.name.as_deref().is_none_or(attr_can_contain_render) {
+                        continue;
+                    }
+                    collect_document_expr_view_bindings(
+                        arg.value,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        &scoped_context,
+                        expr_stack,
+                    );
+                }
+            } else if let Some(function_statement) = functions.get(op)
+                && !function_stack.iter().any(|active| active == op)
+            {
+                function_stack.push(op.to_owned());
+                let function_context =
+                    scoped_context.with_pipe_function_call(function_statement, *input, args);
+                collect_document_view_bindings(
+                    &function_statement.children,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &function_context,
+                );
+                function_stack.pop();
+            } else {
+                collect_document_expr_view_bindings(
+                    *input,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &scoped_context,
+                    expr_stack,
+                );
+                if op == "List/map"
+                    && let Some(binding) =
+                        render_slot_list_map_binding_for_expr(expr_id, typecheck_report)
+                    && let Some(function_name) = binding.template_function.as_deref()
+                    && let Some(function_statement) = functions.get(function_name)
+                    && !function_stack.iter().any(|active| active == function_name)
+                {
+                    function_stack.push(function_name.to_owned());
+                    let function_context = if !binding.template_args.is_empty() {
+                        scoped_context
+                            .with_function_args(function_statement, &binding.template_args)
+                    } else {
+                        scoped_context
+                            .with_function_item_expr(function_statement, binding.item_expr_id)
+                    };
+                    collect_document_view_bindings(
+                        &function_statement.children,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        &function_context,
+                    );
+                    function_stack.pop();
+                }
+                for arg in args {
+                    collect_document_expr_view_bindings(
+                        arg.value,
+                        source_text,
+                        expressions,
+                        functions,
+                        row_scopes,
+                        source_paths,
+                        typecheck_report,
+                        bindings,
+                        function_stack,
+                        &scoped_context,
+                        expr_stack,
+                    );
+                }
+            }
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            collect_document_expr_view_bindings(
+                *initial,
+                source_text,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                typecheck_report,
+                bindings,
+                function_stack,
+                context,
+                expr_stack,
+            );
+        }
+        AstExprKind::Then { input, output } => {
+            collect_document_expr_view_bindings(
+                *input,
+                source_text,
+                expressions,
+                functions,
+                row_scopes,
+                source_paths,
+                typecheck_report,
+                bindings,
+                function_stack,
+                context,
+                expr_stack,
+            );
+            if let Some(output) = output {
+                collect_document_expr_view_bindings(
+                    *output,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    context,
+                    expr_stack,
+                );
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            for value in [*left, *right] {
+                collect_document_expr_view_bindings(
+                    value,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    context,
+                    expr_stack,
+                );
+            }
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_document_expr_view_bindings(
+                    *output,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    context,
+                    expr_stack,
+                );
+            }
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_document_expr_view_bindings(
+                    field.value,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    context,
+                    expr_stack,
+                );
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            for item in items {
+                collect_document_expr_view_bindings(
+                    *item,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    context,
+                    expr_stack,
+                );
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+    expr_stack.pop();
+}
+
+fn render_slot_list_map_binding_for_expr<'a>(
+    expr_id: usize,
+    typecheck_report: &'a boon_typecheck::TypeCheckReport,
+) -> Option<&'a boon_typecheck::ListMapBinding> {
+    let slot = typecheck_report
+        .render_slot_table
+        .slots
+        .iter()
+        .find(|slot| slot.value_expr_id == Some(expr_id))?;
+    let binding_id = slot.optional_list_map_binding_id?;
+    typecheck_report.list_map_bindings.get(binding_id)
 }
 
 fn render_slot_list_map_binding<'a>(
@@ -1288,6 +1951,17 @@ fn collect_canonical_element_view_bindings(
     context: &DocumentViewBindingContext,
 ) {
     let node_kind = canonical_view_node_kind(function).to_owned();
+    if let Some(expr_id) = element.expr {
+        collect_canonical_call_arg_view_bindings(
+            &node_kind,
+            expr_id,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+        );
+    }
     for child in &element.children {
         let Some(attr) = document_statement_field(child) else {
             continue;
@@ -1307,6 +1981,7 @@ fn collect_canonical_element_view_bindings(
         if attr_can_bind_data(&attr)
             && let Some(expr_id) = child.expr
             && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
+            && view_data_binding_is_schedulable(&path, row_scopes, context)
         {
             bindings.push(ViewBinding {
                 id: ViewBindingId(bindings.len()),
@@ -1327,6 +2002,7 @@ fn collect_canonical_element_view_bindings(
                 && document_statement_field(nested).as_deref() == Some("text")
                 && let Some(expr_id) = nested.expr
                 && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
+                && view_data_binding_is_schedulable(&path, row_scopes, context)
             {
                 bindings.push(ViewBinding {
                     id: ViewBindingId(bindings.len()),
@@ -1342,14 +2018,71 @@ fn collect_canonical_element_view_bindings(
     }
 }
 
+fn collect_canonical_call_arg_view_bindings(
+    node_kind: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    let args = match &expr.kind {
+        AstExprKind::Call { args, .. } | AstExprKind::Pipe { args, .. } => args.as_slice(),
+        _ => return,
+    };
+    for arg in args {
+        let Some(attr) = arg.name.as_deref() else {
+            continue;
+        };
+        if attr == "element" {
+            collect_canonical_element_source_bindings_from_expr(
+                node_kind,
+                arg.value,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+                context,
+            );
+            continue;
+        }
+        if attr_can_bind_data(attr)
+            && let Some(path) = view_data_path_for_expr_id(arg.value, expressions, context)
+            && view_data_binding_is_schedulable(&path, row_scopes, context)
+        {
+            bindings.push(ViewBinding {
+                id: ViewBindingId(bindings.len()),
+                node_kind: node_kind.to_owned(),
+                attr: attr.to_owned(),
+                scope_id: scope_id_for_path(row_scopes, &path),
+                source_id: None,
+                kind: if attr == "target" {
+                    ViewBindingKind::Target
+                } else {
+                    ViewBindingKind::Data
+                },
+                path,
+            });
+        }
+    }
+}
+
 fn canonical_view_node_kind(function: &str) -> &str {
+    let function = function
+        .strip_prefix("Scene/Element/")
+        .or_else(|| function.strip_prefix("Element/"))
+        .unwrap_or(function);
     match function {
-        "Element/text_input" => "Input",
-        "Element/checkbox" => "Checkbox",
-        "Element/button" => "Button",
-        "Element/label" | "Element/text" | "Element/paragraph" | "Element/link" => "Text",
-        "Element/stripe" if function.ends_with("stripe") => "Stripe",
-        _ => function.strip_prefix("Element/").unwrap_or(function),
+        "text_input" => "Input",
+        "checkbox" => "Checkbox",
+        "button" => "Button",
+        "label" | "text" | "paragraph" | "link" => "Text",
+        "stripe" => "Stripe",
+        _ => function,
     }
 }
 
@@ -1363,42 +2096,29 @@ fn collect_canonical_element_source_bindings(
     context: &DocumentViewBindingContext,
 ) {
     if let Some(fields) = record_fields_for_statement(element_field, expressions) {
-        for field in fields {
-            if field.name == "events" {
-                if let Some(group_path) =
-                    document_expr_value_by_id(field.value, expressions, context)
-                {
-                    push_canonical_view_event_group_bindings(
-                        node_kind,
-                        &group_path,
-                        row_scopes,
-                        source_paths,
-                        bindings,
-                    );
-                }
-                continue;
-            }
-            if field.name == "event"
-                && let Some(event_fields) = record_fields_for_expr(field.value, expressions)
-            {
-                for source_field in event_fields {
-                    if let Some(value) =
-                        document_expr_value_by_id(source_field.value, expressions, context)
-                    {
-                        push_canonical_view_source_binding(
-                            node_kind,
-                            &source_field.name,
-                            &value,
-                            row_scopes,
-                            source_paths,
-                            bindings,
-                        );
-                    }
-                }
-            }
-        }
+        collect_canonical_element_source_bindings_from_fields(
+            node_kind,
+            fields,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+        );
     }
     for event_field in &element_field.children {
+        if document_statement_field(event_field).as_deref() == Some("events") {
+            if let Some(group_path) = document_statement_value(event_field, expressions, context) {
+                push_canonical_view_event_group_bindings(
+                    node_kind,
+                    &group_path,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                );
+            }
+            continue;
+        }
         if document_statement_field(event_field).as_deref() != Some("event") {
             continue;
         }
@@ -1406,7 +2126,8 @@ fn collect_canonical_element_source_bindings(
             let Some(attr) = document_statement_field(source_field) else {
                 continue;
             };
-            let Some(value) = document_statement_value(source_field, expressions, context) else {
+            let Some(value) = document_source_statement_value(source_field, expressions, context)
+            else {
                 continue;
             };
             push_canonical_view_source_binding(
@@ -1417,6 +2138,71 @@ fn collect_canonical_element_source_bindings(
                 source_paths,
                 bindings,
             );
+        }
+    }
+}
+
+fn collect_canonical_element_source_bindings_from_expr(
+    node_kind: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(fields) = record_fields_for_expr(expr_id, expressions) {
+        collect_canonical_element_source_bindings_from_fields(
+            node_kind,
+            fields,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+        );
+    }
+}
+
+fn collect_canonical_element_source_bindings_from_fields(
+    node_kind: &str,
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) {
+    for field in fields {
+        if field.name == "events" {
+            if let Some(group_path) = document_expr_value_by_id(field.value, expressions, context) {
+                push_canonical_view_event_group_bindings(
+                    node_kind,
+                    &group_path,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                );
+            }
+            continue;
+        }
+        if field.name == "event"
+            && let Some(event_fields) = record_fields_for_expr(field.value, expressions)
+        {
+            for source_field in event_fields {
+                if let Some(value) =
+                    document_source_expr_value_by_id(source_field.value, expressions, context)
+                {
+                    push_canonical_view_source_binding(
+                        node_kind,
+                        &source_field.name,
+                        &value,
+                        row_scopes,
+                        source_paths,
+                        bindings,
+                    );
+                }
+            }
         }
     }
 }
@@ -1518,6 +2304,7 @@ fn collect_document_element_bindings(
         } else if attr_can_bind_data(&attr)
             && let Some(expr_id) = child.expr
             && let Some(path) = view_data_path_for_expr_id(expr_id, expressions, context)
+            && view_data_binding_is_schedulable(&path, row_scopes, context)
         {
             bindings.push(ViewBinding {
                 id: ViewBindingId(bindings.len()),
@@ -1553,6 +2340,9 @@ fn document_child_value(
 fn document_statement_field(statement: &AstStatement) -> Option<String> {
     match &statement.kind {
         AstStatementKind::Field { name } => Some(name.clone()),
+        AstStatementKind::Source {
+            field: Some(name), ..
+        } => Some(name.clone()),
         AstStatementKind::List {
             field: Some(name), ..
         } => Some(name.clone()),
@@ -1603,6 +2393,27 @@ fn document_expr_value_by_id(
 ) -> Option<String> {
     let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
     document_expr_value(expressions.get(expr_id)?, expressions, context)
+}
+
+fn document_source_expr_value_by_id(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
+    match &expressions.get(expr_id)?.kind {
+        AstExprKind::Source => context.source_base().map(str::to_owned),
+        _ => document_expr_value(expressions.get(expr_id)?, expressions, context),
+    }
+}
+
+fn document_source_statement_value(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    let expr_id = statement.expr?;
+    document_source_expr_value_by_id(expr_id, expressions, context)
 }
 
 fn document_statement_value(
@@ -1811,6 +2622,9 @@ fn verify_scheduled_update_expression(
             }
             require_known_symbol("trim previous", previous, known_symbols)
         }
+        UpdateExpression::MatchConst { input, .. } => {
+            require_known_symbol("match input", input, known_symbols)
+        }
         UpdateExpression::Unknown { summary } => Err(format!(
             "static schedule contains unsupported update expression `{summary}`"
         )),
@@ -1853,6 +2667,9 @@ fn verify_scheduled_list_predicate(
     match value {
         ListPredicate::AlwaysTrue => Ok(()),
         ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
+            if is_row_local_field_path(path) {
+                return Ok(());
+            }
             require_known_symbol("list predicate field", path, known_symbols)
         }
         ListPredicate::SelectedFilterVisibility {
@@ -1860,12 +2677,22 @@ fn verify_scheduled_list_predicate(
             row_field,
         } => {
             require_known_symbol("list predicate selector", selector, known_symbols)?;
+            if is_row_local_field_path(row_field) {
+                return Ok(());
+            }
             require_known_symbol("list predicate row field", row_field, known_symbols)
         }
         ListPredicate::Unknown { summary } => Err(format!(
             "static schedule contains unsupported list predicate `{summary}`"
         )),
     }
+}
+
+fn is_row_local_field_path(path: &str) -> bool {
+    let Some((row, field)) = path.split_once('.') else {
+        return false;
+    };
+    !field.is_empty() && value_starts_lowercase_identifier(row)
 }
 
 fn verify_combinational_field_cycles(
@@ -2020,6 +2847,14 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::NumberInfix { left, right, .. } => {
             reject_hidden_identity_identifier("number infix left", left)?;
             reject_hidden_identity_identifier("number infix right", right)
+        }
+        UpdateExpression::MatchConst { input, arms } => {
+            reject_hidden_identity_identifier("match input", input)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_hidden_identity_identifier("match output", &arm.output)?;
+            }
+            Ok(())
         }
         UpdateExpression::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown update expression", summary)
@@ -2323,7 +3158,10 @@ fn expression_operator_node_kind(operators: &[String]) -> Option<IrNodeKind> {
         Some(IrNodeKind::ListMap)
     } else if operators.iter().any(|operator| operator == "List/retain") {
         Some(IrNodeKind::ListRetain)
-    } else if operators.iter().any(|operator| operator == "List/count") {
+    } else if operators
+        .iter()
+        .any(|operator| operator == "List/count" || operator == "List/every")
+    {
         Some(IrNodeKind::Aggregate)
     } else if operators.iter().any(|operator| operator == "LATEST") {
         Some(IrNodeKind::Latest)
@@ -2489,7 +3327,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
             continue;
         }
         if let Some(trigger) = list_append_trigger(field) {
-            let fields = list_append_fields(field);
+            let fields = list_append_fields(field, program, &fields);
             operations.push(ListOperation {
                 list: list_name.to_owned(),
                 kind: ListOperationKind::Append { trigger, fields },
@@ -2497,7 +3335,10 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
         }
         for source in direct_source_refs(field, program) {
             let branch = field.source_branch(&source).unwrap_or_default();
-            if branch.has_token("List/remove") || field.has_token("List/remove") {
+            if branch.has_token("List/remove")
+                || field.has_token("List/remove")
+                || (field.has_operator("List/retain") && branch.has_token("False"))
+            {
                 let row_scope = row_scope_for_list(program, list_name);
                 operations.push(ListOperation {
                     list: list_name.to_owned(),
@@ -2511,27 +3352,45 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
     }
     for field in &fields {
         if field.has_operator("List/count") {
-            let Some(list) = count_or_retain_source_list(field) else {
+            let Some(list) = count_or_retain_source_list(field, program) else {
                 continue;
             };
-            let row_scope = row_scope_for_list(program, &list);
+            let row_scope = row_scope_for_list(program, &list)
+                .map(str::to_owned)
+                .or_else(|| ast_call_argument(field, "List/count"));
             operations.push(ListOperation {
                 list,
                 kind: ListOperationKind::Count {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(field, row_scope),
+                    predicate: list_retain_predicate(field, row_scope.as_deref()),
                 },
             });
         } else if field.has_operator("List/retain") {
-            let Some(list) = count_or_retain_source_list(field) else {
+            let Some(list) = count_or_retain_source_list(field, program) else {
                 continue;
             };
-            let row_scope = row_scope_for_list(program, &list);
+            let row_scope = ast_call_argument(field, "List/retain")
+                .or_else(|| row_scope_for_list(program, &list).map(str::to_owned));
+            for source in retain_remove_sources(field, program, row_scope.as_deref()) {
+                let branch = field.source_branch(&source).unwrap_or_default();
+                operations.push(ListOperation {
+                    list: list.clone(),
+                    kind: ListOperationKind::Remove {
+                        predicate: list_retain_remove_predicate(
+                            field,
+                            &source,
+                            &branch,
+                            row_scope.as_deref(),
+                        ),
+                        source,
+                    },
+                });
+            }
             operations.push(ListOperation {
                 list,
                 kind: ListOperationKind::Retain {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(field, row_scope),
+                    predicate: list_retain_predicate(field, row_scope.as_deref()),
                 },
             });
         }
@@ -2628,7 +3487,7 @@ fn collect_function_definitions(
 }
 
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
-    if field.has_operator("List/count") {
+    if field.has_operator("List/count") || field.has_operator("List/every") {
         DerivedValueKind::Aggregate
     } else if field.has_any_operator(&["List/retain", "List/map", "List/chunk", "List/find"]) {
         DerivedValueKind::ListView
@@ -2645,6 +3504,7 @@ fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValu
     let initial_expr = if let Some(initial) =
         field.ast_exprs.iter().find_map(|expr| match expr.kind {
             AstExprKind::Hold { initial, .. } => Some(initial),
+            AstExprKind::Pipe { input, ref op, .. } if op == "HOLD" => Some(input),
             _ => None,
         }) {
         field.ast_exprs.iter().find(|expr| expr.id == initial)
@@ -2981,16 +3841,21 @@ fn list_append_trigger(field: &FieldDef) -> Option<String> {
         .find(|expr| expr.id == item_arg.value)?;
     let trigger = match &value.kind {
         AstExprKind::Then { input, .. } => ast_argument_value(field, *input)?,
+        AstExprKind::Pipe { input, .. } => ast_argument_value(field, *input)?,
         _ => ast_argument_value(field, item_arg.value)?,
     };
     (!trigger.is_empty()).then(|| canonical_local_path(&trigger, &field.parent_path))
 }
 
-fn list_append_fields(field: &FieldDef) -> Vec<ListAppendField> {
+fn list_append_fields(
+    field: &FieldDef,
+    program: &ParsedProgram,
+    fields: &[FieldDef],
+) -> Vec<ListAppendField> {
     let Some(append_expr) = list_append_expr(field) else {
         return Vec::new();
     };
-    field
+    let literal_fields = field
         .ast_exprs
         .iter()
         .filter(|expr| expr.id > append_expr.id)
@@ -3011,7 +3876,146 @@ fn list_append_fields(field: &FieldDef) -> Vec<ListAppendField> {
             ),
             _ => None,
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !literal_fields.is_empty() {
+        return literal_fields;
+    }
+    list_append_function_constructor_fields(field, program, fields)
+}
+
+fn list_append_function_constructor_fields(
+    field: &FieldDef,
+    program: &ParsedProgram,
+    fields: &[FieldDef],
+) -> Vec<ListAppendField> {
+    let Some((function, arg_sources)) = list_append_item_constructor_args(field, program) else {
+        return Vec::new();
+    };
+    let Some(row_scope) = row_scope_for_append_constructor(program, &function) else {
+        return Vec::new();
+    };
+    let prefix = format!("{row_scope}.");
+    let row_scopes = row_scopes(program);
+    fields
+        .iter()
+        .filter(|candidate| candidate.path.starts_with(&prefix))
+        .filter_map(|candidate| {
+            let InitialValue::RowInitialField { path } =
+                field_initial_value(candidate, &row_scopes)
+            else {
+                return None;
+            };
+            let source = arg_sources.get(&path)?;
+            Some(ListAppendField {
+                name: candidate
+                    .path
+                    .strip_prefix(&prefix)
+                    .unwrap_or(candidate.local_name.as_str())
+                    .to_owned(),
+                source: source.clone(),
+            })
+        })
+        .collect()
+}
+
+fn list_append_item_constructor_args(
+    field: &FieldDef,
+    program: &ParsedProgram,
+) -> Option<(String, BTreeMap<String, String>)> {
+    let item_expr = list_append_item_expr(field)?;
+    match &item_expr.kind {
+        AstExprKind::Pipe { input, op, args } => Some((
+            op.clone(),
+            constructor_arg_sources(
+                field,
+                program,
+                op,
+                Some(*input),
+                args,
+                field.parent_path.as_str(),
+            )?,
+        )),
+        AstExprKind::Call { function, args } => Some((
+            function.clone(),
+            constructor_arg_sources(
+                field,
+                program,
+                function,
+                None,
+                args,
+                field.parent_path.as_str(),
+            )?,
+        )),
+        _ => None,
+    }
+}
+
+fn constructor_arg_sources(
+    field: &FieldDef,
+    program: &ParsedProgram,
+    function: &str,
+    piped_input: Option<usize>,
+    args: &[AstCallArg],
+    parent_path: &str,
+) -> Option<BTreeMap<String, String>> {
+    let function_args = function_arg_names(program, function)?;
+    let mut sources = BTreeMap::new();
+    let mut positional_index = 0usize;
+    if let Some(input) = piped_input {
+        let arg_name = function_args.first()?;
+        let source = ast_argument_value(field, input)?;
+        sources.insert(arg_name.clone(), canonical_local_path(&source, parent_path));
+        positional_index = 1;
+    }
+    for arg in args {
+        let arg_name = if let Some(name) = arg.name.as_ref() {
+            name.clone()
+        } else {
+            let name = function_args.get(positional_index)?.clone();
+            positional_index += 1;
+            name
+        };
+        let source = ast_argument_value(field, arg.value)?;
+        sources.insert(arg_name, canonical_local_path(&source, parent_path));
+    }
+    Some(sources)
+}
+
+fn function_arg_names(program: &ParsedProgram, function: &str) -> Option<Vec<String>> {
+    function_definitions(program)
+        .into_iter()
+        .find(|definition| definition.name == function)
+        .map(|definition| definition.args)
+}
+
+fn row_scope_for_append_constructor<'a>(
+    program: &'a ParsedProgram,
+    function: &str,
+) -> Option<&'a str> {
+    program
+        .row_scope_functions
+        .iter()
+        .find(|scope| {
+            scope.function == function
+                || scope
+                    .function
+                    .strip_prefix("__source_row_scope_")
+                    .is_some_and(|source_function| source_function == function)
+        })
+        .map(|scope| scope.row_scope.as_str())
+}
+
+fn list_append_item_expr<'a>(field: &'a FieldDef) -> Option<&'a AstExpr> {
+    let AstExprKind::Pipe { args, .. } = &list_append_expr(field)?.kind else {
+        return None;
+    };
+    let item_arg = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("item"))?;
+    field
+        .ast_exprs
+        .iter()
+        .find(|expr| expr.id == item_arg.value)
 }
 
 fn list_append_expr(field: &FieldDef) -> Option<&AstExpr> {
@@ -3023,12 +4027,109 @@ fn list_append_expr(field: &FieldDef) -> Option<&AstExpr> {
     })
 }
 
+fn retain_remove_sources(
+    field: &FieldDef,
+    program: &ParsedProgram,
+    row_scope: Option<&str>,
+) -> Vec<String> {
+    let mut sources = direct_source_refs(field, program)
+        .into_iter()
+        .filter(|source| {
+            let scoped = program
+                .source_ports
+                .iter()
+                .find(|port| port.path == *source)
+                .is_some_and(|port| port.scoped);
+            scoped || retain_source_predicate(field, source, row_scope).is_some()
+        })
+        .collect::<Vec<_>>();
+    for source in &program.source_ports {
+        if retain_source_predicate(field, &source.path, row_scope).is_some() {
+            push_unique(&mut sources, source.path.clone());
+        }
+    }
+    if !field.has_token("False") {
+        return sources;
+    }
+    for source in &program.source_ports {
+        if source.scoped
+            && source
+                .path
+                .split('.')
+                .any(|segment| segment.contains("remove") || segment.contains("delete"))
+            && source
+                .path
+                .split('.')
+                .any(|segment| field.has_token(segment))
+        {
+            push_unique(&mut sources, source.path.clone());
+        }
+    }
+    sources
+}
+
+fn list_retain_remove_predicate(
+    field: &FieldDef,
+    source: &str,
+    branch: &RoutedBranch,
+    row_scope: Option<&str>,
+) -> ListPredicate {
+    if !source.starts_with("store.")
+        && source
+            .split('.')
+            .any(|segment| segment.contains("remove") || segment.contains("delete"))
+    {
+        return ListPredicate::AlwaysTrue;
+    }
+    if branch.has_token("False") {
+        return ListPredicate::AlwaysTrue;
+    }
+    if let Some(retain_predicate) = retain_source_predicate(field, source, row_scope)
+        && let Some(remove_predicate) = invert_retain_predicate(retain_predicate)
+    {
+        return remove_predicate;
+    }
+    list_remove_predicate(field, source, branch, row_scope)
+}
+
+fn retain_source_predicate(
+    field: &FieldDef,
+    source: &str,
+    row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    list_remove_predicate_from_then_output(field, source, row_scope).or_else(|| {
+        let branch = field.source_branch(source)?;
+        let path = row_field_path_in_exprs(branch.ast_exprs(), row_scope)?;
+        if branch.bool_not_path().as_deref() == Some(path.as_str()) {
+            Some(ListPredicate::RowFieldBoolNot { path })
+        } else {
+            Some(ListPredicate::RowFieldBool { path })
+        }
+    })
+}
+
+fn invert_retain_predicate(predicate: ListPredicate) -> Option<ListPredicate> {
+    match predicate {
+        ListPredicate::RowFieldBool { path } => Some(ListPredicate::RowFieldBoolNot { path }),
+        ListPredicate::RowFieldBoolNot { path } => Some(ListPredicate::RowFieldBool { path }),
+        ListPredicate::AlwaysTrue
+        | ListPredicate::SelectedFilterVisibility { .. }
+        | ListPredicate::Unknown { .. } => None,
+    }
+}
+
 fn list_remove_predicate(
     field: &FieldDef,
     source: &str,
     branch: &RoutedBranch,
     row_scope: Option<&str>,
 ) -> ListPredicate {
+    if source
+        .split('.')
+        .any(|segment| segment.contains("remove") || segment.contains("delete"))
+    {
+        return ListPredicate::AlwaysTrue;
+    }
     if let Some(predicate) = list_remove_predicate_from_then_output(field, source, row_scope) {
         return predicate;
     }
@@ -3063,14 +4164,24 @@ fn list_remove_predicate_from_then_output(
         };
         let input_path = ast_argument_value(field, input)?;
         let matches_source = source_ref_variants(source).iter().any(|variant| {
-            input_path == *variant
-                || canonical_local_path(&input_path, &field.parent_path) == *variant
+            path_matches_source_variant(&input_path, variant)
+                || path_matches_source_variant(
+                    &canonical_local_path(&input_path, &field.parent_path),
+                    variant,
+                )
         });
         if !matches_source {
             return None;
         }
         list_predicate_from_expr(field, output, row_scope)
     })
+}
+
+fn path_matches_source_variant(path: &str, variant: &str) -> bool {
+    path == variant
+        || path
+            .strip_prefix(variant)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn list_predicate_from_expr(
@@ -3081,6 +4192,7 @@ fn list_predicate_from_expr(
     let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
     match &expr.kind {
         AstExprKind::Bool(true) => Some(ListPredicate::AlwaysTrue),
+        AstExprKind::Latest => latest_default_list_predicate(field, expr_id, row_scope),
         AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
             row_field_path_from_expr(field, *input, row_scope)
                 .map(|path| ListPredicate::RowFieldBoolNot { path })
@@ -3088,6 +4200,29 @@ fn list_predicate_from_expr(
         _ => row_field_path_from_expr(field, expr_id, row_scope)
             .map(|path| ListPredicate::RowFieldBool { path }),
     }
+}
+
+fn latest_default_list_predicate(
+    field: &FieldDef,
+    latest_expr_id: usize,
+    row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let statement = statement_containing_expr(&field.statement, latest_expr_id)?;
+    statement
+        .children
+        .iter()
+        .find_map(|child| child.expr)
+        .and_then(|expr_id| list_predicate_from_expr(field, expr_id, row_scope))
+}
+
+fn statement_containing_expr(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
+    if statement.expr == Some(expr_id) {
+        return Some(statement);
+    }
+    statement
+        .children
+        .iter()
+        .find_map(|child| statement_containing_expr(child, expr_id))
 }
 
 fn row_field_path_from_expr(
@@ -3115,9 +4250,7 @@ fn list_retain_predicate(field: &FieldDef, row_scope: Option<&str>) -> ListPredi
     if let Some(predicate) = list_retain_predicate_from_ast_arg(field, row_scope) {
         return predicate;
     }
-    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope)
-        && bool_not_path_in_exprs(&field.ast_exprs).as_deref() == Some(path.as_str())
-    {
+    if let Some(path) = bool_not_path_in_exprs(&field.ast_exprs) {
         return ListPredicate::RowFieldBoolNot { path };
     }
     if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope) {
@@ -3152,11 +4285,20 @@ fn list_retain_predicate_from_ast_arg(
     list_predicate_from_expr(field, predicate_arg.value, row_scope)
 }
 
-fn count_or_retain_source_list(field: &FieldDef) -> Option<String> {
+fn count_or_retain_source_list(field: &FieldDef, program: &ParsedProgram) -> Option<String> {
+    if let Some(list_name) = field.path.strip_prefix("store.")
+        && program
+            .list_memories
+            .iter()
+            .any(|list| list.name == list_name)
+    {
+        return Some(list_name.to_owned());
+    }
     let count_or_retain = field.ast_exprs.iter().find(|expr| {
         matches!(
             &expr.kind,
-            AstExprKind::Pipe { op, .. } if op == "List/count" || op == "List/retain"
+            AstExprKind::Pipe { op, .. }
+                if op == "List/count" || op == "List/retain" || op == "List/every"
         )
     })?;
     source_list_from_expr(field, count_or_retain.id)
@@ -3320,6 +4462,7 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
             | "List/retain"
             | "List/count"
             | "List/sum"
+            | "List/every"
     )
 }
 
@@ -3351,13 +4494,26 @@ fn update_expression_for_source(
             path: value.to_owned(),
         };
     }
-    if let Some(path) = branch.bool_not_path() {
+    if let Some(path) = branch.bool_not_path().filter(|path| !path.is_empty()) {
         return UpdateExpression::BoolNot { path };
+    }
+    if branch.has_token("Bool/not") {
+        return UpdateExpression::BoolNot {
+            path: target.to_owned(),
+        };
+    }
+    if bool_toggle_when_matches_source(field, source) {
+        return UpdateExpression::BoolNot {
+            path: target.to_owned(),
+        };
     }
     if let Some(expression) = text_trim_or_previous_update(program, target, &branch) {
         return expression;
     }
     if let Some(expression) = branch.then_number_infix_expression(field, target) {
+        return expression;
+    }
+    if let Some(expression) = match_const_update_expression(field, target, source, &branch) {
         return expression;
     }
     if let Some(value) = branch.then_simple_value() {
@@ -3399,6 +4555,294 @@ fn update_expression_for_source(
     UpdateExpression::Unknown {
         summary: "source reaches target through derived local field".to_owned(),
     }
+}
+
+fn match_const_update_expression(
+    field: &FieldDef,
+    target: &str,
+    source: &str,
+    branch: &RoutedBranch,
+) -> Option<UpdateExpression> {
+    field
+        .ast_exprs
+        .iter()
+        .find_map(|expr| {
+            let AstExprKind::Then { input, .. } = expr.kind else {
+                return None;
+            };
+            (then_input_matches_source(field, input, source)
+                || branch
+                    .ast_exprs
+                    .iter()
+                    .any(|branch_expr| branch_expr.id == expr.id))
+            .then(|| match_const_update_expression_from_then_expr(field, target, expr.id))
+            .flatten()
+        })
+        .or_else(|| following_match_const_update_expression(field, target, source))
+}
+
+fn then_input_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
+    expr_matches_source(field, expr_id, source)
+}
+
+fn expr_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
+    let Some(input_path) = ast_argument_value(field, expr_id) else {
+        return false;
+    };
+    source_ref_variants(source).iter().any(|variant| {
+        let canonical = canonical_local_path(&input_path, &field.parent_path);
+        input_path == *variant
+            || input_path
+                .strip_prefix(variant)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+            || canonical == *variant
+            || canonical
+                .strip_prefix(variant)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
+}
+
+fn bool_toggle_when_matches_source(field: &FieldDef, source: &str) -> bool {
+    field.ast_exprs.iter().any(|expr| {
+        let AstExprKind::Pipe { op, args, .. } = &expr.kind else {
+            return false;
+        };
+        op == "Bool/toggle"
+            && args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("when"))
+                .is_some_and(|arg| expr_matches_source(field, arg.value, source))
+    })
+}
+
+fn match_const_update_expression_from_then_expr(
+    field: &FieldDef,
+    target: &str,
+    expr_id: usize,
+) -> Option<UpdateExpression> {
+    let expr = field_expr(field, expr_id)?;
+    let AstExprKind::Then { output, .. } = expr.kind else {
+        return None;
+    };
+    let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
+    match_const_update_expression_from_expr(field, target, output)
+}
+
+fn following_match_const_update_expression(
+    field: &FieldDef,
+    target: &str,
+    source: &str,
+) -> Option<UpdateExpression> {
+    field.ast_exprs.iter().find_map(|expr| {
+        if !expr_matches_source(field, expr.id, source) {
+            return None;
+        }
+        let then = field.ast_exprs.iter().find(|candidate| {
+            candidate.line > expr.line && matches!(candidate.kind, AstExprKind::Then { .. })
+        })?;
+        match_const_update_expression_from_then_expr(field, target, then.id)
+    })
+}
+
+fn following_when_expr_id(field: &FieldDef, line: usize) -> Option<usize> {
+    field
+        .ast_exprs
+        .iter()
+        .find(|candidate| {
+            candidate.line > line && matches!(candidate.kind, AstExprKind::When { .. })
+        })
+        .map(|expr| expr.id)
+}
+
+fn match_const_update_expression_from_expr(
+    field: &FieldDef,
+    target: &str,
+    expr_id: usize,
+) -> Option<UpdateExpression> {
+    let expr = field_expr(field, expr_id)?;
+    match &expr.kind {
+        AstExprKind::When { input } => {
+            let input =
+                canonical_scalar_update_path(field, target, &ast_argument_value(field, *input)?);
+            let arms = match_const_arms_for_when(field, expr.id);
+            (!arms.is_empty()).then_some(UpdateExpression::MatchConst { input, arms })
+        }
+        AstExprKind::Then {
+            output: Some(output),
+            ..
+        } => match_const_update_expression_from_expr(field, target, *output),
+        _ => None,
+    }
+}
+
+fn match_const_arms_for_when(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
+    let mut arms = Vec::new();
+    collect_match_const_arms_for_when(field, &field.statement, when_expr_id, &mut arms);
+    if arms.is_empty() {
+        match_const_arms_after_when_expr(field, when_expr_id)
+    } else {
+        arms
+    }
+}
+
+fn match_const_arms_after_when_expr(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
+    let Some(when_expr) = field_expr(field, when_expr_id) else {
+        return Vec::new();
+    };
+    let end_line = field
+        .ast_exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_expr.line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
+        .filter_map(|expr| match_const_arm_expr(field, expr))
+        .collect()
+}
+
+fn collect_match_const_arms_for_when(
+    field: &FieldDef,
+    statement: &AstStatement,
+    when_expr_id: usize,
+    arms: &mut Vec<UpdateMatchArm>,
+) -> bool {
+    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
+        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
+    });
+    if statement_contains_when {
+        for child in &statement.children {
+            if let Some(arm) = match_const_arm(field, child) {
+                arms.push(arm);
+            }
+        }
+        if !arms.is_empty() {
+            return true;
+        }
+    }
+    for child in &statement.children {
+        if collect_match_const_arms_for_when(field, child, when_expr_id, arms) {
+            return true;
+        }
+    }
+    false
+}
+
+fn match_const_arm(field: &FieldDef, statement: &AstStatement) -> Option<UpdateMatchArm> {
+    let expr_id = statement.expr?;
+    let expr = field_expr(field, expr_id)?;
+    match_const_arm_expr(field, expr)
+}
+
+fn match_const_arm_expr(field: &FieldDef, expr: &AstExpr) -> Option<UpdateMatchArm> {
+    let AstExprKind::MatchArm {
+        pattern,
+        output: Some(output),
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let output = ast_simple_update_value_in_exprs(&field.ast_exprs, *output)?;
+    (!pattern.is_empty()).then(|| UpdateMatchArm {
+        pattern: pattern.join("."),
+        output,
+    })
+}
+
+fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
+    if root == needle {
+        return true;
+    }
+    let Some(expr) = field_expr(field, root) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .any(|arg| expr_contains_expr_id(field, arg.value, needle)),
+        AstExprKind::Pipe { input, args, .. } => {
+            expr_contains_expr_id(field, *input, needle)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_expr_id(field, arg.value, needle))
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            expr_contains_expr_id(field, *initial, needle)
+        }
+        AstExprKind::Then {
+            input,
+            output: Some(output),
+        } => {
+            expr_contains_expr_id(field, *input, needle)
+                || expr_contains_expr_id(field, *output, needle)
+        }
+        AstExprKind::Then {
+            input,
+            output: None,
+        } => expr_contains_expr_id(field, *input, needle),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expr_contains_expr_id(field, *output, needle),
+        AstExprKind::Infix { left, right, .. } => {
+            expr_contains_expr_id(field, *left, needle)
+                || expr_contains_expr_id(field, *right, needle)
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .any(|record_field| expr_contains_expr_id(field, record_field.value, needle)),
+        AstExprKind::ListLiteral { .. }
+        | AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => false,
+    }
+}
+
+fn canonical_scalar_update_path(field: &FieldDef, target: &str, value: &str) -> String {
+    let target_field = target
+        .rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(target);
+    if value == field.local_name
+        || value == target_field
+        || field_hold_name(field).as_deref() == Some(value)
+    {
+        target.to_owned()
+    } else {
+        canonical_local_path(value, &field.parent_path)
+    }
+}
+
+fn field_hold_name(field: &FieldDef) -> Option<String> {
+    match &field.statement.kind {
+        AstStatementKind::Hold { name, .. } => name.clone(),
+        _ => None,
+    }
+}
+
+fn field_expr(field: &FieldDef, expr_id: usize) -> Option<&AstExpr> {
+    field.ast_exprs.iter().find(|expr| expr.id == expr_id)
 }
 
 fn text_trim_or_previous_update(
@@ -3696,8 +5140,25 @@ impl FieldDef {
     }
 
     fn references_payload_path(&self, source_variant: &str, payload_field: &str) -> bool {
-        let payload_path = format!("{source_variant}.{payload_field}");
-        self.references_path_expr(&payload_path, PathMatch::Exact)
+        let mut payload_paths = vec![format!("{source_variant}.{payload_field}")];
+        match payload_field {
+            "text" => {
+                payload_paths.push(format!("{source_variant}.event.change.text"));
+                payload_paths.push(format!("{source_variant}.change.text"));
+            }
+            "key" => {
+                payload_paths.push(format!("{source_variant}.event.key_down.key"));
+                payload_paths.push(format!("{source_variant}.key_down.key"));
+            }
+            "address" => {
+                payload_paths.push(format!("{source_variant}.event.address"));
+                payload_paths.push(format!("{source_variant}.address"));
+            }
+            _ => {}
+        }
+        payload_paths
+            .iter()
+            .any(|payload_path| self.references_path_expr(payload_path, PathMatch::Exact))
     }
 
     fn match_arm_destructures_payload(&self, payload_field: &str) -> bool {
@@ -3755,7 +5216,11 @@ impl FieldDef {
                 })
                 .sum::<i32>();
             depth += scope_delta;
-            if offset == 0 && depth == 0 && scope_delta == 0 {
+            let has_indented_continuation = self
+                .ast_items
+                .get(start + offset + 1)
+                .is_some_and(|next| next.indent > start_indent);
+            if offset == 0 && depth == 0 && scope_delta == 0 && !has_indented_continuation {
                 break;
             }
             if depth <= 0 && item_has_symbol(item, "}") {
@@ -3819,6 +5284,7 @@ fn source_ref_variants(path: &str) -> Vec<String> {
     let mut variants = vec![path.to_owned()];
     if let Some((_, suffix)) = path.split_once('.') {
         variants.push(suffix.to_owned());
+        variants.push(format!("item.{suffix}"));
     }
     variants
 }
@@ -3860,20 +5326,7 @@ fn gather_field_defs_from_statements(
             }
             AstStatementKind::Field { name } => {
                 if should_record_field_statement(name, scope, program) {
-                    let parent_path = scope.join(".");
-                    let path = if parent_path.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{parent_path}.{name}")
-                    };
-                    fields.push(FieldDef {
-                        path,
-                        local_name: name.clone(),
-                        parent_path,
-                        statement: statement.clone(),
-                        ast_items: collect_statement_ast_items(statement, items),
-                        ast_exprs: collect_statement_ast_exprs(statement, program),
-                    });
+                    push_field_def(statement, name, scope, program, items, fields);
                 }
                 if !statement.children.is_empty() {
                     scope.push(name.clone());
@@ -3887,10 +5340,38 @@ fn gather_field_defs_from_statements(
                     scope.pop();
                 }
             }
+            AstStatementKind::Hold {
+                field: Some(name), ..
+            } => {
+                if should_record_field_statement(name, scope, program) {
+                    push_field_def(statement, name, scope, program, items, fields);
+                }
+                gather_field_defs_from_statements(
+                    &statement.children,
+                    scope,
+                    program,
+                    items,
+                    fields,
+                );
+            }
+            AstStatementKind::List {
+                field: Some(name), ..
+            } => {
+                if should_record_field_statement(name, scope, program) {
+                    push_field_def(statement, name, scope, program, items, fields);
+                }
+                gather_field_defs_from_statements(
+                    &statement.children,
+                    scope,
+                    program,
+                    items,
+                    fields,
+                );
+            }
             AstStatementKind::Block
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
-            | AstStatementKind::List { .. }
+            | AstStatementKind::List { field: None, .. }
             | AstStatementKind::Source { .. } => {
                 gather_field_defs_from_statements(
                     &statement.children,
@@ -3902,6 +5383,30 @@ fn gather_field_defs_from_statements(
             }
         }
     }
+}
+
+fn push_field_def(
+    statement: &AstStatement,
+    name: &str,
+    scope: &[String],
+    program: &ParsedProgram,
+    items: &[&AstItem],
+    fields: &mut Vec<FieldDef>,
+) {
+    let parent_path = scope.join(".");
+    let path = if parent_path.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent_path}.{name}")
+    };
+    fields.push(FieldDef {
+        path,
+        local_name: name.to_owned(),
+        parent_path,
+        statement: statement.clone(),
+        ast_items: collect_statement_ast_items(statement, items),
+        ast_exprs: collect_statement_ast_exprs(statement, program),
+    });
 }
 
 fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
@@ -4002,15 +5507,28 @@ fn should_record_field_statement(
     scope: &[String],
     program: &ParsedProgram,
 ) -> bool {
+    let candidate_path = if scope.is_empty() {
+        local_name.to_owned()
+    } else {
+        format!("{}.{}", scope.join("."), local_name)
+    };
+    let top_level_data_scope = scope
+        .first()
+        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene"));
     local_name != "sources"
         && !scope.iter().any(|name| name == "sources")
-        && scope.iter().any(|name| {
-            name == "store"
-                || program
-                    .row_scope_functions
-                    .iter()
-                    .any(|scope| scope.row_scope == *name)
-        })
+        && (program
+            .state_cells
+            .iter()
+            .any(|cell| cell.path == candidate_path)
+            || top_level_data_scope
+            || scope.iter().any(|name| {
+                name == "store"
+                    || program
+                        .row_scope_functions
+                        .iter()
+                        .any(|scope| scope.row_scope == *name)
+            }))
 }
 
 fn collect_statement_ast_items(statement: &AstStatement, items: &[&AstItem]) -> Vec<AstItem> {
@@ -4046,7 +5564,13 @@ fn function_row_scope<'a>(name: &str, program: &'a ParsedProgram) -> Option<&'a 
     program
         .row_scope_functions
         .iter()
-        .find(|scope| scope.function == name)
+        .find(|scope| {
+            scope.function == name
+                || scope
+                    .function
+                    .strip_prefix("__source_row_scope_")
+                    .is_some_and(|source_function| source_function == name)
+        })
         .map(|scope| scope.row_scope.as_str())
 }
 
@@ -4147,6 +5671,44 @@ FUNCTION counter_button(press, label) {
                 .iter()
                 .any(|binding| binding.kind == ViewBindingKind::Data && binding.path == "label")
         );
+    }
+
+    #[test]
+    fn source_wrapper_binds_nested_element_events_generically() {
+        let source = r#"
+HOLD
+LATEST
+items: LIST {}
+rows: items |> List/map(item, new: item)
+
+store: [
+    button: SOURCE
+]
+
+document: Document/new(root: wrapped_button())
+
+FUNCTION wrapped_button() {
+    button() |> SOURCE { PASSED.store.button }
+}
+
+FUNCTION button() {
+    Element/button(
+        element: [event: [press: SOURCE]]
+        style: []
+        label: TEXT { Go }
+        )
+}
+"#;
+        let parsed = boon_parser::parse_source("scene-source-wrapper.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Button"
+                && binding.attr == "press"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.button"
+                && binding.source_id.is_some()
+        }));
     }
 
     #[test]
@@ -4525,6 +6087,213 @@ FUNCTION new_todo(todo) {
     }
 
     #[test]
+    fn physical_todomvc_mode_toggle_lowers_to_match_const_expression() {
+        let parsed = boon_parser::parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            [
+                (
+                    "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Glassmorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Glassmorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neobrutalism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neobrutalism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Neumorphism.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Neumorphism.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Theme/Theme.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Theme.bn").to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/Generated/Assets.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Generated/Assets.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/todo_mvc_physical/RUN.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/RUN.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let fields = typed_field_defs(&parsed);
+        let field = fields
+            .iter()
+            .find(|field| field.path == "theme_options.mode")
+            .expect("theme_options.mode field");
+        let source = "store.elements.theme_switcher.mode_toggle";
+        let routed_branch = field
+            .source_branch(source)
+            .expect("mode toggle routed branch");
+        let expected = UpdateExpression::MatchConst {
+            input: "theme_options.mode".to_owned(),
+            arms: vec![
+                UpdateMatchArm {
+                    pattern: "Light".to_owned(),
+                    output: "Dark".to_owned(),
+                },
+                UpdateMatchArm {
+                    pattern: "Dark".to_owned(),
+                    output: "Light".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            match_const_update_expression(field, "theme_options.mode", source, &routed_branch),
+            Some(expected.clone())
+        );
+        let row_scopes = row_scopes(&parsed);
+        let state_cells = parsed
+            .state_cells
+            .iter()
+            .enumerate()
+            .map(|(id, cell)| StateCell {
+                id: StateId(id),
+                path: cell.path.clone(),
+                scope_id: scope_id_for_path(&row_scopes, &cell.path),
+                hold_name: cell.hold_name.clone(),
+                initial_value: InitialValue::Unknown {
+                    summary: "test probe".to_owned(),
+                },
+                indexed: cell.indexed,
+                source_line: cell.line,
+            })
+            .collect::<Vec<_>>();
+        let unknown_branches = update_branches(&parsed, &state_cells)
+            .into_iter()
+            .filter(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
+            .collect::<Vec<_>>();
+        assert!(unknown_branches.is_empty(), "{unknown_branches:#?}");
+        let ir = lower(&parsed).unwrap();
+        assert!(
+            parsed
+                .source_ports
+                .iter()
+                .any(|source| source.path == "store.elements.remove_completed_button"),
+            "{:#?}",
+            parsed
+                .source_ports
+                .iter()
+                .map(|source| &source.path)
+                .collect::<Vec<_>>()
+        );
+        let fields = typed_field_defs(&parsed);
+        let todos_field = fields
+            .iter()
+            .find(|field| field.path == "store.todos")
+            .expect("store.todos field");
+        assert!(
+            todos_field
+                .source_branch("store.elements.remove_completed_button")
+                .is_some(),
+            "{:#?}",
+            todos_field
+                .ast_exprs
+                .iter()
+                .filter_map(|expr| match &expr.kind {
+                    AstExprKind::Path(parts) => Some(parts.join(".")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        let remove_completed_branch = todos_field
+            .source_branch("store.elements.remove_completed_button")
+            .unwrap();
+        assert_eq!(
+            retain_source_predicate(
+                todos_field,
+                "store.elements.remove_completed_button",
+                Some("item"),
+            ),
+            Some(ListPredicate::RowFieldBoolNot {
+                path: "item.completed".to_owned(),
+            }),
+            "{:#?}",
+            remove_completed_branch
+                .ast_exprs()
+                .iter()
+                .map(|expr| format!("{:?}", expr.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ir.row_scopes
+                .iter()
+                .any(|scope| { scope.list == "todos" && scope.row_scope == "todo" })
+        );
+        assert!(ir.sources.iter().any(|source| {
+            source.path == "todo.todo_elements.todo_checkbox"
+                && source.scoped
+                && source.scope_id.is_some()
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Input"
+                && binding.attr == "change"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.elements.new_todo_title_text_input"
+                && binding.source_id.is_some()
+        }));
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Input"
+                && binding.attr == "submit"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.elements.new_todo_title_text_input"
+                && binding.source_id.is_some()
+        }));
+        assert!(ir.state_cells.iter().any(|cell| {
+            cell.path == "todo.title"
+                && cell.initial_value
+                    == InitialValue::RowInitialField {
+                        path: "title".to_owned(),
+                    }
+        }));
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Append {
+                        trigger: "store.title_to_save".to_owned(),
+                        fields: vec![ListAppendField {
+                            name: "title".to_owned(),
+                            source: "store.title_to_save".to_owned(),
+                        }],
+                    }
+        }));
+        assert!(
+            ir.list_operations.iter().any(|operation| {
+                operation.list == "todos"
+                    && operation.kind
+                        == ListOperationKind::Remove {
+                            source: "store.elements.remove_completed_button".to_owned(),
+                            predicate: ListPredicate::RowFieldBool {
+                                path: "item.completed".to_owned(),
+                            },
+                        }
+            }),
+            "{:#?}",
+            ir.list_operations
+        );
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| {
+                branch.target == "theme_options.mode"
+                    && branch.source == "store.elements.theme_switcher.mode_toggle"
+            })
+            .expect("physical TodoMVC mode toggle update branch");
+        assert_eq!(branch.expression, expected);
+    }
+
+    #[test]
     fn derived_value_kind_uses_ast_operators_not_text_tokens() {
         let source = r#"
 store: [
@@ -4632,6 +6401,43 @@ FUNCTION new_todo(todo) {
                         fields: vec![ListAppendField {
                             name: "title".to_owned(),
                             source: "store.pending_title".to_owned(),
+                        }],
+                    }
+        }));
+    }
+
+    #[test]
+    fn list_append_function_constructor_maps_piped_input_to_row_initial_field() {
+        let source = r#"
+store: [
+    sources: [
+        input: [key_down: SOURCE]
+    ]
+    title_to_save:
+        sources.input.key_down |> THEN { typed_title }
+    todos:
+        LIST {}
+        |> List/append(item: title_to_save |> new_todo())
+]
+FUNCTION new_todo(title) {
+    [
+        title:
+            title |> HOLD title { LATEST {} }
+        completed:
+            False |> HOLD completed { LATEST {} }
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("append-function-constructor.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        assert!(ir.list_operations.iter().any(|operation| {
+            operation.list == "todos"
+                && operation.kind
+                    == ListOperationKind::Append {
+                        trigger: "store.title_to_save".to_owned(),
+                        fields: vec![ListAppendField {
+                            name: "title".to_owned(),
+                            source: "store.title_to_save".to_owned(),
                         }],
                     }
         }));

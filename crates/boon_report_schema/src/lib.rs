@@ -808,7 +808,7 @@ pub fn require_generic_runtime_slice_flags(
         report_path,
     )?;
     let example_specific = match example {
-        "todomvc" => &[
+        "todomvc" | "todo_mvc_physical" => &[
             "generic_common_render_patch_lowering",
             "generic_source_effects_through_action_executor",
             "generic_route_selected_indexed_text_commit_executor",
@@ -1106,7 +1106,7 @@ fn verify_expression_coverage(report: &JsonValue, report_path: &Path) -> Runtime
 
 fn key_is_other_example_runtime_slice(key: &str, example: &str) -> bool {
     match example {
-        "todomvc" => {
+        "todomvc" | "todo_mvc_physical" => {
             key.starts_with("generic_cells") || key.starts_with("cells_") || key.contains("_cells_")
         }
         "cells" => {
@@ -2360,7 +2360,17 @@ fn verify_report_source_files_hash(
     report_path: &Path,
     expected: &str,
 ) -> RuntimeResult<bool> {
-    let Some(files) = report.get("source_files").and_then(JsonValue::as_array) else {
+    let Some((files_key, files)) = report
+        .get("project_files")
+        .and_then(JsonValue::as_array)
+        .map(|files| ("project_files", files))
+        .or_else(|| {
+            report
+                .get("source_files")
+                .and_then(JsonValue::as_array)
+                .map(|files| ("source_files", files))
+        })
+    else {
         return Ok(false);
     };
     let paths = files
@@ -2379,7 +2389,7 @@ fn verify_report_source_files_hash(
     let actual = sha256_combined_source_files(&paths)?;
     if actual != expected {
         return Err(format!(
-            "{} has stale `source_hash` for manifest source_files",
+            "{} has stale `source_hash` for manifest {files_key}",
             report_path.display()
         )
         .into());
@@ -2388,20 +2398,17 @@ fn verify_report_source_files_hash(
 }
 
 fn sha256_combined_source_files(paths: &[&str]) -> RuntimeResult<String> {
-    let mut combined = String::new();
-    for path in paths {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str("-- file: ");
-        combined.push_str(path);
-        combined.push('\n');
-        combined.push_str(&fs::read_to_string(path)?);
-        if !combined.ends_with('\n') {
-            combined.push('\n');
-        }
+    if paths.len() == 1 {
+        return Ok(sha256_bytes(&fs::read(paths[0])?));
     }
-    Ok(sha256_bytes(combined.as_bytes()))
+    let mut canonical = String::new();
+    for path in paths {
+        canonical.push_str(path);
+        canonical.push('\0');
+        canonical.push_str(&sha256_bytes(&fs::read(path)?));
+        canonical.push('\0');
+    }
+    Ok(sha256_bytes(canonical.as_bytes()))
 }
 
 fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {

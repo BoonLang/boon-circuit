@@ -318,7 +318,7 @@ FUNCTION todo_new_entry() {
             Element/button(
                 element: [events: PASSED.store.sources.toggle_all_checkbox.events]
                 style: [
-                    width: 45
+                    width: 54
                     height: 65
                     background: [color: Oklch[lightness:1,alpha:0]]
                     cursor: Pointer
@@ -525,12 +525,16 @@ FUNCTION todo_footer() {
         items: LIST {
             Element/label(
                 element: []
-                style: [width: 130, height: 20, line_height: 19.6, text_inset: 0, font: [family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }, size: 15, color: Oklch[lightness:0.17], weight: Light]]
-                label: TEXT { {PASSED.store.active_count} items left }
+                style: [width: 130, height: 25.2, line_height: 19.6, text_inset: 0, vertical_align: Center, font: [family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }, size: 15, color: Oklch[lightness:0.17], weight: Light]]
+                label:
+                    PASSED.store.active_count == 1 |> WHILE {
+                        True => TEXT { 1 item left }
+                        False => TEXT { {PASSED.store.active_count} items left }
+                    }
             )
             Element/container(
                 element: []
-                style: [width: 17, height: 20, background: [color: Oklch[lightness:1]]]
+                style: [width: 17, height: 25.2, background: [color: Oklch[lightness:1]]]
                 child: Text/empty()
             )
             Element/button(
@@ -540,6 +544,7 @@ FUNCTION todo_footer() {
                     height: 25.2
                     line_height: 19.6
                     text_inset: 0
+                    vertical_align: Center
                     background: [color: Oklch[lightness:1]]
                     border_width: 0.8
                     rounded_corners: 3
@@ -563,6 +568,7 @@ FUNCTION todo_footer() {
                     height: 25.2
                     line_height: 19.6
                     text_inset: 0
+                    vertical_align: Center
                     background: [color: Oklch[lightness:1]]
                     border_width: 0.8
                     rounded_corners: 3
@@ -586,6 +592,7 @@ FUNCTION todo_footer() {
                     height: 25.2
                     line_height: 19.6
                     text_inset: 0
+                    vertical_align: Center
                     background: [color: Oklch[lightness:1]]
                     border_width: 0.8
                     rounded_corners: 3
@@ -604,12 +611,12 @@ FUNCTION todo_footer() {
             )
             Element/container(
                 element: []
-                style: [width: 33, height: 20, background: [color: Oklch[lightness:1]]]
+                style: [width: 33, height: 25.2, background: [color: Oklch[lightness:1]]]
                 child: Text/empty()
             )
             Element/button(
                 element: [events: PASSED.store.sources.clear_completed_button.events, hovered: True]
-                style: [width: 110, height: 20, line_height: 19, text_inset: 0, text_align: Left, background: [color: Oklch[lightness:1]], font: [family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }, size: 15, color: Oklch[lightness:0.17], weight: Light, line: [underline: element.hovered]]]
+                style: [width: 110, height: 25.2, line_height: 19.6, text_inset: 0, text_align: Left, vertical_align: Center, background: [color: Oklch[lightness:1]], font: [family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }, size: 15, color: Oklch[lightness:0.17], weight: Light, line: [underline: element.hovered]]]
                 label: TEXT { Clear completed }
                 visible: PASSED.store.has_completed
             )

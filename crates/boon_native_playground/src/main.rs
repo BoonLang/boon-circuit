@@ -72,6 +72,7 @@ const DEV_TYPE_INSPECTOR_LINE_HEIGHT: u32 = 20;
 const DEV_TYPE_INSPECTOR_DETAIL_PADDING: u32 = 2;
 const DEV_TYPE_INSPECTOR_ROW_GAP: u32 = 2;
 const DEV_TYPE_INSPECTOR_WRAP_CHARS: usize = 240;
+const DEV_TYPE_INSPECTOR_EMPTY_STATE_TEXT: &str = "click or hover source code to inspect";
 const DEV_TYPE_INSPECTOR_VALUE_MAX_DEPTH: usize = 5;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS: usize = 16;
 const DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS: usize = 1;
@@ -8503,7 +8504,7 @@ impl DevWindowShell {
     fn type_inspector_content(&self, wrap_chars: usize) -> TypeInspectorContent {
         let Some(active) = self.active_type_hint() else {
             return TypeInspectorContent {
-                detail_lines: vec!["no inferred type".to_owned()],
+                detail_lines: vec![DEV_TYPE_INSPECTOR_EMPTY_STATE_TEXT.to_owned()],
                 actions: vec![None],
             };
         };
@@ -14025,6 +14026,13 @@ fn document_text_or_nested_text(
                 .filter(|text| !text.is_empty())
         })
         .or_else(|| {
+            statement.children.iter().find_map(|child| {
+                child.expr?;
+                document_text_value(child, expressions, context, false)
+                    .filter(|text| !text.is_empty())
+            })
+        })
+        .or_else(|| {
             record_fields_for_statement(statement, expressions).and_then(|fields| {
                 fields
                     .iter()
@@ -14683,6 +14691,22 @@ fn document_text_value(
     template: bool,
 ) -> Option<String> {
     let expr = expressions.get(statement.expr?)?;
+    if let AstExprKind::Pipe { input, op, .. } = &expr.kind
+        && op == "WHILE"
+        && let Some(resolved) = document_eval_while_expr_value(
+            *input,
+            statement.children.as_slice(),
+            expressions,
+            context,
+        )
+    {
+        let text = json_value_to_document_text(&resolved);
+        return Some(if text.contains('{') && text.contains('}') {
+            document_resolved_template(&text, context)
+        } else {
+            text
+        });
+    }
     if template {
         return document_expr_value(expr, expressions)
             .map(|value| document_resolved_template(&value, context));
@@ -20305,7 +20329,7 @@ mod tests {
                 && span["color"].as_str() == Some(syntax_color_for_kind("tag"))
         }));
 
-        let empty_segments = type_inspector_syntax_segments("no inferred type");
+        let empty_segments = type_inspector_syntax_segments(DEV_TYPE_INSPECTOR_EMPTY_STATE_TEXT);
         assert!(
             empty_segments.iter().all(|span| span.kind == "variable"),
             "empty-state text should not be highlighted as tags or types: {empty_segments:?}"
@@ -20325,6 +20349,17 @@ mod tests {
             .find(|segment| segment.text.contains("Read documentation255"))
             .expect("TEXT value content should stay in one content segment");
         assert_eq!(content_segment.kind, "text-literal-content");
+    }
+
+    #[test]
+    fn type_inspector_empty_state_prompts_source_interaction() {
+        let (shell, _input_state, _document, _layout) = test_dev_editor_context("\n");
+        assert_eq!(
+            shell
+                .type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS)
+                .detail_lines,
+            vec![DEV_TYPE_INSPECTOR_EMPTY_STATE_TEXT.to_owned()]
+        );
     }
 
     #[test]
@@ -23690,6 +23725,18 @@ mod tests {
             Some(&boon_document_model::StyleValue::Number(6.0)),
             "new-todo input should keep the old TodoMVC left text padding"
         );
+        let new_todo_text_left = new_todo_input.bounds.x
+            + style_number_from_map(&new_todo_input.style, "text_inset")
+                .expect("new-todo input should expose text_inset");
+        let active_todo_title_left = active_todo_title.bounds.x
+            + style_number_from_map(&active_todo_title.style, "text_inset")
+                .expect("todo title should expose text_inset");
+        assert!(
+            (new_todo_text_left - active_todo_title_left).abs() <= 0.5,
+            "new-todo placeholder should start at the same x as todo titles: input_left={new_todo_text_left}, title_left={active_todo_title_left}, input={:?}, title={:?}",
+            new_todo_input.bounds,
+            active_todo_title.bounds
+        );
         let author_link = layout
             .display_list
             .iter()
@@ -23810,6 +23857,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("TodoMVC filter button `{label}` should render"))
         };
         let all_filter = filter_button("All");
+        let item_count_label = layout
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some("1 item left"))
+            .expect("TodoMVC should use singular copy for one active item");
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("1 items left")),
+            "TodoMVC Boon source should own item/item(s) pluralization"
+        );
+        let clear_completed_button = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("Clear completed")
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .expect("TodoMVC clear-completed button should render while completed todos exist");
+        let footer_line_top = |item: &boon_document::DisplayItem| {
+            let line_height = style_number_from_map(&item.style, "line_height")
+                .expect("footer text control should expose line_height");
+            item.bounds.y + (item.bounds.height - line_height).max(0.0) * 0.5
+        };
+        let count_line_top = footer_line_top(item_count_label);
+        let all_filter_line_top = footer_line_top(all_filter);
+        let clear_line_top = footer_line_top(clear_completed_button);
+        assert!(
+            (all_filter_line_top - count_line_top).abs() <= 0.1
+                && (clear_line_top - count_line_top).abs() <= 0.1,
+            "footer text controls should share one baseline: count={count_line_top}, all={all_filter_line_top}, clear={clear_line_top}"
+        );
         assert!(
             all_filter.bounds.height >= 25.0,
             "selected filter should have enough vertical room to paint its rounded outline"
@@ -24164,6 +24244,27 @@ mod tests {
                 "Oklch[lightness:0.667]".to_owned()
             )),
             "dynamic WHILE font color must resolve from live document state, not serialize as a raw expression"
+        );
+        assert_eq!(
+            state
+                .pointer("/store/active_count")
+                .and_then(serde_json::Value::as_i64),
+            Some(3),
+            "TodoMVC default fixture should exercise the plural item-count branch"
+        );
+        assert!(
+            layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("3 items left")),
+            "TodoMVC plural item-count label should keep the extra s in Boon source"
+        );
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("3 item left")),
+            "TodoMVC plural item-count label should not use the singular copy"
         );
         let mut checked_state = state.clone();
         checked_state["all_completed"] = serde_json::Value::Bool(true);

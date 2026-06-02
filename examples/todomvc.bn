@@ -506,7 +506,7 @@ FUNCTION todo_footer() {
         gap: 9
         style: [
             width: Fill
-            height: 44.4
+            height: 46
             padding_top: 10
             padding_right: 15
             padding_bottom: 10
@@ -537,7 +537,7 @@ FUNCTION todo_footer() {
                 element: [events: PASSED.store.sources.filter_all.events, hovered: True]
                 style: [
                     width: 32
-                    height: 24.4
+                    height: 25.2
                     line_height: 19.6
                     text_inset: 0
                     background: [color: Oklch[lightness:1]]
@@ -560,7 +560,7 @@ FUNCTION todo_footer() {
                 element: [events: PASSED.store.sources.filter_active.events, hovered: True]
                 style: [
                     width: 56
-                    height: 24.4
+                    height: 25.2
                     line_height: 19.6
                     text_inset: 0
                     background: [color: Oklch[lightness:1]]
@@ -583,7 +583,7 @@ FUNCTION todo_footer() {
                 element: [events: PASSED.store.sources.filter_completed.events, hovered: True]
                 style: [
                     width: 88
-                    height: 24.4
+                    height: 25.2
                     line_height: 19.6
                     text_inset: 0
                     background: [color: Oklch[lightness:1]]

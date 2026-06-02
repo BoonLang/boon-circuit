@@ -3361,7 +3361,10 @@ fn dev_input_may_change(
             .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
         || input_state.held_repeat_key.as_ref().is_some_and(|key| {
             input_state.held_repeat_next_at.is_some()
-                && input.pressed_keys.iter().any(|pressed| pressed == key)
+                && input
+                    .pressed_keys
+                    .iter()
+                    .any(|pressed| pressed_key_matches_repeat(pressed, key))
         })
 }
 
@@ -3956,7 +3959,11 @@ fn dev_apply_real_window_input_with_clipboard(
         && !primary_modifier_pressed
     {
         if let Some(key) = input_state.held_repeat_key.clone() {
-            if input.pressed_keys.iter().any(|pressed| pressed == &key) {
+            if input
+                .pressed_keys
+                .iter()
+                .any(|pressed| pressed_key_matches_repeat(pressed, &key))
+            {
                 let now = Instant::now();
                 let mut applied = 0usize;
                 while input_state
@@ -17099,7 +17106,11 @@ fn document_value_for_node(layout_proof: &Value, node: &str) -> Option<String> {
 }
 
 fn keyboard_event_text(key: &str, shift: bool) -> Option<char> {
-    match (key, shift) {
+    if let Some(character) = single_character_key_text(key) {
+        return Some(character);
+    }
+    let normalized = normalized_text_input_key(key);
+    match (normalized.as_str(), shift) {
         ("A", false) => Some('a'),
         ("A", true) => Some('A'),
         ("B", false) => Some('b'),
@@ -17197,6 +17208,87 @@ fn keyboard_event_text(key: &str, shift: bool) -> Option<char> {
         ("Grave", true) => Some('~'),
         _ => None,
     }
+}
+
+fn single_character_key_text(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    let character = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    if character.is_control() || character.is_ascii_uppercase() {
+        return None;
+    }
+    Some(character)
+}
+
+fn normalized_text_input_key(key: &str) -> String {
+    if let Some(letter) = key.strip_prefix("Key").filter(|rest| rest.len() == 1) {
+        return letter.to_ascii_uppercase();
+    }
+    if let Some(digit) = key.strip_prefix("Digit").filter(|rest| rest.len() == 1) {
+        return format!("Num{digit}");
+    }
+    if let Some(digit) = key.strip_prefix("Numpad").filter(|rest| rest.len() == 1) {
+        return format!("Keypad{digit}");
+    }
+    match key {
+        "NumpadDecimal" => "KeypadDecimal",
+        "NumpadMultiply" => "KeypadMultiply",
+        "NumpadAdd" => "KeypadPlus",
+        "NumpadSubtract" => "KeypadMinus",
+        "NumpadDivide" => "KeypadDivide",
+        "NumpadEqual" => "KeypadEquals",
+        "NumpadEnter" => "KeypadEnter",
+        "ArrowLeft" => "LeftArrow",
+        "ArrowRight" => "RightArrow",
+        "ArrowUp" => "UpArrow",
+        "ArrowDown" => "DownArrow",
+        "Enter" => "Return",
+        "Backquote" => "Grave",
+        "BracketLeft" => "LeftBracket",
+        "BracketRight" => "RightBracket",
+        "IntlBackslash" => "InternationalBackslash",
+        other => other,
+    }
+    .to_owned()
+}
+
+fn normalized_repeat_key(key: &str) -> String {
+    if let Some(character) = single_character_key_text(key) {
+        return match character {
+            'a'..='z' => character.to_ascii_uppercase().to_string(),
+            '0'..='9' => format!("Num{character}"),
+            ' ' => "Space".to_owned(),
+            ')' => "Num0".to_owned(),
+            '!' => "Num1".to_owned(),
+            '@' => "Num2".to_owned(),
+            '#' => "Num3".to_owned(),
+            '$' => "Num4".to_owned(),
+            '%' => "Num5".to_owned(),
+            '^' => "Num6".to_owned(),
+            '&' => "Num7".to_owned(),
+            '*' => "Num8".to_owned(),
+            '(' => "Num9".to_owned(),
+            '-' | '_' => "Minus".to_owned(),
+            '=' | '+' => "Equal".to_owned(),
+            ',' | '<' => "Comma".to_owned(),
+            '.' | '>' => "Period".to_owned(),
+            '/' | '?' => "Slash".to_owned(),
+            ';' | ':' => "Semicolon".to_owned(),
+            '\'' | '"' => "Quote".to_owned(),
+            '[' | '{' => "LeftBracket".to_owned(),
+            ']' | '}' => "RightBracket".to_owned(),
+            '\\' | '|' => "Backslash".to_owned(),
+            '`' | '~' => "Grave".to_owned(),
+            _ => character.to_string(),
+        };
+    }
+    normalized_text_input_key(key)
+}
+
+fn pressed_key_matches_repeat(pressed: &str, held: &str) -> bool {
+    pressed == held || normalized_repeat_key(pressed) == normalized_repeat_key(held)
 }
 
 fn role_window_title(base: &str, token: Option<&str>) -> String {
@@ -21915,6 +22007,28 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_text_input_accepts_system_and_browser_key_names() {
+        assert_eq!(keyboard_event_text("Num4", false), Some('4'));
+        assert_eq!(keyboard_event_text("Digit4", false), Some('4'));
+        assert_eq!(keyboard_event_text("Numpad4", false), Some('4'));
+        assert_eq!(keyboard_event_text("4", false), Some('4'));
+        assert_eq!(keyboard_event_text("Num4", true), Some('$'));
+        assert_eq!(keyboard_event_text("Digit4", true), Some('$'));
+        assert_eq!(keyboard_event_text("$", false), Some('$'));
+        assert_eq!(keyboard_event_text("KeyA", false), Some('a'));
+        assert_eq!(keyboard_event_text("KeyA", true), Some('A'));
+        assert_eq!(keyboard_event_text("a", false), Some('a'));
+        assert_eq!(keyboard_event_text("BracketLeft", false), Some('['));
+        assert_eq!(keyboard_event_text("Backquote", true), Some('~'));
+        assert!(pressed_key_matches_repeat("Num4", "Digit4"));
+        assert!(pressed_key_matches_repeat("Num4", "4"));
+        assert!(pressed_key_matches_repeat("Num4", "$"));
+        assert!(pressed_key_matches_repeat("A", "KeyA"));
+        assert!(pressed_key_matches_repeat("A", "a"));
+        assert!(pressed_key_matches_repeat("Keypad4", "Numpad4"));
+    }
+
+    #[test]
     fn fallback_tokenizer_keeps_malformed_buffers_renderable() {
         let tokens = BoonLanguageService::syntax_tokens_fallback("SOURCE @\n-- ok\n");
         assert!(
@@ -23386,8 +23500,8 @@ mod tests {
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
                     && item.bounds.width >= 540.0
-                    && item.bounds.height >= 44.0
-                    && item.bounds.height <= 45.0
+                    && item.bounds.height >= 45.5
+                    && item.bounds.height <= 46.5
                     && item.style.get("border_top").is_some()
             })
             .expect("TodoMVC footer should render as the bottom row of the real panel");
@@ -23400,8 +23514,8 @@ mod tests {
             _ => 0.0,
         };
         assert!(
-            footer.bounds.height - footer_padding_top - footer_padding_bottom >= 24.4_f32,
-            "TodoMVC footer content box must be tall enough for 24.4px filter buttons without cutting their bottom outline: footer={:?}",
+            footer.bounds.height - footer_padding_top - footer_padding_bottom >= 25.2_f32,
+            "TodoMVC footer content box must be tall enough for filter buttons without cutting their bottom outline: footer={:?}",
             footer.bounds
         );
         assert_eq!(
@@ -23696,6 +23810,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("TodoMVC filter button `{label}` should render"))
         };
         let all_filter = filter_button("All");
+        assert!(
+            all_filter.bounds.height >= 25.0,
+            "selected filter should have enough vertical room to paint its rounded outline"
+        );
         assert_eq!(
             all_filter.style.get("border"),
             Some(&selected_filter_outline),

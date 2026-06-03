@@ -334,6 +334,7 @@ FUNCTION content_element() {
                 items: LIST { main_panel(), footer() }
             )
             theme_switcher()
+            theme_gap(of: Small)
         }
     )
 }
@@ -1040,7 +1041,7 @@ FUNCTION theme_name_button(theme_name) {
                 hovered: SOURCE
             ]
             style: [
-                padding: [row: 3, column: 3]
+                padding: [row: 4, column: 4]
                 depth: Theme/depth(of: Detail)
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: Button)
@@ -1076,7 +1077,7 @@ FUNCTION mode_toggle_button() {
             hovered: SOURCE
         ]
         style: [
-            padding: [row: 3, column: 3]
+            padding: [row: 4, column: 4]
             depth: Theme/depth(of: Detail)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: Button)

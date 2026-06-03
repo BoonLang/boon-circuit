@@ -489,6 +489,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let code_file = value_arg(args, "--code-file")
         .ok_or("preview role requires --code-file for initial source before ReplaceCode updates")?;
+    let runtime_state_override = value_arg(args, "--runtime-state-file")
+        .map(|path| read_json(Path::new(&path)))
+        .transpose()?;
     let source = boon_runtime::source_text_for_path(Path::new(&code_file))?;
     let initial_runtime_units = project_units_for_source_text(Path::new(&code_file), &source);
     let code_hash = boon_runtime::source_units_hash(&initial_runtime_units);
@@ -528,7 +531,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         native_document_layout_proof_with_project_state_mode(
             Path::new(&code_file),
             &initial_runtime_units,
-            document_state_summary.as_ref(),
+            runtime_state_override
+                .as_ref()
+                .or(document_state_summary.as_ref()),
             true,
         )
         .unwrap_or_else(|error| {
@@ -2118,6 +2123,7 @@ fn native_document_layout_proof_with_project_state_mode(
     )?;
     let layout_metrics = serde_json::to_value(&layout.metrics)?;
     let scroll_regions = serde_json::to_value(&layout.scroll_regions)?;
+    let physical_theme_evidence = document_physical_theme_evidence(&eval_context);
 
     let proof = json!({
         "status": "pass",
@@ -2128,6 +2134,7 @@ fn native_document_layout_proof_with_project_state_mode(
         "typecheck_report_hash": typecheck_report_hash,
         "render_slot_table_hash": render_slot_table_hash,
         "typed_render_metadata_used": typecheck_report.render_slot_count > 0,
+        "physical_theme_evidence": physical_theme_evidence,
         "unresolved_type_variable_count": typecheck_report.unresolved_type_variable_count,
         "render_slot_failure_count": typecheck_report.render_slot_failure_count,
         "artifact_path": if write_artifact { json!(artifact_path) } else { serde_json::Value::Null },
@@ -13476,14 +13483,14 @@ fn document_pipe_render_function<'a>(
     statement: &'a AstStatement,
     expressions: &'a [AstExpr],
     functions: &DocumentFunctionRegistry<'_>,
-) -> Option<(&'a str, usize, &'a [AstCallArg])> {
+    context: &DocumentEvalContext<'_>,
+) -> Option<(String, usize, &'a [AstCallArg])> {
     let AstExprKind::Pipe { input, op, args } = &expressions.get(statement.expr?)?.kind else {
         return None;
     };
-    functions
-        .get(op)
-        .filter(|function| functions.contains_render_constructor(function))
-        .map(|_| (op.as_str(), *input, args.as_slice()))
+    document_resolve_function(functions, op, context)
+        .filter(|(_, function)| functions.contains_render_constructor(function))
+        .map(|(resolved_name, _)| (resolved_name, *input, args.as_slice()))
 }
 
 fn document_source_pipe_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
@@ -13499,6 +13506,8 @@ struct DocumentFunctionRegistry<'a> {
     aliases: BTreeMap<&'a str, &'a str>,
     render_constructor_statement_ids: BTreeSet<usize>,
 }
+
+const DOCUMENT_FUNCTION_NAMESPACE_LOCAL: &str = "__document_function_namespace";
 
 impl<'a> DocumentFunctionRegistry<'a> {
     fn new(statements: &'a [AstStatement], expressions: &[AstExpr]) -> Self {
@@ -13555,8 +13564,70 @@ impl<'a> DocumentFunctionRegistry<'a> {
             })
     }
 
+    fn get_exact(&self, name: &str) -> Option<&'a AstStatement> {
+        self.functions.get(name).copied()
+    }
+
     fn contains_render_constructor(&self, function: &AstStatement) -> bool {
         self.render_constructor_statement_ids.contains(&function.id)
+    }
+}
+
+fn document_resolve_function<'a>(
+    functions: &'a DocumentFunctionRegistry<'a>,
+    name: &str,
+    context: &DocumentEvalContext<'_>,
+) -> Option<(String, &'a AstStatement)> {
+    if let Some(function) = functions.get_exact(name) {
+        return Some((name.to_owned(), function));
+    }
+    if !name.contains('/')
+        && let Some(namespace) = document_current_function_namespace(context)
+    {
+        let namespaced = format!("{namespace}/{name}");
+        if let Some(function) = functions.get_exact(&namespaced) {
+            return Some((namespaced, function));
+        }
+    }
+    let function = functions.get(name)?;
+    let resolved_name = document_function_name(function)
+        .map(str::to_owned)
+        .unwrap_or_else(|| name.to_owned());
+    Some((resolved_name, function))
+}
+
+fn document_current_function_namespace<'a>(
+    context: &'a DocumentEvalContext<'_>,
+) -> Option<&'a str> {
+    context
+        .locals
+        .get(DOCUMENT_FUNCTION_NAMESPACE_LOCAL)
+        .and_then(Value::as_str)
+        .filter(|namespace| !namespace.is_empty())
+}
+
+fn document_function_name(function: &AstStatement) -> Option<&str> {
+    match &function.kind {
+        AstStatementKind::Function { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn document_function_namespace(function: &AstStatement) -> Option<&str> {
+    document_function_name(function)?
+        .rsplit_once('/')
+        .map(|(namespace, _)| namespace)
+}
+
+fn document_apply_function_namespace(
+    context: &mut DocumentEvalContext<'_>,
+    function: &AstStatement,
+) {
+    if let Some(namespace) = document_function_namespace(function) {
+        context.locals.insert(
+            DOCUMENT_FUNCTION_NAMESPACE_LOCAL.to_owned(),
+            Value::String(namespace.to_owned()),
+        );
     }
 }
 
@@ -13637,9 +13708,9 @@ fn lower_canonical_document_entry(
     }
 
     if let Some((function_name, input_expr_id, args)) =
-        document_pipe_render_function(statement, expressions, functions)
+        document_pipe_render_function(statement, expressions, functions, context)
     {
-        if let Some(function) = functions.get(function_name) {
+        if let Some((_, function)) = document_resolve_function(functions, &function_name, context) {
             let input_value = expressions
                 .get(input_expr_id)
                 .and_then(|expr| document_eval_expr_value(expr, expressions, context))
@@ -13674,7 +13745,7 @@ fn lower_canonical_document_entry(
     }
 
     if let Some(function_name) = document_call_function(statement, expressions)
-        && let Some(function) = functions.get(function_name)
+        && let Some((_, function)) = document_resolve_function(functions, function_name, context)
     {
         let scoped = document_function_call_context(function, statement, expressions, context);
         for child in &function.children {
@@ -14053,7 +14124,7 @@ fn document_function_call_context<'a>(
             context,
         );
     }
-    DocumentEvalContext {
+    let mut scoped = DocumentEvalContext {
         root: context.root,
         locals: context.locals.clone(),
         render_args: context.render_args.clone(),
@@ -14063,7 +14134,9 @@ fn document_function_call_context<'a>(
         functions: context.functions,
         eval_depth: context.eval_depth,
         eval_cache: Arc::clone(&context.eval_cache),
-    }
+    };
+    document_apply_function_namespace(&mut scoped, function);
+    scoped
 }
 
 fn document_function_args_context<'a>(
@@ -14089,11 +14162,7 @@ fn document_function_args_context<'a>(
         _ => &[],
     };
     for (index, arg) in args.iter().enumerate() {
-        let Some(name) = arg
-            .name
-            .as_deref()
-            .or_else(|| formals.get(index).map(String::as_str))
-        else {
+        let Some(name) = document_call_arg_binding_name(arg, index, formals) else {
             continue;
         };
         if let Some(expr) = expressions.get(arg.value) {
@@ -14132,7 +14201,7 @@ fn document_function_args_context<'a>(
                     })
             };
             if let Some(render_statement) = render_statement {
-                scoped.render_args.insert(name.to_owned(), render_statement);
+                scoped.render_args.insert(name.clone(), render_statement);
                 continue;
             }
             let value = document_eval_expr_value(expr, expressions, context)
@@ -14145,7 +14214,7 @@ fn document_function_args_context<'a>(
                     scoped.passed = Some(value);
                     continue;
                 }
-                scoped.locals.insert(name.to_owned(), value);
+                scoped.locals.insert(name, value);
             }
         }
     }
@@ -14153,7 +14222,10 @@ fn document_function_args_context<'a>(
         let Some(name) = document_field_name(child) else {
             continue;
         };
-        if !formals.iter().any(|formal| formal == &name) || scoped.locals.contains_key(&name) {
+        let Some(name) = document_field_arg_binding_name(&name, formals) else {
+            continue;
+        };
+        if scoped.locals.contains_key(&name) {
             continue;
         }
         let Some(expr) = child.expr.and_then(|expr_id| expressions.get(expr_id)) else {
@@ -14170,7 +14242,35 @@ fn document_function_args_context<'a>(
             }
         }
     }
+    document_apply_function_namespace(&mut scoped, function);
     scoped
+}
+
+fn document_call_arg_binding_name(
+    arg: &AstCallArg,
+    index: usize,
+    formals: &[String],
+) -> Option<String> {
+    if let Some(name) = arg.name.as_deref() {
+        if formals.iter().any(|formal| formal == name) || name == "PASS" {
+            return Some(name.to_owned());
+        }
+        if name == "of" && formals.len() == 1 {
+            return formals.first().cloned();
+        }
+        return Some(name.to_owned());
+    }
+    formals.get(index).cloned()
+}
+
+fn document_field_arg_binding_name(name: &str, formals: &[String]) -> Option<String> {
+    if formals.iter().any(|formal| formal == name) || name == "PASS" {
+        return Some(name.to_owned());
+    }
+    if name == "of" && formals.len() == 1 {
+        return formals.first().cloned();
+    }
+    None
 }
 
 fn document_statement_may_render(
@@ -14222,6 +14322,7 @@ fn document_function_item_context<'a>(
             .entry(name.clone())
             .or_insert_with(|| item_value.clone());
     }
+    document_apply_function_namespace(&mut scoped, function);
     scoped
 }
 
@@ -15376,9 +15477,12 @@ fn document_statement_directly_renders(
     document_render_arg_statement(statement, expressions, context).is_some()
         || canonical_element_function(statement, expressions).is_some()
         || document_call_function(statement, expressions)
-            .and_then(|function| functions.get(function))
+            .and_then(|function| {
+                document_resolve_function(functions, function, context)
+                    .map(|(_, function)| function)
+            })
             .is_some()
-        || document_pipe_render_function(statement, expressions, functions).is_some()
+        || document_pipe_render_function(statement, expressions, functions, context).is_some()
         || document_source_pipe_statement(statement, expressions)
         || document_conditional_statement(statement, expressions)
 }
@@ -15610,6 +15714,7 @@ fn lower_canonical_style_block(
             "material" => lower_material_style_statement(child, expressions, context, node),
             "glow" => lower_glow_style_statement(child, expressions, context, node),
             "move" => lower_spacing_style(child, "move", expressions, context, node),
+            "spring_range" => lower_spring_range_style(child, expressions, context, node),
             "rounded_corners" => {
                 if let Some(value) = document_style_value(child, expressions, context) {
                     node.style.insert("border_radius".to_owned(), value);
@@ -16324,6 +16429,32 @@ fn lower_glow_style_field(
         .or_insert(boon_document_model::StyleValue::Number(2.0));
 }
 
+fn lower_spring_range_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(expr_id) = statement.expr
+        && let Some(Value::Object(object)) = expressions
+            .get(expr_id)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_spring_range_style(&Value::Object(object), node);
+        return;
+    }
+    for child in &statement.children {
+        let Some(field) = document_field_name(child) else {
+            continue;
+        };
+        if matches!(field.as_str(), "extend" | "compress")
+            && let Some(value) = document_style_value(child, expressions, context)
+        {
+            node.style.insert(format!("spring_range_{field}"), value);
+        }
+    }
+}
+
 fn statement_nested_style_value(
     statement: &AstStatement,
     nested_name: &str,
@@ -16389,9 +16520,6 @@ fn lower_spacing_style_field(
     context: &DocumentEvalContext<'_>,
     node: &mut boon_document_model::DocumentNode,
 ) {
-    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
-        node.style.insert(prefix.to_owned(), value);
-    }
     if let Some(nested) = record_fields_for_expr(field.value, expressions) {
         for nested_field in nested {
             if let Some(value) =
@@ -16400,6 +16528,17 @@ fn lower_spacing_style_field(
                 lower_spacing_named_field(prefix, &nested_field.name, value, node);
             }
         }
+        return;
+    }
+    if let Some(Value::Object(object)) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_spacing_style(prefix, &Value::Object(object), node);
+        return;
+    }
+    if let Some(value) = document_style_value_for_expr(field.value, expressions, context) {
+        node.style.insert(prefix.to_owned(), value);
     }
 }
 
@@ -16410,7 +16549,7 @@ fn lower_spacing_named_field(
     node: &mut boon_document_model::DocumentNode,
 ) {
     match field {
-        "top" | "right" | "bottom" | "left" => {
+        "top" | "right" | "bottom" | "left" | "closer" | "further" | "up" => {
             node.style.insert(format!("{prefix}_{field}"), value);
         }
         "row" => {
@@ -16477,6 +16616,7 @@ fn lower_canonical_style_record(
             "material" => lower_material_style_field(field, expressions, context, node),
             "glow" => lower_glow_style_field(field, expressions, context, node),
             "move" => lower_spacing_style_field(field, "move", expressions, context, node),
+            "spring_range" => lower_spring_range_style_field(field, expressions, context, node),
             "rounded_corners" => {
                 if let Some(value) =
                     document_style_value_for_expr(field.value, expressions, context)
@@ -16638,9 +16778,48 @@ fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_mod
             }
         }
         "shadows" => lower_json_shadow_style(value, node),
+        "spring_range" => lower_json_spring_range_style(value, node),
         "width" | "height" | "size" => lower_json_dimension_style(key, value, node),
         "align" => lower_json_align_style(value, node),
         _ => insert_json_style_value(node, key, value),
+    }
+}
+
+fn lower_spring_range_style_field(
+    field: &AstRecordField,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    if let Some(Value::Object(object)) = expressions
+        .get(field.value)
+        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+    {
+        lower_json_spring_range_style(&Value::Object(object), node);
+        return;
+    }
+    if let Some(fields) = record_fields_for_expr(field.value, expressions) {
+        for spring_field in fields {
+            if matches!(spring_field.name.as_str(), "extend" | "compress")
+                && let Some(value) =
+                    document_style_value_for_expr(spring_field.value, expressions, context)
+            {
+                node.style
+                    .insert(format!("spring_range_{}", spring_field.name), value);
+            }
+        }
+    }
+}
+
+fn lower_json_spring_range_style(value: &Value, node: &mut boon_document_model::DocumentNode) {
+    let Some(object) = value.as_object() else {
+        insert_json_style_value(node, "spring_range", value);
+        return;
+    };
+    for field in ["extend", "compress"] {
+        if let Some(value) = object.get(field) {
+            insert_json_style_value(node, &format!("spring_range_{field}"), value);
+        }
     }
 }
 
@@ -16835,6 +17014,18 @@ fn lower_style_align_value(
 }
 
 fn synthesize_physical_style(node: &mut boon_document_model::DocumentNode) {
+    let surface_like = matches!(
+        node.kind,
+        boon_document_model::DocumentNodeKind::Stack
+            | boon_document_model::DocumentNodeKind::Row
+            | boon_document_model::DocumentNodeKind::Button
+            | boon_document_model::DocumentNodeKind::Checkbox
+            | boon_document_model::DocumentNodeKind::TextInput
+            | boon_document_model::DocumentNodeKind::TableCell
+    );
+    if !surface_like {
+        return;
+    }
     let depth = node
         .style
         .get("depth")
@@ -16854,42 +17045,130 @@ fn synthesize_physical_style(node: &mut boon_document_model::DocumentNode) {
         .and_then(style_number_from_value)
         .unwrap_or(0.0);
     let elevation = (move_closer - move_further).max(0.0);
+    let transparency = node
+        .style
+        .get("transparency")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let refraction = node
+        .style
+        .get("refraction")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let gloss = node
+        .style
+        .get("gloss")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let radius = node
+        .style
+        .get("border_radius")
+        .and_then(style_number_from_value)
+        .unwrap_or(0.0);
+    let material_color = node
+        .style
+        .get("material_color")
+        .and_then(style_text_from_value)
+        .unwrap_or("");
+    let glass = transparency > 0.05 || refraction > 0.0;
+    let hard_edge =
+        surface_like && radius <= 0.5 && gloss <= 0.15 && transparency <= 0.01 && depth >= 4.0;
+    let low_contrast_soft = material_color.contains("chroma:0.005");
     if !node.style.contains_key("box_shadow_1_color") {
+        let (shadow_color, shadow_x, shadow_y, shadow_blur) = if hard_edge {
+            (
+                "Oklch[lightness:0,alpha:0.72]",
+                (depth * 0.55 + elevation * 0.03).max(2.0),
+                (depth * 0.65 + elevation * 0.04).max(2.0),
+                0.0,
+            )
+        } else if glass {
+            (
+                "Oklch[lightness:0.18,chroma:0.02,hue:240,alpha:0.24]",
+                0.0,
+                (depth * 0.38 + elevation * 0.05).max(1.0),
+                (depth * 2.9 + elevation * 0.28).max(6.0),
+            )
+        } else if low_contrast_soft {
+            (
+                "Oklch[lightness:0.18,chroma:0.005,hue:240,alpha:0.28]",
+                (depth * 0.32 + elevation * 0.03).max(1.0),
+                (depth * 0.42 + elevation * 0.05).max(1.0),
+                (depth * 3.2 + elevation * 0.24).max(5.0),
+            )
+        } else {
+            (
+                "Oklch[lightness:0.20,alpha:0.30]",
+                0.0,
+                (depth * 0.45 + elevation * 0.08).max(1.0),
+                (depth * 1.8 + elevation * 0.25).max(2.0),
+            )
+        };
         node.style.insert(
             "box_shadow_1_color".to_owned(),
-            boon_document_model::StyleValue::Text("Oklch[lightness:0.20]".to_owned()),
+            boon_document_model::StyleValue::Text(shadow_color.to_owned()),
         );
         node.style.insert(
             "box_shadow_1_x".to_owned(),
-            boon_document_model::StyleValue::Number(0.0),
+            boon_document_model::StyleValue::Number(shadow_x),
         );
         node.style.insert(
             "box_shadow_1_y".to_owned(),
-            boon_document_model::StyleValue::Number((depth * 0.45 + elevation * 0.08).max(1.0)),
+            boon_document_model::StyleValue::Number(shadow_y),
         );
         node.style.insert(
             "box_shadow_1_blur".to_owned(),
-            boon_document_model::StyleValue::Number((depth * 1.8 + elevation * 0.25).max(2.0)),
+            boon_document_model::StyleValue::Number(shadow_blur),
         );
         node.style.insert(
             "box_shadow_1_spread".to_owned(),
             boon_document_model::StyleValue::Number(0.0),
         );
+        if low_contrast_soft && !node.style.contains_key("box_shadow_2_color") {
+            node.style.insert(
+                "box_shadow_2_color".to_owned(),
+                boon_document_model::StyleValue::Text(
+                    "Oklch[lightness:1,chroma:0.005,hue:240,alpha:0.62]".to_owned(),
+                ),
+            );
+            node.style.insert(
+                "box_shadow_2_x".to_owned(),
+                boon_document_model::StyleValue::Number(-(depth * 0.28).max(1.0)),
+            );
+            node.style.insert(
+                "box_shadow_2_y".to_owned(),
+                boon_document_model::StyleValue::Number(-(depth * 0.34).max(1.0)),
+            );
+            node.style.insert(
+                "box_shadow_2_blur".to_owned(),
+                boon_document_model::StyleValue::Number((depth * 2.6).max(4.0)),
+            );
+            node.style.insert(
+                "box_shadow_2_spread".to_owned(),
+                boon_document_model::StyleValue::Number(0.0),
+            );
+        }
     }
-    if !node.style.contains_key("border")
-        && matches!(
-            node.kind,
-            boon_document_model::DocumentNodeKind::Stack
-                | boon_document_model::DocumentNodeKind::Row
-                | boon_document_model::DocumentNodeKind::Button
-                | boon_document_model::DocumentNodeKind::Checkbox
-                | boon_document_model::DocumentNodeKind::TextInput
-        )
-    {
+    if !node.style.contains_key("border") && surface_like {
+        let border = if hard_edge {
+            "Oklch[lightness:0,alpha:0.90]"
+        } else if glass {
+            "Oklch[lightness:1,alpha:0.36]"
+        } else if low_contrast_soft {
+            "Oklch[lightness:0.98,chroma:0.005,hue:240,alpha:0.46]"
+        } else {
+            "Oklch[lightness:0.92]"
+        };
         node.style.insert(
             "border".to_owned(),
-            boon_document_model::StyleValue::Text("Oklch[lightness:0.92]".to_owned()),
+            boon_document_model::StyleValue::Text(border.to_owned()),
         );
+        if hard_edge && !node.style.contains_key("border_width") {
+            node.style.insert(
+                "border_width".to_owned(),
+                boon_document_model::StyleValue::Number(2.0),
+            );
+        }
     }
 }
 
@@ -16898,6 +17177,15 @@ fn style_number_from_value(value: &boon_document_model::StyleValue) -> Option<f6
         boon_document_model::StyleValue::Number(value) => Some(*value),
         boon_document_model::StyleValue::Text(value) => value.parse::<f64>().ok(),
         boon_document_model::StyleValue::Bool(_) => None,
+    }
+}
+
+fn style_text_from_value(value: &boon_document_model::StyleValue) -> Option<&str> {
+    match value {
+        boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
+        boon_document_model::StyleValue::Number(_) | boon_document_model::StyleValue::Bool(_) => {
+            None
+        }
     }
 }
 
@@ -18013,6 +18301,56 @@ fn tagged_document_object_value(
     format!("{tag}[{body}]")
 }
 
+fn tagged_document_object_value_with_context(
+    tag: &str,
+    fields: &[AstRecordField],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    let body = fields
+        .iter()
+        .filter_map(|field| {
+            let value = expressions
+                .get(field.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .map(tagged_field_text_from_json)
+                .or_else(|| {
+                    expressions
+                        .get(field.value)
+                        .and_then(|expr| document_expr_value(expr, expressions))
+                })?;
+            Some(format!("{}:{value}", field.name))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{tag}[{body}]")
+}
+
+fn tagged_field_text_from_json(value: Value) -> String {
+    match value {
+        Value::Null => "None".to_owned(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|number| {
+                number.is_finite()
+                    && number.fract().abs() <= f64::EPSILON
+                    && *number >= i64::MIN as f64
+                    && *number <= i64::MAX as f64
+            })
+            .map(|number| (number as i64).to_string())
+            .unwrap_or_else(|| value.to_string()),
+        Value::String(value) => value,
+        Value::Array(values) => values
+            .into_iter()
+            .map(tagged_field_text_from_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => String::new(),
+    }
+}
+
 fn document_text_value(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -18297,9 +18635,12 @@ fn document_eval_while_selector_value(
             continue;
         }
         let branch_context;
-        let context = if let Some(binding) = document_match_pattern_binding(pattern) {
+        let bindings = document_match_pattern_bindings(pattern, &selector);
+        let context = if !bindings.is_empty() {
             let mut locals = context.locals.clone();
-            locals.insert(binding.to_owned(), selector.clone());
+            for (binding, value) in bindings {
+                locals.insert(binding, value);
+            }
             branch_context = DocumentEvalContext {
                 root: context.root,
                 locals,
@@ -18326,44 +18667,154 @@ fn document_eval_while_selector_value(
     None
 }
 
-fn document_match_pattern_binding(pattern: &[String]) -> Option<&str> {
+fn document_match_pattern_bindings(pattern: &[String], value: &Value) -> Vec<(String, Value)> {
     let [single] = pattern else {
-        return None;
+        return Vec::new();
     };
-    let first = single.chars().next()?;
+    if let Some(binding) = document_simple_match_pattern_binding(single) {
+        return vec![(binding.to_owned(), value.clone())];
+    }
+    let Some((pattern_tag, pattern_fields)) = parse_tagged_pattern(single) else {
+        return Vec::new();
+    };
+    let Some((value_tag, value_fields)) = value.as_str().and_then(parse_tagged_value) else {
+        return Vec::new();
+    };
+    if pattern_tag != value_tag {
+        return Vec::new();
+    }
+    pattern_fields
+        .into_iter()
+        .filter_map(|field| {
+            let binding = document_simple_match_pattern_binding(&field)?;
+            value_fields
+                .get(field.as_str())
+                .cloned()
+                .map(|value| (binding.to_owned(), value))
+        })
+        .collect()
+}
+
+fn document_simple_match_pattern_binding(pattern: &str) -> Option<&str> {
+    if pattern.contains('[') || pattern.contains(':') {
+        return None;
+    }
+    let first = pattern.chars().next()?;
     (first == '_' || first.is_ascii_lowercase())
-        .then_some(single.as_str())
+        .then_some(pattern)
         .filter(|value| *value != "__")
 }
 
 fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bool {
+    let list_pattern = pattern
+        .strip_prefix(&["LIST".to_owned()])
+        .unwrap_or(pattern);
+    if let Some(items) = value.as_array()
+        && list_pattern.len() == items.len()
+        && list_pattern
+            .iter()
+            .zip(items)
+            .all(|(pattern, value)| document_match_single_pattern_matches_value(pattern, value))
+    {
+        return true;
+    }
     match pattern {
         [single] if single == "__" => true,
         [single] if single == "True" => match value {
             Value::Bool(true) => true,
-            Value::String(value) => value == "True",
+            Value::String(value) => value == "True" || value == "true",
             _ => false,
         },
         [single] if single == "False" => match value {
             Value::Bool(false) => true,
-            Value::String(value) => value == "False",
+            Value::String(value) => value == "False" || value == "false",
             _ => false,
         },
-        [single] if document_match_pattern_binding(pattern).is_some() => true,
-        [single] => match value {
+        [single] if document_simple_match_pattern_binding(single).is_some() => true,
+        [single] => document_match_single_pattern_matches_value(single, value),
+        _ => false,
+    }
+}
+
+fn document_match_single_pattern_matches_value(pattern: &str, value: &Value) -> bool {
+    match pattern {
+        "__" => true,
+        "True" => {
+            matches!(value, Value::Bool(true))
+                || matches!(value, Value::String(value) if value == "True" || value == "true")
+        }
+        "False" => {
+            matches!(value, Value::Bool(false))
+                || matches!(value, Value::String(value) if value == "False" || value == "false")
+        }
+        pattern if document_simple_match_pattern_binding(pattern).is_some() => true,
+        pattern => match value {
             Value::String(value) => {
-                value == single
-                    || single
-                        .split_once('[')
-                        .is_some_and(|(tag, _)| value.starts_with(&format!("{tag}[")))
+                value == pattern
+                    || parse_tagged_pattern(pattern).is_some_and(|(tag, _)| {
+                        parse_tagged_value(value).is_some_and(|(value_tag, _)| value_tag == tag)
+                    })
             }
-            Value::Number(value) => single
+            Value::Number(value) => pattern
                 .parse::<f64>()
                 .ok()
                 .is_some_and(|expected| value.as_f64() == Some(expected)),
             _ => false,
         },
-        _ => false,
+    }
+}
+
+fn parse_tagged_pattern(pattern: &str) -> Option<(String, Vec<String>)> {
+    let (tag, body) = pattern.split_once('[')?;
+    let body = body.strip_suffix(']')?;
+    let fields = body
+        .split(',')
+        .filter_map(|field| {
+            let field = field.trim();
+            if field.is_empty() {
+                return None;
+            }
+            Some(
+                field
+                    .split_once(':')
+                    .map(|(name, _)| name)
+                    .unwrap_or(field)
+                    .trim()
+                    .to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Some((tag.to_owned(), fields))
+}
+
+fn parse_tagged_value(value: &str) -> Option<(String, BTreeMap<String, Value>)> {
+    let (tag, body) = value.split_once('[')?;
+    let body = body.strip_suffix(']')?;
+    let mut fields = BTreeMap::new();
+    for field in body.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        let (name, value) = field.split_once(':')?;
+        fields.insert(
+            name.trim().to_owned(),
+            document_value_from_tagged_field(value.trim()),
+        );
+    }
+    Some((tag.to_owned(), fields))
+}
+
+fn document_value_from_tagged_field(value: &str) -> Value {
+    match value {
+        "True" | "true" => Value::Bool(true),
+        "False" | "false" => Value::Bool(false),
+        "None" => Value::Null,
+        value => value
+            .parse::<f64>()
+            .ok()
+            .map(|value| json!(value))
+            .unwrap_or_else(|| Value::String(value.to_owned())),
     }
 }
 
@@ -18416,7 +18867,24 @@ fn document_eval_expr_value(
             Some(Value::Object(object))
         }
         AstExprKind::TaggedObject { tag, fields } => Some(Value::String(
-            tagged_document_object_value(tag, fields, expressions),
+            tagged_document_object_value_with_context(tag, fields, expressions, context),
+        )),
+        AstExprKind::ListLiteral { items, .. } => Some(Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    expressions
+                        .get(*item)
+                        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                        .or_else(|| {
+                            expressions
+                                .get(*item)
+                                .and_then(|expr| document_expr_value(expr, expressions))
+                                .map(Value::String)
+                        })
+                        .unwrap_or(Value::Null)
+                })
+                .collect(),
         )),
         AstExprKind::Call { function, args } => {
             if let Some(value) = document_builtin_value_call(function, args, expressions, context) {
@@ -18444,6 +18912,15 @@ fn document_builtin_value_call(
     expressions: &[AstExpr],
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
+    if function.starts_with("Theme/")
+        && let Some(value) = document_eval_function_call(function, args, expressions, context)
+        && document_theme_real_value_usable(function, &value)
+    {
+        return Some(value);
+    }
+    if let Some(light_kind) = function.strip_prefix("Light/") {
+        return document_light_value_call(light_kind, args, expressions, context);
+    }
     match function {
         "Theme/font" => Some(document_theme_font(
             &document_call_arg_text(args, "of", expressions, context)?,
@@ -18457,39 +18934,32 @@ fn document_builtin_value_call(
             &document_call_arg_text(args, "of", expressions, context)?,
             context,
         )),
-        "Theme/depth" => Some(json!(if document_theme_name(context) == "Classic" {
-            0.0
-        } else {
-            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                "Container" => 8.0,
-                "Element" => 6.0,
-                "Detail" => 2.0,
-                "Hero" => 10.0,
-                _ => 1.0,
-            }
-        })),
-        "Theme/elevation" => Some(json!(if document_theme_name(context) == "Classic" {
-            0.0
-        } else {
-            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                "Card" => 50.0,
-                "EditingFocus" => 24.0,
-                "Selection" => 4.0,
-                "TodoItem" => 4.0,
-                "Inset" => -4.0,
-                _ => 0.0,
-            }
-        })),
+        "Theme/depth" => Some(json!(document_theme_depth(
+            &document_call_arg_text(args, "of", expressions, context)?,
+            context,
+        ))),
+        "Theme/elevation" => Some(json!(document_theme_elevation(
+            &document_call_arg_text(args, "of", expressions, context)?,
+            context,
+        ))),
         "Theme/corners" => Some(json!(match (
             document_theme_name(context),
             document_call_arg_text(args, "of", expressions, context)?.as_str()
         ) {
             ("Classic", "Touch" | "Comfort") => 0.0,
             ("Classic", "Soft" | "Pill" | "Fully") => 3.0,
-            ("Neobrutalism", "Pill" | "Fully") => 2.0,
+            ("Glassmorphism", "Touch") => 3.0,
+            ("Glassmorphism", "Comfort") => 6.0,
+            ("Glassmorphism", "Soft") => 8.0,
+            ("Glassmorphism", "Pill" | "Fully") => 999.0,
+            ("Neobrutalism", "Soft") => 12.0,
+            ("Neobrutalism", "Pill" | "Fully") => 999.0,
             ("Neobrutalism", _) => 0.0,
-            ("Neumorphism", "Touch") => 10.0,
-            ("Neumorphism", "Comfort" | "Soft") => 12.0,
+            ("Neumorphism", "Edge") => 2.0,
+            ("Neumorphism", "Touch") => 4.0,
+            ("Neumorphism", "Comfort") => 6.0,
+            ("Neumorphism", "Soft") => 8.0,
+            ("Neumorphism", "Pill" | "Fully") => 999.0,
             (_, "Touch") => 2.0,
             (_, "Comfort") => 4.0,
             (_, "Soft") => 6.0,
@@ -18532,14 +19002,85 @@ fn document_builtin_value_call(
                 });
             }
             Some(match of.as_str() {
-                "Button" => json!({"extend": 6.0, "compress": 4.0}),
-                "ButtonDestructive" => json!({"extend": 4.0, "compress": 6.0}),
-                "Checkbox" => json!({"extend": 4.0, "compress": 8.0}),
+                "Button" if document_theme_name(context) == "Professional" => {
+                    json!({"extend": 6.0, "compress": 4.0})
+                }
+                "ButtonDestructive" if document_theme_name(context) == "Professional" => {
+                    json!({"extend": 4.0, "compress": 6.0})
+                }
+                "Checkbox" if document_theme_name(context) == "Professional" => {
+                    json!({"extend": 4.0, "compress": 8.0})
+                }
+                "Button" | "ButtonDestructive" | "Checkbox" => {
+                    json!({"extend": 0.0, "compress": 0.0})
+                }
                 _ => json!({}),
             })
         }
+        "Theme/lights" => Some(document_theme_lights(context)),
+        "Theme/geometry" => Some(document_theme_geometry(context)),
         _ => None,
     }
+}
+
+fn document_theme_real_value_usable(function: &str, value: &Value) -> bool {
+    match function {
+        "Theme/material" => value.as_object().is_some_and(|object| {
+            !object.is_empty()
+                && object.values().any(|value| !value.is_null())
+                && object.get("color").is_none_or(|value| !value.is_null())
+        }),
+        "Theme/font" => value.as_object().is_some_and(|object| {
+            object.get("size").is_some_and(Value::is_number)
+                && object.get("color").is_some_and(|value| !value.is_null())
+        }),
+        "Theme/geometry" => value.is_object(),
+        "Theme/text" => value
+            .as_object()
+            .and_then(|object| object.get("font"))
+            .and_then(Value::as_object)
+            .is_some_and(|font| {
+                font.get("size").is_some_and(Value::is_number)
+                    && font.get("color").is_some_and(|value| !value.is_null())
+            }),
+        "Theme/lights" => value.is_array(),
+        "Theme/depth" | "Theme/elevation" | "Theme/corners" | "Theme/sizing" | "Theme/spacing" => {
+            value.is_number()
+        }
+        "Theme/spring_range" => value.as_object().is_some_and(|object| {
+            object.get("extend").is_some_and(Value::is_number)
+                && object.get("compress").is_some_and(Value::is_number)
+        }),
+        _ => true,
+    }
+}
+
+fn document_light_value_call(
+    kind: &str,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    if !matches!(kind, "ambient" | "directional" | "point" | "spot") {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    for (index, arg) in args.iter().enumerate() {
+        let key = arg.name.clone().unwrap_or_else(|| format!("arg_{index}"));
+        let value = expressions
+            .get(arg.value)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+            .or_else(|| {
+                expressions
+                    .get(arg.value)
+                    .and_then(|expr| document_expr_value(expr, expressions))
+                    .map(Value::String)
+            })
+            .unwrap_or(Value::Null);
+        object.insert(key, value);
+    }
+    Some(Value::Object(object))
 }
 
 fn document_call_arg_text(
@@ -18565,6 +19106,7 @@ fn document_call_arg_text(
 
 fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
     match document_resolved_value("PASSED.theme_options.mode", context)
+        .or_else(|| document_resolved_value("theme_options.mode", context))
         .and_then(Value::as_str)
         .unwrap_or("Light")
     {
@@ -18575,6 +19117,7 @@ fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
 
 fn document_theme_name(context: &DocumentEvalContext<'_>) -> &'static str {
     match document_resolved_value("PASSED.theme_options.name", context)
+        .or_else(|| document_resolved_value("theme_options.name", context))
         .and_then(Value::as_str)
         .unwrap_or("Classic")
     {
@@ -18583,6 +19126,64 @@ fn document_theme_name(context: &DocumentEvalContext<'_>) -> &'static str {
         "Neobrutalism" => "Neobrutalism",
         "Neumorphism" => "Neumorphism",
         _ => "Professional",
+    }
+}
+
+fn document_physical_theme_evidence(context: &DocumentEvalContext<'_>) -> Value {
+    json!({
+        "theme": document_theme_name(context),
+        "mode": document_theme_mode(context),
+        "lights": document_theme_lights(context),
+        "geometry": document_theme_geometry(context)
+    })
+}
+
+fn document_theme_depth(of: &str, context: &DocumentEvalContext<'_>) -> f64 {
+    match (document_theme_name(context), of) {
+        ("Classic", _) => 0.0,
+        ("Glassmorphism", "Container") => 6.0,
+        ("Glassmorphism", "Element") => 4.0,
+        ("Glassmorphism", "Detail") => 2.0,
+        ("Glassmorphism", "Hero") => 8.0,
+        ("Neobrutalism", "Container") => 12.0,
+        ("Neobrutalism", "Element") => 8.0,
+        ("Neobrutalism", "Detail") => 4.0,
+        ("Neobrutalism", "Hero") => 16.0,
+        (_, "Container") => 8.0,
+        (_, "Element") => 6.0,
+        (_, "Detail") => 2.0,
+        (_, "Hero") => 10.0,
+        _ => 1.0,
+    }
+}
+
+fn document_theme_elevation(of: &str, context: &DocumentEvalContext<'_>) -> f64 {
+    match (document_theme_name(context), of) {
+        ("Classic", _) => 0.0,
+        ("Glassmorphism", "Card") => 40.0,
+        ("Glassmorphism", "EditingFocus") => 20.0,
+        ("Glassmorphism", "Selection") | ("Glassmorphism", "TodoItem") => 4.0,
+        ("Glassmorphism", "Inset") => -4.0,
+        ("Neobrutalism", "Card") => 60.0,
+        ("Neobrutalism", "Dialog") | ("Neobrutalism", "EditingFocus") => 32.0,
+        ("Neobrutalism", "Lift") => 12.0,
+        ("Neobrutalism", "Button")
+        | ("Neobrutalism", "Selection")
+        | ("Neobrutalism", "TodoItem") => 6.0,
+        ("Neobrutalism", "Inset") => -6.0,
+        ("Neumorphism", "Card") => 8.0,
+        ("Neumorphism", "Dialog") | ("Neumorphism", "EditingFocus") => 6.0,
+        ("Neumorphism", "Lift") => 4.0,
+        ("Neumorphism", "Button") | ("Neumorphism", "Selection") | ("Neumorphism", "TodoItem") => {
+            2.0
+        }
+        ("Neumorphism", "Inset") => -2.0,
+        (_, "Card") => 50.0,
+        (_, "EditingFocus") => 24.0,
+        (_, "Selection") | (_, "TodoItem") => 4.0,
+        (_, "Inset") => -4.0,
+        (_, "Base") => 0.0,
+        _ => 0.0,
     }
 }
 
@@ -18600,12 +19201,42 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Classic", _, "text_placeholder") => "Oklch[lightness:0.68]",
         ("Classic", _, "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
         ("Classic", _, "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
-        ("Glassmorphism", "Light", "text_header") => "Oklch[lightness:0.62,chroma:0.14,hue:250]",
-        ("Glassmorphism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.12,hue:250]",
-        ("Neobrutalism", "Light", "text_header") => "Oklch[lightness:0.55,chroma:0.18,hue:35]",
-        ("Neobrutalism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.18,hue:80]",
-        ("Neumorphism", "Light", "text_header") => "Oklch[lightness:0.52,chroma:0.08,hue:210]",
-        ("Neumorphism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.08,hue:210]",
+        ("Glassmorphism", "Light", "text") => "Oklch[lightness:0.25,chroma:0.02,hue:240]",
+        ("Glassmorphism", "Light", "text_secondary") => "Oklch[lightness:0.45,chroma:0.02,hue:240]",
+        ("Glassmorphism", "Light", "text_tertiary") => "Oklch[lightness:0.55,chroma:0.015,hue:240]",
+        ("Glassmorphism", "Light", "text_disabled") => "Oklch[lightness:0.65,chroma:0.01,hue:240]",
+        ("Glassmorphism", "Light", "text_header") => "Oklch[lightness:0.7,chroma:0.08,hue:260]",
+        ("Glassmorphism", "Light", "danger") => "Oklch[lightness:0.65,chroma:0.12,hue:10]",
+        ("Glassmorphism", "Dark", "text") => "Oklch[lightness:0.9,chroma:0.01,hue:240]",
+        ("Glassmorphism", "Dark", "text_secondary") => "Oklch[lightness:0.75,chroma:0.01,hue:240]",
+        ("Glassmorphism", "Dark", "text_tertiary") => "Oklch[lightness:0.65,chroma:0.01,hue:240]",
+        ("Glassmorphism", "Dark", "text_disabled") => "Oklch[lightness:0.5,chroma:0.01,hue:240]",
+        ("Glassmorphism", "Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.1,hue:260]",
+        ("Glassmorphism", "Dark", "danger") => "Oklch[lightness:0.75,chroma:0.14,hue:10]",
+        ("Neobrutalism", "Light", "text") => "Oklch[lightness:0.0]",
+        ("Neobrutalism", "Light", "text_secondary") => "Oklch[lightness:0.25]",
+        ("Neobrutalism", "Light", "text_tertiary") => "Oklch[lightness:0.45]",
+        ("Neobrutalism", "Light", "text_disabled") => "Oklch[lightness:0.6]",
+        ("Neobrutalism", "Light", "text_header") => "Oklch[lightness:0.55,chroma:0.25,hue:350]",
+        ("Neobrutalism", "Light", "danger") => "Oklch[lightness:0.5,chroma:0.25,hue:330]",
+        ("Neobrutalism", "Dark", "text") => "Oklch[lightness:1.0]",
+        ("Neobrutalism", "Dark", "text_secondary") => "Oklch[lightness:0.8]",
+        ("Neobrutalism", "Dark", "text_tertiary") => "Oklch[lightness:0.6]",
+        ("Neobrutalism", "Dark", "text_disabled") => "Oklch[lightness:0.4]",
+        ("Neobrutalism", "Dark", "text_header") => "Oklch[lightness:0.7,chroma:0.28,hue:350]",
+        ("Neobrutalism", "Dark", "danger") => "Oklch[lightness:0.75,chroma:0.28,hue:330]",
+        ("Neumorphism", "Light", "text") => "Oklch[lightness:0.45,chroma:0.01,hue:240]",
+        ("Neumorphism", "Light", "text_secondary") => "Oklch[lightness:0.6,chroma:0.01,hue:240]",
+        ("Neumorphism", "Light", "text_tertiary") => "Oklch[lightness:0.7,chroma:0.005,hue:240]",
+        ("Neumorphism", "Light", "text_disabled") => "Oklch[lightness:0.75,chroma:0.005,hue:240]",
+        ("Neumorphism", "Light", "text_header") => "Oklch[lightness:0.75,chroma:0.05,hue:260]",
+        ("Neumorphism", "Light", "danger") => "Oklch[lightness:0.7,chroma:0.06,hue:20]",
+        ("Neumorphism", "Dark", "text") => "Oklch[lightness:0.75,chroma:0.01,hue:240]",
+        ("Neumorphism", "Dark", "text_secondary") => "Oklch[lightness:0.6,chroma:0.01,hue:240]",
+        ("Neumorphism", "Dark", "text_tertiary") => "Oklch[lightness:0.5,chroma:0.005,hue:240]",
+        ("Neumorphism", "Dark", "text_disabled") => "Oklch[lightness:0.4,chroma:0.005,hue:240]",
+        ("Neumorphism", "Dark", "text_header") => "Oklch[lightness:0.65,chroma:0.06,hue:260]",
+        ("Neumorphism", "Dark", "danger") => "Oklch[lightness:0.65,chroma:0.07,hue:20]",
         (_, "Light", "text") => "Oklch[lightness:0.42]",
         (_, "Light", "text_secondary") => "Oklch[lightness:0.57]",
         (_, "Light", "text_tertiary") => "Oklch[lightness:0.75]",
@@ -18624,6 +19255,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
 
 fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    let checked = theme_tagged_field_bool(of, "checked").unwrap_or(false);
     if document_theme_name(context) == "Classic" {
         let family = "Helvetica Neue, Helvetica, Arial, SansSerif";
         return match tagged {
@@ -18667,7 +19299,11 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             "ButtonIcon" => json!({
                 "family": family,
                 "size": 22.0,
-                "color": document_theme_color(context, "text_disabled"),
+                "color": if checked {
+                    "Oklch[lightness:0.4]"
+                } else {
+                    "Oklch[lightness:0.667]"
+                },
                 "weight": "Normal"
             }),
             "Small" => json!({
@@ -18717,7 +19353,11 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
         }),
         "ButtonIcon" => json!({
             "size": 22.0,
-            "color": document_theme_color(context, "text_disabled")
+            "color": if checked {
+                document_theme_color(context, "text")
+            } else {
+                document_theme_color(context, "text_disabled")
+            }
         }),
         "Small" => json!({
             "size": 10.0,
@@ -18765,16 +19405,23 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             }),
         };
     }
+    let (hero_depth, hero_closer, small_depth, small_further, small_relief, body_depth) =
+        match document_theme_name(context) {
+            "Glassmorphism" => (4.0, 4.0, 1.0, 3.0, "Carved[wall:1]", 1.5),
+            "Neobrutalism" => (8.0, 8.0, 2.0, 4.0, "Carved[wall:2]", 3.0),
+            "Neumorphism" => (5.0, 5.0, 1.0, 3.0, "Carved[wall:1]", 1.5),
+            _ => (6.0, 6.0, 1.0, 4.0, "Carved[wall:1]", 1.5),
+        };
     match tagged {
         "Hero" => json!({
             "font": document_theme_font("Hero", context),
-            "depth": 6.0,
-            "move": {"closer": 6.0},
+            "depth": hero_depth,
+            "move": {"closer": hero_closer},
             "relief": "Raised"
         }),
         "BodySecondary" => json!({
             "font": document_theme_font("BodySecondary", context),
-            "depth": 1.5,
+            "depth": body_depth,
             "move": {"further": 2.0},
             "relief": "Raised"
         }),
@@ -18783,15 +19430,15 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
         }),
         "SmallLink" => json!({
             "font": document_theme_font("SmallLink", context),
-            "depth": 1.0,
-            "move": {"further": 4.0},
-            "relief": "Carved[wall:1]"
+            "depth": small_depth,
+            "move": {"further": small_further},
+            "relief": small_relief
         }),
         "Small" | _ => json!({
             "font": document_theme_font("Small", context),
-            "depth": 1.0,
-            "move": {"further": 4.0},
-            "relief": "Carved[wall:1]"
+            "depth": small_depth,
+            "move": {"further": small_further},
+            "relief": small_relief
         }),
     }
 }
@@ -18800,7 +19447,7 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
     let light = document_theme_mode(context) == "Light";
     if document_theme_name(context) == "Classic" {
-        let mut material = match tagged {
+        let material = match tagged {
             "Background" => json!({"color": "Oklch[lightness:0.97]"}),
             "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
                 json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
@@ -18880,68 +19527,389 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
             }),
             _ => json!({}),
         };
-        if let Some(shared_frame) = document_theme_shared_frame_material(tagged, context) {
-            merge_json_object_values(&mut material, shared_frame);
-        }
         return material;
     }
     if let Some(shared_frame) = document_theme_shared_frame_material(tagged, context) {
         return shared_frame;
     }
-    let color = match (document_theme_name(context), tagged, light) {
-        ("Glassmorphism", "Background", true) => "Oklch[lightness:0.94,chroma:0.035,hue:250]",
-        ("Glassmorphism", "Background", false) => "Oklch[lightness:0.10,chroma:0.025,hue:250]",
-        ("Glassmorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
-            "Oklch[lightness:0.985,chroma:0.025,hue:250]"
+    let focus = theme_tagged_field_bool(of, "focus").unwrap_or(false);
+    let hovered = theme_tagged_field_bool(of, "hovered").unwrap_or(false);
+    match (document_theme_name(context), tagged, light) {
+        ("Glassmorphism", "Background", true) => {
+            json!({"color": "Oklch[lightness:0.92,chroma:0.02,hue:240]"})
         }
-        ("Glassmorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
-            "Oklch[lightness:0.20,chroma:0.035,hue:250]"
+        ("Glassmorphism", "Background", false) => {
+            json!({"color": "Oklch[lightness:0.1,chroma:0.03,hue:260]"})
         }
-        ("Neobrutalism", "Background", true) => "Oklch[lightness:0.93,chroma:0.05,hue:90]",
-        ("Neobrutalism", "Background", false) => "Oklch[lightness:0.11,chroma:0.04,hue:90]",
-        ("Neobrutalism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
-            "Oklch[lightness:0.97,chroma:0.045,hue:75]"
+        ("Glassmorphism", "Surface", true) => json!({
+            "color": "Oklch[lightness:0.95,chroma:0.01,hue:220]",
+            "transparency": 0.9,
+            "refraction": 1.5,
+            "gloss": 0.65
+        }),
+        ("Glassmorphism", "Surface", false) => json!({
+            "color": "Oklch[lightness:0.2,chroma:0.01,hue:240]",
+            "transparency": 0.9,
+            "refraction": 1.5,
+            "gloss": 0.65
+        }),
+        ("Glassmorphism", "SurfaceVariant", true) => {
+            json!({
+                "color": "Oklch[lightness:0.92,chroma:0.01,hue:220]",
+                "transparency": 0.9,
+                "refraction": 1.5,
+                "gloss": 0.65
+            })
         }
-        ("Neobrutalism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
-            "Oklch[lightness:0.18,chroma:0.045,hue:75]"
+        ("Glassmorphism", "SurfaceVariant", false) => {
+            json!({
+                "color": "Oklch[lightness:0.25,chroma:0.01,hue:240]",
+                "transparency": 0.9,
+                "refraction": 1.5,
+                "gloss": 0.65
+            })
         }
-        ("Neumorphism", "Background", true) => "Oklch[lightness:0.92,chroma:0.015,hue:210]",
-        ("Neumorphism", "Background", false) => "Oklch[lightness:0.09,chroma:0.012,hue:210]",
-        ("Neumorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", true) => {
-            "Oklch[lightness:0.94,chroma:0.012,hue:210]"
+        ("Glassmorphism", "Interactive", true) => {
+            json!({
+                "color": "Oklch[lightness:0.92,chroma:0.01,hue:220]",
+                "transparency": 0.85,
+                "refraction": 1.5,
+                "gloss": 0.65,
+                "metal": 0.03
+            })
         }
-        ("Neumorphism", "Surface" | "SurfaceVariant" | "SurfaceElevated", false) => {
-            "Oklch[lightness:0.17,chroma:0.018,hue:210]"
+        ("Glassmorphism", "Interactive", false) => {
+            json!({
+                "color": "Oklch[lightness:0.25,chroma:0.01,hue:240]",
+                "transparency": 0.85,
+                "refraction": 1.5,
+                "gloss": 0.65,
+                "metal": 0.03
+            })
         }
-        (_, "Background", true) => "Oklch[lightness:0.96,chroma:0.01,hue:220]",
-        (_, "Background", false) => "Oklch[lightness:0.08,chroma:0.005,hue:220]",
-        (_, "Surface", true) => "Oklch[lightness:1]",
-        (_, "Surface", false) => "Oklch[lightness:0.15]",
-        (_, "SurfaceVariant", true) => "Oklch[lightness:0.985]",
-        (_, "SurfaceVariant", false) => "Oklch[lightness:0.18]",
-        (_, "SurfaceElevated", true) => "Oklch[lightness:0.99]",
-        (_, "SurfaceElevated", false) => "Oklch[lightness:0.22]",
-        (_, "Primary", _) => "Oklch[lightness:0.8,chroma:0.165,hue:25.36]",
-        (_, "PrimarySubtle", true) => "Oklch[lightness:0.98,chroma:0.01,hue:25.36]",
-        (_, "PrimarySubtle", false) => "Oklch[lightness:0.25,chroma:0.08,hue:25.36]",
-        (_, "Danger", true) => "Oklch[lightness:0.8,chroma:0.109,hue:18.87]",
-        (_, "Danger", false) => "Oklch[lightness:0.8,chroma:0.12,hue:18.87]",
-        _ if light => "Oklch[lightness:0.985]",
-        _ => "Oklch[lightness:0.18]",
-    };
-    json!({
-        "color": color,
-        "gloss": if matches!(tagged, "SurfaceElevated") { 0.4 } else { 0.25 },
-        "metal": if tagged.starts_with("Interactive") { 0.03 } else { 0.0 }
-    })
+        ("Glassmorphism", "SurfaceElevated", true) => json!({
+            "color": "Oklch[lightness:0.98,chroma:0.01,hue:220]",
+            "transparency": 0.85,
+            "refraction": 1.5,
+            "gloss": 0.7
+        }),
+        ("Glassmorphism", "SurfaceElevated", false) => json!({
+            "color": "Oklch[lightness:0.3,chroma:0.01,hue:240]",
+            "transparency": 0.85,
+            "refraction": 1.5,
+            "gloss": 0.7
+        }),
+        ("Glassmorphism", "InteractiveRecessed", true) => json!({
+            "color": "Oklch[lightness:0.95,chroma:0.01,hue:220]",
+            "transparency": 0.7,
+            "refraction": 1.5,
+            "gloss": if focus { 0.6 } else { 0.8 }
+        }),
+        ("Glassmorphism", "InteractiveRecessed", false) => json!({
+            "color": "Oklch[lightness:0.2,chroma:0.01,hue:240]",
+            "transparency": 0.7,
+            "refraction": 1.5,
+            "gloss": if focus { 0.6 } else { 0.8 }
+        }),
+        ("Glassmorphism", "Primary", true) => {
+            json!({"color": "Oklch[lightness:0.7,chroma:0.08,hue:260]", "transparency": 0.8, "refraction": 1.5})
+        }
+        ("Glassmorphism", "Primary", false) => {
+            json!({"color": "Oklch[lightness:0.75,chroma:0.1,hue:260]", "transparency": 0.8, "refraction": 1.5})
+        }
+        ("Glassmorphism", "PrimarySubtle", true) => {
+            json!({"color": "Oklch[lightness:0.95,chroma:0.05,hue:260]", "transparency": 0.9, "refraction": 1.5})
+        }
+        ("Glassmorphism", "PrimarySubtle", false) => {
+            json!({"color": "Oklch[lightness:0.3,chroma:0.08,hue:260]", "transparency": 0.9, "refraction": 1.5})
+        }
+        ("Glassmorphism", "Danger", true) => {
+            json!({"color": "Oklch[lightness:0.75,chroma:0.12,hue:10]"})
+        }
+        ("Glassmorphism", "Danger", false) => {
+            json!({"color": "Oklch[lightness:0.85,chroma:0.14,hue:10]"})
+        }
+
+        ("Neobrutalism", "Background", true) => {
+            json!({"color": "Oklch[lightness:0.95,chroma:0.05,hue:90]"})
+        }
+        ("Neobrutalism", "Background", false) => {
+            json!({"color": "Oklch[lightness:0.05,chroma:0.03,hue:280]"})
+        }
+        ("Neobrutalism", "Surface", true) => {
+            json!({"color": "Oklch[lightness:1]", "gloss": 0.05})
+        }
+        ("Neobrutalism", "Surface", false) => {
+            json!({"color": "Oklch[lightness:0]", "gloss": 0.05})
+        }
+        ("Neobrutalism", "SurfaceVariant", true) => {
+            json!({"color": "Oklch[lightness:0.98]", "gloss": 0.08})
+        }
+        ("Neobrutalism", "SurfaceVariant", false) => {
+            json!({"color": "Oklch[lightness:0.08]", "gloss": 0.08})
+        }
+        ("Neobrutalism", "Interactive", true) => {
+            json!({"color": "Oklch[lightness:0.98]", "gloss": 0.12, "metal": 0.03})
+        }
+        ("Neobrutalism", "Interactive", false) => {
+            json!({"color": "Oklch[lightness:0.08]", "gloss": 0.12, "metal": 0.03})
+        }
+        ("Neobrutalism", "SurfaceElevated", true) => {
+            json!({"color": "Oklch[lightness:1]", "gloss": 0.12})
+        }
+        ("Neobrutalism", "SurfaceElevated", false) => {
+            json!({"color": "Oklch[lightness:0.12]", "gloss": 0.12})
+        }
+        ("Neobrutalism", "InteractiveRecessed", true) => {
+            json!({"color": "Oklch[lightness:1]", "gloss": if focus { 0.08 } else { 0.15 }})
+        }
+        ("Neobrutalism", "InteractiveRecessed", false) => {
+            json!({"color": "Oklch[lightness:0]", "gloss": if focus { 0.08 } else { 0.15 }})
+        }
+        ("Neobrutalism", "Primary", true) => {
+            json!({"color": "Oklch[lightness:0.55,chroma:0.25,hue:350]"})
+        }
+        ("Neobrutalism", "Primary", false) => {
+            json!({"color": "Oklch[lightness:0.7,chroma:0.28,hue:350]"})
+        }
+        ("Neobrutalism", "PrimarySubtle", true) => {
+            json!({"color": "Oklch[lightness:1.0]"})
+        }
+        ("Neobrutalism", "PrimarySubtle", false) => {
+            json!({"color": "Oklch[lightness:0.0]"})
+        }
+        ("Neobrutalism", "Danger", true) => {
+            json!({"color": "Oklch[lightness:0.7,chroma:0.25,hue:330]"})
+        }
+        ("Neobrutalism", "Danger", false) => {
+            json!({"color": "Oklch[lightness:0.85,chroma:0.3,hue:330]"})
+        }
+
+        ("Neumorphism", "Background", true) => {
+            json!({"color": "Oklch[lightness:0.90,chroma:0.005,hue:240]"})
+        }
+        ("Neumorphism", "Background", false) => {
+            json!({"color": "Oklch[lightness:0.15,chroma:0.005,hue:240]"})
+        }
+        ("Neumorphism", "Surface", true) => {
+            json!({"color": "Oklch[lightness:0.92,chroma:0.005,hue:240]", "gloss": 0.25})
+        }
+        ("Neumorphism", "Surface", false) => {
+            json!({"color": "Oklch[lightness:0.18,chroma:0.005,hue:240]", "gloss": 0.25})
+        }
+        ("Neumorphism", "SurfaceVariant", true) | ("Neumorphism", "Interactive", true) => {
+            json!({"color": "Oklch[lightness:0.90,chroma:0.005,hue:240]", "gloss": 0.25, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neumorphism", "SurfaceVariant", false) | ("Neumorphism", "Interactive", false) => {
+            json!({"color": "Oklch[lightness:0.20,chroma:0.005,hue:240]", "gloss": 0.25, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neumorphism", "SurfaceElevated", true) => {
+            json!({"color": "Oklch[lightness:0.94,chroma:0.005,hue:240]", "gloss": 0.25})
+        }
+        ("Neumorphism", "SurfaceElevated", false) => {
+            json!({"color": "Oklch[lightness:0.22,chroma:0.005,hue:240]", "gloss": 0.25})
+        }
+        ("Neumorphism", "InteractiveRecessed", true) => {
+            json!({"color": "Oklch[lightness:0.92,chroma:0.005,hue:240]", "gloss": if focus { 0.2 } else { 0.3 }})
+        }
+        ("Neumorphism", "InteractiveRecessed", false) => {
+            json!({"color": "Oklch[lightness:0.18,chroma:0.005,hue:240]", "gloss": if focus { 0.2 } else { 0.3 }})
+        }
+        ("Neumorphism", "Primary", true) => {
+            json!({"color": "Oklch[lightness:0.75,chroma:0.05,hue:260]"})
+        }
+        ("Neumorphism", "Primary", false) => {
+            json!({"color": "Oklch[lightness:0.65,chroma:0.06,hue:260]"})
+        }
+        ("Neumorphism", "PrimarySubtle", true) => {
+            json!({"color": "Oklch[lightness:0.93,chroma:0.02,hue:260]"})
+        }
+        ("Neumorphism", "PrimarySubtle", false) => {
+            json!({"color": "Oklch[lightness:0.22,chroma:0.03,hue:260]"})
+        }
+        ("Neumorphism", "Danger", true) => {
+            json!({"color": "Oklch[lightness:0.75,chroma:0.07,hue:20]"})
+        }
+        ("Neumorphism", "Danger", false) => {
+            json!({"color": "Oklch[lightness:0.7,chroma:0.08,hue:20]"})
+        }
+
+        (_, "Background", true) => json!({"color": "Oklch[lightness:0.96,chroma:0.01,hue:220]"}),
+        (_, "Background", false) => json!({"color": "Oklch[lightness:0.08,chroma:0.005,hue:220]"}),
+        (_, "Surface", true) => json!({"color": "Oklch[lightness:1]", "gloss": 0.25}),
+        (_, "Surface", false) => json!({"color": "Oklch[lightness:0.15]", "gloss": 0.25}),
+        (_, "SurfaceVariant", true) | (_, "Interactive", true) => {
+            json!({"color": "Oklch[lightness:0.985]", "gloss": if hovered { 0.3 } else { 0.25 }, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        (_, "SurfaceVariant", false) | (_, "Interactive", false) => {
+            json!({"color": "Oklch[lightness:0.18]", "gloss": if hovered { 0.3 } else { 0.25 }, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        (_, "SurfaceElevated", true) => json!({"color": "Oklch[lightness:0.99]", "gloss": 0.4}),
+        (_, "SurfaceElevated", false) => json!({"color": "Oklch[lightness:0.22]", "gloss": 0.4}),
+        (_, "InteractiveRecessed", true) => {
+            json!({"color": "Oklch[lightness:1]", "gloss": if focus { 0.15 } else { 0.65 }})
+        }
+        (_, "InteractiveRecessed", false) => {
+            json!({"color": "Oklch[lightness:0.15]", "gloss": if focus { 0.15 } else { 0.65 }})
+        }
+        (_, "Primary", _) => json!({"color": "Oklch[lightness:0.8,chroma:0.165,hue:25.36]"}),
+        (_, "PrimarySubtle", true) => {
+            json!({"color": "Oklch[lightness:0.98,chroma:0.01,hue:25.36]"})
+        }
+        (_, "PrimarySubtle", false) => {
+            json!({"color": "Oklch[lightness:0.25,chroma:0.08,hue:25.36]"})
+        }
+        (_, "Danger", true) => json!({"color": "Oklch[lightness:0.8,chroma:0.109,hue:18.87]"}),
+        (_, "Danger", false) => json!({"color": "Oklch[lightness:0.8,chroma:0.12,hue:18.87]"}),
+        _ => json!({}),
+    }
 }
 
-fn merge_json_object_values(base: &mut Value, overlay: Value) {
-    if let (Some(base), Value::Object(overlay)) = (base.as_object_mut(), overlay) {
-        for (key, value) in overlay {
-            base.insert(key, value);
-        }
+fn document_theme_lights(context: &DocumentEvalContext<'_>) -> Value {
+    let light = document_theme_mode(context) == "Light";
+    match document_theme_name(context) {
+        "Classic" => json!([
+            {
+                "kind": "ambient",
+                "intensity": 1.0,
+                "color": "Oklch[lightness:1]"
+            }
+        ]),
+        "Glassmorphism" => json!([
+            {
+                "kind": "directional",
+                "azimuth": 345.0,
+                "altitude": 40.0,
+                "spread": 1.5,
+                "intensity": 1.1,
+                "color": "Oklch[lightness:0.97,chroma:0.02,hue:200]"
+            },
+            {
+                "kind": "ambient",
+                "intensity": 0.45,
+                "color": if light {
+                    "Oklch[lightness:0.82,chroma:0.01,hue:220]"
+                } else {
+                    "Oklch[lightness:0.35,chroma:0.02,hue:220]"
+                }
+            },
+            {
+                "kind": "spot",
+                "target": "FocusedElement",
+                "color": if light {
+                    "Oklch[lightness:0.75,chroma:0.12,hue:220]"
+                } else {
+                    "Oklch[lightness:0.85,chroma:0.14,hue:220]"
+                },
+                "intensity": 0.35,
+                "radius": 80.0,
+                "softness": 0.95
+            }
+        ]),
+        "Neobrutalism" => json!([
+            {
+                "kind": "directional",
+                "azimuth": 90.0,
+                "altitude": 60.0,
+                "spread": 0.0,
+                "intensity": 1.5,
+                "color": "Oklch[lightness:1.0,chroma:0.0,hue:0]"
+            },
+            {
+                "kind": "ambient",
+                "intensity": 0.3,
+                "color": "Oklch[lightness:0.7,chroma:0.0,hue:0]"
+            },
+            {
+                "kind": "spot",
+                "target": "FocusedElement",
+                "color": if light {
+                    "Oklch[lightness:0.9,chroma:0.25,hue:200]"
+                } else {
+                    "Oklch[lightness:0.85,chroma:0.25,hue:200]"
+                },
+                "intensity": 0.5,
+                "radius": 40.0,
+                "softness": 0.1
+            }
+        ]),
+        "Neumorphism" => json!([
+            {
+                "kind": "directional",
+                "azimuth": 315.0,
+                "altitude": 55.0,
+                "spread": 1.2,
+                "intensity": 1.15,
+                "color": "Oklch[lightness:0.98,chroma:0.01,hue:60]"
+            },
+            {
+                "kind": "ambient",
+                "intensity": 0.42,
+                "color": if light {
+                    "Oklch[lightness:0.82,chroma:0.005,hue:220]"
+                } else {
+                    "Oklch[lightness:0.32,chroma:0.01,hue:220]"
+                }
+            },
+            {
+                "kind": "spot",
+                "target": "FocusedElement",
+                "color": if light {
+                    "Oklch[lightness:0.6,chroma:0.05,hue:220]"
+                } else {
+                    "Oklch[lightness:0.65,chroma:0.06,hue:220]"
+                },
+                "intensity": 0.25,
+                "radius": 70.0,
+                "softness": 0.88
+            }
+        ]),
+        _ => json!([
+            {
+                "kind": "directional",
+                "azimuth": 30.0,
+                "altitude": 45.0,
+                "spread": 1.0,
+                "intensity": 1.2,
+                "color": "Oklch[lightness:0.98,chroma:0.015,hue:65]"
+            },
+            {
+                "kind": "ambient",
+                "intensity": 0.4,
+                "color": if light {
+                    "Oklch[lightness:0.8,chroma:0.01,hue:220]"
+                } else {
+                    "Oklch[lightness:0.3,chroma:0.01,hue:220]"
+                }
+            },
+            {
+                "kind": "spot",
+                "target": "FocusedElement",
+                "color": if light {
+                    "Oklch[lightness:0.7,chroma:0.1,hue:220]"
+                } else {
+                    "Oklch[lightness:0.8,chroma:0.12,hue:220]"
+                },
+                "intensity": 0.3,
+                "radius": 60.0,
+                "softness": 0.85
+            }
+        ]),
     }
+}
+
+fn document_theme_geometry(context: &DocumentEvalContext<'_>) -> Value {
+    match document_theme_name(context) {
+        "Classic" => json!({"edge_radius": 0.0, "bevel_angle": 0.0}),
+        "Neobrutalism" => json!({"edge_radius": 0.0, "bevel_angle": 30.0}),
+        "Neumorphism" => json!({"edge_radius": 3.0, "bevel_angle": 50.0}),
+        _ => json!({"edge_radius": 2.0, "bevel_angle": 45.0}),
+    }
+}
+
+fn theme_tagged_field_bool(value: &str, field: &str) -> Option<bool> {
+    let (_, fields) = parse_tagged_value(value)?;
+    fields.get(field)?.as_bool()
 }
 
 fn document_theme_shared_frame_material(
@@ -19076,8 +20044,119 @@ fn document_eval_pipe_value_from_input(
         "Text/trim" => input
             .as_str()
             .map(|text| Value::String(text.trim().to_owned())),
-        _ => None,
+        _ => document_eval_pipe_function_call(op, input, args, expressions, context),
     }
+}
+
+fn document_eval_pipe_function_call(
+    function_name: &str,
+    input: Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let functions = context.functions?;
+    let (resolved_name, function) = document_resolve_function(functions, function_name, context)?;
+    if functions.contains_render_constructor(function) || context.eval_depth > 64 {
+        return None;
+    }
+    let cache_key =
+        document_eval_pipe_call_cache_key(&resolved_name, &input, args, expressions, context);
+    if let Some(value) = context
+        .eval_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Some(value);
+    }
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
+        passed: context.passed.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth + 1,
+        eval_cache: Arc::clone(&context.eval_cache),
+    };
+    document_apply_function_namespace(&mut scoped, function);
+    let formals = match &function.kind {
+        AstStatementKind::Function { args, .. } => args.as_slice(),
+        _ => &[],
+    };
+    if let Some(first) = formals.first() {
+        scoped.locals.insert(first.clone(), input);
+    }
+    for (index, arg) in args.iter().enumerate() {
+        let Some(name) = arg
+            .name
+            .as_deref()
+            .or_else(|| formals.get(index.saturating_add(1)).map(String::as_str))
+        else {
+            continue;
+        };
+        let value = expressions
+            .get(arg.value)
+            .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+            .or_else(|| {
+                expressions
+                    .get(arg.value)
+                    .and_then(|expr| document_expr_value(expr, expressions))
+                    .map(Value::String)
+            });
+        if let Some(value) = value {
+            if name == "PASS" {
+                scoped.passed = Some(value);
+            } else {
+                scoped.locals.insert(name.to_owned(), value);
+            }
+        }
+    }
+    let value = document_eval_statement_sequence(&function.children, expressions, &scoped)?;
+    if let Ok(mut cache) = context.eval_cache.lock() {
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(cache_key, value.clone());
+    }
+    Some(value)
+}
+
+fn document_eval_pipe_call_cache_key(
+    function_name: &str,
+    input: &Value,
+    args: &[AstCallArg],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> String {
+    let arg_values = args
+        .iter()
+        .map(|arg| {
+            let name = arg.name.as_deref().unwrap_or("");
+            let value = expressions
+                .get(arg.value)
+                .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                .or_else(|| {
+                    expressions
+                        .get(arg.value)
+                        .and_then(|expr| document_expr_value(expr, expressions).map(Value::String))
+                })
+                .unwrap_or(Value::Null);
+            (name.to_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    let input = serde_json::to_vec(input).unwrap_or_default();
+    let args = serde_json::to_vec(&arg_values).unwrap_or_default();
+    let passed = serde_json::to_vec(&context.passed).unwrap_or_default();
+    format!(
+        "pipe:{}:{}:{}:{}",
+        function_name,
+        boon_runtime::sha256_bytes(&input),
+        boon_runtime::sha256_bytes(&args),
+        boon_runtime::sha256_bytes(&passed)
+    )
 }
 
 fn document_eval_function_call(
@@ -19087,14 +20166,14 @@ fn document_eval_function_call(
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
     let functions = context.functions?;
-    let function = functions.get(function_name)?;
+    let (resolved_name, function) = document_resolve_function(functions, function_name, context)?;
     if functions.contains_render_constructor(function) {
         return None;
     }
     if context.eval_depth > 64 {
         return None;
     }
-    let cache_key = document_eval_call_cache_key(function_name, args, expressions, context);
+    let cache_key = document_eval_call_cache_key(&resolved_name, args, expressions, context);
     if let Some(value) = context
         .eval_cache
         .lock()
@@ -19191,7 +20270,10 @@ fn document_expr_may_render(
             boon_typecheck::is_registered_element_constructor(function)
                 || context
                     .functions
-                    .and_then(|functions| functions.get(function))
+                    .and_then(|functions| {
+                        document_resolve_function(functions, function, context)
+                            .map(|(_, function)| function)
+                    })
                     .is_some_and(|function| {
                         context.functions.is_some_and(|functions| {
                             functions.contains_render_constructor(function)
@@ -19203,7 +20285,10 @@ fn document_expr_may_render(
                 || boon_typecheck::is_registered_element_constructor(op)
                 || context
                     .functions
-                    .and_then(|functions| functions.get(op))
+                    .and_then(|functions| {
+                        document_resolve_function(functions, op, context)
+                            .map(|(_, function)| function)
+                    })
                     .is_some_and(|function| {
                         context.functions.is_some_and(|functions| {
                             functions.contains_render_constructor(function)
@@ -25276,7 +26361,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "bf0f59717afa",
+            "436fed5df426",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -26039,6 +27124,11 @@ mod tests {
             let shared_light_divider = boon_document_model::StyleValue::Text(
                 "Oklch[lightness:0.88,chroma:0.02,hue:220,alpha:0.85]".to_owned(),
             );
+            let classic_new_todo_border = boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.66,chroma:0.11,hue:20,alpha:0.45]".to_owned(),
+            );
+            let classic_footer_border =
+                boon_document_model::StyleValue::Text("Oklch[lightness:0.93]".to_owned());
             let text_button = |label: &str| {
                 let text = text_item(label);
                 layout
@@ -26094,8 +27184,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{theme} new-todo row should contain input controls"));
             assert_eq!(
                 new_todo_row.style.get("border"),
-                Some(&shared_light_divider),
-                "{theme} new-todo row should use the shared divider overlay from Theme/material"
+                if theme == "Classic" {
+                    Some(&classic_new_todo_border)
+                } else {
+                    Some(&shared_light_divider)
+                },
+                "{theme} new-todo row should use its source theme divider"
             );
 
             let panel_left = toggle_all.bounds.x;
@@ -26137,8 +27231,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{theme} panel footer row should contain item count"));
             assert_eq!(
                 panel_footer.style.get("border_top"),
-                Some(&shared_light_divider),
-                "{theme} panel footer should use the shared divider overlay from Theme/material"
+                if theme == "Classic" {
+                    Some(&classic_footer_border)
+                } else {
+                    Some(&shared_light_divider)
+                },
+                "{theme} panel footer should use its source theme divider"
             );
             for label in ["All", "Active", "Completed", "Clear completed"] {
                 let item = text_item(label);
@@ -26240,7 +27338,174 @@ mod tests {
                 theme_switcher_bottom <= 704.0,
                 "{theme} theme switcher should leave breathing room at the bottom: bottom={theme_switcher_bottom}"
             );
+            assert!(
+                720.0 - theme_switcher_bottom >= 18.0,
+                "{theme} theme switcher should not look clipped against the viewport bottom: bottom={theme_switcher_bottom}"
+            );
         }
+    }
+
+    #[test]
+    fn physical_todomvc_non_classic_themes_lower_source_physical_tokens() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let themes = [
+            (
+                "Professional",
+                "hue:220",
+                2.0,
+                45.0,
+                "directional",
+                "azimuth",
+            ),
+            (
+                "Glassmorphism",
+                "hue:240",
+                2.0,
+                45.0,
+                "directional",
+                "refraction",
+            ),
+            (
+                "Neobrutalism",
+                "hue:90",
+                0.0,
+                30.0,
+                "directional",
+                "border_width",
+            ),
+            (
+                "Neumorphism",
+                "chroma:0.005,hue:240",
+                3.0,
+                50.0,
+                "directional",
+                "box_shadow_2_color",
+            ),
+        ];
+        let mut signatures = BTreeSet::new();
+
+        for (theme, root_fragment, edge_radius, bevel_angle, first_light_kind, signature_key) in
+            themes
+        {
+            let mut state = physical_todomvc_seed_state(theme, "Light");
+            mirror_physical_todomvc_seed_root_fields(&mut state);
+            let (proof, layout) = native_document_layout_proof_with_state_embedded(
+                &source_path,
+                &source,
+                Some(&state),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{theme} physical TodoMVC layout should lower source tokens: {error}")
+            });
+            let evidence = &proof["physical_theme_evidence"];
+            assert_eq!(evidence["theme"].as_str(), Some(theme));
+            assert_eq!(evidence["mode"].as_str(), Some("Light"));
+            assert_eq!(
+                evidence["geometry"]["edge_radius"].as_f64(),
+                Some(edge_radius),
+                "{theme} should expose source geometry edge radius"
+            );
+            assert_eq!(
+                evidence["geometry"]["bevel_angle"].as_f64(),
+                Some(bevel_angle),
+                "{theme} should expose source geometry bevel angle"
+            );
+            assert_eq!(
+                evidence["lights"][0]["kind"].as_str(),
+                Some(first_light_kind),
+                "{theme} should expose source light constructors"
+            );
+            let root_color = frame_root_material_color(&layout)
+                .unwrap_or_else(|| panic!("{theme} frame should expose root material color"));
+            assert!(
+                root_color.contains(root_fragment),
+                "{theme} root material should contain source color fragment `{root_fragment}`, got {root_color}"
+            );
+
+            match theme {
+                "Professional" => {
+                    assert!(
+                        layout.display_list.iter().any(|item| {
+                            style_text_from_map(&item.style, "material_color")
+                                == Some("Oklch[lightness:1]")
+                                && style_number_from_map(&item.style, "gloss") == Some(0.25)
+                                && style_number_from_map(&item.style, "border_radius")
+                                    .is_some_and(|value| (value - 4.0).abs() <= 0.1)
+                                && style_number_from_map(&item.style, "box_shadow_1_blur")
+                                    .is_some_and(|value| value > 10.0)
+                        }),
+                        "Professional should lower rounded, low-gloss raised surfaces"
+                    );
+                    assert!(
+                        !layout.display_list.iter().any(|item| {
+                            style_number_from_map(&item.style, "transparency")
+                                .is_some_and(|value| value > 0.05)
+                                || item.style.contains_key("box_shadow_2_color")
+                        }),
+                        "Professional should not inherit Glass or Neumorphic physical tokens"
+                    );
+                }
+                "Glassmorphism" => {
+                    assert!(
+                        layout.display_list.iter().any(|item| {
+                            style_number_from_map(&item.style, "transparency")
+                                .is_some_and(|value| value >= 0.85)
+                                && style_number_from_map(&item.style, "refraction") == Some(1.5)
+                                && style_number_from_map(&item.style, "gloss")
+                                    .is_some_and(|value| value >= 0.65)
+                                && style_text_from_map(&item.style, "border")
+                                    .is_some_and(|value| value.contains("alpha:0.36"))
+                                && style_number_from_map(&item.style, "box_shadow_1_blur")
+                                    .is_some_and(|value| value > 15.0)
+                        }),
+                        "Glassmorphism should lower transparent refractive glass surfaces"
+                    );
+                }
+                "Neobrutalism" => {
+                    assert!(
+                        layout.display_list.iter().any(|item| {
+                            style_number_from_map(&item.style, "border_radius") == Some(0.0)
+                                && style_number_from_map(&item.style, "border_width") == Some(2.0)
+                                && style_number_from_map(&item.style, "depth")
+                                    .is_some_and(|value| value >= 8.0)
+                                && style_number_from_map(&item.style, "box_shadow_1_blur")
+                                    == Some(0.0)
+                                && style_number_from_map(&item.style, "box_shadow_1_x")
+                                    .is_some_and(|value| value >= 4.0)
+                        }),
+                        "Neobrutalism should lower sharp edges, thick borders, and hard offset shadows"
+                    );
+                }
+                "Neumorphism" => {
+                    assert!(
+                        layout.display_list.iter().any(|item| {
+                            style_text_from_map(&item.style, "material_color")
+                                .is_some_and(|value| value.contains("chroma:0.005,hue:240"))
+                                && item.style.contains_key("box_shadow_2_color")
+                                && style_number_from_map(&item.style, "box_shadow_1_blur")
+                                    .is_some_and(|value| value > 18.0)
+                                && style_text_from_map(&item.style, "border")
+                                    .is_some_and(|value| value.contains("chroma:0.005"))
+                        }),
+                        "Neumorphism should lower low-contrast material and paired soft shadows"
+                    );
+                }
+                _ => unreachable!("theme list is exhaustive"),
+            }
+
+            signatures.insert(format!(
+                "{theme}:{root_color}:{}:{}",
+                evidence["geometry"], signature_key
+            ));
+        }
+
+        assert_eq!(
+            signatures.len(),
+            themes.len(),
+            "non-Classic themes should expose distinct physical rendering signatures"
+        );
     }
 
     #[test]
@@ -26663,7 +27928,7 @@ mod tests {
             }
             if *expected_name == "Glassmorphism" {
                 assert!(
-                    root_color.contains("hue:250"),
+                    root_color.contains("hue:240"),
                     "Glassmorphism should visibly switch to the glass palette, got {root_color}"
                 );
             }

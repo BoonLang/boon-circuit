@@ -66,38 +66,42 @@ FUNCTION get(from, of) {
 }
 
 FUNCTION shared_material(of) {
-    BLOCK {
-        divider: PASSED.theme_options.mode |> WHEN {
-            Dark => Oklch[lightness: 0.34, chroma: 0.02, hue: 220, alpha: 0.75]
-            Light => Oklch[lightness: 0.88, chroma: 0.02, hue: 220, alpha: 0.85]
-        }
+    PASSED.theme_options.name |> WHEN {
+        Classic => []
 
-        of |> WHEN {
-            NewTodoRowFrame => [
-                height: 65
-                border: divider
-                border_width: 1
-            ]
+        __ => BLOCK {
+            divider: PASSED.theme_options.mode |> WHEN {
+                Dark => Oklch[lightness: 0.34, chroma: 0.02, hue: 220, alpha: 0.75]
+                Light => Oklch[lightness: 0.88, chroma: 0.02, hue: 220, alpha: 0.85]
+            }
 
-            TodoListFrame => [
-                scroll: True
-                scrollbars: False
-            ]
+            of |> WHEN {
+                NewTodoRowFrame => [
+                    height: 65
+                    border: divider
+                    border_width: 1
+                ]
 
-            TodoRowFrame => [
-                height: 59.6
-                padding: 9
-                border_bottom: divider
-                border_bottom_width: 0.8
-            ]
+                TodoListFrame => [
+                    scroll: True
+                    scrollbars: False
+                ]
 
-            PanelFooterFrame => [
-                height: 46
-                border_top: divider
-                border_top_width: 0.8
-            ]
+                TodoRowFrame => [
+                    height: 59.6
+                    padding: 9
+                    border_bottom: divider
+                    border_bottom_width: 0.8
+                ]
 
-            __ => []
+                PanelFooterFrame => [
+                    height: 46
+                    border_top: divider
+                    border_top_width: 0.8
+                ]
+
+                __ => []
+            }
         }
     }
 }

@@ -2241,6 +2241,26 @@ fn rect_intersects(rect: Rect, viewport: Rect) -> bool {
         && rect.y + rect.height > viewport.y
 }
 
+fn checkbox_has_asset_icon(frame: &LayoutFrame, checkbox: &DisplayItem) -> bool {
+    if style_asset_url(&checkbox.style).is_some() {
+        return true;
+    }
+    frame.display_list.iter().any(|item| {
+        item.node != checkbox.node
+            && style_asset_url(&item.style).is_some()
+            && rect_contains_with_epsilon(checkbox.bounds, item.bounds, 1.0)
+            && item.bounds.width >= checkbox.bounds.width * 0.5
+            && item.bounds.height >= checkbox.bounds.height * 0.5
+    })
+}
+
+fn rect_contains_with_epsilon(outer: Rect, inner: Rect, epsilon: f32) -> bool {
+    inner.x + epsilon >= outer.x
+        && inner.y + epsilon >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width + epsilon
+        && inner.y + inner.height <= outer.y + outer.height + epsilon
+}
+
 fn text_layout_metric_nodes(frame: &LayoutFrame) -> BTreeSet<DocumentNodeId> {
     frame
         .display_list
@@ -2427,6 +2447,7 @@ fn rect_vertices(
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
+        let fill = material_adjusted_fill(fill, &item.style);
         let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
         push_styled_rect(
             &mut builder,
@@ -2437,6 +2458,7 @@ fn rect_vertices(
             border_radius,
         );
         metrics.rendered_rect_count += 1;
+        push_material_highlights(&mut builder, item.bounds, width, height, &item.style);
         if let Some(asset_url) = style_asset_url(&item.style) {
             push_asset_rect(&mut builder, item.bounds, width, height, asset_url);
             metrics.rendered_rect_count += 1;
@@ -2558,7 +2580,8 @@ fn rect_vertices(
             );
             metrics.rendered_rect_count += 1;
         }
-        if matches!(item.kind, DocumentNodeKind::Checkbox) {
+        if matches!(item.kind, DocumentNodeKind::Checkbox) && !checkbox_has_asset_icon(frame, item)
+        {
             push_checkbox(&mut builder, item.bounds, width, height, &item.style);
             metrics.rendered_rect_count += 1;
         }
@@ -2912,7 +2935,7 @@ fn push_triangle(
 }
 
 fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, style: &StyleMap) {
-    for index in (1..=6).rev() {
+    for index in (1..=8).rev() {
         let color_key = format!("box_shadow_{index}_color");
         let Some(color) = style_color_f32(style, &color_key) else {
             continue;
@@ -2977,6 +3000,99 @@ fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, 
             }
         }
     }
+}
+
+fn material_adjusted_fill(mut fill: [f32; 4], style: &StyleMap) -> [f32; 4] {
+    let transparency = style_number(style, "transparency")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let gloss = style_number(style, "gloss").unwrap_or(0.0).clamp(0.0, 1.0);
+    let refraction = style_number(style, "refraction").unwrap_or(0.0).max(0.0);
+    let metal = style_number(style, "metal").unwrap_or(0.0).clamp(0.0, 1.0);
+    if transparency > 0.0 {
+        fill[3] *= (1.0 - transparency * 0.58).clamp(0.28, 1.0);
+        let lift = (transparency * 0.08 + refraction * 0.015).clamp(0.0, 0.16);
+        fill[0] = mix_f32(fill[0], 1.0, lift);
+        fill[1] = mix_f32(fill[1], 1.0, lift);
+        fill[2] = mix_f32(fill[2], 1.0, lift);
+    }
+    if gloss > 0.0 {
+        let lift = (gloss * 0.035).clamp(0.0, 0.05);
+        fill[0] = mix_f32(fill[0], 1.0, lift);
+        fill[1] = mix_f32(fill[1], 1.0, lift);
+        fill[2] = mix_f32(fill[2], 1.0, lift);
+    }
+    if metal > 0.0 {
+        let average = (fill[0] + fill[1] + fill[2]) / 3.0;
+        let t = (metal * 0.18).clamp(0.0, 0.18);
+        fill[0] = mix_f32(fill[0], average, t);
+        fill[1] = mix_f32(fill[1], average, t);
+        fill[2] = mix_f32(fill[2], average, t);
+    }
+    fill
+}
+
+fn push_material_highlights(
+    builder: &mut QuadBuilder,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+) {
+    let gloss = style_number(style, "gloss").unwrap_or(0.0).clamp(0.0, 1.0);
+    let transparency = style_number(style, "transparency")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let refraction = style_number(style, "refraction").unwrap_or(0.0).max(0.0);
+    let depth = style_number(style, "depth").unwrap_or(0.0).max(0.0);
+    let top_alpha = (gloss * 0.11 + transparency * 0.08 + refraction * 0.015).clamp(0.0, 0.24);
+    if top_alpha > 0.01 && rect.width > 2.0 && rect.height > 2.0 {
+        let band = (1.0 + gloss * 2.0 + transparency * 2.0).clamp(1.0, 5.0);
+        push_rect(
+            builder,
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: band.min(rect.height),
+            },
+            width,
+            height,
+            [1.0, 1.0, 1.0, top_alpha],
+        );
+        push_rect(
+            builder,
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                width: band.min(rect.width),
+                height: rect.height,
+            },
+            width,
+            height,
+            [1.0, 1.0, 1.0, top_alpha * 0.45],
+        );
+    }
+    let bottom_alpha = ((1.0 - gloss) * 0.035 + depth * 0.006).clamp(0.0, 0.18);
+    if bottom_alpha > 0.01 && rect.width > 2.0 && rect.height > 3.0 {
+        let band = (1.0 + depth * 0.16).clamp(1.0, 4.0);
+        push_rect(
+            builder,
+            Rect {
+                x: rect.x,
+                y: rect.y + rect.height - band.min(rect.height),
+                width: rect.width,
+                height: band.min(rect.height),
+            },
+            width,
+            height,
+            [0.0, 0.0, 0.0, bottom_alpha],
+        );
+    }
+}
+
+fn mix_f32(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t
 }
 
 #[derive(Clone, Copy, Debug, Default)]

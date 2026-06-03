@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TodoMVC — Classic Dark</title>
+  <style>
+:root {
+  --scene-w: 962px;
+  --scene-h: 1017px;
+  --card-w: 552px;
+  --card-top: 151px;
+  --info-top: 562px;
+  --title-top: 48px;
+  --input-height: 64px;
+  --row-height: 59px;
+  --footer-height: 49px;
+  --toggle-col: 60px;
+  --title-size: 80px;
+  --title-weight: 200;
+  --title-spacing: -3px;
+  --item-size: 25px;
+  --item-weight: 300;
+  --item-spacing: 0;
+  --placeholder-size: 25px;
+  --footer-size: 14px;
+  --info-size: 11px;
+  --chevron-thickness: 4px;
+  --body-bg: #111318;
+  --font: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --title-font: var(--font);
+  --scene-before: transparent;
+  --scene-before-filter: none;
+  --scene-before-opacity: 1;
+  --scene-after: transparent;
+  --scene-after-filter: none;
+  --scene-after-opacity: 1;
+  --layers-display: block;
+  --layer-bg: rgba(0,0,0,0.05);
+  --layer-border: 1px solid rgba(0,0,0,0.06);
+  --layer-shadow: none;
+  --layer-left: 5px;
+  --layer-right: 5px;
+  --layer-bottom: -7px;
+  --layer-height: 8px;
+  --layer2-left: 10px;
+  --layer2-right: 10px;
+  --layer2-bottom: -13px;
+  --layer2-opacity: .7;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--body-bg);
+}
+.scene {
+  width: var(--scene-w);
+  height: var(--scene-h);
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  border: var(--window-border);
+  border-radius: var(--window-radius);
+  box-shadow: var(--window-shadow);
+  font-family: var(--font);
+}
+.scene::before,
+.scene::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.scene::before {
+  background: var(--scene-before);
+  filter: var(--scene-before-filter);
+  opacity: var(--scene-before-opacity);
+}
+.scene::after {
+  background: var(--scene-after);
+  filter: var(--scene-after-filter);
+  opacity: var(--scene-after-opacity);
+}
+.window-controls {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  color: var(--control);
+  font-size: 20px;
+  line-height: 1;
+  z-index: 2;
+  user-select: none;
+}
+.window-controls .min { transform: translateY(-2px); }
+.title {
+  position: absolute;
+  top: var(--title-top);
+  left: 0;
+  width: 100%;
+  margin: 0;
+  text-align: center;
+  color: var(--title);
+  font-family: var(--title-font);
+  font-size: var(--title-size);
+  line-height: .9;
+  font-weight: var(--title-weight);
+  letter-spacing: var(--title-spacing);
+  text-shadow: var(--title-shadow);
+  z-index: 2;
+}
+.todoapp {
+  position: absolute;
+  top: var(--card-top);
+  left: 50%;
+  width: var(--card-w);
+  transform: translateX(-50%);
+  border: var(--card-border);
+  border-radius: var(--card-radius);
+  background: var(--card-bg);
+  box-shadow: var(--card-shadow);
+  overflow: visible;
+  z-index: 2;
+}
+.todoapp::before,
+.todoapp::after {
+  content: "";
+  position: absolute;
+  display: var(--layers-display);
+  left: var(--layer-left);
+  right: var(--layer-right);
+  bottom: var(--layer-bottom);
+  height: var(--layer-height);
+  border: var(--layer-border);
+  border-top: 0;
+  border-radius: 0 0 var(--card-radius) var(--card-radius);
+  background: var(--layer-bg);
+  box-shadow: var(--layer-shadow);
+  z-index: 0;
+}
+.todoapp::after {
+  left: var(--layer2-left);
+  right: var(--layer2-right);
+  bottom: var(--layer2-bottom);
+  opacity: var(--layer2-opacity);
+}
+.todoapp-inner {
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+  border-radius: inherit;
+  background: var(--card-bg);
+}
+.input-row {
+  height: var(--input-height);
+  display: grid;
+  grid-template-columns: var(--toggle-col) 1fr;
+  align-items: center;
+  background: var(--input-bg);
+  border-bottom: var(--divider);
+}
+.chevron {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--chevron);
+  border-right: var(--chevron-col-border, 0);
+}
+.chevron::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border: solid currentColor;
+  border-width: 0 var(--chevron-thickness) var(--chevron-thickness) 0;
+  transform: rotate(45deg) translate(-2px, -3px);
+}
+.placeholder {
+  color: var(--placeholder);
+  font-size: var(--placeholder-size);
+  font-style: italic;
+  font-weight: 300;
+  letter-spacing: var(--placeholder-spacing, 0);
+  text-shadow: var(--placeholder-shadow);
+}
+.todo-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.todo {
+  height: var(--row-height);
+  display: grid;
+  grid-template-columns: var(--toggle-col) 1fr;
+  align-items: center;
+  background: var(--row-bg);
+  border-bottom: var(--divider);
+}
+.toggle {
+  width: 38px;
+  height: 38px;
+  margin: 0 auto;
+  display: grid;
+  place-items: center;
+  border: var(--circle-border);
+  border-radius: 50%;
+  background: var(--circle-bg);
+  box-shadow: var(--circle-shadow);
+  color: transparent;
+}
+.todo.completed .toggle {
+  color: var(--check);
+  border-color: var(--check-border);
+  background: var(--check-bg, var(--circle-bg));
+  box-shadow: var(--check-shadow, var(--circle-shadow));
+}
+.todo.completed .toggle::before {
+  content: "";
+  width: 11px;
+  height: 20px;
+  border: solid currentColor;
+  border-width: 0 3px 3px 0;
+  transform: rotate(45deg) translate(-1px, -2px);
+}
+.label {
+  color: var(--text);
+  font-size: var(--item-size);
+  font-weight: var(--item-weight);
+  letter-spacing: var(--item-spacing);
+  text-shadow: var(--item-shadow);
+  white-space: nowrap;
+}
+.todo.completed .label {
+  color: var(--done-text);
+  text-decoration: line-through;
+  text-decoration-color: var(--done-line);
+  text-decoration-thickness: var(--strike-thickness, 2px);
+}
+.footer {
+  height: var(--footer-height);
+  display: grid;
+  grid-template-columns: 150px 1fr 150px;
+  align-items: center;
+  padding: 0 16px;
+  background: var(--footer-bg);
+  color: var(--footer-text);
+  font-size: var(--footer-size);
+}
+.status { white-space: nowrap; }
+.filters {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  height: 100%;
+}
+.filter {
+  color: var(--footer-link);
+  text-decoration: none;
+  border: 1px solid transparent;
+  border-radius: var(--filter-radius);
+  padding: 4px 8px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.filter.selected {
+  color: var(--filter-selected-text);
+  background: var(--filter-selected-bg);
+  border-color: var(--filter-selected-border);
+  box-shadow: var(--filter-selected-shadow);
+}
+.clear {
+  justify-self: end;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--footer-link);
+  font: inherit;
+  white-space: nowrap;
+}
+.info {
+  position: absolute;
+  top: var(--info-top);
+  left: 50%;
+  width: var(--card-w);
+  transform: translateX(-50%);
+  color: var(--info-text);
+  font-size: var(--info-size);
+  text-align: center;
+  z-index: 2;
+}
+.info p {
+  height: 24px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: var(--info-divider);
+}
+.info p:first-child { border-top: var(--info-top-divider); }
+@media print {
+  body { display: block; background: transparent; }
+  .scene { box-shadow: none; }
+}
+
+:root {
+  --body-bg: #0c0c0c;
+  --bg: linear-gradient(135deg, #242424 0%, #1b1b1b 100%);
+  --window-border: 2px solid #707070;
+  --window-radius: 10px;
+  --window-shadow: 0 22px 60px rgba(0,0,0,.60);
+  --control: #d6d6d6;
+  --title: #b83f45;
+  --title-font: var(--font);
+  --title-weight: 300;
+  --title-shadow: 0 2px 8px rgba(0,0,0,.25);
+  --card-bg: #202020;
+  --card-border: 1px solid #3c3c3c;
+  --card-radius: 0;
+  --card-shadow: 0 18px 35px rgba(0,0,0,.45);
+  --input-bg: #202020;
+  --row-bg: #202020;
+  --divider: 1px solid #373737;
+  --text: #dfdfdf;
+  --done-text: #868686;
+  --done-line: #777;
+  --placeholder: #868686;
+  --placeholder-shadow: none;
+  --chevron: #8f8f8f;
+  --footer-bg: #202020;
+  --footer-text: #d6d6d6;
+  --footer-link: #d2d2d2;
+  --filter-radius: 3px;
+  --filter-selected-text: #eeeeee;
+  --filter-selected-bg: transparent;
+  --filter-selected-border: #b83f45;
+  --filter-selected-shadow: none;
+  --circle-bg: transparent;
+  --circle-border: 2px solid #595959;
+  --circle-shadow: none;
+  --check-border: #4aa582;
+  --check: #53b994;
+  --info-text: #858585;
+  --info-divider: 1px solid #333;
+  --info-top-divider: 0;
+  --layer-bg: #1d1d1d;
+  --layer-border: 1px solid #333;
+}
+
+.todoapp-inner { border-radius: inherit; }
+  </style>
+</head>
+<body>
+  <main class="scene" aria-label="TodoMVC Classic Dark theme mockup">
+    <div class="window-controls" aria-hidden="true">
+      <span class="min">–</span>
+      <span>□</span>
+      <span>×</span>
+    </div>
+
+    <h1 class="title">todos</h1>
+
+    <section class="todoapp" aria-label="Todo list">
+      <div class="todoapp-inner">
+        <div class="input-row" aria-label="New todo input">
+          <span class="chevron" aria-hidden="true"></span>
+          <span class="placeholder">What needs to be done?</span>
+        </div>
+
+        <ul class="todo-list">
+          <li class="todo">
+            <span class="toggle" aria-hidden="true"></span>
+            <span class="label">Read documentation</span>
+          </li>
+          <li class="todo completed">
+            <span class="toggle" aria-hidden="true"></span>
+            <span class="label">Finish TodoMVC renderer</span>
+          </li>
+          <li class="todo">
+            <span class="toggle" aria-hidden="true"></span>
+            <span class="label">Walk the dog</span>
+          </li>
+          <li class="todo">
+            <span class="toggle" aria-hidden="true"></span>
+            <span class="label">Buy groceries</span>
+          </li>
+        </ul>
+
+        <footer class="footer">
+          <span class="status">3 items left</span>
+          <nav class="filters" aria-label="Todo filters">
+            <a class="filter selected" href="#/">All</a>
+            <a class="filter" href="#/active">Active</a>
+            <a class="filter" href="#/completed">Completed</a>
+          </nav>
+          <button class="clear" type="button">Clear completed</button>
+        </footer>
+      </div>
+    </section>
+
+    <footer class="info" aria-label="TodoMVC information">
+      <p>Double-click to edit a todo</p>
+      <p>Created by Martin Kavik</p>
+      <p>Part of TodoMVC</p>
+    </footer>
+  </main>
+</body>
+</html>

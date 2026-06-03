@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "example": "todo_mvc_physical",
+  "source_html_directory": "docs/examples/todomvc_styled_generated/html",
+  "reference_content_note": "The native preview switcher remains visible below the TodoMVC content and is excluded from reference-content parity crops.",
+  "references": [
+    {
+      "theme": "classic",
+      "mode": "light",
+      "image": "classic_light.png",
+      "image_sha256": "5a41cafd5c91cfe80ba736ef3767c46bd72509c0eef69aa1610b41504a6b423f",
+      "image_width": 962,
+      "image_height": 1017,
+      "html": null,
+      "source_note": "Copied from /home/martinkavik/Pictures/Screenshots/Screenshot_2026-06-03_21-52-41.png because the downloaded HTML bundle did not include classic-light.html."
+    },
+    {
+      "theme": "classic",
+      "mode": "dark",
+      "image": "classic_dark.png",
+      "image_sha256": "7c132cb43022b4f73b38ef21c47dcb8c8743e35ec852fb0d06814abc0a9e638b",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "classic-dark.html",
+      "html_sha256": "66b37ff47c3862c7bc769c5bdd00db5d2a7fb556cb4e7b88cb5e35a04ce0fc67"
+    },
+    {
+      "theme": "professional",
+      "mode": "light",
+      "image": "professional_light.png",
+      "image_sha256": "9288b47d32dbc064b83beda3ec76423f865ac913d1e61d6e4521b872cffe197f",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "professional-light.html",
+      "html_sha256": "9998757177dbb07278de35a330d87ad4b7bfbcbf38086ee33b0e5d4ef698268a"
+    },
+    {
+      "theme": "professional",
+      "mode": "dark",
+      "image": "professional_dark.png",
+      "image_sha256": "e0e62bce81a4b0781534577cb30f80ebc5719a800d4330fd140d84c8ac71437c",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "professional-dark.html",
+      "html_sha256": "b2cedb9b92f957b1b53eca6695cd6319a505699aedc444b88d5f3f453df05e75"
+    },
+    {
+      "theme": "glassmorphism",
+      "mode": "light",
+      "image": "glass_light.png",
+      "image_sha256": "abfda36f18d4ed47a0858a45c6c1eee39103f3518704ec2647476182cdee402e",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "glass-light.html",
+      "html_sha256": "544deb28619d9bba31d1aa44f44edc26b23d443dcd974216e924569c558823e5"
+    },
+    {
+      "theme": "glassmorphism",
+      "mode": "dark",
+      "image": "glass_dark.png",
+      "image_sha256": "730fa785e3a5715cc1bf90581c57cbe0a8be01b2fb0cf9bd63b56023a02a99d2",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "glass-dark.html",
+      "html_sha256": "039a0eeca2870b719469a0ee6fef83aa1085524342c56f67d54c135fa8c46f18"
+    },
+    {
+      "theme": "neobrutalism",
+      "mode": "light",
+      "image": "brutalist_light.png",
+      "image_sha256": "cc97abed6a5e4b0d60896ad2f0ef2b0e79485f4ffdb06935bddc5b2beab66d0a",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "brutalist-light.html",
+      "html_sha256": "71ac049caf109a616ca9d8d007c592a3a3f2dda722d45b1c9caa7b1e2efcb7b5"
+    },
+    {
+      "theme": "neobrutalism",
+      "mode": "dark",
+      "image": "brutalist_dark.png",
+      "image_sha256": "9e62a2ae1574f668d789cdfd4a6a0e078eeb41c2fbfe3c1193040ad7b35fc9af",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "brutalist-dark.html",
+      "html_sha256": "7f7058713b6a31ffc44b886e01e4d04360c5907f43fb279dfb94fb9ca3820e69"
+    },
+    {
+      "theme": "neumorphism",
+      "mode": "light",
+      "image": "neumorphic_light.png",
+      "image_sha256": "3374571aa8b48de87394b56bc8773f24f44638db8b15bc2f0b45767fe21cfc7d",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "neumorphic-light.html",
+      "html_sha256": "e7803ac2cdd8d0ace2dd94c4e8bbbe657cdec6aeadaa927a532a24694ac57a64"
+    },
+    {
+      "theme": "neumorphism",
+      "mode": "dark",
+      "image": "neumorphic_dark.png",
+      "image_sha256": "db201e96cb78c8725a243088345e2e5810563a3f4d1f9e84806fe07fc462e9ed",
+      "image_width": 1229,
+      "image_height": 1280,
+      "html": "neumorphic-dark.html",
+      "html_sha256": "dcbf982d9145144556615456f310e98b9b31d150f977743135552823d61efda8"
+    }
+  ],
+  "html_support_files": [
+    {
+      "path": "README.txt",
+      "sha256": "92cecb97caa4356f8590e09e30060369869ad564388086147a49f77eaec5458e"
+    },
+    {
+      "path": "index.html",
+      "sha256": "4cf4c64926ea95d3b4bf41f6857ffb40717ecd4edb2b39b72ab6bb70c66445d4"
+    }
+  ]
+}

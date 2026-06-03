@@ -1,5 +1,8 @@
 FUNCTION material(of) {
-    get(from: Material, of: of)
+    [
+        ...get(from: Material, of: of)
+        ...shared_material(of: of)
+    ]
 }
 
 FUNCTION font(of) {
@@ -31,15 +34,19 @@ FUNCTION geometry() {
 }
 
 FUNCTION sizing(of) {
-    get(from: Sizing, of: of)
+    of |> WHEN {
+        TouchTarget => 40
+        ToggleControl => 54
+        IconContainer => 34
+        EditingInputWidth => 405
+        __ => get(from: Sizing, of: of)
+    }
 }
 
 FUNCTION spacing(of) {
     of |> WHEN {
-        TitlePanelGap => PASSED.theme_options.name |> WHEN {
-            Classic => Classic/spacing(of: TitlePanelGap, PASS: PASSED.theme_options)
-            __ => 0
-        }
+        TitlePanelGap => 21
+        Section => 61
         __ => get(from: Spacing, of: of)
     }
 }
@@ -55,5 +62,42 @@ FUNCTION get(from, of) {
         Glassmorphism => Glassmorphism/get(from: from, of: of, PASS: PASSED.theme_options)
         Neobrutalism => Neobrutalism/get(from: from, of: of, PASS: PASSED.theme_options)
         Neumorphism => Neumorphism/get(from: from, of: of, PASS: PASSED.theme_options)
+    }
+}
+
+FUNCTION shared_material(of) {
+    BLOCK {
+        divider: PASSED.theme_options.mode |> WHEN {
+            Dark => Oklch[lightness: 0.34, chroma: 0.02, hue: 220, alpha: 0.75]
+            Light => Oklch[lightness: 0.88, chroma: 0.02, hue: 220, alpha: 0.85]
+        }
+
+        of |> WHEN {
+            NewTodoRowFrame => [
+                height: 65
+                border: divider
+                border_width: 1
+            ]
+
+            TodoListFrame => [
+                scroll: True
+                scrollbars: False
+            ]
+
+            TodoRowFrame => [
+                height: 59.6
+                padding: 9
+                border_bottom: divider
+                border_bottom_width: 0.8
+            ]
+
+            PanelFooterFrame => [
+                height: 46
+                border_top: divider
+                border_top_width: 0.8
+            ]
+
+            __ => []
+        }
     }
 }

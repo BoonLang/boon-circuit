@@ -18501,11 +18501,9 @@ fn document_builtin_value_call(
             document_call_arg_text(args, "of", expressions, context)?.as_str(),
         ) {
             (_, "TouchTarget") => 40.0,
-            ("Classic", "ToggleControl") => 54.0,
-            (_, "ToggleControl") => 60.0,
+            (_, "ToggleControl") => 54.0,
             (_, "IconContainer") => 34.0,
-            ("Classic", "EditingInputWidth") => 405.0,
-            (_, "EditingInputWidth") => 506.0,
+            (_, "EditingInputWidth") => 405.0,
             _ => 0.0,
         })),
         "Theme/spacing" => Some(json!(match (
@@ -18519,10 +18517,8 @@ fn document_builtin_value_call(
             ("Classic", "Standard") => 9.0,
             (_, "Standard") => 10.0,
             (_, "IconOffset") => 18.0,
-            ("Classic", "TitlePanelGap") => 21.0,
-            (_, "TitlePanelGap") => 0.0,
-            ("Classic", "Section") => 61.0,
-            (_, "Section") => 65.0,
+            (_, "TitlePanelGap") => 21.0,
+            (_, "Section") => 61.0,
             _ => 0.0,
         })),
         "Theme/spring_range" => {
@@ -18804,7 +18800,7 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
     let light = document_theme_mode(context) == "Light";
     if document_theme_name(context) == "Classic" {
-        return match tagged {
+        let mut material = match tagged {
             "Background" => json!({"color": "Oklch[lightness:0.97]"}),
             "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
                 json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
@@ -18884,12 +18880,13 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
             }),
             _ => json!({}),
         };
+        if let Some(shared_frame) = document_theme_shared_frame_material(tagged, context) {
+            merge_json_object_values(&mut material, shared_frame);
+        }
+        return material;
     }
-    if matches!(
-        tagged,
-        "PanelFrame" | "NewTodoRowFrame" | "TodoListFrame" | "TodoRowFrame" | "PanelFooterFrame"
-    ) {
-        return json!({});
+    if let Some(shared_frame) = document_theme_shared_frame_material(tagged, context) {
+        return shared_frame;
     }
     let color = match (document_theme_name(context), tagged, light) {
         ("Glassmorphism", "Background", true) => "Oklch[lightness:0.94,chroma:0.035,hue:250]",
@@ -18937,6 +18934,49 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
         "gloss": if matches!(tagged, "SurfaceElevated") { 0.4 } else { 0.25 },
         "metal": if tagged.starts_with("Interactive") { 0.03 } else { 0.0 }
     })
+}
+
+fn merge_json_object_values(base: &mut Value, overlay: Value) {
+    if let (Some(base), Value::Object(overlay)) = (base.as_object_mut(), overlay) {
+        for (key, value) in overlay {
+            base.insert(key, value);
+        }
+    }
+}
+
+fn document_theme_shared_frame_material(
+    tagged: &str,
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let divider = if document_theme_mode(context) == "Dark" {
+        "Oklch[lightness:0.34,chroma:0.02,hue:220,alpha:0.75]"
+    } else {
+        "Oklch[lightness:0.88,chroma:0.02,hue:220,alpha:0.85]"
+    };
+    match tagged {
+        "PanelFrame" => Some(json!({})),
+        "NewTodoRowFrame" => Some(json!({
+            "height": 65.0,
+            "border": divider,
+            "border_width": 1.0
+        })),
+        "TodoListFrame" => Some(json!({
+            "scroll": true,
+            "scrollbars": false
+        })),
+        "TodoRowFrame" => Some(json!({
+            "height": 59.6,
+            "padding": 9.0,
+            "border_bottom": divider,
+            "border_bottom_width": 0.8
+        })),
+        "PanelFooterFrame" => Some(json!({
+            "height": 46.0,
+            "border_top": divider,
+            "border_top_width": 0.8
+        })),
+        _ => None,
+    }
 }
 
 fn document_eval_pipe_value(
@@ -25236,7 +25276,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "33efdb2152c5",
+            "bf0f59717afa",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -25952,6 +25992,258 @@ mod tests {
     }
 
     #[test]
+    fn physical_todomvc_all_themes_share_polished_layout_contracts() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let themes = [
+            "Classic",
+            "Professional",
+            "Glassmorphism",
+            "Neobrutalism",
+            "Neumorphism",
+        ];
+
+        for theme in themes {
+            let mut state = physical_todomvc_seed_state(theme, "Light");
+            mirror_physical_todomvc_seed_root_fields(&mut state);
+            let (_, layout) = native_document_layout_proof_with_state_embedded(
+                &source_path,
+                &source,
+                Some(&state),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{theme} physical TodoMVC layout should lower: {error}")
+            });
+
+            let text_item = |label: &str| {
+                layout
+                    .display_list
+                    .iter()
+                    .find(|item| item.text.as_deref() == Some(label))
+                    .unwrap_or_else(|| {
+                        let labels = layout
+                            .display_list
+                            .iter()
+                            .filter_map(|item| item.text.as_deref())
+                            .collect::<Vec<_>>();
+                        panic!("{theme} physical TodoMVC text `{label}` should render; labels={labels:?}")
+                    })
+            };
+            let contains_bounds = |outer: boon_document::Rect, inner: boon_document::Rect| {
+                outer.x <= inner.x + 0.5
+                    && outer.y <= inner.y + 0.5
+                    && outer.x + outer.width >= inner.x + inner.width - 0.5
+                    && outer.y + outer.height >= inner.y + inner.height - 0.5
+            };
+            let shared_light_divider = boon_document_model::StyleValue::Text(
+                "Oklch[lightness:0.88,chroma:0.02,hue:220,alpha:0.85]".to_owned(),
+            );
+            let text_button = |label: &str| {
+                let text = text_item(label);
+                layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                            && contains_bounds(item.bounds, text.bounds)
+                    })
+                    .unwrap_or_else(|| panic!("{theme} button `{label}` should contain its text"))
+            };
+
+            let input = layout
+                .display_list
+                .iter()
+                .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+                .unwrap_or_else(|| panic!("{theme} new-todo text input should render"));
+            let toggle_all_text = text_item("❯");
+            let toggle_all = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                        && contains_bounds(item.bounds, toggle_all_text.bounds)
+                        && item.bounds.y <= input.bounds.y + 0.5
+                        && item.bounds.y + item.bounds.height
+                            >= input.bounds.y + input.bounds.height - 0.5
+                })
+                .unwrap_or_else(|| panic!("{theme} toggle-all chevron button should render"));
+            assert!(
+                (toggle_all.bounds.width - 54.0).abs() <= 1.0,
+                "{theme} toggle-all should use the shared TodoMVC control width: {:?}",
+                toggle_all.bounds
+            );
+            assert!(
+                !layout.display_list.iter().any(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                        && item.bounds.width >= 50.0
+                        && item.bounds.y <= input.bounds.y + 0.5
+                        && item.bounds.y + item.bounds.height
+                            >= input.bounds.y + input.bounds.height - 0.5
+                }),
+                "{theme} toggle-all must not regress into a checkbox in the input row"
+            );
+            let new_todo_row = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                        && contains_bounds(item.bounds, input.bounds)
+                        && contains_bounds(item.bounds, toggle_all.bounds)
+                })
+                .unwrap_or_else(|| panic!("{theme} new-todo row should contain input controls"));
+            assert_eq!(
+                new_todo_row.style.get("border"),
+                Some(&shared_light_divider),
+                "{theme} new-todo row should use the shared divider overlay from Theme/material"
+            );
+
+            let panel_left = toggle_all.bounds.x;
+            let panel_right = input.bounds.x + input.bounds.width;
+            let panel_center = (panel_left + panel_right) * 0.5;
+            let title = text_item("todos");
+            let title_center = title.bounds.x + title.bounds.width * 0.5;
+            assert!(
+                (title_center - panel_center).abs() <= 1.0,
+                "{theme} title should stay centered over the panel: title={:?}, panel=({panel_left}, {panel_right})",
+                title.bounds
+            );
+
+            let footer_labels = [
+                "3 items left",
+                "All",
+                "Active",
+                "Completed",
+                "Clear completed",
+            ];
+            for label in footer_labels {
+                let item = text_item(label);
+                assert!(
+                    item.bounds.x >= panel_left - 0.5
+                        && item.bounds.x + item.bounds.width <= panel_right + 0.5,
+                    "{theme} footer text `{label}` should stay inside the panel: {:?}, panel=({panel_left}, {panel_right})",
+                    item.bounds
+                );
+            }
+            let count = text_item("3 items left");
+            let panel_footer = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                        && contains_bounds(item.bounds, count.bounds)
+                        && item.style.contains_key("border_top")
+                })
+                .unwrap_or_else(|| panic!("{theme} panel footer row should contain item count"));
+            assert_eq!(
+                panel_footer.style.get("border_top"),
+                Some(&shared_light_divider),
+                "{theme} panel footer should use the shared divider overlay from Theme/material"
+            );
+            for label in ["All", "Active", "Completed", "Clear completed"] {
+                let item = text_item(label);
+                assert!(
+                    (item.bounds.y - count.bounds.y).abs() <= 10.0,
+                    "{theme} footer label `{label}` should share the active-count row"
+                );
+            }
+
+            let clear = text_button("Clear completed");
+            let clear_text = text_item("Clear completed");
+            assert!(
+                style_number_from_map(&clear.style, "depth")
+                    .unwrap_or(0.0)
+                    .abs()
+                    <= f32::EPSILON
+                    && style_number_from_map(&clear_text.style, "depth")
+                        .unwrap_or(0.0)
+                        .abs()
+                        <= f32::EPSILON,
+                "{theme} Clear completed should be a flat text action, not a raised button"
+            );
+            assert_eq!(
+                clear.style.get("relief"),
+                None,
+                "{theme} Clear completed button should not lower raised relief"
+            );
+            assert_eq!(
+                clear_text.style.get("relief"),
+                None,
+                "{theme} Clear completed label should not lower raised relief"
+            );
+
+            let info = text_item("Double-click to edit a todo");
+            let info_center = info.bounds.x + info.bounds.width * 0.5;
+            assert!(
+                (info_center - panel_center).abs() <= 1.0,
+                "{theme} info footer line should be centered under the panel"
+            );
+            let created_by = text_item("Created by");
+            let author = text_item("Martin Kavík");
+            let author_center = (created_by.bounds.x + author.bounds.x + author.bounds.width) * 0.5;
+            assert!(
+                author.bounds.x > created_by.bounds.x + created_by.bounds.width
+                    && (author_center - panel_center).abs() <= 2.0,
+                "{theme} author footer fragments should be inline and centered"
+            );
+            let part_of = text_item("Part of");
+            let todomvc_link = text_item("TodoMVC");
+            let reference_center =
+                (part_of.bounds.x + todomvc_link.bounds.x + todomvc_link.bounds.width) * 0.5;
+            assert!(
+                todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width
+                    && (reference_center - panel_center).abs() <= 2.0,
+                "{theme} reference footer fragments should be inline and centered"
+            );
+
+            let footer_bottom = todomvc_link
+                .bounds
+                .y
+                .max(info.bounds.y)
+                .max(author.bounds.y)
+                + 15.0;
+            let mut theme_switcher_top = f32::MAX;
+            let mut theme_switcher_bottom = 0.0_f32;
+            for label in [
+                "Classic",
+                "Professional",
+                "Glass",
+                "Brutalist",
+                "Neumorphic",
+                "Dark mode",
+            ] {
+                let button = text_button(label);
+                theme_switcher_top = theme_switcher_top.min(button.bounds.y);
+                theme_switcher_bottom =
+                    theme_switcher_bottom.max(button.bounds.y + button.bounds.height);
+                assert!(
+                    button.bounds.x >= 0.0
+                        && button.bounds.x + button.bounds.width <= 920.0
+                        && button.bounds.y >= 0.0
+                        && button.bounds.y + button.bounds.height <= 720.0,
+                    "{theme} theme switcher button `{label}` should stay in the preview viewport: {:?}",
+                    button.bounds
+                );
+            }
+            let mode_button = text_button("Dark mode");
+            let mode_center = mode_button.bounds.x + mode_button.bounds.width * 0.5;
+            assert!(
+                (mode_center - panel_center).abs() <= 2.0,
+                "{theme} mode toggle should be centered under the theme row: {:?}",
+                mode_button.bounds
+            );
+            assert!(
+                theme_switcher_top >= footer_bottom + 8.0,
+                "{theme} theme switcher should not collide with footer text: switcher_top={theme_switcher_top}, footer_bottom={footer_bottom}"
+            );
+            assert!(
+                theme_switcher_bottom <= 704.0,
+                "{theme} theme switcher should leave breathing room at the bottom: bottom={theme_switcher_bottom}"
+            );
+        }
+    }
+
+    #[test]
     fn physical_todomvc_declarative_focus_blinks_new_todo_caret() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
@@ -26056,6 +26348,88 @@ mod tests {
                 .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)),
             "{context} should keep the new todo text input visible"
         );
+    }
+
+    fn physical_todomvc_seed_state(theme_name: &str, mode: &str) -> serde_json::Value {
+        json!({
+            "store": {
+                "elements": {
+                    "new_todo_title_text_input": {"event": {"change": {}, "key_down": {}}},
+                    "toggle_all_checkbox": {"event": {"click": {}}},
+                    "remove_completed_button": {"event": {"press": {}}},
+                    "filter_buttons": {
+                        "all": {"event": {"press": {}}},
+                        "active": {"event": {"press": {}}},
+                        "completed": {"event": {"press": {}}}
+                    },
+                    "theme_switcher": {
+                        "classic": {"event": {"press": {}}},
+                        "professional": {"event": {"press": {}}},
+                        "glassmorphism": {"event": {"press": {}}},
+                        "neobrutalism": {"event": {"press": {}}},
+                        "neumorphism": {"event": {"press": {}}},
+                        "mode_toggle": {"event": {"press": {}}}
+                    }
+                },
+                "title_to_save": "",
+                "selected_filter": "All",
+                "selected_todo_id": "",
+                "todos": [
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-1.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-1.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-1.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-1.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-1",
+                        "title": "Read documentation",
+                        "completed": false,
+                        "edited_title": ""
+                    },
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-2.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-2.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-2.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-2.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-2",
+                        "title": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "edited_title": ""
+                    },
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-3.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-3.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-3.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-3.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-3",
+                        "title": "Walk the dog",
+                        "completed": false,
+                        "edited_title": ""
+                    },
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-4.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-4.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-4.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-4.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-4",
+                        "title": "Buy groceries",
+                        "completed": false,
+                        "edited_title": ""
+                    }
+                ]
+            },
+            "theme_options": {
+                "name": theme_name,
+                "mode": mode
+            }
+        })
     }
 
     fn mirror_physical_todomvc_seed_root_fields(state: &mut serde_json::Value) {
@@ -26328,6 +26702,68 @@ mod tests {
             "mode toggle label should update after switching to dark mode"
         );
         assert_physical_todomvc_preview_healthy(&shared_render_state, "after toggling dark mode");
+
+        let themed_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (input_x, input_y, input_node) =
+            source_hit_center(&themed_layout, "store.elements.new_todo_title_text_input")
+                .expect("new todo input should still have a hit region after theme changes");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(100, input_x, input_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the themed new todo input should focus it");
+        assert_eq!(
+            input_state.focused_node.as_deref(),
+            Some(input_node.as_str())
+        );
+
+        let themed_title = "after theme switch";
+        let themed_typed = test_keyboard_input(
+            themed_title
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    test_key_press(101_u64.saturating_add(index as u64), &character.to_string())
+                })
+                .collect(),
+            Vec::new(),
+        );
+        preview_apply_real_window_input(
+            &themed_typed,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("typing a todo title should still work after theme changes");
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(140, "Return")], Vec::new()),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("pressing Enter should submit a themed todo");
+        let themed_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert!(
+            themed_summary["todos"]
+                .as_array()
+                .expect("physical TodoMVC todos should remain a list")
+                .iter()
+                .any(|todo| todo.get("title").and_then(serde_json::Value::as_str)
+                    == Some(themed_title)),
+            "add-todo should still work after clicking every theme and toggling mode"
+        );
+        assert_physical_todomvc_preview_healthy(
+            &shared_render_state,
+            "after add todo following theme changes",
+        );
     }
 
     fn test_type_scalar(label: &str) -> TypeDisplayNode {

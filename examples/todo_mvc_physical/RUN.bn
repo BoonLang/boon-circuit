@@ -212,9 +212,8 @@ FUNCTION clear_button_font(hovered) {
 FUNCTION clear_button_text(hovered) {
     [
         font: clear_button_font(hovered: hovered)
-        depth: 1.5
+        depth: 0
         move: [further: 0]
-        relief: Raised
     ]
 }
 
@@ -256,8 +255,25 @@ FUNCTION delete_button_text() {
 FUNCTION filter_button_text() {
     [
         font: Theme/font(of: BodySecondary)
-        depth: Theme/depth(of: Element)
-        move: [further: Theme/elevation(of: Selection)]
+        depth: 0
+        move: [further: 0]
+    ]
+}
+
+FUNCTION small_flat_text(of) {
+    [
+        font: Theme/font(of: of)
+        depth: 0
+        move: [further: 0]
+        text_inset: 0
+    ]
+}
+
+FUNCTION transparent_action_material() {
+    [
+        color: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.003]
+        gloss: 0
+        metal: 0
     ]
 }
 
@@ -842,10 +858,10 @@ FUNCTION remove_completed_button() {
             text_inset: 0
             text_align: Left
             vertical_align: Center
-            depth: Theme/depth(of: Element)
-            rounded_corners: Theme/corners(of: Comfort)
+            depth: 0
+            rounded_corners: 0
             spring_range: Theme/spring_range(of: Button)
-            material: Theme/material(of: SurfaceElevated)
+            material: transparent_action_material()
         ]
         label: Scene/Element/text(
             style: clear_button_text(hovered: element.hovered)
@@ -879,12 +895,11 @@ FUNCTION footer_info_line(text) {
     Scene/Element/text(
         element: []
         style: [
-            ...Theme/text(of: Small)
+            ...small_flat_text(of: Small)
             width: Fill
             auto_padding: 0
             height: 15
             line_height: 15
-            text_inset: 0
             center: True
             vertical_align: Center
         ]
@@ -906,12 +921,11 @@ FUNCTION footer_author_line() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...Theme/text(of: Small)
+                    ...small_flat_text(of: Small)
                     width: Auto
                     auto_padding: 0
                     height: 15
                     line_height: 15
-                    text_inset: 0
                     vertical_align: Center
                 ]
                 text: TEXT { Created by }
@@ -938,12 +952,11 @@ FUNCTION footer_reference_line() {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...Theme/text(of: Small)
+                    ...small_flat_text(of: Small)
                     width: Auto
                     auto_padding: 0
                     height: 15
                     line_height: 15
-                    text_inset: 0
                     vertical_align: Center
                 ]
                 text: TEXT { Part of }
@@ -957,12 +970,11 @@ FUNCTION footer_link(label, to) {
     Scene/Element/link(
         element: [hovered: SOURCE]
         style: [
-            ...Theme/text(of: SmallLink[hovered: element.hovered])
+            ...small_flat_text(of: SmallLink[hovered: element.hovered])
             width: Auto
             auto_padding: 0
             height: 15
             line_height: 15
-            text_inset: 0
             vertical_align: Center
         ]
         label: label
@@ -979,14 +991,18 @@ FUNCTION theme_switcher() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: Theme/spacing(of: Small)
-        style: [padding: [top: 20], align: [row: Center]]
+        gap: 4
+        style: [
+            width: Fill
+            padding: [top: 8]
+            align: [row: Center]
+        ]
         items: LIST {
             Scene/Element/stripe(
                 element: []
                 direction: Row
-                gap: Theme/spacing(of: Small)
-                style: []
+                gap: 6
+                style: [width: Fill, align: [row: Center]]
                 items: LIST {
                     theme_name_button(theme_name: Classic)
                         |> SOURCE { PASSED.store.elements.theme_switcher.classic }
@@ -1000,11 +1016,15 @@ FUNCTION theme_switcher() {
                         |> SOURCE { PASSED.store.elements.theme_switcher.neumorphism }
                 }
             )
-            Scene/Element/block(
+            Scene/Element/stripe(
                 element: []
-                style: [align: [row: Center]]
-                child: mode_toggle_button()
-                    |> SOURCE { PASSED.store.elements.theme_switcher.mode_toggle }
+                direction: Row
+                gap: 0
+                style: [width: Fill, align: [row: Center]]
+                items: LIST {
+                    mode_toggle_button()
+                        |> SOURCE { PASSED.store.elements.theme_switcher.mode_toggle }
+                }
             )
         }
     )
@@ -1020,7 +1040,7 @@ FUNCTION theme_name_button(theme_name) {
                 hovered: SOURCE
             ]
             style: [
-                padding: [row: 6, column: 3]
+                padding: [row: 3, column: 3]
                 depth: Theme/depth(of: Detail)
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: Button)
@@ -1035,10 +1055,7 @@ FUNCTION theme_name_button(theme_name) {
             ]
             label: Scene/Element/text(
                 style: [
-                    font: Theme/font(of: Small)
-                    depth: 1
-                    move: [further: 2]
-                    relief: Raised
+                    ...small_flat_text(of: Small)
                 ]
                 text: theme_name |> WHEN {
                     Classic => TEXT { Classic }
@@ -1059,7 +1076,7 @@ FUNCTION mode_toggle_button() {
             hovered: SOURCE
         ]
         style: [
-            padding: [row: 6, column: 3]
+            padding: [row: 3, column: 3]
             depth: Theme/depth(of: Detail)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: Button)
@@ -1067,9 +1084,7 @@ FUNCTION mode_toggle_button() {
         ]
         label: Scene/Element/text(
             style: [
-                font: Theme/font(of: Small)
-                depth: 1
-                relief: Raised
+                ...small_flat_text(of: Small)
             ]
             text: PASSED.theme_options.mode |> WHEN {
                 Light => TEXT { Dark mode }

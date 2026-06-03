@@ -51,6 +51,48 @@ Factorio spatial causality
 + Boon's static circuit runtime
 ```
 
+## Three Surfaces
+
+The intended product shape is three synchronized surfaces. In the current native
+playground language, this can be thought of as a third surface in addition to
+the code/dev surface and the preview surface. Whether it is implemented as a
+literal third native window or as an additional pane inside a dev/debug window is
+an implementation detail; conceptually it is the third thing the developer sees.
+
+```text
+1. Code Surface
+   Canonical Boon source, for example examples/todomvc.bn.
+
+2. Preview Surface
+   The real running app or target-domain simulator.
+
+3. Game / Visual Graph Surface
+   Playable factory/circuit/debug view of the same Boon program.
+```
+
+For TodoMVC, the synchronized surfaces would be:
+
+```text
+Code:
+  store.todos, new_todo(), completed HOLD, selected_filter, document
+
+Preview:
+  actual TodoMVC UI
+
+Game graph:
+  sources, row-template factory, list memory, HOLD tanks, LATEST merges,
+  ownership tree, references, live row values, dirty keys, FLUSH/DRAIN overlays
+```
+
+Synchronization rules:
+
+- editing Boon code updates the graph and preview;
+- interacting with the preview emits `SOURCE` pulses visible in the graph;
+- editing the graph writes or patches canonical Boon source;
+- replaying a scenario drives the preview while the graph shows causality;
+- selected code, selected preview object, and selected graph node should resolve
+  to the same semantic entity when possible.
+
 ## Non-Negotiable Boon Semantics
 
 The game can look freeform, but the compiler must stay strict.
@@ -673,6 +715,159 @@ Scoring goals:
 - short trace paths;
 - visible live values without overlap;
 - static and dynamic layers not confused.
+
+## Domain Profiles
+
+The game surface should be a projection of Boon's typed graph, not a
+frontend-only UI builder. The same core can work for frontend apps,
+backend/server systems, and FPGA/hardware targets if each domain supplies its
+own preview surface, constraints, skin, and scoring.
+
+The common pipeline is:
+
+```text
+Boon source
+  -> typed graph
+  -> runtime/profile metadata
+  -> domain-specific preview
+  -> game/visual graph surface
+```
+
+### Frontend Apps
+
+Frontend is the easiest fit.
+
+```text
+SOURCE = DOM/native UI events
+HOLD = UI/app state
+LIST = dynamic rows
+document = rendered output
+preview = actual app UI
+game graph = visual debugger/factory view
+```
+
+Example TodoMVC flow:
+
+```text
+checkbox click
+  -> todo_checkbox.events.click SOURCE
+  -> completed HOLD candidate
+  -> LATEST winner
+  -> committed row field
+  -> visible_todos / active_count dirty
+  -> render delta
+```
+
+Frontend live values:
+
+- selected rendered element;
+- source binding and last event sequence;
+- current `HOLD` values;
+- dirty keys and render patches;
+- stale source drops;
+- `FLUSH` validation paths;
+- `DRAIN` state migrations.
+
+### Backend And Server Apps
+
+Backend still works, but the preview surface is not a visual UI. It becomes an
+API console, request/event simulator, queue viewer, state snapshot, and trace
+runner.
+
+```text
+SOURCE = HTTP request, websocket message, queue event, DB change, timer
+HOLD = durable app/session/domain state
+LIST = users/orders/jobs/messages
+output = response, effect, event, persistence delta
+preview = API console/logs/scenario runner/state snapshots
+game graph = service graph plus live values
+```
+
+Example backend flow:
+
+```text
+POST /todos
+  -> validate payload
+  -> FLUSH { BadRequest } if invalid
+  -> append todo
+  -> persist
+  -> emit websocket delta
+```
+
+Backend live values:
+
+- last request/event;
+- current response or effect batch;
+- dirty durable records;
+- pending persistence writes;
+- queue depth and backpressure;
+- failed validations and `FLUSHED` payloads;
+- `DRAINING` migrations across services or modules.
+
+The game skin can look less like belts and more like service rooms, mail
+sorters, queues, ledgers, and effect outboxes. The underlying graph remains the
+same.
+
+### FPGA And Hardware
+
+Hardware can use the same game surface under a stricter profile.
+
+```text
+SOURCE = pins, clocks, bus inputs, host events
+THEN = edge/pulse gate
+HOLD = register / memory cell
+LATEST = mux/arbitration
+LIST[capacity] = bounded memory
+output = pins, FIFOs, display deltas, host protocol messages
+preview = waveform/signal probe/board simulator
+game graph = circuit/factory/netlist view
+```
+
+Hardware-specific display:
+
+```text
+HOLD tank       -> register or memory cell
+LATEST station  -> mux / arbitration block
+SOURCE pulse    -> input pin, clock, FIFO event
+THEN            -> clock or pulse gate
+FLUSH           -> bypass, error, or backpressure path
+DRAIN           -> migration/address-remap concept, not normal logic
+```
+
+Hardware profiles must be explicit:
+
+- fixed list capacities;
+- bounded text and byte widths;
+- bounded event and delta queues;
+- no unbounded allocation;
+- no runtime graph creation;
+- clear overflow/backpressure policy;
+- deterministic tick/clock behavior.
+
+The visual graph should make profile violations obvious. A dynamic software list
+can be shown as a growable row factory; an FPGA-targeted `LIST[256]` should look
+like bounded memory with capacity, valid bits, order memory, and generation
+guards.
+
+### Domain-Neutral Core
+
+The domain changes:
+
+- preview surface;
+- visual skin;
+- constraints and profile budgets;
+- examples and scoring;
+- target-specific diagnostics.
+
+The domain should not change:
+
+- canonical Boon source;
+- typed graph;
+- static-vs-dynamic distinction;
+- `SOURCE` / `THEN` / `HOLD` / `LATEST` / `LIST` semantics;
+- live value inspection;
+- ownership/reference distinction;
+- deterministic replay and trace explanation.
 
 ## Product Modes
 

@@ -240,36 +240,24 @@ FUNCTION todo_title_text(completed) {
         width: Theme/sizing(of: EditingInputWidth)
         height: 42
         text_inset: 0
-        depth: completed |> WHEN {
-            True => 1
-            False => 2
-        }
-        move: completed |> WHEN {
-            True => [further: 4]
-            False => [further: 0]
-        }
-        relief: completed |> WHEN {
-            True => Carved[wall: 1]
-            False => Raised
-        }
+        depth: Theme/depth(of: Detail)
+        move: [further: Theme/elevation(of: TodoItem)]
     ]
 }
 
 FUNCTION delete_button_text() {
     [
         font: Theme/font(of: BodyDanger)
-        depth: 2
-        move: [further: 0]
-        relief: Raised
+        depth: Theme/depth(of: Detail)
+        move: [further: Theme/elevation(of: TodoItem)]
     ]
 }
 
 FUNCTION filter_button_text() {
     [
         font: Theme/font(of: BodySecondary)
-        depth: 1.5
-        move: [further: 0]
-        relief: Raised
+        depth: Theme/depth(of: Element)
+        move: [further: Theme/elevation(of: Selection)]
     ]
 }
 
@@ -359,13 +347,18 @@ FUNCTION header() {
     Scene/Element/block(
         element: [tag: Header]
         style: [
-            padding: [top: 10]
             align: [row: Center]
             height: 130
         ]
         child: Scene/Element/text(
             element: [tag: H1]
-            style: Theme/text(of: Hero)
+            style: [
+                ...Theme/text(of: Hero)
+                width: Fill
+                height: 130
+                center: True
+                vertical_align: Center
+            ]
             text: TEXT { todos }
         )
     )
@@ -538,7 +531,7 @@ FUNCTION toggle_all_checkbox() {
     BLOCK {
         checked: todos |> List/every(item, if: item.completed)
 
-        Scene/Element/checkbox(
+        Scene/Element/button(
             element: [
                 event: [click: SOURCE]
                 hovered: SOURCE
@@ -548,22 +541,21 @@ FUNCTION toggle_all_checkbox() {
                 height: Fill
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
-                spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: Interactive[hovered: element.hovered])
+                spring_range: Theme/spring_range(of: Button)
+                center: True
+                material: Theme/material(of: InteractiveRecessed[focus: False])
             ]
-            label: Hidden[text: TEXT { Toggle all }]
-            checked: checked
-            icon: Scene/Element/block(
+            label: Scene/Element/text(
                 style: [
-                    height: Theme/sizing(of: IconContainer)
-                    padding: [row: 27, column: 6]
+                    ...Theme/text(of: ButtonIcon[checked: checked])
+                    width: Fill
+                    height: Fill
+                    center: True
                     rotate: 90
-                    move: [up: Theme/spacing(of: IconOffset)]
+                    text_inset: 0
+                    vertical_align: Center
                 ]
-                child: Scene/Element/text(
-                    style: Theme/text(of: ButtonIcon[checked: checked])
-                    text: TEXT { ❯ }
-                )
+                text: TEXT { ❯ }
             )
         )
     }
@@ -871,34 +863,92 @@ FUNCTION footer() {
         element: [tag: Footer]
         direction: Column
         gap: Theme/spacing(of: Small)
-        style: [align: [row: Center]]
+        style: [
+            width: Fill
+            align: [row: Center]
+        ]
         items: LIST {
-            Scene/Element/paragraph(
+            footer_info_line(text: TEXT { Double-click to edit a todo })
+            footer_author_line()
+            footer_reference_line()
+        }
+    )
+}
+
+FUNCTION footer_info_line(text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...Theme/text(of: Small)
+            width: Fill
+            auto_padding: 0
+            height: 15
+            line_height: 15
+            text_inset: 0
+            center: True
+            vertical_align: Center
+        ]
+        text: text
+    )
+}
+
+FUNCTION footer_author_line() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 3
+        style: [
+            width: Fill
+            height: 15
+            center: True
+        ]
+        items: LIST {
+            Scene/Element/text(
                 element: []
-                style: Theme/text(of: Small)
-                contents: LIST { TEXT { Double-click to edit a todo } }
+                style: [
+                    ...Theme/text(of: Small)
+                    width: Auto
+                    auto_padding: 0
+                    height: 15
+                    line_height: 15
+                    text_inset: 0
+                    vertical_align: Center
+                ]
+                text: TEXT { Created by }
             )
-            Scene/Element/paragraph(
+            footer_link(
+                label: TEXT { Martin Kavík }
+                to: TEXT { https://github.com/MartinKavik }
+            )
+        }
+    )
+}
+
+FUNCTION footer_reference_line() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 3
+        style: [
+            width: Fill
+            height: 15
+            center: True
+        ]
+        items: LIST {
+            Scene/Element/text(
                 element: []
-                style: Theme/text(of: Small)
-                contents: LIST {
-                    TEXT { Created by }
-                    Text/space()
-                    footer_link(
-                        label: TEXT { Martin Kavík }
-                        to: TEXT { https://github.com/MartinKavik }
-                    )
-                }
+                style: [
+                    ...Theme/text(of: Small)
+                    width: Auto
+                    auto_padding: 0
+                    height: 15
+                    line_height: 15
+                    text_inset: 0
+                    vertical_align: Center
+                ]
+                text: TEXT { Part of }
             )
-            Scene/Element/paragraph(
-                element: []
-                style: Theme/text(of: Small)
-                contents: LIST {
-                    TEXT { Part of }
-                    Text/space()
-                    footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
-                }
-            )
+            footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
         }
     )
 }
@@ -906,7 +956,15 @@ FUNCTION footer() {
 FUNCTION footer_link(label, to) {
     Scene/Element/link(
         element: [hovered: SOURCE]
-        style: Theme/text(of: SmallLink[hovered: element.hovered])
+        style: [
+            ...Theme/text(of: SmallLink[hovered: element.hovered])
+            width: Auto
+            auto_padding: 0
+            height: 15
+            line_height: 15
+            text_inset: 0
+            vertical_align: Center
+        ]
         label: label
         to: to
         new_tab: []

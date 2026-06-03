@@ -25236,7 +25236,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "f62733c90b6f",
+            "33efdb2152c5",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -25440,17 +25440,29 @@ mod tests {
             .iter()
             .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
             .expect("physical new-todo input should define the panel width");
+        let toggle_all_text = text_item("❯");
         let toggle_all = layout
             .display_list
             .iter()
             .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && item.bounds.x <= toggle_all_text.bounds.x + 0.5
+                    && item.bounds.y <= input.bounds.y + 0.5
+                    && item.bounds.y + item.bounds.height
+                        >= input.bounds.y + input.bounds.height - 0.5
+            })
+            .expect("physical toggle-all chevron button should define the panel left edge");
+        assert!(
+            !layout.display_list.iter().any(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
                     && (item.bounds.width - 54.0).abs() <= 1.0
                     && item.bounds.y <= input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
                         >= input.bounds.y + input.bounds.height - 0.5
-            })
-            .expect("physical toggle-all checkbox should define the panel left edge");
+            }),
+            "physical toggle-all must not render as a checkbox circle in the new-todo row"
+        );
         let panel_left = toggle_all.bounds.x;
         let panel_right = input.bounds.x + input.bounds.width;
         let active_count = text_item("1 item left");
@@ -25719,17 +25731,29 @@ mod tests {
             .iter()
             .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
             .expect("physical TodoMVC new input should render");
+        let physical_toggle_all_text = physical_text("❯");
         let physical_toggle_all = physical_layout
             .display_list
             .iter()
             .find(|item| {
-                matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
                     && (item.bounds.width - 54.0).abs() <= 1.0
+                    && item.bounds.x <= physical_toggle_all_text.bounds.x + 0.5
                     && item.bounds.y <= physical_input.bounds.y + 0.5
                     && item.bounds.y + item.bounds.height
                         >= physical_input.bounds.y + physical_input.bounds.height - 0.5
             })
             .expect("physical TodoMVC toggle-all control should render");
+        assert!(
+            !physical_layout.display_list.iter().any(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && item.bounds.y <= physical_input.bounds.y + 0.5
+                    && item.bounds.y + item.bounds.height
+                        >= physical_input.bounds.y + physical_input.bounds.height - 0.5
+            }),
+            "Classic physical toggle-all should not draw a checkbox-circle control in the input row"
+        );
         let physical_panel_left = physical_toggle_all.bounds.x;
         let physical_panel_right = physical_input.bounds.x + physical_input.bounds.width;
         assert_close(

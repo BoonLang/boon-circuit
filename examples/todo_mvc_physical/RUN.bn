@@ -15,6 +15,7 @@ store: [
         toggle_all_checkbox: SOURCE
         new_todo_title_text_input: SOURCE
         theme_switcher: [
+            classic: SOURCE
             professional: SOURCE
             glassmorphism: SOURCE
             neobrutalism: SOURCE
@@ -38,14 +39,23 @@ store: [
     title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
-            new_todo_title
-                |> Text/is_not_empty()
-                |> WHEN { True => new_todo_title, False => SKIP }
+            new_todo_title |> WHEN {
+                TEXT {} => SKIP
+                title => title
+            }
         }
         __ => SKIP
     }
-    todos: LIST {}
-        |> List/append(item: title_to_save |> new_todo())
+    todos: LIST {
+            [title: TEXT { Read documentation }, completed: False]
+            [title: TEXT { Finish TodoMVC renderer }, completed: True]
+            [title: TEXT { Walk the dog }, completed: False]
+            [title: TEXT { Buy groceries }, completed: False]
+        }
+        |> List/append(item: title_to_save |> THEN {
+            [title: title_to_save]
+        })
+        |> List/map(todo, new: new_todo(title: todo.title |> Text/trim(), initial_completed: todo.completed |> WHEN { True => True, False => False, __ => False }))
         |> List/retain(item, if: LATEST {
             True
             item.todo_elements.remove_todo_button.event.press
@@ -72,7 +82,7 @@ store: [
 -- TODO ITEM CONSTRUCTOR
 ------------------------------------------------------------------------
 
-FUNCTION new_todo(title) {
+FUNCTION new_todo(title, initial_completed) {
     [
         todo_elements: [
             remove_todo_button: SOURCE
@@ -95,7 +105,7 @@ FUNCTION new_todo(title) {
         }
         completed:
             LATEST {
-                False
+                initial_completed
                 store.elements.toggle_all_checkbox.event.click |> THEN {
                     store.todos
                         |> List/every(item, if: item.completed)
@@ -104,15 +114,15 @@ FUNCTION new_todo(title) {
             }
             |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
         edited_title: BLOCK {
-            edited_title: LATEST {
+            draft_title: LATEST {
                 Text/empty()
                 todo_elements.editing_todo_title_element.event.change.text
                 title_to_update |> THEN { Text/empty() }
             }
             LATEST {
-                edited_title
+                draft_title
                 todo_elements.todo_title_element.event.double_click |> THEN {
-                    edited_title
+                    draft_title
                         |> Text/is_empty()
                         |> WHEN { True => title, False => SKIP }
                 }
@@ -127,7 +137,9 @@ FUNCTION new_todo(title) {
 
 theme_options: [
     name: LATEST {
-        Professional
+        Classic
+        store.elements.theme_switcher.classic.event.press
+            |> THEN { Classic }
         store.elements.theme_switcher.professional.event.press
             |> THEN { Professional }
         store.elements.theme_switcher.glassmorphism.event.press
@@ -220,6 +232,14 @@ FUNCTION todo_title_font(completed) {
 FUNCTION todo_title_text(completed) {
     [
         font: todo_title_font(completed: completed)
+        color: completed |> WHEN {
+            True => Theme/font(of: BodyDisabled).color
+            False => Theme/font(of: Body).color
+        }
+        line: [strike: completed]
+        width: Theme/sizing(of: EditingInputWidth)
+        height: 42
+        text_inset: 0
         depth: completed |> WHEN {
             True => 1
             False => 2
@@ -301,6 +321,7 @@ FUNCTION content_element() {
         ]
         items: LIST {
             header()
+            theme_gap(of: TitlePanelGap)
             Scene/Element/stripe(
                 element: []
                 direction: Column
@@ -310,6 +331,23 @@ FUNCTION content_element() {
             )
             theme_switcher()
         }
+    )
+}
+
+FUNCTION theme_gap(of) {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Fill
+            height: Theme/spacing(of: of)
+            paint: False
+            material: Theme/material(of: Background)
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [paint: False]
+            text: Text/empty()
+        )
     )
 }
 
@@ -348,11 +386,11 @@ FUNCTION main_panel() {
             move: [closer: Theme/elevation(of: Card)]
             rounded_corners: Theme/corners(of: Comfort)
             material: Theme/material(of: Surface)
+            ...Theme/material(of: PanelFrame)
         ]
         items: LIST {
-            new_todo_title_text_input()
-                |> SOURCE { PASSED.store.elements.new_todo_title_text_input }
-            PASSED.store.todos
+            new_todo_entry()
+            todos
                 |> List/is_not_empty()
                 |> WHILE {
                     True => Scene/Element/stripe(
@@ -371,6 +409,25 @@ FUNCTION main_panel() {
     )
 }
 
+FUNCTION new_todo_entry() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            material: Theme/material(of: Surface)
+            ...Theme/material(of: NewTodoRowFrame)
+        ]
+        items: LIST {
+            toggle_all_checkbox()
+                |> SOURCE { PASSED.store.elements.toggle_all_checkbox }
+            new_todo_title_text_input()
+                |> SOURCE { PASSED.store.elements.new_todo_title_text_input }
+        }
+    )
+}
+
 ------------------------------------------------------------------------
 -- NEW TODO INPUT
 ------------------------------------------------------------------------
@@ -384,7 +441,10 @@ FUNCTION new_todo_title_text_input() {
             ]
         ]
         style: [
-            padding: [column: 19, left: 60, right: 16]
+            width: Fill
+            height: Fill
+            padding: [column: 16, left: 6, right: 16]
+            text_inset: 6
             font: Theme/font(of: Input)
             depth: Theme/depth(of: Element)
             move: [further: Theme/elevation(of: Inset)]
@@ -395,7 +455,7 @@ FUNCTION new_todo_title_text_input() {
         text: LATEST {
             Text/empty()
             element.event.change.text
-            PASSED.store.title_to_save |> THEN { Text/empty() }
+            title_to_save |> THEN { Text/empty() }
         }
         placeholder: [
             style: [font: Theme/font(of: Placeholder)]
@@ -412,39 +472,23 @@ FUNCTION new_todo_title_text_input() {
 FUNCTION todos_element() {
     Scene/Element/stripe(
         element: []
-        direction: Row
+        direction: Column
         gap: Theme/spacing(of: None)
         style: [
             width: Fill
             material: Theme/material(of: SurfaceVariant)
+            ...Theme/material(of: TodoListFrame)
         ]
-        items: LIST {
-            Scene/Element/block(
-                element: []
-                style: [
-                    width: Theme/sizing(of: ToggleControl)
-                    align: [row: Left, column: Top]
-                ]
-                child: toggle_all_checkbox()
-                    |> SOURCE { PASSED.store.elements.toggle_all_checkbox }
+        items: todos
+            |> List/retain(
+                item
+                if: selected_filter |> WHILE {
+                    All => True
+                    Active => item.completed |> Bool/not()
+                    Completed => item.completed
+                }
             )
-            Scene/Element/stripe(
-                element: []
-                direction: Column
-                gap: Theme/spacing(of: None)
-                style: [width: Fill]
-                items: PASSED.store.todos
-                    |> List/retain(
-                        item
-                        if: PASSED.store.selected_filter |> WHILE {
-                            All => True
-                            Active => item.completed |> Bool/not()
-                            Completed => item.completed
-                        }
-                    )
-                    |> List/map(old, new: old |> todo_element())
-            )
-        }
+            |> List/map(old, new: old |> todo_element())
     )
 }
 
@@ -464,8 +508,9 @@ FUNCTION todo_element(todo) {
             depth: Theme/depth(of: Detail)
             move: [closer: Theme/elevation(of: TodoItem)]
             material: Theme/material(of: Interactive[hovered: element.hovered])
+            ...Theme/material(of: TodoRowFrame)
         ]
-        items: PASSED.store.selected_todo_id == todo.id |> WHILE {
+        items: selected_todo_id == todo.id |> WHILE {
             True => LIST {
                 editing_todo_title_element(todo: todo)
                     |> SOURCE { todo.todo_elements.editing_todo_title_element }
@@ -491,7 +536,7 @@ FUNCTION todo_element(todo) {
 
 FUNCTION toggle_all_checkbox() {
     BLOCK {
-        checked: PASSED.store.todos |> List/every(item, if: item.completed)
+        checked: todos |> List/every(item, if: item.completed)
 
         Scene/Element/checkbox(
             element: [
@@ -517,7 +562,7 @@ FUNCTION toggle_all_checkbox() {
                 ]
                 child: Scene/Element/text(
                     style: Theme/text(of: ButtonIcon[checked: checked])
-                    text: TEXT { > }
+                    text: TEXT { ❯ }
                 )
             )
         )
@@ -573,6 +618,7 @@ FUNCTION todo_checkbox(todo) {
                 material: Theme/material(of: Interactive[hovered: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
+            target: todo.title
             checked: todo.completed
             icon: Scene/Element/block(
                 element: []
@@ -599,7 +645,7 @@ FUNCTION todo_title_element(todo) {
         ]
         style: [
             width: Fill
-            padding: [column: 15, left: 15, right: 60]
+            padding: [left: 0, right: 60]
         ]
         label: Scene/Element/text(
             style: todo_title_text(completed: todo.completed)
@@ -642,28 +688,56 @@ FUNCTION panel_footer() {
         direction: Row
         gap: Theme/spacing(of: None)
         style: [
-            padding: [row: 15, column: 8]
+            width: Fill
+            gap: Theme/spacing(of: Standard)
+            padding: [top: 10, right: 15, bottom: 10, left: 15]
             material: Theme/material(of: SurfaceElevated)
+            ...Theme/material(of: PanelFooterFrame)
         ]
         items: LIST {
-            footer_section(child: active_items_count_text())
-            footer_section(child: filters_element())
-            footer_section(child: PASSED.store.todos
+            active_items_count_text()
+            filters_leading_spacer()
+            filters_element()
+            clear_button_spacer()
+            todos
                 |> List/any(item, if: item.completed) |> WHILE {
                     True => remove_completed_button()
                         |> SOURCE { PASSED.store.elements.remove_completed_button }
                     False => NoElement
                 }
-            )
         }
     )
 }
 
-FUNCTION footer_section(child) {
+FUNCTION filters_leading_spacer() {
     Scene/Element/block(
         element: []
-        style: [width: Fill]
-        child: child
+        style: [
+            width: 17
+            height: 25.2
+            paint: False
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [paint: False]
+            text: Text/empty()
+        )
+    )
+}
+
+FUNCTION clear_button_spacer() {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: 33
+            height: 25.2
+            paint: False
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [paint: False]
+            text: Text/empty()
+        )
     )
 }
 
@@ -674,12 +748,19 @@ FUNCTION footer_section(child) {
 FUNCTION active_items_count_text() {
     Scene/Element/text(
         element: []
-        style: Theme/text(of: BodySecondary)
-        text: PASSED.store.todos
+        style: [
+            ...Theme/text(of: BodySecondary)
+            width: 130
+            height: 25.2
+            line_height: 19.6
+            text_inset: 0
+            vertical_align: Center
+        ]
+        text: todos
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count()
             |> WHEN { count => BLOCK {
-                maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty() }
+                maybe_s: count == 1 |> WHEN { True => Text/empty(), False => TEXT { s } }
                 TEXT { {count} item{maybe_s} left }
             }}
     )
@@ -694,7 +775,10 @@ FUNCTION filters_element() {
         element: []
         direction: Row
         gap: Theme/spacing(of: Standard)
-        style: []
+        style: [
+            width: 194
+            height: 25.2
+        ]
         items: LIST {
             filter_button(filter: All)
                 |> SOURCE { PASSED.store.elements.filter_buttons.all }
@@ -708,7 +792,7 @@ FUNCTION filters_element() {
 
 FUNCTION filter_button(filter) {
     BLOCK {
-        selected: PASSED.store.selected_filter == filter
+        selected: selected_filter == filter
 
         Scene/Element/button(
             element: [
@@ -716,7 +800,16 @@ FUNCTION filter_button(filter) {
                 hovered: SOURCE
             ]
             style: [
-                padding: [row: 8, column: 4]
+                width: filter |> WHEN {
+                    All => 32
+                    Active => 56
+                    Completed => 88
+                }
+                height: 25.2
+                padding: [row: 0, column: 0]
+                line_height: 19.6
+                text_inset: 0
+                vertical_align: Center
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: Button)
@@ -750,7 +843,13 @@ FUNCTION remove_completed_button() {
         ]
         style: [
             align: Right
-            padding: [row: 4, column: 2]
+            width: 110
+            height: 25.2
+            padding: [row: 0, column: 0]
+            line_height: 19.6
+            text_inset: 0
+            text_align: Left
+            vertical_align: Center
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Comfort)
             spring_range: Theme/spring_range(of: Button)
@@ -784,6 +883,7 @@ FUNCTION footer() {
                 style: Theme/text(of: Small)
                 contents: LIST {
                     TEXT { Created by }
+                    Text/space()
                     footer_link(
                         label: TEXT { Martin Kavík }
                         to: TEXT { https://github.com/MartinKavik }
@@ -795,6 +895,7 @@ FUNCTION footer() {
                 style: Theme/text(of: Small)
                 contents: LIST {
                     TEXT { Part of }
+                    Text/space()
                     footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
                 }
             )
@@ -829,6 +930,8 @@ FUNCTION theme_switcher() {
                 gap: Theme/spacing(of: Small)
                 style: []
                 items: LIST {
+                    theme_name_button(theme_name: Classic)
+                        |> SOURCE { PASSED.store.elements.theme_switcher.classic }
                     theme_name_button(theme_name: Professional)
                         |> SOURCE { PASSED.store.elements.theme_switcher.professional }
                     theme_name_button(theme_name: Glassmorphism)
@@ -880,6 +983,7 @@ FUNCTION theme_name_button(theme_name) {
                     relief: Raised
                 ]
                 text: theme_name |> WHEN {
+                    Classic => TEXT { Classic }
                     Professional => TEXT { Professional }
                     Glassmorphism => TEXT { Glass }
                     Neobrutalism => TEXT { Brutalist }

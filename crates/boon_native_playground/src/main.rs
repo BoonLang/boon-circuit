@@ -13536,12 +13536,23 @@ impl<'a> DocumentFunctionRegistry<'a> {
     }
 
     fn get(&self, name: &str) -> Option<&'a AstStatement> {
-        self.functions.get(name).copied().or_else(|| {
-            self.aliases
-                .get(name)
-                .and_then(|alias| self.functions.get(alias))
-                .copied()
-        })
+        self.functions
+            .get(name)
+            .copied()
+            .or_else(|| {
+                self.aliases
+                    .get(name)
+                    .and_then(|alias| self.functions.get(alias))
+                    .copied()
+            })
+            .or_else(|| {
+                name.rsplit_once('/').and_then(|(_, short_name)| {
+                    self.aliases
+                        .get(short_name)
+                        .and_then(|alias| self.functions.get(alias))
+                        .copied()
+                })
+            })
     }
 
     fn contains_render_constructor(&self, function: &AstStatement) -> bool {
@@ -13988,7 +13999,12 @@ fn lower_canonical_conditional_render_entry_with_input(
                 end: expr.end,
                 kind: AstStatementKind::Expression,
                 expr: Some(*output),
-                children: arm.children.clone(),
+                children: arm
+                    .children
+                    .iter()
+                    .filter(|child| child.expr != Some(*output))
+                    .cloned()
+                    .collect(),
             };
             lower_canonical_document_entry(
                 &synthetic,
@@ -15260,6 +15276,23 @@ fn lower_canonical_list_literal_children(
     let mut lowered = false;
     if items.is_empty() {
         for child in &statement.children {
+            if !document_statement_directly_renders(child, expressions, functions, context)
+                && lower_canonical_sibling_condition_children(
+                    child,
+                    expressions,
+                    functions,
+                    parent,
+                    frame,
+                    source_intents,
+                    seen_ids,
+                    context,
+                    typecheck_report,
+                    scope_key,
+                )
+            {
+                lowered = true;
+                continue;
+            }
             lower_canonical_document_entry(
                 child,
                 expressions,
@@ -15272,18 +15305,6 @@ fn lower_canonical_list_literal_children(
                 typecheck_report,
                 scope_key,
                 false,
-            );
-            lower_canonical_sibling_condition_children(
-                child,
-                expressions,
-                functions,
-                parent,
-                frame,
-                source_intents,
-                seen_ids,
-                context,
-                typecheck_report,
-                scope_key,
             );
             lowered = true;
         }
@@ -15346,6 +15367,22 @@ fn lower_canonical_list_literal_children(
     lowered
 }
 
+fn document_statement_directly_renders(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+    context: &DocumentEvalContext<'_>,
+) -> bool {
+    document_render_arg_statement(statement, expressions, context).is_some()
+        || canonical_element_function(statement, expressions).is_some()
+        || document_call_function(statement, expressions)
+            .and_then(|function| functions.get(function))
+            .is_some()
+        || document_pipe_render_function(statement, expressions, functions).is_some()
+        || document_source_pipe_statement(statement, expressions)
+        || document_conditional_statement(statement, expressions)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_canonical_sibling_condition_children(
     statement: &AstStatement,
@@ -15358,7 +15395,8 @@ fn lower_canonical_sibling_condition_children(
     context: &DocumentEvalContext<'_>,
     typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
-) {
+) -> bool {
+    let mut lowered = false;
     for (index, child) in statement.children.iter().enumerate() {
         if let Some(input_expr_id) = child
             .expr
@@ -15388,6 +15426,7 @@ fn lower_canonical_sibling_condition_children(
                 Some(selector),
             )
         {
+            lowered = true;
             continue;
         }
         if document_conditional_input_is_delimiter(child, expressions)
@@ -15418,10 +15457,11 @@ fn lower_canonical_sibling_condition_children(
                 Some(selector),
             )
         {
+            lowered = true;
             continue;
         }
-        if !child.children.is_empty() {
-            lower_canonical_sibling_condition_children(
+        if !child.children.is_empty()
+            && lower_canonical_sibling_condition_children(
                 child,
                 expressions,
                 functions,
@@ -15432,9 +15472,12 @@ fn lower_canonical_sibling_condition_children(
                 context,
                 typecheck_report,
                 scope_key,
-            );
+            )
+        {
+            lowered = true;
         }
     }
+    lowered
 }
 
 fn lower_canonical_element_style(
@@ -15490,6 +15533,13 @@ fn lower_canonical_style_block(
     }
     for child in &statement.children {
         let Some(field) = document_field_name(child) else {
+            if let Some(expr_id) = child.expr
+                && let Some(Value::Object(object)) = expressions
+                    .get(expr_id)
+                    .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+            {
+                lower_json_style_object(&object, node);
+            }
             continue;
         };
         match field.as_str() {
@@ -16527,7 +16577,12 @@ fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_mod
                     insert_json_style_value(node, "material_color", color);
                 }
                 for (material_key, material_value) in object {
-                    if material_key != "color" {
+                    if material_key == "color" {
+                        continue;
+                    }
+                    if material_key == "shadows" {
+                        lower_json_shadow_style(material_value, node);
+                    } else {
                         insert_json_style_value(node, material_key, material_value);
                     }
                 }
@@ -16582,9 +16637,42 @@ fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_mod
                 }
             }
         }
+        "shadows" => lower_json_shadow_style(value, node),
         "width" | "height" | "size" => lower_json_dimension_style(key, value, node),
         "align" => lower_json_align_style(value, node),
         _ => insert_json_style_value(node, key, value),
+    }
+}
+
+fn lower_json_shadow_style(value: &Value, node: &mut boon_document_model::DocumentNode) {
+    let Some(shadows) = value.as_array() else {
+        return;
+    };
+    for (shadow_index, shadow) in shadows.iter().enumerate() {
+        let Some(object) = shadow.as_object() else {
+            continue;
+        };
+        let index = shadow_index + 1;
+        for (field, value) in object {
+            let key = match field.as_str() {
+                "x" | "y" | "blur" | "spread" => format!("box_shadow_{index}_{field}"),
+                "color" => format!("box_shadow_{index}_color"),
+                "direction" => {
+                    if value.as_str() == Some("Inwards") {
+                        format!("box_shadow_{index}_inset")
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            if field == "direction" {
+                node.style
+                    .insert(key, boon_document_model::StyleValue::Bool(true));
+            } else {
+                insert_json_style_value(node, &key, value);
+            }
+        }
     }
 }
 
@@ -18369,7 +18457,9 @@ fn document_builtin_value_call(
             &document_call_arg_text(args, "of", expressions, context)?,
             context,
         )),
-        "Theme/depth" => Some(json!(
+        "Theme/depth" => Some(json!(if document_theme_name(context) == "Classic" {
+            0.0
+        } else {
             match document_call_arg_text(args, "of", expressions, context)?.as_str() {
                 "Container" => 8.0,
                 "Element" => 6.0,
@@ -18377,23 +18467,25 @@ fn document_builtin_value_call(
                 "Hero" => 10.0,
                 _ => 1.0,
             }
-        )),
-        "Theme/elevation" => {
-            Some(json!(
-                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                    "Card" => 50.0,
-                    "EditingFocus" => 24.0,
-                    "Selection" => 4.0,
-                    "TodoItem" => 4.0,
-                    "Inset" => -4.0,
-                    _ => 0.0,
-                }
-            ))
-        }
+        })),
+        "Theme/elevation" => Some(json!(if document_theme_name(context) == "Classic" {
+            0.0
+        } else {
+            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
+                "Card" => 50.0,
+                "EditingFocus" => 24.0,
+                "Selection" => 4.0,
+                "TodoItem" => 4.0,
+                "Inset" => -4.0,
+                _ => 0.0,
+            }
+        })),
         "Theme/corners" => Some(json!(match (
             document_theme_name(context),
             document_call_arg_text(args, "of", expressions, context)?.as_str()
         ) {
+            ("Classic", "Touch" | "Comfort") => 0.0,
+            ("Classic", "Soft" | "Pill" | "Fully") => 3.0,
             ("Neobrutalism", "Pill" | "Fully") => 2.0,
             ("Neobrutalism", _) => 0.0,
             ("Neumorphism", "Touch") => 10.0,
@@ -18404,30 +18496,45 @@ fn document_builtin_value_call(
             (_, "Pill" | "Fully") => 999.0,
             _ => 0.0,
         })),
-        "Theme/sizing" => Some(json!(
-            match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                "TouchTarget" => 40.0,
-                "ToggleControl" => 60.0,
-                "IconContainer" => 34.0,
-                "EditingInputWidth" => 506.0,
-                _ => 0.0,
-            }
-        )),
-        "Theme/spacing" => {
-            Some(json!(
-                match document_call_arg_text(args, "of", expressions, context)?.as_str() {
-                    "None" => 0.0,
-                    "Tight" => 5.0,
-                    "Small" => 9.0,
-                    "Standard" => 10.0,
-                    "IconOffset" => 18.0,
-                    "Section" => 65.0,
-                    _ => 0.0,
-                }
-            ))
-        }
+        "Theme/sizing" => Some(json!(match (
+            document_theme_name(context),
+            document_call_arg_text(args, "of", expressions, context)?.as_str(),
+        ) {
+            (_, "TouchTarget") => 40.0,
+            ("Classic", "ToggleControl") => 54.0,
+            (_, "ToggleControl") => 60.0,
+            (_, "IconContainer") => 34.0,
+            ("Classic", "EditingInputWidth") => 405.0,
+            (_, "EditingInputWidth") => 506.0,
+            _ => 0.0,
+        })),
+        "Theme/spacing" => Some(json!(match (
+            document_theme_name(context),
+            document_call_arg_text(args, "of", expressions, context)?.as_str(),
+        ) {
+            (_, "None") => 0.0,
+            ("Classic", "Tight") => 11.0,
+            (_, "Tight") => 5.0,
+            (_, "Small") => 9.0,
+            ("Classic", "Standard") => 9.0,
+            (_, "Standard") => 10.0,
+            (_, "IconOffset") => 18.0,
+            ("Classic", "TitlePanelGap") => 21.0,
+            (_, "TitlePanelGap") => 0.0,
+            ("Classic", "Section") => 61.0,
+            (_, "Section") => 65.0,
+            _ => 0.0,
+        })),
         "Theme/spring_range" => {
             let of = document_call_arg_text(args, "of", expressions, context)?;
+            if document_theme_name(context) == "Classic" {
+                return Some(match of.as_str() {
+                    "Button" | "ButtonDestructive" | "Checkbox" => {
+                        json!({"extend": 0.0, "compress": 0.0})
+                    }
+                    _ => json!({}),
+                });
+            }
             Some(match of.as_str() {
                 "Button" => json!({"extend": 6.0, "compress": 4.0}),
                 "ButtonDestructive" => json!({"extend": 4.0, "compress": 6.0}),
@@ -18473,8 +18580,9 @@ fn document_theme_mode(context: &DocumentEvalContext<'_>) -> &'static str {
 fn document_theme_name(context: &DocumentEvalContext<'_>) -> &'static str {
     match document_resolved_value("PASSED.theme_options.name", context)
         .and_then(Value::as_str)
-        .unwrap_or("Professional")
+        .unwrap_or("Classic")
     {
+        "Classic" => "Classic",
         "Glassmorphism" => "Glassmorphism",
         "Neobrutalism" => "Neobrutalism",
         "Neumorphism" => "Neumorphism",
@@ -18488,6 +18596,14 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         document_theme_mode(context),
         role,
     ) {
+        ("Classic", _, "text") => "Oklch[lightness:0.4017]",
+        ("Classic", _, "input_text") => "Oklch[lightness:0.42]",
+        ("Classic", _, "text_secondary") => "Oklch[lightness:0.17]",
+        ("Classic", _, "text_tertiary") => "Oklch[lightness:0.4202]",
+        ("Classic", _, "text_disabled") => "Oklch[lightness:0.6665]",
+        ("Classic", _, "text_placeholder") => "Oklch[lightness:0.68]",
+        ("Classic", _, "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
+        ("Classic", _, "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
         ("Glassmorphism", "Light", "text_header") => "Oklch[lightness:0.62,chroma:0.14,hue:250]",
         ("Glassmorphism", "Dark", "text_header") => "Oklch[lightness:0.78,chroma:0.12,hue:250]",
         ("Neobrutalism", "Light", "text_header") => "Oklch[lightness:0.55,chroma:0.18,hue:35]",
@@ -18512,6 +18628,73 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
 
 fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    if document_theme_name(context) == "Classic" {
+        let family = "Helvetica Neue, Helvetica, Arial, SansSerif";
+        return match tagged {
+            "Hero" => json!({
+                "family": family,
+                "size": 80.0,
+                "color": document_theme_color(context, "text_header"),
+                "weight": "ExtraLight"
+            }),
+            "Body" => json!({
+                "family": family,
+                "size": 24.0,
+                "color": document_theme_color(context, "text"),
+                "weight": "Normal"
+            }),
+            "BodySecondary" => json!({
+                "family": family,
+                "size": 15.0,
+                "color": document_theme_color(context, "text_secondary"),
+                "weight": "Light"
+            }),
+            "BodyDisabled" => json!({
+                "family": family,
+                "size": 24.0,
+                "color": document_theme_color(context, "text_disabled"),
+                "weight": "Normal"
+            }),
+            "BodyDanger" => json!({
+                "family": family,
+                "size": 30.0,
+                "color": document_theme_color(context, "danger"),
+                "weight": "Normal"
+            }),
+            "Placeholder" => json!({
+                "family": family,
+                "size": 24.0,
+                "style": "Italic",
+                "color": document_theme_color(context, "text_placeholder"),
+                "weight": "Light"
+            }),
+            "ButtonIcon" => json!({
+                "family": family,
+                "size": 22.0,
+                "color": document_theme_color(context, "text_disabled"),
+                "weight": "Normal"
+            }),
+            "Small" => json!({
+                "family": family,
+                "size": 11.0,
+                "color": document_theme_color(context, "text_tertiary"),
+                "weight": "Light"
+            }),
+            "SmallLink" => json!({
+                "family": family,
+                "size": 11.0,
+                "color": document_theme_color(context, "text_tertiary"),
+                "weight": "Light",
+                "line": {"underline": false}
+            }),
+            "Input" | _ => json!({
+                "family": family,
+                "size": 24.0,
+                "color": document_theme_color(context, "input_text"),
+                "weight": "Light"
+            }),
+        };
+    }
     match tagged {
         "Hero" => json!({
             "size": 100.0,
@@ -18558,6 +18741,34 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
 
 fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
+    if document_theme_name(context) == "Classic" {
+        return match tagged {
+            "Hero" => json!({
+                "font": document_theme_font("Hero", context),
+                "depth": 0.0,
+                "move": {"further": 0.0}
+            }),
+            "BodySecondary" => json!({
+                "font": document_theme_font("BodySecondary", context),
+                "depth": 0.0,
+                "move": {"further": 0.0}
+            }),
+            "ButtonIcon" => json!({
+                "font": document_theme_font("ButtonIcon", context),
+                "depth": 0.0
+            }),
+            "SmallLink" => json!({
+                "font": document_theme_font("SmallLink", context),
+                "depth": 0.0,
+                "move": {"further": 0.0}
+            }),
+            "Small" | _ => json!({
+                "font": document_theme_font("Small", context),
+                "depth": 0.0,
+                "move": {"further": 0.0}
+            }),
+        };
+    }
     match tagged {
         "Hero" => json!({
             "font": document_theme_font("Hero", context),
@@ -18592,6 +18803,94 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
 fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
     let light = document_theme_mode(context) == "Light";
+    if document_theme_name(context) == "Classic" {
+        return match tagged {
+            "Background" => json!({"color": "Oklch[lightness:0.97]"}),
+            "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
+                json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
+            }
+            "InteractiveRecessed" => {
+                json!({"color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]", "gloss": 0.0})
+            }
+            "Primary" => json!({"color": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]"}),
+            "PrimarySubtle" => json!({
+                "color": "Oklch[lightness:1]",
+                "border": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]",
+                "border_width": 0.8
+            }),
+            "Danger" => json!({"color": "Oklch[lightness:0.57,chroma:0.109,hue:18.87]"}),
+            "PanelFrame" => json!({
+                "shadows": [
+                    {
+                        "y": 2.0,
+                        "blur": 4.0,
+                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                    },
+                    {
+                        "y": 25.0,
+                        "blur": 50.0,
+                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.10]"
+                    }
+                ]
+            }),
+            "NewTodoRowFrame" => json!({
+                "height": 65.0,
+                "border": "Oklch[lightness:0.66,chroma:0.11,hue:20,alpha:0.45]",
+                "border_width": 1.0
+            }),
+            "TodoListFrame" => json!({
+                "scroll": true,
+                "scrollbars": false
+            }),
+            "TodoRowFrame" => json!({
+                "height": 59.6,
+                "padding": 9.0,
+                "border_bottom": "Oklch[lightness:0.93]",
+                "border_bottom_width": 0.8
+            }),
+            "PanelFooterFrame" => json!({
+                "height": 46.0,
+                "border_top": "Oklch[lightness:0.93]",
+                "border_top_width": 0.8,
+                "shadows": [
+                    {
+                        "y": 1.0,
+                        "blur": 1.0,
+                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                    },
+                    {
+                        "y": 8.0,
+                        "spread": -3.0,
+                        "color": "Oklch[lightness:0.973]"
+                    },
+                    {
+                        "y": 9.0,
+                        "blur": 1.0,
+                        "spread": -3.0,
+                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                    },
+                    {
+                        "y": 16.0,
+                        "spread": -6.0,
+                        "color": "Oklch[lightness:0.973]"
+                    },
+                    {
+                        "y": 17.0,
+                        "blur": 2.0,
+                        "spread": -6.0,
+                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                    }
+                ]
+            }),
+            _ => json!({}),
+        };
+    }
+    if matches!(
+        tagged,
+        "PanelFrame" | "NewTodoRowFrame" | "TodoListFrame" | "TodoRowFrame" | "PanelFooterFrame"
+    ) {
+        return json!({});
+    }
     let color = match (document_theme_name(context), tagged, light) {
         ("Glassmorphism", "Background", true) => "Oklch[lightness:0.94,chroma:0.035,hue:250]",
         ("Glassmorphism", "Background", false) => "Oklch[lightness:0.10,chroma:0.025,hue:250]",
@@ -19263,7 +19562,10 @@ fn preview_input_has_unhandled_source_events(
             .any(|event| event.sequence > input_state.last_keyboard_event_sequence)
         || input_state.held_repeat_key.as_ref().is_some_and(|key| {
             input_state.held_repeat_next_at.is_some()
-                && input.pressed_keys.iter().any(|pressed| pressed == key)
+                && input
+                    .pressed_keys
+                    .iter()
+                    .any(|pressed| pressed_key_matches_repeat(pressed, key))
         })
 }
 
@@ -20007,7 +20309,11 @@ fn preview_apply_real_window_input_with_units(
             continue;
         }
         if !event.pressed {
-            if input_state.held_repeat_key.as_deref() == Some(event.key.as_str()) {
+            if input_state
+                .held_repeat_key
+                .as_ref()
+                .is_some_and(|held| pressed_key_matches_repeat(event.key.as_str(), held))
+            {
                 preview_clear_key_repeat(input_state);
             }
             continue;
@@ -20026,7 +20332,10 @@ fn preview_apply_real_window_input_with_units(
                     .or_else(|| live_source_for_node_intent(layout, &focused_node, "key_down"))
                 {
                     let submitted_text = input_state.focused_text.clone();
-                    let carries_text = !source.ends_with(".key_down");
+                    let carries_text = live_runtime
+                        .lock()
+                        .map(|runtime| runtime.source_payload_has_text(&source))
+                        .unwrap_or(false);
                     let submit = boon_runtime::LiveSourceEvent {
                         source,
                         text: carries_text.then_some(submitted_text.clone()),
@@ -20121,7 +20430,11 @@ fn preview_apply_real_window_input_with_units(
     }
     if input_state.focused_node.is_some() && !primary_modifier_pressed {
         if let Some(key) = input_state.held_repeat_key.clone() {
-            if input.pressed_keys.iter().any(|pressed| pressed == &key) {
+            if input
+                .pressed_keys
+                .iter()
+                .any(|pressed| pressed_key_matches_repeat(pressed, &key))
+            {
                 let now = Instant::now();
                 let mut applied = 0usize;
                 while input_state
@@ -24792,7 +25105,7 @@ mod tests {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
-        let state = json!({
+        let mut state = json!({
             "store": {
                 "elements": {
                     "filter_buttons": {
@@ -24804,6 +25117,7 @@ mod tests {
                     "toggle_all_checkbox": "store.elements.toggle_all_checkbox",
                     "new_todo_title_text_input": "store.elements.new_todo_title_text_input",
                     "theme_switcher": {
+                        "classic": "store.elements.theme_switcher.classic",
                         "professional": "store.elements.theme_switcher.professional",
                         "glassmorphism": "store.elements.theme_switcher.glassmorphism",
                         "neobrutalism": "store.elements.theme_switcher.neobrutalism",
@@ -24828,10 +25142,11 @@ mod tests {
                 }]
             },
             "theme_options": {
-                "name": "Professional",
+                "name": "Classic",
                 "mode": "Light"
             }
         });
+        mirror_physical_todomvc_seed_root_fields(&mut state);
         let (proof, layout) =
             native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
                 .expect("physical TodoMVC layout should lower with a seeded todo");
@@ -24901,11 +25216,66 @@ mod tests {
     }
 
     #[test]
+    fn physical_todomvc_manifest_layout_renders_runtime_rows() {
+        let source_path = PathBuf::from("examples/todo_mvc_physical/RUN.bn");
+        let units = [
+            "examples/todo_mvc_physical/Theme/Classic.bn",
+            "examples/todo_mvc_physical/Theme/Professional.bn",
+            "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+            "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
+            "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+            "examples/todo_mvc_physical/Theme/Theme.bn",
+            "examples/todo_mvc_physical/Generated/Assets.bn",
+            "examples/todo_mvc_physical/RUN.bn",
+        ]
+        .into_iter()
+        .map(|path| boon_runtime::RuntimeSourceUnit {
+            path: path.to_owned(),
+            source: std::fs::read_to_string(repo_path(path)).unwrap(),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            &boon_runtime::source_units_hash(&units)[..12],
+            "f62733c90b6f",
+            "test should exercise the same relative-path project identity as preview E2E"
+        );
+        let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
+            .expect("physical TodoMVC runtime should initialize from manifest units");
+        let state_summary = runtime.document_state_summary();
+        let (_, layout) = native_document_layout_proof_with_project_state_mode(
+            &source_path,
+            &units,
+            Some(&state_summary),
+            false,
+        )
+        .expect("physical TodoMVC manifest layout should lower with runtime state");
+        let labels = layout
+            .as_ref()
+            .expect("layout frame should be returned")
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref())
+            .collect::<Vec<_>>();
+
+        for required in [
+            "Read documentation",
+            "Finish TodoMVC renderer",
+            "Walk the dog",
+            "Buy groceries",
+        ] {
+            assert!(
+                labels.iter().any(|label| *label == required),
+                "physical TodoMVC manifest layout should render `{required}`; labels={labels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn physical_todomvc_active_count_text_lowers_full_label() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
-        let state = json!({
+        let mut state = json!({
             "store": {
                 "elements": {
                     "filter_buttons": {},
@@ -24920,10 +25290,11 @@ mod tests {
                 ]
             },
             "theme_options": {
-                "name": "Professional",
+                "name": "Classic",
                 "mode": "Light"
             }
         });
+        mirror_physical_todomvc_seed_root_fields(&mut state);
         fn find_text_field<'a>(statement: &'a AstStatement) -> Option<&'a AstStatement> {
             if document_field_name(statement).as_deref() == Some("text") {
                 return Some(statement);
@@ -24974,7 +25345,7 @@ mod tests {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
-        let state = json!({
+        let mut state = json!({
             "store": {
                 "elements": {
                     "filter_buttons": {
@@ -24986,6 +25357,7 @@ mod tests {
                     "toggle_all_checkbox": "store.elements.toggle_all_checkbox",
                     "new_todo_title_text_input": "store.elements.new_todo_title_text_input",
                     "theme_switcher": {
+                        "classic": "store.elements.theme_switcher.classic",
                         "professional": "store.elements.theme_switcher.professional",
                         "glassmorphism": "store.elements.theme_switcher.glassmorphism",
                         "neobrutalism": "store.elements.theme_switcher.neobrutalism",
@@ -25024,10 +25396,11 @@ mod tests {
                 ]
             },
             "theme_options": {
-                "name": "Professional",
+                "name": "Classic",
                 "mode": "Light"
             }
         });
+        mirror_physical_todomvc_seed_root_fields(&mut state);
         let (_, layout) =
             native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
                 .expect("physical TodoMVC layout should lower with seeded footer controls");
@@ -25067,9 +25440,33 @@ mod tests {
             .iter()
             .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
             .expect("physical new-todo input should define the panel width");
-        let panel_left = input.bounds.x;
+        let toggle_all = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && item.bounds.y <= input.bounds.y + 0.5
+                    && item.bounds.y + item.bounds.height
+                        >= input.bounds.y + input.bounds.height - 0.5
+            })
+            .expect("physical toggle-all checkbox should define the panel left edge");
+        let panel_left = toggle_all.bounds.x;
         let panel_right = input.bounds.x + input.bounds.width;
         let active_count = text_item("1 item left");
+        let labels = layout
+            .display_list
+            .iter()
+            .filter_map(|item| item.text.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == "Clear completed")
+                .count(),
+            1,
+            "footer should render one Clear completed button, labels={labels:?}"
+        );
         assert!(
             active_count.bounds.x >= panel_left
                 && active_count.bounds.x + active_count.bounds.width <= panel_right,
@@ -25090,6 +25487,358 @@ mod tests {
             assert!(
                 (text_item(label).bounds.y - active_count.bounds.y).abs() <= 10.0,
                 "footer label `{label}` should share the active-count text row"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_todomvc_classic_matches_document_todomvc_visual_zones() {
+        let document_source_path = PathBuf::from("examples/todomvc.bn");
+        let document_source = include_str!("../../../examples/todomvc.bn").to_owned();
+        let document_state = json!({
+            "store": {
+                "sources": {
+                    "new_todo_input": {"events": {"change": {}, "key_down": {}, "focus": {}, "blur": {}}},
+                    "toggle_all_checkbox": {"events": {"click": {}}},
+                    "clear_completed_button": {"events": {"press": {}}},
+                    "filter_all": {"events": {"press": {}}},
+                    "filter_active": {"events": {"press": {}}},
+                    "filter_completed": {"events": {"press": {}}}
+                },
+                "new_todo_text": "",
+                "title_to_add": "",
+                "selected_filter": "All",
+                "todos": [
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Read documentation",
+                        "edit_text": "Read documentation",
+                        "completed": false,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": true
+                    },
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Finish TodoMVC renderer",
+                        "edit_text": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": false
+                    }
+                ],
+                "visible_todos": [
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Read documentation",
+                        "edit_text": "Read documentation",
+                        "completed": false,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": true
+                    },
+                    {
+                        "sources": {
+                            "remove_todo_button": {"events": {"press": {}}},
+                            "editing_todo_title_element": {"events": {"change": {}, "key_down": {}, "blur": {}}},
+                            "todo_title_element": {"events": {"double_click": {}}},
+                            "todo_checkbox": {"events": {"click": {}}}
+                        },
+                        "title": "Finish TodoMVC renderer",
+                        "edit_text": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "editing": false,
+                        "not_editing": true,
+                        "not_completed": false
+                    }
+                ],
+                "active_count": 1,
+                "completed_count": 1,
+                "has_todos": true,
+                "has_completed": true,
+                "all_completed": false,
+                "new_todo_focused": true
+            }
+        });
+        let (_, document_layout) = native_document_layout_proof_with_state_embedded(
+            &document_source_path,
+            &document_source,
+            Some(&document_state),
+        )
+        .expect("document TodoMVC layout should lower");
+
+        let physical_source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let physical_source = std::fs::read_to_string(&physical_source_path)
+            .expect("physical TodoMVC source should exist");
+        let mut physical_state = json!({
+            "store": {
+                "elements": {
+                    "new_todo_title_text_input": {"event": {"change": {}, "key_down": {}}},
+                    "toggle_all_checkbox": {"event": {"click": {}}},
+                    "remove_completed_button": {"event": {"press": {}}},
+                    "filter_buttons": {
+                        "all": {"event": {"press": {}}},
+                        "active": {"event": {"press": {}}},
+                        "completed": {"event": {"press": {}}}
+                    },
+                    "theme_switcher": {
+                        "classic": {"event": {"press": {}}},
+                        "professional": {"event": {"press": {}}},
+                        "glassmorphism": {"event": {"press": {}}},
+                        "neobrutalism": {"event": {"press": {}}},
+                        "neumorphism": {"event": {"press": {}}},
+                        "mode_toggle": {"event": {"press": {}}}
+                    }
+                },
+                "title_to_save": "",
+                "selected_filter": "All",
+                "selected_todo_id": "",
+                "todos": [
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-1.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-1.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-1.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-1.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-1",
+                        "title": "Read documentation",
+                        "completed": false,
+                        "edited_title": ""
+                    },
+                    {
+                        "todo_elements": {
+                            "remove_todo_button": "todo-2.todo_elements.remove_todo_button",
+                            "editing_todo_title_element": "todo-2.todo_elements.editing_todo_title_element",
+                            "todo_title_element": "todo-2.todo_elements.todo_title_element",
+                            "todo_checkbox": "todo-2.todo_elements.todo_checkbox"
+                        },
+                        "id": "todo-2",
+                        "title": "Finish TodoMVC renderer",
+                        "completed": true,
+                        "edited_title": ""
+                    }
+                ]
+            },
+            "theme_options": {
+                "name": "Classic",
+                "mode": "Light"
+            }
+        });
+        mirror_physical_todomvc_seed_root_fields(&mut physical_state);
+        let (_, physical_layout) = native_document_layout_proof_with_state_embedded(
+            &physical_source_path,
+            &physical_source,
+            Some(&physical_state),
+        )
+        .expect("physical TodoMVC Classic layout should lower");
+
+        let classic_theme =
+            std::fs::read_to_string(repo_path("examples/todo_mvc_physical/Theme/Classic.bn"))
+                .expect("Classic theme source should exist");
+        assert!(
+            classic_theme.contains("shadows: LIST"),
+            "Classic physical theme should use public scene shadow lists"
+        );
+        assert!(
+            !classic_theme.contains("box_shadow_"),
+            "Classic physical theme source should not use renderer-specific shadow keys"
+        );
+
+        let document_text = |label: &str| {
+            document_layout
+                .display_list
+                .iter()
+                .find(|item| item.text.as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("document TodoMVC should render text `{label}`"))
+        };
+        let physical_text = |label: &str| {
+            physical_layout
+                .display_list
+                .iter()
+                .find(|item| item.text.as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("physical TodoMVC should render text `{label}`"))
+        };
+        let assert_close = |label: &str, left: f32, right: f32, tolerance: f32| {
+            assert!(
+                (left - right).abs() <= tolerance,
+                "{label} should stay within tolerance: left={left}, right={right}, tolerance={tolerance}"
+            );
+        };
+
+        let document_title = document_text("todos");
+        let physical_title = physical_text("todos");
+        assert_eq!(
+            physical_title.style.get("color"),
+            document_title.style.get("color"),
+            "Classic physical title should use the document TodoMVC red"
+        );
+        assert_eq!(
+            physical_title.style.get("size"),
+            document_title.style.get("size"),
+            "Classic physical title should keep the document TodoMVC title size"
+        );
+
+        let document_panel = document_layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.style.get("box_shadow_1_color").is_some()
+                    && item.style.get("box_shadow_2_color").is_some()
+                    && item.bounds.width >= 540.0
+            })
+            .expect("document TodoMVC panel should expose shadowed panel bounds");
+        let document_input = document_layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && item.bounds.width >= 480.0
+                    && item.bounds.y >= 150.0
+                    && item.bounds.y <= 152.0
+            })
+            .expect("document TodoMVC new input should render");
+        let physical_input = physical_layout
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .expect("physical TodoMVC new input should render");
+        let physical_toggle_all = physical_layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                    && (item.bounds.width - 54.0).abs() <= 1.0
+                    && item.bounds.y <= physical_input.bounds.y + 0.5
+                    && item.bounds.y + item.bounds.height
+                        >= physical_input.bounds.y + physical_input.bounds.height - 0.5
+            })
+            .expect("physical TodoMVC toggle-all control should render");
+        let physical_panel_left = physical_toggle_all.bounds.x;
+        let physical_panel_right = physical_input.bounds.x + physical_input.bounds.width;
+        assert_close(
+            "classic panel left",
+            physical_panel_left,
+            document_panel.bounds.x,
+            1.5,
+        );
+        assert_close(
+            "classic panel right",
+            physical_panel_right,
+            document_panel.bounds.x + document_panel.bounds.width,
+            1.5,
+        );
+        assert_close(
+            "new-todo input x",
+            physical_input.bounds.x,
+            document_input.bounds.x,
+            1.5,
+        );
+        assert_close(
+            "new-todo input y",
+            physical_input.bounds.y,
+            document_input.bounds.y,
+            1.5,
+        );
+        assert_close(
+            "new-todo input height",
+            physical_toggle_all.bounds.height,
+            document_input.bounds.height,
+            1.0,
+        );
+
+        let document_active_title = document_text("Read documentation");
+        let physical_active_title = physical_text("Read documentation");
+        let document_title_left = document_active_title.bounds.x
+            + style_number_from_map(&document_active_title.style, "text_inset").unwrap_or(0.0);
+        let physical_title_left = physical_active_title.bounds.x
+            + style_number_from_map(&physical_active_title.style, "text_inset").unwrap_or(0.0);
+        let document_input_text_left = document_input.bounds.x
+            + style_number_from_map(&document_input.style, "text_inset").unwrap_or(0.0);
+        let physical_input_text_left = physical_input.bounds.x
+            + style_number_from_map(&physical_input.style, "text_inset").unwrap_or(0.0);
+        assert_close(
+            "new-todo placeholder text left",
+            physical_input_text_left,
+            document_input_text_left,
+            1.5,
+        );
+        assert_close(
+            "todo title text left",
+            physical_title_left,
+            document_title_left,
+            1.5,
+        );
+        assert_eq!(
+            physical_active_title.style.get("color"),
+            document_active_title.style.get("color"),
+            "Classic physical active todo text should match the document color"
+        );
+        assert_eq!(
+            physical_text("Finish TodoMVC renderer")
+                .style
+                .get("strikethrough"),
+            document_text("Finish TodoMVC renderer")
+                .style
+                .get("strikethrough"),
+            "Classic physical completed todos should keep the reference strikethrough"
+        );
+
+        let document_footer_active = document_text("1 item left");
+        let physical_footer_active = physical_text("1 item left");
+        assert_close(
+            "footer active-count x",
+            physical_footer_active.bounds.x,
+            document_footer_active.bounds.x,
+            1.5,
+        );
+        assert_close(
+            "footer active-count baseline",
+            physical_footer_active.bounds.y,
+            document_footer_active.bounds.y,
+            1.5,
+        );
+        for (label, expected_width) in [
+            ("All", 32.0),
+            ("Active", 56.0),
+            ("Completed", 88.0),
+            ("Clear completed", 110.0),
+        ] {
+            let document_item = document_text(label);
+            let physical_item = physical_text(label);
+            assert_close(
+                &format!("footer `{label}` x"),
+                physical_item.bounds.x,
+                document_item.bounds.x,
+                2.0,
+            );
+            assert_close(
+                &format!("footer `{label}` y"),
+                physical_item.bounds.y,
+                document_item.bounds.y,
+                2.0,
+            );
+            assert_close(
+                &format!("footer `{label}` width"),
+                physical_item.bounds.width,
+                expected_width,
+                1.0,
             );
         }
     }
@@ -25141,7 +25890,13 @@ mod tests {
             "second footer helper link should render inline after text"
         );
 
-        for label in ["Professional", "Glass", "Brutalist", "Neumorphic"] {
+        for label in [
+            "Classic",
+            "Professional",
+            "Glass",
+            "Brutalist",
+            "Neumorphic",
+        ] {
             let text = text_item(label);
             let button = layout
                 .display_list
@@ -25170,6 +25925,385 @@ mod tests {
                 "theme button `{label}` should reserve horizontal padding around its label"
             );
         }
+    }
+
+    #[test]
+    fn physical_todomvc_declarative_focus_blinks_new_todo_caret() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let live_runtime = Arc::new(Mutex::new(
+            live_runtime_from_source_text("physical-todomvc-caret", &source_path, &source)
+                .expect("physical TodoMVC runtime should initialize"),
+        ));
+        let state = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("physical TodoMVC layout should lower");
+        let input_node = layout_frame
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    && item.style.get("focus") == Some(&boon_document_model::StyleValue::Bool(true))
+            })
+            .map(|item| item.node.0.clone())
+            .expect("physical new-todo input should declare focus");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let input_state = PreviewNativeInputState::default();
+
+        assert!(
+            preview_apply_focus_overlay(&shared_render_state, &input_state, true).unwrap(),
+            "declarative focus should install a caret overlay"
+        );
+        let visible_frame = latest_preview_frame(&shared_render_state);
+        let visible_input = visible_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == input_node)
+            .expect("focused physical input should remain in the frame");
+        assert!(visible_input.focused);
+        assert_eq!(
+            visible_input.style.get("caret_visible"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        assert_eq!(
+            frame_caret_column_for_node(&visible_frame, &input_node),
+            Some(0.0)
+        );
+
+        assert!(
+            preview_apply_focus_overlay(&shared_render_state, &input_state, false).unwrap(),
+            "caret blink should update declaratively focused inputs even without preview text focus"
+        );
+        let hidden_frame = latest_preview_frame(&shared_render_state);
+        let hidden_input = hidden_frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == input_node)
+            .expect("focused physical input should remain in the hidden-caret frame");
+        assert!(hidden_input.focused);
+        assert_eq!(
+            hidden_input.style.get("caret_visible"),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+    }
+
+    fn assert_physical_todomvc_preview_healthy(
+        shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+        context: &str,
+    ) {
+        let shared = shared_render_state
+            .lock()
+            .expect("physical TodoMVC render state should lock");
+        assert_eq!(
+            shared.last_error, None,
+            "{context} should not leave a preview render error"
+        );
+        assert_eq!(
+            shared.last_error_count, 0,
+            "{context} should not increment preview render errors"
+        );
+        let frame = shared
+            .layout_frame_override
+            .as_ref()
+            .expect("physical TodoMVC should keep a visible layout frame");
+        assert!(
+            frame
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("todos")),
+            "{context} should keep the TodoMVC header visible"
+        );
+        assert!(
+            frame
+                .display_list
+                .iter()
+                .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)),
+            "{context} should keep the new todo text input visible"
+        );
+    }
+
+    fn mirror_physical_todomvc_seed_root_fields(state: &mut serde_json::Value) {
+        for field in [
+            "todos",
+            "selected_filter",
+            "selected_todo_id",
+            "title_to_save",
+        ] {
+            if state.get(field).is_some() {
+                continue;
+            }
+            if let Some(value) = state
+                .get("store")
+                .and_then(|store| store.get(field))
+                .cloned()
+            {
+                state[field] = value;
+            }
+        }
+    }
+
+    #[test]
+    fn physical_todomvc_add_todo_accepts_keyboard_submit() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let live_runtime = Arc::new(Mutex::new(
+            live_runtime_from_source_text("physical-todomvc-add-todo", &source_path, &source)
+                .expect("physical TodoMVC runtime should initialize"),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        let (layout_proof, layout_frame) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&state_summary),
+        )
+        .expect("physical TodoMVC layout should lower");
+        let (input_x, input_y, input_node) =
+            source_hit_center(&layout_proof, "store.elements.new_todo_title_text_input")
+                .expect("new todo input should have a hit region");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(0, input_x, input_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the new todo input should focus it");
+        assert_eq!(
+            input_state.focused_node.as_deref(),
+            Some(input_node.as_str())
+        );
+
+        let typed = test_keyboard_input(
+            "ship physical"
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    test_key_press(index.saturating_add(1) as u64, &character.to_string())
+                })
+                .collect(),
+            Vec::new(),
+        );
+        preview_apply_real_window_input(
+            &typed,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("typing a todo title should dispatch change events");
+        assert_eq!(input_state.focused_text, "ship physical");
+
+        let enter = test_keyboard_input(vec![test_key_press(30, "Return")], Vec::new());
+        preview_apply_real_window_input(
+            &enter,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("pressing Enter should submit the new todo");
+
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        let todos = summary["todos"]
+            .as_array()
+            .expect("physical TodoMVC state should expose todos");
+        let added_todo = todos
+            .iter()
+            .find(|todo| todo["title"].as_str() == Some("ship physical"))
+            .unwrap_or_else(|| {
+                panic!("submitted todo should be present in runtime state: {todos:?}")
+            });
+        assert_eq!(
+            added_todo["completed"], false,
+            "new physical todos should be active by default"
+        );
+        assert_eq!(
+            input_state.focused_text, "",
+            "new todo input should clear after a successful submit"
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert!(
+            frame
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("ship physical")),
+            "submitted todo title should be visible in the preview frame"
+        );
+        assert_physical_todomvc_preview_healthy(&shared_render_state, "after add todo submit");
+
+        let checkbox_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (checkbox_x, checkbox_y, _) = source_hit_center_for_target(
+            &checkbox_layout,
+            "todo.todo_elements.todo_checkbox",
+            Some("ship physical"),
+        )
+        .expect("newly appended todo should expose a checkbox hit region");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, checkbox_x, checkbox_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking the appended todo checkbox should dispatch a source event");
+        let toggled_summary = live_runtime.lock().unwrap().document_state_summary();
+        let toggled_todos = toggled_summary["todos"]
+            .as_array()
+            .expect("physical TodoMVC state should expose todos after toggle");
+        let toggled_todo = toggled_todos
+            .iter()
+            .find(|todo| todo["title"].as_str() == Some("ship physical"))
+            .expect("submitted todo should remain present after checkbox toggle");
+        assert_eq!(
+            toggled_todo["completed"], true,
+            "newly appended todo should remain toggleable"
+        );
+        assert_physical_todomvc_preview_healthy(&shared_render_state, "after toggling added todo");
+    }
+
+    #[test]
+    fn physical_todomvc_theme_and_mode_clicks_restyle_preview() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let live_runtime = Arc::new(Mutex::new(
+            live_runtime_from_source_text("physical-todomvc-theme-clicks", &source_path, &source)
+                .expect("physical TodoMVC runtime should initialize"),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(state_summary["theme_options"]["mode"], "Light");
+        let (layout_proof, layout_frame) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&state_summary),
+        )
+        .expect("physical TodoMVC layout should lower");
+        let initial_root_color = frame_root_material_color(&layout_frame)
+            .expect("initial physical frame should expose a root material color");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        let themes = [
+            ("Classic", "classic"),
+            ("Professional", "professional"),
+            ("Glassmorphism", "glassmorphism"),
+            ("Neobrutalism", "neobrutalism"),
+            ("Neumorphism", "neumorphism"),
+        ];
+        let mut previous_root_color = initial_root_color;
+        for (index, (expected_name, source_suffix)) in themes.iter().enumerate() {
+            let layout = shared_render_state.lock().unwrap().layout_proof.clone();
+            let source_event = format!("store.elements.theme_switcher.{source_suffix}");
+            let (x, y, _) = source_hit_center(&layout, &source_event).unwrap_or_else(|_| {
+                panic!("{expected_name} theme button should have a hit region")
+            });
+            preview_apply_real_window_input(
+                &deterministic_click_input_from_index(index as u64, x, y),
+                &source_path,
+                &source,
+                Some(&live_runtime),
+                &shared_render_state,
+                &mut input_state,
+            )
+            .unwrap_or_else(|_| panic!("clicking {expected_name} should dispatch a source event"));
+            let summary = live_runtime.lock().unwrap().document_state_summary();
+            assert_eq!(summary["theme_options"]["name"], *expected_name);
+            assert_eq!(summary["theme_options"]["mode"], "Light");
+            assert_physical_todomvc_preview_healthy(
+                &shared_render_state,
+                &format!("after clicking {expected_name} theme"),
+            );
+            let frame = latest_preview_frame(&shared_render_state);
+            let root_color = frame_root_material_color(&frame).unwrap_or_else(|| {
+                panic!("{expected_name} frame should expose a root material color")
+            });
+            if *expected_name != "Classic" {
+                assert_ne!(
+                    root_color, previous_root_color,
+                    "changing to {expected_name} should re-lower visible material colors"
+                );
+            }
+            if *expected_name == "Glassmorphism" {
+                assert!(
+                    root_color.contains("hue:250"),
+                    "Glassmorphism should visibly switch to the glass palette, got {root_color}"
+                );
+            }
+            previous_root_color = root_color;
+        }
+
+        let light_before_mode_root_color = previous_root_color;
+        let mode_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (mode_x, mode_y, _) =
+            source_hit_center(&mode_layout, "store.elements.theme_switcher.mode_toggle")
+                .expect("mode toggle should have a hit region");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(themes.len() as u64, mode_x, mode_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking mode toggle should dispatch a source event");
+        let dark_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(dark_summary["theme_options"]["name"], "Neumorphism");
+        assert_eq!(dark_summary["theme_options"]["mode"], "Dark");
+        let dark_frame = latest_preview_frame(&shared_render_state);
+        let dark_root_color = frame_root_material_color(&dark_frame)
+            .expect("dark physical frame should expose a root material color");
+        assert_ne!(
+            dark_root_color, light_before_mode_root_color,
+            "changing light/dark mode should re-lower visible material colors"
+        );
+        assert!(
+            dark_frame
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Light mode")),
+            "mode toggle label should update after switching to dark mode"
+        );
+        assert_physical_todomvc_preview_healthy(&shared_render_state, "after toggling dark mode");
     }
 
     fn test_type_scalar(label: &str) -> TypeDisplayNode {
@@ -29807,7 +30941,50 @@ mod tests {
         );
 
         preview_apply_real_window_input(
-            &test_keyboard_input(vec![test_key_press(3, "Z")], Vec::new()),
+            &test_keyboard_input(vec![test_key_press(5, "Digit4")], vec!["Num4"]),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let after_digit = live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+            .as_str()
+            .expect("new todo text should be a string")
+            .to_owned();
+        assert!(
+            after_digit.ends_with('4'),
+            "preview input should accept browser-style digit key events"
+        );
+        input_state.held_repeat_next_at =
+            Instant::now().checked_sub(Duration::from_millis(BOON_EDITOR_KEY_REPEAT_INTERVAL_MS));
+        let held_digit_input = test_keyboard_input(Vec::new(), vec!["Num4"]);
+        assert!(
+            preview_input_has_unhandled_source_events(&held_digit_input, &input_state),
+            "preview render loop should wake for held digits even when key names are normalized differently"
+        );
+        preview_apply_real_window_input(
+            &held_digit_input,
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let after_held_digit =
+            live_runtime.lock().unwrap().document_state_summary()["new_todo_text"]
+                .as_str()
+                .expect("new todo text should be a string")
+                .to_owned();
+        assert!(
+            after_held_digit.len() > after_digit.len() && after_held_digit.ends_with("44"),
+            "holding a number key should repeat even when event and pressed-key names differ"
+        );
+
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(6, "Z")], Vec::new()),
             &source_path,
             &source,
             Some(&live_runtime),
@@ -29826,7 +31003,7 @@ mod tests {
         );
 
         preview_apply_real_window_input(
-            &test_keyboard_input(vec![test_key_press(4, "Return")], vec!["Return"]),
+            &test_keyboard_input(vec![test_key_press(7, "Return")], vec!["Return"]),
             &source_path,
             &source,
             Some(&live_runtime),
@@ -31606,6 +32783,24 @@ mod tests {
             .as_ref()
             .expect("preview should have a visible frame override")
             .clone()
+    }
+
+    fn frame_root_material_color(frame: &boon_document::LayoutFrame) -> Option<String> {
+        frame
+            .display_list
+            .iter()
+            .filter(|item| {
+                item.bounds.x.abs() <= f32::EPSILON && item.bounds.y.abs() <= f32::EPSILON
+            })
+            .max_by(|left, right| {
+                let left_area = left.bounds.width * left.bounds.height;
+                let right_area = right.bounds.width * right.bounds.height;
+                left_area
+                    .partial_cmp(&right_area)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|item| style_text_from_map(&item.style, "material_color"))
+            .map(str::to_owned)
     }
 
     fn cells_live_runtime(

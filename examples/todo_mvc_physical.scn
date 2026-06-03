@@ -3,18 +3,20 @@ source = "examples/todo_mvc_physical/RUN.bn"
 
 [[step]]
 id = "initial"
-expect_root_text = { "theme_options.name" = "Professional" }
+expect_root_text = { "theme_options.name" = "Classic" }
 
 [[step]]
 id = "add-todo"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "Ship physical TodoMVC" }
 expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "Ship physical TodoMVC" }
-expect_root_text = { "theme_options.name" = "Professional" }
+expect_root_text = { "theme_options.name" = "Classic" }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "reject-empty-todo"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "   " }
 expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "   " }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "toggle-one-todo"
@@ -74,7 +76,7 @@ expected_source_event = { source = "todo.todo_elements.editing_todo_title_elemen
 id = "edit-todo-commit"
 user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Enter" }
 expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Enter" }
-expect_titles = ["Ship physical TodoMVC edited"]
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC edited"]
 
 [[step]]
 id = "toggle-edited-todo-completed"
@@ -85,6 +87,12 @@ expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_te
 id = "clear-completed"
 user_action = { kind = "click", target = "clear completed" }
 expected_source_event = { source = "store.elements.remove_completed_button" }
+
+[[step]]
+id = "switch-theme-classic"
+user_action = { kind = "click", target = "theme classic" }
+expected_source_event = { source = "store.elements.theme_switcher.classic" }
+expect_root_text = { "theme_options.name" = "Classic" }
 
 [[step]]
 id = "switch-theme-professional"

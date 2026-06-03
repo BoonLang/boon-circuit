@@ -7728,6 +7728,47 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         ),
         Some("native preview lacks generic document layout/hit proof".to_owned()),
     );
+    let physical_todomvc_content_evidence = if example == "todo_mvc_physical" {
+        physical_todomvc_preview_content_evidence(&extra)
+    } else {
+        json!({"status": "not-applicable"})
+    };
+    let physical_todomvc_content_pass = example != "todo_mvc_physical"
+        || physical_todomvc_content_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let physical_todomvc_content_detail = format!(
+        "status={:?}, missing_initial={}, clear_completed_count={:?}, added_visual={:?}, theme_sources={}",
+        physical_todomvc_content_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+        physical_todomvc_content_evidence
+            .get("missing_initial_labels")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        physical_todomvc_content_evidence
+            .get("clear_completed_count")
+            .and_then(serde_json::Value::as_u64),
+        physical_todomvc_content_evidence
+            .get("added_todo_visual_pass")
+            .and_then(serde_json::Value::as_bool),
+        physical_todomvc_content_evidence
+            .get("theme_runtime_sources")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    );
+    extra["physical_todomvc_preview_content_evidence"] = physical_todomvc_content_evidence;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-preview-e2e-{example}:physical-todomvc-content"),
+        physical_todomvc_content_pass,
+        physical_todomvc_content_detail,
+        (!physical_todomvc_content_pass).then(|| {
+            "physical TodoMVC preview E2E did not prove initial rows, add-todo visual output, single clear-completed control, and theme runtime actions".to_owned()
+        }),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -9200,6 +9241,227 @@ fn todomvc_layout_reference_evidence(layout_artifact: &serde_json::Value) -> ser
         "surface_reference_sized": surface_reference_sized,
         "input_reference_sized": input_reference_sized
     })
+}
+
+fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serde_json::Value {
+    let initial_layout_path = report
+        .pointer("/preview_document_layout_proof/artifact_path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let initial_layout = initial_layout_path
+        .as_deref()
+        .and_then(|path| read_json(Path::new(path)).ok());
+    let initial_texts = initial_layout
+        .as_ref()
+        .map(layout_display_texts)
+        .unwrap_or_default();
+    let required_initial_labels = [
+        "todos",
+        "Read documentation",
+        "Finish TodoMVC renderer",
+        "Walk the dog",
+        "Buy groceries",
+        "3 items left",
+        "All",
+        "Active",
+        "Completed",
+        "Clear completed",
+        "Classic",
+        "Professional",
+        "Glass",
+        "Brutalist",
+        "Neumorphic",
+    ];
+    let missing_initial_labels = required_initial_labels
+        .iter()
+        .filter(|label| !initial_texts.iter().any(|text| text == **label))
+        .map(|label| json!(label))
+        .collect::<Vec<_>>();
+    let clear_completed_count = initial_texts
+        .iter()
+        .filter(|text| text.as_str() == "Clear completed")
+        .count();
+
+    let post_input_layout_paths = report
+        .pointer("/boon_driver_proof/action_proofs")
+        .and_then(serde_json::Value::as_array)
+        .map(|actions| {
+            actions
+                .iter()
+                .filter_map(|action| {
+                    action
+                        .pointer("/framebuffer_delta_evidence/post_input_layout_artifact")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut added_todo_layout_path = None;
+    for path in &post_input_layout_paths {
+        if let Ok(artifact) = read_json(Path::new(path)) {
+            let texts = layout_display_texts(&artifact);
+            if texts.iter().any(|text| text == "Ship physical TodoMVC")
+                || texts
+                    .iter()
+                    .any(|text| text == "Ship physical TodoMVC edited")
+            {
+                added_todo_layout_path = Some(path.clone());
+                break;
+            }
+        }
+    }
+
+    let runtime_assertions = report
+        .pointer("/native_runtime_assertion_evidence/assertions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let add_runtime_pass = runtime_assertions.iter().any(|assertion| {
+        assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+            && assertion
+                .pointer("/event/source")
+                .and_then(serde_json::Value::as_str)
+                == Some("store.elements.new_todo_title_text_input")
+            && assertion
+                .pointer("/event/key")
+                .and_then(serde_json::Value::as_str)
+                == Some("Enter")
+            && assertion
+                .pointer("/event/text")
+                .and_then(serde_json::Value::as_str)
+                == Some("Ship physical TodoMVC")
+            && runtime_assertion_todos_len(assertion).unwrap_or_default() >= 5
+            && runtime_assertion_last_todo_title(assertion)
+                .as_deref()
+                .is_some_and(|title| title == "Ship physical TodoMVC")
+    });
+    let required_theme_sources = [
+        ("store.elements.theme_switcher.classic", "Classic", "Light"),
+        (
+            "store.elements.theme_switcher.professional",
+            "Professional",
+            "Light",
+        ),
+        (
+            "store.elements.theme_switcher.glassmorphism",
+            "Glassmorphism",
+            "Light",
+        ),
+        (
+            "store.elements.theme_switcher.neobrutalism",
+            "Neobrutalism",
+            "Light",
+        ),
+        (
+            "store.elements.theme_switcher.neumorphism",
+            "Neumorphism",
+            "Light",
+        ),
+        (
+            "store.elements.theme_switcher.mode_toggle",
+            "Neumorphism",
+            "Dark",
+        ),
+    ];
+    let mut theme_runtime_sources = Vec::new();
+    let mut missing_theme_sources = Vec::new();
+    for (source, expected_name, expected_mode) in required_theme_sources {
+        let matched = runtime_assertions.iter().any(|assertion| {
+            assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                && assertion
+                    .pointer("/event/source")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source)
+                && runtime_assertion_scalar(assertion, "name").as_deref() == Some(expected_name)
+                && runtime_assertion_scalar(assertion, "mode").as_deref() == Some(expected_mode)
+        });
+        if matched {
+            theme_runtime_sources.push(json!(source));
+        } else {
+            missing_theme_sources.push(json!(source));
+        }
+    }
+
+    let pass = initial_layout.is_some()
+        && missing_initial_labels.is_empty()
+        && clear_completed_count == 1
+        && added_todo_layout_path.is_some()
+        && add_runtime_pass
+        && missing_theme_sources.is_empty();
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "initial_layout_artifact": initial_layout_path,
+        "initial_text_samples": initial_texts
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .take(48)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "missing_initial_labels": missing_initial_labels,
+        "clear_completed_count": clear_completed_count,
+        "post_input_layout_artifact_count": post_input_layout_paths.len(),
+        "added_todo_visual_pass": added_todo_layout_path.is_some(),
+        "added_todo_layout_artifact": added_todo_layout_path,
+        "add_runtime_pass": add_runtime_pass,
+        "theme_runtime_sources": theme_runtime_sources,
+        "missing_theme_sources": missing_theme_sources
+    })
+}
+
+fn layout_display_texts(layout_artifact: &serde_json::Value) -> Vec<String> {
+    layout_artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn runtime_assertion_scalar(assertion: &serde_json::Value, key: &str) -> Option<String> {
+    assertion
+        .pointer("/bounded_state_summary_sample/scalars")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|scalar| scalar.get("key").and_then(serde_json::Value::as_str) == Some(key))
+        .and_then(|scalar| scalar.get("value"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+                .or_else(|| value.as_bool().map(|boolean| boolean.to_string()))
+        })
+}
+
+fn runtime_assertion_todos_len(assertion: &serde_json::Value) -> Option<u64> {
+    runtime_assertion_array(assertion, "todos")
+        .and_then(|array| array.get("len"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn runtime_assertion_last_todo_title(assertion: &serde_json::Value) -> Option<String> {
+    runtime_assertion_array(assertion, "todos")
+        .and_then(|array| array.pointer("/last/title"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn runtime_assertion_array<'a>(
+    assertion: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    assertion
+        .pointer("/bounded_state_summary_sample/arrays")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|array| array.get("key").and_then(serde_json::Value::as_str) == Some(key))
 }
 
 fn todomvc_pixel_reference_evidence(
@@ -18598,6 +18860,7 @@ fn require_physical_todomvc_project_evidence(
         "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
         "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
         "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+        "examples/todo_mvc_physical/Theme/Classic.bn",
         "examples/todo_mvc_physical/Theme/Theme.bn",
         "examples/todo_mvc_physical/Generated/Assets.bn",
         "examples/todo_mvc_physical/RUN.bn",

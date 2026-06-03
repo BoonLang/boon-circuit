@@ -35,7 +35,13 @@ FUNCTION sizing(of) {
 }
 
 FUNCTION spacing(of) {
-    get(from: Spacing, of: of)
+    of |> WHEN {
+        TitlePanelGap => PASSED.theme_options.name |> WHEN {
+            Classic => Classic/spacing(of: TitlePanelGap, PASS: PASSED.theme_options)
+            __ => 0
+        }
+        __ => get(from: Spacing, of: of)
+    }
 }
 
 FUNCTION spring_range(of) {
@@ -44,6 +50,7 @@ FUNCTION spring_range(of) {
 
 FUNCTION get(from, of) {
     PASSED.theme_options.name |> WHEN {
+        Classic => Classic/get(from: from, of: of, PASS: PASSED.theme_options)
         Professional => Professional/get(from: from, of: of, PASS: PASSED.theme_options)
         Glassmorphism => Glassmorphism/get(from: from, of: of, PASS: PASSED.theme_options)
         Neobrutalism => Neobrutalism/get(from: from, of: of, PASS: PASSED.theme_options)

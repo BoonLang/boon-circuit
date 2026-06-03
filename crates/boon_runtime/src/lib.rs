@@ -2104,12 +2104,22 @@ impl CompiledProgram {
         let derived_text_transform_count = derived_equations.text_transforms.len();
         let list_equations = ListEquationPlan::from_ir(ir);
         let list_projections = ListProjectionPlan::from_ir(ir);
-        let root_state_paths = ir
+        let mut root_state_paths = ir
             .state_cells
             .iter()
             .filter(|cell| !cell.indexed)
             .map(|cell| cell.path.clone())
             .collect::<Vec<_>>();
+        root_state_paths.extend(
+            ir.derived_values
+                .iter()
+                .filter(|value| {
+                    !value.indexed && value.kind == DerivedValueKind::SourceEventTransform
+                })
+                .map(|value| value.path.clone()),
+        );
+        root_state_paths.sort();
+        root_state_paths.dedup();
         let list_summary_fields = list_summary_fields_from_ir(ir);
         let root_targets = ir
             .state_cells
@@ -3875,6 +3885,10 @@ impl ListMemory {
         }
     }
 
+    fn owned_value(&self, index: usize, field: &str) -> Option<FieldValue> {
+        self.value(index, field).map(|value| value.owned_value())
+    }
+
     fn textlike(&self, index: usize, field: &str) -> Option<&str> {
         let slot = self.visible_slot(index)?;
         let field_id = FieldSlotId::from_path(field);
@@ -3935,7 +3949,7 @@ impl ListMemory {
             current.push_str(value);
             Ok(())
         } else if bool_column_index(&self.bool_columns, &field_id).is_some() {
-            Err("cannot write text into bool runtime value".into())
+            Err(format!("cannot write text into bool runtime value `{field}`").into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
         }
@@ -3952,7 +3966,7 @@ impl ListMemory {
             return self.set_textlike(index, field, value);
         }
         if bool_column_index(&self.bool_columns, &field_id).is_some() {
-            return Err("cannot write text into bool runtime value".into());
+            return Err(format!("cannot write text into bool runtime value `{field}`").into());
         }
         let column = self.insert_text_column(field_id, false);
         self.text_columns[column].values[slot].push_str(value);
@@ -3973,6 +3987,15 @@ impl ListMemory {
             Err("cannot write bool into text runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn set_value(&mut self, index: usize, field: &str, value: FieldValue) -> RuntimeResult<()> {
+        match value {
+            FieldValue::Text(value) | FieldValue::Enum(value) => {
+                self.set_textlike(index, field, &value)
+            }
+            FieldValue::Bool(value) => self.set_bool(index, field, value),
         }
     }
 
@@ -4522,6 +4545,7 @@ struct RuntimeRowSnapshotFieldTemplate {
     field_name: Box<str>,
     field_id: FieldSlotId,
     initial_value: InitialValue,
+    missing_row_initial_value: Option<FieldValue>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4746,17 +4770,24 @@ impl GenericScheduledRuntime {
             };
             let len = self.storage.list_len(&row_scope.list)?;
             for index in 0..len {
-                let value = self
+                if let Some(value) = self
                     .storage
-                    .list_row_textlike_opt(&row_scope.list, index, path)
-                    .unwrap_or_default()
-                    .to_owned();
-                self.storage.set_or_insert_list_row_textlike(
-                    &row_scope.list,
-                    index,
-                    target_field,
-                    &value,
-                )?;
+                    .list_row_value_opt(&row_scope.list, index, path)
+                {
+                    self.storage
+                        .set_list_row_value(&row_scope.list, index, target_field, value)?;
+                    continue;
+                }
+                let value =
+                    match self
+                        .storage
+                        .list_row_value_opt(&row_scope.list, index, target_field)
+                    {
+                        Some(_) => continue,
+                        None => FieldValue::Text(String::new()),
+                    };
+                self.storage
+                    .set_list_row_value(&row_scope.list, index, target_field, value)?;
             }
         }
         Ok(())
@@ -7937,7 +7968,8 @@ impl GenericCircuitRuntime {
                 .iter()
                 .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
                 .collect::<Vec<_>>();
-            let row_template = RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells)?;
+            let row_template =
+                RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;
             let rows = match &list.initializer {
                 ListInitializer::RecordLiteral { rows } => rows
                     .iter()
@@ -8322,6 +8354,10 @@ impl GenericCircuitRuntime {
         self.lists.memory(list)?.textlike(index, field)
     }
 
+    fn list_row_value_opt(&self, list: &str, index: usize, field: &str) -> Option<FieldValue> {
+        self.lists.memory(list)?.owned_value(index, field)
+    }
+
     fn list_row_bool(&self, list: &str, index: usize, field: &str) -> RuntimeResult<bool> {
         self.list_row_field(list, index, field)?
             .as_bool()
@@ -8385,6 +8421,19 @@ impl GenericCircuitRuntime {
             .memory_mut(list)
             .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
             .set_bool(index, field, value)
+    }
+
+    fn set_list_row_value(
+        &mut self,
+        list: &str,
+        index: usize,
+        field: &str,
+        value: FieldValue,
+    ) -> RuntimeResult<()> {
+        self.lists
+            .memory_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .set_value(index, field, value)
     }
 
     fn commit_indexed_text_field(
@@ -9282,6 +9331,14 @@ impl GenericCircuitRuntime {
 }
 
 impl FieldValueRef<'_> {
+    fn owned_value(&self) -> FieldValue {
+        match self {
+            Self::Text(value) => FieldValue::Text((*value).to_owned()),
+            Self::Bool(value) => FieldValue::Bool(*value),
+            Self::Enum(value) => FieldValue::Enum((*value).to_owned()),
+        }
+    }
+
     fn as_json(&self) -> JsonValue {
         match self {
             Self::Text(value) | Self::Enum(value) => json!(value),
@@ -9595,7 +9652,7 @@ impl ValueColumns {
             current.push_str(value);
             Ok(())
         } else if self.bool_index(field).is_some() {
-            Err("cannot write text into bool runtime value".into())
+            Err(format!("cannot write text into bool runtime value `{field}`").into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
         }
@@ -9620,6 +9677,13 @@ impl ValueColumns {
             Err("cannot write bool into text runtime value".into())
         } else {
             Err(format!("generic row missing field `{field}`").into())
+        }
+    }
+
+    fn set_value(&mut self, field: &str, value: FieldValue) -> RuntimeResult<()> {
+        match value {
+            FieldValue::Text(value) | FieldValue::Enum(value) => self.set_textlike(field, &value),
+            FieldValue::Bool(value) => self.set_bool(field, value),
         }
     }
 
@@ -9701,7 +9765,11 @@ fn list_initial_fields(row: &boon_ir::ListInitialRecord) -> RuntimeResult<ValueC
 }
 
 impl RuntimeRowSnapshotTemplate {
-    fn from_cells(row_scope: &str, indexed_cells: &[&boon_ir::StateCell]) -> RuntimeResult<Self> {
+    fn from_cells(
+        row_scope: &str,
+        indexed_cells: &[&boon_ir::StateCell],
+        ir: &TypedProgram,
+    ) -> RuntimeResult<Self> {
         let mut fields = Vec::with_capacity(indexed_cells.len());
         for cell in indexed_cells {
             let field = cell
@@ -9718,6 +9786,7 @@ impl RuntimeRowSnapshotTemplate {
                 field_id: FieldSlotId::from_path(&field),
                 field_name: field.into_boxed_str(),
                 initial_value: cell.initial_value.clone(),
+                missing_row_initial_value: missing_row_initial_value(cell, ir),
             });
         }
         Ok(Self { fields })
@@ -9728,7 +9797,8 @@ impl RuntimeRowSnapshotTemplate {
             if initial_fields.contains_key_id(field.field_id.clone()) {
                 continue;
             }
-            let value = runtime_value_from_initial(&field.initial_value, &initial_fields)?;
+            let value = runtime_value_from_initial(&field.initial_value, &initial_fields)
+                .or_else(|error| field.missing_row_initial_value.clone().ok_or(error))?;
             initial_fields.insert_value(field.field_name.to_string(), value);
         }
         Ok(RuntimeRowSnapshot {
@@ -9743,7 +9813,11 @@ impl RuntimeRowSnapshotTemplate {
             };
             let field_id = FieldSlotId::from_path(path);
             if !initial_fields.contains_key_id(field_id) {
-                initial_fields.insert_value(path.clone(), FieldValue::Text(String::new()));
+                let value = field
+                    .missing_row_initial_value
+                    .clone()
+                    .unwrap_or_else(|| FieldValue::Text(String::new()));
+                initial_fields.insert_value(path.clone(), value);
             }
         }
     }
@@ -9769,9 +9843,13 @@ impl RuntimeRowSnapshotTemplate {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
                 InitialValue::RowInitialField { path } => {
-                    let value = initial_text(path)
-                        .ok_or_else(|| format!("row initial field `{path}` is missing"))?;
-                    row.columns.set_textlike(&field.field_name, value)?;
+                    if let Some(value) = initial_text(path) {
+                        row.columns.set_textlike(&field.field_name, value)?;
+                    } else if let Some(value) = field.missing_row_initial_value.clone() {
+                        row.columns.set_value(&field.field_name, value)?;
+                    } else {
+                        return Err(format!("row initial field `{path}` is missing").into());
+                    }
                 }
                 InitialValue::Unknown { summary } => {
                     return Err(format!("unsupported state initializer `{summary}`").into());
@@ -9787,6 +9865,19 @@ impl RuntimeRowSnapshot {
         self.columns.reserve_all_textlike(additional);
         Ok(())
     }
+}
+
+fn missing_row_initial_value(cell: &boon_ir::StateCell, ir: &TypedProgram) -> Option<FieldValue> {
+    if !matches!(cell.initial_value, InitialValue::RowInitialField { .. }) {
+        return None;
+    }
+    ir.update_branches
+        .iter()
+        .any(|branch| {
+            branch.target == cell.path
+                && matches!(branch.expression, UpdateExpression::BoolNot { .. })
+        })
+        .then_some(FieldValue::Bool(false))
 }
 
 fn runtime_value_from_initial(
@@ -13971,6 +14062,10 @@ mod tests {
             "examples/todo_mvc_physical/RUN.bn",
             [
                 (
+                    "examples/todo_mvc_physical/Theme/Classic.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Classic.bn").to_owned(),
+                ),
+                (
                     "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
                     include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
                         .to_owned(),
@@ -14025,12 +14120,10 @@ mod tests {
         for relative in [
             "BUILD.bn",
             "Generated/Assets.bn",
-            "RUN.bn",
             "Theme/Glassmorphism.bn",
             "Theme/Neobrutalism.bn",
             "Theme/Neumorphism.bn",
             "Theme/Professional.bn",
-            "Theme/Theme.bn",
             "assets/icons/checkbox_active.svg",
             "assets/icons/checkbox_completed.svg",
         ] {
@@ -14044,6 +14137,21 @@ mod tests {
             assert_eq!(
                 migrated, expected,
                 "{relative} changed beyond LINK to SOURCE"
+            );
+        }
+        assert!(
+            migrated_root.join("Theme/Classic.bn").exists(),
+            "Classic is a Boon Circuit scene theme added during migration"
+        );
+        for relative in ["RUN.bn", "Theme/Theme.bn"] {
+            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
+            assert!(
+                migrated.contains("Classic"),
+                "{relative} should document the intentional Classic theme divergence"
+            );
+            assert!(
+                !migrated.contains("LINK"),
+                "{relative} should keep the migration-wide SOURCE spelling"
             );
         }
     }
@@ -14154,7 +14262,7 @@ FUNCTION icon_code(item) {
         let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
         assert_eq!(
             generic.root_textlike_ref("theme_options.name").unwrap(),
-            "Professional"
+            "Classic"
         );
     }
 
@@ -14180,6 +14288,14 @@ FUNCTION icon_code(item) {
             .collect::<Vec<_>>();
         assert!(
             theme_targets.iter().any(|target| {
+                target.source == "store.elements.theme_switcher.classic"
+                    && target.target == "theme_options.name"
+                    && target.value == "Classic"
+            }),
+            "{theme_targets:#?}\n{theme_debug:#?}"
+        );
+        assert!(
+            theme_targets.iter().any(|target| {
                 target.source == "store.elements.theme_switcher.glassmorphism"
                     && target.target == "theme_options.name"
                     && target.value == "Glassmorphism"
@@ -14192,7 +14308,12 @@ FUNCTION icon_code(item) {
                 .generic
                 .root_textlike_ref("theme_options.name")
                 .unwrap(),
-            "Professional"
+            "Classic"
+        );
+        assert_eq!(
+            runtime.generic.document_summary()["theme_options"]["name"],
+            "Classic",
+            "document summary should expose root source-event transforms used by physical styling"
         );
 
         let mut action = BTreeMap::new();
@@ -14225,9 +14346,87 @@ FUNCTION icon_code(item) {
                 .unwrap(),
             "Glassmorphism"
         );
+        assert_eq!(
+            runtime.generic.document_summary()["theme_options"]["name"],
+            "Glassmorphism",
+            "document summary should update root source-event transforms after source events"
+        );
         assert!(deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("theme_options.name")
         }));
+    }
+
+    #[test]
+    fn physical_todomvc_add_todo_defaults_active_and_remains_toggleable() {
+        let parsed = physical_todomvc_project_for_test();
+        let mut runtime = list_scenario_harness_from_parsed(&parsed);
+
+        let mut deltas = Vec::new();
+        let mut patches = Vec::new();
+        let mut submit_action = BTreeMap::new();
+        submit_action.insert(
+            "kind".to_owned(),
+            toml::Value::String("key_down".to_owned()),
+        );
+        submit_action.insert(
+            "target".to_owned(),
+            toml::Value::String("new todo input".to_owned()),
+        );
+        submit_action.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
+        let mut submit_expected = BTreeMap::new();
+        submit_expected.insert(
+            "source".to_owned(),
+            toml::Value::String("store.elements.new_todo_title_text_input".to_owned()),
+        );
+        submit_expected.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
+        submit_expected.insert(
+            "text".to_owned(),
+            toml::Value::String("ship physical".to_owned()),
+        );
+        let submit_step = ScenarioStep {
+            id: "physical-add-todo-submit".to_owned(),
+            user_action: Some(submit_action),
+            expected_source_event: Some(submit_expected),
+            ..ScenarioStep::default()
+        };
+        runtime
+            .apply_step_into(&submit_step, &mut deltas, &mut patches)
+            .unwrap();
+        let added_index = list_row_index(&runtime, "ship physical");
+        assert_eq!(runtime.list_title_for_test(added_index), "ship physical");
+        assert!(
+            !runtime.list_completed_for_test(added_index),
+            "new physical todos should default to active"
+        );
+
+        let mut toggle_action = BTreeMap::new();
+        toggle_action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
+        toggle_action.insert(
+            "target_text".to_owned(),
+            toml::Value::String("ship physical".to_owned()),
+        );
+        let mut toggle_expected = BTreeMap::new();
+        toggle_expected.insert(
+            "source".to_owned(),
+            toml::Value::String("todo.todo_elements.todo_checkbox".to_owned()),
+        );
+        toggle_expected.insert(
+            "target_text".to_owned(),
+            toml::Value::String("ship physical".to_owned()),
+        );
+        let toggle_step = ScenarioStep {
+            id: "physical-added-todo-toggle".to_owned(),
+            user_action: Some(toggle_action),
+            expected_source_event: Some(toggle_expected),
+            ..ScenarioStep::default()
+        };
+        runtime
+            .apply_step_into(&toggle_step, &mut deltas, &mut patches)
+            .unwrap();
+        assert!(
+            runtime.list_completed_for_test(added_index),
+            "new physical todos should remain toggleable"
+        );
     }
 
     #[test]

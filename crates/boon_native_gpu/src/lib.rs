@@ -972,6 +972,7 @@ struct GlyphonTextState {
     prepared_signatures: Vec<TextRunPlacementSignature>,
     prepared_viewport: Option<(u32, u32)>,
     custom_glyph_ids: BTreeMap<RotatedTextKey, CustomGlyphId>,
+    custom_glyph_rasters: BTreeMap<CustomGlyphId, RasterizedCustomGlyph>,
     next_custom_glyph_id: CustomGlyphId,
 }
 
@@ -1162,6 +1163,7 @@ impl GlyphonTextState {
             prepared_signatures: Vec::new(),
             prepared_viewport: None,
             custom_glyph_ids: BTreeMap::new(),
+            custom_glyph_rasters: BTreeMap::new(),
             next_custom_glyph_id: 1,
         }
     }
@@ -1203,10 +1205,9 @@ impl GlyphonTextState {
         {
             let mut custom_buffers = Vec::with_capacity(rotated_runs.len());
             let mut custom_glyph_lists = Vec::with_capacity(rotated_runs.len());
-            let mut custom_rasters = BTreeMap::new();
             for (run, glyph) in &rotated_runs {
                 let id = self.custom_glyph_id(glyph.key.clone());
-                custom_rasters.insert(
+                self.custom_glyph_rasters.insert(
                     id,
                     RasterizedCustomGlyph {
                         data: glyph.mask.clone(),
@@ -1268,6 +1269,7 @@ impl GlyphonTextState {
                     custom_glyphs: glyphs,
                 });
             }
+            let custom_rasters = self.custom_glyph_rasters.clone();
             self.renderer
                 .prepare_with_custom(
                     device,

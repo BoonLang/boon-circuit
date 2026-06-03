@@ -138,6 +138,7 @@ id = "todo_mvc_physical"
 label = "TodoMVC Physical"
 source = "examples/todo_mvc_physical/RUN.bn"
 source_files = [
+  "examples/todo_mvc_physical/Theme/Classic.bn",
   "examples/todo_mvc_physical/Theme/Professional.bn",
   "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
   "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
@@ -186,6 +187,7 @@ input_scenarios = [
   "edit-todo-commit",
   "toggle-edited-todo-completed",
   "clear-completed",
+  "switch-theme-classic",
   "switch-theme-professional",
   "switch-theme-glassmorphism",
   "switch-theme-neobrutalism",

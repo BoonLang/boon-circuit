@@ -5702,8 +5702,12 @@ fn source_payload_access(
     let normalized_parts = normalized_source_path_parts(parts);
     let path = normalized_parts.join(".");
     for source_path in source_paths {
-        let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
-        for base in [source_path.as_str(), relative] {
+        let store_relative = source_path.strip_prefix("store.").unwrap_or(source_path);
+        let scoped_relative = source_path
+            .split_once('.')
+            .map(|(_, relative)| relative)
+            .unwrap_or(source_path);
+        for base in [source_path.as_str(), store_relative, scoped_relative] {
             if path == base || base.ends_with(&format!(".{path}")) {
                 return Some(SourcePayloadAccess::Direct(source_path.clone()));
             }
@@ -6606,17 +6610,18 @@ fn source_path_matches_parts(
     if !path_is_source_path(source_paths, &path) {
         return false;
     }
-    let relative = source_path.strip_prefix("store.").unwrap_or(source_path);
-    path.starts_with(&format!("{source_path}."))
-        || path.starts_with(&format!("{relative}."))
-        || source_path.ends_with(&format!(
-            ".{}",
-            parts_without_payload(&normalized_parts).join(".")
-        ))
-        || relative.ends_with(&format!(
-            ".{}",
-            parts_without_payload(&normalized_parts).join(".")
-        ))
+    let store_relative = source_path.strip_prefix("store.").unwrap_or(source_path);
+    let scoped_relative = source_path
+        .split_once('.')
+        .map(|(_, relative)| relative)
+        .unwrap_or(source_path);
+    let path_without_payload = parts_without_payload(&normalized_parts).join(".");
+    [source_path, store_relative, scoped_relative]
+        .into_iter()
+        .any(|base| {
+            path.starts_with(&format!("{base}."))
+                || base.ends_with(&format!(".{path_without_payload}"))
+        })
 }
 
 fn parts_without_payload(parts: &[String]) -> &[String] {
@@ -6668,15 +6673,20 @@ fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
         .collect::<Vec<_>>()
         .join(".");
     source_paths.iter().any(|source_path| {
-        let relative = source_path
+        let store_relative = source_path
             .strip_prefix("store.")
             .unwrap_or(source_path.as_str());
-        source_path.as_str() == normalized_path
-            || source_path.ends_with(&format!(".{normalized_path}"))
-            || normalized_path.starts_with(&format!("{source_path}."))
-            || relative == normalized_path
-            || relative.ends_with(&format!(".{normalized_path}"))
-            || normalized_path.starts_with(&format!("{relative}."))
+        let scoped_relative = source_path
+            .split_once('.')
+            .map(|(_, relative)| relative)
+            .unwrap_or(source_path.as_str());
+        [source_path.as_str(), store_relative, scoped_relative]
+            .into_iter()
+            .any(|base| {
+                base == normalized_path
+                    || base.ends_with(&format!(".{normalized_path}"))
+                    || normalized_path.starts_with(&format!("{base}."))
+            })
     })
 }
 
@@ -7875,6 +7885,50 @@ document: []
     }
 
     #[test]
+    fn mapped_row_local_source_payload_paths_strip_row_scope() {
+        let source = r#"
+todos:
+    LIST {
+        [title: TEXT { First }]
+    }
+    |> List/map(todo, new: row(title: todo.title |> Text/trim()))
+
+FUNCTION row(title) {
+    [
+        editor: SOURCE
+        committed:
+            Text/empty() |> HOLD committed {
+                LATEST {
+                    editor.event.key_down.key |> WHEN {
+                        Enter => title
+                        __ => SKIP
+                    }
+                }
+            }
+    ]
+}
+document: []
+"#;
+        let parsed = boon_parser::parse_source("mapped-row-local-source-payload.bn", source)
+            .expect("source should parse");
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "mapped row-local source payload paths should typecheck: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            report
+                .source_payload_shape_table
+                .iter()
+                .any(|entry| entry.source_path == "todo.editor"
+                    && entry.fields.iter().any(|field| field.name == "key")),
+            "{:#?}",
+            report.source_payload_shape_table
+        );
+    }
+
+    #[test]
     fn type_hint_table_uses_boon_facing_labels() {
         let source = r#"
 source: SOURCE
@@ -8436,6 +8490,10 @@ document: []
         let parsed = boon_parser::parse_project(
             "examples/todo_mvc_physical/RUN.bn",
             [
+                (
+                    "examples/todo_mvc_physical/Theme/Classic.bn".to_owned(),
+                    include_str!("../../../examples/todo_mvc_physical/Theme/Classic.bn").to_owned(),
+                ),
                 (
                     "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
                     include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")

@@ -257,6 +257,16 @@ FUNCTION small_flat_text(of) {
     ]
 }
 
+FUNCTION theme_switcher_button_text(selected) {
+    [
+        ...small_flat_text(of: Small)
+        color: selected |> WHEN {
+            True => Theme/font(of: FilterSelected).color
+            False => Theme/font(of: Small).color
+        }
+    ]
+}
+
 ------------------------------------------------------------------------
 -- SCENE
 ------------------------------------------------------------------------
@@ -1106,7 +1116,7 @@ FUNCTION theme_name_button(theme_name) {
             ]
             label: Scene/Element/text(
                 style: [
-                    ...small_flat_text(of: Small)
+                    ...theme_switcher_button_text(selected: selected)
                 ]
                 text: theme_name |> WHEN {
                     Classic => TEXT { Classic }

@@ -19511,7 +19511,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Neumorphism", "Dark", "text_secondary") => "#d0d6df",
         ("Neumorphism", "Dark", "text_tertiary") => "#cbd2dd",
         ("Neumorphism", "Dark", "text_disabled") => "#8b94a4",
-        ("Neumorphism", "Dark", "text_header") => "#252b34",
+        ("Neumorphism", "Dark", "text_header") => "#cbd2dd",
         ("Neumorphism", "Dark", "text_placeholder") => "#9da6b5",
         ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
         ("Neumorphism", "Dark", "danger") => "#5be0bd",
@@ -20221,16 +20221,16 @@ fn document_theme_checkbox_glyph_material(
         }),
         ("Neumorphism", "Light") => json!({
             "checkbox_background": "#eef1f6",
-            "checkbox_border": "#ffffff59",
-            "checked_border": "#ffffff61",
-            "check_color": "#56c3ad",
+            "checkbox_border": "#98a2b1",
+            "checked_border": "#42ad98",
+            "check_color": "#42ad98",
             "checkbox_border_width": 1.0,
             "check_width": 3.0
         }),
         ("Neumorphism", "Dark") => json!({
             "checkbox_background": "#252c36",
-            "checkbox_border": "#ffffff14",
-            "checked_border": "#ffffff14",
+            "checkbox_border": "#6d7786",
+            "checked_border": "#5be0bd",
             "check_color": "#5be0bd",
             "checkbox_border_width": 1.0,
             "check_width": 3.0
@@ -27090,7 +27090,7 @@ mod tests {
             ("Neumorphism", "Dark", "secondary") => "#d0d6df",
             ("Neumorphism", "Dark", "tertiary") => "#cbd2dd",
             ("Neumorphism", "Dark", "disabled") => "#8b94a4",
-            ("Neumorphism", "Dark", "header") => "#252b34",
+            ("Neumorphism", "Dark", "header") => "#cbd2dd",
             ("Neumorphism", "Dark", "placeholder") => "#9da6b5",
             ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
             ("Neumorphism", "Dark", "chevron") => "#b2bac8",
@@ -27222,12 +27222,12 @@ mod tests {
             ("Neobrutalism", "Dark", "checked_border") => "#00d95a",
             ("Neobrutalism", "Dark", "check") => "#00e861",
             ("Neumorphism", "Light", "background") => "#eef1f6",
-            ("Neumorphism", "Light", "border") => "#ffffff59",
-            ("Neumorphism", "Light", "checked_border") => "#ffffff61",
-            ("Neumorphism", "Light", "check") => "#56c3ad",
+            ("Neumorphism", "Light", "border") => "#98a2b1",
+            ("Neumorphism", "Light", "checked_border") => "#42ad98",
+            ("Neumorphism", "Light", "check") => "#42ad98",
             ("Neumorphism", "Dark", "background") => "#252c36",
-            ("Neumorphism", "Dark", "border") => "#ffffff14",
-            ("Neumorphism", "Dark", "checked_border") => "#ffffff14",
+            ("Neumorphism", "Dark", "border") => "#6d7786",
+            ("Neumorphism", "Dark", "checked_border") => "#5be0bd",
             ("Neumorphism", "Dark", "check") => "#5be0bd",
             _ => panic!("missing physical TodoMVC checkbox color for {theme}/{mode}/{role}"),
         }
@@ -27242,6 +27242,154 @@ mod tests {
             ("Neobrutalism", "Dark") => 3.0,
             ("Neumorphism", _) => 1.0,
             _ => panic!("missing physical TodoMVC checkbox border width for {theme}/{mode}"),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct VisualColor {
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+    }
+
+    fn parse_visual_color(value: &str) -> VisualColor {
+        let value = value.trim();
+        if let Some(hex) = value.strip_prefix('#') {
+            let parse_pair =
+                |slice: &str| u8::from_str_radix(slice, 16).expect("hex color pair should parse");
+            let (r, g, b, a) = match hex.len() {
+                3 => {
+                    let mut chars = hex.chars();
+                    let r = chars.next().unwrap();
+                    let g = chars.next().unwrap();
+                    let b = chars.next().unwrap();
+                    (
+                        u8::from_str_radix(&format!("{r}{r}"), 16).unwrap(),
+                        u8::from_str_radix(&format!("{g}{g}"), 16).unwrap(),
+                        u8::from_str_radix(&format!("{b}{b}"), 16).unwrap(),
+                        255,
+                    )
+                }
+                6 => (
+                    parse_pair(&hex[0..2]),
+                    parse_pair(&hex[2..4]),
+                    parse_pair(&hex[4..6]),
+                    255,
+                ),
+                8 => (
+                    parse_pair(&hex[0..2]),
+                    parse_pair(&hex[2..4]),
+                    parse_pair(&hex[4..6]),
+                    parse_pair(&hex[6..8]),
+                ),
+                _ => panic!("unsupported hex color `{value}`"),
+            };
+            return VisualColor {
+                r: r as f32 / 255.0,
+                g: g as f32 / 255.0,
+                b: b as f32 / 255.0,
+                a: a as f32 / 255.0,
+            };
+        }
+
+        if value.starts_with("Oklch[") {
+            let component = |name: &str| -> Option<f32> {
+                let needle = format!("{name}:");
+                let start = value.find(&needle)? + needle.len();
+                let rest = &value[start..];
+                let end = rest
+                    .find(|character| character == ',' || character == ']')
+                    .unwrap_or(rest.len());
+                rest[..end].trim().parse::<f32>().ok()
+            };
+            let lightness = component("lightness")
+                .unwrap_or_else(|| panic!("Oklch color `{value}` should expose lightness"))
+                .clamp(0.0, 1.0);
+            let alpha = component("alpha").unwrap_or(1.0).clamp(0.0, 1.0);
+            return VisualColor {
+                r: lightness,
+                g: lightness,
+                b: lightness,
+                a: alpha,
+            };
+        }
+
+        panic!("unsupported visual color `{value}`");
+    }
+
+    fn visual_color_over(foreground: VisualColor, background: VisualColor) -> VisualColor {
+        let inverse_alpha = 1.0 - foreground.a;
+        VisualColor {
+            r: foreground.r * foreground.a + background.r * inverse_alpha,
+            g: foreground.g * foreground.a + background.g * inverse_alpha,
+            b: foreground.b * foreground.a + background.b * inverse_alpha,
+            a: 1.0,
+        }
+    }
+
+    fn visual_relative_luminance(color: VisualColor) -> f32 {
+        let linear = |channel: f32| {
+            if channel <= 0.039_28 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+
+    fn visual_contrast_ratio(foreground: VisualColor, background: VisualColor) -> f32 {
+        let foreground = visual_color_over(foreground, background);
+        let foreground_luma = visual_relative_luminance(foreground);
+        let background_luma = visual_relative_luminance(background);
+        let (lighter, darker) = if foreground_luma >= background_luma {
+            (foreground_luma, background_luma)
+        } else {
+            (background_luma, foreground_luma)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn visual_luma_255(color: VisualColor) -> f32 {
+        (0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b) * 255.0
+    }
+
+    fn assert_visual_contrast_at_least(
+        foreground: &str,
+        background: VisualColor,
+        minimum: f32,
+        context: &str,
+    ) {
+        let contrast = visual_contrast_ratio(parse_visual_color(foreground), background);
+        assert!(
+            contrast >= minimum,
+            "{context} should keep contrast >= {minimum:.1}:1, got {contrast:.2}:1 for foreground `{foreground}` over {background:?}"
+        );
+    }
+
+    fn assert_visual_luma_delta_at_least(
+        foreground: &str,
+        background: VisualColor,
+        minimum: f32,
+        context: &str,
+    ) {
+        let composited_foreground = visual_color_over(parse_visual_color(foreground), background);
+        let delta = (visual_luma_255(composited_foreground) - visual_luma_255(background)).abs();
+        assert!(
+            delta >= minimum,
+            "{context} should keep luma delta >= {minimum:.1}, got {delta:.1} for foreground `{foreground}` over {background:?}"
+        );
+    }
+
+    fn physical_todomvc_theme_switcher_label(theme: &str) -> &'static str {
+        match theme {
+            "Classic" => "Classic",
+            "Professional" => "Professional",
+            "Glassmorphism" => "Glass",
+            "Neobrutalism" => "Brutalist",
+            "Neumorphism" => "Neumorphic",
+            _ => panic!("missing physical TodoMVC switcher label for {theme}"),
         }
     }
 
@@ -27360,6 +27508,72 @@ mod tests {
             .unwrap_or_else(|| panic!("{context} should render text `{label}`"))
     }
 
+    fn physical_todomvc_checkbox_for_todo_title<'a>(
+        frame: &'a boon_document::LayoutFrame,
+        todo_title: &str,
+        context: &str,
+    ) -> &'a boon_document::DisplayItem {
+        let title = physical_frame_text_item(frame, todo_title, context);
+        frame
+            .display_list
+            .iter()
+            .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
+            .find(|item| {
+                let checkbox_center_y = item.bounds.y + item.bounds.height * 0.5;
+                item.bounds.x < title.bounds.x
+                    && checkbox_center_y >= title.bounds.y - 12.0
+                    && checkbox_center_y <= title.bounds.y + title.bounds.height + 12.0
+            })
+            .unwrap_or_else(|| {
+                panic!("{context} should render a checkbox aligned with todo `{todo_title}`")
+            })
+    }
+
+    fn assert_physical_todomvc_checkbox_visual_style(
+        checkbox: &boon_document::DisplayItem,
+        theme: &str,
+        mode: &str,
+        checked: bool,
+        context: &str,
+    ) {
+        assert_eq!(
+            style_bool(&checkbox.style, "checked"),
+            checked,
+            "{context} checkbox should lower checked={checked}: {:?}",
+            checkbox.style
+        );
+        assert_display_style_text(
+            checkbox,
+            "checkbox_background",
+            physical_todomvc_checkbox_style_color(theme, mode, "background"),
+            context,
+        );
+        assert_display_style_text(
+            checkbox,
+            "checkbox_border",
+            physical_todomvc_checkbox_style_color(theme, mode, "border"),
+            context,
+        );
+        assert_display_style_text(
+            checkbox,
+            "checked_border",
+            physical_todomvc_checkbox_style_color(theme, mode, "checked_border"),
+            context,
+        );
+        assert_display_style_text(
+            checkbox,
+            "check_color",
+            physical_todomvc_checkbox_style_color(theme, mode, "check"),
+            context,
+        );
+        assert_display_style_number(
+            checkbox,
+            "checkbox_border_width",
+            physical_todomvc_checkbox_border_width(theme, mode),
+            context,
+        );
+    }
+
     fn assert_physical_todomvc_frame_theme_styles(
         frame: &boon_document::LayoutFrame,
         theme: &str,
@@ -27448,27 +27662,16 @@ mod tests {
             physical_todomvc_text_color(theme, mode, "tertiary"),
             context,
         );
-        let checkbox = frame
-            .display_list
-            .iter()
-            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
-            .unwrap_or_else(|| panic!("{context} should expose a themed checkbox"));
-        assert_display_style_text(
-            checkbox,
-            "checkbox_background",
-            physical_todomvc_checkbox_style_color(theme, mode, "background"),
-            context,
-        );
-        assert_display_style_text(
-            checkbox,
-            "check_color",
-            physical_todomvc_checkbox_style_color(theme, mode, "check"),
-            context,
-        );
-        assert_display_style_number(
-            checkbox,
-            "checkbox_border_width",
-            physical_todomvc_checkbox_border_width(theme, mode),
+        let active_checkbox =
+            physical_todomvc_checkbox_for_todo_title(frame, "Read documentation", context);
+        assert_physical_todomvc_checkbox_visual_style(active_checkbox, theme, mode, false, context);
+        let completed_checkbox =
+            physical_todomvc_checkbox_for_todo_title(frame, "Finish TodoMVC renderer", context);
+        assert_physical_todomvc_checkbox_visual_style(
+            completed_checkbox,
+            theme,
+            mode,
+            true,
             context,
         );
         let root_color = frame_root_material_color(frame)
@@ -27871,7 +28074,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "3af0612e02c7",
+            "629dfa01a955",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -28853,41 +29056,28 @@ mod tests {
                     physical_todomvc_material_color(theme, mode, "interactive"),
                     &context,
                 );
-                let first_checkbox = layout
-                    .display_list
-                    .iter()
-                    .find(|item| {
-                        matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
-                    })
-                    .unwrap_or_else(|| panic!("{context} first todo checkbox should render"));
-                assert_display_style_text(
-                    first_checkbox,
-                    "checkbox_background",
-                    physical_todomvc_checkbox_style_color(theme, mode, "background"),
+                let active_checkbox = physical_todomvc_checkbox_for_todo_title(
+                    &layout,
+                    "Read documentation",
                     &context,
                 );
-                assert_display_style_text(
-                    first_checkbox,
-                    "checkbox_border",
-                    physical_todomvc_checkbox_style_color(theme, mode, "border"),
+                assert_physical_todomvc_checkbox_visual_style(
+                    active_checkbox,
+                    theme,
+                    mode,
+                    false,
                     &context,
                 );
-                assert_display_style_text(
-                    first_checkbox,
-                    "checked_border",
-                    physical_todomvc_checkbox_style_color(theme, mode, "checked_border"),
+                let completed_checkbox = physical_todomvc_checkbox_for_todo_title(
+                    &layout,
+                    "Finish TodoMVC renderer",
                     &context,
                 );
-                assert_display_style_text(
-                    first_checkbox,
-                    "check_color",
-                    physical_todomvc_checkbox_style_color(theme, mode, "check"),
-                    &context,
-                );
-                assert_display_style_number(
-                    first_checkbox,
-                    "checkbox_border_width",
-                    physical_todomvc_checkbox_border_width(theme, mode),
+                assert_physical_todomvc_checkbox_visual_style(
+                    completed_checkbox,
+                    theme,
+                    mode,
+                    true,
                     &context,
                 );
                 let new_todo_row = layout
@@ -29209,11 +29399,16 @@ mod tests {
                     mode_label,
                 ] {
                     let label_text = text_item(label);
+                    let text_role = if label == physical_todomvc_theme_switcher_label(theme) {
+                        "filter_selected"
+                    } else {
+                        "tertiary"
+                    };
                     assert_display_style_text(label_text, "font", body_font_family, &context);
                     assert_display_style_text(
                         label_text,
                         "color",
-                        physical_todomvc_text_color(theme, mode, "tertiary"),
+                        physical_todomvc_text_color(theme, mode, text_role),
                         &context,
                     );
                     let button = text_button(label);
@@ -29249,6 +29444,76 @@ mod tests {
                 assert!(
                     PHYSICAL_TODOMVC_PREVIEW_HEIGHT - theme_switcher_bottom >= 18.0,
                     "{context} theme switcher should not look clipped against the viewport bottom: bottom={theme_switcher_bottom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn physical_todomvc_requested_visual_roles_have_sufficient_contrast() {
+        let themes = [
+            "Classic",
+            "Professional",
+            "Glassmorphism",
+            "Neobrutalism",
+            "Neumorphism",
+        ];
+        for theme in themes {
+            for mode in ["Light", "Dark"] {
+                let context = format!("{theme}/{mode}");
+                let root = parse_visual_color(physical_todomvc_material_color(theme, mode, "root"));
+                let surface = visual_color_over(
+                    parse_visual_color(physical_todomvc_material_color(theme, mode, "surface")),
+                    root,
+                );
+                let selected_backdrop =
+                    physical_todomvc_selected_filter_material_color(theme, mode)
+                        .map(|color| visual_color_over(parse_visual_color(color), root))
+                        .unwrap_or(root);
+                let checkbox_background = visual_color_over(
+                    parse_visual_color(physical_todomvc_checkbox_style_color(
+                        theme,
+                        mode,
+                        "background",
+                    )),
+                    surface,
+                );
+
+                assert_visual_contrast_at_least(
+                    physical_todomvc_text_color(theme, mode, "header"),
+                    root,
+                    3.0,
+                    &format!("{context} `todos` title"),
+                );
+                assert_visual_contrast_at_least(
+                    physical_todomvc_text_color(theme, mode, "tertiary"),
+                    root,
+                    4.0,
+                    &format!("{context} unselected theme switcher text"),
+                );
+                assert_visual_contrast_at_least(
+                    physical_todomvc_text_color(theme, mode, "filter_selected"),
+                    selected_backdrop,
+                    4.0,
+                    &format!("{context} selected theme switcher text"),
+                );
+                assert_visual_luma_delta_at_least(
+                    physical_todomvc_checkbox_style_color(theme, mode, "border"),
+                    checkbox_background,
+                    14.0,
+                    &format!("{context} unchecked checkbox circle"),
+                );
+                assert_visual_luma_delta_at_least(
+                    physical_todomvc_checkbox_style_color(theme, mode, "checked_border"),
+                    checkbox_background,
+                    14.0,
+                    &format!("{context} checked checkbox circle"),
+                );
+                assert_visual_contrast_at_least(
+                    physical_todomvc_checkbox_style_color(theme, mode, "check"),
+                    checkbox_background,
+                    2.0,
+                    &format!("{context} checkbox checkmark"),
                 );
             }
         }

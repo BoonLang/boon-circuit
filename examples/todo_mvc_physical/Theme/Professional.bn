@@ -138,7 +138,31 @@ FUNCTION material(material) {
 
             PrimarySubtle => primary_subtle_base
 
+            FilterSelected => [
+                ...primary_subtle_base
+                shadows: PASSED.mode |> WHEN {
+                    Light => LIST {
+                        [y: 1, blur: 2, color: TEXT { #b140491a }]
+                    }
+                    Dark => LIST {
+                        [spread: 1, color: TEXT { #d65d5e2e }]
+                    }
+                }
+            ]
+
             Danger => danger_base
+
+            CheckboxGlyph[checked] => [
+                checkbox_background: surface_base.color
+                checkbox_border: PASSED.mode |> WHEN {
+                    Light => TEXT { #d9dee7 }
+                    Dark => TEXT { #3d4652 }
+                }
+                checked_border: primary_base.color
+                check_color: primary_base.color
+                checkbox_border_width: 1.5
+                check_width: 3
+            ]
         }
     }
 }
@@ -306,6 +330,10 @@ FUNCTION corners(of) {
         Touch => 8
         Comfort => 8
         Soft => 999
+        Filter => PASSED.mode |> WHEN {
+            Light => 999
+            Dark => 6
+        }
         Pill => Fully
     }
 }

@@ -14108,7 +14108,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_todomvc_source_preserves_original_except_source_rename() {
+    fn physical_todomvc_source_preserves_original_assets_and_declares_theme_divergence() {
         let original_root = Path::new(
             "/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc_physical",
         );
@@ -14120,10 +14120,6 @@ mod tests {
         for relative in [
             "BUILD.bn",
             "Generated/Assets.bn",
-            "Theme/Glassmorphism.bn",
-            "Theme/Neobrutalism.bn",
-            "Theme/Neumorphism.bn",
-            "Theme/Professional.bn",
             "assets/icons/checkbox_active.svg",
             "assets/icons/checkbox_completed.svg",
         ] {
@@ -14137,6 +14133,22 @@ mod tests {
             assert_eq!(
                 migrated, expected,
                 "{relative} changed beyond LINK to SOURCE"
+            );
+        }
+        for relative in [
+            "Theme/Glassmorphism.bn",
+            "Theme/Neobrutalism.bn",
+            "Theme/Neumorphism.bn",
+            "Theme/Professional.bn",
+        ] {
+            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
+            assert!(
+                migrated.contains("CheckboxGlyph[checked]"),
+                "{relative} should declare the intentional themed checkbox glyph divergence"
+            );
+            assert!(
+                !migrated.contains("LINK"),
+                "{relative} should keep the migration-wide SOURCE spelling"
             );
         }
         assert!(

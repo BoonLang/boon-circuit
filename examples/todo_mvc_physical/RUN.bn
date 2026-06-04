@@ -63,6 +63,20 @@ store: [
             elements.remove_completed_button.event.press
                 |> THEN { item.completed |> Bool/not() }
         })
+    active_count:
+        todos
+        |> List/retain(todo, if: todo.completed |> Bool/not())
+        |> List/count()
+    completed_count:
+        todos
+        |> List/retain(todo, if: todo.completed)
+        |> List/count()
+    has_todos:
+        active_count == 0 |> Bool/and(completed_count == 0) |> Bool/not()
+    has_completed:
+        completed_count > 0
+    all_completed:
+        active_count == 0 |> Bool/and(completed_count > 0)
     selected_todo_id: LATEST {
         None
         todos
@@ -107,9 +121,7 @@ FUNCTION new_todo(title, initial_completed) {
             LATEST {
                 initial_completed
                 store.elements.toggle_all_checkbox.event.click |> THEN {
-                    store.todos
-                        |> List/every(item, if: item.completed)
-                        |> Bool/not()
+                    store.all_completed |> Bool/not()
                 }
             }
             |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
@@ -177,27 +189,11 @@ FUNCTION delete_button_material(hovered) {
     ]
 }
 
-FUNCTION filter_button_material(selected, hovered) {
+FUNCTION filter_button_material(selected) {
     [
         ...selected |> WHEN {
-            True => Theme/material(of: PrimarySubtle)
-            False => Theme/material(of: SurfaceVariant)
-        }
-        gloss: selected |> WHEN {
-            False => 0.35
-            True => 0.2
-        }
-        metal: 0.03
-        glow: LIST { selected, hovered } |> WHEN {
-            LIST { True, __ } => [
-                color: Theme/material(of: Primary).color
-                intensity: 0.05
-            ]
-            LIST { False, True } => [
-                color: Theme/material(of: Primary).color
-                intensity: 0.025
-            ]
-            LIST { False, False } => None
+            True => Theme/material(of: FilterSelected)
+            False => []
         }
     ]
 }
@@ -258,14 +254,6 @@ FUNCTION small_flat_text(of) {
         depth: 0
         move: [further: 0]
         text_inset: 0
-    ]
-}
-
-FUNCTION transparent_action_material() {
-    [
-        color: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.003]
-        gloss: 0
-        metal: 0
     ]
 }
 
@@ -465,9 +453,7 @@ FUNCTION main_panel() {
         ]
         items: LIST {
             new_todo_entry()
-            todos
-                |> List/is_not_empty()
-                |> WHILE {
+            store.has_todos |> WHILE {
                     True => Scene/Element/stripe(
                         element: []
                         direction: Column
@@ -615,7 +601,7 @@ FUNCTION todo_element(todo) {
 
 FUNCTION toggle_all_checkbox() {
     BLOCK {
-        checked: todos |> List/every(item, if: item.completed)
+        checked: store.all_completed
 
         Scene/Element/button(
             element: [
@@ -643,6 +629,7 @@ FUNCTION toggle_all_checkbox() {
                 ]
                 text: TEXT { ❯ }
             )
+            visible: store.has_todos
         )
     }
 }
@@ -690,24 +677,12 @@ FUNCTION todo_checkbox(todo) {
             ]
             style: [
                 size: Theme/sizing(of: TouchTarget)
-                depth: Theme/depth(of: Element)
-                rounded_corners: Theme/corners(of: Pill)
                 spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: Interactive[hovered: element.hovered])
+                ...Theme/material(of: CheckboxGlyph[checked: todo.completed])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             target: todo.title
             checked: todo.completed
-            icon: Scene/Element/block(
-                element: []
-                style: [
-                    size: Theme/sizing(of: TouchTarget)
-                    background: [url: todo.completed |> WHEN {
-                        True => Assets/icon().checkbox_completed
-                        False => Assets/icon().checkbox_active
-                    }]
-                ]
-            )
         )
     }
 }
@@ -777,9 +752,8 @@ FUNCTION panel_footer() {
             filters_leading_spacer()
             filters_element()
             clear_button_spacer()
-            todos
-                |> List/any(item, if: item.completed) |> WHILE {
-                    True => remove_completed_button()
+            store.has_completed |> WHILE {
+                True => remove_completed_button()
                         |> SOURCE { PASSED.store.elements.remove_completed_button }
                     False => NoElement
                 }
@@ -834,10 +808,7 @@ FUNCTION active_items_count_text() {
             text_inset: 0
             vertical_align: Center
         ]
-        text: todos
-            |> List/retain(item, if: item.completed |> Bool/not())
-            |> List/count()
-            |> WHEN { count => BLOCK {
+        text: store.active_count |> WHEN { count => BLOCK {
                 maybe_s: count == 1 |> WHEN { True => Text/empty(), False => TEXT { s } }
                 TEXT { {count} item{maybe_s} left }
             }}
@@ -888,14 +859,17 @@ FUNCTION filter_button(filter) {
                 line_height: 19.6
                 text_inset: 0
                 vertical_align: Center
-                depth: Theme/depth(of: Element)
-                rounded_corners: Theme/corners(of: Soft)
+                rounded_corners: Theme/corners(of: Filter)
+                outline:
+                    selected |> WHILE {
+                        True => NoOutline
+                        False => element.hovered |> WHILE {
+                            True => [side: Inner, color: Theme/material(of: FilterSelected).border]
+                            False => NoOutline
+                        }
+                    }
                 spring_range: Theme/spring_range(of: Button)
-                move: [closer: selected |> WHEN {
-                    True => Theme/elevation(of: Selection)
-                    False => 0
-                }]
-                material: filter_button_material(selected: selected, hovered: element.hovered)
+                material: filter_button_material(selected: selected)
             ]
             label: Scene/Element/text(
                 style: filter_button_text(selected: selected)
@@ -931,7 +905,7 @@ FUNCTION remove_completed_button() {
             depth: 0
             rounded_corners: 0
             spring_range: Theme/spring_range(of: Button)
-            material: transparent_action_material()
+            material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
         label: Scene/Element/text(
             style: clear_button_text(hovered: element.hovered)
@@ -1112,16 +1086,13 @@ FUNCTION theme_name_button(theme_name) {
             style: [
                 padding: [row: 4, column: 4]
                 depth: Theme/depth(of: Detail)
-                rounded_corners: Theme/corners(of: Soft)
+                rounded_corners: Theme/corners(of: Filter)
                 spring_range: Theme/spring_range(of: Button)
                 move: [closer: selected |> WHEN {
                     True => Theme/elevation(of: Selection)
                     False => 0
                 }]
-                material: filter_button_material(
-                    selected: selected
-                    hovered: element.hovered
-                )
+                material: filter_button_material(selected: selected)
             ]
             label: Scene/Element/text(
                 style: [

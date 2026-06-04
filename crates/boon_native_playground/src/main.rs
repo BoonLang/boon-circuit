@@ -1887,6 +1887,11 @@ fn normalize_runtime_state_for_source_path(
     };
     for field in [
         "todos",
+        "active_count",
+        "completed_count",
+        "has_todos",
+        "has_completed",
+        "all_completed",
         "selected_filter",
         "selected_todo_id",
         "title_to_save",
@@ -17099,7 +17104,6 @@ fn synthesize_physical_style(node: &mut boon_document_model::DocumentNode) {
         boon_document_model::DocumentNodeKind::Stack
             | boon_document_model::DocumentNodeKind::Row
             | boon_document_model::DocumentNodeKind::Button
-            | boon_document_model::DocumentNodeKind::Checkbox
             | boon_document_model::DocumentNodeKind::TextInput
             | boon_document_model::DocumentNodeKind::TableCell
     );
@@ -17465,6 +17469,7 @@ fn lower_canonical_element_text(
                         boon_document_model::StyleValue::Text(text),
                     );
                 }
+                lower_placeholder_nested_style(child, expressions, context, node);
             }
             "child" | "icon" => {
                 if document_render_arg_statement(child, expressions, context).is_some() {
@@ -17479,6 +17484,36 @@ fn lower_canonical_element_text(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn lower_placeholder_nested_style(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for child in &statement.children {
+        if document_field_name(child).as_deref() != Some("style") {
+            continue;
+        }
+        let mut placeholder_node = boon_document_model::DocumentNode::new(
+            "__placeholder_style",
+            boon_document_model::DocumentNodeKind::Text,
+        );
+        lower_canonical_style_block(child, expressions, context, &mut placeholder_node);
+        for (source, target) in [
+            ("font", "placeholder_font"),
+            ("font_style", "placeholder_style"),
+            ("size", "placeholder_size"),
+            ("weight", "placeholder_weight"),
+            ("color", "placeholder_color"),
+            ("line_height", "placeholder_line_height"),
+        ] {
+            if let Some(value) = placeholder_node.style.get(source).cloned() {
+                node.style.insert(target.to_owned(), value);
+            }
         }
     }
 }
@@ -19090,18 +19125,21 @@ fn document_builtin_value_call(
             document_call_arg_text(args, "of", expressions, context)?.as_str()
         ) {
             ("Classic", "Touch" | "Comfort") => 0.0,
-            ("Classic", "Soft" | "Pill" | "Fully") => 3.0,
+            ("Classic", "Soft" | "Filter" | "Pill" | "Fully") => 3.0,
+            ("Professional", "Filter") if document_theme_mode(context) == "Dark" => 6.0,
+            ("Professional", "Filter") => 999.0,
             ("Glassmorphism", "Touch") => 8.0,
             ("Glassmorphism", "Comfort") => 14.0,
-            ("Glassmorphism", "Soft") => 8.0,
+            ("Glassmorphism", "Soft" | "Filter") => 8.0,
             ("Glassmorphism", "Pill" | "Fully") => 999.0,
+            ("Neobrutalism", "Filter") => 0.0,
             ("Neobrutalism", "Soft") => 12.0,
             ("Neobrutalism", "Pill" | "Fully") => 999.0,
             ("Neobrutalism", _) => 0.0,
             ("Neumorphism", "Edge") => 2.0,
             ("Neumorphism", "Touch") => 14.0,
             ("Neumorphism", "Comfort") => 22.0,
-            ("Neumorphism", "Soft") => 8.0,
+            ("Neumorphism", "Soft" | "Filter") => 8.0,
             ("Neumorphism", "Pill" | "Fully") => 999.0,
             (_, "Touch") => 8.0,
             (_, "Comfort") => 8.0,
@@ -19344,14 +19382,18 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Classic", "Light", "text_placeholder") => "Oklch[lightness:0.68]",
         ("Classic", "Light", "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
         ("Classic", "Light", "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
-        ("Classic", "Dark", "text") => "#dfdfdf",
-        ("Classic", "Dark", "input_text") => "#dfdfdf",
-        ("Classic", "Dark", "text_secondary") => "#d6d6d6",
-        ("Classic", "Dark", "text_tertiary") => "#d2d2d2",
-        ("Classic", "Dark", "text_disabled") => "#868686",
-        ("Classic", "Dark", "text_placeholder") => "#868686",
-        ("Classic", "Dark", "text_header") => "#b83f45",
-        ("Classic", "Dark", "danger") => "#b83f45",
+        ("Classic", "Light", "icon_checked") => "Oklch[lightness:0.4]",
+        ("Classic", "Light", "icon_unchecked") => "Oklch[lightness:0.667]",
+        ("Classic", "Dark", "text") => "Oklch[lightness:0.88]",
+        ("Classic", "Dark", "input_text") => "Oklch[lightness:0.86]",
+        ("Classic", "Dark", "text_secondary") => "Oklch[lightness:0.78]",
+        ("Classic", "Dark", "text_tertiary") => "Oklch[lightness:0.68]",
+        ("Classic", "Dark", "text_disabled") => "Oklch[lightness:0.54]",
+        ("Classic", "Dark", "text_placeholder") => "Oklch[lightness:0.58]",
+        ("Classic", "Dark", "text_header") => "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
+        ("Classic", "Dark", "danger") => "Oklch[lightness:0.72,chroma:0.12,hue:18.87]",
+        ("Classic", "Dark", "icon_checked") => "Oklch[lightness:0.86]",
+        ("Classic", "Dark", "icon_unchecked") => "Oklch[lightness:0.56]",
         ("Glassmorphism", "Light", "text") => "#30353c",
         ("Glassmorphism", "Light", "text_secondary") => "#6a7481",
         ("Glassmorphism", "Light", "text_tertiary") => "#6a7481",
@@ -19473,9 +19515,9 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
                 "family": family,
                 "size": 22.0,
                 "color": if checked {
-                    "Oklch[lightness:0.4]"
+                    document_theme_color(context, "icon_checked")
                 } else {
-                    "Oklch[lightness:0.667]"
+                    document_theme_color(context, "icon_unchecked")
                 },
                 "weight": "Normal"
             }),
@@ -19639,41 +19681,49 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
 fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value {
     let tagged = of.split_once('[').map(|(tag, _)| tag).unwrap_or(of);
     let light = document_theme_mode(context) == "Light";
+    let checkbox_checked = theme_tagged_field_bool(of, "checked").unwrap_or(false);
     if document_theme_name(context) == "Classic" {
         let material = match tagged {
             "Background" if light => json!({"color": "Oklch[lightness:0.97]"}),
-            "Background" => json!({"color": "#1b1b1b"}),
+            "Background" => json!({"color": "Oklch[lightness:0.07,chroma:0.008,hue:250]"}),
             "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
                 if light {
                     json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
                 } else {
-                    json!({"color": "#202020", "gloss": 0.0})
+                    json!({"color": "Oklch[lightness:0.12,chroma:0.01,hue:250]", "gloss": 0.0})
                 }
             }
             "InteractiveRecessed" => {
                 if light {
                     json!({"color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]", "gloss": 0.0})
                 } else {
-                    json!({"color": "#202020", "gloss": 0.0})
+                    json!({"color": "Oklch[lightness:1,chroma:0,hue:0,alpha:0.045]", "gloss": 0.0})
                 }
             }
             "Primary" if light => json!({"color": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]"}),
-            "Primary" => json!({"color": "#b83f45"}),
+            "Primary" => json!({"color": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]"}),
             "PrimarySubtle" if light => json!({
                 "color": "Oklch[lightness:1]",
                 "border": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]",
                 "border_width": 1.0
             }),
             "PrimarySubtle" => json!({
-                "color": "#00000000",
-                "border": "#b83f45",
+                "color": "Oklch[lightness:0.12,chroma:0.01,hue:250]",
+                "border": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
+                "border_width": 1.0
+            }),
+            "FilterSelected" if light => json!({
+                "border": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]",
+                "border_width": 1.0
+            }),
+            "FilterSelected" => json!({
+                "border": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
                 "border_width": 1.0
             }),
             "Danger" if light => json!({"color": "Oklch[lightness:0.57,chroma:0.109,hue:18.87]"}),
-            "Danger" => json!({"color": "#b83f45"}),
+            "Danger" => json!({"color": "Oklch[lightness:0.72,chroma:0.12,hue:18.87]"}),
+            "CheckboxGlyph" => document_theme_checkbox_glyph_material(context, checkbox_checked),
             "PanelFrame" => json!({
-                "border": if light { "#00000000" } else { "#3c3c3c" },
-                "border_width": if light { 0.0 } else { 1.0 },
                 "shadows": [
                     {
                         "y": 2.0,
@@ -19681,7 +19731,7 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                         "color": if light {
                             "Oklch[lightness:0,chroma:0,hue:0,alpha:0.24]"
                         } else {
-                            "#00000073"
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.45]"
                         }
                     },
                     {
@@ -19690,7 +19740,7 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                         "color": if light {
                             "Oklch[lightness:0,chroma:0,hue:0,alpha:0.14]"
                         } else {
-                            "#00000073"
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.30]"
                         }
                     }
                 ]
@@ -19785,6 +19835,9 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
         hovered,
     ) {
         return material;
+    }
+    if tagged == "CheckboxGlyph" {
+        return document_theme_checkbox_glyph_material(context, checkbox_checked);
     }
     match (document_theme_name(context), tagged, light) {
         ("Glassmorphism", "Background", true) => {
@@ -20017,6 +20070,102 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     }
 }
 
+fn document_theme_checkbox_glyph_material(
+    context: &DocumentEvalContext<'_>,
+    _checked: bool,
+) -> Value {
+    match (document_theme_name(context), document_theme_mode(context)) {
+        ("Classic", "Light") => json!({
+            "checkbox_background": "Oklch[lightness:1]",
+            "checkbox_border": "#ededed",
+            "checked_border": "#bddad5",
+            "check_color": "#5dc2af",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Classic", "Dark") => json!({
+            "checkbox_background": "Oklch[lightness:0.12,chroma:0.01,hue:250]",
+            "checkbox_border": "Oklch[lightness:0.34,chroma:0.01,hue:250]",
+            "checked_border": "Oklch[lightness:0.62,chroma:0.08,hue:180]",
+            "check_color": "Oklch[lightness:0.78,chroma:0.09,hue:180]",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Professional", "Light") => json!({
+            "checkbox_background": "#ffffff",
+            "checkbox_border": "#d9dee7",
+            "checked_border": "#bd454d",
+            "check_color": "#bd454d",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Professional", "Dark") => json!({
+            "checkbox_background": "#1b1f24",
+            "checkbox_border": "#3d4652",
+            "checked_border": "#dc6463",
+            "check_color": "#dc6463",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Glassmorphism", "Light") => json!({
+            "checkbox_background": "#ffffff8a",
+            "checkbox_border": "#8ba3bd8f",
+            "checked_border": "#ba4048db",
+            "check_color": "#ba4048db",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Glassmorphism", "Dark") => json!({
+            "checkbox_background": "#1f26438a",
+            "checkbox_border": "#b4c3eb70",
+            "checked_border": "#917cdecc",
+            "check_color": "#917cdecc",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Neobrutalism", "Light") => json!({
+            "checkbox_background": "#ffffff",
+            "checkbox_border": "#000000",
+            "checked_border": "#000000",
+            "check_color": "#000000",
+            "checkbox_border_width": 2.0,
+            "check_width": 4.0
+        }),
+        ("Neobrutalism", "Dark") => json!({
+            "checkbox_background": "#101010",
+            "checkbox_border": "#ffffff",
+            "checked_border": "#ffffff",
+            "check_color": "#ffffff",
+            "checkbox_border_width": 2.0,
+            "check_width": 4.0
+        }),
+        ("Neumorphism", "Light") => json!({
+            "checkbox_background": "#eef1f6",
+            "checkbox_border": "#a8b2c23d",
+            "checked_border": "#b94a52",
+            "check_color": "#b94a52",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        ("Neumorphism", "Dark") => json!({
+            "checkbox_background": "#252c36",
+            "checkbox_border": "#ffffff14",
+            "checked_border": "#ffffff",
+            "check_color": "#ffffff",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+        _ => json!({
+            "checkbox_background": "#ffffff",
+            "checkbox_border": "#d9dee7",
+            "checked_border": "#bd454d",
+            "check_color": "#bd454d",
+            "checkbox_border_width": 1.5,
+            "check_width": 3.0
+        }),
+    }
+}
+
 fn document_theme_reference_material(
     theme: &str,
     tagged: &str,
@@ -20059,6 +20208,18 @@ fn document_theme_reference_material(
         ("Professional", "PrimarySubtle", false) => {
             json!({"color": "#1d2127", "border": "#d65d5e", "border_width": 1.0})
         }
+        ("Professional", "FilterSelected", true) => json!({
+            "color": "#fbf1f2",
+            "border": "#f0d0d3",
+            "border_width": 1.0,
+            "shadows": [{"y": 1.0, "blur": 2.0, "color": "#b140491a"}]
+        }),
+        ("Professional", "FilterSelected", false) => json!({
+            "color": "#1d2127",
+            "border": "#d65d5e",
+            "border_width": 1.0,
+            "shadows": [{"spread": 1.0, "color": "#d65d5e2e"}]
+        }),
         ("Professional", "Danger", true) => json!({"color": "#b5424a"}),
         ("Professional", "Danger", false) => json!({"color": "#d65d5e"}),
 
@@ -20096,6 +20257,20 @@ fn document_theme_reference_material(
         ("Glassmorphism", "PrimarySubtle", false) => {
             json!({"color": "#765ec22e", "refraction": 1.5, "border": "#a890f6c2", "border_width": 1.0})
         }
+        ("Glassmorphism", "FilterSelected", true) => json!({
+            "color": "#fff2f4ad",
+            "refraction": 1.5,
+            "border": "#da677052",
+            "border_width": 1.0,
+            "shadows": [{"y": 8.0, "blur": 18.0, "color": "#7a3e4e14"}]
+        }),
+        ("Glassmorphism", "FilterSelected", false) => json!({
+            "color": "#765ec22e",
+            "refraction": 1.5,
+            "border": "#a890f6c2",
+            "border_width": 1.0,
+            "shadows": [{"blur": 22.0, "color": "#765ec23d"}]
+        }),
         ("Glassmorphism", "Danger", true) => json!({"color": "#a7434d"}),
         ("Glassmorphism", "Danger", false) => json!({"color": "#a890f6"}),
 
@@ -20125,6 +20300,8 @@ fn document_theme_reference_material(
         | ("Neobrutalism", "Danger", false) => {
             json!({"color": "#ffffff", "border": "#ffffff", "border_width": if tagged == "PrimarySubtle" { 1.0 } else { 0.0 }})
         }
+        ("Neobrutalism", "FilterSelected", true) => json!({"color": "#000000"}),
+        ("Neobrutalism", "FilterSelected", false) => json!({"color": "#ffffff"}),
 
         ("Neumorphism", "Background", true) => json!({"color": "#e9edf3"}),
         ("Neumorphism", "Background", false) => json!({"color": "#1d232d"}),
@@ -20184,6 +20361,24 @@ fn document_theme_reference_material(
             ]
         }),
         ("Neumorphism", "PrimarySubtle", false) => json!({
+            "color": "#252c36",
+            "border": "#ffffff0f",
+            "border_width": 1.0,
+            "shadows": [
+                {"x": 5.0, "y": 5.0, "blur": 12.0, "color": "#00000061"},
+                {"x": -5.0, "y": -5.0, "blur": 12.0, "color": "#4f5b6d24"}
+            ]
+        }),
+        ("Neumorphism", "FilterSelected", true) => json!({
+            "color": "#eef1f6",
+            "border": "#ffffff7a",
+            "border_width": 1.0,
+            "shadows": [
+                {"x": 4.0, "y": 4.0, "blur": 10.0, "color": "#a6aebe73"},
+                {"x": -4.0, "y": -4.0, "blur": 10.0, "color": "#ffffffdb"}
+            ]
+        }),
+        ("Neumorphism", "FilterSelected", false) => json!({
             "color": "#252c36",
             "border": "#ffffff0f",
             "border_width": 1.0,
@@ -26836,7 +27031,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_theme_material_primary_subtle_lowers_as_object() {
+    fn physical_theme_material_filter_selected_lowers_as_object() {
         let units =
             boon_runtime::source_units_for_path(&repo_path("examples/todo_mvc_physical/RUN.bn"))
                 .unwrap();
@@ -26880,27 +27075,27 @@ mod tests {
                                         .get(arg.value)
                                         .and_then(|expr| document_expr_value(expr, &parsed.ast.expressions))
                                         .as_deref()
-                                        == Some("PrimarySubtle")
+                                        == Some("FilterSelected")
                             })
                 )
             })
-            .expect("physical source should call Theme/material(of: PrimarySubtle)");
+            .expect("physical source should call Theme/material(of: FilterSelected)");
         let value = document_eval_expr_value(material_expr, &parsed.ast.expressions, &context)
-            .expect("PrimarySubtle material should evaluate");
+            .expect("FilterSelected material should evaluate");
         assert_eq!(
             value.get("border").and_then(Value::as_str),
             Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
-            "PrimarySubtle should return the Classic selected-filter outline material: {value}"
+            "FilterSelected should return the Classic selected-filter outline material: {value}"
         );
         assert_eq!(
             value.get("color").and_then(Value::as_str),
-            Some("Oklch[lightness:1]"),
-            "PrimarySubtle should keep a white selected-filter fill: {value}"
+            None,
+            "Classic FilterSelected should not paint a backing fill: {value}"
         );
     }
 
     #[test]
-    fn physical_filter_button_material_preserves_selected_outline_and_glow() {
+    fn physical_filter_button_material_keeps_inactive_filters_unpainted() {
         let units =
             boon_runtime::source_units_for_path(&repo_path("examples/todo_mvc_physical/RUN.bn"))
                 .unwrap();
@@ -26911,30 +27106,6 @@ mod tests {
         .unwrap();
         let functions =
             DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
-        let mut locals = BTreeMap::new();
-        locals.insert("selected".to_owned(), Value::Bool(true));
-        locals.insert(
-            "element".to_owned(),
-            json!({
-                "hovered": false
-            }),
-        );
-        let context = DocumentEvalContext {
-            root: None,
-            locals,
-            render_args: BTreeMap::new(),
-            passed: Some(json!({
-                "theme_options": {
-                    "name": "Classic",
-                    "mode": "Light"
-                }
-            })),
-            source_binding_index: Arc::new(BTreeMap::new()),
-            source_override: None,
-            functions: Some(&functions),
-            eval_depth: 0,
-            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
-        };
         let material_expr = parsed
             .ast
             .expressions
@@ -26947,22 +27118,53 @@ mod tests {
                 )
             })
             .expect("physical source should call filter_button_material");
-        let value = document_eval_expr_value(material_expr, &parsed.ast.expressions, &context)
-            .expect("filter_button_material should evaluate");
+        let context_for_selected = |selected| {
+            let mut locals = BTreeMap::new();
+            locals.insert("selected".to_owned(), Value::Bool(selected));
+            DocumentEvalContext {
+                root: None,
+                locals,
+                render_args: BTreeMap::new(),
+                passed: Some(json!({
+                    "theme_options": {
+                        "name": "Classic",
+                        "mode": "Light"
+                    }
+                })),
+                source_binding_index: Arc::new(BTreeMap::new()),
+                source_override: None,
+                functions: Some(&functions),
+                eval_depth: 0,
+                eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            }
+        };
+        let selected_context = context_for_selected(true);
+        let value =
+            document_eval_expr_value(material_expr, &parsed.ast.expressions, &selected_context)
+                .expect("filter_button_material should evaluate");
         assert_eq!(
             value.get("border").and_then(Value::as_str),
             Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
-            "selected filter material should preserve PrimarySubtle border: {value}"
+            "selected filter material should preserve FilterSelected border: {value}"
         );
         assert_eq!(
             value.pointer("/glow/color").and_then(Value::as_str),
-            Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
-            "selected filter glow should remain nested under glow: {value}"
+            None,
+            "filter buttons should not synthesize material glow rectangles: {value}"
+        );
+        let inactive_context = context_for_selected(false);
+        let inactive =
+            document_eval_expr_value(material_expr, &parsed.ast.expressions, &inactive_context);
+        assert!(
+            inactive.as_ref().map_or(true, |value| value
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)),
+            "inactive filters should not return material chrome, got {inactive:?}"
         );
     }
 
     #[test]
-    fn physical_todomvc_todo_row_lowers_source_bindings_and_svg_asset() {
+    fn physical_todomvc_todo_row_lowers_source_bindings_and_themed_checkbox_glyph() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
@@ -27036,25 +27238,42 @@ mod tests {
             "checkbox accessibility label should not paint as visible text"
         );
 
-        let icon = layout
-            .display_list
-            .iter()
-            .find(|item| item.style.contains_key("asset_url"))
-            .expect("todo checkbox icon should lower generated SVG asset URL");
-        let asset_url = icon
-            .style
-            .get("asset_url")
-            .and_then(|value| match value {
-                boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
-                _ => None,
-            })
-            .unwrap_or_default();
         assert!(
-            asset_url.starts_with("data:image/svg+xml;utf8,"),
-            "generated physical SVG asset should lower as a data URL"
+            !layout
+                .display_list
+                .iter()
+                .any(|item| item.style.contains_key("asset_url")),
+            "physical todo row checkbox should use theme-owned glyph styles, not fixed SVG assets"
         );
-        assert_eq!(icon.bounds.width, 40.0);
-        assert_eq!(icon.bounds.height, 40.0);
+        assert_eq!(
+            checkbox.style.get("checkbox_border"),
+            Some(&boon_document_model::StyleValue::Text("#ededed".to_owned())),
+            "unchecked checkbox ring should come from the active Classic light theme"
+        );
+        assert_eq!(
+            checkbox.style.get("checked_border"),
+            Some(&boon_document_model::StyleValue::Text("#bddad5".to_owned())),
+            "checked checkbox ring should come from the active Classic light theme"
+        );
+        assert_eq!(
+            checkbox.style.get("check_color"),
+            Some(&boon_document_model::StyleValue::Text("#5dc2af".to_owned())),
+            "checkbox checkmark should come from the active Classic light theme"
+        );
+        for generic_surface_key in [
+            "background",
+            "material_color",
+            "border",
+            "box_shadow_1_color",
+            "box_shadow_8_color",
+            "depth",
+        ] {
+            assert!(
+                !checkbox.style.contains_key(generic_surface_key),
+                "checkbox glyph should not also lower a generic `{generic_surface_key}` surface: {:?}",
+                checkbox.style
+            );
+        }
 
         let empty_source_paths = proof["source_intent_assertions"]
             .as_array()
@@ -27097,7 +27316,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "d2d738f2c8ef",
+            "540f7e8d2b90",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -27148,7 +27367,12 @@ mod tests {
                 "todos": [
                     {"id": "todo-1", "title": "Active", "completed": false, "edited_title": "", "todo_elements": {}},
                     {"id": "todo-2", "title": "Completed", "completed": true, "edited_title": "", "todo_elements": {}}
-                ]
+                ],
+                "active_count": 1,
+                "completed_count": 1,
+                "has_todos": true,
+                "has_completed": true,
+                "all_completed": false
             },
             "theme_options": {
                 "name": "Classic",
@@ -27254,7 +27478,12 @@ mod tests {
                         "completed": true,
                         "edited_title": ""
                     }
-                ]
+                ],
+                "active_count": 1,
+                "completed_count": 1,
+                "has_todos": true,
+                "has_completed": true,
+                "all_completed": false
             },
             "theme_options": {
                 "name": "Classic",
@@ -28065,19 +28294,39 @@ mod tests {
                     );
                 }
                 let selected_filter = text_button("All");
-                assert!(
-                    selected_filter.style.get("border").is_some()
-                        && style_number_from_map(&selected_filter.style, "border_width")
-                            .is_some_and(|width| width >= 0.9),
-                    "{context} selected filter should lower the source PrimarySubtle outline: {:?}",
-                    selected_filter.style
-                );
-                assert!(
-                    selected_filter.style.contains_key("material_color")
-                        || selected_filter.style.contains_key("background"),
-                    "{context} selected filter should lower helper-returned material tokens, not a raw list marker: {:?}",
-                    selected_filter.style
-                );
+                if theme == "Neobrutalism" {
+                    assert!(
+                        selected_filter.style.get("border").is_none()
+                            || style_number_from_map(&selected_filter.style, "border_width")
+                                .unwrap_or(0.0)
+                                <= f32::EPSILON,
+                        "{context} Neobrutalist selected filters should be solid blocks without an extra outline: {:?}",
+                        selected_filter.style
+                    );
+                } else {
+                    assert!(
+                        selected_filter.style.get("border").is_some()
+                            && style_number_from_map(&selected_filter.style, "border_width")
+                                .is_some_and(|width| width >= 0.9),
+                        "{context} selected filter should lower the source FilterSelected outline: {:?}",
+                        selected_filter.style
+                    );
+                }
+                if theme == "Classic" {
+                    assert!(
+                        !selected_filter.style.contains_key("material_color")
+                            && !selected_filter.style.contains_key("background"),
+                        "{context} Classic selected filters should keep the HTML fixture's transparent background: {:?}",
+                        selected_filter.style
+                    );
+                } else {
+                    assert!(
+                        selected_filter.style.contains_key("material_color")
+                            || selected_filter.style.contains_key("background"),
+                        "{context} selected filter should lower helper-returned material tokens, not a raw list marker: {:?}",
+                        selected_filter.style
+                    );
+                }
                 let inactive_filter = text_button("Active");
                 assert_ne!(
                     inactive_filter.style.get("border"),
@@ -28086,6 +28335,19 @@ mod tests {
                     selected_filter.style,
                     inactive_filter.style
                 );
+                for generic_surface_key in [
+                    "background",
+                    "material_color",
+                    "box_shadow_1_color",
+                    "box_shadow_8_color",
+                    "depth",
+                ] {
+                    assert!(
+                        !inactive_filter.style.contains_key(generic_surface_key),
+                        "{context} inactive filter should not lower generic `{generic_surface_key}` chrome: {:?}",
+                        inactive_filter.style
+                    );
+                }
 
                 let clear = text_button("Clear completed");
                 let clear_text = text_item("Clear completed");
@@ -28518,7 +28780,12 @@ mod tests {
                         "completed": false,
                         "edited_title": ""
                     }
-                ]
+                ],
+                "active_count": 3,
+                "completed_count": 1,
+                "has_todos": true,
+                "has_completed": true,
+                "all_completed": false
             },
             "theme_options": {
                 "name": theme_name,
@@ -28528,8 +28795,14 @@ mod tests {
     }
 
     fn mirror_physical_todomvc_seed_root_fields(state: &mut serde_json::Value) {
+        derive_physical_todomvc_seed_store_fields(state);
         for field in [
             "todos",
+            "active_count",
+            "completed_count",
+            "has_todos",
+            "has_completed",
+            "all_completed",
             "selected_filter",
             "selected_todo_id",
             "title_to_save",
@@ -28545,6 +28818,41 @@ mod tests {
                 state[field] = value;
             }
         }
+    }
+
+    fn derive_physical_todomvc_seed_store_fields(state: &mut serde_json::Value) {
+        let Some(todos) = state
+            .pointer("/store/todos")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return;
+        };
+        let completed_count = todos
+            .iter()
+            .filter(|todo| todo["completed"].as_bool() == Some(true))
+            .count();
+        let active_count = todos.len().saturating_sub(completed_count);
+        let Some(store) = state
+            .get_mut("store")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        store
+            .entry("active_count")
+            .or_insert_with(|| json!(active_count));
+        store
+            .entry("completed_count")
+            .or_insert_with(|| json!(completed_count));
+        store
+            .entry("has_todos")
+            .or_insert_with(|| json!(active_count > 0 || completed_count > 0));
+        store
+            .entry("has_completed")
+            .or_insert_with(|| json!(completed_count > 0));
+        store
+            .entry("all_completed")
+            .or_insert_with(|| json!(active_count == 0 && completed_count > 0));
     }
 
     #[test]
@@ -28685,6 +28993,123 @@ mod tests {
     }
 
     #[test]
+    fn physical_todomvc_toggle_all_completes_then_clears_every_row() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let live_runtime = Arc::new(Mutex::new(
+            live_runtime_from_source_text("physical-todomvc-toggle-all", &source_path, &source)
+                .expect("physical TodoMVC runtime should initialize"),
+        ));
+        let state_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(state_summary["store"]["active_count"], 3);
+        assert_eq!(state_summary["store"]["completed_count"], 1);
+        assert_eq!(state_summary["store"]["all_completed"], false);
+        let (layout_proof, layout_frame) = native_document_layout_proof_with_state_embedded(
+            &source_path,
+            &source,
+            Some(&state_summary),
+        )
+        .expect("physical TodoMVC layout should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(layout_frame),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+
+        for (index, expected_completed, expected_active_count, expected_completed_count) in
+            [(0_u64, true, 0_i64, 4_i64), (1_u64, false, 4_i64, 0_i64)]
+        {
+            let layout = shared_render_state.lock().unwrap().layout_proof.clone();
+            let (toggle_x, toggle_y, _) =
+                source_hit_center(&layout, "store.elements.toggle_all_checkbox")
+                    .expect("physical toggle-all should expose a hit region");
+            preview_apply_real_window_input(
+                &deterministic_click_input_from_index(index, toggle_x, toggle_y),
+                &source_path,
+                &source,
+                Some(&live_runtime),
+                &shared_render_state,
+                &mut input_state,
+            )
+            .expect("clicking physical toggle-all should dispatch a source event");
+            let summary = live_runtime.lock().unwrap().document_state_summary();
+            let todos = summary["todos"]
+                .as_array()
+                .expect("physical TodoMVC state should expose todos");
+            assert!(
+                todos
+                    .iter()
+                    .all(|todo| todo["completed"].as_bool() == Some(expected_completed)),
+                "toggle-all click {index} should set every row to {expected_completed}: {todos:?}"
+            );
+            assert_eq!(
+                summary["store"]["active_count"].as_i64(),
+                Some(expected_active_count)
+            );
+            assert_eq!(
+                summary["store"]["completed_count"].as_i64(),
+                Some(expected_completed_count)
+            );
+            assert_eq!(
+                summary["store"]["all_completed"].as_bool(),
+                Some(expected_completed)
+            );
+            assert_physical_todomvc_preview_healthy(
+                &shared_render_state,
+                &format!("after toggle-all click {index}"),
+            );
+        }
+    }
+
+    #[test]
+    fn physical_todomvc_empty_state_hides_toggle_all_and_bulk_footer_controls() {
+        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+        let source =
+            std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
+        let mut state = physical_todomvc_seed_state("Classic", "Light");
+        state["store"]["todos"] = json!([]);
+        state["store"]["active_count"] = json!(0);
+        state["store"]["completed_count"] = json!(0);
+        state["store"]["has_todos"] = json!(false);
+        state["store"]["has_completed"] = json!(false);
+        state["store"]["all_completed"] = json!(false);
+        mirror_physical_todomvc_seed_root_fields(&mut state);
+        let (layout_proof, layout) =
+            native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
+                .expect("empty physical TodoMVC layout should lower");
+        assert!(
+            source_hit_center(&layout_proof, "store.elements.toggle_all_checkbox").is_err(),
+            "empty physical TodoMVC should not expose a toggle-all hit region"
+        );
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)),
+            "empty physical TodoMVC should not render row checkboxes"
+        );
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Clear completed")),
+            "empty physical TodoMVC should hide the clear-completed control"
+        );
+        assert!(
+            physical_new_todo_input_item(&layout).is_some(),
+            "empty physical TodoMVC should keep the new-todo input visible"
+        );
+    }
+
+    #[test]
     fn physical_todomvc_theme_and_mode_clicks_restyle_preview() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
@@ -28716,6 +29141,17 @@ mod tests {
         }));
         let mut input_state = PreviewNativeInputState::default();
 
+        let initial_frame = latest_preview_frame(&shared_render_state);
+        let initial_new_todo_input = physical_new_todo_input_item(&initial_frame)
+            .expect("initial physical frame should expose the new-todo text input");
+        assert_eq!(
+            initial_new_todo_input.style.get("placeholder_size"),
+            Some(&boon_document_model::StyleValue::Number(24.0)),
+            "Classic placeholder should lower its nested Theme/font(Placeholder) size"
+        );
+        let mut previous_checkbox_check_color =
+            first_todo_checkbox_style_text(&initial_frame, "check_color")
+                .expect("initial physical frame should expose themed checkbox check color");
         let themes = [
             ("Classic", "classic"),
             ("Professional", "professional"),
@@ -28750,10 +29186,18 @@ mod tests {
             let root_color = frame_root_material_color(&frame).unwrap_or_else(|| {
                 panic!("{expected_name} frame should expose a root material color")
             });
+            let checkbox_check_color = first_todo_checkbox_style_text(&frame, "check_color")
+                .unwrap_or_else(|| {
+                    panic!("{expected_name} frame should expose themed row checkbox check color")
+                });
             if *expected_name != "Classic" {
                 assert_ne!(
                     root_color, previous_root_color,
                     "changing to {expected_name} should re-lower visible material colors"
+                );
+                assert_ne!(
+                    checkbox_check_color, previous_checkbox_check_color,
+                    "changing to {expected_name} should re-lower todo row checkbox glyph colors"
                 );
             }
             if *expected_name == "Glassmorphism" {
@@ -28762,10 +29206,26 @@ mod tests {
                     "Glassmorphism should visibly switch to the glass palette, got {root_color}"
                 );
             }
+            if *expected_name == "Neobrutalism" {
+                let new_todo_input = physical_new_todo_input_item(&frame)
+                    .expect("Neobrutalism frame should expose the new-todo text input");
+                assert_eq!(
+                    new_todo_input.style.get("size"),
+                    Some(&boon_document_model::StyleValue::Number(25.0)),
+                    "typed input text should keep the Neobrutalism Input font size"
+                );
+                assert_eq!(
+                    new_todo_input.style.get("placeholder_size"),
+                    Some(&boon_document_model::StyleValue::Number(22.0)),
+                    "placeholder text should use the Neobrutalism Placeholder font size"
+                );
+            }
             previous_root_color = root_color;
+            previous_checkbox_check_color = checkbox_check_color;
         }
 
         let light_before_mode_root_color = previous_root_color;
+        let light_before_mode_checkbox_check_color = previous_checkbox_check_color;
         let mode_layout = shared_render_state.lock().unwrap().layout_proof.clone();
         let (mode_x, mode_y, _) =
             source_hit_center(&mode_layout, "store.elements.theme_switcher.mode_toggle")
@@ -28788,6 +29248,19 @@ mod tests {
         assert_ne!(
             dark_root_color, light_before_mode_root_color,
             "changing light/dark mode should re-lower visible material colors"
+        );
+        let dark_checkbox_check_color = first_todo_checkbox_style_text(&dark_frame, "check_color")
+            .expect("dark frame should expose themed row checkbox check color");
+        assert_ne!(
+            dark_checkbox_check_color, light_before_mode_checkbox_check_color,
+            "changing light/dark mode should re-lower todo row checkbox glyph colors"
+        );
+        assert!(
+            !dark_frame
+                .display_list
+                .iter()
+                .any(|item| item.style.contains_key("asset_url")),
+            "themed physical rows should not keep stale SVG asset icons after mode changes"
         );
         assert!(
             dark_frame
@@ -32381,7 +32854,7 @@ mod tests {
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
                     && item.bounds.width >= 540.0
-                    && item.bounds.height >= 48.5
+                    && item.bounds.height >= 45.5
                     && item.bounds.height <= 49.5
                     && item.style.get("border_top").is_some()
             })
@@ -32603,7 +33076,7 @@ mod tests {
         let author_link = layout
             .display_list
             .iter()
-            .find(|item| item.text.as_deref() == Some("Martin Kavik"))
+            .find(|item| item.text.as_deref() == Some("Martin Kavík"))
             .expect("TodoMVC author footer link should render");
         let author_prefix = layout
             .display_list
@@ -35354,6 +35827,30 @@ mod tests {
             })
             .and_then(|item| style_text_from_map(&item.style, "material_color"))
             .map(str::to_owned)
+    }
+
+    fn first_todo_checkbox_style_text(
+        frame: &boon_document::LayoutFrame,
+        key: &str,
+    ) -> Option<String> {
+        frame
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
+            .and_then(|item| style_text_from_map(&item.style, key))
+            .map(str::to_owned)
+    }
+
+    fn physical_new_todo_input_item(
+        frame: &boon_document::LayoutFrame,
+    ) -> Option<&boon_document::DisplayItem> {
+        frame.display_list.iter().find(|item| {
+            matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                && item.style.get("placeholder")
+                    == Some(&boon_document_model::StyleValue::Text(
+                        "What needs to be done?".to_owned(),
+                    ))
+        })
     }
 
     fn cells_live_runtime(

@@ -4,6 +4,9 @@ source = "examples/todo_mvc_physical/RUN.bn"
 [[step]]
 id = "initial"
 expect_root_text = { "theme_options.name" = "Classic" }
+expect_completed_titles = ["Finish TodoMVC renderer"]
+expect_active_count = 3
+expect_completed_count = 1
 
 [[step]]
 id = "add-todo"
@@ -11,22 +14,42 @@ user_action = { kind = "key_down", target = "new todo input", key = "Enter", tex
 expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "Ship physical TodoMVC" }
 expect_root_text = { "theme_options.name" = "Classic" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
+expect_completed_titles = ["Finish TodoMVC renderer"]
+expect_active_count = 4
+expect_completed_count = 1
 
 [[step]]
 id = "reject-empty-todo"
 user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "   " }
 expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "   " }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
+expect_completed_titles = ["Finish TodoMVC renderer"]
+expect_active_count = 4
+expect_completed_count = 1
 
 [[step]]
 id = "toggle-one-todo"
 user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC" }
 expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC" }
+expect_completed_titles = ["Finish TodoMVC renderer", "Ship physical TodoMVC"]
+expect_active_count = 3
+expect_completed_count = 2
 
 [[step]]
 id = "toggle-all"
 user_action = { kind = "click", target = "toggle all" }
 expected_source_event = { source = "store.elements.toggle_all_checkbox" }
+expect_completed_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
+expect_active_count = 0
+expect_completed_count = 5
+
+[[step]]
+id = "toggle-all-active"
+user_action = { kind = "click", target = "toggle all" }
+expected_source_event = { source = "store.elements.toggle_all_checkbox" }
+expect_completed_titles = []
+expect_active_count = 5
+expect_completed_count = 0
 
 [[step]]
 id = "filter-all-active-completed"
@@ -77,16 +100,26 @@ id = "edit-todo-commit"
 user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Enter" }
 expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Enter" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC edited"]
+expect_completed_titles = []
+expect_active_count = 5
+expect_completed_count = 0
 
 [[step]]
 id = "toggle-edited-todo-completed"
 user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC edited" }
 expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC edited" }
+expect_completed_titles = ["Ship physical TodoMVC edited"]
+expect_active_count = 4
+expect_completed_count = 1
 
 [[step]]
 id = "clear-completed"
 user_action = { kind = "click", target = "clear completed" }
 expected_source_event = { source = "store.elements.remove_completed_button" }
+expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries"]
+expect_completed_titles = []
+expect_active_count = 4
+expect_completed_count = 0
 
 [[step]]
 id = "switch-theme-classic"

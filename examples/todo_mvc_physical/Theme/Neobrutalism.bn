@@ -134,7 +134,23 @@ FUNCTION material(material) {
 
             PrimarySubtle => primary_subtle_base
 
+            FilterSelected => [
+                color: primary_base.color
+            ]
+
             Danger => danger_base
+
+            CheckboxGlyph[checked] => [
+                checkbox_background: surface_base.color
+                checkbox_border: primary_base.color
+                checked_border: primary_base.color
+                check_color: primary_base.color
+                checkbox_border_width: PASSED.mode |> WHEN {
+                    Light => 2
+                    Dark => 2
+                }
+                check_width: 4
+            ]
         }
     }
 }
@@ -308,6 +324,7 @@ FUNCTION corners(of) {
         Touch => 0
         Comfort => 0
         Soft => 12
+        Filter => 0
         Pill => Fully
     }
 }

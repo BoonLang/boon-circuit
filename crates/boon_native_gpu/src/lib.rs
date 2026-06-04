@@ -1691,8 +1691,22 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             let color = style_color_u8(&item.style, "color").unwrap_or([36, 44, 58, 255]);
             (raw_text.to_owned(), color)
         };
+        let run_size = if placeholder_active {
+            style_number(&item.style, "placeholder_size").unwrap_or(size)
+        } else {
+            size
+        };
+        let run_line_height = if placeholder_active {
+            style_number(&item.style, "placeholder_line_height").unwrap_or(line_height)
+        } else {
+            line_height
+        };
         let font_family = if checked && !matches!(item.kind, DocumentNodeKind::Checkbox) {
             "DejaVu Sans"
+        } else if placeholder_active {
+            style_text(&item.style, "placeholder_font")
+                .or_else(|| style_text(&item.style, "font"))
+                .unwrap_or(DOCUMENT_FONT_FAMILY)
         } else {
             style_text(&item.style, "font").unwrap_or(DOCUMENT_FONT_FAMILY)
         };
@@ -1710,15 +1724,20 @@ fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
             } else {
                 text_font_style(&item.style)
             },
-            font_weight: text_font_weight(&item.style),
+            font_weight: if placeholder_active {
+                placeholder_font_weight(&item.style)
+                    .unwrap_or_else(|| text_font_weight(&item.style))
+            } else {
+                text_font_weight(&item.style)
+            },
             font_features: style_text(&item.style, "font_features")
                 .unwrap_or("")
                 .to_owned(),
             text_inset: style_number(&item.style, "text_inset").unwrap_or(4.0),
             text_clip_padding: style_number(&item.style, "text_clip_padding").unwrap_or(0.0),
             color,
-            size,
-            line_height,
+            size: run_size,
+            line_height: run_line_height,
             align: text_align(&item.kind, &item.style),
             vertical_align: text_vertical_align(&item.kind, &item.style),
             rotate_degrees: normalized_quarter_turn(style_number(&item.style, "rotate")),
@@ -1990,6 +2009,15 @@ fn text_font_weight(style: &StyleMap) -> Weight {
                 .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
         })
         .unwrap_or(Weight::NORMAL)
+}
+
+fn placeholder_font_weight(style: &StyleMap) -> Option<Weight> {
+    style_text(style, "placeholder_weight")
+        .map(text_font_weight_value)
+        .or_else(|| {
+            style_number(style, "placeholder_weight")
+                .map(|value| Weight(value.round().clamp(100.0, 900.0) as u16))
+        })
 }
 
 fn text_font_weight_value(value: &str) -> Weight {
@@ -2465,12 +2493,19 @@ fn rect_vertices(
         {
             continue;
         }
-        push_shadows(&mut builder, item.bounds, width, height, &item.style);
+        let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
+        push_shadows(
+            &mut builder,
+            item.bounds,
+            width,
+            height,
+            &item.style,
+            border_radius,
+        );
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
         let fill = material_adjusted_fill(fill, &item.style);
-        let border_radius = style_number(&item.style, "border_radius").unwrap_or(0.0);
         push_styled_rect(
             &mut builder,
             item.bounds,
@@ -2480,7 +2515,14 @@ fn rect_vertices(
             border_radius,
         );
         metrics.rendered_rect_count += 1;
-        push_material_highlights(&mut builder, item.bounds, width, height, &item.style);
+        push_material_highlights(
+            &mut builder,
+            item.bounds,
+            width,
+            height,
+            &item.style,
+            border_radius,
+        );
         if let Some(asset_url) = style_asset_url(&item.style) {
             push_asset_rect(&mut builder, item.bounds, width, height, asset_url);
             metrics.rendered_rect_count += 1;
@@ -3167,7 +3209,15 @@ fn push_triangle(
     );
 }
 
-fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, style: &StyleMap) {
+fn push_shadows(
+    builder: &mut QuadBuilder,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+    radius: f32,
+) {
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
     for index in (1..=8).rev() {
         let color_key = format!("box_shadow_{index}_color");
         let Some(color) = style_color_f32(style, &color_key) else {
@@ -3180,18 +3230,13 @@ fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, 
         let inset = style_bool(style, &format!("box_shadow_{index}_inset")) == Some(true);
         if inset {
             let thickness = blur.max(1.0);
-            push_rect(
-                builder,
-                Rect {
-                    x: rect.x,
-                    y: rect.y + rect.height - thickness + y,
-                    width: rect.width,
-                    height: thickness,
-                },
-                width,
-                height,
-                color,
-            );
+            let band = Rect {
+                x: rect.x,
+                y: rect.y + rect.height - thickness + y,
+                width: rect.width,
+                height: thickness,
+            };
+            push_styled_rect(builder, band, width, height, color, radius);
         } else {
             let base = Rect {
                 x: rect.x + x - spread,
@@ -3199,6 +3244,43 @@ fn push_shadows(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32, 
                 width: (rect.width + spread * 2.0).max(1.0),
                 height: (rect.height + spread * 2.0).max(1.0),
             };
+            if radius > 0.25 {
+                let base_radius =
+                    (radius + spread.max(0.0)).clamp(0.0, base.width.min(base.height) * 0.5);
+                if blur <= 0.0 {
+                    push_styled_rect(builder, base, width, height, color, base_radius);
+                    continue;
+                }
+                push_styled_rect(
+                    builder,
+                    base,
+                    width,
+                    height,
+                    color_with_alpha_scale(color, 0.42),
+                    base_radius,
+                );
+                let steps = blur.ceil().clamp(2.0, 18.0) as u32;
+                for step in (0..steps).rev() {
+                    let outer_expand = blur * (step + 1) as f32 / steps as f32;
+                    let t = (step + 1) as f32 / steps as f32;
+                    let alpha_scale = (1.0 - t).powi(2) * 0.36;
+                    if alpha_scale < 0.01 {
+                        continue;
+                    }
+                    let layer = expanded_rect(base, outer_expand);
+                    let layer_radius = (base_radius + outer_expand)
+                        .clamp(0.0, layer.width.min(layer.height) * 0.5);
+                    push_styled_rect(
+                        builder,
+                        layer,
+                        width,
+                        height,
+                        color_with_alpha_scale(color, alpha_scale),
+                        layer_radius,
+                    );
+                }
+                continue;
+            }
             if blur <= 0.0 {
                 push_rect_difference(builder, base, rect, width, height, color);
                 continue;
@@ -3271,7 +3353,9 @@ fn push_material_highlights(
     width: f32,
     height: f32,
     style: &StyleMap,
+    radius: f32,
 ) {
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
     let gloss = style_number(style, "gloss").unwrap_or(0.0).clamp(0.0, 1.0);
     let transparency = style_number(style, "transparency")
         .unwrap_or(0.0)
@@ -3281,7 +3365,7 @@ fn push_material_highlights(
     let top_alpha = (gloss * 0.11 + transparency * 0.08 + refraction * 0.015).clamp(0.0, 0.24);
     if top_alpha > 0.01 && rect.width > 2.0 && rect.height > 2.0 {
         let band = (1.0 + gloss * 2.0 + transparency * 2.0).clamp(1.0, 5.0);
-        push_rect(
+        push_styled_rect(
             builder,
             Rect {
                 x: rect.x,
@@ -3292,8 +3376,9 @@ fn push_material_highlights(
             width,
             height,
             [1.0, 1.0, 1.0, top_alpha],
+            radius,
         );
-        push_rect(
+        push_styled_rect(
             builder,
             Rect {
                 x: rect.x,
@@ -3304,12 +3389,13 @@ fn push_material_highlights(
             width,
             height,
             [1.0, 1.0, 1.0, top_alpha * 0.45],
+            radius,
         );
     }
     let bottom_alpha = ((1.0 - gloss) * 0.035 + depth * 0.006).clamp(0.0, 0.18);
     if bottom_alpha > 0.01 && rect.width > 2.0 && rect.height > 3.0 {
         let band = (1.0 + depth * 0.16).clamp(1.0, 4.0);
-        push_rect(
+        push_styled_rect(
             builder,
             Rect {
                 x: rect.x,
@@ -3320,6 +3406,7 @@ fn push_material_highlights(
             width,
             height,
             [0.0, 0.0, 0.0, bottom_alpha],
+            radius,
         );
     }
 }
@@ -3795,7 +3882,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
             }
         }
         DocumentNodeKind::TextInput => [1.0, 1.0, 1.0, 1.0],
-        DocumentNodeKind::Button => [0.92, 0.95, 0.97, 1.0],
+        DocumentNodeKind::Button => [1.0, 1.0, 1.0, 0.0],
         DocumentNodeKind::Checkbox => [1.0, 1.0, 1.0, 0.0],
         DocumentNodeKind::Table | DocumentNodeKind::TableCell => [1.0, 1.0, 1.0, 1.0],
         DocumentNodeKind::Text => [1.0, 1.0, 1.0, 0.0],
@@ -3902,6 +3989,34 @@ mod tests {
             }
         }
         (positions, colors)
+    }
+
+    fn vertex_pixels_for_color(
+        positions: &[f32],
+        colors: &[u8],
+        surface_width: f32,
+        surface_height: f32,
+        target_color: [u8; 4],
+    ) -> Vec<(f32, f32)> {
+        colors
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(index, color)| {
+                (color == target_color).then(|| {
+                    let x_ndc = positions[index * 2];
+                    let y_ndc = positions[index * 2 + 1];
+                    let x = (x_ndc + 1.0) * 0.5 * surface_width;
+                    let y = (1.0 - y_ndc) * 0.5 * surface_height;
+                    (x, y)
+                })
+            })
+            .collect()
+    }
+
+    fn has_vertex_at_pixel(vertices: &[(f32, f32)], x: f32, y: f32) -> bool {
+        vertices
+            .iter()
+            .any(|(vx, vy)| (*vx - x).abs() <= 0.01 && (*vy - y).abs() <= 0.01)
     }
 
     fn shape_glyph_ids(text: &str, font_features: FontFeatures) -> Vec<u16> {
@@ -4321,6 +4436,131 @@ mod tests {
     }
 
     #[test]
+    fn button_without_background_uses_transparent_default_fill() {
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("button".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 32.0,
+                },
+                text: None,
+                style: StyleMap::new(),
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, None);
+        let (_, colors) = flatten_quad_batches(&batches);
+        assert!(
+            colors
+                .chunks_exact(4)
+                .any(|color| color == [255, 255, 255, 0]),
+            "buttons without explicit material/background should not receive fallback chrome"
+        );
+    }
+
+    #[test]
+    fn rounded_material_highlights_respect_control_shape() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        style.insert("border_radius".to_owned(), StyleValue::Number(12.0));
+        style.insert("gloss".to_owned(), StyleValue::Number(1.0));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("rounded-button".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 80.0,
+                    height: 24.0,
+                },
+                text: None,
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (batches, _) = rect_vertices(&frame, 160.0, 90.0, None);
+        let (positions, colors) = flatten_quad_batches(&batches);
+        let highlight_vertices =
+            vertex_pixels_for_color(&positions, &colors, 160.0, 90.0, [255, 255, 255, 28]);
+        assert!(
+            !highlight_vertices.is_empty(),
+            "test fixture should emit a gloss highlight"
+        );
+        assert!(
+            !has_vertex_at_pixel(&highlight_vertices, 20.0, 20.0),
+            "rounded gloss highlights must not emit square top-left corner vertices"
+        );
+    }
+
+    #[test]
+    fn rounded_shadows_respect_control_shape() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        style.insert("border_radius".to_owned(), StyleValue::Number(12.0));
+        style.insert(
+            "box_shadow_1_color".to_owned(),
+            StyleValue::Text("#00000080".to_owned()),
+        );
+        style.insert("box_shadow_1_spread".to_owned(), StyleValue::Number(4.0));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("rounded-shadow".to_owned()),
+                kind: DocumentNodeKind::Button,
+                bounds: Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 80.0,
+                    height: 24.0,
+                },
+                text: None,
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (batches, _) = rect_vertices(&frame, 160.0, 90.0, None);
+        let (positions, colors) = flatten_quad_batches(&batches);
+        let shadow_vertices =
+            vertex_pixels_for_color(&positions, &colors, 160.0, 90.0, [0, 0, 0, 128]);
+        assert!(
+            !shadow_vertices.is_empty(),
+            "test fixture should emit a rounded shadow"
+        );
+        assert!(
+            !has_vertex_at_pixel(&shadow_vertices, 16.0, 16.0),
+            "rounded shadows must not emit square expanded-corner vertices"
+        );
+    }
+
+    #[test]
     fn focused_text_input_needs_explicit_caret_visibility_to_draw_caret() {
         let mut style = StyleMap::new();
         style.insert(
@@ -4574,7 +4814,7 @@ mod tests {
             height: 40.0,
         };
         let mut builder = QuadBuilder::default();
-        push_shadows(&mut builder, source, 160.0, 120.0, &style);
+        push_shadows(&mut builder, source, 160.0, 120.0, &style, 0.0);
         let (positions, _) = flatten_quad_batches(&builder.batches);
 
         assert_eq!(
@@ -4617,6 +4857,7 @@ mod tests {
             160.0,
             120.0,
             &style,
+            0.0,
         );
         let (_, colors) = flatten_quad_batches(&builder.batches);
 

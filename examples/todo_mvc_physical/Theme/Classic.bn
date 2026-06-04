@@ -31,6 +31,9 @@ FUNCTION material(material) {
                 panel_stack_fill: Oklch[lightness: 0.973]
                 shadow_medium: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.24]
                 shadow_soft: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.14]
+                checkbox_border: TEXT { #ededed }
+                checkbox_checked_border: TEXT { #bddad5 }
+                checkbox_check: TEXT { #5dc2af }
             ]
             Dark => [
                 background: Oklch[lightness: 0.07, chroma: 0.008, hue: 250]
@@ -43,6 +46,9 @@ FUNCTION material(material) {
                 panel_stack_fill: TEXT { #1d1d1d }
                 shadow_medium: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.45]
                 shadow_soft: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.30]
+                checkbox_border: Oklch[lightness: 0.34, chroma: 0.01, hue: 250]
+                checkbox_checked_border: Oklch[lightness: 0.62, chroma: 0.08, hue: 180]
+                checkbox_check: Oklch[lightness: 0.78, chroma: 0.09, hue: 180]
             ]
         }
 
@@ -76,8 +82,22 @@ FUNCTION material(material) {
                 border_width: 1
             ]
 
+            FilterSelected => [
+                border: colors.primary
+                border_width: 1
+            ]
+
             Danger => [
                 color: colors.danger
+            ]
+
+            CheckboxGlyph[checked] => [
+                checkbox_background: colors.surface
+                checkbox_border: colors.checkbox_border
+                checked_border: colors.checkbox_checked_border
+                check_color: colors.checkbox_check
+                checkbox_border_width: 1.5
+                check_width: 3
             ]
 
             PanelFrame => [
@@ -293,6 +313,7 @@ FUNCTION corners(of) {
         Touch => 0
         Comfort => 0
         Soft => 3
+        Filter => 3
         Pill => 3
     }
 }

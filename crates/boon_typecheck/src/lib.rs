@@ -1740,6 +1740,14 @@ impl<'a> Checker<'a> {
         field_order: &mut Vec<String>,
     ) {
         for statement in statements {
+            if semantic_block_statement(statement, &self.program.expressions) {
+                if let Some(Type::Object(shape)) =
+                    self.static_block_return_type(&statement.children, active_functions)
+                {
+                    merge_shape_override(fields, field_order, &shape);
+                }
+                continue;
+            }
             if let Some(field) = statement_output_name(statement)
                 && field != "document"
                 && let Some(ty) = self.static_statement_type(statement, active_functions)
@@ -1761,6 +1769,9 @@ impl<'a> Checker<'a> {
         statement: &AstStatement,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
+        if semantic_block_statement(statement, &self.program.expressions) {
+            return self.static_block_return_type(&statement.children, active_functions);
+        }
         if let Some(arm_type) = self.static_match_arm_statement_type(statement, active_functions) {
             return Some(arm_type);
         }
@@ -1792,6 +1803,17 @@ impl<'a> Checker<'a> {
                     }))
                 }),
         }
+    }
+
+    fn static_block_return_type(
+        &self,
+        statements: &[AstStatement],
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        statements
+            .iter()
+            .filter_map(|statement| self.static_statement_type(statement, active_functions))
+            .last()
     }
 
     fn static_match_arm_statement_type(
@@ -2465,7 +2487,7 @@ impl<'a> Checker<'a> {
         if !style_color_accepts_type(&ty) {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
-                format!("style field `{field_name}` must be `Oklch[...]`"),
+                format!("style field `{field_name}` must be `Oklch[...]` or CSS hex text"),
             ));
         }
     }
@@ -3824,6 +3846,9 @@ fn style_dimension_accepts_type(ty: &Type) -> bool {
 }
 
 fn style_color_accepts_type(ty: &Type) -> bool {
+    if matches!(ty, Type::Text) {
+        return true;
+    }
     matches!(
         ty,
         Type::VariantSet(variants)
@@ -5472,6 +5497,17 @@ fn collect_statement_shape_fields(
     field_order: &mut Vec<String>,
 ) {
     for statement in statements {
+        if semantic_block_statement(statement, expressions) {
+            if let Some(returned) = semantic_block_return_statement(&statement.children) {
+                collect_statement_shape_fields(
+                    std::slice::from_ref(returned),
+                    expressions,
+                    fields,
+                    field_order,
+                );
+            }
+            continue;
+        }
         if let Some(field) = statement_field(statement) {
             let ty = simple_statement_value_type(statement, expressions).unwrap_or_else(|| {
                 Type::Object(object_shape_for_statement(statement, expressions))
@@ -5481,6 +5517,24 @@ fn collect_statement_shape_fields(
             collect_statement_shape_fields(&statement.children, expressions, fields, field_order);
         }
     }
+}
+
+fn semantic_block_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    matches!(statement.kind, AstStatementKind::Block)
+        && statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(
+                |expr| matches!(&expr.kind, AstExprKind::Identifier(value) if value == "BLOCK"),
+            )
+}
+
+fn semantic_block_return_statement(statements: &[AstStatement]) -> Option<&AstStatement> {
+    statements
+        .iter()
+        .rev()
+        .find(|statement| statement_output_name(statement).is_none())
+        .or_else(|| statements.last())
 }
 
 fn list_item_shape(program: &ParsedProgram, list_name: &str) -> Option<ObjectShape> {
@@ -7535,13 +7589,42 @@ document:
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("style field `background.color` must be `Oklch[...]`")
+                .contains("style field `background.color` must be `Oklch[...]` or CSS hex text")
         }));
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
                 .contains("style field `font.size` must be a number")
         }));
+    }
+
+    #[test]
+    fn accepts_css_hex_text_style_colors() {
+        let source = r##"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+document:
+    root:
+        Element/stripe(
+            style: [
+                color: TEXT { #32363d }
+                background: [color: TEXT { #f8fafc }]
+                border: [color: TEXT { #d7dde6cc }]
+                font: [
+                    size: 16
+                    color: TEXT { #bd454d }
+                ]
+            ]
+            items: LIST {}
+        )
+"##;
+        let parsed = boon_parser::parse_source("hex-style-colors.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "CSS hex text colors should be valid style colors: {:?}",
+            report.diagnostics
+        );
     }
 
     #[test]

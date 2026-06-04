@@ -47,6 +47,7 @@ FUNCTION spacing(of) {
     of |> WHEN {
         TitlePanelGap => 21
         Section => 61
+        SwitcherBottomPush => 260
         __ => get(from: Spacing, of: of)
     }
 }
@@ -70,16 +71,29 @@ FUNCTION shared_material(of) {
         Classic => []
 
         __ => BLOCK {
-            divider: PASSED.theme_options.mode |> WHEN {
-                Dark => Oklch[lightness: 0.34, chroma: 0.02, hue: 220, alpha: 0.75]
-                Light => Oklch[lightness: 0.88, chroma: 0.02, hue: 220, alpha: 0.85]
+            divider: LIST { PASSED.theme_options.name, PASSED.theme_options.mode } |> WHEN {
+                LIST { Professional, Light } => TEXT { #e5e8ee }
+                LIST { Professional, Dark } => TEXT { #323840 }
+                LIST { Glassmorphism, Light } => TEXT { #5f71882e }
+                LIST { Glassmorphism, Dark } => TEXT { #b4c3eb29 }
+                LIST { Neobrutalism, Light } => TEXT { #000000 }
+                LIST { Neobrutalism, Dark } => TEXT { #f4f4f4 }
+                LIST { Neumorphism, Light } => TEXT { #a8b2c23d }
+                LIST { Neumorphism, Dark } => TEXT { #ffffff14 }
+                __ => TEXT { #e5e8ee }
             }
 
             of |> WHEN {
                 NewTodoRowFrame => [
-                    height: 65
-                    border: divider
-                    border_width: 1
+                    height: 64
+                    border_bottom: divider
+                    border_bottom_width: PASSED.theme_options.name |> WHEN {
+                        Neobrutalism => PASSED.theme_options.mode |> WHEN {
+                            Light => 4
+                            Dark => 2
+                        }
+                        __ => 1
+                    }
                 ]
 
                 TodoListFrame => [
@@ -88,16 +102,28 @@ FUNCTION shared_material(of) {
                 ]
 
                 TodoRowFrame => [
-                    height: 59.6
+                    height: 59
                     padding: 9
                     border_bottom: divider
-                    border_bottom_width: 0.8
+                    border_bottom_width: PASSED.theme_options.name |> WHEN {
+                        Neobrutalism => PASSED.theme_options.mode |> WHEN {
+                            Light => 4
+                            Dark => 2
+                        }
+                        __ => 1
+                    }
                 ]
 
                 PanelFooterFrame => [
-                    height: 46
+                    height: 49
                     border_top: divider
-                    border_top_width: 0.8
+                    border_top_width: PASSED.theme_options.name |> WHEN {
+                        Neobrutalism => PASSED.theme_options.mode |> WHEN {
+                            Light => 4
+                            Dark => 2
+                        }
+                        __ => 1
+                    }
                 ]
 
                 __ => []

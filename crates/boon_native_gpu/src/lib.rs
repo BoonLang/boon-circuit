@@ -2401,6 +2401,27 @@ struct RectVertexMetrics {
     cap_hit: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BorderStroke {
+    color: [f32; 4],
+    thickness: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BorderDecoration {
+    rect: Rect,
+    radius: f32,
+    all: Option<BorderStroke>,
+    sides: [Option<BorderStroke>; 4],
+}
+
+impl BorderDecoration {
+    fn metric_rect_count(self) -> u32 {
+        u32::from(self.all.is_some())
+            + self.sides.iter().filter(|side| side.is_some()).count() as u32
+    }
+}
+
 fn rect_vertices(
     frame: &LayoutFrame,
     width: f32,
@@ -2408,6 +2429,7 @@ fn rect_vertices(
     text_layouts: Option<&TextRunLayoutMap>,
 ) -> (Vec<QuadBatch>, RectVertexMetrics) {
     let mut builder = QuadBuilder::default();
+    let mut border_decorations = Vec::new();
     let mut metrics = RectVertexMetrics {
         rendered_rect_count: 1,
         ..RectVertexMetrics::default()
@@ -2463,20 +2485,12 @@ fn rect_vertices(
             push_asset_rect(&mut builder, item.bounds, width, height, asset_url);
             metrics.rendered_rect_count += 1;
         }
-        if let Some(border) = style_color_f32(&item.style, "border") {
-            push_styled_border_all(
-                &mut builder,
-                item.bounds,
-                width,
-                height,
-                border,
-                fill,
-                style_number(&item.style, "border_width").unwrap_or(2.0),
-                border_radius,
-            );
-            metrics.rendered_rect_count += 1;
+        if let Some(decoration) =
+            border_decoration_for_style(item.bounds, &item.style, border_radius)
+        {
+            metrics.rendered_rect_count += decoration.metric_rect_count();
+            border_decorations.push(decoration);
         }
-        push_side_borders(&mut builder, item.bounds, width, height, &item.style);
         if matches!(item.kind, DocumentNodeKind::Text) {
             let font_size = style_number(&item.style, "size").unwrap_or(14.0);
             let text_layout = text_layouts.and_then(|layouts| layouts.get(&item.node));
@@ -2621,7 +2635,7 @@ fn rect_vertices(
         }
         if matches!(item.kind, DocumentNodeKind::TextInput)
             && (item.focused || style_bool(&item.style, "focus") == Some(true))
-            && style_bool(&item.style, "caret_visible").unwrap_or(true)
+            && style_bool(&item.style, "caret_visible") == Some(true)
         {
             let text_bounds = text_content_bounds_for_item(item);
             let color = style_color_f32(&item.style, "caret_color")
@@ -2652,6 +2666,9 @@ fn rect_vertices(
             );
             metrics.rendered_rect_count += 1;
         }
+    }
+    for decoration in border_decorations {
+        push_border_decoration(&mut builder, decoration, width, height);
     }
     if builder.batches.is_empty() {
         push_rect(
@@ -2736,6 +2753,38 @@ fn style_asset_url(style: &StyleMap) -> Option<&str> {
         .filter(|url| !url.trim().is_empty())
 }
 
+fn border_decoration_for_style(
+    rect: Rect,
+    style: &StyleMap,
+    radius: f32,
+) -> Option<BorderDecoration> {
+    let all = style_color_f32(style, "border").map(|color| BorderStroke {
+        color,
+        thickness: style_number(style, "border_width").unwrap_or(2.0),
+    });
+    let mut sides = [None, None, None, None];
+    for (index, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+        let Some(color) = style_color_f32(style, &format!("border_{side}")) else {
+            continue;
+        };
+        sides[index] = Some(BorderStroke {
+            color,
+            thickness: style_number(style, &format!("border_{side}_width"))
+                .or_else(|| style_number(style, "border_width"))
+                .unwrap_or(1.0),
+        });
+    }
+    if all.is_none() && sides.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(BorderDecoration {
+        rect,
+        radius,
+        all,
+        sides,
+    })
+}
+
 fn push_styled_rect(
     builder: &mut QuadBuilder,
     rect: Rect,
@@ -2758,7 +2807,6 @@ fn push_styled_border_all(
     width: f32,
     height: f32,
     border_color: [f32; 4],
-    fill_color: [f32; 4],
     thickness: f32,
     radius: f32,
 ) {
@@ -2767,25 +2815,159 @@ fn push_styled_border_all(
         push_border_all(builder, rect, width, height, border_color, thickness);
         return;
     }
+    push_rounded_border_all(
+        builder,
+        rect,
+        width,
+        height,
+        border_color,
+        thickness,
+        radius,
+    );
+}
 
-    let thickness = thickness.max(0.25).min(rect.width.min(rect.height) * 0.5);
-    push_rounded_rect(builder, rect, width, height, border_color, radius);
-    let inner = Rect {
-        x: rect.x + thickness,
-        y: rect.y + thickness,
-        width: (rect.width - thickness * 2.0).max(0.0),
-        height: (rect.height - thickness * 2.0).max(0.0),
-    };
-    if inner.width > 0.0 && inner.height > 0.0 {
-        push_rounded_rect(
+fn push_border_decoration(
+    builder: &mut QuadBuilder,
+    decoration: BorderDecoration,
+    width: f32,
+    height: f32,
+) {
+    if let Some(stroke) = decoration.all {
+        push_styled_border_all(
             builder,
-            inner,
+            decoration.rect,
             width,
             height,
-            fill_color,
-            (radius - thickness).max(0.0),
+            stroke.color,
+            stroke.thickness,
+            decoration.radius,
         );
     }
+    for (index, stroke) in decoration.sides.into_iter().enumerate() {
+        if let Some(stroke) = stroke {
+            push_side_border(builder, decoration.rect, width, height, index, stroke);
+        }
+    }
+}
+
+fn push_rounded_border_all(
+    builder: &mut QuadBuilder,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+    thickness: f32,
+    radius: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) * 0.5);
+    let thickness = thickness
+        .max(0.25)
+        .min(radius.max(0.25))
+        .min(rect.width.min(rect.height) * 0.5);
+    let center_width = (rect.width - radius * 2.0).max(0.0);
+    let center_height = (rect.height - radius * 2.0).max(0.0);
+    push_rect(
+        builder,
+        Rect {
+            x: rect.x + radius,
+            y: rect.y,
+            width: center_width,
+            height: thickness,
+        },
+        width,
+        height,
+        color,
+    );
+    push_rect(
+        builder,
+        Rect {
+            x: rect.x + radius,
+            y: rect.y + rect.height - thickness,
+            width: center_width,
+            height: thickness,
+        },
+        width,
+        height,
+        color,
+    );
+    push_rect(
+        builder,
+        Rect {
+            x: rect.x,
+            y: rect.y + radius,
+            width: thickness,
+            height: center_height,
+        },
+        width,
+        height,
+        color,
+    );
+    push_rect(
+        builder,
+        Rect {
+            x: rect.x + rect.width - thickness,
+            y: rect.y + radius,
+            width: thickness,
+            height: center_height,
+        },
+        width,
+        height,
+        color,
+    );
+
+    let segments = ((radius * 1.5).ceil() as usize).clamp(4, 12);
+    let inner_radius = (radius - thickness).max(0.0);
+    push_corner_ring(
+        builder,
+        [rect.x + radius, rect.y + radius],
+        radius,
+        inner_radius,
+        std::f32::consts::PI,
+        std::f32::consts::PI * 1.5,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_ring(
+        builder,
+        [rect.x + rect.width - radius, rect.y + radius],
+        radius,
+        inner_radius,
+        std::f32::consts::PI * 1.5,
+        std::f32::consts::PI * 2.0,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_ring(
+        builder,
+        [rect.x + rect.width - radius, rect.y + rect.height - radius],
+        radius,
+        inner_radius,
+        0.0,
+        std::f32::consts::PI * 0.5,
+        segments,
+        width,
+        height,
+        color,
+    );
+    push_corner_ring(
+        builder,
+        [rect.x + radius, rect.y + rect.height - radius],
+        radius,
+        inner_radius,
+        std::f32::consts::PI * 0.5,
+        std::f32::consts::PI,
+        segments,
+        width,
+        height,
+        color,
+    );
 }
 
 fn push_rounded_rect(
@@ -2912,6 +3094,57 @@ fn push_corner_fan(
             height,
             color,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_corner_ring(
+    builder: &mut QuadBuilder,
+    center: [f32; 2],
+    outer_radius: f32,
+    inner_radius: f32,
+    start: f32,
+    end: f32,
+    segments: usize,
+    width: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    if inner_radius <= 0.0 {
+        push_corner_fan(
+            builder,
+            center,
+            outer_radius,
+            start,
+            end,
+            segments,
+            width,
+            height,
+            color,
+        );
+        return;
+    }
+    for index in 0..segments {
+        let a0 = start + (end - start) * (index as f32 / segments as f32);
+        let a1 = start + (end - start) * ((index + 1) as f32 / segments as f32);
+        let outer0 = [
+            center[0] + a0.cos() * outer_radius,
+            center[1] + a0.sin() * outer_radius,
+        ];
+        let outer1 = [
+            center[0] + a1.cos() * outer_radius,
+            center[1] + a1.sin() * outer_radius,
+        ];
+        let inner0 = [
+            center[0] + a0.cos() * inner_radius,
+            center[1] + a0.sin() * inner_radius,
+        ];
+        let inner1 = [
+            center[0] + a1.cos() * inner_radius,
+            center[1] + a1.sin() * inner_radius,
+        ];
+        push_triangle(builder, outer0, outer1, inner1, width, height, color);
+        push_triangle(builder, outer0, inner1, inner0, width, height, color);
     }
 }
 
@@ -3486,50 +3719,43 @@ fn push_border_all(
     }
 }
 
-fn push_side_borders(
+fn push_side_border(
     builder: &mut QuadBuilder,
     rect: Rect,
     width: f32,
     height: f32,
-    style: &StyleMap,
+    side: usize,
+    stroke: BorderStroke,
 ) {
-    for side in ["top", "right", "bottom", "left"] {
-        let Some(color) = style_color_f32(style, &format!("border_{side}")) else {
-            continue;
-        };
-        let thickness = style_number(style, &format!("border_{side}_width"))
-            .or_else(|| style_number(style, "border_width"))
-            .unwrap_or(1.0)
-            .max(0.25);
-        let edge = match side {
-            "top" => Rect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: thickness,
-            },
-            "right" => Rect {
-                x: rect.x + rect.width - thickness,
-                y: rect.y,
-                width: thickness,
-                height: rect.height,
-            },
-            "bottom" => Rect {
-                x: rect.x,
-                y: rect.y + rect.height - thickness,
-                width: rect.width,
-                height: thickness,
-            },
-            "left" => Rect {
-                x: rect.x,
-                y: rect.y,
-                width: thickness,
-                height: rect.height,
-            },
-            _ => unreachable!(),
-        };
-        push_rect(builder, edge, width, height, color);
-    }
+    let thickness = stroke.thickness.max(0.25);
+    let edge = match side {
+        0 => Rect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: thickness,
+        },
+        1 => Rect {
+            x: rect.x + rect.width - thickness,
+            y: rect.y,
+            width: thickness,
+            height: rect.height,
+        },
+        2 => Rect {
+            x: rect.x,
+            y: rect.y + rect.height - thickness,
+            width: rect.width,
+            height: thickness,
+        },
+        3 => Rect {
+            x: rect.x,
+            y: rect.y,
+            width: thickness,
+            height: rect.height,
+        },
+        _ => unreachable!(),
+    };
+    push_rect(builder, edge, width, height, stroke.color);
 }
 
 fn rgba8_from_f32(color: [f32; 4]) -> [u8; 4] {
@@ -3572,7 +3798,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [f32; 4] {
         DocumentNodeKind::Button => [0.92, 0.95, 0.97, 1.0],
         DocumentNodeKind::Checkbox => [1.0, 1.0, 1.0, 0.0],
         DocumentNodeKind::Table | DocumentNodeKind::TableCell => [1.0, 1.0, 1.0, 1.0],
-        DocumentNodeKind::Text => [0.965, 0.972, 0.982, 1.0],
+        DocumentNodeKind::Text => [1.0, 1.0, 1.0, 0.0],
     }
 }
 
@@ -3910,13 +4136,23 @@ mod tests {
 
         let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
         let (positions, colors) = flatten_quad_batches(&batches);
-        let selection_rect = 2usize;
+        let rect_colors = colors
+            .chunks_exact(24)
+            .map(|color| [color[0], color[1], color[2], color[3]])
+            .collect::<Vec<_>>();
+        let selection_rect = rect_colors
+            .iter()
+            .position(|color| *color == [12, 15, 21, 255])
+            .expect("selection highlight rect should render");
         assert_eq!(
             &colors[selection_rect * 24..selection_rect * 24 + 4],
             &[12, 15, 21, 255],
             "selection highlight must stay opaque while bracket highlights are softened"
         );
-        let first_bracket_rect = 3usize;
+        let first_bracket_rect = rect_colors
+            .iter()
+            .position(|color| *color == [22, 66, 255, 64])
+            .expect("bracket highlight rect should render");
         let x0_ndc = positions[first_bracket_rect * 12];
         let x1_ndc = positions[first_bracket_rect * 12 + 2];
         let bracket_width = ((x1_ndc - x0_ndc) * 0.5) * 320.0;
@@ -3977,6 +4213,148 @@ mod tests {
                 .chunks_exact(4)
                 .any(|color| color == [25, 117, 210, 255]),
             "focused border must not fall back to the old hard-coded blue"
+        );
+    }
+
+    #[test]
+    fn parent_borders_render_after_descendant_backgrounds() {
+        let mut parent_style = StyleMap::new();
+        parent_style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        parent_style.insert("border".to_owned(), StyleValue::Text("#ff0000".to_owned()));
+        parent_style.insert("border_width".to_owned(), StyleValue::Number(1.0));
+
+        let mut child_style = StyleMap::new();
+        child_style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+
+        let frame = LayoutFrame {
+            display_list: vec![
+                DisplayItem {
+                    node: DocumentNodeId("parent".to_owned()),
+                    kind: DocumentNodeKind::Row,
+                    bounds: Rect {
+                        x: 10.0,
+                        y: 20.0,
+                        width: 160.0,
+                        height: 48.0,
+                    },
+                    text: None,
+                    style: parent_style,
+                    focused: false,
+                },
+                DisplayItem {
+                    node: DocumentNodeId("child".to_owned()),
+                    kind: DocumentNodeKind::TextInput,
+                    bounds: Rect {
+                        x: 10.0,
+                        y: 20.0,
+                        width: 160.0,
+                        height: 48.0,
+                    },
+                    text: None,
+                    style: child_style,
+                    focused: false,
+                },
+            ],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, None);
+        let (_, colors) = flatten_quad_batches(&batches);
+        let vertex_colors = colors
+            .chunks_exact(4)
+            .map(|color| [color[0], color[1], color[2], color[3]])
+            .collect::<Vec<_>>();
+
+        assert!(
+            vertex_colors
+                .iter()
+                .rev()
+                .take(24)
+                .all(|color| *color == [255, 0, 0, 255]),
+            "a parent border should be emitted as an overlay after descendant backgrounds"
+        );
+    }
+
+    #[test]
+    fn text_without_background_uses_transparent_default_fill() {
+        let mut style = StyleMap::new();
+        style.insert("color".to_owned(), StyleValue::Text("#333333".to_owned()));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("label".to_owned()),
+                kind: DocumentNodeKind::Text,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 24.0,
+                },
+                text: Some("label".to_owned()),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, None);
+        let (_, colors) = flatten_quad_batches(&batches);
+        assert!(
+            colors
+                .chunks_exact(4)
+                .any(|color| color == [255, 255, 255, 0]),
+            "text display items without an explicit background should not paint backing rectangles"
+        );
+    }
+
+    #[test]
+    fn focused_text_input_needs_explicit_caret_visibility_to_draw_caret() {
+        let mut style = StyleMap::new();
+        style.insert(
+            "background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        style.insert("color".to_owned(), StyleValue::Text("#000000".to_owned()));
+        let frame = LayoutFrame {
+            display_list: vec![DisplayItem {
+                node: DocumentNodeId("input".to_owned()),
+                kind: DocumentNodeKind::TextInput,
+                bounds: Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 120.0,
+                    height: 32.0,
+                },
+                text: None,
+                style,
+                focused: true,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let text_layouts = test_text_layouts(&frame, 320, 120);
+        let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
+        let (_, colors) = flatten_quad_batches(&batches);
+        assert!(
+            !colors.chunks_exact(4).any(|color| color == [0, 0, 0, 255]),
+            "declarative focus alone should not draw a static preview caret"
         );
     }
 
@@ -4768,10 +5146,13 @@ mod tests {
             .x_for_column(1.0);
         let (batches, _) = rect_vertices(&frame, 320.0, 120.0, Some(&text_layouts));
         let (positions, _) = flatten_quad_batches(&batches);
-        let caret_rect = 2usize;
-        let caret_x = ((positions[caret_rect * 12] + 1.0) * 0.5) * 320.0;
         assert!(
-            (caret_x - expected_caret_x).abs() <= 0.5,
+            positions.chunks_exact(12).any(|rect| {
+                let x0 = ((rect[0] + 1.0) * 0.5) * 320.0;
+                let x1 = ((rect[2] + 1.0) * 0.5) * 320.0;
+                let rect_width = (x1 - x0).abs();
+                (x0 - expected_caret_x).abs() <= 0.5 && (1.5..=2.5).contains(&rect_width)
+            }),
             "input caret should use measured glyph edges"
         );
     }

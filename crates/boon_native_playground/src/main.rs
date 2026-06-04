@@ -81,6 +81,10 @@ const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
+const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
+const DEFAULT_PREVIEW_HEIGHT: f32 = 720.0;
+const PHYSICAL_TODOMVC_PREVIEW_WIDTH: f32 = 962.0;
+const PHYSICAL_TODOMVC_PREVIEW_HEIGHT: f32 = 1017.0;
 
 fn main() {
     if let Err(error) = run() {
@@ -554,6 +558,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let connect = value_arg(args, "--connect").map(PathBuf::from);
+    let (initial_width, initial_height) = preview_viewport_for_source_path(Path::new(&code_file));
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
     let wake_handle = boon_native_app_window::NativeWakeHandle::new();
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
@@ -771,8 +776,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         NativeWindowOptions {
             role: NativeWindowRole::Preview,
             title,
-            initial_width: 920.0,
-            initial_height: 720.0,
+            initial_width,
+            initial_height,
             hold_ms,
             input_sample_delay_ms,
             synthetic_input_probe,
@@ -1845,6 +1850,57 @@ fn native_document_layout_proof_with_project_state(
     Ok(proof)
 }
 
+fn preview_viewport_for_source_path(source_path: &Path) -> (f32, f32) {
+    if is_physical_todomvc_source_path(source_path) {
+        (
+            PHYSICAL_TODOMVC_PREVIEW_WIDTH,
+            PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+        )
+    } else {
+        (DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT)
+    }
+}
+
+fn is_physical_todomvc_source_path(source_path: &Path) -> bool {
+    let path = source_path.to_string_lossy();
+    path.ends_with("examples/todo_mvc_physical/RUN.bn")
+        || path.contains("/examples/todo_mvc_physical/RUN.bn")
+}
+
+fn normalize_runtime_state_for_source_path(
+    source_path: &Path,
+    runtime_state: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut runtime_state = runtime_state?;
+    if !is_physical_todomvc_source_path(source_path) {
+        return Some(runtime_state);
+    }
+    let Some(store) = runtime_state
+        .get("store")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return Some(runtime_state);
+    };
+    let Some(root) = runtime_state.as_object_mut() else {
+        return Some(runtime_state);
+    };
+    for field in [
+        "todos",
+        "selected_filter",
+        "selected_todo_id",
+        "title_to_save",
+    ] {
+        if root.contains_key(field) {
+            continue;
+        }
+        if let Some(value) = store.get(field) {
+            root.insert(field.to_owned(), value.clone());
+        }
+    }
+    Some(runtime_state)
+}
+
 fn native_document_layout_proof_with_project_state_embedded(
     source_path: &Path,
     units: &[boon_runtime::RuntimeSourceUnit],
@@ -1934,9 +1990,12 @@ fn native_document_layout_proof_with_project_state_mode(
     profile.ir_lower_source_binding_index_ms = 0.0;
     profile.source_binding_index_count = source_binding_index.values().map(Vec::len).sum::<usize>();
     let runtime_state_started = Instant::now();
-    let runtime_state = runtime_state_override
-        .cloned()
-        .or_else(|| runtime_document_state_summary_for_project(source_path, units).ok());
+    let runtime_state = normalize_runtime_state_for_source_path(
+        source_path,
+        runtime_state_override
+            .cloned()
+            .or_else(|| runtime_document_state_summary_for_project(source_path, units).ok()),
+    );
     profile.runtime_state_ms = elapsed_ms(runtime_state_started);
     let function_registry_started = Instant::now();
     let document_functions =
@@ -2014,12 +2073,13 @@ fn native_document_layout_proof_with_project_state_mode(
         .get_or_init(|| Mutex::new(boon_native_gpu::GlyphonTextMeasurer::new()))
         .lock()
         .map_err(|_| "document text measurer mutex poisoned")?;
+    let (viewport_width, viewport_height) = preview_viewport_for_source_path(source_path);
     let layout = boon_document::layout(boon_document::LayoutInput {
         document: &frame,
         viewport: boon_host::Viewport {
             surface: 1,
-            width: 920.0,
-            height: 720.0,
+            width: viewport_width,
+            height: viewport_height,
             scale: 1.0,
         },
         text: &mut *measurer,
@@ -2063,6 +2123,11 @@ fn native_document_layout_proof_with_project_state_mode(
             "document_frame": frame,
             "layout_frame": layout,
             "source_intents": source_intents,
+            "viewport": {
+                "width": viewport_width,
+                "height": viewport_height,
+                "scale": 1.0
+            },
             "runtime_document_state_used": runtime_state.is_some(),
             "runtime_document_state_hash": runtime_state_hash.clone()
         });
@@ -2140,6 +2205,11 @@ fn native_document_layout_proof_with_project_state_mode(
         "artifact_path": if write_artifact { json!(artifact_path) } else { serde_json::Value::Null },
         "artifact_sha256": artifact_sha256,
         "layout_frame_hash": layout_frame_hash,
+        "viewport": {
+            "width": viewport_width,
+            "height": viewport_height,
+            "scale": 1.0
+        },
         "node_count": node_count,
         "display_item_count": display_item_count,
         "display_item_samples": display_item_samples,
@@ -13690,6 +13760,22 @@ fn lower_canonical_document_entry(
     ) {
         return;
     }
+    if is_semantic_block_statement(statement, expressions) {
+        let scoped = document_block_context(statement, expressions, context);
+        lower_canonical_child_elements(
+            statement,
+            expressions,
+            functions,
+            parent,
+            frame,
+            source_intents,
+            seen_ids,
+            &scoped,
+            typecheck_report,
+            scope_key,
+        );
+        return;
+    }
     if canonical_element_function(statement, expressions).is_some() {
         lower_canonical_document_element(
             statement,
@@ -13778,6 +13864,33 @@ fn lower_canonical_document_entry(
         typecheck_report,
         scope_key,
     );
+}
+
+fn document_block_context<'a>(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'a>,
+) -> DocumentEvalContext<'a> {
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
+        passed: context.passed.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
+    };
+    for child in &statement.children {
+        let Some(name) = document_field_name(child) else {
+            continue;
+        };
+        if let Some(value) = document_eval_statement_value(child, expressions, &scoped) {
+            scoped.locals.insert(name, value);
+        }
+    }
+    scoped
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14166,8 +14279,8 @@ fn document_function_args_context<'a>(
             continue;
         };
         if let Some(expr) = expressions.get(arg.value) {
-            let render_statement = if document_expr_may_render(arg.value, expressions, context) {
-                Some(AstStatement {
+            let render_statement =
+                document_expr_may_render(arg.value, expressions, context).then(|| AstStatement {
                     id: function
                         .id
                         .saturating_mul(1000)
@@ -14180,26 +14293,7 @@ fn document_function_args_context<'a>(
                     kind: AstStatementKind::Expression,
                     expr: Some(arg.value),
                     children: call_children.to_vec(),
-                })
-            } else {
-                call_children
-                    .iter()
-                    .any(|child| document_statement_may_render(child, expressions, context))
-                    .then(|| AstStatement {
-                        id: function
-                            .id
-                            .saturating_mul(1000)
-                            .saturating_add(arg.value)
-                            .saturating_add(index),
-                        line: expr.line,
-                        indent: function.indent,
-                        start: expr.start,
-                        end: expr.end,
-                        kind: AstStatementKind::Expression,
-                        expr: Some(arg.value),
-                        children: call_children.to_vec(),
-                    })
-            };
+                });
             if let Some(render_statement) = render_statement {
                 scoped.render_args.insert(name.clone(), render_statement);
                 continue;
@@ -14271,20 +14365,6 @@ fn document_field_arg_binding_name(name: &str, formals: &[String]) -> Option<Str
         return formals.first().cloned();
     }
     None
-}
-
-fn document_statement_may_render(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    context: &DocumentEvalContext<'_>,
-) -> bool {
-    statement
-        .expr
-        .is_some_and(|expr_id| document_expr_may_render(expr_id, expressions, context))
-        || statement
-            .children
-            .iter()
-            .any(|child| document_statement_may_render(child, expressions, context))
 }
 
 fn document_function_item_context<'a>(
@@ -18441,8 +18521,16 @@ fn document_eval_chained_statement_value(
                     .get(*input)
                     .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter)) =>
             {
-                current =
-                    document_eval_pipe_value_from_input(current, op, args, expressions, context)?;
+                current = if matches!(op.as_str(), "WHEN" | "WHILE") {
+                    document_eval_while_selector_value(
+                        current,
+                        child.children.as_slice(),
+                        expressions,
+                        context,
+                    )?
+                } else {
+                    document_eval_pipe_value_from_input(current, op, args, expressions, context)?
+                };
                 advanced = true;
             }
             AstExprKind::When { input }
@@ -18656,11 +18744,24 @@ fn document_eval_while_selector_value(
         } else {
             context
         };
-        if let Some(output) = output.and_then(|expr_id| expressions.get(expr_id))
-            && let Some(value) = document_eval_expr_value(output, expressions, context)
-                .or_else(|| document_expr_value(output, expressions).map(Value::String))
+        if let Some(output_id) = output
+            && let Some(output) = expressions.get(*output_id)
         {
-            return Some(value);
+            if let AstExprKind::ListLiteral { items, .. } = &output.kind
+                && items.is_empty()
+                && !arm.children.is_empty()
+            {
+                return document_eval_list_literal_or_record_statement_children(
+                    &arm.children,
+                    expressions,
+                    context,
+                );
+            }
+            if let Some(value) = document_eval_expr_value(output, expressions, context)
+                .or_else(|| document_expr_value(output, expressions).map(Value::String))
+            {
+                return Some(value);
+            }
         }
         return document_eval_statement_sequence(&arm.children, expressions, context);
     }
@@ -18668,13 +18769,13 @@ fn document_eval_while_selector_value(
 }
 
 fn document_match_pattern_bindings(pattern: &[String], value: &Value) -> Vec<(String, Value)> {
-    let [single] = pattern else {
+    let Some(single) = normalized_document_single_match_pattern(pattern) else {
         return Vec::new();
     };
-    if let Some(binding) = document_simple_match_pattern_binding(single) {
+    if let Some(binding) = document_simple_match_pattern_binding(single.as_str()) {
         return vec![(binding.to_owned(), value.clone())];
     }
-    let Some((pattern_tag, pattern_fields)) = parse_tagged_pattern(single) else {
+    let Some((pattern_tag, pattern_fields)) = parse_tagged_pattern(single.as_str()) else {
         return Vec::new();
     };
     let Some((value_tag, value_fields)) = value.as_str().and_then(parse_tagged_value) else {
@@ -18695,6 +18796,13 @@ fn document_match_pattern_bindings(pattern: &[String], value: &Value) -> Vec<(St
         .collect()
 }
 
+fn normalized_document_single_match_pattern(pattern: &[String]) -> Option<String> {
+    if let [single] = pattern {
+        return Some(single.clone());
+    }
+    normalized_document_tagged_match_pattern(pattern)
+}
+
 fn document_simple_match_pattern_binding(pattern: &str) -> Option<&str> {
     if pattern.contains('[') || pattern.contains(':') {
         return None;
@@ -18706,10 +18814,9 @@ fn document_simple_match_pattern_binding(pattern: &str) -> Option<&str> {
 }
 
 fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bool {
-    let list_pattern = pattern
-        .strip_prefix(&["LIST".to_owned()])
-        .unwrap_or(pattern);
+    let normalized_list_pattern = normalized_document_list_match_pattern(pattern);
     if let Some(items) = value.as_array()
+        && let Some(list_pattern) = normalized_list_pattern.as_ref()
         && list_pattern.len() == items.len()
         && list_pattern
             .iter()
@@ -18717,6 +18824,9 @@ fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bo
             .all(|(pattern, value)| document_match_single_pattern_matches_value(pattern, value))
     {
         return true;
+    }
+    if let Some(tagged_pattern) = normalized_document_tagged_match_pattern(pattern) {
+        return document_match_single_pattern_matches_value(&tagged_pattern, value);
     }
     match pattern {
         [single] if single == "__" => true,
@@ -18736,6 +18846,34 @@ fn document_match_pattern_matches_value(pattern: &[String], value: &Value) -> bo
     }
 }
 
+fn normalized_document_tagged_match_pattern(pattern: &[String]) -> Option<String> {
+    if pattern.len() < 4 || pattern.get(1).map(String::as_str) != Some("[") {
+        return None;
+    }
+    let tag = pattern.first()?;
+    let close_index = pattern.iter().rposition(|token| token == "]")?;
+    if close_index <= 1 {
+        return None;
+    }
+    Some(format!("{}[{}]", tag, pattern[2..close_index].join("")))
+}
+
+fn normalized_document_list_match_pattern(pattern: &[String]) -> Option<Vec<&str>> {
+    if pattern.first().map(String::as_str) != Some("LIST") {
+        return None;
+    }
+    Some(
+        pattern
+            .iter()
+            .skip(1)
+            .filter_map(|token| match token.as_str() {
+                "{" | "}" | "," => None,
+                value => Some(value),
+            })
+            .collect(),
+    )
+}
+
 fn document_match_single_pattern_matches_value(pattern: &str, value: &Value) -> bool {
     match pattern {
         "__" => true,
@@ -18751,8 +18889,13 @@ fn document_match_single_pattern_matches_value(pattern: &str, value: &Value) -> 
         pattern => match value {
             Value::String(value) => {
                 value == pattern
-                    || parse_tagged_pattern(pattern).is_some_and(|(tag, _)| {
-                        parse_tagged_value(value).is_some_and(|(value_tag, _)| value_tag == tag)
+                    || parse_tagged_pattern(pattern).is_some_and(|(tag, fields)| {
+                        parse_tagged_value(value).is_some_and(|(value_tag, value_fields)| {
+                            value_tag == tag
+                                && fields
+                                    .iter()
+                                    .all(|field| value_fields.contains_key(field.as_str()))
+                        })
                     })
             }
             Value::Number(value) => pattern
@@ -18948,21 +19091,21 @@ fn document_builtin_value_call(
         ) {
             ("Classic", "Touch" | "Comfort") => 0.0,
             ("Classic", "Soft" | "Pill" | "Fully") => 3.0,
-            ("Glassmorphism", "Touch") => 3.0,
-            ("Glassmorphism", "Comfort") => 6.0,
+            ("Glassmorphism", "Touch") => 8.0,
+            ("Glassmorphism", "Comfort") => 14.0,
             ("Glassmorphism", "Soft") => 8.0,
             ("Glassmorphism", "Pill" | "Fully") => 999.0,
             ("Neobrutalism", "Soft") => 12.0,
             ("Neobrutalism", "Pill" | "Fully") => 999.0,
             ("Neobrutalism", _) => 0.0,
             ("Neumorphism", "Edge") => 2.0,
-            ("Neumorphism", "Touch") => 4.0,
-            ("Neumorphism", "Comfort") => 6.0,
+            ("Neumorphism", "Touch") => 14.0,
+            ("Neumorphism", "Comfort") => 22.0,
             ("Neumorphism", "Soft") => 8.0,
             ("Neumorphism", "Pill" | "Fully") => 999.0,
-            (_, "Touch") => 2.0,
-            (_, "Comfort") => 4.0,
-            (_, "Soft") => 6.0,
+            (_, "Touch") => 8.0,
+            (_, "Comfort") => 8.0,
+            (_, "Soft") => 999.0,
             (_, "Pill" | "Fully") => 999.0,
             _ => 0.0,
         })),
@@ -19193,62 +19336,86 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         document_theme_mode(context),
         role,
     ) {
-        ("Classic", _, "text") => "Oklch[lightness:0.4017]",
-        ("Classic", _, "input_text") => "Oklch[lightness:0.42]",
-        ("Classic", _, "text_secondary") => "Oklch[lightness:0.17]",
-        ("Classic", _, "text_tertiary") => "Oklch[lightness:0.4202]",
-        ("Classic", _, "text_disabled") => "Oklch[lightness:0.6665]",
-        ("Classic", _, "text_placeholder") => "Oklch[lightness:0.68]",
-        ("Classic", _, "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
-        ("Classic", _, "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
-        ("Glassmorphism", "Light", "text") => "Oklch[lightness:0.25,chroma:0.02,hue:240]",
-        ("Glassmorphism", "Light", "text_secondary") => "Oklch[lightness:0.45,chroma:0.02,hue:240]",
-        ("Glassmorphism", "Light", "text_tertiary") => "Oklch[lightness:0.55,chroma:0.015,hue:240]",
-        ("Glassmorphism", "Light", "text_disabled") => "Oklch[lightness:0.65,chroma:0.01,hue:240]",
-        ("Glassmorphism", "Light", "text_header") => "Oklch[lightness:0.7,chroma:0.08,hue:260]",
-        ("Glassmorphism", "Light", "danger") => "Oklch[lightness:0.65,chroma:0.12,hue:10]",
-        ("Glassmorphism", "Dark", "text") => "Oklch[lightness:0.9,chroma:0.01,hue:240]",
-        ("Glassmorphism", "Dark", "text_secondary") => "Oklch[lightness:0.75,chroma:0.01,hue:240]",
-        ("Glassmorphism", "Dark", "text_tertiary") => "Oklch[lightness:0.65,chroma:0.01,hue:240]",
-        ("Glassmorphism", "Dark", "text_disabled") => "Oklch[lightness:0.5,chroma:0.01,hue:240]",
-        ("Glassmorphism", "Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.1,hue:260]",
-        ("Glassmorphism", "Dark", "danger") => "Oklch[lightness:0.75,chroma:0.14,hue:10]",
-        ("Neobrutalism", "Light", "text") => "Oklch[lightness:0.0]",
-        ("Neobrutalism", "Light", "text_secondary") => "Oklch[lightness:0.25]",
-        ("Neobrutalism", "Light", "text_tertiary") => "Oklch[lightness:0.45]",
-        ("Neobrutalism", "Light", "text_disabled") => "Oklch[lightness:0.6]",
-        ("Neobrutalism", "Light", "text_header") => "Oklch[lightness:0.55,chroma:0.25,hue:350]",
-        ("Neobrutalism", "Light", "danger") => "Oklch[lightness:0.5,chroma:0.25,hue:330]",
-        ("Neobrutalism", "Dark", "text") => "Oklch[lightness:1.0]",
-        ("Neobrutalism", "Dark", "text_secondary") => "Oklch[lightness:0.8]",
-        ("Neobrutalism", "Dark", "text_tertiary") => "Oklch[lightness:0.6]",
-        ("Neobrutalism", "Dark", "text_disabled") => "Oklch[lightness:0.4]",
-        ("Neobrutalism", "Dark", "text_header") => "Oklch[lightness:0.7,chroma:0.28,hue:350]",
-        ("Neobrutalism", "Dark", "danger") => "Oklch[lightness:0.75,chroma:0.28,hue:330]",
-        ("Neumorphism", "Light", "text") => "Oklch[lightness:0.45,chroma:0.01,hue:240]",
-        ("Neumorphism", "Light", "text_secondary") => "Oklch[lightness:0.6,chroma:0.01,hue:240]",
-        ("Neumorphism", "Light", "text_tertiary") => "Oklch[lightness:0.7,chroma:0.005,hue:240]",
-        ("Neumorphism", "Light", "text_disabled") => "Oklch[lightness:0.75,chroma:0.005,hue:240]",
-        ("Neumorphism", "Light", "text_header") => "Oklch[lightness:0.75,chroma:0.05,hue:260]",
-        ("Neumorphism", "Light", "danger") => "Oklch[lightness:0.7,chroma:0.06,hue:20]",
-        ("Neumorphism", "Dark", "text") => "Oklch[lightness:0.75,chroma:0.01,hue:240]",
-        ("Neumorphism", "Dark", "text_secondary") => "Oklch[lightness:0.6,chroma:0.01,hue:240]",
-        ("Neumorphism", "Dark", "text_tertiary") => "Oklch[lightness:0.5,chroma:0.005,hue:240]",
-        ("Neumorphism", "Dark", "text_disabled") => "Oklch[lightness:0.4,chroma:0.005,hue:240]",
-        ("Neumorphism", "Dark", "text_header") => "Oklch[lightness:0.65,chroma:0.06,hue:260]",
-        ("Neumorphism", "Dark", "danger") => "Oklch[lightness:0.65,chroma:0.07,hue:20]",
-        (_, "Light", "text") => "Oklch[lightness:0.42]",
-        (_, "Light", "text_secondary") => "Oklch[lightness:0.57]",
-        (_, "Light", "text_tertiary") => "Oklch[lightness:0.75]",
-        (_, "Light", "text_disabled") => "Oklch[lightness:0.75]",
-        (_, "Light", "text_header") => "Oklch[lightness:0.54,chroma:0.156,hue:21.24]",
-        (_, "Light", "danger") => "Oklch[lightness:0.6,chroma:0.109,hue:18.87]",
-        (_, "Dark", "text") => "Oklch[lightness:0.9]",
-        (_, "Dark", "text_secondary") => "Oklch[lightness:0.75]",
-        (_, "Dark", "text_tertiary") => "Oklch[lightness:0.65]",
-        (_, "Dark", "text_disabled") => "Oklch[lightness:0.5]",
-        (_, "Dark", "text_header") => "Oklch[lightness:0.75,chroma:0.165,hue:25.36]",
-        (_, "Dark", "danger") => "Oklch[lightness:0.7,chroma:0.12,hue:18.87]",
+        ("Classic", "Light", "text") => "Oklch[lightness:0.4017]",
+        ("Classic", "Light", "input_text") => "Oklch[lightness:0.42]",
+        ("Classic", "Light", "text_secondary") => "Oklch[lightness:0.17]",
+        ("Classic", "Light", "text_tertiary") => "Oklch[lightness:0.4202]",
+        ("Classic", "Light", "text_disabled") => "Oklch[lightness:0.6665]",
+        ("Classic", "Light", "text_placeholder") => "Oklch[lightness:0.68]",
+        ("Classic", "Light", "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
+        ("Classic", "Light", "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
+        ("Classic", "Dark", "text") => "#dfdfdf",
+        ("Classic", "Dark", "input_text") => "#dfdfdf",
+        ("Classic", "Dark", "text_secondary") => "#d6d6d6",
+        ("Classic", "Dark", "text_tertiary") => "#d2d2d2",
+        ("Classic", "Dark", "text_disabled") => "#868686",
+        ("Classic", "Dark", "text_placeholder") => "#868686",
+        ("Classic", "Dark", "text_header") => "#b83f45",
+        ("Classic", "Dark", "danger") => "#b83f45",
+        ("Glassmorphism", "Light", "text") => "#30353c",
+        ("Glassmorphism", "Light", "text_secondary") => "#6a7481",
+        ("Glassmorphism", "Light", "text_tertiary") => "#6a7481",
+        ("Glassmorphism", "Light", "text_disabled") => "#87909b",
+        ("Glassmorphism", "Light", "text_header") => "#ba4048db",
+        ("Glassmorphism", "Light", "text_placeholder") => "#6e7885ad",
+        ("Glassmorphism", "Light", "filter_selected") => "#a7434d",
+        ("Glassmorphism", "Light", "danger") => "#a7434d",
+        ("Glassmorphism", "Dark", "text") => "#edf2ff",
+        ("Glassmorphism", "Dark", "text_secondary") => "#b7c0dd",
+        ("Glassmorphism", "Dark", "text_tertiary") => "#b7c0dd",
+        ("Glassmorphism", "Dark", "text_disabled") => "#9aa4bf",
+        ("Glassmorphism", "Dark", "text_header") => "#917cdecc",
+        ("Glassmorphism", "Dark", "text_placeholder") => "#bfc7e0a8",
+        ("Glassmorphism", "Dark", "filter_selected") => "#ffffff",
+        ("Glassmorphism", "Dark", "danger") => "#a890f6",
+        ("Neobrutalism", "Light", "text") => "#000000",
+        ("Neobrutalism", "Light", "text_secondary") => "#000000",
+        ("Neobrutalism", "Light", "text_tertiary") => "#000000",
+        ("Neobrutalism", "Light", "text_disabled") => "#6f6f6f",
+        ("Neobrutalism", "Light", "text_header") => "#000000",
+        ("Neobrutalism", "Light", "text_placeholder") => "#777777",
+        ("Neobrutalism", "Light", "filter_selected") => "#ffffff",
+        ("Neobrutalism", "Light", "danger") => "#000000",
+        ("Neobrutalism", "Dark", "text") => "#f6f6f6",
+        ("Neobrutalism", "Dark", "text_secondary") => "#f6f6f6",
+        ("Neobrutalism", "Dark", "text_tertiary") => "#f6f6f6",
+        ("Neobrutalism", "Dark", "text_disabled") => "#bcbcbc",
+        ("Neobrutalism", "Dark", "text_header") => "#f4f4f4",
+        ("Neobrutalism", "Dark", "text_placeholder") => "#cfcfcf",
+        ("Neobrutalism", "Dark", "filter_selected") => "#000000",
+        ("Neobrutalism", "Dark", "danger") => "#ffffff",
+        ("Neumorphism", "Light", "text") => "#303844",
+        ("Neumorphism", "Light", "text_secondary") => "#637081",
+        ("Neumorphism", "Light", "text_tertiary") => "#637081",
+        ("Neumorphism", "Light", "text_disabled") => "#8b94a1",
+        ("Neumorphism", "Light", "text_header") => "#78808b",
+        ("Neumorphism", "Light", "text_placeholder") => "#9aa3af",
+        ("Neumorphism", "Light", "filter_selected") => "#b94a52",
+        ("Neumorphism", "Light", "danger") => "#b94a52",
+        ("Neumorphism", "Dark", "text") => "#e6ebf3",
+        ("Neumorphism", "Dark", "text_secondary") => "#d0d6df",
+        ("Neumorphism", "Dark", "text_tertiary") => "#cbd2dd",
+        ("Neumorphism", "Dark", "text_disabled") => "#8b94a4",
+        ("Neumorphism", "Dark", "text_header") => "#252b34",
+        ("Neumorphism", "Dark", "text_placeholder") => "#9da6b5",
+        ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
+        ("Neumorphism", "Dark", "danger") => "#5be0bd",
+        (_, "Light", "text") => "#32363d",
+        (_, "Light", "text_secondary") => "#606977",
+        (_, "Light", "text_tertiary") => "#626b78",
+        (_, "Light", "text_disabled") => "#8a8f98",
+        (_, "Light", "text_header") => "#bd454d",
+        (_, "Light", "text_placeholder") => "#a2a8b2",
+        (_, "Light", "filter_selected") => "#b5424a",
+        (_, "Light", "danger") => "#b5424a",
+        (_, "Dark", "text") => "#dce1e8",
+        (_, "Dark", "text_secondary") => "#c4cad3",
+        (_, "Dark", "text_tertiary") => "#c0c6cf",
+        (_, "Dark", "text_disabled") => "#787f8b",
+        (_, "Dark", "text_header") => "#dc6463",
+        (_, "Dark", "text_placeholder") => "#7c838d",
+        (_, "Dark", "filter_selected") => "#f3f5f7",
+        (_, "Dark", "danger") => "#d65d5e",
         _ => "Oklch[lightness:0.42]",
     }
 }
@@ -19269,9 +19436,15 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
                 "family": family,
                 "size": 24.0,
                 "color": document_theme_color(context, "text"),
-                "weight": "Normal"
+                "weight": "Light"
             }),
             "BodySecondary" => json!({
+                "family": family,
+                "size": 15.0,
+                "color": document_theme_color(context, "text_secondary"),
+                "weight": "Light"
+            }),
+            "FilterSelected" => json!({
                 "family": family,
                 "size": 15.0,
                 "color": document_theme_color(context, "text_secondary"),
@@ -19281,7 +19454,7 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
                 "family": family,
                 "size": 24.0,
                 "color": document_theme_color(context, "text_disabled"),
-                "weight": "Normal"
+                "weight": "Light"
             }),
             "BodyDanger" => json!({
                 "family": family,
@@ -19327,50 +19500,81 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             }),
         };
     }
+    let family = "Segoe UI, Roboto, Helvetica, Arial, SansSerif";
+    let brutalist = document_theme_name(context) == "Neobrutalism";
     match tagged {
-        "Hero" => json!({
-            "size": 100.0,
+        "Hero" if brutalist => json!({
+            "family": "Impact, Haettenschweiler, Arial Black, SansSerif",
+            "size": 78.0,
             "color": document_theme_color(context, "text_header"),
-            "weight": "Hairline"
+            "weight": 900.0
+        }),
+        "Hero" => json!({
+            "family": family,
+            "size": 80.0,
+            "color": document_theme_color(context, "text_header"),
+            "weight": "Light"
         }),
         "BodySecondary" => json!({
-            "size": 14.0,
-            "color": document_theme_color(context, "text_secondary")
+            "family": family,
+            "size": if brutalist { 13.0 } else { 14.0 },
+            "color": document_theme_color(context, "text_secondary"),
+            "weight": "Normal"
+        }),
+        "FilterSelected" => json!({
+            "family": family,
+            "size": if brutalist { 13.0 } else { 14.0 },
+            "color": document_theme_color(context, "filter_selected"),
+            "weight": "Normal"
         }),
         "BodyDisabled" => json!({
-            "size": 24.0,
-            "color": document_theme_color(context, "text_disabled")
+            "family": family,
+            "size": 25.0,
+            "color": document_theme_color(context, "text_disabled"),
+            "weight": "Light"
         }),
         "BodyDanger" => json!({
+            "family": family,
             "size": 30.0,
             "align": "Center",
-            "color": document_theme_color(context, "danger")
+            "color": document_theme_color(context, "danger"),
+            "weight": "Normal"
         }),
         "Placeholder" => json!({
-            "size": 24.0,
+            "family": family,
+            "size": if brutalist { 22.0 } else { 25.0 },
             "style": "Italic",
-            "color": document_theme_color(context, "text_secondary")
+            "color": document_theme_color(context, "text_placeholder"),
+            "weight": "Light"
         }),
         "ButtonIcon" => json!({
+            "family": family,
             "size": 22.0,
             "color": if checked {
                 document_theme_color(context, "text")
             } else {
                 document_theme_color(context, "text_disabled")
-            }
+            },
+            "weight": "Normal"
         }),
         "Small" => json!({
-            "size": 10.0,
-            "color": document_theme_color(context, "text_tertiary")
+            "family": family,
+            "size": 11.0,
+            "color": document_theme_color(context, "text_tertiary"),
+            "weight": "Normal"
         }),
         "SmallLink" => json!({
-            "size": 10.0,
+            "family": family,
+            "size": 11.0,
             "color": document_theme_color(context, "text_tertiary"),
+            "weight": "Normal",
             "line": {"underline": false}
         }),
         "Input" | "Body" | _ => json!({
-            "size": 24.0,
-            "color": document_theme_color(context, "text")
+            "family": family,
+            "size": 25.0,
+            "color": document_theme_color(context, "text"),
+            "weight": "Light"
         }),
     }
 }
@@ -19405,40 +19609,29 @@ fn document_theme_text(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             }),
         };
     }
-    let (hero_depth, hero_closer, small_depth, small_further, small_relief, body_depth) =
-        match document_theme_name(context) {
-            "Glassmorphism" => (4.0, 4.0, 1.0, 3.0, "Carved[wall:1]", 1.5),
-            "Neobrutalism" => (8.0, 8.0, 2.0, 4.0, "Carved[wall:2]", 3.0),
-            "Neumorphism" => (5.0, 5.0, 1.0, 3.0, "Carved[wall:1]", 1.5),
-            _ => (6.0, 6.0, 1.0, 4.0, "Carved[wall:1]", 1.5),
-        };
     match tagged {
         "Hero" => json!({
             "font": document_theme_font("Hero", context),
-            "depth": hero_depth,
-            "move": {"closer": hero_closer},
-            "relief": "Raised"
+            "depth": 0.0,
+            "move": {"closer": 0.0}
         }),
         "BodySecondary" => json!({
             "font": document_theme_font("BodySecondary", context),
-            "depth": body_depth,
-            "move": {"further": 2.0},
-            "relief": "Raised"
+            "depth": 0.0,
+            "move": {"further": 0.0}
         }),
         "ButtonIcon" => json!({
             "font": document_theme_font("ButtonIcon", context)
         }),
         "SmallLink" => json!({
             "font": document_theme_font("SmallLink", context),
-            "depth": small_depth,
-            "move": {"further": small_further},
-            "relief": small_relief
+            "depth": 0.0,
+            "move": {"further": 0.0}
         }),
         "Small" | _ => json!({
             "font": document_theme_font("Small", context),
-            "depth": small_depth,
-            "move": {"further": small_further},
-            "relief": small_relief
+            "depth": 0.0,
+            "move": {"further": 0.0}
         }),
     }
 }
@@ -19448,37 +19641,67 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     let light = document_theme_mode(context) == "Light";
     if document_theme_name(context) == "Classic" {
         let material = match tagged {
-            "Background" => json!({"color": "Oklch[lightness:0.97]"}),
+            "Background" if light => json!({"color": "Oklch[lightness:0.97]"}),
+            "Background" => json!({"color": "#1b1b1b"}),
             "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
-                json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
+                if light {
+                    json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
+                } else {
+                    json!({"color": "#202020", "gloss": 0.0})
+                }
             }
             "InteractiveRecessed" => {
-                json!({"color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]", "gloss": 0.0})
+                if light {
+                    json!({"color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]", "gloss": 0.0})
+                } else {
+                    json!({"color": "#202020", "gloss": 0.0})
+                }
             }
-            "Primary" => json!({"color": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]"}),
-            "PrimarySubtle" => json!({
+            "Primary" if light => json!({"color": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]"}),
+            "Primary" => json!({"color": "#b83f45"}),
+            "PrimarySubtle" if light => json!({
                 "color": "Oklch[lightness:1]",
                 "border": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]",
-                "border_width": 0.8
+                "border_width": 1.0
             }),
-            "Danger" => json!({"color": "Oklch[lightness:0.57,chroma:0.109,hue:18.87]"}),
+            "PrimarySubtle" => json!({
+                "color": "#00000000",
+                "border": "#b83f45",
+                "border_width": 1.0
+            }),
+            "Danger" if light => json!({"color": "Oklch[lightness:0.57,chroma:0.109,hue:18.87]"}),
+            "Danger" => json!({"color": "#b83f45"}),
             "PanelFrame" => json!({
+                "border": if light { "#00000000" } else { "#3c3c3c" },
+                "border_width": if light { 0.0 } else { 1.0 },
                 "shadows": [
                     {
                         "y": 2.0,
                         "blur": 4.0,
-                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                        "color": if light {
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.24]"
+                        } else {
+                            "#00000073"
+                        }
                     },
                     {
                         "y": 25.0,
                         "blur": 50.0,
-                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.10]"
+                        "color": if light {
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.14]"
+                        } else {
+                            "#00000073"
+                        }
                     }
                 ]
             }),
             "NewTodoRowFrame" => json!({
                 "height": 65.0,
-                "border": "Oklch[lightness:0.66,chroma:0.11,hue:20,alpha:0.45]",
+                "border": if light {
+                    "Oklch[lightness:0.7,chroma:0.18,hue:24.1]"
+                } else {
+                    "Oklch[lightness:0.31,chroma:0.03,hue:25,alpha:0.9]"
+                },
                 "border_width": 1.0
             }),
             "TodoListFrame" => json!({
@@ -19486,42 +19709,62 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                 "scrollbars": false
             }),
             "TodoRowFrame" => json!({
-                "height": 59.6,
+                "height": 59.0,
                 "padding": 9.0,
-                "border_bottom": "Oklch[lightness:0.93]",
+                "border_bottom": if light {
+                    "Oklch[lightness:0.93]"
+                } else {
+                    "#373737"
+                },
                 "border_bottom_width": 0.8
             }),
             "PanelFooterFrame" => json!({
-                "height": 46.0,
-                "border_top": "Oklch[lightness:0.93]",
+                "height": 49.0,
+                "border_top": if light {
+                    "Oklch[lightness:0.93]"
+                } else {
+                    "#373737"
+                },
                 "border_top_width": 0.8,
                 "shadows": [
                     {
                         "y": 1.0,
                         "blur": 1.0,
-                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                        "color": if light {
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.24]"
+                        } else {
+                            "#00000073"
+                        }
                     },
                     {
                         "y": 8.0,
                         "spread": -3.0,
-                        "color": "Oklch[lightness:0.973]"
+                        "color": if light { "Oklch[lightness:0.973]" } else { "#1d1d1d" }
                     },
                     {
                         "y": 9.0,
                         "blur": 1.0,
                         "spread": -3.0,
-                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                        "color": if light {
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.24]"
+                        } else {
+                            "#00000073"
+                        }
                     },
                     {
                         "y": 16.0,
                         "spread": -6.0,
-                        "color": "Oklch[lightness:0.973]"
+                        "color": if light { "Oklch[lightness:0.973]" } else { "#1d1d1d" }
                     },
                     {
                         "y": 17.0,
                         "blur": 2.0,
                         "spread": -6.0,
-                        "color": "Oklch[lightness:0,chroma:0,hue:0,alpha:0.20]"
+                        "color": if light {
+                            "Oklch[lightness:0,chroma:0,hue:0,alpha:0.24]"
+                        } else {
+                            "#00000073"
+                        }
                     }
                 ]
             }),
@@ -19534,6 +19777,15 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     }
     let focus = theme_tagged_field_bool(of, "focus").unwrap_or(false);
     let hovered = theme_tagged_field_bool(of, "hovered").unwrap_or(false);
+    if let Some(material) = document_theme_reference_material(
+        document_theme_name(context),
+        tagged,
+        light,
+        focus,
+        hovered,
+    ) {
+        return material;
+    }
     match (document_theme_name(context), tagged, light) {
         ("Glassmorphism", "Background", true) => {
             json!({"color": "Oklch[lightness:0.92,chroma:0.02,hue:240]"})
@@ -19765,6 +20017,186 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     }
 }
 
+fn document_theme_reference_material(
+    theme: &str,
+    tagged: &str,
+    light: bool,
+    focus: bool,
+    hovered: bool,
+) -> Option<Value> {
+    let material = match (theme, tagged, light) {
+        ("Professional", "Background", true) => json!({"color": "#f8fafc"}),
+        ("Professional", "Background", false) => json!({"color": "#16191e"}),
+        ("Professional", "Surface", true) | ("Professional", "SurfaceVariant", true) => {
+            json!({"color": "#ffffff", "gloss": 0.0})
+        }
+        ("Professional", "Surface", false) | ("Professional", "SurfaceVariant", false) => {
+            json!({"color": "#1b1f24", "gloss": 0.0})
+        }
+        ("Professional", "SurfaceElevated", true) => {
+            json!({"color": "#ffffff", "gloss": 0.0})
+        }
+        ("Professional", "SurfaceElevated", false) => {
+            json!({"color": "#1d2127", "gloss": 0.0})
+        }
+        ("Professional", "Interactive", true) => {
+            json!({"color": "#ffffff", "gloss": if hovered { 0.04 } else { 0.0 }, "metal": 0.03})
+        }
+        ("Professional", "Interactive", false) => {
+            json!({"color": "#1b1f24", "gloss": if hovered { 0.04 } else { 0.0 }, "metal": 0.03})
+        }
+        ("Professional", "InteractiveRecessed", true) => {
+            json!({"color": "#ffffff", "gloss": if focus { 0.02 } else { 0.0 }})
+        }
+        ("Professional", "InteractiveRecessed", false) => {
+            json!({"color": "#1b1f24", "gloss": if focus { 0.02 } else { 0.0 }})
+        }
+        ("Professional", "Primary", true) => json!({"color": "#bd454d"}),
+        ("Professional", "Primary", false) => json!({"color": "#dc6463"}),
+        ("Professional", "PrimarySubtle", true) => {
+            json!({"color": "#fbf1f2", "border": "#f0d0d3", "border_width": 1.0})
+        }
+        ("Professional", "PrimarySubtle", false) => {
+            json!({"color": "#1d2127", "border": "#d65d5e", "border_width": 1.0})
+        }
+        ("Professional", "Danger", true) => json!({"color": "#b5424a"}),
+        ("Professional", "Danger", false) => json!({"color": "#d65d5e"}),
+
+        ("Glassmorphism", "Background", true) => json!({"color": "#eef7ff"}),
+        ("Glassmorphism", "Background", false) => json!({"color": "#10152d"}),
+        ("Glassmorphism", "Surface", true) => {
+            json!({"color": "#ffffff8a", "refraction": 1.5, "gloss": 0.08})
+        }
+        ("Glassmorphism", "Surface", false) => {
+            json!({"color": "#1f26438a", "refraction": 1.5, "gloss": 0.08})
+        }
+        ("Glassmorphism", "SurfaceVariant", true) | ("Glassmorphism", "Interactive", true) => {
+            json!({"color": "#ffffff29", "refraction": 1.5, "gloss": 0.05, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Glassmorphism", "SurfaceVariant", false) | ("Glassmorphism", "Interactive", false) => {
+            json!({"color": "#ffffff06", "refraction": 1.5, "gloss": 0.05, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Glassmorphism", "SurfaceElevated", true) => {
+            json!({"color": "#ffffff38", "refraction": 1.5, "gloss": 0.06})
+        }
+        ("Glassmorphism", "SurfaceElevated", false) => {
+            json!({"color": "#090d1e47", "refraction": 1.5, "gloss": 0.06})
+        }
+        ("Glassmorphism", "InteractiveRecessed", true) => {
+            json!({"color": "#ffffff8a", "refraction": 1.5, "gloss": if focus { 0.08 } else { 0.04 }})
+        }
+        ("Glassmorphism", "InteractiveRecessed", false) => {
+            json!({"color": "#1f26438a", "refraction": 1.5, "gloss": if focus { 0.08 } else { 0.04 }})
+        }
+        ("Glassmorphism", "Primary", true) => json!({"color": "#ba4048db", "refraction": 1.5}),
+        ("Glassmorphism", "Primary", false) => json!({"color": "#917cdecc", "refraction": 1.5}),
+        ("Glassmorphism", "PrimarySubtle", true) => {
+            json!({"color": "#fff2f4ad", "refraction": 1.5, "border": "#da677052", "border_width": 1.0})
+        }
+        ("Glassmorphism", "PrimarySubtle", false) => {
+            json!({"color": "#765ec22e", "refraction": 1.5, "border": "#a890f6c2", "border_width": 1.0})
+        }
+        ("Glassmorphism", "Danger", true) => json!({"color": "#a7434d"}),
+        ("Glassmorphism", "Danger", false) => json!({"color": "#a890f6"}),
+
+        ("Neobrutalism", "Background", true) => json!({"color": "#fbfbf7"}),
+        ("Neobrutalism", "Background", false) => json!({"color": "#080808"}),
+        ("Neobrutalism", "Surface", true)
+        | ("Neobrutalism", "SurfaceVariant", true)
+        | ("Neobrutalism", "SurfaceElevated", true)
+        | ("Neobrutalism", "Interactive", true)
+        | ("Neobrutalism", "InteractiveRecessed", true) => {
+            json!({"color": "#ffffff", "gloss": 0.0, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neobrutalism", "Surface", false)
+        | ("Neobrutalism", "SurfaceVariant", false)
+        | ("Neobrutalism", "SurfaceElevated", false)
+        | ("Neobrutalism", "Interactive", false)
+        | ("Neobrutalism", "InteractiveRecessed", false) => {
+            json!({"color": "#101010", "gloss": 0.0, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neobrutalism", "Primary", true)
+        | ("Neobrutalism", "PrimarySubtle", true)
+        | ("Neobrutalism", "Danger", true) => {
+            json!({"color": "#000000", "border": "#000000", "border_width": if tagged == "PrimarySubtle" { 1.0 } else { 0.0 }})
+        }
+        ("Neobrutalism", "Primary", false)
+        | ("Neobrutalism", "PrimarySubtle", false)
+        | ("Neobrutalism", "Danger", false) => {
+            json!({"color": "#ffffff", "border": "#ffffff", "border_width": if tagged == "PrimarySubtle" { 1.0 } else { 0.0 }})
+        }
+
+        ("Neumorphism", "Background", true) => json!({"color": "#e9edf3"}),
+        ("Neumorphism", "Background", false) => json!({"color": "#1d232d"}),
+        ("Neumorphism", "Surface", true) => json!({"color": "#eef1f6", "gloss": 0.0}),
+        ("Neumorphism", "Surface", false) => json!({"color": "#252c36", "gloss": 0.0}),
+        ("Neumorphism", "SurfaceVariant", true) | ("Neumorphism", "Interactive", true) => {
+            json!({"color": "#00000000", "gloss": 0.0, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neumorphism", "SurfaceVariant", false) | ("Neumorphism", "Interactive", false) => {
+            json!({"color": "#00000000", "gloss": 0.0, "metal": if tagged == "Interactive" { 0.03 } else { 0.0 }})
+        }
+        ("Neumorphism", "SurfaceElevated", true) => json!({
+            "color": "#eef1f6",
+            "gloss": 0.0,
+            "shadows": [
+                {"x": 6.0, "y": 6.0, "blur": 14.0, "color": "#a6aebe61"},
+                {"x": -6.0, "y": -6.0, "blur": 14.0, "color": "#ffffffe0"}
+            ]
+        }),
+        ("Neumorphism", "SurfaceElevated", false) => json!({
+            "color": "#252c36",
+            "gloss": 0.0,
+            "shadows": [
+                {"x": 6.0, "y": 6.0, "blur": 14.0, "color": "#00000052"},
+                {"x": -6.0, "y": -6.0, "blur": 14.0, "color": "#4d596b1f"}
+            ]
+        }),
+        ("Neumorphism", "InteractiveRecessed", true) => json!({
+            "color": "#eef1f6",
+            "gloss": 0.0,
+            "shadows": [
+                {"x": 7.0, "y": 7.0, "blur": 14.0, "direction": "Inwards", "color": "#a6aebe6b"},
+                {"x": -7.0, "y": -7.0, "blur": 14.0, "direction": "Inwards", "color": "#ffffffe0"}
+            ]
+        }),
+        ("Neumorphism", "InteractiveRecessed", false) => json!({
+            "color": "#252c36",
+            "gloss": 0.0,
+            "shadows": [
+                {"x": 7.0, "y": 7.0, "blur": 14.0, "direction": "Inwards", "color": "#00000059"},
+                {"x": -7.0, "y": -7.0, "blur": 14.0, "direction": "Inwards", "color": "#4f5b6d24"}
+            ]
+        }),
+        ("Neumorphism", "Primary", true) | ("Neumorphism", "Danger", true) => {
+            json!({"color": "#b94a52"})
+        }
+        ("Neumorphism", "Primary", false) | ("Neumorphism", "Danger", false) => {
+            json!({"color": "#5be0bd"})
+        }
+        ("Neumorphism", "PrimarySubtle", true) => json!({
+            "color": "#eef1f6",
+            "border": "#ffffff7a",
+            "border_width": 1.0,
+            "shadows": [
+                {"x": 4.0, "y": 4.0, "blur": 10.0, "color": "#a6aebe73"},
+                {"x": -4.0, "y": -4.0, "blur": 10.0, "color": "#ffffffdb"}
+            ]
+        }),
+        ("Neumorphism", "PrimarySubtle", false) => json!({
+            "color": "#252c36",
+            "border": "#ffffff0f",
+            "border_width": 1.0,
+            "shadows": [
+                {"x": 5.0, "y": 5.0, "blur": 12.0, "color": "#00000061"},
+                {"x": -5.0, "y": -5.0, "blur": 12.0, "color": "#4f5b6d24"}
+            ]
+        }),
+        _ => return None,
+    };
+    Some(material)
+}
+
 fn document_theme_lights(context: &DocumentEvalContext<'_>) -> Value {
     let light = document_theme_mode(context) == "Light";
     match document_theme_name(context) {
@@ -19916,32 +20348,106 @@ fn document_theme_shared_frame_material(
     tagged: &str,
     context: &DocumentEvalContext<'_>,
 ) -> Option<Value> {
-    let divider = if document_theme_mode(context) == "Dark" {
-        "Oklch[lightness:0.34,chroma:0.02,hue:220,alpha:0.75]"
-    } else {
-        "Oklch[lightness:0.88,chroma:0.02,hue:220,alpha:0.85]"
+    let theme = document_theme_name(context);
+    let dark = document_theme_mode(context) == "Dark";
+    let divider = match (theme, dark) {
+        ("Professional", false) => "#e5e8ee",
+        ("Professional", true) => "#323840",
+        ("Glassmorphism", false) => "#5f71882e",
+        ("Glassmorphism", true) => "#b4c3eb29",
+        ("Neobrutalism", false) => "#000000",
+        ("Neobrutalism", true) => "#f4f4f4",
+        ("Neumorphism", false) => "#a8b2c23d",
+        ("Neumorphism", true) => "#ffffff14",
+        (_, false) => "#e5e8ee",
+        (_, true) => "#323840",
+    };
+    let divider_width = match (theme, dark) {
+        ("Neobrutalism", false) => 4.0,
+        ("Neobrutalism", true) => 2.0,
+        _ => 1.0,
     };
     match tagged {
-        "PanelFrame" => Some(json!({})),
+        "PanelFrame" => Some(match (theme, dark) {
+            ("Professional", false) => json!({
+                "border": "#d7dde6",
+                "border_width": 1.0,
+                "shadows": [
+                    {"y": 24.0, "blur": 48.0, "color": "#222e4424"},
+                    {"y": 2.0, "blur": 7.0, "color": "#222e4414"}
+                ]
+            }),
+            ("Professional", true) => json!({
+                "border": "#3a414b",
+                "border_width": 1.0,
+                "shadows": [
+                    {"y": 26.0, "blur": 52.0, "color": "#0000006b"},
+                    {"y": 1.0, "blur": 0.0, "color": "#ffffff08"}
+                ]
+            }),
+            ("Glassmorphism", false) => json!({
+                "border": "#ffffffe0",
+                "border_width": 1.0,
+                "shadows": [
+                    {"y": 28.0, "blur": 54.0, "color": "#3a56762e"},
+                    {"y": 1.0, "blur": 0.0, "color": "#ffffffd1"}
+                ]
+            }),
+            ("Glassmorphism", true) => json!({
+                "border": "#a1b2e96b",
+                "border_width": 1.0,
+                "shadows": [
+                    {"y": 32.0, "blur": 64.0, "color": "#00000066"},
+                    {"y": 1.0, "blur": 0.0, "color": "#ffffff24"}
+                ]
+            }),
+            ("Neobrutalism", false) => json!({
+                "border": "#000000",
+                "border_width": 4.0,
+                "shadows": [{"x": 12.0, "y": 14.0, "blur": 0.0, "color": "#000000"}]
+            }),
+            ("Neobrutalism", true) => json!({
+                "border": "#f4f4f4",
+                "border_width": 3.0,
+                "shadows": [{"x": 14.0, "y": 15.0, "blur": 0.0, "color": "#000000"}]
+            }),
+            ("Neumorphism", false) => json!({
+                "border": "#ffffff8c",
+                "border_width": 1.0,
+                "shadows": [
+                    {"x": 14.0, "y": 14.0, "blur": 34.0, "color": "#a1aabc80"},
+                    {"x": -14.0, "y": -14.0, "blur": 34.0, "color": "#ffffffeb"}
+                ]
+            }),
+            ("Neumorphism", true) => json!({
+                "border": "#ffffff0f",
+                "border_width": 1.0,
+                "shadows": [
+                    {"x": 16.0, "y": 16.0, "blur": 35.0, "color": "#00000073"},
+                    {"x": -12.0, "y": -12.0, "blur": 28.0, "color": "#4854652e"}
+                ]
+            }),
+            _ => json!({}),
+        }),
         "NewTodoRowFrame" => Some(json!({
-            "height": 65.0,
-            "border": divider,
-            "border_width": 1.0
+            "height": 64.0,
+            "border_bottom": divider,
+            "border_bottom_width": divider_width
         })),
         "TodoListFrame" => Some(json!({
             "scroll": true,
             "scrollbars": false
         })),
         "TodoRowFrame" => Some(json!({
-            "height": 59.6,
+            "height": 59.0,
             "padding": 9.0,
             "border_bottom": divider,
-            "border_bottom_width": 0.8
+            "border_bottom_width": divider_width
         })),
         "PanelFooterFrame" => Some(json!({
-            "height": 46.0,
+            "height": 49.0,
             "border_top": divider,
-            "border_top_width": 0.8
+            "border_top_width": divider_width
         })),
         _ => None,
     }
@@ -20331,12 +20837,59 @@ fn document_eval_statement_sequence(
                 field_object.insert(name, value.clone());
                 last = Some(value);
             }
-        } else if matches!(statement.kind, AstStatementKind::Block) {
+        } else if is_semantic_block_statement(statement, expressions) {
             saw_non_field = true;
-            last = document_eval_statement_sequence(&statement.children, expressions, &scoped);
-        } else {
+            last =
+                document_eval_block_statement_sequence(&statement.children, expressions, &scoped);
+        } else if let Some(value) = document_eval_statement_value(statement, expressions, &scoped) {
+            if let Value::Object(object) = &value {
+                field_object.extend(object.clone());
+                last = Some(Value::Object(field_object.clone()));
+                continue;
+            }
             saw_non_field = true;
-            last = document_eval_statement_value(statement, expressions, &scoped).or(last);
+            last = Some(value);
+        }
+    }
+    if !saw_non_field && !field_object.is_empty() {
+        return Some(Value::Object(field_object));
+    }
+    last
+}
+
+fn document_eval_block_statement_sequence(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    let mut scoped = DocumentEvalContext {
+        root: context.root,
+        locals: context.locals.clone(),
+        render_args: context.render_args.clone(),
+        passed: context.passed.clone(),
+        source_binding_index: Arc::clone(&context.source_binding_index),
+        source_override: context.source_override.clone(),
+        functions: context.functions,
+        eval_depth: context.eval_depth,
+        eval_cache: Arc::clone(&context.eval_cache),
+    };
+    let mut last = None;
+    let mut field_object = serde_json::Map::new();
+    let mut saw_non_field = false;
+    for statement in statements {
+        if let Some(name) = document_field_name(statement) {
+            if let Some(value) = document_eval_statement_value(statement, expressions, &scoped) {
+                scoped.locals.insert(name.clone(), value.clone());
+                field_object.insert(name, value.clone());
+                last = Some(value);
+            }
+        } else if is_semantic_block_statement(statement, expressions) {
+            saw_non_field = true;
+            last =
+                document_eval_block_statement_sequence(&statement.children, expressions, &scoped);
+        } else if let Some(value) = document_eval_statement_value(statement, expressions, &scoped) {
+            saw_non_field = true;
+            last = Some(value);
         }
     }
     if !saw_non_field && !field_object.is_empty() {
@@ -20352,6 +20905,21 @@ fn document_eval_statement_value(
 ) -> Option<Value> {
     if let Some(expr_id) = statement.expr {
         let expr = expressions.get(expr_id)?;
+        if let Some(resolved) =
+            document_eval_chained_statement_value(statement, expressions, context)
+        {
+            return Some(resolved);
+        }
+        if let AstExprKind::ListLiteral { items, .. } = &expr.kind
+            && items.is_empty()
+            && !statement.children.is_empty()
+        {
+            return document_eval_list_literal_or_record_statement_children(
+                &statement.children,
+                expressions,
+                context,
+            );
+        }
         if let Some(input) = document_when_input_expr_id(expr) {
             return document_eval_while_expr_value(
                 input,
@@ -20360,10 +20928,59 @@ fn document_eval_statement_value(
                 context,
             );
         }
+        if statement_has_match_arm_children(statement, expressions) {
+            let selector = document_eval_expr_value(expr, expressions, context)?;
+            return document_eval_while_selector_value(
+                selector,
+                statement.children.as_slice(),
+                expressions,
+                context,
+            );
+        }
         return document_eval_expr_value(expr, expressions, context)
             .or_else(|| document_expr_value(expr, expressions).map(Value::String));
     }
+    if is_semantic_block_statement(statement, expressions) {
+        return document_eval_block_statement_sequence(&statement.children, expressions, context);
+    }
     document_eval_statement_sequence(&statement.children, expressions, context)
+}
+
+fn is_semantic_block_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    matches!(statement.kind, AstStatementKind::Block)
+        && statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(
+                |expr| matches!(&expr.kind, AstExprKind::Identifier(value) if value == "BLOCK"),
+            )
+}
+
+fn document_eval_list_literal_or_record_statement_children(
+    children: &[AstStatement],
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<Value> {
+    if children
+        .iter()
+        .any(|child| document_field_name(child).is_some())
+    {
+        return document_eval_statement_sequence(children, expressions, context);
+    }
+    let values = children
+        .iter()
+        .filter_map(|child| document_eval_statement_value(child, expressions, context))
+        .collect::<Vec<_>>();
+    Some(Value::Array(values))
+}
+
+fn statement_has_match_arm_children(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement.children.iter().any(|child| {
+        child
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
+    })
 }
 
 fn document_eval_list_retain(
@@ -21663,22 +22280,20 @@ fn preview_apply_focus_overlay(
         if item.style.remove("caret_visible").is_some() {
             changed = true;
         }
-        if item.focused && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            if input_state.focused_node.is_some() && !input_state.replace_focused_text_on_next_edit
-            {
+        let host_text_focus_active = input_state.focused_node.is_some();
+        if item.focused
+            && host_text_focus_active
+            && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+        {
+            if !input_state.replace_focused_text_on_next_edit {
                 let next_text = Some(input_state.focused_text.clone());
                 if item.text != next_text {
                     item.text = next_text;
                     changed = true;
                 }
             }
-            let caret_column = boon_document_model::StyleValue::Number(
-                input_state
-                    .focused_node
-                    .as_ref()
-                    .map(|_| input_state.focused_caret_index as f64)
-                    .unwrap_or(0.0),
-            );
+            let caret_column =
+                boon_document_model::StyleValue::Number(input_state.focused_caret_index as f64);
             if item
                 .style
                 .insert("caret_column".to_owned(), caret_column.clone())
@@ -21716,13 +22331,8 @@ fn preview_frame_has_active_text_input_caret(
     frame: Option<&boon_document::LayoutFrame>,
     input_state: &PreviewNativeInputState,
 ) -> bool {
+    let _ = frame;
     input_state.focused_node.is_some()
-        || frame.is_some_and(|frame| {
-            frame.display_list.iter().any(|item| {
-                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
-                    && (item.focused || display_item_declares_text_input_focus(item))
-            })
-        })
 }
 
 fn preview_update_hover_from_input(
@@ -26226,6 +26836,132 @@ mod tests {
     }
 
     #[test]
+    fn physical_theme_material_primary_subtle_lowers_as_object() {
+        let units =
+            boon_runtime::source_units_for_path(&repo_path("examples/todo_mvc_physical/RUN.bn"))
+                .unwrap();
+        let parsed = boon_parser::parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            units.into_iter().map(|unit| (unit.path, unit.source)),
+        )
+        .unwrap();
+        let functions =
+            DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
+        let context = DocumentEvalContext {
+            root: None,
+            locals: BTreeMap::new(),
+            render_args: BTreeMap::new(),
+            passed: Some(json!({
+                "theme_options": {
+                    "name": "Classic",
+                    "mode": "Light"
+                }
+            })),
+            source_binding_index: Arc::new(BTreeMap::new()),
+            source_override: None,
+            functions: Some(&functions),
+            eval_depth: 0,
+            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let material_expr = parsed
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| {
+                matches!(
+                    &expr.kind,
+                    AstExprKind::Call { function, args }
+                        if function.ends_with("Theme/material")
+                            && args.iter().any(|arg| {
+                                arg.name.as_deref() == Some("of")
+                                    && parsed
+                                        .ast
+                                        .expressions
+                                        .get(arg.value)
+                                        .and_then(|expr| document_expr_value(expr, &parsed.ast.expressions))
+                                        .as_deref()
+                                        == Some("PrimarySubtle")
+                            })
+                )
+            })
+            .expect("physical source should call Theme/material(of: PrimarySubtle)");
+        let value = document_eval_expr_value(material_expr, &parsed.ast.expressions, &context)
+            .expect("PrimarySubtle material should evaluate");
+        assert_eq!(
+            value.get("border").and_then(Value::as_str),
+            Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
+            "PrimarySubtle should return the Classic selected-filter outline material: {value}"
+        );
+        assert_eq!(
+            value.get("color").and_then(Value::as_str),
+            Some("Oklch[lightness:1]"),
+            "PrimarySubtle should keep a white selected-filter fill: {value}"
+        );
+    }
+
+    #[test]
+    fn physical_filter_button_material_preserves_selected_outline_and_glow() {
+        let units =
+            boon_runtime::source_units_for_path(&repo_path("examples/todo_mvc_physical/RUN.bn"))
+                .unwrap();
+        let parsed = boon_parser::parse_project(
+            "examples/todo_mvc_physical/RUN.bn",
+            units.into_iter().map(|unit| (unit.path, unit.source)),
+        )
+        .unwrap();
+        let functions =
+            DocumentFunctionRegistry::new(&parsed.ast.statements, &parsed.ast.expressions);
+        let mut locals = BTreeMap::new();
+        locals.insert("selected".to_owned(), Value::Bool(true));
+        locals.insert(
+            "element".to_owned(),
+            json!({
+                "hovered": false
+            }),
+        );
+        let context = DocumentEvalContext {
+            root: None,
+            locals,
+            render_args: BTreeMap::new(),
+            passed: Some(json!({
+                "theme_options": {
+                    "name": "Classic",
+                    "mode": "Light"
+                }
+            })),
+            source_binding_index: Arc::new(BTreeMap::new()),
+            source_override: None,
+            functions: Some(&functions),
+            eval_depth: 0,
+            eval_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let material_expr = parsed
+            .ast
+            .expressions
+            .iter()
+            .find(|expr| {
+                matches!(
+                    &expr.kind,
+                    AstExprKind::Call { function, .. }
+                        if function.ends_with("filter_button_material")
+                )
+            })
+            .expect("physical source should call filter_button_material");
+        let value = document_eval_expr_value(material_expr, &parsed.ast.expressions, &context)
+            .expect("filter_button_material should evaluate");
+        assert_eq!(
+            value.get("border").and_then(Value::as_str),
+            Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
+            "selected filter material should preserve PrimarySubtle border: {value}"
+        );
+        assert_eq!(
+            value.pointer("/glow/color").and_then(Value::as_str),
+            Some("Oklch[lightness:0.585,chroma:0.172,hue:24.1]"),
+            "selected filter glow should remain nested under glow: {value}"
+        );
+    }
+
+    #[test]
     fn physical_todomvc_todo_row_lowers_source_bindings_and_svg_asset() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
@@ -26361,7 +27097,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "436fed5df426",
+            "d2d738f2c8ef",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -26832,7 +27568,7 @@ mod tests {
             "Classic physical title should keep the document TodoMVC title size"
         );
 
-        let document_panel = document_layout
+        let _document_panel = document_layout
             .display_list
             .iter()
             .find(|item| {
@@ -26881,22 +27617,24 @@ mod tests {
         );
         let physical_panel_left = physical_toggle_all.bounds.x;
         let physical_panel_right = physical_input.bounds.x + physical_input.bounds.width;
+        let reference_panel_left = 188.0;
+        let reference_panel_right = reference_panel_left + 552.0;
         assert_close(
             "classic panel left",
             physical_panel_left,
-            document_panel.bounds.x,
+            reference_panel_left,
             1.5,
         );
         assert_close(
             "classic panel right",
             physical_panel_right,
-            document_panel.bounds.x + document_panel.bounds.width,
+            reference_panel_right,
             1.5,
         );
         assert_close(
             "new-todo input x",
             physical_input.bounds.x,
-            document_input.bounds.x,
+            reference_panel_left + 54.0,
             1.5,
         );
         assert_close(
@@ -26914,24 +27652,21 @@ mod tests {
 
         let document_active_title = document_text("Read documentation");
         let physical_active_title = physical_text("Read documentation");
-        let document_title_left = document_active_title.bounds.x
-            + style_number_from_map(&document_active_title.style, "text_inset").unwrap_or(0.0);
         let physical_title_left = physical_active_title.bounds.x
             + style_number_from_map(&physical_active_title.style, "text_inset").unwrap_or(0.0);
-        let document_input_text_left = document_input.bounds.x
-            + style_number_from_map(&document_input.style, "text_inset").unwrap_or(0.0);
         let physical_input_text_left = physical_input.bounds.x
             + style_number_from_map(&physical_input.style, "text_inset").unwrap_or(0.0);
+        let reference_text_left = reference_panel_left + 60.0;
         assert_close(
             "new-todo placeholder text left",
             physical_input_text_left,
-            document_input_text_left,
+            reference_text_left,
             1.5,
         );
         assert_close(
             "todo title text left",
             physical_title_left,
-            document_title_left,
+            reference_text_left,
             1.5,
         );
         assert_eq!(
@@ -26954,7 +27689,7 @@ mod tests {
         assert_close(
             "footer active-count x",
             physical_footer_active.bounds.x,
-            document_footer_active.bounds.x,
+            reference_panel_left + 15.0,
             1.5,
         );
         assert_close(
@@ -26963,24 +27698,23 @@ mod tests {
             document_footer_active.bounds.y,
             1.5,
         );
-        for (label, expected_width) in [
-            ("All", 32.0),
-            ("Active", 56.0),
-            ("Completed", 88.0),
-            ("Clear completed", 110.0),
+        for (label, expected_x, expected_width) in [
+            ("All", reference_panel_left + 180.0, 32.0),
+            ("Active", reference_panel_left + 221.0, 56.0),
+            ("Completed", reference_panel_left + 286.0, 88.0),
+            ("Clear completed", reference_panel_left + 427.0, 117.0),
         ] {
-            let document_item = document_text(label);
             let physical_item = physical_text(label);
             assert_close(
                 &format!("footer `{label}` x"),
                 physical_item.bounds.x,
-                document_item.bounds.x,
+                expected_x,
                 2.0,
             );
             assert_close(
                 &format!("footer `{label}` y"),
                 physical_item.bounds.y,
-                document_item.bounds.y,
+                document_footer_active.bounds.y,
                 2.0,
             );
             assert_close(
@@ -27017,7 +27751,7 @@ mod tests {
         };
 
         let created_by = text_item("Created by");
-        let author = text_item("Martin Kavík");
+        let author = text_item("Martin Kavik");
         assert!(
             author.bounds.x > created_by.bounds.x + created_by.bounds.width,
             "helper-returned footer link should render after the paragraph text"
@@ -27090,19 +27824,21 @@ mod tests {
         ];
 
         for theme in themes {
-            let mut state = physical_todomvc_seed_state(theme, "Light");
-            mirror_physical_todomvc_seed_root_fields(&mut state);
-            let (_, layout) = native_document_layout_proof_with_state_embedded(
-                &source_path,
-                &source,
-                Some(&state),
-            )
-            .unwrap_or_else(|error| {
-                panic!("{theme} physical TodoMVC layout should lower: {error}")
-            });
+            for mode in ["Light", "Dark"] {
+                let context = format!("{theme}/{mode}");
+                let mut state = physical_todomvc_seed_state(theme, mode);
+                mirror_physical_todomvc_seed_root_fields(&mut state);
+                let (_, layout) = native_document_layout_proof_with_state_embedded(
+                    &source_path,
+                    &source,
+                    Some(&state),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{context} physical TodoMVC layout should lower: {error}")
+                });
 
-            let text_item = |label: &str| {
-                layout
+                let text_item = |label: &str| {
+                    layout
                     .display_list
                     .iter()
                     .find(|item| item.text.as_deref() == Some(label))
@@ -27112,236 +27848,350 @@ mod tests {
                             .iter()
                             .filter_map(|item| item.text.as_deref())
                             .collect::<Vec<_>>();
-                        panic!("{theme} physical TodoMVC text `{label}` should render; labels={labels:?}")
+                        panic!("{context} physical TodoMVC text `{label}` should render; labels={labels:?}")
                     })
-            };
-            let contains_bounds = |outer: boon_document::Rect, inner: boon_document::Rect| {
-                outer.x <= inner.x + 0.5
-                    && outer.y <= inner.y + 0.5
-                    && outer.x + outer.width >= inner.x + inner.width - 0.5
-                    && outer.y + outer.height >= inner.y + inner.height - 0.5
-            };
-            let shared_light_divider = boon_document_model::StyleValue::Text(
-                "Oklch[lightness:0.88,chroma:0.02,hue:220,alpha:0.85]".to_owned(),
-            );
-            let classic_new_todo_border = boon_document_model::StyleValue::Text(
-                "Oklch[lightness:0.66,chroma:0.11,hue:20,alpha:0.45]".to_owned(),
-            );
-            let classic_footer_border =
-                boon_document_model::StyleValue::Text("Oklch[lightness:0.93]".to_owned());
-            let text_button = |label: &str| {
-                let text = text_item(label);
-                layout
+                };
+                let contains_bounds = |outer: boon_document::Rect, inner: boon_document::Rect| {
+                    outer.x <= inner.x + 0.5
+                        && outer.y <= inner.y + 0.5
+                        && outer.x + outer.width >= inner.x + inner.width - 0.5
+                        && outer.y + outer.height >= inner.y + inner.height - 0.5
+                };
+                let non_classic_divider = boon_document_model::StyleValue::Text(
+                    match (theme, mode) {
+                        ("Professional", "Light") => "#e5e8ee",
+                        ("Professional", "Dark") => "#323840",
+                        ("Glassmorphism", "Light") => "#5f71882e",
+                        ("Glassmorphism", "Dark") => "#b4c3eb29",
+                        ("Neobrutalism", "Light") => "#000000",
+                        ("Neobrutalism", "Dark") => "#f4f4f4",
+                        ("Neumorphism", "Light") => "#a8b2c23d",
+                        ("Neumorphism", "Dark") => "#ffffff14",
+                        _ => "#e5e8ee",
+                    }
+                    .to_owned(),
+                );
+                let classic_new_todo_border_light = boon_document_model::StyleValue::Text(
+                    "Oklch[lightness:0.7,chroma:0.18,hue:24.1]".to_owned(),
+                );
+                let classic_new_todo_border_dark = boon_document_model::StyleValue::Text(
+                    "Oklch[lightness:0.31,chroma:0.03,hue:25,alpha:0.9]".to_owned(),
+                );
+                let classic_new_todo_border = if mode == "Dark" {
+                    &classic_new_todo_border_dark
+                } else {
+                    &classic_new_todo_border_light
+                };
+                let classic_footer_border_light =
+                    boon_document_model::StyleValue::Text("Oklch[lightness:0.93]".to_owned());
+                let classic_footer_border_dark =
+                    boon_document_model::StyleValue::Text("#373737".to_owned());
+                let classic_footer_border = if mode == "Dark" {
+                    &classic_footer_border_dark
+                } else {
+                    &classic_footer_border_light
+                };
+                let text_button = |label: &str| {
+                    let text = text_item(label);
+                    layout
+                        .display_list
+                        .iter()
+                        .find(|item| {
+                            matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                                && contains_bounds(item.bounds, text.bounds)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{context} button `{label}` should contain its text")
+                        })
+                };
+
+                let input = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    })
+                    .unwrap_or_else(|| panic!("{context} new-todo text input should render"));
+                let toggle_all_text = text_item("❯");
+                let toggle_all = layout
                     .display_list
                     .iter()
                     .find(|item| {
                         matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
-                            && contains_bounds(item.bounds, text.bounds)
+                            && contains_bounds(item.bounds, toggle_all_text.bounds)
+                            && item.bounds.y <= input.bounds.y + 0.5
+                            && item.bounds.y + item.bounds.height
+                                >= input.bounds.y + input.bounds.height - 0.5
                     })
-                    .unwrap_or_else(|| panic!("{theme} button `{label}` should contain its text"))
-            };
-
-            let input = layout
-                .display_list
-                .iter()
-                .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
-                .unwrap_or_else(|| panic!("{theme} new-todo text input should render"));
-            let toggle_all_text = text_item("❯");
-            let toggle_all = layout
-                .display_list
-                .iter()
-                .find(|item| {
-                    matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
-                        && contains_bounds(item.bounds, toggle_all_text.bounds)
-                        && item.bounds.y <= input.bounds.y + 0.5
-                        && item.bounds.y + item.bounds.height
-                            >= input.bounds.y + input.bounds.height - 0.5
-                })
-                .unwrap_or_else(|| panic!("{theme} toggle-all chevron button should render"));
-            assert!(
-                (toggle_all.bounds.width - 54.0).abs() <= 1.0,
-                "{theme} toggle-all should use the shared TodoMVC control width: {:?}",
-                toggle_all.bounds
-            );
-            assert!(
-                !layout.display_list.iter().any(|item| {
-                    matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
-                        && item.bounds.width >= 50.0
-                        && item.bounds.y <= input.bounds.y + 0.5
-                        && item.bounds.y + item.bounds.height
-                            >= input.bounds.y + input.bounds.height - 0.5
-                }),
-                "{theme} toggle-all must not regress into a checkbox in the input row"
-            );
-            let new_todo_row = layout
-                .display_list
-                .iter()
-                .find(|item| {
-                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
-                        && contains_bounds(item.bounds, input.bounds)
-                        && contains_bounds(item.bounds, toggle_all.bounds)
-                })
-                .unwrap_or_else(|| panic!("{theme} new-todo row should contain input controls"));
-            assert_eq!(
-                new_todo_row.style.get("border"),
-                if theme == "Classic" {
-                    Some(&classic_new_todo_border)
-                } else {
-                    Some(&shared_light_divider)
-                },
-                "{theme} new-todo row should use its source theme divider"
-            );
-
-            let panel_left = toggle_all.bounds.x;
-            let panel_right = input.bounds.x + input.bounds.width;
-            let panel_center = (panel_left + panel_right) * 0.5;
-            let title = text_item("todos");
-            let title_center = title.bounds.x + title.bounds.width * 0.5;
-            assert!(
-                (title_center - panel_center).abs() <= 1.0,
-                "{theme} title should stay centered over the panel: title={:?}, panel=({panel_left}, {panel_right})",
-                title.bounds
-            );
-
-            let footer_labels = [
-                "3 items left",
-                "All",
-                "Active",
-                "Completed",
-                "Clear completed",
-            ];
-            for label in footer_labels {
-                let item = text_item(label);
+                    .unwrap_or_else(|| panic!("{context} toggle-all chevron button should render"));
                 assert!(
-                    item.bounds.x >= panel_left - 0.5
-                        && item.bounds.x + item.bounds.width <= panel_right + 0.5,
-                    "{theme} footer text `{label}` should stay inside the panel: {:?}, panel=({panel_left}, {panel_right})",
-                    item.bounds
+                    (toggle_all.bounds.width - 54.0).abs() <= 1.0,
+                    "{context} toggle-all should use the shared TodoMVC control width: {:?}",
+                    toggle_all.bounds
                 );
-            }
-            let count = text_item("3 items left");
-            let panel_footer = layout
-                .display_list
-                .iter()
-                .find(|item| {
-                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
-                        && contains_bounds(item.bounds, count.bounds)
-                        && item.style.contains_key("border_top")
-                })
-                .unwrap_or_else(|| panic!("{theme} panel footer row should contain item count"));
-            assert_eq!(
-                panel_footer.style.get("border_top"),
-                if theme == "Classic" {
-                    Some(&classic_footer_border)
-                } else {
-                    Some(&shared_light_divider)
-                },
-                "{theme} panel footer should use its source theme divider"
-            );
-            for label in ["All", "Active", "Completed", "Clear completed"] {
-                let item = text_item(label);
                 assert!(
-                    (item.bounds.y - count.bounds.y).abs() <= 10.0,
-                    "{theme} footer label `{label}` should share the active-count row"
+                    toggle_all.style.contains_key("background")
+                        || toggle_all.style.contains_key("material_color"),
+                    "{context} toggle-all should lower the tagged InteractiveRecessed material arm, not rely on renderer defaults: {:?}",
+                    toggle_all.style
                 );
-            }
+                assert!(
+                    !toggle_all.style.contains_key("surface_base")
+                        && !toggle_all.style.contains_key("subtle_transparent_base"),
+                    "{context} BLOCK locals from Theme/material should not leak into returned style: {:?}",
+                    toggle_all.style
+                );
+                assert!(
+                    !layout.display_list.iter().any(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                            && item.bounds.width >= 50.0
+                            && item.bounds.y <= input.bounds.y + 0.5
+                            && item.bounds.y + item.bounds.height
+                                >= input.bounds.y + input.bounds.height - 0.5
+                    }),
+                    "{context} toggle-all must not regress into a checkbox in the input row"
+                );
+                let new_todo_row = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                            && contains_bounds(item.bounds, input.bounds)
+                            && contains_bounds(item.bounds, toggle_all.bounds)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{context} new-todo row should contain input controls")
+                    });
+                if theme == "Classic" {
+                    assert_eq!(
+                        new_todo_row.style.get("border"),
+                        Some(classic_new_todo_border),
+                        "{context} new-todo row should use the Classic input outline"
+                    );
+                } else {
+                    assert_eq!(
+                        new_todo_row.style.get("border"),
+                        None,
+                        "{context} non-Classic new-todo row should not draw a full input outline"
+                    );
+                    assert_eq!(
+                        new_todo_row.style.get("border_bottom"),
+                        Some(&non_classic_divider),
+                        "{context} non-Classic new-todo row should use its source divider"
+                    );
+                }
 
-            let clear = text_button("Clear completed");
-            let clear_text = text_item("Clear completed");
-            assert!(
-                style_number_from_map(&clear.style, "depth")
-                    .unwrap_or(0.0)
-                    .abs()
-                    <= f32::EPSILON
-                    && style_number_from_map(&clear_text.style, "depth")
+                let panel_left = toggle_all.bounds.x;
+                let panel_right = input.bounds.x + input.bounds.width;
+                let panel_center = (panel_left + panel_right) * 0.5;
+                let title = text_item("todos");
+                let title_center = title.bounds.x + title.bounds.width * 0.5;
+                assert!(
+                    (title_center - panel_center).abs() <= 1.0,
+                    "{context} title should stay centered over the panel: title={:?}, panel=({panel_left}, {panel_right})",
+                    title.bounds
+                );
+
+                let footer_labels = [
+                    "3 items left",
+                    "All",
+                    "Active",
+                    "Completed",
+                    "Clear completed",
+                ];
+                for label in footer_labels {
+                    let item = text_item(label);
+                    assert!(
+                        item.bounds.x >= panel_left - 0.5
+                            && item.bounds.x + item.bounds.width <= panel_right + 0.5,
+                        "{context} footer text `{label}` should stay inside the panel: {:?}, panel=({panel_left}, {panel_right})",
+                        item.bounds
+                    );
+                }
+                let count = text_item("3 items left");
+                let panel_footer = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                            && contains_bounds(item.bounds, count.bounds)
+                            && item.style.contains_key("border_top")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{context} panel footer row should contain item count")
+                    });
+                assert_eq!(
+                    panel_footer.style.get("border_top"),
+                    if theme == "Classic" {
+                        Some(classic_footer_border)
+                    } else {
+                        Some(&non_classic_divider)
+                    },
+                    "{context} panel footer should use its source theme divider"
+                );
+                let panel_frame = layout
+                    .display_list
+                    .iter()
+                    .filter(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Stack)
+                            && contains_bounds(item.bounds, new_todo_row.bounds)
+                            && contains_bounds(item.bounds, panel_footer.bounds)
+                            && (item.style.contains_key("background")
+                                || item.style.contains_key("material_color"))
+                    })
+                    .min_by(|left, right| {
+                        let left_area = left.bounds.width * left.bounds.height;
+                        let right_area = right.bounds.width * right.bounds.height;
+                        left_area
+                            .partial_cmp(&right_area)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or_else(|| panic!("{context} panel frame should wrap TodoMVC rows"));
+                assert!(
+                    panel_frame.style.contains_key("box_shadow_1_color"),
+                    "{context} panel frame should lower PanelFrame shadows from the theme source: {:?}",
+                    panel_frame.style
+                );
+                assert!(
+                    panel_footer.style.contains_key("box_shadow_1_color") || theme != "Classic",
+                    "{context} Classic footer should lower stacked-paper shadow tokens from PanelFooterFrame: {:?}",
+                    panel_footer.style
+                );
+                for label in ["All", "Active", "Completed", "Clear completed"] {
+                    let item = text_item(label);
+                    assert!(
+                        (item.bounds.y - count.bounds.y).abs() <= 10.0,
+                        "{context} footer label `{label}` should share the active-count row"
+                    );
+                }
+                let selected_filter = text_button("All");
+                assert!(
+                    selected_filter.style.get("border").is_some()
+                        && style_number_from_map(&selected_filter.style, "border_width")
+                            .is_some_and(|width| width >= 0.9),
+                    "{context} selected filter should lower the source PrimarySubtle outline: {:?}",
+                    selected_filter.style
+                );
+                assert!(
+                    selected_filter.style.contains_key("material_color")
+                        || selected_filter.style.contains_key("background"),
+                    "{context} selected filter should lower helper-returned material tokens, not a raw list marker: {:?}",
+                    selected_filter.style
+                );
+                let inactive_filter = text_button("Active");
+                assert_ne!(
+                    inactive_filter.style.get("border"),
+                    selected_filter.style.get("border"),
+                    "{context} inactive filter should not inherit the selected outline: selected={:?}, inactive={:?}",
+                    selected_filter.style,
+                    inactive_filter.style
+                );
+
+                let clear = text_button("Clear completed");
+                let clear_text = text_item("Clear completed");
+                assert!(
+                    style_number_from_map(&clear.style, "depth")
                         .unwrap_or(0.0)
                         .abs()
-                        <= f32::EPSILON,
-                "{theme} Clear completed should be a flat text action, not a raised button"
-            );
-            assert_eq!(
-                clear.style.get("relief"),
-                None,
-                "{theme} Clear completed button should not lower raised relief"
-            );
-            assert_eq!(
-                clear_text.style.get("relief"),
-                None,
-                "{theme} Clear completed label should not lower raised relief"
-            );
+                        <= f32::EPSILON
+                        && style_number_from_map(&clear_text.style, "depth")
+                            .unwrap_or(0.0)
+                            .abs()
+                            <= f32::EPSILON,
+                    "{context} Clear completed should be a flat text action, not a raised button"
+                );
+                assert_eq!(
+                    clear.style.get("relief"),
+                    None,
+                    "{context} Clear completed button should not lower raised relief"
+                );
+                assert_eq!(
+                    clear_text.style.get("relief"),
+                    None,
+                    "{context} Clear completed label should not lower raised relief"
+                );
 
-            let info = text_item("Double-click to edit a todo");
-            let info_center = info.bounds.x + info.bounds.width * 0.5;
-            assert!(
-                (info_center - panel_center).abs() <= 1.0,
-                "{theme} info footer line should be centered under the panel"
-            );
-            let created_by = text_item("Created by");
-            let author = text_item("Martin Kavík");
-            let author_center = (created_by.bounds.x + author.bounds.x + author.bounds.width) * 0.5;
-            assert!(
-                author.bounds.x > created_by.bounds.x + created_by.bounds.width
-                    && (author_center - panel_center).abs() <= 2.0,
-                "{theme} author footer fragments should be inline and centered"
-            );
-            let part_of = text_item("Part of");
-            let todomvc_link = text_item("TodoMVC");
-            let reference_center =
-                (part_of.bounds.x + todomvc_link.bounds.x + todomvc_link.bounds.width) * 0.5;
-            assert!(
-                todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width
-                    && (reference_center - panel_center).abs() <= 2.0,
-                "{theme} reference footer fragments should be inline and centered"
-            );
-
-            let footer_bottom = todomvc_link
-                .bounds
-                .y
-                .max(info.bounds.y)
-                .max(author.bounds.y)
-                + 15.0;
-            let mut theme_switcher_top = f32::MAX;
-            let mut theme_switcher_bottom = 0.0_f32;
-            for label in [
-                "Classic",
-                "Professional",
-                "Glass",
-                "Brutalist",
-                "Neumorphic",
-                "Dark mode",
-            ] {
-                let button = text_button(label);
-                theme_switcher_top = theme_switcher_top.min(button.bounds.y);
-                theme_switcher_bottom =
-                    theme_switcher_bottom.max(button.bounds.y + button.bounds.height);
+                let info = text_item("Double-click to edit a todo");
+                let info_center = info.bounds.x + info.bounds.width * 0.5;
                 assert!(
-                    button.bounds.x >= 0.0
-                        && button.bounds.x + button.bounds.width <= 920.0
-                        && button.bounds.y >= 0.0
-                        && button.bounds.y + button.bounds.height <= 720.0,
-                    "{theme} theme switcher button `{label}` should stay in the preview viewport: {:?}",
-                    button.bounds
+                    (info_center - panel_center).abs() <= 1.0,
+                    "{context} info footer line should be centered under the panel"
+                );
+                let created_by = text_item("Created by");
+                let author = text_item("Martin Kavik");
+                let author_center =
+                    (created_by.bounds.x + author.bounds.x + author.bounds.width) * 0.5;
+                assert!(
+                    author.bounds.x > created_by.bounds.x + created_by.bounds.width
+                        && (author_center - panel_center).abs() <= 2.0,
+                    "{context} author footer fragments should be inline and centered"
+                );
+                let part_of = text_item("Part of");
+                let todomvc_link = text_item("TodoMVC");
+                let reference_center =
+                    (part_of.bounds.x + todomvc_link.bounds.x + todomvc_link.bounds.width) * 0.5;
+                assert!(
+                    todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width
+                        && (reference_center - panel_center).abs() <= 2.0,
+                    "{context} reference footer fragments should be inline and centered"
+                );
+
+                let footer_bottom = todomvc_link
+                    .bounds
+                    .y
+                    .max(info.bounds.y)
+                    .max(author.bounds.y)
+                    + 15.0;
+                let mode_label = if mode == "Dark" {
+                    "Light mode"
+                } else {
+                    "Dark mode"
+                };
+                let mut theme_switcher_top = f32::MAX;
+                let mut theme_switcher_bottom = 0.0_f32;
+                for label in [
+                    "Classic",
+                    "Professional",
+                    "Glass",
+                    "Brutalist",
+                    "Neumorphic",
+                    mode_label,
+                ] {
+                    let button = text_button(label);
+                    theme_switcher_top = theme_switcher_top.min(button.bounds.y);
+                    theme_switcher_bottom =
+                        theme_switcher_bottom.max(button.bounds.y + button.bounds.height);
+                    assert!(
+                        button.bounds.x >= 0.0
+                            && button.bounds.x + button.bounds.width
+                                <= PHYSICAL_TODOMVC_PREVIEW_WIDTH
+                            && button.bounds.y >= 0.0
+                            && button.bounds.y + button.bounds.height
+                                <= PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+                        "{context} theme switcher button `{label}` should stay in the preview viewport: {:?}",
+                        button.bounds
+                    );
+                }
+                let mode_button = text_button(mode_label);
+                let mode_center = mode_button.bounds.x + mode_button.bounds.width * 0.5;
+                assert!(
+                    (mode_center - PHYSICAL_TODOMVC_PREVIEW_WIDTH * 0.5).abs() <= 2.0,
+                    "{context} mode toggle should be centered in the full preview control area: {:?}",
+                    mode_button.bounds
+                );
+                assert!(
+                    theme_switcher_top >= footer_bottom + 8.0,
+                    "{context} theme switcher should not collide with footer text: switcher_top={theme_switcher_top}, footer_bottom={footer_bottom}"
+                );
+                assert!(
+                    theme_switcher_bottom <= PHYSICAL_TODOMVC_PREVIEW_HEIGHT - 16.0,
+                    "{context} theme switcher should leave breathing room at the bottom: bottom={theme_switcher_bottom}"
+                );
+                assert!(
+                    PHYSICAL_TODOMVC_PREVIEW_HEIGHT - theme_switcher_bottom >= 18.0,
+                    "{context} theme switcher should not look clipped against the viewport bottom: bottom={theme_switcher_bottom}"
                 );
             }
-            let mode_button = text_button("Dark mode");
-            let mode_center = mode_button.bounds.x + mode_button.bounds.width * 0.5;
-            assert!(
-                (mode_center - panel_center).abs() <= 2.0,
-                "{theme} mode toggle should be centered under the theme row: {:?}",
-                mode_button.bounds
-            );
-            assert!(
-                theme_switcher_top >= footer_bottom + 8.0,
-                "{theme} theme switcher should not collide with footer text: switcher_top={theme_switcher_top}, footer_bottom={footer_bottom}"
-            );
-            assert!(
-                theme_switcher_bottom <= 704.0,
-                "{theme} theme switcher should leave breathing room at the bottom: bottom={theme_switcher_bottom}"
-            );
-            assert!(
-                720.0 - theme_switcher_bottom >= 18.0,
-                "{theme} theme switcher should not look clipped against the viewport bottom: bottom={theme_switcher_bottom}"
-            );
         }
     }
 
@@ -27353,7 +28203,7 @@ mod tests {
         let themes = [
             (
                 "Professional",
-                "hue:220",
+                "#f8fafc",
                 2.0,
                 45.0,
                 "directional",
@@ -27361,7 +28211,7 @@ mod tests {
             ),
             (
                 "Glassmorphism",
-                "hue:240",
+                "#eef7ff",
                 2.0,
                 45.0,
                 "directional",
@@ -27369,7 +28219,7 @@ mod tests {
             ),
             (
                 "Neobrutalism",
-                "hue:90",
+                "#fbfbf7",
                 0.0,
                 30.0,
                 "directional",
@@ -27377,7 +28227,7 @@ mod tests {
             ),
             (
                 "Neumorphism",
-                "chroma:0.005,hue:240",
+                "#e9edf3",
                 3.0,
                 50.0,
                 "directional",
@@ -27428,52 +28278,49 @@ mod tests {
                 "Professional" => {
                     assert!(
                         layout.display_list.iter().any(|item| {
-                            style_text_from_map(&item.style, "material_color")
-                                == Some("Oklch[lightness:1]")
-                                && style_number_from_map(&item.style, "gloss") == Some(0.25)
+                            style_text_from_map(&item.style, "material_color") == Some("#ffffff")
+                                && style_number_from_map(&item.style, "gloss") == Some(0.0)
                                 && style_number_from_map(&item.style, "border_radius")
-                                    .is_some_and(|value| (value - 4.0).abs() <= 0.1)
+                                    .is_some_and(|value| (value - 8.0).abs() <= 0.1)
                                 && style_number_from_map(&item.style, "box_shadow_1_blur")
-                                    .is_some_and(|value| value > 10.0)
+                                    .is_some_and(|value| value >= 40.0)
+                                && style_text_from_map(&item.style, "border") == Some("#d7dde6")
                         }),
-                        "Professional should lower rounded, low-gloss raised surfaces"
+                        "Professional should lower the rounded white card, border, and CSS shadow"
                     );
                     assert!(
                         !layout.display_list.iter().any(|item| {
                             style_number_from_map(&item.style, "transparency")
                                 .is_some_and(|value| value > 0.05)
-                                || item.style.contains_key("box_shadow_2_color")
+                                || style_number_from_map(&item.style, "refraction")
+                                    .is_some_and(|value| value > 0.05)
                         }),
-                        "Professional should not inherit Glass or Neumorphic physical tokens"
+                        "Professional should not inherit Glass refraction/transparency tokens"
                     );
                 }
                 "Glassmorphism" => {
                     assert!(
                         layout.display_list.iter().any(|item| {
-                            style_number_from_map(&item.style, "transparency")
-                                .is_some_and(|value| value >= 0.85)
+                            style_text_from_map(&item.style, "material_color") == Some("#ffffff8a")
                                 && style_number_from_map(&item.style, "refraction") == Some(1.5)
-                                && style_number_from_map(&item.style, "gloss")
-                                    .is_some_and(|value| value >= 0.65)
-                                && style_text_from_map(&item.style, "border")
-                                    .is_some_and(|value| value.contains("alpha:0.36"))
+                                && style_text_from_map(&item.style, "border") == Some("#ffffffe0")
                                 && style_number_from_map(&item.style, "box_shadow_1_blur")
-                                    .is_some_and(|value| value > 15.0)
+                                    .is_some_and(|value| value >= 50.0)
                         }),
-                        "Glassmorphism should lower transparent refractive glass surfaces"
+                        "Glassmorphism should lower transparent hex-alpha glass surfaces"
                     );
                 }
                 "Neobrutalism" => {
                     assert!(
                         layout.display_list.iter().any(|item| {
                             style_number_from_map(&item.style, "border_radius") == Some(0.0)
-                                && style_number_from_map(&item.style, "border_width") == Some(2.0)
+                                && style_number_from_map(&item.style, "border_width") == Some(4.0)
                                 && style_number_from_map(&item.style, "depth")
-                                    .is_some_and(|value| value >= 8.0)
+                                    .is_some_and(|value| value >= 12.0)
                                 && style_number_from_map(&item.style, "box_shadow_1_blur")
                                     == Some(0.0)
                                 && style_number_from_map(&item.style, "box_shadow_1_x")
-                                    .is_some_and(|value| value >= 4.0)
+                                    .is_some_and(|value| value >= 12.0)
                         }),
                         "Neobrutalism should lower sharp edges, thick borders, and hard offset shadows"
                     );
@@ -27481,13 +28328,11 @@ mod tests {
                 "Neumorphism" => {
                     assert!(
                         layout.display_list.iter().any(|item| {
-                            style_text_from_map(&item.style, "material_color")
-                                .is_some_and(|value| value.contains("chroma:0.005,hue:240"))
+                            style_text_from_map(&item.style, "material_color") == Some("#eef1f6")
                                 && item.style.contains_key("box_shadow_2_color")
                                 && style_number_from_map(&item.style, "box_shadow_1_blur")
-                                    .is_some_and(|value| value > 18.0)
-                                && style_text_from_map(&item.style, "border")
-                                    .is_some_and(|value| value.contains("chroma:0.005"))
+                                    .is_some_and(|value| value >= 30.0)
+                                && style_text_from_map(&item.style, "border") == Some("#ffffff8c")
                         }),
                         "Neumorphism should lower low-contrast material and paired soft shadows"
                     );
@@ -27509,7 +28354,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_todomvc_declarative_focus_blinks_new_todo_caret() {
+    fn physical_todomvc_declarative_focus_does_not_paint_static_preview_caret() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
@@ -27545,7 +28390,7 @@ mod tests {
 
         assert!(
             preview_apply_focus_overlay(&shared_render_state, &input_state, true).unwrap(),
-            "declarative focus should install a caret overlay"
+            "declarative focus should still mark the input focused"
         );
         let visible_frame = latest_preview_frame(&shared_render_state);
         let visible_input = visible_frame
@@ -27556,27 +28401,12 @@ mod tests {
         assert!(visible_input.focused);
         assert_eq!(
             visible_input.style.get("caret_visible"),
-            Some(&boon_document_model::StyleValue::Bool(true))
+            None,
+            "static reference readbacks should not paint a text caret before host text focus"
         );
         assert_eq!(
             frame_caret_column_for_node(&visible_frame, &input_node),
-            Some(0.0)
-        );
-
-        assert!(
-            preview_apply_focus_overlay(&shared_render_state, &input_state, false).unwrap(),
-            "caret blink should update declaratively focused inputs even without preview text focus"
-        );
-        let hidden_frame = latest_preview_frame(&shared_render_state);
-        let hidden_input = hidden_frame
-            .display_list
-            .iter()
-            .find(|item| item.node.0 == input_node)
-            .expect("focused physical input should remain in the hidden-caret frame");
-        assert!(hidden_input.focused);
-        assert_eq!(
-            hidden_input.style.get("caret_visible"),
-            Some(&boon_document_model::StyleValue::Bool(false))
+            None
         );
     }
 
@@ -27928,7 +28758,7 @@ mod tests {
             }
             if *expected_name == "Glassmorphism" {
                 assert!(
-                    root_color.contains("hue:240"),
+                    root_color.contains("#eef7ff"),
                     "Glassmorphism should visibly switch to the glass palette, got {root_color}"
                 );
             }
@@ -31551,8 +32381,8 @@ mod tests {
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
                     && item.bounds.width >= 540.0
-                    && item.bounds.height >= 45.5
-                    && item.bounds.height <= 46.5
+                    && item.bounds.height >= 48.5
+                    && item.bounds.height <= 49.5
                     && item.style.get("border_top").is_some()
             })
             .expect("TodoMVC footer should render as the bottom row of the real panel");
@@ -31773,7 +32603,7 @@ mod tests {
         let author_link = layout
             .display_list
             .iter()
-            .find(|item| item.text.as_deref() == Some("Martin Kavík"))
+            .find(|item| item.text.as_deref() == Some("Martin Kavik"))
             .expect("TodoMVC author footer link should render");
         let author_prefix = layout
             .display_list
@@ -34514,9 +35344,7 @@ mod tests {
         frame
             .display_list
             .iter()
-            .filter(|item| {
-                item.bounds.x.abs() <= f32::EPSILON && item.bounds.y.abs() <= f32::EPSILON
-            })
+            .filter(|item| item.style.contains_key("material_color"))
             .max_by(|left, right| {
                 let left_area = left.bounds.width * left.bounds.height;
                 let right_area = right.bounds.width * right.bounds.height;

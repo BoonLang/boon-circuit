@@ -71,6 +71,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-dev-editor-speed",
     "verify-native-two-window-content",
     "verify-native-todomvc-reference-parity",
+    "verify-native-todomvc-physical-reference-parity",
     "verify-native-todomvc-input-parity",
     "verify-native-gpu-scroll-speed",
     "verify-native-dev-editor-scroll-speed",
@@ -156,6 +157,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-dev-editor-speed" => verify_native_dev_editor_speed(&args),
         "verify-native-two-window-content" => verify_native_two_window_content(&args),
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
+        "verify-native-todomvc-physical-reference-parity" => {
+            verify_native_todomvc_physical_reference_parity(&args)
+        }
         "verify-native-todomvc-input-parity" => verify_native_todomvc_input_parity(&args),
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
         "verify-native-dev-editor-scroll-speed" => verify_native_dev_editor_scroll_speed(&args),
@@ -8694,6 +8698,397 @@ fn verify_native_todomvc_reference_parity(
     )
 }
 
+fn verify_native_todomvc_physical_reference_parity(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let reference_dir = PathBuf::from("docs/examples/todomvc_styled_generated");
+    let html_dir = reference_dir.join("html");
+    let manifest_path = reference_dir.join("reference_set.json");
+    let manifest_value = read_optional_json(&manifest_path)?;
+    let manifest = manifest_value.as_ref().unwrap_or(&serde_json::Value::Null);
+    let references = manifest
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let expected_combos = [
+        "classic/light",
+        "classic/dark",
+        "professional/light",
+        "professional/dark",
+        "glassmorphism/light",
+        "glassmorphism/dark",
+        "neobrutalism/light",
+        "neobrutalism/dark",
+        "neumorphism/light",
+        "neumorphism/dark",
+    ];
+    let expected_combo_set = expected_combos
+        .iter()
+        .map(|combo| (*combo).to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut observed_combo_set = BTreeSet::new();
+    let mut duplicate_combos = Vec::new();
+    let mut reference_evidence = Vec::new();
+    let mut missing_or_drifted_images = Vec::new();
+    let mut missing_or_drifted_html = Vec::new();
+    let mut html_token_failures = Vec::new();
+    let mut artifact_sha256s = Vec::new();
+    let mut artifact_paths = BTreeSet::new();
+
+    let reference_readme_path = reference_dir.join("README.md");
+    for path in [manifest_path.as_path(), reference_readme_path.as_path()] {
+        if path.exists() && artifact_paths.insert(path.to_path_buf()) {
+            artifact_sha256s.push(artifact_hash(path)?);
+        }
+    }
+
+    for reference in &references {
+        let theme = reference
+            .get("theme")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing-theme>");
+        let mode = reference
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing-mode>");
+        let combo = format!("{theme}/{mode}");
+        if !observed_combo_set.insert(combo.clone()) {
+            duplicate_combos.push(combo.clone());
+        }
+
+        let image_relative = reference
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let image_path = reference_dir.join(image_relative);
+        let image_dimensions = image::image_dimensions(&image_path).ok();
+        let expected_dimensions = reference
+            .get("image_width")
+            .and_then(serde_json::Value::as_u64)
+            .zip(
+                reference
+                    .get("image_height")
+                    .and_then(serde_json::Value::as_u64),
+            )
+            .and_then(|(width, height)| {
+                Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+            });
+        let image_sha256 = if image_path.exists() {
+            Some(boon_runtime::sha256_file(&image_path)?)
+        } else {
+            None
+        };
+        let expected_image_sha256 = reference
+            .get("image_sha256")
+            .and_then(serde_json::Value::as_str);
+        let image_pass = image_path.exists()
+            && image_dimensions == expected_dimensions
+            && image_sha256.as_deref() == expected_image_sha256;
+        if !image_pass {
+            missing_or_drifted_images.push(json!({
+                "combo": combo,
+                "path": image_path.display().to_string(),
+                "dimensions": image_dimensions,
+                "expected_dimensions": expected_dimensions,
+                "sha256": image_sha256,
+                "expected_sha256": expected_image_sha256
+            }));
+        }
+        if image_path.exists() && artifact_paths.insert(image_path.clone()) {
+            artifact_sha256s.push(artifact_hash(&image_path)?);
+        }
+
+        let html_relative = reference.get("html").and_then(serde_json::Value::as_str);
+        let mut html_evidence = serde_json::Value::Null;
+        if let Some(html_relative) = html_relative {
+            let html_path = html_dir.join(html_relative);
+            let html_sha256 = if html_path.exists() {
+                Some(boon_runtime::sha256_file(&html_path)?)
+            } else {
+                None
+            };
+            let expected_html_sha256 = reference
+                .get("html_sha256")
+                .and_then(serde_json::Value::as_str);
+            let html_text = fs::read_to_string(&html_path).unwrap_or_default();
+            let required_tokens = [
+                "--scene-w: 962px",
+                "--scene-h: 1017px",
+                "--card-w: 552px",
+                "--input-height: 64px",
+                "--row-height: 59px",
+                "--footer-height: 49px",
+                "--title-size: 80px",
+            ];
+            let missing_tokens = required_tokens
+                .iter()
+                .filter(|token| !html_text.contains(**token))
+                .map(|token| json!(token))
+                .collect::<Vec<_>>();
+            let html_pass = html_path.exists()
+                && html_sha256.as_deref() == expected_html_sha256
+                && missing_tokens.is_empty();
+            if !html_pass {
+                missing_or_drifted_html.push(json!({
+                    "combo": combo,
+                    "path": html_path.display().to_string(),
+                    "sha256": html_sha256,
+                    "expected_sha256": expected_html_sha256,
+                    "missing_tokens": missing_tokens
+                }));
+            }
+            if !missing_tokens.is_empty() {
+                html_token_failures.push(json!({
+                    "combo": combo,
+                    "path": html_path.display().to_string(),
+                    "missing_tokens": missing_tokens
+                }));
+            }
+            if html_path.exists() && artifact_paths.insert(html_path.clone()) {
+                artifact_sha256s.push(artifact_hash(&html_path)?);
+            }
+            html_evidence = json!({
+                "path": html_path,
+                "sha256": html_sha256,
+                "expected_sha256": expected_html_sha256,
+                "missing_tokens": missing_tokens,
+                "pass": html_pass
+            });
+        }
+
+        reference_evidence.push(json!({
+            "combo": combo,
+            "image": {
+                "path": image_path,
+                "dimensions": image_dimensions,
+                "expected_dimensions": expected_dimensions,
+                "sha256": image_sha256,
+                "expected_sha256": expected_image_sha256,
+                "pass": image_pass
+            },
+            "html": html_evidence
+        }));
+    }
+
+    for support in manifest
+        .get("html_support_files")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(path) = support.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let support_path = html_dir.join(path);
+        if support_path.exists() && artifact_paths.insert(support_path.clone()) {
+            artifact_sha256s.push(artifact_hash(&support_path)?);
+        }
+        let expected_sha256 = support.get("sha256").and_then(serde_json::Value::as_str);
+        let actual_sha256 = if support_path.exists() {
+            Some(boon_runtime::sha256_file(&support_path)?)
+        } else {
+            None
+        };
+        if actual_sha256.as_deref() != expected_sha256 {
+            missing_or_drifted_html.push(json!({
+                "combo": "support-file",
+                "path": support_path.display().to_string(),
+                "sha256": actual_sha256,
+                "expected_sha256": expected_sha256
+            }));
+        }
+    }
+
+    let missing_combos = expected_combo_set
+        .difference(&observed_combo_set)
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    let unexpected_combos = observed_combo_set
+        .difference(&expected_combo_set)
+        .cloned()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    let classic_light_html_absent = !html_dir.join("classic-light.html").exists()
+        && references.iter().any(|reference| {
+            reference.get("theme").and_then(serde_json::Value::as_str) == Some("classic")
+                && reference.get("mode").and_then(serde_json::Value::as_str) == Some("light")
+                && reference
+                    .get("html")
+                    .is_some_and(serde_json::Value::is_null)
+        });
+
+    let preview_e2e_report = native_preview_e2e_report_path("todo_mvc_physical");
+    let report_value = read_optional_json(&preview_e2e_report)?;
+    let report = report_value.as_ref().unwrap_or(&serde_json::Value::Null);
+    let preview_artifact_path = report
+        .pointer("/preview_surface_proof/readback_artifact/path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let freshness_evidence = physical_todomvc_reference_freshness_evidence(
+        &preview_e2e_report,
+        preview_artifact_path.as_deref(),
+    );
+    let physical_content_evidence = if report_value.is_some() {
+        physical_todomvc_preview_content_evidence(report)
+    } else {
+        json!({
+            "status": "fail",
+            "missing": ["preview-e2e report missing"]
+        })
+    };
+    let initial_layout = report
+        .pointer("/preview_document_layout_proof/artifact_path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| read_json(Path::new(path)).ok());
+    let switcher_crop_evidence = initial_layout
+        .as_ref()
+        .map(physical_todomvc_switcher_crop_evidence)
+        .unwrap_or_else(|| {
+            json!({
+                "pass": false,
+                "missing": ["initial layout artifact missing"]
+            })
+        });
+    if preview_e2e_report.exists() && artifact_paths.insert(preview_e2e_report.clone()) {
+        artifact_sha256s.push(artifact_hash(&preview_e2e_report)?);
+    }
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:manifest-present",
+        manifest_value.is_some(),
+        format!("manifest={}", manifest_path.display()),
+        Some("physical TodoMVC reference manifest is missing or invalid".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:all-combinations-declared",
+        references.len() == expected_combos.len()
+            && missing_combos.is_empty()
+            && unexpected_combos.is_empty()
+            && duplicate_combos.is_empty(),
+        format!(
+            "observed={observed_combo_set:?} missing={missing_combos:?} unexpected={unexpected_combos:?} duplicates={duplicate_combos:?}"
+        ),
+        Some("physical TodoMVC reference set must declare exactly all five themes in light and dark mode".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:image-fixtures-current",
+        missing_or_drifted_images.is_empty(),
+        format!("image_failures={missing_or_drifted_images:?}"),
+        Some(
+            "one or more physical TodoMVC PNG references are missing, resized, or hash-drifted"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:html-fixtures-current",
+        missing_or_drifted_html.is_empty(),
+        format!("html_failures={missing_or_drifted_html:?}"),
+        Some(
+            "one or more copied physical TodoMVC HTML templates are missing or hash-drifted"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:html-scene-token-contract",
+        html_token_failures.is_empty(),
+        format!("html_token_failures={html_token_failures:?}"),
+        Some(
+            "copied physical TodoMVC HTML templates no longer expose the expected sizing tokens"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:classic-light-provenance-recorded",
+        classic_light_html_absent,
+        format!(
+            "classic_light_html={} manifest_html={:?}",
+            html_dir.join("classic-light.html").display(),
+            references
+                .iter()
+                .find(|reference| {
+                    reference.get("theme").and_then(serde_json::Value::as_str) == Some("classic")
+                        && reference.get("mode").and_then(serde_json::Value::as_str)
+                            == Some("light")
+                })
+                .and_then(|reference| reference.get("html"))
+        ),
+        Some("classic light must be explicitly recorded as screenshot-only because no downloaded classic-light.html fixture exists".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:fresh-current-preview-evidence",
+        freshness_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("freshness_evidence={freshness_evidence}"),
+        Some(
+            "physical TodoMVC reference parity is using a stale preview E2E report or framebuffer artifact"
+                .to_owned(),
+        ),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:preview-content-evidence",
+        physical_content_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass"),
+        format!("physical_content_evidence={physical_content_evidence}"),
+        Some("physical TodoMVC preview E2E report does not prove the expected content and switcher actions".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-todomvc-physical-reference-parity:switcher-below-reference-crop",
+        switcher_crop_evidence
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!("switcher_crop_evidence={switcher_crop_evidence}"),
+        Some("physical TodoMVC theme switcher must stay visible below, not inside, the reference content crop".to_owned()),
+    );
+
+    write_native_gate_report(
+        args,
+        "verify-native-todomvc-physical-reference-parity",
+        checks,
+        blockers,
+        json!({
+            "reference_manifest": manifest_path,
+            "reference_directory": reference_dir,
+            "html_directory": html_dir,
+            "expected_combinations": expected_combos,
+            "reference_evidence": reference_evidence,
+            "preview_e2e_report": preview_e2e_report,
+            "preview_readback_artifact": preview_artifact_path,
+            "freshness_evidence": freshness_evidence,
+            "physical_content_evidence": physical_content_evidence,
+            "switcher_crop_evidence": switcher_crop_evidence,
+            "artifact_sha256s": artifact_sha256s,
+            "visual_comparator_contract": "all physical TodoMVC theme/mode references are declared and hash-pinned; switcher remains visible below the TodoMVC parity crop"
+        }),
+    )
+}
+
 fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -9070,6 +9465,68 @@ fn native_preview_e2e_freshness_evidence(
     })
 }
 
+fn physical_todomvc_reference_freshness_evidence(
+    report_path: &Path,
+    readback_artifact_path: Option<&Path>,
+) -> serde_json::Value {
+    let source_paths = [
+        "crates/xtask/src/main.rs",
+        "crates/boon_native_playground/src/main.rs",
+        "crates/boon_native_gpu/src/lib.rs",
+        "crates/boon_document/src/lib.rs",
+        "crates/boon_document_model/src/lib.rs",
+        "crates/boon_runtime/src/lib.rs",
+        "crates/boon_ir/src/lib.rs",
+        "crates/boon_parser/src/lib.rs",
+        "examples/manifest.toml",
+        "examples/todo_mvc_physical/RUN.bn",
+        "examples/todo_mvc_physical/Theme/Classic.bn",
+        "examples/todo_mvc_physical/Theme/Professional.bn",
+        "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+        "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
+        "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+        "examples/todo_mvc_physical/Theme/Theme.bn",
+        "docs/examples/todomvc_styled_generated/README.md",
+        "docs/examples/todomvc_styled_generated/reference_set.json",
+        "docs/examples/todomvc_styled_generated/classic_light.png",
+        "docs/examples/todomvc_styled_generated/classic_dark.png",
+        "docs/examples/todomvc_styled_generated/professional_light.png",
+        "docs/examples/todomvc_styled_generated/professional_dark.png",
+        "docs/examples/todomvc_styled_generated/glass_light.png",
+        "docs/examples/todomvc_styled_generated/glass_dark.png",
+        "docs/examples/todomvc_styled_generated/brutalist_light.png",
+        "docs/examples/todomvc_styled_generated/brutalist_dark.png",
+        "docs/examples/todomvc_styled_generated/neumorphic_light.png",
+        "docs/examples/todomvc_styled_generated/neumorphic_dark.png",
+    ];
+    let source_mtimes = source_paths
+        .iter()
+        .filter_map(|path| file_modified_unix_secs(Path::new(path)).map(|mtime| (*path, mtime)))
+        .collect::<Vec<_>>();
+    let newest_source_mtime = source_mtimes
+        .iter()
+        .map(|(_, mtime)| *mtime)
+        .max()
+        .unwrap_or_default();
+    let report_mtime = file_modified_unix_secs(report_path);
+    let artifact_mtime = readback_artifact_path.and_then(file_modified_unix_secs);
+    let pass = report_mtime.is_some_and(|mtime| mtime >= newest_source_mtime)
+        && artifact_mtime.is_some_and(|mtime| mtime >= newest_source_mtime);
+    json!({
+        "pass": pass,
+        "basis": "physical TodoMVC preview E2E report and app-owned framebuffer artifact must be newer than physical source, native runtime, and reference fixture files",
+        "newest_source_mtime": newest_source_mtime,
+        "source_mtimes": source_mtimes
+            .into_iter()
+            .map(|(path, mtime)| json!({"path": path, "mtime": mtime}))
+            .collect::<Vec<_>>(),
+        "preview_e2e_report": report_path,
+        "preview_e2e_report_mtime": report_mtime,
+        "readback_artifact": readback_artifact_path,
+        "readback_artifact_mtime": artifact_mtime
+    })
+}
+
 fn file_modified_unix_secs(path: &Path) -> Option<u64> {
     fs::metadata(path)
         .ok()?
@@ -9271,6 +9728,7 @@ fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serd
         "Glass",
         "Brutalist",
         "Neumorphic",
+        "Dark mode",
     ];
     let missing_initial_labels = required_initial_labels
         .iter()
@@ -9421,6 +9879,67 @@ fn layout_display_texts(layout_artifact: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn physical_todomvc_switcher_crop_evidence(
+    layout_artifact: &serde_json::Value,
+) -> serde_json::Value {
+    let text_bounds = |label: &str| -> Option<JsonBounds> {
+        layout_artifact
+            .pointer("/layout_frame/display_list")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .find(|item| item.get("text").and_then(serde_json::Value::as_str) == Some(label))
+            .and_then(|item| item.get("bounds"))
+            .and_then(parse_json_bounds)
+    };
+
+    let content_footer_labels = ["Double-click to edit a todo", "Martin Kavik", "TodoMVC"];
+    let content_bottom = content_footer_labels
+        .iter()
+        .filter_map(|label| text_bounds(label).map(|bounds| bounds.y + bounds.height))
+        .fold(0.0_f64, f64::max);
+    let switcher_labels = [
+        "Classic",
+        "Professional",
+        "Glass",
+        "Brutalist",
+        "Neumorphic",
+        "Dark mode",
+    ];
+    let switcher_bounds = switcher_labels
+        .iter()
+        .filter_map(|label| text_bounds(label))
+        .collect::<Vec<_>>();
+    let switcher_top = switcher_bounds
+        .iter()
+        .map(|bounds| bounds.y)
+        .fold(f64::INFINITY, f64::min);
+    let switcher_bottom = switcher_bounds
+        .iter()
+        .map(|bounds| bounds.y + bounds.height)
+        .fold(0.0_f64, f64::max);
+    let missing_labels = switcher_labels
+        .iter()
+        .filter(|label| text_bounds(label).is_none())
+        .map(|label| json!(label))
+        .collect::<Vec<_>>();
+    let pass = content_bottom > 0.0
+        && switcher_bounds.len() == switcher_labels.len()
+        && switcher_top.is_finite()
+        && switcher_top >= content_bottom + 8.0;
+
+    json!({
+        "pass": pass,
+        "content_footer_labels": content_footer_labels,
+        "content_bottom": content_bottom,
+        "switcher_labels": switcher_labels,
+        "missing_switcher_labels": missing_labels,
+        "switcher_top": if switcher_top.is_finite() { json!(switcher_top) } else { serde_json::Value::Null },
+        "switcher_bottom": switcher_bottom,
+        "minimum_gap_px": if switcher_top.is_finite() { json!(switcher_top - content_bottom) } else { serde_json::Value::Null },
+        "contract": "theme/mode switcher remains visible below the TodoMVC reference content crop"
+    })
 }
 
 fn runtime_assertion_scalar(assertion: &serde_json::Value, key: &str) -> Option<String> {
@@ -16580,6 +17099,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "todo_mvc_physical")],
         ),
         native_gpu_required_report(
+            "todomvc-physical-reference-parity",
+            "target/reports/native-gpu/todomvc-physical-reference-parity.json",
+            "verify-native-todomvc-physical-reference-parity",
+            &[],
+        ),
+        native_gpu_required_report(
             "scroll-speed-cells",
             "target/reports/native-gpu/scroll-speed-cells.json",
             "verify-native-gpu-scroll-speed",
@@ -18535,6 +19060,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-dev-editor-speed" => "dev-editor-speed",
         "verify-native-two-window-content" => "todomvc-two-window-content",
         "verify-native-todomvc-reference-parity" => "todomvc-reference-parity",
+        "verify-native-todomvc-physical-reference-parity" => "todomvc-physical-reference-parity",
         "verify-native-todomvc-input-parity" => "todomvc-input-parity",
         "verify-native-gpu-scroll-speed" => {
             let label = native_gpu_scroll_selector(args).label;

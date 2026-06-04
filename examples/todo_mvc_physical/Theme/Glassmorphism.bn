@@ -24,74 +24,73 @@ FUNCTION material(material) {
     BLOCK {
         background_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
-                Dark => Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
+                Light => TEXT { #eef7ff }
+                Dark => TEXT { #10152d }
             }
         ]
 
         surface_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.95, chroma: 0.01, hue: 220]
-                Dark => Oklch[lightness: 0.2, chroma: 0.01, hue: 240]
+                Light => TEXT { #ffffff8a }
+                Dark => TEXT { #1f26438a }
             }
-            transparency: 0.9
             refraction: 1.5
-            gloss: 0.65
+            gloss: 0.08
         ]
 
         surface_variant_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
-                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+                Light => TEXT { #ffffff29 }
+                Dark => TEXT { #ffffff06 }
             }
-            transparency: 0.9
             refraction: 1.5
-            gloss: 0.65
+            gloss: 0.05
         ]
 
         surface_elevated_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
-                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+                Light => TEXT { #ffffff38 }
+                Dark => TEXT { #090d1e47 }
             }
-            transparency: 0.85
             refraction: 1.5
-            gloss: 0.7
+            gloss: 0.06
         ]
 
         interactive_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
-                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+                Light => TEXT { #ffffff29 }
+                Dark => TEXT { #ffffff06 }
             }
-            transparency: 0.85
             refraction: 1.5
-            gloss: 0.65
+            gloss: 0.05
             metal: 0.03
         ]
 
         primary_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
-                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+                Light => TEXT { #ba4048db }
+                Dark => TEXT { #917cdecc }
             }
-            transparency: 0.8
             refraction: 1.5
         ]
 
         primary_subtle_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 260]
-                Dark => Oklch[lightness: 0.3, chroma: 0.08, hue: 260]
+                Light => TEXT { #fff2f4ad }
+                Dark => TEXT { #765ec22e }
             }
-            transparency: 0.9
             refraction: 1.5
+            border: PASSED.mode |> WHEN {
+                Light => TEXT { #da677052 }
+                Dark => TEXT { #a890f6c2 }
+            }
+            border_width: 1
         ]
 
         danger_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 10]
-                Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 10]
+                Light => TEXT { #a7434d }
+                Dark => TEXT { #a890f6 }
             }
         ]
 
@@ -104,14 +103,31 @@ FUNCTION material(material) {
 
             SurfaceElevated => surface_elevated_base
 
+            PanelFrame => [
+                border: PASSED.mode |> WHEN {
+                    Light => TEXT { #ffffffe0 }
+                    Dark => TEXT { #a1b2e96b }
+                }
+                border_width: 1
+                shadows: PASSED.mode |> WHEN {
+                    Light => LIST {
+                        [y: 28, blur: 54, color: TEXT { #3a56762e }]
+                        [y: 1, blur: 0, color: TEXT { #ffffffd1 }]
+                    }
+                    Dark => LIST {
+                        [y: 32, blur: 64, color: TEXT { #00000066 }]
+                        [y: 1, blur: 0, color: TEXT { #ffffff24 }]
+                    }
+                }
+            ]
+
             Interactive[hovered] => interactive_base
 
             InteractiveRecessed[focus] => [
                 ...surface_base
-                transparency: 0.7
                 gloss: focus |> WHEN {
-                    False => 0.8
-                    True => 0.6
+                    False => 0.04
+                    True => 0.08
                 }
                 glow: focus |> WHEN {
                     True => [
@@ -138,45 +154,63 @@ FUNCTION font(font) {
     BLOCK {
         colors: PASSED.mode |> WHEN {
             Light => [
-                text: Oklch[lightness: 0.25, chroma: 0.02, hue: 240]
-                text_secondary: Oklch[lightness: 0.45, chroma: 0.02, hue: 240]
-                text_tertiary: Oklch[lightness: 0.55, chroma: 0.015, hue: 240]
-                text_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240]
-                text_header: Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
-                danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10]
+                text: TEXT { #30353c }
+                text_secondary: TEXT { #6a7481 }
+                text_tertiary: TEXT { #6a7481 }
+                text_disabled: TEXT { #87909b }
+                text_header: TEXT { #ba4048db }
+                placeholder: TEXT { #6e7885ad }
+                filter_selected: TEXT { #a7434d }
+                danger: TEXT { #a7434d }
             ]
             Dark => [
-                text: Oklch[lightness: 0.9, chroma: 0.01, hue: 240]
-                text_secondary: Oklch[lightness: 0.75, chroma: 0.01, hue: 240]
-                text_tertiary: Oklch[lightness: 0.65, chroma: 0.01, hue: 240]
-                text_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240]
-                text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
-                danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10]
+                text: TEXT { #edf2ff }
+                text_secondary: TEXT { #b7c0dd }
+                text_tertiary: TEXT { #b7c0dd }
+                text_disabled: TEXT { #9aa4bf }
+                text_header: TEXT { #917cdecc }
+                placeholder: TEXT { #bfc7e0a8 }
+                filter_selected: TEXT { #ffffff }
+                danger: TEXT { #a890f6 }
             ]
         }
 
         body_base: [
-            size: 24
+            family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+            size: 25
             color: colors.text
+            weight: Light
         ]
 
         small_base: [
-            size: 10
+            family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+            size: 11
             color: colors.text_tertiary
+            weight: Normal
         ]
 
         font |> WHEN {
             Hero => [
-                size: 100
+                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                size: 80
                 color: colors.text_header
-                weight: Hairline
+                weight: Light
             ]
 
             Body => body_base
 
             BodySecondary => [
+                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
                 size: 14
                 color: colors.text_secondary
+                weight: Normal
+            ]
+
+            FilterSelected => [
+                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                size: 14
+                color: colors.filter_selected
+                weight: Normal
             ]
 
             BodyDisabled => [
@@ -185,9 +219,11 @@ FUNCTION font(font) {
             ]
 
             BodyDanger => [
+                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
                 size: 30
                 align: Center
                 color: colors.danger
+                weight: Normal
             ]
 
             Input => [...body_base]
@@ -195,15 +231,17 @@ FUNCTION font(font) {
             Placeholder => [
                 ...body_base
                 style: Italic
-                color: colors.text_secondary
+                color: colors.placeholder
             ]
 
             ButtonIcon[checked] => [
+                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
                 size: 22
                 color: checked |> WHEN {
                     True => colors.text
                     False => colors.text_disabled
                 }
+                weight: Normal
             ]
 
             Small => small_base
@@ -220,24 +258,21 @@ FUNCTION text(of) {
     BLOCK {
         small_base: [
             font: font(of: Small)
-            depth: 1
-            move: [further: 3]
-            relief: Carved[wall: 1]
+            depth: 0
+            move: [further: 0]
         ]
 
         of |> WHEN {
             Hero => [
                 font: font(of: Hero)
-                depth: 4
-                move: [closer: 4]
-                relief: Raised
+                depth: 0
+                move: [closer: 0]
             ]
 
             BodySecondary => [
                 font: font(of: BodySecondary)
-                depth: 1.5
-                move: [further: 2]
-                relief: Raised
+                depth: 0
+                move: [further: 0]
             ]
 
             ButtonIcon[checked] => [
@@ -275,8 +310,8 @@ FUNCTION elevation(of) {
 
 FUNCTION corners(of) {
     of |> WHEN {
-        Touch => 3
-        Comfort => 6
+        Touch => 8
+        Comfort => 14
         Soft => 8
         Pill => Fully
     }

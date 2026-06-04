@@ -217,20 +217,9 @@ FUNCTION clear_button_text(hovered) {
     ]
 }
 
-FUNCTION todo_title_font(completed) {
-    [
-        ...Theme/font(of: Body)
-        line: [strike: completed]
-        ...completed |> WHEN {
-            True => [color: Theme/font(of: BodyDisabled).color]
-            False => []
-        }
-    ]
-}
-
 FUNCTION todo_title_text(completed) {
     [
-        font: todo_title_font(completed: completed)
+        font: Theme/font(of: Body)
         color: completed |> WHEN {
             True => Theme/font(of: BodyDisabled).color
             False => Theme/font(of: Body).color
@@ -252,9 +241,12 @@ FUNCTION delete_button_text() {
     ]
 }
 
-FUNCTION filter_button_text() {
+FUNCTION filter_button_text(selected) {
     [
-        font: Theme/font(of: BodySecondary)
+        font: selected |> WHEN {
+            True => Theme/font(of: FilterSelected)
+            False => Theme/font(of: BodySecondary)
+        }
         depth: 0
         move: [further: 0]
     ]
@@ -320,7 +312,27 @@ FUNCTION content_element() {
         direction: Column
         gap: Theme/spacing(of: None)
         style: [
-            width: [sizing: Fill, minimum: 230, maximum: 550]
+            width: Fill
+            align: [row: Center]
+        ]
+        items: LIST {
+            window_controls()
+            reference_content()
+            theme_gap(of: SwitcherBottomPush)
+            theme_switcher()
+            theme_gap(of: Small)
+        }
+    )
+}
+
+FUNCTION reference_content() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: Theme/spacing(of: None)
+        style: [
+            width: Fill
+            padding: [right: 34]
             align: [row: Center]
         ]
         items: LIST {
@@ -330,11 +342,12 @@ FUNCTION content_element() {
                 element: []
                 direction: Column
                 gap: Theme/spacing(of: Section)
-                style: [width: Fill]
+                style: [
+                    width: [sizing: Fill, minimum: 230, maximum: 552]
+                    align: [row: Center]
+                ]
                 items: LIST { main_panel(), footer() }
             )
-            theme_switcher()
-            theme_gap(of: Small)
         }
     )
 }
@@ -360,19 +373,71 @@ FUNCTION theme_gap(of) {
 -- HEADER
 ------------------------------------------------------------------------
 
+FUNCTION window_controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 22
+        style: [
+            width: Fill
+            height: 46
+            padding: [top: 14, right: 13]
+        ]
+        items: LIST {
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: Fill
+                    height: 24
+                    paint: False
+                ]
+                child: Scene/Element/text(
+                    element: []
+                    style: [paint: False]
+                    text: Text/empty()
+                )
+            )
+            window_control_label(label: TEXT { – })
+            window_control_label(label: TEXT { □ })
+            window_control_label(label: TEXT { × })
+        }
+    )
+}
+
+FUNCTION window_control_label(label) {
+    Scene/Element/text(
+        element: []
+        style: [
+            family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
+            size: 20
+            color: PASSED.theme_options.mode |> WHEN {
+                Light => Oklch[lightness: 0.78, chroma: 0.08, hue: 25]
+                Dark => Oklch[lightness: 0.86]
+            }
+            weight: Light
+            width: 22
+            height: 24
+            line_height: 20
+            center: True
+            vertical_align: Center
+        ]
+        text: label
+    )
+}
+
 FUNCTION header() {
     Scene/Element/block(
         element: [tag: Header]
         style: [
             align: [row: Center]
-            height: 130
+            height: 84
         ]
         child: Scene/Element/text(
             element: [tag: H1]
             style: [
                 ...Theme/text(of: Hero)
                 width: Fill
-                height: 130
+                height: 84
                 center: True
                 vertical_align: Center
             ]
@@ -456,6 +521,10 @@ FUNCTION new_todo_title_text_input() {
             padding: [column: 16, left: 6, right: 16]
             text_inset: 6
             font: Theme/font(of: Input)
+            size: Theme/font(of: Input).size
+            weight: Theme/font(of: Input).weight
+            placeholder_color: Theme/font(of: Placeholder).color
+            placeholder_style: Italic
             depth: Theme/depth(of: Element)
             move: [further: Theme/elevation(of: Inset)]
             rounded_corners: Theme/corners(of: Touch)
@@ -829,7 +898,7 @@ FUNCTION filter_button(filter) {
                 material: filter_button_material(selected: selected, hovered: element.hovered)
             ]
             label: Scene/Element/text(
-                style: filter_button_text()
+                style: filter_button_text(selected: selected)
                 text: filter |> WHEN {
                     All => TEXT { All }
                     Active => TEXT { Active }
@@ -852,7 +921,7 @@ FUNCTION remove_completed_button() {
         ]
         style: [
             align: Right
-            width: 110
+            width: 118
             height: 25.2
             padding: [row: 0, column: 0]
             line_height: 19.6
@@ -932,7 +1001,7 @@ FUNCTION footer_author_line() {
                 text: TEXT { Created by }
             )
             footer_link(
-                label: TEXT { Martin Kavík }
+                label: TEXT { Martin Kavik }
                 to: TEXT { https://github.com/MartinKavik }
             )
         }

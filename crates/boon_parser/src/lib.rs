@@ -1126,6 +1126,8 @@ fn ast_statement(
     id: usize,
     source: &str,
 ) -> AstStatement {
+    let is_semantic_block = item.symbols.first().map(String::as_str) == Some("BLOCK")
+        && item.symbols.last().map(String::as_str) == Some("{");
     let kind = if let Some(function) = item.function.clone() {
         AstStatementKind::Function {
             name: function,
@@ -1148,9 +1150,7 @@ fn ast_statement(
         }
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
-    } else if item.symbols.first().map(String::as_str) == Some("BLOCK")
-        && item.symbols.last().map(String::as_str) == Some("{")
-    {
+    } else if is_semantic_block {
         AstStatementKind::Block
     } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
     {
@@ -1158,10 +1158,9 @@ fn ast_statement(
     } else {
         AstStatementKind::Expression
     };
-    let expr = if matches!(
-        kind,
-        AstStatementKind::Function { .. } | AstStatementKind::Block
-    ) {
+    let expr = if matches!(kind, AstStatementKind::Function { .. })
+        || (matches!(kind, AstStatementKind::Block) && !is_semantic_block)
+    {
         None
     } else {
         let expr_tokens = statement_expression_tokens(item);

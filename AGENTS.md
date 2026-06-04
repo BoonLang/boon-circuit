@@ -22,10 +22,15 @@ cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_
 ```
 
 After finishing native playground work that the user should manually test,
-build and launch the latest playground in release mode in the `boon-circuit`
-COSMIC background workspace unless the user explicitly says not to:
+restart the latest playground in release mode in the `boon-circuit` COSMIC
+background workspace unless the user explicitly says not to. Do not leave
+multiple old release playgrounds running for the same example: first inspect
+existing matching processes, stop only the matching release playground process
+tree for that same example, then build and launch the current binary:
 
 ```bash
+pgrep -af 'boon_native_playground.*todo_mvc_physical'
+# Stop only the matching old desktop/preview/dev PIDs for the same example.
 cargo build --release -p boon_native_playground
 cosmic-background-launch --workspace boon-circuit -- ./target/release/boon_native_playground --role desktop --example todo_mvc_physical
 ```

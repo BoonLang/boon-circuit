@@ -199,7 +199,9 @@ visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",
   "dev-app-owned-framebuffer",
   "physical-scene-depth-crop",
+  "physical-reference-content-crop",
   "theme-switcher-crop",
+  "html-theme-fixtures",
 ]
 performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",

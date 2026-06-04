@@ -153,14 +153,23 @@ FUNCTION material(material) {
             Danger => danger_base
 
             CheckboxGlyph[checked] => [
-                checkbox_background: surface_base.color
-                checkbox_border: PASSED.mode |> WHEN {
-                    Light => TEXT { #d9dee7 }
-                    Dark => TEXT { #3d4652 }
+                checkbox_background: PASSED.mode |> WHEN {
+                    Light => TEXT { #ffffff }
+                    Dark => TEXT { #00000000 }
                 }
-                checked_border: primary_base.color
-                check_color: primary_base.color
-                checkbox_border_width: 1.5
+                checkbox_border: PASSED.mode |> WHEN {
+                    Light => TEXT { #d8dde4 }
+                    Dark => TEXT { #626a75 }
+                }
+                checked_border: PASSED.mode |> WHEN {
+                    Light => TEXT { #62c6aa }
+                    Dark => TEXT { #3fb18f }
+                }
+                check_color: PASSED.mode |> WHEN {
+                    Light => TEXT { #43bc9a }
+                    Dark => TEXT { #45c9a3 }
+                }
+                checkbox_border_width: 2
                 check_width: 3
             ]
         }
@@ -177,6 +186,7 @@ FUNCTION font(font) {
                 text_disabled: TEXT { #8a8f98 }
                 text_header: TEXT { #bd454d }
                 placeholder: TEXT { #a2a8b2 }
+                chevron: TEXT { #7f8792 }
                 filter_selected: TEXT { #b5424a }
                 danger: TEXT { #b5424a }
             ]
@@ -187,6 +197,7 @@ FUNCTION font(font) {
                 text_disabled: TEXT { #787f8b }
                 text_header: TEXT { #dc6463 }
                 placeholder: TEXT { #7c838d }
+                chevron: TEXT { #b8c0ca }
                 filter_selected: TEXT { #f3f5f7 }
                 danger: TEXT { #d65d5e }
             ]
@@ -256,7 +267,7 @@ FUNCTION font(font) {
                 size: 22
                 color: checked |> WHEN {
                     True => colors.text
-                    False => colors.text_disabled
+                    False => colors.chevron
                 }
                 weight: Normal
             ]

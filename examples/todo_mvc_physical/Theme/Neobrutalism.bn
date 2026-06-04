@@ -143,11 +143,17 @@ FUNCTION material(material) {
             CheckboxGlyph[checked] => [
                 checkbox_background: surface_base.color
                 checkbox_border: primary_base.color
-                checked_border: primary_base.color
-                check_color: primary_base.color
+                checked_border: PASSED.mode |> WHEN {
+                    Light => TEXT { #000000 }
+                    Dark => TEXT { #00d95a }
+                }
+                check_color: PASSED.mode |> WHEN {
+                    Light => TEXT { #000000 }
+                    Dark => TEXT { #00e861 }
+                }
                 checkbox_border_width: PASSED.mode |> WHEN {
-                    Light => 2
-                    Dark => 2
+                    Light => 4
+                    Dark => 3
                 }
                 check_width: 4
             ]
@@ -165,6 +171,7 @@ FUNCTION font(font) {
                 text_disabled: TEXT { #6f6f6f }
                 text_header: TEXT { #000000 }
                 placeholder: TEXT { #777777 }
+                chevron: TEXT { #000000 }
                 filter_selected: TEXT { #ffffff }
                 danger: TEXT { #000000 }
             ]
@@ -175,6 +182,7 @@ FUNCTION font(font) {
                 text_disabled: TEXT { #bcbcbc }
                 text_header: TEXT { #f4f4f4 }
                 placeholder: TEXT { #cfcfcf }
+                chevron: TEXT { #ffffff }
                 filter_selected: TEXT { #000000 }
                 danger: TEXT { #ffffff }
             ]
@@ -248,7 +256,7 @@ FUNCTION font(font) {
                 size: 22
                 color: checked |> WHEN {
                     True => colors.text
-                    False => colors.text_disabled
+                    False => colors.chevron
                 }
                 weight: Normal
             ]

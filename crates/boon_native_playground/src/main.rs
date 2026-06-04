@@ -2715,9 +2715,9 @@ fn native_gpu_app_owned_render_hook(
         width: context.width,
         height: context.height,
     })?;
-    let app_owned_readback_reused = app_owned_proof
-        .as_ref()
-        .is_some_and(|proof| render_proof_matches_viewport(proof, context.width, context.height));
+    let app_owned_readback_reused = app_owned_proof.as_ref().is_some_and(|proof| {
+        render_proof_matches_frame(proof, context.width, context.height, &render_frame)
+    });
     let proof = if app_owned_readback_reused {
         app_owned_proof
             .as_ref()
@@ -2816,6 +2816,28 @@ fn render_proof_matches_viewport(
             height: proof_height,
             ..
         } => *proof_width == width && *proof_height == height,
+    }
+}
+
+fn render_frame_hash(frame: &boon_document::LayoutFrame) -> String {
+    let bytes = serde_json::to_vec(frame).unwrap_or_default();
+    boon_runtime::sha256_bytes(&bytes)
+}
+
+fn render_proof_matches_frame(
+    proof: &boon_native_gpu::RenderProof,
+    width: u32,
+    height: u32,
+    frame: &boon_document::LayoutFrame,
+) -> bool {
+    if !render_proof_matches_viewport(proof, width, height) {
+        return false;
+    }
+    match &proof.artifact {
+        boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+            layout_frame_hash, ..
+        } => layout_frame_hash == &render_frame_hash(frame),
+        boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => false,
     }
 }
 
@@ -19425,19 +19447,21 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Classic", "Light", "text_disabled") => "Oklch[lightness:0.6665]",
         ("Classic", "Light", "text_placeholder") => "Oklch[lightness:0.68]",
         ("Classic", "Light", "text_header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
+        ("Classic", "Light", "filter_selected") => "Oklch[lightness:0.17]",
         ("Classic", "Light", "danger") => "Oklch[lightness:0.57,chroma:0.109,hue:18.87]",
         ("Classic", "Light", "icon_checked") => "Oklch[lightness:0.4]",
         ("Classic", "Light", "icon_unchecked") => "Oklch[lightness:0.667]",
-        ("Classic", "Dark", "text") => "Oklch[lightness:0.88]",
-        ("Classic", "Dark", "input_text") => "Oklch[lightness:0.86]",
-        ("Classic", "Dark", "text_secondary") => "Oklch[lightness:0.78]",
-        ("Classic", "Dark", "text_tertiary") => "Oklch[lightness:0.68]",
-        ("Classic", "Dark", "text_disabled") => "Oklch[lightness:0.54]",
-        ("Classic", "Dark", "text_placeholder") => "Oklch[lightness:0.58]",
-        ("Classic", "Dark", "text_header") => "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
-        ("Classic", "Dark", "danger") => "Oklch[lightness:0.72,chroma:0.12,hue:18.87]",
-        ("Classic", "Dark", "icon_checked") => "Oklch[lightness:0.86]",
-        ("Classic", "Dark", "icon_unchecked") => "Oklch[lightness:0.56]",
+        ("Classic", "Dark", "text") => "#dfdfdf",
+        ("Classic", "Dark", "input_text") => "#dfdfdf",
+        ("Classic", "Dark", "text_secondary") => "#d6d6d6",
+        ("Classic", "Dark", "text_tertiary") => "#858585",
+        ("Classic", "Dark", "text_disabled") => "#868686",
+        ("Classic", "Dark", "text_placeholder") => "#868686",
+        ("Classic", "Dark", "text_header") => "#b83f45",
+        ("Classic", "Dark", "filter_selected") => "#eeeeee",
+        ("Classic", "Dark", "danger") => "#b83f45",
+        ("Classic", "Dark", "icon_checked") => "#dfdfdf",
+        ("Classic", "Dark", "icon_unchecked") => "#8f8f8f",
         ("Glassmorphism", "Light", "text") => "#30353c",
         ("Glassmorphism", "Light", "text_secondary") => "#6a7481",
         ("Glassmorphism", "Light", "text_tertiary") => "#6a7481",
@@ -19446,6 +19470,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Glassmorphism", "Light", "text_placeholder") => "#6e7885ad",
         ("Glassmorphism", "Light", "filter_selected") => "#a7434d",
         ("Glassmorphism", "Light", "danger") => "#a7434d",
+        ("Glassmorphism", "Light", "icon_unchecked") => "#8290a3",
         ("Glassmorphism", "Dark", "text") => "#edf2ff",
         ("Glassmorphism", "Dark", "text_secondary") => "#b7c0dd",
         ("Glassmorphism", "Dark", "text_tertiary") => "#b7c0dd",
@@ -19454,6 +19479,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Glassmorphism", "Dark", "text_placeholder") => "#bfc7e0a8",
         ("Glassmorphism", "Dark", "filter_selected") => "#ffffff",
         ("Glassmorphism", "Dark", "danger") => "#a890f6",
+        ("Glassmorphism", "Dark", "icon_unchecked") => "#d3d8f5",
         ("Neobrutalism", "Light", "text") => "#000000",
         ("Neobrutalism", "Light", "text_secondary") => "#000000",
         ("Neobrutalism", "Light", "text_tertiary") => "#000000",
@@ -19462,6 +19488,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Neobrutalism", "Light", "text_placeholder") => "#777777",
         ("Neobrutalism", "Light", "filter_selected") => "#ffffff",
         ("Neobrutalism", "Light", "danger") => "#000000",
+        ("Neobrutalism", "Light", "icon_unchecked") => "#000000",
         ("Neobrutalism", "Dark", "text") => "#f6f6f6",
         ("Neobrutalism", "Dark", "text_secondary") => "#f6f6f6",
         ("Neobrutalism", "Dark", "text_tertiary") => "#f6f6f6",
@@ -19470,6 +19497,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Neobrutalism", "Dark", "text_placeholder") => "#cfcfcf",
         ("Neobrutalism", "Dark", "filter_selected") => "#000000",
         ("Neobrutalism", "Dark", "danger") => "#ffffff",
+        ("Neobrutalism", "Dark", "icon_unchecked") => "#ffffff",
         ("Neumorphism", "Light", "text") => "#303844",
         ("Neumorphism", "Light", "text_secondary") => "#637081",
         ("Neumorphism", "Light", "text_tertiary") => "#637081",
@@ -19478,6 +19506,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Neumorphism", "Light", "text_placeholder") => "#9aa3af",
         ("Neumorphism", "Light", "filter_selected") => "#b94a52",
         ("Neumorphism", "Light", "danger") => "#b94a52",
+        ("Neumorphism", "Light", "icon_unchecked") => "#88919d",
         ("Neumorphism", "Dark", "text") => "#e6ebf3",
         ("Neumorphism", "Dark", "text_secondary") => "#d0d6df",
         ("Neumorphism", "Dark", "text_tertiary") => "#cbd2dd",
@@ -19486,6 +19515,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         ("Neumorphism", "Dark", "text_placeholder") => "#9da6b5",
         ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
         ("Neumorphism", "Dark", "danger") => "#5be0bd",
+        ("Neumorphism", "Dark", "icon_unchecked") => "#b2bac8",
         (_, "Light", "text") => "#32363d",
         (_, "Light", "text_secondary") => "#606977",
         (_, "Light", "text_tertiary") => "#626b78",
@@ -19494,6 +19524,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         (_, "Light", "text_placeholder") => "#a2a8b2",
         (_, "Light", "filter_selected") => "#b5424a",
         (_, "Light", "danger") => "#b5424a",
+        (_, "Light", "icon_unchecked") => "#7f8792",
         (_, "Dark", "text") => "#dce1e8",
         (_, "Dark", "text_secondary") => "#c4cad3",
         (_, "Dark", "text_tertiary") => "#c0c6cf",
@@ -19502,6 +19533,7 @@ fn document_theme_color(context: &DocumentEvalContext<'_>, role: &str) -> &'stat
         (_, "Dark", "text_placeholder") => "#7c838d",
         (_, "Dark", "filter_selected") => "#f3f5f7",
         (_, "Dark", "danger") => "#d65d5e",
+        (_, "Dark", "icon_unchecked") => "#b8c0ca",
         _ => "Oklch[lightness:0.42]",
     }
 }
@@ -19533,7 +19565,7 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             "FilterSelected" => json!({
                 "family": family,
                 "size": 15.0,
-                "color": document_theme_color(context, "text_secondary"),
+                "color": document_theme_color(context, "filter_selected"),
                 "weight": "Light"
             }),
             "BodyDisabled" => json!({
@@ -19643,7 +19675,7 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             "color": if checked {
                 document_theme_color(context, "text")
             } else {
-                document_theme_color(context, "text_disabled")
+                document_theme_color(context, "icon_unchecked")
             },
             "weight": "Normal"
         }),
@@ -19733,12 +19765,12 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
     if document_theme_name(context) == "Classic" {
         let material = match tagged {
             "Background" if light => json!({"color": "Oklch[lightness:0.97]"}),
-            "Background" => json!({"color": "Oklch[lightness:0.07,chroma:0.008,hue:250]"}),
+            "Background" => json!({"color": "#1b1b1b"}),
             "Surface" | "SurfaceVariant" | "SurfaceElevated" | "Interactive" => {
                 if light {
                     json!({"color": "Oklch[lightness:1]", "gloss": 0.0})
                 } else {
-                    json!({"color": "Oklch[lightness:0.12,chroma:0.01,hue:250]", "gloss": 0.0})
+                    json!({"color": "#202020", "gloss": 0.0})
                 }
             }
             "InteractiveRecessed" => {
@@ -19749,15 +19781,15 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                 }
             }
             "Primary" if light => json!({"color": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]"}),
-            "Primary" => json!({"color": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]"}),
+            "Primary" => json!({"color": "#b83f45"}),
             "PrimarySubtle" if light => json!({
                 "color": "Oklch[lightness:1]",
                 "border": "Oklch[lightness:0.585,chroma:0.172,hue:24.1]",
                 "border_width": 1.0
             }),
             "PrimarySubtle" => json!({
-                "color": "Oklch[lightness:0.12,chroma:0.01,hue:250]",
-                "border": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
+                "color": "#202020",
+                "border": "#b83f45",
                 "border_width": 1.0
             }),
             "FilterSelected" if light => json!({
@@ -19765,11 +19797,11 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                 "border_width": 1.0
             }),
             "FilterSelected" => json!({
-                "border": "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
+                "border": "#b83f45",
                 "border_width": 1.0
             }),
             "Danger" if light => json!({"color": "Oklch[lightness:0.57,chroma:0.109,hue:18.87]"}),
-            "Danger" => json!({"color": "Oklch[lightness:0.72,chroma:0.12,hue:18.87]"}),
+            "Danger" => json!({"color": "#b83f45"}),
             "CheckboxGlyph" => document_theme_checkbox_glyph_material(context, checkbox_checked),
             "PanelFrame" => json!({
                 "shadows": [
@@ -19798,7 +19830,7 @@ fn document_theme_material(of: &str, context: &DocumentEvalContext<'_>) -> Value
                 "border": if light {
                     "Oklch[lightness:0.7,chroma:0.18,hue:24.1]"
                 } else {
-                    "Oklch[lightness:0.31,chroma:0.03,hue:25,alpha:0.9]"
+                    "#3c3c3c"
                 },
                 "border_width": 1.0
             }),
@@ -20132,43 +20164,43 @@ fn document_theme_checkbox_glyph_material(
             "check_width": 3.0
         }),
         ("Classic", "Dark") => json!({
-            "checkbox_background": "Oklch[lightness:0.12,chroma:0.01,hue:250]",
-            "checkbox_border": "Oklch[lightness:0.34,chroma:0.01,hue:250]",
-            "checked_border": "Oklch[lightness:0.62,chroma:0.08,hue:180]",
-            "check_color": "Oklch[lightness:0.78,chroma:0.09,hue:180]",
-            "checkbox_border_width": 1.5,
+            "checkbox_background": "#00000000",
+            "checkbox_border": "#595959",
+            "checked_border": "#4aa582",
+            "check_color": "#53b994",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
         ("Professional", "Light") => json!({
             "checkbox_background": "#ffffff",
-            "checkbox_border": "#d9dee7",
-            "checked_border": "#bd454d",
-            "check_color": "#bd454d",
-            "checkbox_border_width": 1.5,
+            "checkbox_border": "#d8dde4",
+            "checked_border": "#62c6aa",
+            "check_color": "#43bc9a",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
         ("Professional", "Dark") => json!({
-            "checkbox_background": "#1b1f24",
-            "checkbox_border": "#3d4652",
-            "checked_border": "#dc6463",
-            "check_color": "#dc6463",
-            "checkbox_border_width": 1.5,
+            "checkbox_background": "#00000000",
+            "checkbox_border": "#626a75",
+            "checked_border": "#3fb18f",
+            "check_color": "#45c9a3",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
         ("Glassmorphism", "Light") => json!({
-            "checkbox_background": "#ffffff8a",
-            "checkbox_border": "#8ba3bd8f",
-            "checked_border": "#ba4048db",
-            "check_color": "#ba4048db",
-            "checkbox_border_width": 1.5,
+            "checkbox_background": "#ffffff38",
+            "checkbox_border": "#b2bccaa6",
+            "checked_border": "#8bd9c8",
+            "check_color": "#4dc8ad",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
         ("Glassmorphism", "Dark") => json!({
-            "checkbox_background": "#1f26438a",
-            "checkbox_border": "#b4c3eb70",
-            "checked_border": "#917cdecc",
-            "check_color": "#917cdecc",
-            "checkbox_border_width": 1.5,
+            "checkbox_background": "#ffffff0a",
+            "checkbox_border": "#bfc7e08c",
+            "checked_border": "#62e4d7",
+            "check_color": "#6cf0e4",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
         ("Neobrutalism", "Light") => json!({
@@ -20176,39 +20208,39 @@ fn document_theme_checkbox_glyph_material(
             "checkbox_border": "#000000",
             "checked_border": "#000000",
             "check_color": "#000000",
-            "checkbox_border_width": 2.0,
+            "checkbox_border_width": 4.0,
             "check_width": 4.0
         }),
         ("Neobrutalism", "Dark") => json!({
             "checkbox_background": "#101010",
             "checkbox_border": "#ffffff",
-            "checked_border": "#ffffff",
-            "check_color": "#ffffff",
-            "checkbox_border_width": 2.0,
+            "checked_border": "#00d95a",
+            "check_color": "#00e861",
+            "checkbox_border_width": 3.0,
             "check_width": 4.0
         }),
         ("Neumorphism", "Light") => json!({
             "checkbox_background": "#eef1f6",
-            "checkbox_border": "#a8b2c23d",
-            "checked_border": "#b94a52",
-            "check_color": "#b94a52",
-            "checkbox_border_width": 1.5,
+            "checkbox_border": "#ffffff59",
+            "checked_border": "#ffffff61",
+            "check_color": "#56c3ad",
+            "checkbox_border_width": 1.0,
             "check_width": 3.0
         }),
         ("Neumorphism", "Dark") => json!({
             "checkbox_background": "#252c36",
             "checkbox_border": "#ffffff14",
-            "checked_border": "#ffffff",
-            "check_color": "#ffffff",
-            "checkbox_border_width": 1.5,
+            "checked_border": "#ffffff14",
+            "check_color": "#5be0bd",
+            "checkbox_border_width": 1.0,
             "check_width": 3.0
         }),
         _ => json!({
             "checkbox_background": "#ffffff",
-            "checkbox_border": "#d9dee7",
-            "checked_border": "#bd454d",
-            "check_color": "#bd454d",
-            "checkbox_border_width": 1.5,
+            "checkbox_border": "#d8dde4",
+            "checked_border": "#62c6aa",
+            "check_color": "#43bc9a",
+            "checkbox_border_width": 2.0,
             "check_width": 3.0
         }),
     }
@@ -27001,14 +27033,14 @@ mod tests {
             ("Classic", "Light", "placeholder") => "Oklch[lightness:0.68]",
             ("Classic", "Light", "header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
             ("Classic", "Light", "filter_selected") => "Oklch[lightness:0.17]",
-            ("Classic", "Dark", "body") => "Oklch[lightness:0.88]",
-            ("Classic", "Dark", "input") => "Oklch[lightness:0.86]",
-            ("Classic", "Dark", "secondary") => "Oklch[lightness:0.78]",
-            ("Classic", "Dark", "tertiary") => "Oklch[lightness:0.68]",
-            ("Classic", "Dark", "disabled") => "Oklch[lightness:0.54]",
-            ("Classic", "Dark", "placeholder") => "Oklch[lightness:0.58]",
-            ("Classic", "Dark", "header") => "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
-            ("Classic", "Dark", "filter_selected") => "Oklch[lightness:0.78]",
+            ("Classic", "Light", "chevron") => "Oklch[lightness:0.667]",
+            ("Classic", "Dark", "body") | ("Classic", "Dark", "input") => "#dfdfdf",
+            ("Classic", "Dark", "secondary") => "#d6d6d6",
+            ("Classic", "Dark", "tertiary") => "#858585",
+            ("Classic", "Dark", "disabled") | ("Classic", "Dark", "placeholder") => "#868686",
+            ("Classic", "Dark", "header") => "#b83f45",
+            ("Classic", "Dark", "filter_selected") => "#eeeeee",
+            ("Classic", "Dark", "chevron") => "#8f8f8f",
             ("Glassmorphism", "Light", "body") | ("Glassmorphism", "Light", "input") => "#30353c",
             ("Glassmorphism", "Light", "secondary") | ("Glassmorphism", "Light", "tertiary") => {
                 "#6a7481"
@@ -27017,6 +27049,7 @@ mod tests {
             ("Glassmorphism", "Light", "header") => "#ba4048db",
             ("Glassmorphism", "Light", "placeholder") => "#6e7885ad",
             ("Glassmorphism", "Light", "filter_selected") => "#a7434d",
+            ("Glassmorphism", "Light", "chevron") => "#8290a3",
             ("Glassmorphism", "Dark", "body") | ("Glassmorphism", "Dark", "input") => "#edf2ff",
             ("Glassmorphism", "Dark", "secondary") | ("Glassmorphism", "Dark", "tertiary") => {
                 "#b7c0dd"
@@ -27025,11 +27058,13 @@ mod tests {
             ("Glassmorphism", "Dark", "header") => "#917cdecc",
             ("Glassmorphism", "Dark", "placeholder") => "#bfc7e0a8",
             ("Glassmorphism", "Dark", "filter_selected") => "#ffffff",
+            ("Glassmorphism", "Dark", "chevron") => "#d3d8f5",
             ("Neobrutalism", "Light", "body")
             | ("Neobrutalism", "Light", "input")
             | ("Neobrutalism", "Light", "secondary")
             | ("Neobrutalism", "Light", "tertiary")
-            | ("Neobrutalism", "Light", "header") => "#000000",
+            | ("Neobrutalism", "Light", "header")
+            | ("Neobrutalism", "Light", "chevron") => "#000000",
             ("Neobrutalism", "Light", "disabled") => "#6f6f6f",
             ("Neobrutalism", "Light", "placeholder") => "#777777",
             ("Neobrutalism", "Light", "filter_selected") => "#ffffff",
@@ -27041,6 +27076,7 @@ mod tests {
             ("Neobrutalism", "Dark", "header") => "#f4f4f4",
             ("Neobrutalism", "Dark", "placeholder") => "#cfcfcf",
             ("Neobrutalism", "Dark", "filter_selected") => "#000000",
+            ("Neobrutalism", "Dark", "chevron") => "#ffffff",
             ("Neumorphism", "Light", "body") | ("Neumorphism", "Light", "input") => "#303844",
             ("Neumorphism", "Light", "secondary") | ("Neumorphism", "Light", "tertiary") => {
                 "#637081"
@@ -27049,6 +27085,7 @@ mod tests {
             ("Neumorphism", "Light", "header") => "#78808b",
             ("Neumorphism", "Light", "placeholder") => "#9aa3af",
             ("Neumorphism", "Light", "filter_selected") => "#b94a52",
+            ("Neumorphism", "Light", "chevron") => "#88919d",
             ("Neumorphism", "Dark", "body") | ("Neumorphism", "Dark", "input") => "#e6ebf3",
             ("Neumorphism", "Dark", "secondary") => "#d0d6df",
             ("Neumorphism", "Dark", "tertiary") => "#cbd2dd",
@@ -27056,6 +27093,7 @@ mod tests {
             ("Neumorphism", "Dark", "header") => "#252b34",
             ("Neumorphism", "Dark", "placeholder") => "#9da6b5",
             ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
+            ("Neumorphism", "Dark", "chevron") => "#b2bac8",
             (_, "Light", "body") | (_, "Light", "input") => "#32363d",
             (_, "Light", "secondary") => "#606977",
             (_, "Light", "tertiary") => "#626b78",
@@ -27063,6 +27101,7 @@ mod tests {
             (_, "Light", "header") => "#bd454d",
             (_, "Light", "placeholder") => "#a2a8b2",
             (_, "Light", "filter_selected") => "#b5424a",
+            (_, "Light", "chevron") => "#7f8792",
             (_, "Dark", "body") | (_, "Dark", "input") => "#dce1e8",
             (_, "Dark", "secondary") => "#c4cad3",
             (_, "Dark", "tertiary") => "#c0c6cf",
@@ -27070,6 +27109,7 @@ mod tests {
             (_, "Dark", "header") => "#dc6463",
             (_, "Dark", "placeholder") => "#7c838d",
             (_, "Dark", "filter_selected") => "#f3f5f7",
+            (_, "Dark", "chevron") => "#b8c0ca",
             _ => panic!("missing physical TodoMVC text color for {theme}/{mode}/{role}"),
         }
     }
@@ -27077,13 +27117,13 @@ mod tests {
     fn physical_todomvc_material_color(theme: &str, mode: &str, role: &str) -> &'static str {
         match (theme, mode, role) {
             ("Classic", "Light", "root") => "Oklch[lightness:0.97]",
-            ("Classic", "Dark", "root") => "Oklch[lightness:0.07,chroma:0.008,hue:250]",
+            ("Classic", "Dark", "root") => "#1b1b1b",
             ("Classic", "Light", "surface")
             | ("Classic", "Light", "surface_elevated")
             | ("Classic", "Light", "interactive") => "Oklch[lightness:1]",
             ("Classic", "Dark", "surface")
             | ("Classic", "Dark", "surface_elevated")
-            | ("Classic", "Dark", "interactive") => "Oklch[lightness:0.12,chroma:0.01,hue:250]",
+            | ("Classic", "Dark", "interactive") => "#202020",
             ("Classic", "Light", "recessed") => "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]",
             ("Classic", "Dark", "recessed") => "Oklch[lightness:1,chroma:0,hue:0,alpha:0.045]",
             ("Professional", "Light", "root") => "#f8fafc",
@@ -27153,49 +27193,55 @@ mod tests {
             ("Classic", "Light", "border") => "#ededed",
             ("Classic", "Light", "checked_border") => "#bddad5",
             ("Classic", "Light", "check") => "#5dc2af",
-            ("Classic", "Dark", "background") => "Oklch[lightness:0.12,chroma:0.01,hue:250]",
-            ("Classic", "Dark", "border") => "Oklch[lightness:0.34,chroma:0.01,hue:250]",
-            ("Classic", "Dark", "checked_border") => "Oklch[lightness:0.62,chroma:0.08,hue:180]",
-            ("Classic", "Dark", "check") => "Oklch[lightness:0.78,chroma:0.09,hue:180]",
+            ("Classic", "Dark", "background") => "#00000000",
+            ("Classic", "Dark", "border") => "#595959",
+            ("Classic", "Dark", "checked_border") => "#4aa582",
+            ("Classic", "Dark", "check") => "#53b994",
             ("Professional", "Light", "background") => "#ffffff",
-            ("Professional", "Light", "border") => "#d9dee7",
-            ("Professional", "Light", "checked_border") | ("Professional", "Light", "check") => {
-                "#bd454d"
-            }
-            ("Professional", "Dark", "background") => "#1b1f24",
-            ("Professional", "Dark", "border") => "#3d4652",
-            ("Professional", "Dark", "checked_border") | ("Professional", "Dark", "check") => {
-                "#dc6463"
-            }
-            ("Glassmorphism", "Light", "background") => "#ffffff8a",
-            ("Glassmorphism", "Light", "border") => "#8ba3bd8f",
-            ("Glassmorphism", "Light", "checked_border") | ("Glassmorphism", "Light", "check") => {
-                "#ba4048db"
-            }
-            ("Glassmorphism", "Dark", "background") => "#1f26438a",
-            ("Glassmorphism", "Dark", "border") => "#b4c3eb70",
-            ("Glassmorphism", "Dark", "checked_border") | ("Glassmorphism", "Dark", "check") => {
-                "#917cdecc"
-            }
+            ("Professional", "Light", "border") => "#d8dde4",
+            ("Professional", "Light", "checked_border") => "#62c6aa",
+            ("Professional", "Light", "check") => "#43bc9a",
+            ("Professional", "Dark", "background") => "#00000000",
+            ("Professional", "Dark", "border") => "#626a75",
+            ("Professional", "Dark", "checked_border") => "#3fb18f",
+            ("Professional", "Dark", "check") => "#45c9a3",
+            ("Glassmorphism", "Light", "background") => "#ffffff38",
+            ("Glassmorphism", "Light", "border") => "#b2bccaa6",
+            ("Glassmorphism", "Light", "checked_border") => "#8bd9c8",
+            ("Glassmorphism", "Light", "check") => "#4dc8ad",
+            ("Glassmorphism", "Dark", "background") => "#ffffff0a",
+            ("Glassmorphism", "Dark", "border") => "#bfc7e08c",
+            ("Glassmorphism", "Dark", "checked_border") => "#62e4d7",
+            ("Glassmorphism", "Dark", "check") => "#6cf0e4",
             ("Neobrutalism", "Light", "background") => "#ffffff",
             ("Neobrutalism", "Light", "border")
             | ("Neobrutalism", "Light", "checked_border")
             | ("Neobrutalism", "Light", "check") => "#000000",
             ("Neobrutalism", "Dark", "background") => "#101010",
-            ("Neobrutalism", "Dark", "border")
-            | ("Neobrutalism", "Dark", "checked_border")
-            | ("Neobrutalism", "Dark", "check") => "#ffffff",
+            ("Neobrutalism", "Dark", "border") => "#ffffff",
+            ("Neobrutalism", "Dark", "checked_border") => "#00d95a",
+            ("Neobrutalism", "Dark", "check") => "#00e861",
             ("Neumorphism", "Light", "background") => "#eef1f6",
-            ("Neumorphism", "Light", "border") => "#a8b2c23d",
-            ("Neumorphism", "Light", "checked_border") | ("Neumorphism", "Light", "check") => {
-                "#b94a52"
-            }
+            ("Neumorphism", "Light", "border") => "#ffffff59",
+            ("Neumorphism", "Light", "checked_border") => "#ffffff61",
+            ("Neumorphism", "Light", "check") => "#56c3ad",
             ("Neumorphism", "Dark", "background") => "#252c36",
             ("Neumorphism", "Dark", "border") => "#ffffff14",
-            ("Neumorphism", "Dark", "checked_border") | ("Neumorphism", "Dark", "check") => {
-                "#ffffff"
-            }
+            ("Neumorphism", "Dark", "checked_border") => "#ffffff14",
+            ("Neumorphism", "Dark", "check") => "#5be0bd",
             _ => panic!("missing physical TodoMVC checkbox color for {theme}/{mode}/{role}"),
+        }
+    }
+
+    fn physical_todomvc_checkbox_border_width(theme: &str, mode: &str) -> f32 {
+        match (theme, mode) {
+            ("Classic", "Light") => 1.5,
+            ("Classic", "Dark") => 2.0,
+            ("Professional" | "Glassmorphism", _) => 2.0,
+            ("Neobrutalism", "Light") => 4.0,
+            ("Neobrutalism", "Dark") => 3.0,
+            ("Neumorphism", _) => 1.0,
+            _ => panic!("missing physical TodoMVC checkbox border width for {theme}/{mode}"),
         }
     }
 
@@ -27248,6 +27294,57 @@ mod tests {
             "{context} expected `{key}`={expected} for {:?}, style={:?}",
             item.text,
             item.style
+        );
+    }
+
+    fn display_item_paint_color(item: &boon_document::DisplayItem) -> Option<&str> {
+        style_text_from_map(&item.style, "background")
+            .or_else(|| style_text_from_map(&item.style, "bg"))
+            .or_else(|| style_text_from_map(&item.style, "material_color"))
+    }
+
+    fn assert_physical_todomvc_rendered_viewport_background(
+        frame: &boon_document::LayoutFrame,
+        theme: &str,
+        mode: &str,
+        context: &str,
+    ) {
+        let expanded_frame = preview_frame_with_viewport_background(
+            frame,
+            PHYSICAL_TODOMVC_PREVIEW_WIDTH,
+            PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+        );
+        let expected = physical_todomvc_material_color(theme, mode, "root");
+        let background = expanded_frame
+            .display_list
+            .iter()
+            .filter(|item| {
+                item.bounds.x.abs() <= f32::EPSILON
+                    && item.bounds.y.abs() <= f32::EPSILON
+                    && item.style.get("paint")
+                        != Some(&boon_document_model::StyleValue::Bool(false))
+                    && display_item_paint_color(item).is_some()
+            })
+            .max_by(|left, right| {
+                let left_area = left.bounds.width * left.bounds.height;
+                let right_area = right.bounds.width * right.bounds.height;
+                left_area
+                    .partial_cmp(&right_area)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or_else(|| {
+                panic!("{context} should render a paintable root background at the viewport origin")
+            });
+        assert!(
+            background.bounds.width >= PHYSICAL_TODOMVC_PREVIEW_WIDTH - 0.5
+                && background.bounds.height >= PHYSICAL_TODOMVC_PREVIEW_HEIGHT - 0.5,
+            "{context} rendered root background should cover the viewport, got {:?}",
+            background.bounds
+        );
+        assert_eq!(
+            display_item_paint_color(background),
+            Some(expected),
+            "{context} rendered viewport background should use the selected theme/mode color, item={background:?}"
         );
     }
 
@@ -27320,6 +27417,13 @@ mod tests {
             physical_todomvc_text_color(theme, mode, "placeholder"),
             context,
         );
+        let toggle_all = physical_frame_text_item(frame, "❯", context);
+        assert_display_style_text(
+            toggle_all,
+            "color",
+            physical_todomvc_text_color(theme, mode, "chevron"),
+            context,
+        );
         let count = physical_frame_text_item(frame, "3 items left", context);
         assert_display_style_text(count, "font", body_font_family, context);
         assert_display_style_text(
@@ -27361,6 +27465,12 @@ mod tests {
             physical_todomvc_checkbox_style_color(theme, mode, "check"),
             context,
         );
+        assert_display_style_number(
+            checkbox,
+            "checkbox_border_width",
+            physical_todomvc_checkbox_border_width(theme, mode),
+            context,
+        );
         let root_color = frame_root_material_color(frame)
             .unwrap_or_else(|| panic!("{context} should expose root material color"));
         assert_eq!(
@@ -27368,6 +27478,7 @@ mod tests {
             physical_todomvc_material_color(theme, mode, "root"),
             "{context} root material should follow live theme/mode state"
         );
+        assert_physical_todomvc_rendered_viewport_background(frame, theme, mode, context);
     }
 
     #[test]
@@ -27760,7 +27871,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "27b32c56e516",
+            "3af0612e02c7",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -28547,9 +28658,8 @@ mod tests {
                 let classic_new_todo_border_light = boon_document_model::StyleValue::Text(
                     "Oklch[lightness:0.7,chroma:0.18,hue:24.1]".to_owned(),
                 );
-                let classic_new_todo_border_dark = boon_document_model::StyleValue::Text(
-                    "Oklch[lightness:0.31,chroma:0.03,hue:25,alpha:0.9]".to_owned(),
-                );
+                let classic_new_todo_border_dark =
+                    boon_document_model::StyleValue::Text("#3c3c3c".to_owned());
                 let classic_new_todo_border = if mode == "Dark" {
                     &classic_new_todo_border_dark
                 } else {
@@ -28603,6 +28713,9 @@ mod tests {
                     physical_todomvc_material_color(theme, mode, "root"),
                     "{context} root background should use the selected mode palette"
                 );
+                assert_physical_todomvc_rendered_viewport_background(
+                    &layout, theme, mode, &context,
+                );
 
                 let input = layout
                     .display_list
@@ -28651,6 +28764,12 @@ mod tests {
                     &context,
                 );
                 let toggle_all_text = text_item("❯");
+                assert_display_style_text(
+                    toggle_all_text,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "chevron"),
+                    &context,
+                );
                 let toggle_all = layout
                     .display_list
                     .iter()
@@ -28763,6 +28882,12 @@ mod tests {
                     first_checkbox,
                     "check_color",
                     physical_todomvc_checkbox_style_color(theme, mode, "check"),
+                    &context,
+                );
+                assert_display_style_number(
+                    first_checkbox,
+                    "checkbox_border_width",
+                    physical_todomvc_checkbox_border_width(theme, mode),
                     &context,
                 );
                 let new_todo_row = layout
@@ -29127,6 +29252,172 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn physical_todomvc_classic_dark_app_owned_readback_paints_dark_viewport_regions() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "skipping Classic dark app-owned readback visual test: request_adapter failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-playground-physical-todomvc-dark-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+            let source = std::fs::read_to_string(&source_path)
+                .expect("physical TodoMVC source should exist");
+            let mut state = physical_todomvc_seed_state("Classic", "Dark");
+            mirror_physical_todomvc_seed_root_fields(&mut state);
+            let (_, layout) = native_document_layout_proof_with_state_embedded(
+                &source_path,
+                &source,
+                Some(&state),
+            )
+            .expect("Classic dark physical TodoMVC layout should lower");
+            assert_physical_todomvc_frame_theme_styles(
+                &layout,
+                "Classic",
+                "Dark",
+                "Classic dark app-owned readback layout",
+            );
+
+            let render_frame = preview_frame_with_viewport_background(
+                &layout,
+                PHYSICAL_TODOMVC_PREVIEW_WIDTH,
+                PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+            );
+            let proof =
+                boon_native_gpu::render_app_owned_pixels(boon_native_gpu::AppOwnedRenderRequest {
+                    device: &device,
+                    queue: &queue,
+                    frame: &render_frame,
+                    surface_id: boon_host::SurfaceId(
+                        "physical-todomvc-classic-dark-test".to_owned(),
+                    ),
+                    surface_epoch: 0,
+                    width: PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                    height: PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
+                    artifact_dir: Path::new("target/artifacts/native-gpu/tests"),
+                    artifact_label: "physical-todomvc-classic-dark",
+                })
+                .expect("Classic dark frame should render to app-owned pixels");
+            let artifact_path = match &proof.artifact {
+                boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+                    artifact_path,
+                    layout_frame_hash,
+                    ..
+                } => {
+                    assert_eq!(
+                        layout_frame_hash,
+                        &render_frame_hash(&render_frame),
+                        "app-owned readback proof should bind to the rendered Classic dark frame"
+                    );
+                    PathBuf::from(artifact_path)
+                }
+                boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => {
+                    panic!("Classic dark visual test should produce app-owned pixels")
+                }
+            };
+            let image = image::open(&artifact_path)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Classic dark app-owned readback `{}` should decode: {error}",
+                        artifact_path.display()
+                    )
+                })
+                .to_rgba8();
+            assert_eq!(
+                image.dimensions(),
+                (
+                    PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                    PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32
+                )
+            );
+
+            let contains_bounds = |outer: boon_document::Rect, inner: boon_document::Rect| {
+                outer.x <= inner.x + 0.5
+                    && outer.y <= inner.y + 0.5
+                    && outer.x + outer.width >= inner.x + inner.width - 0.5
+                    && outer.y + outer.height >= inner.y + inner.height - 0.5
+            };
+            let input = physical_new_todo_input_item(&layout)
+                .expect("Classic dark layout should expose new-todo input");
+            let toggle_all = physical_frame_text_item(&layout, "❯", "Classic dark readback");
+            let new_todo_row = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                        && contains_bounds(item.bounds, input.bounds)
+                        && contains_bounds(item.bounds, toggle_all.bounds)
+                })
+                .expect("Classic dark readback should expose the new-todo row");
+            let count = physical_frame_text_item(&layout, "3 items left", "Classic dark readback");
+            let panel_footer = layout
+                .display_list
+                .iter()
+                .find(|item| {
+                    matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                        && contains_bounds(item.bounds, count.bounds)
+                        && item.style.contains_key("border_top")
+                })
+                .expect("Classic dark readback should expose the panel footer row");
+
+            let luma_at = |x: f32, y: f32| {
+                let x = x.round().clamp(0.0, PHYSICAL_TODOMVC_PREVIEW_WIDTH - 1.0) as u32;
+                let y = y.round().clamp(0.0, PHYSICAL_TODOMVC_PREVIEW_HEIGHT - 1.0) as u32;
+                let pixel = image.get_pixel(x, y);
+                0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
+            };
+
+            for (label, x, y, max_luma) in [
+                ("root top-left", 8.0, 8.0, 55.0),
+                (
+                    "new-todo row",
+                    new_todo_row.bounds.x + 4.0,
+                    new_todo_row.bounds.y + 4.0,
+                    70.0,
+                ),
+                (
+                    "footer/filter row",
+                    panel_footer.bounds.x + 4.0,
+                    panel_footer.bounds.y + 4.0,
+                    70.0,
+                ),
+            ] {
+                let luma = luma_at(x, y);
+                assert!(
+                    luma <= max_luma,
+                    "Classic dark app-owned readback should paint `{label}` dark, got luma={luma} at ({x}, {y}); artifact={}",
+                    artifact_path.display()
+                );
+            }
+        });
     }
 
     #[test]
@@ -29830,6 +30121,89 @@ mod tests {
         let mut previous_checkbox_check_color =
             first_todo_checkbox_style_text(&initial_frame, "check_color")
                 .expect("initial physical frame should expose themed checkbox check color");
+        let mut previous_root_color = initial_root_color;
+
+        let classic_light_mode_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (classic_mode_x, classic_mode_y, _) = source_hit_center(
+            &classic_light_mode_layout,
+            "store.elements.theme_switcher.mode_toggle",
+        )
+        .expect("Classic mode toggle should have a hit region");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(1, classic_mode_x, classic_mode_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking Classic mode toggle should dispatch a source event");
+        let classic_dark_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(classic_dark_summary["theme_options"]["name"], "Classic");
+        assert_eq!(classic_dark_summary["theme_options"]["mode"], "Dark");
+        let classic_dark_frame = latest_preview_frame(&shared_render_state);
+        assert_physical_todomvc_frame_theme_styles(
+            &classic_dark_frame,
+            "Classic",
+            "Dark",
+            "after toggling Classic dark mode",
+        );
+        assert!(
+            classic_dark_frame
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Light mode")),
+            "Classic dark mode toggle label should update after switching to dark"
+        );
+        let classic_dark_root_color = frame_root_material_color(&classic_dark_frame)
+            .expect("Classic dark frame should expose a root material color");
+        assert_ne!(
+            classic_dark_root_color, previous_root_color,
+            "Classic dark should re-lower the viewport root material, not keep the light background"
+        );
+        let classic_dark_checkbox_check_color =
+            first_todo_checkbox_style_text(&classic_dark_frame, "check_color")
+                .expect("Classic dark frame should expose themed row checkbox check color");
+        assert_ne!(
+            classic_dark_checkbox_check_color, previous_checkbox_check_color,
+            "Classic dark should re-lower todo row checkbox glyph colors"
+        );
+        assert_physical_todomvc_preview_healthy(
+            &shared_render_state,
+            "after toggling Classic dark mode",
+        );
+
+        let classic_dark_mode_layout = shared_render_state.lock().unwrap().layout_proof.clone();
+        let (classic_light_x, classic_light_y, _) = source_hit_center(
+            &classic_dark_mode_layout,
+            "store.elements.theme_switcher.mode_toggle",
+        )
+        .expect("Classic mode toggle should still have a hit region");
+        preview_apply_real_window_input(
+            &deterministic_click_input_from_index(2, classic_light_x, classic_light_y),
+            &source_path,
+            &source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .expect("clicking Classic mode toggle back to light should dispatch a source event");
+        let classic_light_summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(classic_light_summary["theme_options"]["name"], "Classic");
+        assert_eq!(classic_light_summary["theme_options"]["mode"], "Light");
+        let classic_light_frame = latest_preview_frame(&shared_render_state);
+        assert_physical_todomvc_frame_theme_styles(
+            &classic_light_frame,
+            "Classic",
+            "Light",
+            "after returning Classic light mode",
+        );
+        previous_root_color = frame_root_material_color(&classic_light_frame)
+            .expect("Classic light frame should expose a root material color");
+        previous_checkbox_check_color =
+            first_todo_checkbox_style_text(&classic_light_frame, "check_color")
+                .expect("Classic light frame should expose themed checkbox check color");
+
         let themes = [
             ("Classic", "classic"),
             ("Professional", "professional"),
@@ -29837,7 +30211,6 @@ mod tests {
             ("Neobrutalism", "neobrutalism"),
             ("Neumorphism", "neumorphism"),
         ];
-        let mut previous_root_color = initial_root_color;
         for (index, (expected_name, source_suffix)) in themes.iter().enumerate() {
             let layout = shared_render_state.lock().unwrap().layout_proof.clone();
             let source_event = format!("store.elements.theme_switcher.{source_suffix}");
@@ -29845,7 +30218,7 @@ mod tests {
                 panic!("{expected_name} theme button should have a hit region")
             });
             preview_apply_real_window_input(
-                &deterministic_click_input_from_index(index as u64, x, y),
+                &deterministic_click_input_from_index(10 + index as u64, x, y),
                 &source_path,
                 &source,
                 Some(&live_runtime),
@@ -29915,7 +30288,7 @@ mod tests {
             source_hit_center(&mode_layout, "store.elements.theme_switcher.mode_toggle")
                 .expect("mode toggle should have a hit region");
         preview_apply_real_window_input(
-            &deterministic_click_input_from_index(themes.len() as u64, mode_x, mode_y),
+            &deterministic_click_input_from_index(20, mode_x, mode_y),
             &source_path,
             &source,
             Some(&live_runtime),
@@ -37557,6 +37930,68 @@ mod tests {
             "layout-b",
             false
         ));
+    }
+
+    #[test]
+    fn app_owned_readback_reuse_requires_matching_render_frame_hash() {
+        fn frame_with_background(color: &str) -> boon_document::LayoutFrame {
+            let mut style = BTreeMap::new();
+            style.insert(
+                "background".to_owned(),
+                boon_document_model::StyleValue::Text(color.to_owned()),
+            );
+            boon_document::LayoutFrame {
+                display_list: vec![boon_document::DisplayItem {
+                    node: boon_document::DocumentNodeId("root".to_owned()),
+                    kind: boon_document_model::DocumentNodeKind::Stack,
+                    bounds: boon_document::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 320.0,
+                        height: 200.0,
+                    },
+                    text: None,
+                    style,
+                    focused: false,
+                }],
+                hit_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                accessibility: boon_document::AccessibilityTree::default(),
+                demands: Vec::new(),
+                metrics: boon_document::LayoutMetrics::default(),
+            }
+        }
+
+        fn proof_for_frame(frame: &boon_document::LayoutFrame) -> boon_native_gpu::RenderProof {
+            boon_native_gpu::RenderProof {
+                artifact: boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+                    artifact_path: "target/artifacts/native-gpu/tests/cache-proof.png".to_owned(),
+                    artifact_sha256: "test-proof".to_owned(),
+                    capture_method: "test".to_owned(),
+                    surface_id: boon_host::SurfaceId("test-surface".to_owned()),
+                    surface_epoch: 0,
+                    frame_seq: 1,
+                    layout_frame_hash: render_frame_hash(frame),
+                    width: 320,
+                    height: 200,
+                    nonblank_samples: 1,
+                    unique_rgba_values: 1,
+                },
+                metrics: boon_native_gpu::FrameMetrics::default(),
+            }
+        }
+
+        let light_frame = frame_with_background("#ffffff");
+        let dark_frame = frame_with_background("#1b1b1b");
+        let proof = proof_for_frame(&light_frame);
+
+        assert!(render_proof_matches_viewport(&proof, 320, 200));
+        assert!(render_proof_matches_frame(&proof, 320, 200, &light_frame));
+        assert!(
+            !render_proof_matches_frame(&proof, 320, 200, &dark_frame),
+            "same-size app-owned readbacks must not be reused after a visual frame change"
+        );
+        assert!(!render_proof_matches_frame(&proof, 321, 200, &light_frame));
     }
 
     #[test]

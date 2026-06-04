@@ -19,46 +19,70 @@ FUNCTION get(from, of) {
 
 FUNCTION material(material) {
     BLOCK {
-        colors: PASSED.mode |> WHEN {
-            Light => [
-                background: Oklch[lightness: 0.97]
-                surface: Oklch[lightness: 1]
-                subtle: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.003]
-                primary: Oklch[lightness: 0.585, chroma: 0.172, hue: 24.1]
-                danger: Oklch[lightness: 0.57, chroma: 0.109, hue: 18.87]
-                input_border: Oklch[lightness: 0.7, chroma: 0.18, hue: 24.1]
-                divider: Oklch[lightness: 0.93]
-                panel_stack_fill: Oklch[lightness: 0.973]
-                shadow_medium: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.24]
-                shadow_soft: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.14]
-                checkbox_border: TEXT { #ededed }
-                checkbox_checked_border: TEXT { #bddad5 }
-                checkbox_check: TEXT { #5dc2af }
-            ]
-            Dark => [
-                background: Oklch[lightness: 0.07, chroma: 0.008, hue: 250]
-                surface: Oklch[lightness: 0.12, chroma: 0.01, hue: 250]
-                subtle: Oklch[lightness: 1, chroma: 0, hue: 0, alpha: 0.045]
-                primary: Oklch[lightness: 0.68, chroma: 0.16, hue: 24.1]
-                danger: Oklch[lightness: 0.72, chroma: 0.12, hue: 18.87]
-                input_border: Oklch[lightness: 0.31, chroma: 0.03, hue: 25, alpha: 0.9]
-                divider: TEXT { #373737 }
-                panel_stack_fill: TEXT { #1d1d1d }
-                shadow_medium: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.45]
-                shadow_soft: Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.30]
-                checkbox_border: Oklch[lightness: 0.34, chroma: 0.01, hue: 250]
-                checkbox_checked_border: Oklch[lightness: 0.62, chroma: 0.08, hue: 180]
-                checkbox_check: Oklch[lightness: 0.78, chroma: 0.09, hue: 180]
-            ]
+        background_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.97]
+            Dark => TEXT { #1b1b1b }
+        }
+        surface_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 1]
+            Dark => TEXT { #202020 }
+        }
+        subtle_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.003]
+            Dark => Oklch[lightness: 1, chroma: 0, hue: 0, alpha: 0.045]
+        }
+        primary_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.585, chroma: 0.172, hue: 24.1]
+            Dark => TEXT { #b83f45 }
+        }
+        danger_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.57, chroma: 0.109, hue: 18.87]
+            Dark => TEXT { #b83f45 }
+        }
+        input_border_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.7, chroma: 0.18, hue: 24.1]
+            Dark => TEXT { #3c3c3c }
+        }
+        divider_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.93]
+            Dark => TEXT { #373737 }
+        }
+        panel_stack_fill_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.973]
+            Dark => TEXT { #1d1d1d }
+        }
+        shadow_medium_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.24]
+            Dark => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.45]
+        }
+        shadow_soft_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.14]
+            Dark => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.30]
+        }
+        checkbox_background_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 1]
+            Dark => TEXT { #00000000 }
+        }
+        checkbox_border_color: PASSED.mode |> WHEN {
+            Light => TEXT { #ededed }
+            Dark => TEXT { #595959 }
+        }
+        checkbox_checked_border_color: PASSED.mode |> WHEN {
+            Light => TEXT { #bddad5 }
+            Dark => TEXT { #4aa582 }
+        }
+        checkbox_check_color: PASSED.mode |> WHEN {
+            Light => TEXT { #5dc2af }
+            Dark => TEXT { #53b994 }
         }
 
-        background_base: [color: colors.background]
+        background_base: [color: background_color]
         surface_base: [
-            color: colors.surface
+            color: surface_color
             gloss: 0
         ]
         subtle_transparent_base: [
-            color: colors.subtle
+            color: subtle_color
             gloss: 0
         ]
 
@@ -73,43 +97,46 @@ FUNCTION material(material) {
             InteractiveRecessed[focus] => subtle_transparent_base
 
             Primary => [
-                color: colors.primary
+                color: primary_color
             ]
 
             PrimarySubtle => [
-                color: colors.surface
-                border: colors.primary
+                color: surface_color
+                border: primary_color
                 border_width: 1
             ]
 
             FilterSelected => [
-                border: colors.primary
+                border: primary_color
                 border_width: 1
             ]
 
             Danger => [
-                color: colors.danger
+                color: danger_color
             ]
 
             CheckboxGlyph[checked] => [
-                checkbox_background: colors.surface
-                checkbox_border: colors.checkbox_border
-                checked_border: colors.checkbox_checked_border
-                check_color: colors.checkbox_check
-                checkbox_border_width: 1.5
+                checkbox_background: checkbox_background_color
+                checkbox_border: checkbox_border_color
+                checked_border: checkbox_checked_border_color
+                check_color: checkbox_check_color
+                checkbox_border_width: PASSED.mode |> WHEN {
+                    Light => 1.5
+                    Dark => 2
+                }
                 check_width: 3
             ]
 
             PanelFrame => [
                 shadows: LIST {
-                    [y: 2, blur: 4, color: colors.shadow_medium]
-                    [y: 25, blur: 50, color: colors.shadow_soft]
+                    [y: 2, blur: 4, color: shadow_medium_color]
+                    [y: 25, blur: 50, color: shadow_soft_color]
                 }
             ]
 
             NewTodoRowFrame => [
                 height: 65
-                border: colors.input_border
+                border: input_border_color
                 border_width: 1
             ]
 
@@ -121,20 +148,20 @@ FUNCTION material(material) {
             TodoRowFrame => [
                 height: 59
                 padding: 9
-                border_bottom: colors.divider
+                border_bottom: divider_color
                 border_bottom_width: 0.8
             ]
 
             PanelFooterFrame => [
                 height: 49
-                border_top: colors.divider
+                border_top: divider_color
                 border_top_width: 0.8
                 shadows: LIST {
-                    [y: 1, blur: 1, color: colors.shadow_medium]
-                    [y: 8, spread: -3, color: colors.panel_stack_fill]
-                    [y: 9, blur: 1, spread: -3, color: colors.shadow_medium]
-                    [y: 16, spread: -6, color: colors.panel_stack_fill]
-                    [y: 17, blur: 2, spread: -6, color: colors.shadow_medium]
+                    [y: 1, blur: 1, color: shadow_medium_color]
+                    [y: 8, spread: -3, color: panel_stack_fill_color]
+                    [y: 9, blur: 1, spread: -3, color: shadow_medium_color]
+                    [y: 16, spread: -6, color: panel_stack_fill_color]
+                    [y: 17, blur: 2, spread: -6, color: shadow_medium_color]
                 }
             ]
         }
@@ -143,87 +170,105 @@ FUNCTION material(material) {
 
 FUNCTION font(font) {
     BLOCK {
-        colors: PASSED.mode |> WHEN {
-            Light => [
-                hero: Oklch[lightness: 0.5404, chroma: 0.1561, hue: 21.24]
-                body: Oklch[lightness: 0.4017]
-                body_secondary: Oklch[lightness: 0.17]
-                disabled: Oklch[lightness: 0.6665]
-                danger: Oklch[lightness: 0.57, chroma: 0.109, hue: 18.87]
-                input: Oklch[lightness: 0.42]
-                placeholder: Oklch[lightness: 0.68]
-                icon_checked: Oklch[lightness: 0.4]
-                icon_unchecked: Oklch[lightness: 0.667]
-                small: Oklch[lightness: 0.4202]
-            ]
-            Dark => [
-                hero: Oklch[lightness: 0.68, chroma: 0.16, hue: 24.1]
-                body: Oklch[lightness: 0.88]
-                body_secondary: Oklch[lightness: 0.78]
-                disabled: Oklch[lightness: 0.54]
-                danger: Oklch[lightness: 0.72, chroma: 0.12, hue: 18.87]
-                input: Oklch[lightness: 0.86]
-                placeholder: Oklch[lightness: 0.58]
-                icon_checked: Oklch[lightness: 0.86]
-                icon_unchecked: Oklch[lightness: 0.56]
-                small: Oklch[lightness: 0.68]
-            ]
+        hero_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.5404, chroma: 0.1561, hue: 21.24]
+            Dark => TEXT { #b83f45 }
+        }
+        body_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.4017]
+            Dark => TEXT { #dfdfdf }
+        }
+        body_secondary_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.17]
+            Dark => TEXT { #d6d6d6 }
+        }
+        disabled_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.6665]
+            Dark => TEXT { #868686 }
+        }
+        danger_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.57, chroma: 0.109, hue: 18.87]
+            Dark => TEXT { #b83f45 }
+        }
+        input_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.42]
+            Dark => TEXT { #dfdfdf }
+        }
+        placeholder_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.68]
+            Dark => TEXT { #868686 }
+        }
+        icon_checked_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.4]
+            Dark => TEXT { #dfdfdf }
+        }
+        icon_unchecked_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.667]
+            Dark => TEXT { #8f8f8f }
+        }
+        small_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.4202]
+            Dark => TEXT { #858585 }
+        }
+        filter_selected_color: PASSED.mode |> WHEN {
+            Light => Oklch[lightness: 0.17]
+            Dark => TEXT { #eeeeee }
         }
 
         font |> WHEN {
             Hero => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 80
-                color: colors.hero
+                color: hero_color
                 weight: ExtraLight
             ]
 
             Body => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 24
-                color: colors.body
+                color: body_color
                 weight: Light
             ]
 
             BodySecondary => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 15
-                color: colors.body_secondary
+                color: body_secondary_color
                 weight: Light
             ]
 
             FilterSelected => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 15
-                color: colors.body_secondary
+                color: filter_selected_color
                 weight: Light
             ]
 
             BodyDisabled => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 24
-                color: colors.disabled
+                color: disabled_color
                 weight: Light
             ]
 
             BodyDanger => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 30
-                color: colors.danger
+                color: danger_color
                 weight: Normal
             ]
 
             Input => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 24
-                color: colors.input
+                color: input_color
                 weight: Light
             ]
 
             Placeholder => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 24
-                color: colors.placeholder
+                color: placeholder_color
                 weight: Light
                 style: Italic
             ]
@@ -232,8 +277,8 @@ FUNCTION font(font) {
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 22
                 color: checked |> WHEN {
-                    True => colors.icon_checked
-                    False => colors.icon_unchecked
+                    True => icon_checked_color
+                    False => icon_unchecked_color
                 }
                 weight: Normal
             ]
@@ -241,14 +286,14 @@ FUNCTION font(font) {
             Small => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 11
-                color: colors.small
+                color: small_color
                 weight: Light
             ]
 
             SmallLink[hovered] => [
                 family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
                 size: 11
-                color: colors.small
+                color: small_color
                 weight: Light
                 line: [underline: hovered]
             ]

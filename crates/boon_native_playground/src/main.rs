@@ -15736,6 +15736,13 @@ fn lower_canonical_style_block(
                 lower_background_style(child, expressions, context, node);
             }
             "font" => {
+                if let Some(expr_id) = child.expr
+                    && let Some(Value::Object(object)) = expressions
+                        .get(expr_id)
+                        .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                {
+                    lower_json_font_style_object(&object, node);
+                }
                 if let Some(font_fields) = record_fields_for_statement(child, expressions) {
                     for font_field in font_fields {
                         if matches!(
@@ -16693,6 +16700,11 @@ fn lower_canonical_style_record(
                             );
                         }
                     }
+                } else if let Some(Value::Object(object)) = expressions
+                    .get(field.value)
+                    .and_then(|expr| document_eval_expr_value(expr, expressions, context))
+                {
+                    lower_json_font_style_object(&object, node);
                 }
             }
             "align" => lower_align_style_field(field, expressions, context, node),
@@ -16757,7 +16769,34 @@ fn lower_json_style_object(
     object: &serde_json::Map<String, Value>,
     node: &mut boon_document_model::DocumentNode,
 ) {
+    for compound_key in [
+        "background",
+        "material",
+        "font",
+        "shadows",
+        "glow",
+        "move",
+        "padding",
+        "spring_range",
+    ] {
+        if let Some(value) = object.get(compound_key) {
+            lower_json_style_field(compound_key, value, node);
+        }
+    }
     for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "background"
+                | "material"
+                | "font"
+                | "shadows"
+                | "glow"
+                | "move"
+                | "padding"
+                | "spring_range"
+        ) {
+            continue;
+        }
         lower_json_style_field(key, value, node);
     }
 }
@@ -16766,17 +16805,7 @@ fn lower_json_style_field(key: &str, value: &Value, node: &mut boon_document_mod
     match key {
         "font" => {
             if let Some(object) = value.as_object() {
-                for (font_key, font_value) in object {
-                    match font_key.as_str() {
-                        "family" => insert_json_style_value(node, "font", font_value),
-                        "style" => insert_json_style_value(node, "font_style", font_value),
-                        "line" => lower_json_font_line_style(font_value, node),
-                        "size" | "color" | "weight" => {
-                            insert_json_style_value(node, font_key, font_value)
-                        }
-                        _ => {}
-                    }
-                }
+                lower_json_font_style_object(object, node);
             }
         }
         "line" => lower_json_font_line_style(value, node),
@@ -17269,6 +17298,21 @@ fn style_text_from_value(value: &boon_document_model::StyleValue) -> Option<&str
         boon_document_model::StyleValue::Text(value) => Some(value.as_str()),
         boon_document_model::StyleValue::Number(_) | boon_document_model::StyleValue::Bool(_) => {
             None
+        }
+    }
+}
+
+fn lower_json_font_style_object(
+    object: &serde_json::Map<String, Value>,
+    node: &mut boon_document_model::DocumentNode,
+) {
+    for (font_key, font_value) in object {
+        match font_key.as_str() {
+            "family" => insert_json_style_value(node, "font", font_value),
+            "style" => insert_json_style_value(node, "font_style", font_value),
+            "line" => lower_json_font_line_style(font_value, node),
+            "size" | "color" | "weight" => insert_json_style_value(node, font_key, font_value),
+            _ => {}
         }
     }
 }
@@ -19542,8 +19586,12 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
             }),
         };
     }
-    let family = "Segoe UI, Roboto, Helvetica, Arial, SansSerif";
     let brutalist = document_theme_name(context) == "Neobrutalism";
+    let family = if brutalist {
+        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace"
+    } else {
+        "Segoe UI, Roboto, Helvetica, Arial, SansSerif"
+    };
     match tagged {
         "Hero" if brutalist => json!({
             "family": "Impact, Haettenschweiler, Arial Black, SansSerif",
@@ -19571,9 +19619,9 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
         }),
         "BodyDisabled" => json!({
             "family": family,
-            "size": 25.0,
+            "size": if brutalist { 23.0 } else { 25.0 },
             "color": document_theme_color(context, "text_disabled"),
-            "weight": "Light"
+            "weight": if brutalist { json!(800.0) } else { json!("Light") }
         }),
         "BodyDanger" => json!({
             "family": family,
@@ -19601,22 +19649,22 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
         }),
         "Small" => json!({
             "family": family,
-            "size": 11.0,
+            "size": if brutalist { 13.0 } else { 11.0 },
             "color": document_theme_color(context, "text_tertiary"),
             "weight": "Normal"
         }),
         "SmallLink" => json!({
             "family": family,
-            "size": 11.0,
+            "size": if brutalist { 13.0 } else { 11.0 },
             "color": document_theme_color(context, "text_tertiary"),
             "weight": "Normal",
             "line": {"underline": false}
         }),
         "Input" | "Body" | _ => json!({
             "family": family,
-            "size": 25.0,
+            "size": if brutalist { 23.0 } else { 25.0 },
             "color": document_theme_color(context, "text"),
-            "weight": "Light"
+            "weight": if brutalist { json!(800.0) } else { json!("Light") }
         }),
     }
 }
@@ -26926,6 +26974,402 @@ mod tests {
             .join(relative)
     }
 
+    fn physical_todomvc_body_font_family(theme: &str) -> &'static str {
+        match theme {
+            "Classic" => "Helvetica Neue, Helvetica, Arial, SansSerif",
+            "Neobrutalism" => {
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace"
+            }
+            _ => "Segoe UI, Roboto, Helvetica, Arial, SansSerif",
+        }
+    }
+
+    fn physical_todomvc_title_font_family(theme: &str) -> &'static str {
+        match theme {
+            "Neobrutalism" => "Impact, Haettenschweiler, Arial Black, SansSerif",
+            _ => physical_todomvc_body_font_family(theme),
+        }
+    }
+
+    fn physical_todomvc_text_color(theme: &str, mode: &str, role: &str) -> &'static str {
+        match (theme, mode, role) {
+            ("Classic", "Light", "body") => "Oklch[lightness:0.4017]",
+            ("Classic", "Light", "input") => "Oklch[lightness:0.42]",
+            ("Classic", "Light", "secondary") => "Oklch[lightness:0.17]",
+            ("Classic", "Light", "tertiary") => "Oklch[lightness:0.4202]",
+            ("Classic", "Light", "disabled") => "Oklch[lightness:0.6665]",
+            ("Classic", "Light", "placeholder") => "Oklch[lightness:0.68]",
+            ("Classic", "Light", "header") => "Oklch[lightness:0.5404,chroma:0.1561,hue:21.24]",
+            ("Classic", "Light", "filter_selected") => "Oklch[lightness:0.17]",
+            ("Classic", "Dark", "body") => "Oklch[lightness:0.88]",
+            ("Classic", "Dark", "input") => "Oklch[lightness:0.86]",
+            ("Classic", "Dark", "secondary") => "Oklch[lightness:0.78]",
+            ("Classic", "Dark", "tertiary") => "Oklch[lightness:0.68]",
+            ("Classic", "Dark", "disabled") => "Oklch[lightness:0.54]",
+            ("Classic", "Dark", "placeholder") => "Oklch[lightness:0.58]",
+            ("Classic", "Dark", "header") => "Oklch[lightness:0.68,chroma:0.16,hue:24.1]",
+            ("Classic", "Dark", "filter_selected") => "Oklch[lightness:0.78]",
+            ("Glassmorphism", "Light", "body") | ("Glassmorphism", "Light", "input") => "#30353c",
+            ("Glassmorphism", "Light", "secondary") | ("Glassmorphism", "Light", "tertiary") => {
+                "#6a7481"
+            }
+            ("Glassmorphism", "Light", "disabled") => "#87909b",
+            ("Glassmorphism", "Light", "header") => "#ba4048db",
+            ("Glassmorphism", "Light", "placeholder") => "#6e7885ad",
+            ("Glassmorphism", "Light", "filter_selected") => "#a7434d",
+            ("Glassmorphism", "Dark", "body") | ("Glassmorphism", "Dark", "input") => "#edf2ff",
+            ("Glassmorphism", "Dark", "secondary") | ("Glassmorphism", "Dark", "tertiary") => {
+                "#b7c0dd"
+            }
+            ("Glassmorphism", "Dark", "disabled") => "#9aa4bf",
+            ("Glassmorphism", "Dark", "header") => "#917cdecc",
+            ("Glassmorphism", "Dark", "placeholder") => "#bfc7e0a8",
+            ("Glassmorphism", "Dark", "filter_selected") => "#ffffff",
+            ("Neobrutalism", "Light", "body")
+            | ("Neobrutalism", "Light", "input")
+            | ("Neobrutalism", "Light", "secondary")
+            | ("Neobrutalism", "Light", "tertiary")
+            | ("Neobrutalism", "Light", "header") => "#000000",
+            ("Neobrutalism", "Light", "disabled") => "#6f6f6f",
+            ("Neobrutalism", "Light", "placeholder") => "#777777",
+            ("Neobrutalism", "Light", "filter_selected") => "#ffffff",
+            ("Neobrutalism", "Dark", "body")
+            | ("Neobrutalism", "Dark", "input")
+            | ("Neobrutalism", "Dark", "secondary")
+            | ("Neobrutalism", "Dark", "tertiary") => "#f6f6f6",
+            ("Neobrutalism", "Dark", "disabled") => "#bcbcbc",
+            ("Neobrutalism", "Dark", "header") => "#f4f4f4",
+            ("Neobrutalism", "Dark", "placeholder") => "#cfcfcf",
+            ("Neobrutalism", "Dark", "filter_selected") => "#000000",
+            ("Neumorphism", "Light", "body") | ("Neumorphism", "Light", "input") => "#303844",
+            ("Neumorphism", "Light", "secondary") | ("Neumorphism", "Light", "tertiary") => {
+                "#637081"
+            }
+            ("Neumorphism", "Light", "disabled") => "#8b94a1",
+            ("Neumorphism", "Light", "header") => "#78808b",
+            ("Neumorphism", "Light", "placeholder") => "#9aa3af",
+            ("Neumorphism", "Light", "filter_selected") => "#b94a52",
+            ("Neumorphism", "Dark", "body") | ("Neumorphism", "Dark", "input") => "#e6ebf3",
+            ("Neumorphism", "Dark", "secondary") => "#d0d6df",
+            ("Neumorphism", "Dark", "tertiary") => "#cbd2dd",
+            ("Neumorphism", "Dark", "disabled") => "#8b94a4",
+            ("Neumorphism", "Dark", "header") => "#252b34",
+            ("Neumorphism", "Dark", "placeholder") => "#9da6b5",
+            ("Neumorphism", "Dark", "filter_selected") => "#ffffff",
+            (_, "Light", "body") | (_, "Light", "input") => "#32363d",
+            (_, "Light", "secondary") => "#606977",
+            (_, "Light", "tertiary") => "#626b78",
+            (_, "Light", "disabled") => "#8a8f98",
+            (_, "Light", "header") => "#bd454d",
+            (_, "Light", "placeholder") => "#a2a8b2",
+            (_, "Light", "filter_selected") => "#b5424a",
+            (_, "Dark", "body") | (_, "Dark", "input") => "#dce1e8",
+            (_, "Dark", "secondary") => "#c4cad3",
+            (_, "Dark", "tertiary") => "#c0c6cf",
+            (_, "Dark", "disabled") => "#787f8b",
+            (_, "Dark", "header") => "#dc6463",
+            (_, "Dark", "placeholder") => "#7c838d",
+            (_, "Dark", "filter_selected") => "#f3f5f7",
+            _ => panic!("missing physical TodoMVC text color for {theme}/{mode}/{role}"),
+        }
+    }
+
+    fn physical_todomvc_material_color(theme: &str, mode: &str, role: &str) -> &'static str {
+        match (theme, mode, role) {
+            ("Classic", "Light", "root") => "Oklch[lightness:0.97]",
+            ("Classic", "Dark", "root") => "Oklch[lightness:0.07,chroma:0.008,hue:250]",
+            ("Classic", "Light", "surface")
+            | ("Classic", "Light", "surface_elevated")
+            | ("Classic", "Light", "interactive") => "Oklch[lightness:1]",
+            ("Classic", "Dark", "surface")
+            | ("Classic", "Dark", "surface_elevated")
+            | ("Classic", "Dark", "interactive") => "Oklch[lightness:0.12,chroma:0.01,hue:250]",
+            ("Classic", "Light", "recessed") => "Oklch[lightness:0,chroma:0,hue:0,alpha:0.003]",
+            ("Classic", "Dark", "recessed") => "Oklch[lightness:1,chroma:0,hue:0,alpha:0.045]",
+            ("Professional", "Light", "root") => "#f8fafc",
+            ("Professional", "Dark", "root") => "#16191e",
+            ("Professional", "Light", "surface")
+            | ("Professional", "Light", "surface_elevated")
+            | ("Professional", "Light", "interactive")
+            | ("Professional", "Light", "recessed") => "#ffffff",
+            ("Professional", "Dark", "surface")
+            | ("Professional", "Dark", "interactive")
+            | ("Professional", "Dark", "recessed") => "#1b1f24",
+            ("Professional", "Dark", "surface_elevated") => "#1d2127",
+            ("Glassmorphism", "Light", "root") => "#eef7ff",
+            ("Glassmorphism", "Dark", "root") => "#10152d",
+            ("Glassmorphism", "Light", "surface") => "#ffffff8a",
+            ("Glassmorphism", "Dark", "surface") => "#1f26438a",
+            ("Glassmorphism", "Light", "surface_elevated") => "#ffffff38",
+            ("Glassmorphism", "Dark", "surface_elevated") => "#090d1e47",
+            ("Glassmorphism", "Light", "interactive") => "#ffffff29",
+            ("Glassmorphism", "Dark", "interactive") => "#ffffff06",
+            ("Glassmorphism", "Light", "recessed") => "#ffffff8a",
+            ("Glassmorphism", "Dark", "recessed") => "#1f26438a",
+            ("Neobrutalism", "Light", "root") => "#fbfbf7",
+            ("Neobrutalism", "Dark", "root") => "#080808",
+            ("Neobrutalism", "Light", "surface")
+            | ("Neobrutalism", "Light", "surface_elevated")
+            | ("Neobrutalism", "Light", "interactive")
+            | ("Neobrutalism", "Light", "recessed") => "#ffffff",
+            ("Neobrutalism", "Dark", "surface")
+            | ("Neobrutalism", "Dark", "surface_elevated")
+            | ("Neobrutalism", "Dark", "interactive")
+            | ("Neobrutalism", "Dark", "recessed") => "#101010",
+            ("Neumorphism", "Light", "root") => "#e9edf3",
+            ("Neumorphism", "Dark", "root") => "#1d232d",
+            ("Neumorphism", "Light", "surface")
+            | ("Neumorphism", "Light", "surface_elevated")
+            | ("Neumorphism", "Light", "recessed") => "#eef1f6",
+            ("Neumorphism", "Dark", "surface")
+            | ("Neumorphism", "Dark", "surface_elevated")
+            | ("Neumorphism", "Dark", "recessed") => "#252c36",
+            ("Neumorphism", _, "interactive") => "#00000000",
+            _ => panic!("missing physical TodoMVC material color for {theme}/{mode}/{role}"),
+        }
+    }
+
+    fn physical_todomvc_selected_filter_material_color(
+        theme: &str,
+        mode: &str,
+    ) -> Option<&'static str> {
+        match (theme, mode) {
+            ("Classic", _) => None,
+            ("Professional", "Light") => Some("#fbf1f2"),
+            ("Professional", "Dark") => Some("#1d2127"),
+            ("Glassmorphism", "Light") => Some("#fff2f4ad"),
+            ("Glassmorphism", "Dark") => Some("#765ec22e"),
+            ("Neobrutalism", "Light") => Some("#000000"),
+            ("Neobrutalism", "Dark") => Some("#ffffff"),
+            ("Neumorphism", "Light") => Some("#eef1f6"),
+            ("Neumorphism", "Dark") => Some("#252c36"),
+            _ => panic!("missing selected filter material color for {theme}/{mode}"),
+        }
+    }
+
+    fn physical_todomvc_checkbox_style_color(theme: &str, mode: &str, role: &str) -> &'static str {
+        match (theme, mode, role) {
+            ("Classic", "Light", "background") => "Oklch[lightness:1]",
+            ("Classic", "Light", "border") => "#ededed",
+            ("Classic", "Light", "checked_border") => "#bddad5",
+            ("Classic", "Light", "check") => "#5dc2af",
+            ("Classic", "Dark", "background") => "Oklch[lightness:0.12,chroma:0.01,hue:250]",
+            ("Classic", "Dark", "border") => "Oklch[lightness:0.34,chroma:0.01,hue:250]",
+            ("Classic", "Dark", "checked_border") => "Oklch[lightness:0.62,chroma:0.08,hue:180]",
+            ("Classic", "Dark", "check") => "Oklch[lightness:0.78,chroma:0.09,hue:180]",
+            ("Professional", "Light", "background") => "#ffffff",
+            ("Professional", "Light", "border") => "#d9dee7",
+            ("Professional", "Light", "checked_border") | ("Professional", "Light", "check") => {
+                "#bd454d"
+            }
+            ("Professional", "Dark", "background") => "#1b1f24",
+            ("Professional", "Dark", "border") => "#3d4652",
+            ("Professional", "Dark", "checked_border") | ("Professional", "Dark", "check") => {
+                "#dc6463"
+            }
+            ("Glassmorphism", "Light", "background") => "#ffffff8a",
+            ("Glassmorphism", "Light", "border") => "#8ba3bd8f",
+            ("Glassmorphism", "Light", "checked_border") | ("Glassmorphism", "Light", "check") => {
+                "#ba4048db"
+            }
+            ("Glassmorphism", "Dark", "background") => "#1f26438a",
+            ("Glassmorphism", "Dark", "border") => "#b4c3eb70",
+            ("Glassmorphism", "Dark", "checked_border") | ("Glassmorphism", "Dark", "check") => {
+                "#917cdecc"
+            }
+            ("Neobrutalism", "Light", "background") => "#ffffff",
+            ("Neobrutalism", "Light", "border")
+            | ("Neobrutalism", "Light", "checked_border")
+            | ("Neobrutalism", "Light", "check") => "#000000",
+            ("Neobrutalism", "Dark", "background") => "#101010",
+            ("Neobrutalism", "Dark", "border")
+            | ("Neobrutalism", "Dark", "checked_border")
+            | ("Neobrutalism", "Dark", "check") => "#ffffff",
+            ("Neumorphism", "Light", "background") => "#eef1f6",
+            ("Neumorphism", "Light", "border") => "#a8b2c23d",
+            ("Neumorphism", "Light", "checked_border") | ("Neumorphism", "Light", "check") => {
+                "#b94a52"
+            }
+            ("Neumorphism", "Dark", "background") => "#252c36",
+            ("Neumorphism", "Dark", "border") => "#ffffff14",
+            ("Neumorphism", "Dark", "checked_border") | ("Neumorphism", "Dark", "check") => {
+                "#ffffff"
+            }
+            _ => panic!("missing physical TodoMVC checkbox color for {theme}/{mode}/{role}"),
+        }
+    }
+
+    fn physical_todomvc_body_font_size(theme: &str) -> f32 {
+        if theme == "Classic" {
+            24.0
+        } else if theme == "Neobrutalism" {
+            23.0
+        } else {
+            25.0
+        }
+    }
+
+    fn physical_todomvc_secondary_font_size(theme: &str) -> f32 {
+        match theme {
+            "Classic" => 15.0,
+            "Neobrutalism" => 13.0,
+            _ => 14.0,
+        }
+    }
+
+    fn physical_todomvc_small_font_size(theme: &str) -> f32 {
+        if theme == "Neobrutalism" { 13.0 } else { 11.0 }
+    }
+
+    fn assert_display_style_text(
+        item: &boon_document::DisplayItem,
+        key: &str,
+        expected: &str,
+        context: &str,
+    ) {
+        assert_eq!(
+            style_text_from_map(&item.style, key),
+            Some(expected),
+            "{context} expected `{key}`={expected} for {:?}, style={:?}",
+            item.text,
+            item.style
+        );
+    }
+
+    fn assert_display_style_number(
+        item: &boon_document::DisplayItem,
+        key: &str,
+        expected: f32,
+        context: &str,
+    ) {
+        assert_eq!(
+            style_number_from_map(&item.style, key),
+            Some(expected),
+            "{context} expected `{key}`={expected} for {:?}, style={:?}",
+            item.text,
+            item.style
+        );
+    }
+
+    fn physical_frame_text_item<'a>(
+        frame: &'a boon_document::LayoutFrame,
+        label: &str,
+        context: &str,
+    ) -> &'a boon_document::DisplayItem {
+        frame
+            .display_list
+            .iter()
+            .find(|item| item.text.as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("{context} should render text `{label}`"))
+    }
+
+    fn assert_physical_todomvc_frame_theme_styles(
+        frame: &boon_document::LayoutFrame,
+        theme: &str,
+        mode: &str,
+        context: &str,
+    ) {
+        let body_font_family = physical_todomvc_body_font_family(theme);
+        let title = physical_frame_text_item(frame, "todos", context);
+        assert_display_style_text(
+            title,
+            "font",
+            physical_todomvc_title_font_family(theme),
+            context,
+        );
+        assert_display_style_text(
+            title,
+            "color",
+            physical_todomvc_text_color(theme, mode, "header"),
+            context,
+        );
+        let active_todo = physical_frame_text_item(frame, "Read documentation", context);
+        assert_display_style_text(active_todo, "font", body_font_family, context);
+        assert_display_style_text(
+            active_todo,
+            "color",
+            physical_todomvc_text_color(theme, mode, "body"),
+            context,
+        );
+        let completed_todo = physical_frame_text_item(frame, "Finish TodoMVC renderer", context);
+        assert_display_style_text(completed_todo, "font", body_font_family, context);
+        assert_display_style_text(
+            completed_todo,
+            "color",
+            physical_todomvc_text_color(theme, mode, "disabled"),
+            context,
+        );
+        assert_eq!(
+            completed_todo.style.get("strikethrough"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "{context} completed todo should keep strikethrough after live restyle"
+        );
+        let input = physical_new_todo_input_item(frame)
+            .unwrap_or_else(|| panic!("{context} should expose the new-todo input"));
+        assert_display_style_text(input, "font", body_font_family, context);
+        assert_display_style_text(
+            input,
+            "color",
+            physical_todomvc_text_color(theme, mode, "input"),
+            context,
+        );
+        assert_display_style_text(input, "placeholder_font", body_font_family, context);
+        assert_display_style_text(
+            input,
+            "placeholder_color",
+            physical_todomvc_text_color(theme, mode, "placeholder"),
+            context,
+        );
+        let count = physical_frame_text_item(frame, "3 items left", context);
+        assert_display_style_text(count, "font", body_font_family, context);
+        assert_display_style_text(
+            count,
+            "color",
+            physical_todomvc_text_color(theme, mode, "secondary"),
+            context,
+        );
+        let selected_filter = physical_frame_text_item(frame, "All", context);
+        assert_display_style_text(selected_filter, "font", body_font_family, context);
+        assert_display_style_text(
+            selected_filter,
+            "color",
+            physical_todomvc_text_color(theme, mode, "filter_selected"),
+            context,
+        );
+        let info = physical_frame_text_item(frame, "Double-click to edit a todo", context);
+        assert_display_style_text(info, "font", body_font_family, context);
+        assert_display_style_text(
+            info,
+            "color",
+            physical_todomvc_text_color(theme, mode, "tertiary"),
+            context,
+        );
+        let checkbox = frame
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox))
+            .unwrap_or_else(|| panic!("{context} should expose a themed checkbox"));
+        assert_display_style_text(
+            checkbox,
+            "checkbox_background",
+            physical_todomvc_checkbox_style_color(theme, mode, "background"),
+            context,
+        );
+        assert_display_style_text(
+            checkbox,
+            "check_color",
+            physical_todomvc_checkbox_style_color(theme, mode, "check"),
+            context,
+        );
+        let root_color = frame_root_material_color(frame)
+            .unwrap_or_else(|| panic!("{context} should expose root material color"));
+        assert_eq!(
+            root_color,
+            physical_todomvc_material_color(theme, mode, "root"),
+            "{context} root material should follow live theme/mode state"
+        );
+    }
+
     #[test]
     fn physical_theme_button_when_label_resolves_from_function_argument() {
         let units =
@@ -27316,7 +27760,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "540f7e8d2b90",
+            "27b32c56e516",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -28133,6 +28577,32 @@ mod tests {
                             panic!("{context} button `{label}` should contain its text")
                         })
                 };
+                let body_font_family = physical_todomvc_body_font_family(theme);
+                let title_font_family = physical_todomvc_title_font_family(theme);
+                let title = text_item("todos");
+                assert_display_style_text(title, "font", title_font_family, &context);
+                assert_display_style_text(
+                    title,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "header"),
+                    &context,
+                );
+                assert_display_style_number(
+                    title,
+                    "size",
+                    if theme == "Neobrutalism" { 78.0 } else { 80.0 },
+                    &context,
+                );
+                if theme == "Neobrutalism" {
+                    assert_display_style_number(title, "weight", 900.0, &context);
+                }
+                let root_color = frame_root_material_color(&layout)
+                    .unwrap_or_else(|| panic!("{context} root should expose material color"));
+                assert_eq!(
+                    root_color,
+                    physical_todomvc_material_color(theme, mode, "root"),
+                    "{context} root background should use the selected mode palette"
+                );
 
                 let input = layout
                     .display_list
@@ -28141,6 +28611,45 @@ mod tests {
                         matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
                     })
                     .unwrap_or_else(|| panic!("{context} new-todo text input should render"));
+                assert_display_style_text(input, "font", body_font_family, &context);
+                assert_display_style_text(
+                    input,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "input"),
+                    &context,
+                );
+                assert_display_style_number(
+                    input,
+                    "size",
+                    physical_todomvc_body_font_size(theme),
+                    &context,
+                );
+                assert_display_style_text(input, "placeholder_font", body_font_family, &context);
+                assert_display_style_text(
+                    input,
+                    "placeholder_color",
+                    physical_todomvc_text_color(theme, mode, "placeholder"),
+                    &context,
+                );
+                assert_display_style_number(
+                    input,
+                    "placeholder_size",
+                    if theme == "Classic" {
+                        24.0
+                    } else if theme == "Neobrutalism" {
+                        22.0
+                    } else {
+                        25.0
+                    },
+                    &context,
+                );
+                assert_display_style_text(input, "placeholder_style", "Italic", &context);
+                assert_display_style_text(
+                    input,
+                    "material_color",
+                    physical_todomvc_material_color(theme, mode, "recessed"),
+                    &context,
+                );
                 let toggle_all_text = text_item("❯");
                 let toggle_all = layout
                     .display_list
@@ -28180,6 +28689,82 @@ mod tests {
                     }),
                     "{context} toggle-all must not regress into a checkbox in the input row"
                 );
+                let active_todo_title = text_item("Read documentation");
+                assert_display_style_text(active_todo_title, "font", body_font_family, &context);
+                assert_display_style_text(
+                    active_todo_title,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "body"),
+                    &context,
+                );
+                assert_display_style_number(
+                    active_todo_title,
+                    "size",
+                    physical_todomvc_body_font_size(theme),
+                    &context,
+                );
+                if theme == "Neobrutalism" {
+                    assert_display_style_number(active_todo_title, "weight", 800.0, &context);
+                }
+                let completed_todo_title = text_item("Finish TodoMVC renderer");
+                assert_display_style_text(completed_todo_title, "font", body_font_family, &context);
+                assert_display_style_text(
+                    completed_todo_title,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "disabled"),
+                    &context,
+                );
+                assert_eq!(
+                    completed_todo_title.style.get("strikethrough"),
+                    Some(&boon_document_model::StyleValue::Bool(true)),
+                    "{context} completed todo should keep the source strikethrough"
+                );
+                let first_todo_row = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Row)
+                            && contains_bounds(item.bounds, active_todo_title.bounds)
+                            && item.style.contains_key("border_bottom")
+                    })
+                    .unwrap_or_else(|| panic!("{context} active todo row should render"));
+                assert_display_style_text(
+                    first_todo_row,
+                    "material_color",
+                    physical_todomvc_material_color(theme, mode, "interactive"),
+                    &context,
+                );
+                let first_checkbox = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::Checkbox)
+                    })
+                    .unwrap_or_else(|| panic!("{context} first todo checkbox should render"));
+                assert_display_style_text(
+                    first_checkbox,
+                    "checkbox_background",
+                    physical_todomvc_checkbox_style_color(theme, mode, "background"),
+                    &context,
+                );
+                assert_display_style_text(
+                    first_checkbox,
+                    "checkbox_border",
+                    physical_todomvc_checkbox_style_color(theme, mode, "border"),
+                    &context,
+                );
+                assert_display_style_text(
+                    first_checkbox,
+                    "checked_border",
+                    physical_todomvc_checkbox_style_color(theme, mode, "checked_border"),
+                    &context,
+                );
+                assert_display_style_text(
+                    first_checkbox,
+                    "check_color",
+                    physical_todomvc_checkbox_style_color(theme, mode, "check"),
+                    &context,
+                );
                 let new_todo_row = layout
                     .display_list
                     .iter()
@@ -28191,6 +28776,12 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("{context} new-todo row should contain input controls")
                     });
+                assert_display_style_text(
+                    new_todo_row,
+                    "material_color",
+                    physical_todomvc_material_color(theme, mode, "surface"),
+                    &context,
+                );
                 if theme == "Classic" {
                     assert_eq!(
                         new_todo_row.style.get("border"),
@@ -28213,7 +28804,6 @@ mod tests {
                 let panel_left = toggle_all.bounds.x;
                 let panel_right = input.bounds.x + input.bounds.width;
                 let panel_center = (panel_left + panel_right) * 0.5;
-                let title = text_item("todos");
                 let title_center = title.bounds.x + title.bounds.width * 0.5;
                 assert!(
                     (title_center - panel_center).abs() <= 1.0,
@@ -28249,6 +28839,25 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("{context} panel footer row should contain item count")
                     });
+                assert_display_style_text(count, "font", body_font_family, &context);
+                assert_display_style_text(
+                    count,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "secondary"),
+                    &context,
+                );
+                assert_display_style_number(
+                    count,
+                    "size",
+                    physical_todomvc_secondary_font_size(theme),
+                    &context,
+                );
+                assert_display_style_text(
+                    panel_footer,
+                    "material_color",
+                    physical_todomvc_material_color(theme, mode, "surface_elevated"),
+                    &context,
+                );
                 assert_eq!(
                     panel_footer.style.get("border_top"),
                     if theme == "Classic" {
@@ -28276,6 +28885,12 @@ mod tests {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap_or_else(|| panic!("{context} panel frame should wrap TodoMVC rows"));
+                assert_display_style_text(
+                    panel_frame,
+                    "material_color",
+                    physical_todomvc_material_color(theme, mode, "surface"),
+                    &context,
+                );
                 assert!(
                     panel_frame.style.contains_key("box_shadow_1_color"),
                     "{context} panel frame should lower PanelFrame shadows from the theme source: {:?}",
@@ -28320,6 +28935,13 @@ mod tests {
                         selected_filter.style
                     );
                 } else {
+                    assert_display_style_text(
+                        selected_filter,
+                        "material_color",
+                        physical_todomvc_selected_filter_material_color(theme, mode)
+                            .expect("non-Classic selected filters should have a material color"),
+                        &context,
+                    );
                     assert!(
                         selected_filter.style.contains_key("material_color")
                             || selected_filter.style.contains_key("background"),
@@ -28327,7 +28949,29 @@ mod tests {
                         selected_filter.style
                     );
                 }
+                let selected_filter_text = text_item("All");
+                assert_display_style_text(selected_filter_text, "font", body_font_family, &context);
+                assert_display_style_text(
+                    selected_filter_text,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "filter_selected"),
+                    &context,
+                );
+                assert_display_style_number(
+                    selected_filter_text,
+                    "size",
+                    physical_todomvc_secondary_font_size(theme),
+                    &context,
+                );
                 let inactive_filter = text_button("Active");
+                let inactive_filter_text = text_item("Active");
+                assert_display_style_text(inactive_filter_text, "font", body_font_family, &context);
+                assert_display_style_text(
+                    inactive_filter_text,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "secondary"),
+                    &context,
+                );
                 assert_ne!(
                     inactive_filter.style.get("border"),
                     selected_filter.style.get("border"),
@@ -28351,6 +28995,13 @@ mod tests {
 
                 let clear = text_button("Clear completed");
                 let clear_text = text_item("Clear completed");
+                assert_display_style_text(clear_text, "font", body_font_family, &context);
+                assert_display_style_text(
+                    clear_text,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "secondary"),
+                    &context,
+                );
                 assert!(
                     style_number_from_map(&clear.style, "depth")
                         .unwrap_or(0.0)
@@ -28374,6 +29025,19 @@ mod tests {
                 );
 
                 let info = text_item("Double-click to edit a todo");
+                assert_display_style_text(info, "font", body_font_family, &context);
+                assert_display_style_text(
+                    info,
+                    "color",
+                    physical_todomvc_text_color(theme, mode, "tertiary"),
+                    &context,
+                );
+                assert_display_style_number(
+                    info,
+                    "size",
+                    physical_todomvc_small_font_size(theme),
+                    &context,
+                );
                 let info_center = info.bounds.x + info.bounds.width * 0.5;
                 assert!(
                     (info_center - panel_center).abs() <= 1.0,
@@ -28419,6 +29083,14 @@ mod tests {
                     "Neumorphic",
                     mode_label,
                 ] {
+                    let label_text = text_item(label);
+                    assert_display_style_text(label_text, "font", body_font_family, &context);
+                    assert_display_style_text(
+                        label_text,
+                        "color",
+                        physical_todomvc_text_color(theme, mode, "tertiary"),
+                        &context,
+                    );
                     let button = text_button(label);
                     theme_switcher_top = theme_switcher_top.min(button.bounds.y);
                     theme_switcher_bottom =
@@ -29142,6 +29814,12 @@ mod tests {
         let mut input_state = PreviewNativeInputState::default();
 
         let initial_frame = latest_preview_frame(&shared_render_state);
+        assert_physical_todomvc_frame_theme_styles(
+            &initial_frame,
+            "Classic",
+            "Light",
+            "initial Classic light frame",
+        );
         let initial_new_todo_input = physical_new_todo_input_item(&initial_frame)
             .expect("initial physical frame should expose the new-todo text input");
         assert_eq!(
@@ -29183,6 +29861,12 @@ mod tests {
                 &format!("after clicking {expected_name} theme"),
             );
             let frame = latest_preview_frame(&shared_render_state);
+            assert_physical_todomvc_frame_theme_styles(
+                &frame,
+                expected_name,
+                "Light",
+                &format!("after clicking {expected_name} theme"),
+            );
             let root_color = frame_root_material_color(&frame).unwrap_or_else(|| {
                 panic!("{expected_name} frame should expose a root material color")
             });
@@ -29211,7 +29895,7 @@ mod tests {
                     .expect("Neobrutalism frame should expose the new-todo text input");
                 assert_eq!(
                     new_todo_input.style.get("size"),
-                    Some(&boon_document_model::StyleValue::Number(25.0)),
+                    Some(&boon_document_model::StyleValue::Number(23.0)),
                     "typed input text should keep the Neobrutalism Input font size"
                 );
                 assert_eq!(
@@ -29243,6 +29927,12 @@ mod tests {
         assert_eq!(dark_summary["theme_options"]["name"], "Neumorphism");
         assert_eq!(dark_summary["theme_options"]["mode"], "Dark");
         let dark_frame = latest_preview_frame(&shared_render_state);
+        assert_physical_todomvc_frame_theme_styles(
+            &dark_frame,
+            "Neumorphism",
+            "Dark",
+            "after toggling Neumorphism dark mode",
+        );
         let dark_root_color = frame_root_material_color(&dark_frame)
             .expect("dark physical frame should expose a root material color");
         assert_ne!(

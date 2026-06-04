@@ -180,16 +180,18 @@ FUNCTION font(font) {
             ]
         }
 
+        body_family: TEXT { ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace }
+
         body_base: [
-            family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
-            size: 25
+            family: body_family
+            size: 23
             color: colors.text
-            weight: Light
+            weight: 800
         ]
 
         small_base: [
-            family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
-            size: 11
+            family: body_family
+            size: 13
             color: colors.text_tertiary
             weight: Normal
         ]
@@ -205,14 +207,14 @@ FUNCTION font(font) {
             Body => body_base
 
             BodySecondary => [
-                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                family: body_family
                 size: 13
                 color: colors.text_secondary
                 weight: Normal
             ]
 
             FilterSelected => [
-                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                family: body_family
                 size: 13
                 color: colors.filter_selected
                 weight: Normal
@@ -224,7 +226,7 @@ FUNCTION font(font) {
             ]
 
             BodyDanger => [
-                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                family: body_family
                 size: 30
                 align: Center
                 color: colors.danger
@@ -238,10 +240,11 @@ FUNCTION font(font) {
                 size: 22
                 style: Italic
                 color: colors.placeholder
+                weight: Light
             ]
 
             ButtonIcon[checked] => [
-                family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+                family: body_family
                 size: 22
                 color: checked |> WHEN {
                     True => colors.text

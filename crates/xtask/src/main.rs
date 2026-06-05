@@ -9894,7 +9894,7 @@ fn physical_todomvc_switcher_crop_evidence(
             .and_then(parse_json_bounds)
     };
 
-    let content_footer_labels = ["Double-click to edit a todo", "Martin Kavik", "TodoMVC"];
+    let content_footer_labels = ["Double-click to edit a todo", "Martin Kavík", "TodoMVC"];
     let content_bottom = content_footer_labels
         .iter()
         .filter_map(|label| text_bounds(label).map(|bounds| bounds.y + bounds.height))

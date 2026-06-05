@@ -924,7 +924,10 @@ FUNCTION remove_completed_button() {
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
         label: Scene/Element/text(
-            style: clear_button_text(hovered: element.hovered)
+            style: [
+                ...clear_button_text(hovered: element.hovered)
+                font: [line: [underline: element.hovered]]
+            ]
             text: TEXT { Clear completed }
         )
     )
@@ -993,8 +996,8 @@ FUNCTION footer_author_line() {
                 text: TEXT { Created by }
             )
             footer_link(
-                label: TEXT { Martin Kavik }
-                to: TEXT { https://github.com/MartinKavik }
+                label: TEXT { Martin Kavík }
+                to: TEXT { https://kavik.cz/ }
             )
         }
     )
@@ -1024,7 +1027,10 @@ FUNCTION footer_reference_line() {
                 ]
                 text: TEXT { Part of }
             )
-            footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
+            footer_link(
+                label: TEXT { TodoMVC }
+                to: TEXT { http://todomvc.com }
+            )
         }
     )
 }
@@ -1034,11 +1040,13 @@ FUNCTION footer_link(label, to) {
         element: [hovered: SOURCE]
         style: [
             ...small_flat_text(of: SmallLink[hovered: element.hovered])
+            font: [line: [underline: element.hovered]]
             width: Auto
             auto_padding: 0
             height: 15
             line_height: 15
             vertical_align: Center
+            text_clip_padding: 3
         ]
         label: label
         to: to

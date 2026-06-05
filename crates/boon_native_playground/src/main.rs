@@ -22681,19 +22681,34 @@ fn preview_apply_hover_overlay(
                 })
             })
     });
+    let hovered_button_bounds = input_state.hovered_node.as_deref().and_then(|hovered| {
+        frame
+            .display_list
+            .iter()
+            .find(|item| {
+                item.node.0 == hovered
+                    && matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+            })
+            .map(|item| item.bounds)
+    });
     let mut changed = false;
     for item in &mut frame.display_list {
         let item_target = focused_target_text(&layout_proof, &item.node.0);
         let item_scope = display_style_text(&item.style, "__scope_key");
         let direct_hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
-        let reveal_active = direct_hover
+        let button_text_hover = hovered_button_bounds.is_some_and(|bounds| {
+            matches!(item.kind, boon_document_model::DocumentNodeKind::Text)
+                && rect_contains_bounds_with_epsilon(bounds, item.bounds, 0.5)
+        });
+        let hover_active = direct_hover || button_text_hover;
+        let reveal_active = hover_active
             || (item_scope.is_some() && item_scope == hovered_scope.as_deref())
             || (item_target.is_some()
                 && item_target.as_deref() == input_state.hovered_target_text.as_deref());
         changed |= set_display_style_value(
             &mut item.style,
             "__hover",
-            boon_document_model::StyleValue::Bool(direct_hover),
+            boon_document_model::StyleValue::Bool(hover_active),
         );
         if item.style.get("__hover_visible") != Some(&boon_document_model::StyleValue::Bool(true)) {
             changed |= remove_display_style_key(&mut item.style, "__hover_paint");
@@ -22711,6 +22726,17 @@ fn preview_apply_hover_overlay(
             Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
     }
     Ok(changed)
+}
+
+fn rect_contains_bounds_with_epsilon(
+    outer: boon_document::Rect,
+    inner: boon_document::Rect,
+    epsilon: f32,
+) -> bool {
+    outer.x <= inner.x + epsilon
+        && outer.y <= inner.y + epsilon
+        && outer.x + outer.width >= inner.x + inner.width - epsilon
+        && outer.y + outer.height >= inner.y + inner.height - epsilon
 }
 
 fn display_style_text<'a>(
@@ -28074,7 +28100,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "629dfa01a955",
+            "08a7e9daf5f8",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -28718,7 +28744,7 @@ mod tests {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
-        let (_, layout) =
+        let (layout_proof, layout) =
             native_document_layout_proof_with_state_embedded(&source_path, &source, None)
                 .expect("physical TodoMVC layout should lower");
 
@@ -28738,7 +28764,14 @@ mod tests {
         };
 
         let created_by = text_item("Created by");
-        let author = text_item("Martin Kavik");
+        let author = text_item("Martin Kavík");
+        assert!(
+            !layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("Martin Kavik")),
+            "physical TodoMVC footer should use the actual author link text with accent"
+        );
         assert!(
             author.bounds.x > created_by.bounds.x + created_by.bounds.width,
             "helper-returned footer link should render after the paragraph text"
@@ -28752,12 +28785,161 @@ mod tests {
             Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
             "footer helper links should keep link hit/cursor metadata"
         );
+        assert_eq!(
+            author.style.get("link_url"),
+            Some(&boon_document_model::StyleValue::Text(
+                "https://kavik.cz/".to_owned()
+            )),
+            "physical TodoMVC author link should keep the same target as the reference fixture"
+        );
+        assert_eq!(
+            author.style.get("__hover_scope"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "physical TodoMVC author link should be an app-owned hover target"
+        );
+        assert_eq!(
+            author.style.get("__hover_underline_if"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "physical TodoMVC author link should underline on hover"
+        );
+        assert_eq!(
+            author.style.get("text_clip_padding"),
+            Some(&boon_document_model::StyleValue::Number(3.0)),
+            "physical TodoMVC author link should leave clip room for accented glyphs"
+        );
 
         let part_of = text_item("Part of");
         let todomvc_link = text_item("TodoMVC");
         assert!(
             todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width,
             "second footer helper link should render inline after text"
+        );
+        assert_eq!(
+            todomvc_link.style.get("link_url"),
+            Some(&boon_document_model::StyleValue::Text(
+                "http://todomvc.com".to_owned()
+            )),
+            "physical TodoMVC reference link should keep the TodoMVC target"
+        );
+        assert_eq!(
+            todomvc_link.style.get("cursor"),
+            Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
+            "physical TodoMVC reference link should request a pointer cursor"
+        );
+        assert_eq!(
+            todomvc_link.style.get("__hover_underline_if"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "physical TodoMVC reference link should underline on hover"
+        );
+        assert_eq!(
+            todomvc_link.style.get("text_clip_padding"),
+            Some(&boon_document_model::StyleValue::Number(3.0)),
+            "physical TodoMVC reference link should leave clip room for hover underlines"
+        );
+        assert_eq!(
+            document_link_url_for_node(&layout_proof, &author.node.0).as_deref(),
+            Some("https://kavik.cz/"),
+            "layout proof lookup should find the physical author link URL"
+        );
+        assert_eq!(
+            document_link_url_for_node(&layout_proof, &todomvc_link.node.0).as_deref(),
+            Some("http://todomvc.com"),
+            "layout proof lookup should find the physical TodoMVC link URL"
+        );
+
+        let clear_completed_text = text_item("Clear completed");
+        let clear_completed_button = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                    && item.bounds.x <= clear_completed_text.bounds.x + 0.5
+                    && item.bounds.y <= clear_completed_text.bounds.y + 0.5
+                    && item.bounds.x + item.bounds.width
+                        >= clear_completed_text.bounds.x + clear_completed_text.bounds.width - 0.5
+                    && item.bounds.y + item.bounds.height
+                        >= clear_completed_text.bounds.y + clear_completed_text.bounds.height - 0.5
+            })
+            .expect("physical TodoMVC Clear completed button should render");
+        assert_eq!(
+            clear_completed_button.style.get("cursor"),
+            Some(&boon_document_model::StyleValue::Text("pointer".to_owned())),
+            "physical TodoMVC Clear completed should be a pointer action"
+        );
+        assert_eq!(
+            clear_completed_text.style.get("__hover_underline_if"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "physical TodoMVC Clear completed text should expose hover underline metadata"
+        );
+        let mut clear_hover = deterministic_click_input(0, 0.0, 0.0);
+        clear_hover.mouse_motion_event_count = 0;
+        clear_hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: f64::from(
+                clear_completed_button.bounds.x + clear_completed_button.bounds.width * 0.5,
+            ),
+            y: f64::from(
+                clear_completed_button.bounds.y + clear_completed_button.bounds.height * 0.5,
+            ),
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        let clear_shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: layout_proof.clone(),
+            layout_frame_override: Some(layout.clone()),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut clear_input_state = PreviewNativeInputState::default();
+        assert!(
+            preview_update_hover_from_input(
+                &layout_proof,
+                &clear_hover,
+                &clear_shared_render_state,
+                &mut clear_input_state
+            )
+            .expect("physical Clear completed hover overlay should update")
+        );
+        let hovered_clear_completed = clear_shared_render_state
+            .lock()
+            .expect("render state")
+            .layout_frame_override
+            .as_ref()
+            .expect("hover overlay should install frame override")
+            .display_list
+            .iter()
+            .find(|item| item.node == clear_completed_button.node)
+            .cloned()
+            .expect("hovered Clear completed button should remain in the display list");
+        assert_eq!(
+            hovered_clear_completed.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "host hover should mark physical Clear completed button"
+        );
+        let hovered_clear_completed_text = clear_shared_render_state
+            .lock()
+            .expect("render state")
+            .layout_frame_override
+            .as_ref()
+            .expect("hover overlay should install frame override")
+            .display_list
+            .iter()
+            .find(|item| item.node == clear_completed_text.node)
+            .cloned()
+            .expect("hovered Clear completed text should remain in the display list");
+        assert_eq!(
+            hovered_clear_completed_text.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "host hover should mark physical Clear completed text so underline renders"
+        );
+        assert_eq!(
+            preview_cursor_icon(&layout_proof, &clear_input_state),
+            boon_native_app_window::NativeCursorIcon::Pointer,
+            "hovering physical Clear completed should request the native pointer cursor"
         );
 
         for label in [
@@ -29338,6 +29520,11 @@ mod tests {
                     None,
                     "{context} Clear completed label should not lower raised relief"
                 );
+                assert_eq!(
+                    clear_text.style.get("__hover_underline_if"),
+                    Some(&boon_document_model::StyleValue::Bool(true)),
+                    "{context} Clear completed text should underline on hover"
+                );
 
                 let info = text_item("Double-click to edit a todo");
                 assert_display_style_text(info, "font", body_font_family, &context);
@@ -29359,7 +29546,24 @@ mod tests {
                     "{context} info footer line should be centered under the panel"
                 );
                 let created_by = text_item("Created by");
-                let author = text_item("Martin Kavik");
+                let author = text_item("Martin Kavík");
+                assert_eq!(
+                    author.style.get("link_url"),
+                    Some(&boon_document_model::StyleValue::Text(
+                        "https://kavik.cz/".to_owned()
+                    )),
+                    "{context} author footer link should expose the actual URL"
+                );
+                assert_eq!(
+                    author.style.get("__hover_underline_if"),
+                    Some(&boon_document_model::StyleValue::Bool(true)),
+                    "{context} author footer link should underline on hover"
+                );
+                assert_eq!(
+                    author.style.get("text_clip_padding"),
+                    Some(&boon_document_model::StyleValue::Number(3.0)),
+                    "{context} author footer link should leave clip room for accented glyphs"
+                );
                 let author_center =
                     (created_by.bounds.x + author.bounds.x + author.bounds.width) * 0.5;
                 assert!(
@@ -29369,6 +29573,23 @@ mod tests {
                 );
                 let part_of = text_item("Part of");
                 let todomvc_link = text_item("TodoMVC");
+                assert_eq!(
+                    todomvc_link.style.get("link_url"),
+                    Some(&boon_document_model::StyleValue::Text(
+                        "http://todomvc.com".to_owned()
+                    )),
+                    "{context} TodoMVC footer link should expose the actual URL"
+                );
+                assert_eq!(
+                    todomvc_link.style.get("__hover_underline_if"),
+                    Some(&boon_document_model::StyleValue::Bool(true)),
+                    "{context} TodoMVC footer link should underline on hover"
+                );
+                assert_eq!(
+                    todomvc_link.style.get("text_clip_padding"),
+                    Some(&boon_document_model::StyleValue::Number(3.0)),
+                    "{context} TodoMVC footer link should leave clip room for hover underlines"
+                );
                 let reference_center =
                     (part_of.bounds.x + todomvc_link.bounds.x + todomvc_link.bounds.width) * 0.5;
                 assert!(

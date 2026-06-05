@@ -2415,8 +2415,8 @@ fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
 fn text_bounds(run: &TextRun, width: u32, height: u32) -> TextBounds {
     let bounds = run.bounds;
     TextBounds {
-        left: bounds.x.max(0.0) as i32,
-        top: bounds.y.max(0.0) as i32,
+        left: (bounds.x - run.text_clip_padding).max(0.0) as i32,
+        top: (bounds.y - run.text_clip_padding).max(0.0) as i32,
         right: (bounds.x + bounds.width + run.text_clip_padding).clamp(0.0, width as f32) as i32,
         bottom: (bounds.y + bounds.height + run.text_clip_padding).clamp(0.0, height as f32) as i32,
     }
@@ -5451,6 +5451,108 @@ mod tests {
             "placeholder text should be readable gray, not washed-out near-white: {:?}",
             run.color
         );
+    }
+
+    #[test]
+    fn wide_todo_text_controls_shape_with_natural_word_spacing() {
+        let mut input_style = StyleMap::new();
+        input_style.insert("size".to_owned(), StyleValue::Number(24.0));
+        input_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
+        input_style.insert("text_inset".to_owned(), StyleValue::Number(6.0));
+        input_style.insert(
+            "placeholder".to_owned(),
+            StyleValue::Text("What needs to be done?".to_owned()),
+        );
+        input_style.insert(
+            "placeholder_style".to_owned(),
+            StyleValue::Text("Italic".to_owned()),
+        );
+
+        let mut title_style = StyleMap::new();
+        title_style.insert("size".to_owned(), StyleValue::Number(24.0));
+        title_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
+        title_style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+
+        let frame = LayoutFrame {
+            display_list: vec![
+                DisplayItem {
+                    node: DocumentNodeId("new-todo-input".to_owned()),
+                    kind: DocumentNodeKind::TextInput,
+                    bounds: Rect {
+                        x: 55.0,
+                        y: 151.0,
+                        width: 495.0,
+                        height: 65.0,
+                    },
+                    text: None,
+                    style: input_style,
+                    focused: false,
+                },
+                DisplayItem {
+                    node: DocumentNodeId("active-title".to_owned()),
+                    kind: DocumentNodeKind::Text,
+                    bounds: Rect {
+                        x: 109.0,
+                        y: 217.0,
+                        width: 441.0,
+                        height: 65.0,
+                    },
+                    text: Some("Read documentation".to_owned()),
+                    style: title_style,
+                    focused: false,
+                },
+            ],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: AccessibilityTree::default(),
+            demands: Vec::new(),
+            metrics: LayoutMetrics::default(),
+        };
+
+        let mut font_system = editor_font_system();
+        for run in text_runs(&frame, 640, 360) {
+            let buffer = shape_text_run(&mut font_system, &run);
+            let line_width = shaped_line_width(&buffer).expect("todo text should shape");
+            assert!(
+                line_width < run.bounds.width * 0.75,
+                "`{}` should keep natural word spacing instead of expanding to its whole control width: line_width={line_width}, bounds={:?}",
+                run.text,
+                run.bounds
+            );
+        }
+    }
+
+    #[test]
+    fn text_clip_padding_expands_text_bounds_on_all_edges() {
+        let run = TextRun {
+            node: DocumentNodeId("accented-footer-link".to_owned()),
+            bounds: Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 10.0,
+            },
+            text: "Kavík".to_owned(),
+            rich_spans: Vec::new(),
+            font_family: "Nimbus Sans".to_owned(),
+            font_style: Style::Normal,
+            font_weight: Weight::NORMAL,
+            font_features: String::new(),
+            text_inset: 0.0,
+            text_clip_padding: 3.0,
+            color: [90, 90, 90, 255],
+            size: 11.0,
+            line_height: 15.0,
+            align: TextAlign::Left,
+            vertical_align: TextVerticalAlign::Center,
+            rotate_degrees: 0,
+        };
+
+        let bounds = text_bounds(&run, 100, 100);
+        assert_eq!(bounds.left, 7);
+        assert_eq!(bounds.top, 17);
+        assert_eq!(bounds.right, 53);
+        assert_eq!(bounds.bottom, 33);
     }
 
     #[test]

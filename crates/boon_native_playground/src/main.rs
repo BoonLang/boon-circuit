@@ -19665,9 +19665,9 @@ fn document_theme_font(of: &str, context: &DocumentEvalContext<'_>) -> Value {
         "Placeholder" => json!({
             "family": family,
             "size": if brutalist { 22.0 } else { 25.0 },
-            "style": "Italic",
+            "style": if brutalist { "Normal" } else { "Italic" },
             "color": document_theme_color(context, "text_placeholder"),
-            "weight": "Light"
+            "weight": if brutalist { "Normal" } else { "Light" }
         }),
         "ButtonIcon" => json!({
             "family": family,
@@ -27522,6 +27522,57 @@ mod tests {
         );
     }
 
+    fn assert_rendered_text_region_has_no_stretched_gaps(
+        image: &image::RgbaImage,
+        bounds: boon_document::Rect,
+        max_gap_px: u32,
+        context: &str,
+    ) {
+        let x_start = bounds.x.max(0.0).floor() as u32;
+        let x_end = (bounds.x + bounds.width).min(image.width() as f32).ceil() as u32;
+        let y_start = (bounds.y + bounds.height * 0.18).max(0.0).floor() as u32;
+        let y_end = (bounds.y + bounds.height * 0.82)
+            .min(image.height() as f32)
+            .ceil() as u32;
+        let mut occupied_columns = Vec::new();
+        for x in x_start..x_end {
+            let dark_pixel_count = (y_start..y_end)
+                .filter(|y| {
+                    let [r, g, b, a] = image.get_pixel(x, *y).0;
+                    let luma =
+                        0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+                    a > 16 && luma < 214.0
+                })
+                .count();
+            if dark_pixel_count >= 2 {
+                occupied_columns.push(x);
+            }
+        }
+        let Some(first) = occupied_columns.first().copied() else {
+            panic!("{context} should have detectable rendered text pixels in {bounds:?}");
+        };
+        let last = occupied_columns
+            .last()
+            .copied()
+            .expect("occupied text columns should have a last column");
+        let mut max_gap = 0_u32;
+        let mut current_gap = 0_u32;
+        let mut occupied_iter = occupied_columns.into_iter().peekable();
+        for x in first..=last {
+            if occupied_iter.peek().copied() == Some(x) {
+                occupied_iter.next();
+                max_gap = max_gap.max(current_gap);
+                current_gap = 0;
+            } else {
+                current_gap = current_gap.saturating_add(1);
+            }
+        }
+        assert!(
+            max_gap <= max_gap_px,
+            "{context} should not render stretched word spacing: max_blank_gap={max_gap}px, allowed={max_gap_px}px, bounds={bounds:?}"
+        );
+    }
+
     fn physical_frame_text_item<'a>(
         frame: &'a boon_document::LayoutFrame,
         label: &str,
@@ -28100,7 +28151,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "08a7e9daf5f8",
+            "c46f7d0c80ed",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -29141,7 +29192,16 @@ mod tests {
                     },
                     &context,
                 );
-                assert_display_style_text(input, "placeholder_style", "Italic", &context);
+                assert_display_style_text(
+                    input,
+                    "placeholder_style",
+                    if theme == "Neobrutalism" {
+                        "Normal"
+                    } else {
+                        "Italic"
+                    },
+                    &context,
+                );
                 assert_display_style_text(
                     input,
                     "material_color",
@@ -29901,6 +29961,158 @@ mod tests {
                     luma <= max_luma,
                     "Classic dark app-owned readback should paint `{label}` dark, got luma={luma} at ({x}, {y}); artifact={}",
                     artifact_path.display()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn physical_todomvc_non_classic_app_owned_readbacks_render_text_naturally() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "skipping non-Classic physical TodoMVC app-owned readbacks: request_adapter failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-playground-physical-todomvc-non-classic-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+            let source = std::fs::read_to_string(&source_path)
+                .expect("physical TodoMVC source should exist");
+            for theme in [
+                "Professional",
+                "Glassmorphism",
+                "Neobrutalism",
+                "Neumorphism",
+            ] {
+                let mut state = physical_todomvc_seed_state(theme, "Light");
+                mirror_physical_todomvc_seed_root_fields(&mut state);
+                let (_, layout) = native_document_layout_proof_with_state_embedded(
+                    &source_path,
+                    &source,
+                    Some(&state),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{theme} Light physical TodoMVC layout should lower: {error}")
+                });
+                assert_physical_todomvc_frame_theme_styles(
+                    &layout,
+                    theme,
+                    "Light",
+                    &format!("{theme} Light app-owned readback layout"),
+                );
+
+                let render_frame = preview_frame_with_viewport_background(
+                    &layout,
+                    PHYSICAL_TODOMVC_PREVIEW_WIDTH,
+                    PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+                );
+                let proof = boon_native_gpu::render_app_owned_pixels(
+                    boon_native_gpu::AppOwnedRenderRequest {
+                        device: &device,
+                        queue: &queue,
+                        frame: &render_frame,
+                        surface_id: boon_host::SurfaceId(format!(
+                            "physical-todomvc-{}-light-test",
+                            theme.to_ascii_lowercase()
+                        )),
+                        surface_epoch: 0,
+                        width: PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                        height: PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
+                        artifact_dir: Path::new("target/artifacts/native-gpu/tests"),
+                        artifact_label: &format!(
+                            "physical-todomvc-{}-light",
+                            theme.to_ascii_lowercase()
+                        ),
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{theme} Light frame should render to app-owned pixels: {error}")
+                });
+                let artifact_path = match &proof.artifact {
+                    boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+                        artifact_path,
+                        layout_frame_hash,
+                        nonblank_samples,
+                        ..
+                    } => {
+                        assert_eq!(
+                            layout_frame_hash,
+                            &render_frame_hash(&render_frame),
+                            "{theme} Light app-owned readback proof should bind to the rendered frame"
+                        );
+                        assert!(
+                            *nonblank_samples > 100_000,
+                            "{theme} Light app-owned readback should contain visible content"
+                        );
+                        PathBuf::from(artifact_path)
+                    }
+                    boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => {
+                        panic!("{theme} Light visual test should produce app-owned pixels")
+                    }
+                };
+                let image = image::open(&artifact_path)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{theme} Light app-owned readback should be readable at {}: {error}",
+                            artifact_path.display()
+                        )
+                    })
+                    .to_rgba8();
+                let active_title = physical_frame_text_item(
+                    &layout,
+                    "Read documentation",
+                    &format!("{theme} Light"),
+                );
+                assert_rendered_text_region_has_no_stretched_gaps(
+                    &image,
+                    active_title.bounds,
+                    if theme == "Neobrutalism" { 32 } else { 28 },
+                    &format!("{theme} Light active todo title"),
+                );
+                let input = layout
+                    .display_list
+                    .iter()
+                    .find(|item| {
+                        matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                    })
+                    .unwrap_or_else(|| panic!("{theme} Light should render the new-todo input"));
+                let inset = style_number_from_map(&input.style, "text_inset").unwrap_or(6.0);
+                let placeholder_bounds = boon_document::Rect {
+                    x: input.bounds.x + inset,
+                    y: input.bounds.y,
+                    width: (input.bounds.width - inset - 16.0).max(1.0),
+                    height: input.bounds.height,
+                };
+                assert_rendered_text_region_has_no_stretched_gaps(
+                    &image,
+                    placeholder_bounds,
+                    if theme == "Neobrutalism" { 26 } else { 30 },
+                    &format!("{theme} Light placeholder"),
                 );
             }
         });

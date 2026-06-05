@@ -796,7 +796,10 @@ FUNCTION clear_button_spacer() {
     Scene/Element/block(
         element: []
         style: [
-            width: 33
+            width: PASSED.theme_options.name |> WHEN {
+                Neobrutalism => 23
+                __ => 33
+            }
             height: 25.2
             paint: False
         ]
@@ -911,7 +914,10 @@ FUNCTION remove_completed_button() {
         ]
         style: [
             align: Right
-            width: 118
+            width: PASSED.theme_options.name |> WHEN {
+                Neobrutalism => 128
+                __ => 118
+            }
             height: 25.2
             padding: [row: 0, column: 0]
             line_height: 19.6

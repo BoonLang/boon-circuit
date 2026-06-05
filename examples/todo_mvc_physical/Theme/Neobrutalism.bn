@@ -246,9 +246,9 @@ FUNCTION font(font) {
             Placeholder => [
                 ...body_base
                 size: 22
-                style: Italic
+                style: Normal
                 color: colors.placeholder
-                weight: Light
+                weight: Normal
             ]
 
             ButtonIcon[checked] => [

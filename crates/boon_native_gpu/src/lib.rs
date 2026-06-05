@@ -32,6 +32,7 @@ const JETBRAINS_MONO_BOLD_ITALIC_FONT_BYTES: &[u8] =
 const EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 const EDITOR_FONT_FEATURES: &str = "zero,calt";
 const DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
+const DOCUMENT_MONOSPACE_FONT_FAMILY: &str = "Liberation Mono";
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -1569,10 +1570,15 @@ fn text_attrs<'a>(
 ) -> Attrs<'a> {
     let font_family = resolved_font_family(font_family);
     let family = match font_family {
+        "ui-monospace" | "SFMono-Regular" | "Menlo" | "Monaco" | "Consolas" | "Liberation Mono" => {
+            Family::Name(DOCUMENT_MONOSPACE_FONT_FAMILY)
+        }
         "SansSerif" | "sans-serif" => Family::SansSerif,
         "Serif" | "serif" => Family::Serif,
         "Monospace" | "monospace" => Family::Monospace,
-        "Helvetica Neue" | "Helvetica" | "Arial" => Family::Name(DOCUMENT_FONT_FAMILY),
+        "Segoe UI" | "Roboto" | "Helvetica Neue" | "Helvetica" | "Arial" => {
+            Family::Name(DOCUMENT_FONT_FAMILY)
+        }
         _ => Family::Name(font_family),
     };
     Attrs::new()
@@ -5453,72 +5459,164 @@ mod tests {
         );
     }
 
+    fn max_shaped_word_gap(buffer: &Buffer) -> Option<f32> {
+        let mut previous_right = None;
+        let mut max_gap = 0.0_f32;
+        for glyph in buffer
+            .layout_runs()
+            .next()?
+            .glyphs
+            .iter()
+            .filter(|glyph| glyph.w > 0.0)
+        {
+            let left = glyph.x;
+            if let Some(previous_right) = previous_right {
+                max_gap = max_gap.max(left - previous_right);
+            }
+            previous_right = Some(left + glyph.w);
+        }
+        Some(max_gap)
+    }
+
     #[test]
     fn wide_todo_text_controls_shape_with_natural_word_spacing() {
-        let mut input_style = StyleMap::new();
-        input_style.insert("size".to_owned(), StyleValue::Number(24.0));
-        input_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
-        input_style.insert("text_inset".to_owned(), StyleValue::Number(6.0));
-        input_style.insert(
-            "placeholder".to_owned(),
-            StyleValue::Text("What needs to be done?".to_owned()),
-        );
-        input_style.insert(
-            "placeholder_style".to_owned(),
-            StyleValue::Text("Italic".to_owned()),
-        );
-
-        let mut title_style = StyleMap::new();
-        title_style.insert("size".to_owned(), StyleValue::Number(24.0));
-        title_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
-        title_style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
-
-        let frame = LayoutFrame {
-            display_list: vec![
-                DisplayItem {
-                    node: DocumentNodeId("new-todo-input".to_owned()),
-                    kind: DocumentNodeKind::TextInput,
-                    bounds: Rect {
-                        x: 55.0,
-                        y: 151.0,
-                        width: 495.0,
-                        height: 65.0,
-                    },
-                    text: None,
-                    style: input_style,
-                    focused: false,
-                },
-                DisplayItem {
-                    node: DocumentNodeId("active-title".to_owned()),
-                    kind: DocumentNodeKind::Text,
-                    bounds: Rect {
-                        x: 109.0,
-                        y: 217.0,
-                        width: 441.0,
-                        height: 65.0,
-                    },
-                    text: Some("Read documentation".to_owned()),
-                    style: title_style,
-                    focused: false,
-                },
-            ],
-            hit_regions: Vec::new(),
-            scroll_regions: Vec::new(),
-            accessibility: AccessibilityTree::default(),
-            demands: Vec::new(),
-            metrics: LayoutMetrics::default(),
-        };
-
-        let mut font_system = editor_font_system();
-        for run in text_runs(&frame, 640, 360) {
-            let buffer = shape_text_run(&mut font_system, &run);
-            let line_width = shaped_line_width(&buffer).expect("todo text should shape");
-            assert!(
-                line_width < run.bounds.width * 0.75,
-                "`{}` should keep natural word spacing instead of expanding to its whole control width: line_width={line_width}, bounds={:?}",
-                run.text,
-                run.bounds
+        for (
+            font_family,
+            title_weight,
+            placeholder_weight,
+            placeholder_style,
+            title_size,
+            placeholder_size,
+            title_text,
+        ) in [
+            (
+                "Helvetica Neue, Helvetica, Arial, SansSerif",
+                Weight(300),
+                Weight(300),
+                "Italic",
+                24.0,
+                24.0,
+                "Read documentation",
+            ),
+            (
+                "Segoe UI, Roboto, Helvetica, Arial, SansSerif",
+                Weight(300),
+                Weight(300),
+                "Italic",
+                25.0,
+                25.0,
+                "Read documentation",
+            ),
+            (
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace",
+                Weight(800),
+                Weight::NORMAL,
+                "Normal",
+                23.0,
+                22.0,
+                "Read documentation",
+            ),
+        ] {
+            let mut input_style = StyleMap::new();
+            input_style.insert("size".to_owned(), StyleValue::Number(title_size));
+            input_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
+            input_style.insert("text_inset".to_owned(), StyleValue::Number(6.0));
+            input_style.insert("font".to_owned(), StyleValue::Text(font_family.to_owned()));
+            input_style.insert(
+                "weight".to_owned(),
+                StyleValue::Number(f64::from(title_weight.0)),
             );
+            input_style.insert(
+                "placeholder_size".to_owned(),
+                StyleValue::Number(placeholder_size),
+            );
+            input_style.insert(
+                "placeholder_weight".to_owned(),
+                StyleValue::Number(f64::from(placeholder_weight.0)),
+            );
+            input_style.insert(
+                "placeholder_font".to_owned(),
+                StyleValue::Text(font_family.to_owned()),
+            );
+            input_style.insert(
+                "placeholder".to_owned(),
+                StyleValue::Text("What needs to be done?".to_owned()),
+            );
+            input_style.insert(
+                "placeholder_style".to_owned(),
+                StyleValue::Text(placeholder_style.to_owned()),
+            );
+
+            let mut title_style = StyleMap::new();
+            title_style.insert("size".to_owned(), StyleValue::Number(title_size));
+            title_style.insert("line_height".to_owned(), StyleValue::Number(33.6));
+            title_style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+            title_style.insert("font".to_owned(), StyleValue::Text(font_family.to_owned()));
+            title_style.insert(
+                "weight".to_owned(),
+                StyleValue::Number(f64::from(title_weight.0)),
+            );
+
+            let frame = LayoutFrame {
+                display_list: vec![
+                    DisplayItem {
+                        node: DocumentNodeId("new-todo-input".to_owned()),
+                        kind: DocumentNodeKind::TextInput,
+                        bounds: Rect {
+                            x: 55.0,
+                            y: 151.0,
+                            width: 495.0,
+                            height: 65.0,
+                        },
+                        text: None,
+                        style: input_style,
+                        focused: false,
+                    },
+                    DisplayItem {
+                        node: DocumentNodeId("active-title".to_owned()),
+                        kind: DocumentNodeKind::Text,
+                        bounds: Rect {
+                            x: 109.0,
+                            y: 217.0,
+                            width: 441.0,
+                            height: 65.0,
+                        },
+                        text: Some(title_text.to_owned()),
+                        style: title_style,
+                        focused: false,
+                    },
+                ],
+                hit_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                accessibility: AccessibilityTree::default(),
+                demands: Vec::new(),
+                metrics: LayoutMetrics::default(),
+            };
+
+            let mut font_system = editor_font_system();
+            for run in text_runs(&frame, 640, 360) {
+                let buffer = shape_text_run(&mut font_system, &run);
+                let line_width = shaped_line_width(&buffer).expect("todo text should shape");
+                let max_gap = max_shaped_word_gap(&buffer).expect("todo glyphs should shape");
+                assert!(
+                    line_width < run.bounds.width * 0.75,
+                    "`{}` in `{}` should keep natural word spacing instead of expanding to its whole control width: line_width={line_width}, bounds={:?}",
+                    run.text,
+                    font_family,
+                    run.bounds
+                );
+                let run_size = if run.text == "What needs to be done?" {
+                    placeholder_size
+                } else {
+                    title_size
+                };
+                assert!(
+                    max_gap <= (run_size as f32) * 0.65,
+                    "`{}` in `{}` should not shape with stretched spaces: max_gap={max_gap}, size={run_size}",
+                    run.text,
+                    font_family
+                );
+            }
         }
     }
 

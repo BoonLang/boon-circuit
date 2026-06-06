@@ -1,0 +1,10 @@
+-- Required construct proof isolated from NovyWave app behavior.
+
+proof_source: SOURCE
+
+FUNCTION hold_proof() {
+    0
+    |> HOLD count {
+        LATEST {}
+    }
+}

@@ -1,0 +1,685 @@
+-- Physical NovyWave scene view.
+
+FUNCTION main_scene() {
+    Scene/new(
+        root: root()
+        lights: [
+            key: [x: -0.4, y: -0.8, z: 1.0, intensity: 0.78]
+            rim: [x: 0.8, y: 0.2, z: 0.5, intensity: 0.22]
+        ]
+        geometry: [depth_scale: 1.0]
+    )
+}
+
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: Fill
+            height: [sizing: Fill, minimum: Screen]
+            padding: 18
+            material: NovyTheme/material(of: AppBackground)
+        ]
+        items: LIST {
+            header()
+            PASSED.store.fixture_status |> WHEN {
+                Empty => empty_state()
+                Loaded => loaded_app()
+            }
+        }
+    )
+}
+
+FUNCTION header() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [
+            width: Fill
+            height: 74
+            depth: 12
+            move: [closer: 5]
+            rounded_corners: 14
+            padding: 12
+            material: NovyTheme/material(of: PanelSurface)
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Title)
+                    width: 210
+                    height: Fill
+                    vertical_align: Center
+                ]
+                text: TEXT { NovyWave }
+            )
+            header_stat(stat_label: TEXT { File }, stat_value: TEXT { counter.vcd })
+            header_stat(stat_label: TEXT { View }, stat_value: PASSED.store.viewport_label)
+            header_stat(stat_label: TEXT { Cursor }, stat_value: PASSED.store.cursor_label)
+            toolbar_button(button_text: TEXT { Load }, source: PASSED.store.elements.load_fixture)
+            toolbar_button(button_text: TEXT { Empty }, source: PASSED.store.elements.show_empty)
+            toolbar_button(button_text: PASSED.store.mode |> WHEN { Dark => TEXT { Light } Light => TEXT { Dark } }, source: PASSED.store.elements.mode_toggle)
+        }
+    )
+}
+
+FUNCTION header_stat(stat_label, stat_value) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: 150
+            height: Fill
+            padding: 8
+            rounded_corners: 10
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        items: LIST {
+            text_line(label_text: stat_label, font: Muted, width: Fill, height: 18)
+            text_line(label_text: stat_value, font: Mono, width: Fill, height: 24)
+        }
+    )
+}
+
+FUNCTION loaded_app() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [
+            width: Fill
+            height: 650
+            paint: False
+        ]
+        items: LIST {
+            left_panel()
+            timeline_panel()
+            inspector_panel()
+        }
+    )
+}
+
+FUNCTION empty_state() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 14
+        style: [
+            width: Fill
+            height: 650
+            align: [row: Center]
+            padding: 80
+            depth: 10
+            move: [closer: 2]
+            rounded_corners: 18
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Title)
+                    width: Fill
+                    height: 44
+                    center: True
+                ]
+                text: TEXT { No waveform loaded }
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Body)
+                    width: Fill
+                    height: 28
+                    center: True
+                ]
+                text: TEXT { Load the generated counter fixture to inspect signals. }
+            )
+            toolbar_button(button_text: TEXT { Load fixture }, source: PASSED.store.elements.load_fixture)
+        }
+    )
+}
+
+FUNCTION left_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: 250
+            height: Fill
+            padding: 10
+            depth: 10
+            rounded_corners: 14
+            material: NovyTheme/material(of: PanelSurface)
+        ]
+        items: LIST {
+            panel_title(title_text: TEXT { Files and scopes })
+            files_list()
+            search_box()
+            scope_button(text: TEXT { top.cpu }, detail: TEXT { 8 signals }, source: PASSED.store.elements.scope_cpu, active: PASSED.store.active_scope == TEXT { top.cpu })
+            scope_button(text: TEXT { top.uart }, detail: TEXT { 5 signals }, source: PASSED.store.elements.scope_uart, active: PASSED.store.active_scope == TEXT { top.uart })
+            text_line(label_text: TEXT { Search result }, font: Muted, width: Fill, height: 18)
+            text_line(label_text: NovyFixtures/search_result(text: PASSED.store.signal_search_text), font: Mono, width: Fill, height: 24)
+        }
+    )
+}
+
+FUNCTION files_list() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, paint: False]
+        items:
+            NovyFixtures/files()
+            |> List/map(file, new: file_row(file: file))
+    )
+}
+
+FUNCTION file_row(file) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: Fill
+            height: 52
+            padding: 8
+            rounded_corners: 9
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        items: LIST {
+            text_line(label_text: file.name, font: Mono, width: Fill, height: 18)
+            text_line(label_text: file.range, font: Muted, width: Fill, height: 16)
+        }
+    )
+}
+
+FUNCTION search_box() {
+    Scene/Element/text_input(
+        element: [
+            event: [change: PASSED.store.elements.signal_search_input]
+        ]
+        style: [
+            width: Fill
+            height: 36
+            padding: [left: 10, right: 10]
+            text_inset: 4
+            rounded_corners: 9
+            font: NovyTheme/font(of: Body)
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Hidden[text: TEXT { signal search }]
+        text: PASSED.store.signal_search_text
+        placeholder: [text: TEXT { search signals }]
+    )
+}
+
+FUNCTION scope_button(scope_text, detail, source, active) {
+    Scene/Element/button(
+        element: [
+            event: [press: source]
+            hovered: SOURCE
+        ]
+        style: [
+            width: Fill
+            height: 42
+            padding: 7
+            rounded_corners: 9
+            spring_range: 3
+            material: active |> WHEN {
+                True => NovyTheme/material(of: SelectedRow)
+                False => NovyTheme/material(of: HoverControl)
+            }
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 1
+            style: [paint: False]
+            items: LIST {
+                text_line(label_text: scope_text, font: Body, width: Fill, height: 18)
+                text_line(label_text: detail, font: Muted, width: Fill, height: 14)
+            }
+        )
+    )
+}
+
+FUNCTION timeline_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: Fill
+            height: Fill
+            padding: 10
+            depth: 14
+            move: [closer: 4]
+            rounded_corners: 14
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            timeline_toolbar()
+            timeline_axis()
+            PASSED.store.selected_group |> WHEN {
+                Collapsed => collapsed_group()
+                Expanded => waveform_rows()
+            }
+        }
+    )
+}
+
+FUNCTION timeline_toolbar() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 38, paint: False]
+        items: LIST {
+            toolbar_button(button_text: TEXT { W + }, source: PASSED.store.elements.zoom_in)
+            toolbar_button(button_text: TEXT { S - }, source: PASSED.store.elements.zoom_out)
+            toolbar_button(button_text: TEXT { A < }, source: PASSED.store.elements.pan_left)
+            toolbar_button(button_text: TEXT { D > }, source: PASSED.store.elements.pan_right)
+            toolbar_button(button_text: TEXT { Q }, source: PASSED.store.elements.cursor_left)
+            toolbar_button(button_text: TEXT { E }, source: PASSED.store.elements.cursor_right)
+            toolbar_button(button_text: TEXT { M }, source: PASSED.store.elements.marker_toggle)
+            toolbar_button(button_text: TEXT { Group }, source: PASSED.store.elements.group_toggle)
+            toolbar_button(button_text: TEXT { Format }, source: PASSED.store.elements.format_cycle)
+            keyboard_capture()
+        }
+    )
+}
+
+FUNCTION keyboard_capture() {
+    Scene/Element/text_input(
+        element: [
+            event: [key_down: PASSED.store.elements.keyboard_capture]
+        ]
+        style: [
+            width: 88
+            height: 32
+            padding: [left: 8, right: 8]
+            rounded_corners: 8
+            font: NovyTheme/font(of: Muted)
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Hidden[text: TEXT { keyboard capture }]
+        text: TEXT { keys }
+        placeholder: []
+    )
+}
+
+FUNCTION timeline_axis() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 3
+        style: [
+            width: Fill
+            height: 48
+            padding: 6
+            rounded_corners: 10
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 0
+                style: [width: Fill, height: 20, paint: False]
+                items: LIST {
+                    axis_tick(label: TEXT { 0 ns })
+                    axis_tick(label: TEXT { 40 ns })
+                    axis_tick(label: TEXT { 80 ns })
+                    axis_tick(label: TEXT { 120 ns })
+                    axis_tick(label: TEXT { 160 ns })
+                }
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 4
+                style: [width: Fill, height: 16, paint: False]
+                items: LIST {
+                    cursor_chip()
+                    PASSED.store.marker_visibility |> WHEN {
+                        Visible => marker_chip()
+                        Hidden => NoElement
+                    }
+                }
+            )
+        }
+    )
+}
+
+FUNCTION axis_tick(label) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(of: Muted)
+            width: 120
+            height: 18
+            center: True
+        ]
+        text: label
+    )
+}
+
+FUNCTION cursor_chip() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 118
+            height: 18
+            rounded_corners: 8
+            material: NovyTheme/material(of: CursorGlow)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: PASSED.store.cursor_label
+        )
+    )
+}
+
+FUNCTION marker_chip() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 150
+            height: 18
+            rounded_corners: 8
+            material: NovyTheme/material(of: MarkerChip)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: TEXT { M reset released }
+        )
+    )
+}
+
+FUNCTION collapsed_group() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 48
+            rounded_corners: 10
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Body)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: TEXT { Core bus group collapsed }
+        )
+    )
+}
+
+FUNCTION waveform_rows() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: Fill, paint: False]
+        items:
+            NovyFixtures/selected_signals()
+            |> List/map(signal, new: waveform_row(signal: signal))
+    )
+}
+
+FUNCTION waveform_row(signal) {
+    BLOCK {
+        active: signal.id == PASSED.store.active_signal
+
+        Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 6
+            style: [
+                width: Fill
+                height: PASSED.store.row_height
+                padding: 5
+                rounded_corners: 9
+                material: active |> WHEN {
+                    True => NovyTheme/material(of: SelectedRow)
+                    False => NovyTheme/material(of: PanelInset)
+                }
+            ]
+            items: LIST {
+                signal_select_button(signal: signal)
+                value_pill(signal: signal)
+                wave_area(signal: signal)
+            }
+        )
+    }
+}
+
+FUNCTION signal_select_button(signal) {
+    Scene/Element/button(
+        element: [
+            event: [
+                press: signal.id |> WHEN {
+                    TEXT { clk } => PASSED.store.elements.select_clk
+                    TEXT { reset_n } => PASSED.store.elements.select_reset
+                    TEXT { data_bus } => PASSED.store.elements.select_data
+                    TEXT { temperature } => PASSED.store.elements.select_temperature
+                    __ => PASSED.store.elements.select_clk
+                }
+            ]
+            hovered: SOURCE
+        ]
+        style: [
+            width: 145
+            height: Fill
+            padding: 6
+            rounded_corners: 8
+            material: NovyTheme/material(of: HoverControl)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                vertical_align: Center
+            ]
+            text: signal.name
+        )
+    )
+}
+
+FUNCTION value_pill(signal) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 86
+            height: Fill
+            rounded_corners: 8
+            material: NovyTheme/material(of: PanelSurface)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: NovyFixtures/signal_value(signal: signal.id, format: PASSED.store.value_format)
+        )
+    )
+}
+
+FUNCTION wave_area(signal) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 8
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items:
+            NovyFixtures/segments(of: signal.id)
+            |> List/map(segment, new: waveform_segment(segment: segment))
+    )
+}
+
+FUNCTION waveform_segment(segment) {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: segment.width
+            height: NovyTheme/trace_height(state: segment.state)
+            align: [column: Center]
+            rounded_corners: 4
+            material: NovyTheme/trace_material(state: segment.state)
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [paint: False]
+            text: Text/empty()
+        )
+    )
+}
+
+FUNCTION inspector_panel() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: 275
+            height: Fill
+            padding: 10
+            depth: 10
+            rounded_corners: 14
+            material: NovyTheme/material(of: PanelSurface)
+        ]
+        items: LIST {
+            panel_title(title_text: TEXT { Inspector })
+            inspector_row(row_label: TEXT { Active signal }, row_value: PASSED.store.active_signal_label)
+            inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
+            inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.viewport_label)
+            inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_fingerprint)
+            inspector_row(row_label: TEXT { Bridge }, row_value: PASSED.store.bridge_contract)
+            row_resize_controls()
+        }
+    )
+}
+
+FUNCTION inspector_row(row_label, row_value) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: Fill
+            height: 52
+            padding: 8
+            rounded_corners: 9
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        items: LIST {
+            text_line(label_text: row_label, font: Muted, width: Fill, height: 16)
+            text_line(label_text: row_value, font: Mono, width: Fill, height: 22)
+        }
+    )
+}
+
+FUNCTION row_resize_controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 36, paint: False]
+        items: LIST {
+            toolbar_button(button_text: TEXT { Short }, source: PASSED.store.elements.row_shorter)
+            toolbar_button(button_text: TEXT { Tall }, source: PASSED.store.elements.row_taller)
+        }
+    )
+}
+
+FUNCTION panel_title(title_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(of: Heading)
+            width: Fill
+            height: 24
+            vertical_align: Center
+        ]
+        text: title_text
+    )
+}
+
+FUNCTION toolbar_button(button_text, source) {
+    Scene/Element/button(
+        element: [
+            event: [press: source]
+            hovered: SOURCE
+        ]
+        style: [
+            width: 76
+            height: 32
+            rounded_corners: 8
+            spring_range: 3
+            center: True
+            material: NovyTheme/material(of: HoverControl)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Body)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: button_text
+        )
+    )
+}
+
+FUNCTION text_line(label_text, font, width, height) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(of: font)
+            width: width
+            height: height
+            vertical_align: Center
+        ]
+        text: label_text
+    )
+}

@@ -1,0 +1,225 @@
+-- Physical NovyWave material and text theme.
+
+FUNCTION material(of) {
+    of |> WHEN {
+        AppBackground => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #08111f }
+                Light => TEXT { #edf4fb }
+            }
+            gloss: 0.02
+        ]
+
+        PanelSurface => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #111d2fcc }
+                Light => TEXT { #ffffffd6 }
+            }
+            gloss: 0.10
+            metal: 0.04
+            transparency: 0.10
+            frosted_blur: 14
+            frosted_saturate: 1.18
+            glass_highlight: 0.56
+            border: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #89a6d640 }
+                Light => TEXT { #ffffffd8 }
+            }
+            border_width: 1
+            shadows: LIST {
+                [y: 20, blur: 42, color: TEXT { #00000045 }]
+                [y: 1, blur: 0, color: TEXT { #ffffff22 }]
+            }
+        ]
+
+        PanelInset => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #08101dcc }
+                Light => TEXT { #dce8f4cc }
+            }
+            gloss: 0.04
+            border: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #2a3a55 }
+                Light => TEXT { #bccbdd }
+            }
+            border_width: 1
+        ]
+
+        TimelineGlass => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0b1528a8 }
+                Light => TEXT { #f8fbffb0 }
+            }
+            refraction: 1.5
+            gloss: 0.06
+            transparency: 0.24
+            frosted_blur: 18
+            frosted_saturate: 1.25
+            glass_highlight: 0.64
+        ]
+
+        TraceHigh => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #73f7b1 }
+                Light => TEXT { #087a4c }
+            }
+            glow: [color: TEXT { #55ffc266 }, intensity: 0.16]
+        ]
+
+        TraceLow => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #39516c }
+                Light => TEXT { #b7c4d2 }
+            }
+        ]
+
+        TraceUnknown => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #f6d365 }
+                Light => TEXT { #9a6a00 }
+            }
+            glow: [color: TEXT { #f6d36555 }, intensity: 0.10]
+        ]
+
+        AnalogTrace => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #6bbdff }
+                Light => TEXT { #1267aa }
+            }
+            glow: [color: TEXT { #6bbdff55 }, intensity: 0.14]
+        ]
+
+        CursorGlow => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #ffef8a }
+                Light => TEXT { #9a7600 }
+            }
+            glow: [color: TEXT { #ffe76888 }, intensity: 0.24]
+        ]
+
+        MarkerChip => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #6147d9 }
+                Light => TEXT { #e7ddff }
+            }
+            gloss: 0.13
+            glow: [color: TEXT { #8f75ff66 }, intensity: 0.12]
+        ]
+
+        SelectedRow => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #203b62 }
+                Light => TEXT { #d7e9ff }
+            }
+            border: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #73b7ff }
+                Light => TEXT { #2474bb }
+            }
+            border_width: 1
+        ]
+
+        HoverControl => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1a2b44 }
+                Light => TEXT { #e9f3ff }
+            }
+            gloss: 0.08
+            border: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #49617f }
+                Light => TEXT { #bad0e8 }
+            }
+            border_width: 1
+        ]
+
+        PressedControl => [
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #28466d }
+                Light => TEXT { #cce4ff }
+            }
+            gloss: 0.12
+            glow: [color: TEXT { #65b8ff44 }, intensity: 0.10]
+        ]
+
+        Warning => [color: TEXT { #f6d365 }]
+        Error => [color: TEXT { #ff6b7a }]
+        __ => [color: TEXT { #00000000 }]
+    }
+}
+
+FUNCTION font(of) {
+    of |> WHEN {
+        Title => [
+            family: TEXT { Inter, Arial, SansSerif }
+            size: 32
+            weight: Bold
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #eef7ff }
+                Light => TEXT { #102033 }
+            }
+        ]
+        Heading => [
+            family: TEXT { Inter, Arial, SansSerif }
+            size: 15
+            weight: Bold
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dceaff }
+                Light => TEXT { #182a3d }
+            }
+        ]
+        Body => [
+            family: TEXT { Inter, Arial, SansSerif }
+            size: 12
+            weight: Regular
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #d2def0 }
+                Light => TEXT { #25384c }
+            }
+        ]
+        Muted => [
+            family: TEXT { Inter, Arial, SansSerif }
+            size: 11
+            weight: Regular
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
+        ]
+        Mono => [
+            family: TEXT { JetBrains Mono, Menlo, Monospace }
+            size: 11
+            weight: Regular
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
+            }
+        ]
+        __ => [
+            size: 12
+            color: TEXT { #ffffff }
+        ]
+    }
+}
+
+FUNCTION trace_material(state) {
+    state |> WHEN {
+        High => material(of: TraceHigh)
+        Low => material(of: TraceLow)
+        Unknown => material(of: TraceUnknown)
+        AnalogLow => material(of: AnalogTrace)
+        AnalogMid => material(of: AnalogTrace)
+        AnalogHigh => material(of: AnalogTrace)
+        __ => material(of: TraceUnknown)
+    }
+}
+
+FUNCTION trace_height(state) {
+    state |> WHEN {
+        High => 18
+        Low => 6
+        Unknown => 14
+        AnalogLow => 8
+        AnalogMid => 15
+        AnalogHigh => 24
+        __ => 10
+    }
+}

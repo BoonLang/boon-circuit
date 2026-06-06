@@ -210,6 +210,79 @@ performance_thresholds = [
 ]
 
 [[example]]
+id = "novywave"
+label = "NovyWave"
+source = "examples/novywave/RUN.bn"
+source_files = [
+  "examples/novywave/hold.bn",
+  "examples/novywave/Bridge/NovyBridge.bn",
+  "examples/novywave/Generated/Assets.bn",
+  "examples/novywave/Generated/NovyFixtures.bn",
+  "examples/novywave/Model/NovyModel.bn",
+  "examples/novywave/Theme/NovyTheme.bn",
+  "examples/novywave/View/NovyView.bn",
+  "examples/novywave/RUN.bn",
+]
+build_files = [
+  "examples/novywave/BUILD.bn",
+]
+asset_files = [
+  "examples/novywave/assets/icons/novywave_mark.svg",
+]
+scenario = "examples/novywave.scn"
+budget = "examples/novywave.budget.toml"
+category = "main"
+order = 26
+default_tab_order = 26
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "novywave-title-visible",
+  "waveform-fixture-visible",
+  "scope-panel-visible",
+  "timeline-grid-visible",
+  "physical-materials-visible",
+  "dev-window-editor-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "initial-loaded-fixture",
+  "search-data",
+  "select-data-bus",
+  "format-binary",
+  "zoom-in",
+  "keyboard-pan-right",
+  "keyboard-cursor-left",
+  "toggle-marker",
+  "collapse-group",
+  "row-tall",
+  "switch-light",
+  "show-empty-state",
+  "reload-fixture",
+]
+scroll_focus_scenarios = [
+  "timeline-pan",
+  "selected-signal-scroll",
+]
+visual_artifacts = [
+  "preview-app-owned-framebuffer-before-after",
+  "dev-app-owned-framebuffer",
+  "novywave-dark-mode-crop",
+  "novywave-light-mode-crop",
+  "timeline-glass-material-crop",
+  "waveform-trace-crop",
+  "cursor-marker-glow-crop",
+  "novywave-reference-comparison-crop",
+]
+performance_thresholds = [
+  "preview-interaction-p95-frame-ms <= 16.7",
+  "preview-interaction-p99-frame-ms <= 25.0",
+  "dev-editor-scroll-p95-frame-ms <= 16.7",
+  "timeline-pan-zoom-p95-frame-ms <= 16.7",
+]
+
+[[example]]
 id = "counter"
 label = "Counter"
 source = "examples/counter.bn"

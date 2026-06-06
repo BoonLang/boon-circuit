@@ -1,0 +1,110 @@
+-- Generated fixture waveform data for the static NovyWave playground phase.
+
+FUNCTION files() {
+    LIST {
+        [
+            name: TEXT { counter.vcd }
+            format: TEXT { VCD }
+            range: TEXT { 0 ns - 240 ns }
+            status: TEXT { loaded }
+        ]
+        [
+            name: TEXT { uart_compare.fst }
+            format: TEXT { FST }
+            range: TEXT { 0 ns - 240 ns }
+            status: TEXT { fixture }
+        ]
+    }
+}
+
+FUNCTION scopes() {
+    LIST {
+        [id: TEXT { top.cpu }, name: TEXT { top.cpu }, signal_count: TEXT { 8 signals }]
+        [id: TEXT { top.uart }, name: TEXT { top.uart }, signal_count: TEXT { 5 signals }]
+        [id: TEXT { top.analog }, name: TEXT { top.analog }, signal_count: TEXT { 2 signals }]
+    }
+}
+
+FUNCTION selected_signals() {
+    LIST {
+        [id: TEXT { clk }, name: TEXT { clk }, value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, value: TEXT { 0x2a }, kind: Digital]
+        [id: TEXT { temperature }, name: TEXT { temperature }, value: TEXT { 42.8 C }, kind: Analog]
+    }
+}
+
+FUNCTION search_result(text) {
+    text |> WHEN {
+        TEXT { reset } => TEXT { reset_n }
+        TEXT { data } => TEXT { data_bus[7:0] }
+        TEXT { temp } => TEXT { temperature }
+        TEXT { clk } => TEXT { clk }
+        TEXT {} => TEXT { clk, reset_n, data_bus, temperature }
+        __ => TEXT { clk, reset_n, data_bus, temperature }
+    }
+}
+
+FUNCTION signal_value(signal, format) {
+    LIST { signal, format } |> WHEN {
+        LIST { TEXT { clk }, Binary } => TEXT { 1b }
+        LIST { TEXT { clk }, Signed } => TEXT { 1 }
+        LIST { TEXT { clk }, ASCII } => TEXT { . }
+        LIST { TEXT { reset_n }, Binary } => TEXT { 1b }
+        LIST { TEXT { data_bus }, Binary } => TEXT { 00101010 }
+        LIST { TEXT { data_bus }, Signed } => TEXT { 42 }
+        LIST { TEXT { data_bus }, ASCII } => TEXT { * }
+        LIST { TEXT { temperature }, Signed } => TEXT { 43 }
+        LIST { TEXT { temperature }, ASCII } => TEXT { temp }
+        LIST { TEXT { temperature }, Binary } => TEXT { analog }
+        __ => signal |> WHEN {
+            TEXT { data_bus } => TEXT { 0x2a }
+            TEXT { temperature } => TEXT { 42.8 C }
+            TEXT { reset_n } => TEXT { 1 }
+            __ => TEXT { 1 }
+        }
+    }
+}
+
+FUNCTION segments(of) {
+    of |> WHEN {
+        TEXT { clk } => LIST {
+            [width: 28, state: High]
+            [width: 28, state: Low]
+            [width: 28, state: High]
+            [width: 28, state: Low]
+            [width: 28, state: High]
+            [width: 28, state: Low]
+            [width: 28, state: High]
+            [width: 28, state: Low]
+            [width: 28, state: High]
+            [width: 28, state: Low]
+            [width: 28, state: High]
+            [width: 28, state: Low]
+        }
+        TEXT { reset_n } => LIST {
+            [width: 84, state: Low]
+            [width: 252, state: High]
+        }
+        TEXT { data_bus } => LIST {
+            [width: 56, state: Unknown]
+            [width: 56, state: High]
+            [width: 56, state: Low]
+            [width: 84, state: High]
+            [width: 84, state: Low]
+        }
+        TEXT { temperature } => LIST {
+            [width: 42, state: AnalogLow]
+            [width: 42, state: AnalogMid]
+            [width: 42, state: AnalogHigh]
+            [width: 42, state: AnalogMid]
+            [width: 42, state: AnalogLow]
+            [width: 42, state: AnalogMid]
+            [width: 42, state: AnalogHigh]
+            [width: 42, state: AnalogMid]
+        }
+        __ => LIST {
+            [width: 336, state: Unknown]
+        }
+    }
+}

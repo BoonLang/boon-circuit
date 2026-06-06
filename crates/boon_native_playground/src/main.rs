@@ -22489,6 +22489,7 @@ fn preview_apply_repeatable_text_input_key(
                         .clone()
                         .or_else(|| focused_target_text(layout, focused_node)),
                     target_occurrence: None,
+                    ..boon_runtime::LiveSourceEvent::default()
                 };
                 return preview_apply_live_event(
                     source_path,
@@ -22521,6 +22522,7 @@ fn preview_apply_repeatable_text_input_key(
                             .clone()
                             .or_else(|| focused_target_text(layout, focused_node)),
                         target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
                     };
                     return preview_apply_live_event(
                         source_path,
@@ -22669,6 +22671,7 @@ fn preview_apply_real_window_input_with_units(
                             .clone()
                             .or_else(|| focused_target_text(layout, &node)),
                         target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
                     });
                 }
                 if let Some(mut event) =
@@ -22806,6 +22809,7 @@ fn preview_apply_real_window_input_with_units(
                             .clone()
                             .or_else(|| focused_target_text(layout, &focused_node)),
                         target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
                     };
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
@@ -22848,6 +22852,7 @@ fn preview_apply_real_window_input_with_units(
                             .clone()
                             .or_else(|| focused_target_text(layout, &focused_node)),
                         target_occurrence: None,
+                        ..boon_runtime::LiveSourceEvent::default()
                     };
                     latest_layout = Some(preview_apply_live_event(
                         source_path,
@@ -24035,6 +24040,7 @@ fn live_source_event_for_hit_region(
         address: focused_address(layout_proof, node),
         target_text: focused_target_text(layout_proof, node),
         target_occurrence: None,
+        ..boon_runtime::LiveSourceEvent::default()
     })
 }
 
@@ -24064,6 +24070,7 @@ fn preview_focused_blur_event(
             .clone()
             .or_else(|| focused_target_text(layout_proof, focused_node)),
         target_occurrence: None,
+        ..boon_runtime::LiveSourceEvent::default()
     })
 }
 
@@ -26103,6 +26110,18 @@ fn preview_operator_host_input_response(
                 .get("target_occurrence")
                 .and_then(serde_json::Value::as_u64)
                 .map(|value| value as usize),
+            target_key: event_json
+                .get("target_key")
+                .and_then(serde_json::Value::as_u64),
+            target_generation: event_json
+                .get("target_generation")
+                .and_then(serde_json::Value::as_u64),
+            bind_epoch: event_json
+                .get("bind_epoch")
+                .and_then(serde_json::Value::as_u64),
+            source_id: event_json
+                .get("source_id")
+                .and_then(serde_json::Value::as_u64),
         };
         let before_state_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&before_state)?);
         let runtime_started = Instant::now();
@@ -26761,6 +26780,19 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
         {
             event["user_action_kind"] = json!(kind);
         }
+        if let Some(action) = &step.user_action {
+            for key in [
+                "target_occurrence",
+                "target_key",
+                "target_generation",
+                "bind_epoch",
+                "source_id",
+            ] {
+                if let Some(value) = action.get(key).and_then(toml_value_as_u64) {
+                    event[key] = json!(value);
+                }
+            }
+        }
         let Some(source_path) = event.get("source").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -26837,19 +26869,26 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
 fn scenario_path_for_source_path(path: &Path) -> PathBuf {
     if let Ok(entries) = boon_runtime::example_manifest_entries() {
         for entry in entries {
-            let entry_source = Path::new(&entry.source);
-            if paths_match_for_preview_units(path, entry_source) {
-                return PathBuf::from(entry.scenario);
-            }
-            for ancestor in path.ancestors() {
-                let candidate = ancestor.join(entry_source);
-                if paths_match_for_preview_units(path, &candidate) {
-                    return ancestor.join(entry.scenario);
-                }
+            if let Some(scenario) = manifest_scenario_path_for_source_path(path, &entry) {
+                return scenario;
             }
         }
     }
     path.with_extension("scn")
+}
+
+fn manifest_scenario_path_for_source_path(
+    path: &Path,
+    entry: &boon_runtime::ExampleManifestEntry,
+) -> Option<PathBuf> {
+    let entry_source = Path::new(&entry.source);
+    for ancestor in path.ancestors() {
+        let candidate = ancestor.join(entry_source);
+        if paths_match_for_preview_units(path, &candidate) {
+            return Some(ancestor.join(&entry.scenario));
+        }
+    }
+    paths_match_for_preview_units(path, entry_source).then(|| repo_relative_path(&entry.scenario))
 }
 
 fn toml_table_to_json(table: &BTreeMap<String, toml::Value>) -> serde_json::Value {
@@ -26883,6 +26922,13 @@ fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
 fn toml_value_as_str(value: &toml::Value) -> Option<&str> {
     match value {
         toml::Value::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn toml_value_as_u64(value: &toml::Value) -> Option<u64> {
+    match value {
+        toml::Value::Integer(value) => (*value).try_into().ok(),
         _ => None,
     }
 }
@@ -34700,6 +34746,7 @@ mod tests {
                 address: None,
                 target_text: None,
                 target_occurrence: None,
+                ..boon_runtime::LiveSourceEvent::default()
             })
             .expect("increment event should apply");
 
@@ -34766,6 +34813,7 @@ mod tests {
                 address: None,
                 target_text: Some("Buy groceries".to_owned()),
                 target_occurrence: None,
+                ..boon_runtime::LiveSourceEvent::default()
             })
             .expect("TodoMVC checkbox event should apply");
 
@@ -37873,6 +37921,7 @@ mod tests {
                 address: None,
                 target_text: None,
                 target_occurrence: None,
+                ..boon_runtime::LiveSourceEvent::default()
             })
             .unwrap();
         assert!(!output.semantic_deltas.is_empty());
@@ -38255,6 +38304,31 @@ mod tests {
             expected_count > 1,
             "expected source event count={expected_count}"
         );
+    }
+
+    #[test]
+    fn operator_host_input_carries_row_identity_for_bound_sources() {
+        let source_path = repo_path("examples/novywave/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let requests = operator_host_input_probe_requests(&source_path, &source)
+            .expect("NovyWave should produce operator host input probes");
+        let first_event = requests
+            .first()
+            .and_then(|request| request.get("source_events"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|events| events.first())
+            .and_then(|event| event.get("source_event"))
+            .expect("first NovyWave source event");
+
+        assert_eq!(
+            first_event["source"],
+            "signal_catalog_item.signal_elements.select_signal"
+        );
+        assert_eq!(first_event["target_text"], "data_bus[7:0]");
+        assert_eq!(first_event["target_key"], 3);
+        assert_eq!(first_event["target_generation"], 1);
+        assert_eq!(first_event["bind_epoch"], 5);
+        assert_eq!(first_event["source_id"], 5);
     }
 
     #[test]

@@ -261,6 +261,10 @@ pub struct LiveSourceEvent {
     pub address: Option<String>,
     pub target_text: Option<String>,
     pub target_occurrence: Option<usize>,
+    pub target_key: Option<u64>,
+    pub target_generation: Option<u64>,
+    pub bind_epoch: Option<u64>,
+    pub source_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1113,6 +1117,30 @@ impl LiveSourceEvent {
             user_action.insert(
                 "target_occurrence".to_owned(),
                 toml::Value::Integer(occurrence as i64),
+            );
+        }
+        if let Some(target_key) = self.target_key {
+            user_action.insert(
+                "target_key".to_owned(),
+                toml::Value::Integer(target_key as i64),
+            );
+        }
+        if let Some(target_generation) = self.target_generation {
+            user_action.insert(
+                "target_generation".to_owned(),
+                toml::Value::Integer(target_generation as i64),
+            );
+        }
+        if let Some(bind_epoch) = self.bind_epoch {
+            user_action.insert(
+                "bind_epoch".to_owned(),
+                toml::Value::Integer(bind_epoch as i64),
+            );
+        }
+        if let Some(source_id) = self.source_id {
+            user_action.insert(
+                "source_id".to_owned(),
+                toml::Value::Integer(source_id as i64),
             );
         }
         user_action
@@ -15656,6 +15684,49 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn live_source_event_preserves_bound_row_identity() {
+        let source = include_str!("../../../examples/todomvc.bn");
+        let mut runtime = LiveRuntime::new(
+            "playground-live:todomvc",
+            source,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .unwrap();
+        let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
+            row.get(field)
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                })
+                .unwrap_or_else(|| panic!("todo row missing numeric `{field}`: {row}"))
+        };
+        let initial = runtime.state_summary();
+        let first_todo = &initial["todos"][0];
+        let target_key = json_u64_field(first_todo, "key");
+        let target_generation = json_u64_field(first_todo, "generation");
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "todo.sources.todo_checkbox.click".to_owned(),
+                target_text: Some("Buy groceries".to_owned()),
+                target_key: Some(target_key),
+                target_generation: Some(target_generation),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let todos = output
+            .state_summary
+            .get("todos")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        assert_eq!(todos[0]["title"], "Read documentation");
+        assert_eq!(todos[0]["completed"], true);
+        assert_eq!(todos[3]["title"], "Buy groceries");
+        assert_eq!(todos[3]["completed"], false);
     }
 
     #[test]

@@ -58,6 +58,11 @@ store: [
             elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
         }
 
+    empty_state_title: TEXT { No waveform loaded }
+    empty_state_hint: TEXT { Drop or load a VCD, FST, or GHW waveform to inspect signals. }
+    empty_state_bridge_label: TEXT { Bridge state: no request scheduled; pure descriptor is wave:none }
+    empty_state_formats_label: TEXT { Supported fixture contracts: VCD, FST, GHW }
+
     active_file:
         LATEST {
             TEXT { counter.vcd }
@@ -92,7 +97,97 @@ store: [
             status: file_compare_status
             page: compare_request_page
             source: TEXT { generated-fixture-page }
+            bridge_contract: TEXT { wellen.v1 }
+            waveform_ref: bridge_waveform_ref
         ]
+
+    bridge_file_format:
+        LATEST {
+            TEXT { VCD }
+            elements.select_counter_file.event.press |> THEN { TEXT { VCD } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { VCD } }
+            elements.load_fixture.event.press |> THEN { TEXT { VCD } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+
+    bridge_file_digest:
+        LATEST {
+            TEXT { sha256:fixture-counter-vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { sha256:fixture-corrupted-vcd } }
+            elements.load_fixture.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
+            elements.show_empty.event.press |> THEN { TEXT { sha256:none } }
+        }
+
+    bridge_waveform_ref:
+        LATEST {
+            TEXT { wave:vcd:counter:0-240ns }
+            elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { diagnostic:unsupported-corrupted-vcd } }
+            elements.load_fixture.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
+            elements.show_empty.event.press |> THEN { TEXT { wave:none } }
+        }
+
+    bridge_descriptor_file:
+        LATEST {
+            TEXT { counter.vcd }
+            elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
+            elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
+            elements.show_empty.event.press |> THEN { TEXT { none } }
+        }
+
+    bridge_open_status:
+        LATEST {
+            TEXT { FIXTURE_READY }
+            elements.select_counter_file.event.press |> THEN { TEXT { FIXTURE_READY } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { FIXTURE_READY } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { FIXTURE_READY } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { DIAGNOSTIC } }
+            elements.load_fixture.event.press |> THEN { TEXT { FIXTURE_READY } }
+            elements.show_empty.event.press |> THEN { TEXT { NOT_REQUESTED } }
+        }
+
+    bridge_open_summary:
+        LATEST {
+            TEXT { fixture VCD wave:vcd:counter:0-240ns }
+            elements.select_counter_file.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { fixture FST wave:fst:uart-compare:0-240ns } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { fixture GHW wave:ghw:simple-test:0-100ns } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
+            elements.load_fixture.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
+            elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
+        }
+
+    bridge_hierarchy_page_label:
+        LATEST {
+            TEXT { HIER:top.cpu/top.uart/top.analog }
+            elements.select_counter_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { HIER:none } }
+            elements.load_fixture.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
+            elements.show_empty.event.press |> THEN { TEXT { HIER:none } }
+        }
+
+    bridge_file_stats_label:
+        LATEST {
+            TEXT { VCD 15 signals, 0-240ns, bounded pages }
+            elements.select_counter_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { no waveform stats } }
+            elements.load_fixture.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
+            elements.show_empty.event.press |> THEN { TEXT { no waveform stats } }
+        }
 
     compare_request_page:
         LATEST {
@@ -730,6 +825,7 @@ store: [
                     __ => SKIP
                 }
                 elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
             }
         }
 
@@ -774,6 +870,7 @@ store: [
                     __ => SKIP
                 }
                 elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
             }
         }
 
@@ -846,6 +943,7 @@ store: [
                 elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
                 elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
             }
         }
 
@@ -855,14 +953,94 @@ store: [
                 elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
+            }
+        }
+
+    bridge_request_descriptor_label:
+        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_request_descriptor_label {
+            LATEST {
+                elements.select_clk.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_reset.event.press |> THEN { TEXT { TOP_CPU/RESET_N/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_data.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Hexadecimal } }
+                elements.select_temperature.event.press |> THEN { TEXT { TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal } }
+                elements.format_cycle.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Fit/Center/Cursor42/Binary } }
+                elements.zoom_in.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/Center/Cursor42/Binary } }
+                elements.pan_right.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary } }
+                elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.keyboard_capture.key |> WHEN {
+                    A => TEXT { TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary }
+                    Q => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary }
+                    E => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor48/Binary }
+                    D => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary }
+                    S => TEXT { TOP_CPU/DATA_BUS/Wide/RightWindow/Cursor36/Binary }
+                    W => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary }
+                    __ => SKIP
+                }
+                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.show_empty.event.press |> THEN { TEXT { No request scheduled } }
+            }
+        }
+
+    bridge_response_descriptor_label:
+        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
+                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.show_empty.event.press |> THEN { TEXT { No response available } }
             }
         }
 
     bridge_request_descriptor:
-        bridge_page_descriptor(request_page: bridge_request_page)
+        [
+            page: bridge_request_page
+            descriptor: bridge_request_descriptor_label
+            fingerprint: bridge_request_fingerprint
+        ]
 
     bridge_response_descriptor:
-        bridge_page_descriptor(request_page: bridge_response_page)
+        [
+            page: bridge_response_page
+            descriptor: bridge_response_descriptor_label
+            fingerprint: bridge_response_fingerprint
+        ]
+
+    bridge_signal_page_label:
+        LATEST {
+            TEXT { PAGE_CLK_FIT_CENTER_42_HEX }
+            elements.select_counter_file.event.press |> THEN { bridge_request_page }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
+            elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
+        }
+
+    bridge_cursor_values_label:
+        LATEST {
+            TEXT { clk=1 reset_n=1 data=0x2a temp=42C }
+            elements.select_counter_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data=0x55 busy=0 at 42 ns } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
+            elements.diagnostic_probe.event.press |> THEN { TEXT { unavailable } }
+            elements.show_empty.event.press |> THEN { TEXT { unavailable } }
+            elements.cursor_left.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+            elements.cursor_right.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
+        }
+
+    bridge_open_descriptor:
+        [
+            module: TEXT { wellen.v1 }
+            provider: NovyBridge/provider_version()
+            schema: NovyBridge/schema_version()
+            export: TEXT { open }
+            file: bridge_descriptor_file
+            format: bridge_file_format
+            digest: bridge_file_digest
+            waveform_ref: bridge_waveform_ref
+            status: bridge_open_status
+            policy: NovyBridge/data_policy_label()
+        ]
 
     bridge_request_label:
         bridge_request_fingerprint
@@ -908,6 +1086,7 @@ store: [
                     __ => SKIP
                 }
                 elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 
@@ -926,6 +1105,7 @@ store: [
                 }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 
@@ -937,6 +1117,10 @@ store: [
 
     stale_response_policy: TEXT { canonical page id equality required }
     bridge_contract: NovyBridge/contract_summary()
+    bridge_provider_version: NovyBridge/provider_version()
+    bridge_schema_version: NovyBridge/schema_version()
+    bridge_effect_exports: NovyBridge/effect_exports_label()
+    bridge_data_policy: NovyBridge/data_policy_label()
 ]
 
 FUNCTION scoped_search_label(text, scope) {
@@ -974,46 +1158,23 @@ FUNCTION scoped_empty_search_label(scope) {
     }
 }
 
-FUNCTION bridge_page_descriptor(request_page) {
-    request_page |> WHEN {
-        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { CLK }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_CLK_FIT_CENTER_42_HEX }]
-        TEXT { PAGE_RESET_FIT_CENTER_42_HEX } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { RESET_N }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_RESET_FIT_CENTER_42_HEX }]
-        TEXT { PAGE_DATA_FIT_CENTER_42_HEX } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_DATA_FIT_CENTER_42_HEX }]
-        TEXT { PAGE_DATA_FIT_CENTER_42_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_FIT_CENTER_42_BIN }]
-        TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_CENTER_42_BIN }]
-        TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_42_BIN }]
-        TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor36 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN }]
-        TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor48 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_RIGHT_48_BIN }]
-        TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Close }, pan: TEXT { LeftWindow }, cursor: TEXT { Cursor42 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN }]
-        TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN } =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { Wide }, pan: TEXT { RightWindow }, cursor: TEXT { Cursor36 }, format: TEXT { Binary }, page: TEXT { PAGE_DATA_WIDE_RIGHT_36_BIN }]
-        TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX } =>
-            [scope: TEXT { TOP_ANALOG }, signal: TEXT { TEMPERATURE }, zoom: TEXT { Fit }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: TEXT { Hexadecimal }, page: TEXT { PAGE_ANALOG_TEMP_FIT_CENTER_42_HEX }]
-        __ =>
-            [scope: TEXT { TOP_CPU }, signal: TEXT { DATA_BUS }, zoom: TEXT { FormatOnly }, pan: TEXT { Center }, cursor: TEXT { Cursor42 }, format: request_page, page: request_page]
-    }
-}
-
 FUNCTION bridge_page_match_status(request, response) {
-    request == response |> WHEN {
-        True => TEXT { ACCEPTED_CURRENT_PAGE }
-        False => TEXT { REJECTED_STALE_PAGE }
+    request == TEXT { PAGE_UNAVAILABLE } |> WHEN {
+        True => TEXT { NOT_REQUESTED }
+        False => request == response |> WHEN {
+            True => TEXT { ACCEPTED_CURRENT_PAGE }
+            False => TEXT { REJECTED_STALE_PAGE }
+        }
     }
 }
 
 FUNCTION bridge_page_match_compact_label(request, response) {
-    request == response |> WHEN {
-        True => TEXT { CURRENT }
-        False => TEXT { STALE }
+    request == TEXT { PAGE_UNAVAILABLE } |> WHEN {
+        True => TEXT { NONE }
+        False => request == response |> WHEN {
+            True => TEXT { CURRENT }
+            False => TEXT { STALE }
+        }
     }
 }
 

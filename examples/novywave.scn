@@ -3,31 +3,35 @@ source = "examples/novywave/RUN.bn"
 
 [[step]]
 id = "initial-loaded-fixture"
-expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "fixture pages now; wellen.v1 pure-data bridge planned" }
+expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats", "bridge_effect_exports" = "open/hierarchy/signal/cursor/stats", "bridge_data_policy" = "comparable descriptors only; no Rust handles" }
+
+[[step]]
+id = "bridge-contract-descriptor"
+expect_root_text = { "bridge_provider_version" = "planned official wellen 0.24.x provider", "bridge_schema_version" = "wellen.v1 fixture schema draft; hashes required before live bridge", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_open_summary" = "fixture VCD wave:vcd:counter:0-240ns", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog", "bridge_file_stats_label" = "VCD 15 signals, 0-240ns, bounded pages", "bridge_cursor_values_label" = "clk=1 reset_n=1 data=0x2a temp=42C", "bridge_request_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal" }
 
 [[step]]
 id = "select-compare-fixture"
 user_action = { kind = "click", target = "file row", target_text = "- uart_compare.fst" }
 expected_source_event = { source = "store.elements.select_uart_compare_file", target_text = "- uart_compare.fst" }
-expect_root_text = { "active_file" = "uart_compare.fst", "compare_file" = "counter.vcd", "file_compare_status" = "comparing counter.vcd to uart_compare.fst", "compare_request_page" = "PAGE_COMPARE_COUNTER_UART", "compare_result_label" = "shared window: 0 ns - 240 ns, 2 files" }
+expect_root_text = { "active_file" = "uart_compare.fst", "compare_file" = "counter.vcd", "file_compare_status" = "comparing counter.vcd to uart_compare.fst", "compare_request_page" = "PAGE_COMPARE_COUNTER_UART", "compare_result_label" = "shared window: 0 ns - 240 ns, 2 files", "bridge_descriptor_file" = "uart_compare.fst", "bridge_file_format" = "FST", "bridge_waveform_ref" = "wave:fst:uart-compare:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_open_summary" = "fixture FST wave:fst:uart-compare:0-240ns", "bridge_hierarchy_page_label" = "HIER:top.uart compare page", "bridge_file_stats_label" = "FST 5 signals, 0-240ns, bounded pages" }
 
 [[step]]
 id = "select-primary-fixture"
 user_action = { kind = "click", target = "file row", target_text = "- counter.vcd" }
 expected_source_event = { source = "store.elements.select_counter_file", target_text = "- counter.vcd" }
-expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd" }
+expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY", "bridge_hierarchy_page_label" = "HIER:top.cpu/top.uart/top.analog" }
 
 [[step]]
 id = "select-ghw-fixture"
 user_action = { kind = "click", target = "file row", target_text = "- simple_test.ghw" }
 expected_source_event = { source = "store.elements.select_ghw_file", target_text = "- simple_test.ghw" }
-expect_root_text = { "active_file" = "simple_test.ghw", "compare_file" = "none", "file_compare_status" = "single fixture: simple_test.ghw", "compare_request_page" = "PAGE_GHW_SIMPLE_PRIMARY", "compare_result_label" = "primary page: simple_test.ghw, GHW fixture", "diagnostic_state" = "OK" }
+expect_root_text = { "active_file" = "simple_test.ghw", "compare_file" = "none", "file_compare_status" = "single fixture: simple_test.ghw", "compare_request_page" = "PAGE_GHW_SIMPLE_PRIMARY", "compare_result_label" = "primary page: simple_test.ghw, GHW fixture", "diagnostic_state" = "OK", "bridge_descriptor_file" = "simple_test.ghw", "bridge_file_format" = "GHW", "bridge_waveform_ref" = "wave:ghw:simple-test:0-100ns", "bridge_open_status" = "FIXTURE_READY", "bridge_open_summary" = "fixture GHW wave:ghw:simple-test:0-100ns", "bridge_hierarchy_page_label" = "HIER:ghw.simple/counter", "bridge_file_stats_label" = "GHW 4 signals, 0-100ns, bounded pages", "bridge_cursor_values_label" = "ghw_counter=3 at 42 ns" }
 
 [[step]]
 id = "return-primary-after-ghw"
 user_action = { kind = "click", target = "file row", target_text = "- counter.vcd" }
 expected_source_event = { source = "store.elements.select_counter_file", target_text = "- counter.vcd" }
-expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd" }
+expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd", "bridge_descriptor_file" = "counter.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:counter:0-240ns", "bridge_open_status" = "FIXTURE_READY" }
 
 [[step]]
 id = "select-uart-scope"
@@ -245,7 +249,7 @@ expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "ke
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_page" = "PAGE_DATA_CLOSE_LEFT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "canonical page id equality required" }
+expect_root_text = { "bridge_request_page" = "PAGE_DATA_CLOSE_LEFT_42_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_request_descriptor_label" = "TOP_CPU/DATA_BUS/Close/LeftWindow/Cursor42/Binary", "bridge_response_page" = "PAGE_CLK_FIT_CENTER_42_HEX", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_descriptor_label" = "TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "canonical page id equality required" }
 
 [[step]]
 id = "toggle-marker"
@@ -312,7 +316,7 @@ expect_root_text = { "mode" = "Light" }
 id = "probe-unsupported-fixture"
 user_action = { kind = "click", target = "diagnostic", target_text = "Probe" }
 expected_source_event = { source = "store.elements.diagnostic_probe", target_text = "Probe" }
-expect_root_text = { "diagnostic_state" = "Unsupported", "diagnostic_label" = "unsupported fixture: corrupted.vcd", "diagnostic_file" = "corrupted.vcd" }
+expect_root_text = { "diagnostic_state" = "Unsupported", "diagnostic_label" = "unsupported fixture: corrupted.vcd", "diagnostic_file" = "corrupted.vcd", "bridge_descriptor_file" = "corrupted.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "diagnostic:unsupported-corrupted-vcd", "bridge_open_status" = "DIAGNOSTIC", "bridge_open_summary" = "unsupported fixture: corrupted.vcd", "bridge_file_stats_label" = "no waveform stats" }
 
 [[step]]
 id = "select-primary-clears-diagnostic"
@@ -324,13 +328,13 @@ expect_root_text = { "active_file" = "counter.vcd", "diagnostic_state" = "OK", "
 id = "show-empty-state"
 user_action = { kind = "click", target = "empty" }
 expected_source_event = { source = "store.elements.show_empty" }
-expect_root_text = { "fixture_status" = "Empty", "diagnostic_state" = "Idle", "diagnostic_label" = "no file loaded" }
+expect_root_text = { "fixture_status" = "Empty", "diagnostic_state" = "Idle", "diagnostic_label" = "no file loaded", "bridge_descriptor_file" = "none", "bridge_open_status" = "NOT_REQUESTED", "bridge_waveform_ref" = "wave:none", "bridge_request_page" = "PAGE_UNAVAILABLE", "bridge_request_fingerprint" = "FP_NONE", "bridge_request_descriptor_label" = "No request scheduled", "bridge_response_page" = "PAGE_UNAVAILABLE", "bridge_response_fingerprint" = "FP_NONE", "bridge_response_descriptor_label" = "No response available", "bridge_response_status_compact_label" = "NONE", "bridge_response_status" = "NOT_REQUESTED", "empty_state_title" = "No waveform loaded", "empty_state_hint" = "Drop or load a VCD, FST, or GHW waveform to inspect signals.", "empty_state_bridge_label" = "Bridge state: no request scheduled; pure descriptor is wave:none", "empty_state_formats_label" = "Supported fixture contracts: VCD, FST, GHW" }
 
 [[step]]
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
+expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_descriptor_file" = "counter.vcd", "bridge_request_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_request_descriptor_label" = "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_descriptor_label" = "TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
 
 [[step]]
 id = "format-grouped-binary"

@@ -169,15 +169,23 @@ FUNCTION empty_state() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 14
+        gap: 16
         style: [
             width: Fill
             height: 650
             align: [row: Center]
-            padding: 80
+            padding: 72
             depth: 10
             move: [closer: 2]
-            rounded_corners: 18
+            rounded_corners: 0
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #101a2b }
+                Light => TEXT { #f8fbff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #2f80ed }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: TimelineGlass)
         ]
         items: LIST {
@@ -188,8 +196,12 @@ FUNCTION empty_state() {
                     width: Fill
                     height: 44
                     center: True
+                    color: PASSED.store.mode |> WHEN {
+                        Dark => TEXT { #dceaff }
+                        Light => TEXT { #172033 }
+                    }
                 ]
-                text: TEXT { No waveform loaded }
+                text: PASSED.store.empty_state_title
             )
             Scene/Element/text(
                 element: []
@@ -198,11 +210,53 @@ FUNCTION empty_state() {
                     width: Fill
                     height: 28
                     center: True
+                    color: PASSED.store.mode |> WHEN {
+                        Dark => TEXT { #dbeafe }
+                        Light => TEXT { #24364b }
+                    }
                 ]
-                text: TEXT { Load the generated counter fixture to inspect signals. }
+                text: PASSED.store.empty_state_hint
             )
+            empty_state_fact(label_text: PASSED.store.empty_state_bridge_label)
+            empty_state_fact(label_text: PASSED.store.empty_state_formats_label)
             empty_load_button()
         }
+    )
+}
+
+FUNCTION empty_state_fact(label_text) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 520
+            height: 34
+            padding: [left: 12, right: 12]
+            rounded_corners: 10
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0a1322 }
+                Light => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
+                }
+            ]
+            text: label_text
+        )
     )
 }
 
@@ -290,7 +344,7 @@ FUNCTION file_status_card() {
             items: LIST {
                 file_status_text(line_text: PASSED.store.file_compare_status, line_height: 17)
                 file_status_text(
-                    line_text: PASSED.store.file_status_detail
+                    line_text: PASSED.store.bridge_open_summary
                     line_height: 15
                 )
             }
@@ -2876,10 +2930,13 @@ FUNCTION inspector_panel() {
             inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
             inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label)
             inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.keyboard_viewport_label)
+            inspector_row(row_label: TEXT { Open result }, row_value: PASSED.store.bridge_waveform_ref)
+            inspector_row(row_label: TEXT { Hierarchy }, row_value: PASSED.store.bridge_hierarchy_page_label)
             inspector_row(row_label: TEXT { Fixture request }, row_value: PASSED.store.bridge_request_label)
             inspector_row(row_label: TEXT { Fixture page }, row_value: PASSED.store.bridge_response_fingerprint)
             inspector_row(row_label: TEXT { Fixture match }, row_value: PASSED.store.bridge_response_status)
-            inspector_row(row_label: TEXT { Bridge plan }, row_value: PASSED.store.bridge_contract)
+            inspector_row(row_label: TEXT { Cursor values }, row_value: PASSED.store.bridge_cursor_values_label)
+            inspector_row(row_label: TEXT { Bridge policy }, row_value: PASSED.store.bridge_data_policy)
             row_resize_controls()
         }
     )

@@ -1,9 +1,25 @@
 -- Thin pure-data bridge contract description. No Rust handles are Boon values.
 
 FUNCTION contract_summary() {
-    TEXT { fixture pages now; wellen.v1 pure-data bridge planned }
+    TEXT { wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats }
 }
 
 FUNCTION page_status() {
     TEXT { fixture-page: bridge-ready }
+}
+
+FUNCTION provider_version() {
+    TEXT { planned official wellen 0.24.x provider }
+}
+
+FUNCTION schema_version() {
+    TEXT { wellen.v1 fixture schema draft; hashes required before live bridge }
+}
+
+FUNCTION effect_exports_label() {
+    TEXT { open/hierarchy/signal/cursor/stats }
+}
+
+FUNCTION data_policy_label() {
+    TEXT { comparable descriptors only; no Rust handles }
 }

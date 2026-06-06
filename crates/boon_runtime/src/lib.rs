@@ -8072,10 +8072,14 @@ impl GenericCircuitRuntime {
         payload_address: Option<&'a str>,
         seq: TickSeq,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let Some(value) =
-            equations.eval_text(target, source, payload_key, payload_text, payload_address, |path| {
-                self.root_textlike(path).ok()
-            })?
+        let Some(value) = equations.eval_text(
+            target,
+            source,
+            payload_key,
+            payload_text,
+            payload_address,
+            |path| self.root_textlike(path).ok(),
+        )?
         else {
             return Err(format!(
                 "no supported scalar update branch for `{target}` from `{source}`"
@@ -11342,15 +11346,14 @@ impl ScalarEquationPlan {
         payload_address: Option<&'a str>,
         read_textlike: impl Fn(&str) -> Option<String> + Copy,
     ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let Some(value) =
-            self.eval_text_value(
-                target,
-                source,
-                payload_key,
-                payload_text,
-                payload_address,
-                read_textlike,
-            )?
+        let Some(value) = self.eval_text_value(
+            target,
+            source,
+            payload_key,
+            payload_text,
+            payload_address,
+            read_textlike,
+        )?
         else {
             return Ok(None);
         };
@@ -11420,9 +11423,20 @@ impl ScalarEquationPlan {
                 Ok(Some(ScalarTextValue::Text(Cow::Owned(value.to_string()))))
             }
             ScalarUpdateExpression::MatchConst { input, arms } => {
-                let current = read_textlike(input).ok_or_else(|| {
-                    format!("source `{source}` for `{target}` cannot read match input `{input}`")
-                })?;
+                let current = match source_payload_match_input(
+                    input,
+                    source,
+                    payload_key,
+                    payload_text,
+                    payload_address,
+                ) {
+                    Some(value) => Cow::Borrowed(value),
+                    None => Cow::Owned(read_textlike(input).ok_or_else(|| {
+                        format!(
+                            "source `{source}` for `{target}` cannot read match input `{input}`"
+                        )
+                    })?),
+                };
                 Ok(arms
                     .iter()
                     .find(|arm| arm.pattern == current)
@@ -11882,6 +11896,43 @@ impl ListProjectionPlan {
             .collect();
         Self { projections }
     }
+}
+
+fn source_payload_match_input<'a>(
+    input: &str,
+    source: &str,
+    payload_key: Option<&'a str>,
+    payload_text: Option<&'a str>,
+    payload_address: Option<&'a str>,
+) -> Option<&'a str> {
+    if source_payload_input_matches(
+        input,
+        source,
+        &[".key", ".event.key_down.key", ".key_down.key"],
+    ) {
+        return payload_key;
+    }
+    if source_payload_input_matches(
+        input,
+        source,
+        &[".text", ".event.change.text", ".change.text"],
+    ) {
+        return payload_text;
+    }
+    if source_payload_input_matches(input, source, &[".address", ".event.address"]) {
+        return payload_address;
+    }
+    None
+}
+
+fn source_payload_input_matches(input: &str, source: &str, suffixes: &[&str]) -> bool {
+    input
+        .strip_prefix(source)
+        .is_some_and(|suffix| suffixes.contains(&suffix))
+        || source
+            .strip_prefix("store.")
+            .and_then(|local| input.strip_prefix(local))
+            .is_some_and(|suffix| suffixes.contains(&suffix))
 }
 
 impl SourceRoutePlan {
@@ -15239,6 +15290,16 @@ store: [
                 sources.keyboard.key
             }
         }
+    pan_window:
+        TEXT { Center } |> HOLD pan_window {
+            LATEST {
+                sources.keyboard.key |> WHEN {
+                    A => TEXT { LeftWindow }
+                    D => TEXT { RightWindow }
+                    __ => SKIP
+                }
+            }
+        }
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }))
@@ -15274,8 +15335,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
             .unwrap();
 
         assert_eq!(output.state_summary["store"]["last_key"], "D");
+        assert_eq!(output.state_summary["store"]["pan_window"], "RightWindow");
         assert!(output.semantic_deltas.iter().any(|delta| {
             delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.last_key")
+        }));
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.pan_window")
         }));
     }
 

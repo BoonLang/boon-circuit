@@ -9,7 +9,7 @@ expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "view
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "signal_search_text" = "data" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "data" }
 
 [[step]]
 id = "select-data-bus"
@@ -33,7 +33,7 @@ expect_root_text = { "viewport_label" = "36 ns - 60 ns" }
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
 
 [[step]]
 id = "keyboard-cursor-left"
@@ -62,7 +62,7 @@ expect_root_text = { "row_size" = "Tall", "row_height" = "58" }
 [[step]]
 id = "switch-light"
 user_action = { kind = "click", target = "theme mode" }
-expected_source_event = { source = "store.elements.mode_toggle" }
+expected_source_event = { source = "store.elements.mode_to_light" }
 expect_root_text = { "mode" = "Light" }
 
 [[step]]
@@ -76,3 +76,9 @@ id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
 expect_root_text = { "fixture_status" = "Loaded" }
+
+[[step]]
+id = "switch-dark"
+user_action = { kind = "click", target = "theme mode" }
+expected_source_event = { source = "store.elements.mode_to_dark" }
+expect_root_text = { "mode" = "Dark" }

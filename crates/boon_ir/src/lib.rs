@@ -881,7 +881,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
                 branch.source
             ));
         }
-        verify_scheduled_update_expression(&branch.expression, &known_symbols)?;
+        verify_scheduled_update_expression(&branch.expression, &branch.source, &known_symbols)?;
     }
     for operation in &program.list_operations {
         if !list_names.contains(operation.list.as_str()) {
@@ -2214,7 +2214,11 @@ fn collect_canonical_element_source_bindings(
         );
     }
     for event_field in &element_field.children {
-        if let AstStatementKind::Source { field: Some(field), event } = &event_field.kind {
+        if let AstStatementKind::Source {
+            field: Some(field),
+            event,
+        } = &event_field.kind
+        {
             let attr = event.as_deref().unwrap_or(field.as_str());
             if let Some(value) = document_source_statement_value(event_field, expressions, context)
                 .or_else(|| {
@@ -2247,6 +2251,24 @@ fn collect_canonical_element_source_bindings(
             continue;
         }
         if document_statement_field(event_field).as_deref() != Some("event") {
+            continue;
+        }
+        if let Some(event_fields) = record_fields_for_statement(event_field, expressions) {
+            for source_field in event_fields {
+                let Some(value) =
+                    document_source_expr_value_by_id(source_field.value, expressions, context)
+                else {
+                    continue;
+                };
+                push_canonical_view_source_binding(
+                    node_kind,
+                    &source_field.name,
+                    &value,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                );
+            }
             continue;
         }
         for source_field in &event_field.children {
@@ -2390,9 +2412,10 @@ fn push_canonical_view_source_binding(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
 ) {
+    let normalized_value = normalized_document_source_path(value);
     if let Some((path, source_id)) = source_paths
         .iter()
-        .find(|(source_path, _)| *source_path == value)
+        .find(|(source_path, _)| *source_path == normalized_value)
     {
         let binding_attr = if attr == "key_down" { "submit" } else { attr };
         bindings.push(ViewBinding {
@@ -2739,6 +2762,7 @@ fn projection_field_name(path: &str) -> &str {
 
 fn verify_scheduled_update_expression(
     value: &UpdateExpression,
+    source: &str,
     known_symbols: &BTreeSet<&str>,
 ) -> Result<(), String> {
     match value {
@@ -2762,12 +2786,34 @@ fn verify_scheduled_update_expression(
             require_known_symbol("trim previous", previous, known_symbols)
         }
         UpdateExpression::MatchConst { input, .. } => {
-            require_known_symbol("match input", input, known_symbols)
+            if source_payload_input_matches(input, source) {
+                Ok(())
+            } else {
+                require_known_symbol("match input", input, known_symbols)
+            }
         }
         UpdateExpression::Unknown { summary } => Err(format!(
             "static schedule contains unsupported update expression `{summary}`"
         )),
     }
+}
+
+fn source_payload_input_matches(input: &str, source: &str) -> bool {
+    source_ref_variants(source).iter().any(|variant| {
+        input.strip_prefix(variant).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                ".key"
+                    | ".event.key_down.key"
+                    | ".key_down.key"
+                    | ".text"
+                    | ".event.change.text"
+                    | ".change.text"
+                    | ".address"
+                    | ".event.address"
+            )
+        })
+    })
 }
 
 fn verify_scheduled_list_operation(
@@ -4706,16 +4752,33 @@ fn match_const_update_expression(
         .ast_exprs
         .iter()
         .find_map(|expr| {
-            let AstExprKind::Then { input, .. } = expr.kind else {
+            let AstExprKind::When { input } = expr.kind else {
                 return None;
             };
-            (then_input_matches_source(field, input, source)
-                || branch
-                    .ast_exprs
-                    .iter()
-                    .any(|branch_expr| branch_expr.id == expr.id))
-            .then(|| match_const_update_expression_from_then_expr(field, target, expr.id))
-            .flatten()
+            expr_matches_source(field, input, source)
+                .then(|| match_const_update_expression_from_expr(field, target, expr.id))
+                .flatten()
+        })
+        .or_else(|| {
+            branch.ast_exprs.iter().find_map(|expr| {
+                matches!(expr.kind, AstExprKind::When { .. })
+                    .then(|| match_const_update_expression_from_expr(field, target, expr.id))
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            field.ast_exprs.iter().find_map(|expr| {
+                let AstExprKind::Then { input, .. } = expr.kind else {
+                    return None;
+                };
+                (then_input_matches_source(field, input, source)
+                    || branch
+                        .ast_exprs
+                        .iter()
+                        .any(|branch_expr| branch_expr.id == expr.id))
+                .then(|| match_const_update_expression_from_then_expr(field, target, expr.id))
+                .flatten()
+            })
         })
         .or_else(|| following_match_const_update_expression(field, target, source))
 }
@@ -5918,8 +5981,7 @@ scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
                 ),
                 (
                     "examples/novywave/Generated/NovyFixtures.bn".to_owned(),
-                    include_str!("../../../examples/novywave/Generated/NovyFixtures.bn")
-                        .to_owned(),
+                    include_str!("../../../examples/novywave/Generated/NovyFixtures.bn").to_owned(),
                 ),
                 (
                     "examples/novywave/Model/NovyModel.bn".to_owned(),

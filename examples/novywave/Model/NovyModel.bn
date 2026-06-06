@@ -55,14 +55,26 @@ FUNCTION row_height(size) {
 
 FUNCTION request_fingerprint(scope, signal, zoom, pan, cursor, format) {
     LIST { scope, signal, zoom, pan, cursor, format } |> WHEN {
-        LIST { TEXT { top.cpu }, TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { fp:cpu-clk-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { fp:cpu-reset-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { fp:cpu-data-fit-center-42-hex }
-        LIST { TEXT { top.cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
-            TEXT { fp:cpu-data-close-center-42-hex }
-        __ => TEXT { fp:structural-request }
+        LIST { TEXT { top_cpu }, TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
+            TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
+        LIST { TEXT { top_cpu }, TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
+            TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
+            TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
+            TEXT { FP_CPU_DATA_CLOSE_CENTER_42_HEX }
+        __ => TEXT { FP_STRUCTURAL_REQUEST }
+    }
+}
+
+FUNCTION request_label(signal, zoom, pan, format) {
+    LIST { signal, zoom, pan, format } |> WHEN {
+        LIST { TEXT { clk }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_CLK_FIT_HEX }
+        LIST { TEXT { reset_n }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_RESET_FIT_HEX }
+        LIST { TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Binary } } => TEXT { FP_DATA_CLOSE_RIGHT_BIN }
+        LIST { TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Binary } } => TEXT { FP_DATA_CLOSE_BIN }
+        LIST { TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_DATA_FIT_HEX }
+        LIST { TEXT { temperature }, TEXT { Fit }, TEXT { Center }, TEXT { Hexadecimal } } => TEXT { FP_TEMP_FIT_HEX }
+        __ => TEXT { FP_STRUCTURAL_REQUEST }
     }
 }

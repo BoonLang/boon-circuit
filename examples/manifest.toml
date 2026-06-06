@@ -259,6 +259,7 @@ input_scenarios = [
   "switch-light",
   "show-empty-state",
   "reload-fixture",
+  "switch-dark",
 ]
 scroll_focus_scenarios = []
 visual_artifacts = [

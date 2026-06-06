@@ -4,7 +4,8 @@ store: [
     elements: [
         load_fixture: SOURCE
         show_empty: SOURCE
-        mode_toggle: SOURCE
+        mode_to_light: SOURCE
+        mode_to_dark: SOURCE
         zoom_in: SOURCE
         zoom_out: SOURCE
         pan_left: SOURCE
@@ -36,7 +37,8 @@ store: [
     mode:
         LATEST {
             TEXT { Dark }
-            elements.mode_toggle.event.press |> THEN { TEXT { Light } }
+            elements.mode_to_light.event.press |> THEN { TEXT { Light } }
+            elements.mode_to_dark.event.press |> THEN { TEXT { Dark } }
         }
 
     active_scope:
@@ -63,7 +65,17 @@ store: [
         }
 
     search_result_label:
-        NovyFixtures/search_result(text: signal_search_text)
+        TEXT { clk, reset_n, data_bus, temperature } |> HOLD search_result_label {
+            LATEST {
+                elements.signal_search_input.text |> WHEN {
+                    data => TEXT { data }
+                    reset => TEXT { reset_n }
+                    temp => TEXT { temperature }
+                    clk => TEXT { clk }
+                    __ => TEXT { clk, reset_n, data_bus, temperature }
+                }
+            }
+        }
 
     keyboard_last_key:
         Text/empty() |> HOLD keyboard_last_key {
@@ -110,13 +122,15 @@ store: [
         }
 
     pan_window:
-        keyboard_last_key |> WHEN {
-            TEXT { A } => TEXT { LeftWindow }
-            TEXT { D } => TEXT { RightWindow }
-            __ => LATEST {
-                TEXT { Center }
+        TEXT { Center } |> HOLD pan_window {
+            LATEST {
                 elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
                 elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
+                elements.keyboard_capture.key |> WHEN {
+                    A => TEXT { LeftWindow }
+                    D => TEXT { RightWindow }
+                    __ => SKIP
+                }
             }
         }
 
@@ -176,14 +190,24 @@ store: [
         }
 
     bridge_request_fingerprint:
-        NovyModel/request_fingerprint(
-            scope: active_scope
-            signal: active_signal
-            zoom: zoom_level
-            pan: pan_window
-            cursor: cursor_position
-            format: value_format
-        )
+        TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_request_fingerprint {
+            LATEST {
+                elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
+                elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
+                elements.select_data.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX } }
+                elements.format_cycle.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN } }
+                elements.zoom_in.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN } }
+                elements.pan_right.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN } }
+                elements.keyboard_capture.key |> WHEN {
+                    D => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
+                    A => TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
+                    __ => SKIP
+                }
+            }
+        }
+
+    bridge_request_label:
+        bridge_request_fingerprint
 
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()

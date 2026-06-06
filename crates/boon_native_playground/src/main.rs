@@ -15397,7 +15397,34 @@ fn lower_canonical_child_elements(
     typecheck_report: &boon_typecheck::TypeCheckReport,
     scope_key: &str,
 ) {
-    for child in &statement.children {
+    for (child_index, child) in statement.children.iter().enumerate() {
+        if document_source_continuation_statement(child, expressions) {
+            continue;
+        }
+        if document_statement_can_render_entry(child, expressions, functions)
+            && let Some(source_path) = statement
+                .children
+                .get(child_index.saturating_add(1))
+                .filter(|next| document_source_continuation_statement(next, expressions))
+                .and_then(|next| document_source_pipe_path(next, expressions, context))
+        {
+            let mut scoped = context.clone();
+            scoped.source_override = Some(source_path);
+            lower_canonical_document_entry(
+                child,
+                expressions,
+                functions,
+                parent,
+                frame,
+                source_intents,
+                seen_ids,
+                &scoped,
+                typecheck_report,
+                scope_key,
+                false,
+            );
+            continue;
+        }
         if let Some(render_arg) = document_render_arg_statement(child, expressions, context) {
             lower_canonical_document_entry(
                 render_arg,
@@ -15611,6 +15638,23 @@ fn lower_canonical_child_elements(
             }
         }
     }
+}
+
+fn document_statement_can_render_entry(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    functions: &DocumentFunctionRegistry<'_>,
+) -> bool {
+    canonical_element_function(statement, expressions).is_some()
+        || document_call_function(statement, expressions)
+            .and_then(|function| functions.get(function))
+            .is_some()
+        || document_source_pipe_statement(statement, expressions)
+        || document_conditional_statement(statement, expressions)
+        || matches!(
+            document_field_name(statement).as_deref(),
+            Some("child" | "template" | "icon")
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18075,6 +18119,29 @@ fn lower_canonical_element_sources(
                             );
                         }
                         Some("event") => {
+                            if let Some(event_fields) =
+                                record_fields_for_statement(event, expressions)
+                            {
+                                for source_field in event_fields {
+                                    if let Some(source_path) = document_source_value_for_expr(
+                                        source_field.value,
+                                        expressions,
+                                        context,
+                                    )
+                                    .or_else(|| context.source_override.clone())
+                                    .filter(|path| !path.is_empty())
+                                    {
+                                        push_canonical_source_intent(
+                                            node_id,
+                                            node,
+                                            source_intents,
+                                            &source_field.name,
+                                            &source_path,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             for source in &event.children {
                                 let Some(intent) = document_field_name(source) else {
                                     continue;
@@ -18259,6 +18326,8 @@ fn source_paths_for_native_node_attr(
         .unwrap_or_default()
         .into_iter()
         .filter(|path| !path.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -18269,6 +18338,9 @@ fn push_native_node_kind_source_intents(
     node: &mut boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
 ) {
+    if node_kind == "TextInput" {
+        return;
+    }
     let prefix = (node_kind.to_owned(), String::new());
     let paths = context
         .source_binding_index
@@ -18281,7 +18353,15 @@ fn push_native_node_kind_source_intents(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut by_attr: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (attr, path) in paths {
+        by_attr.entry(attr).or_default().push(path);
+    }
+    for (attr, paths) in by_attr {
+        if paths.len() != 1 {
+            continue;
+        }
+        let path = paths[0];
         let intent = if attr == "submit" { "key_down" } else { attr };
         push_canonical_source_intent(node_id, node, source_intents, intent, path);
     }

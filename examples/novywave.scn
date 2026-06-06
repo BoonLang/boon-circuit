@@ -9,10 +9,41 @@ expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "view
 id = "row-select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]", target_key = 3, target_generation = 1, source_id = 5, bind_epoch = 5 }
 expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
+expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]", "active_signal_key" = "DATA_BUS", "bridge_request_fingerprint" = "FP_CPU_DATA_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "DATA_FIT" }
 expect_semantic_delta_contains = ["FieldSet:selected_once"]
 
 [[step]]
 id = "search-data"
+user_action = { kind = "type_text", target = "signal search", text = "data" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
+
+[[step]]
+id = "search-reset"
+user_action = { kind = "type_text", target = "signal search", text = "reset" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "reset" }
+expect_root_text = { "signal_search_text" = "reset", "search_result_label" = "1 result: reset_n" }
+
+[[step]]
+id = "search-temperature"
+user_action = { kind = "type_text", target = "signal search", text = "temp" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "temp" }
+expect_root_text = { "signal_search_text" = "temp", "search_result_label" = "1 result: temperature" }
+
+[[step]]
+id = "search-clock"
+user_action = { kind = "type_text", target = "signal search", text = "clk" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "clk" }
+expect_root_text = { "signal_search_text" = "clk", "search_result_label" = "1 result: clk" }
+
+[[step]]
+id = "search-empty-result"
+user_action = { kind = "type_text", target = "signal search", text = "zzz" }
+expected_source_event = { source = "store.elements.signal_search_input", text = "zzz" }
+expect_root_text = { "signal_search_text" = "zzz", "search_result_label" = "0 results: zzz" }
+
+[[step]]
+id = "search-data-again"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
 expect_root_text = { "signal_search_text" = "data", "search_result_label" = "4 results: data_bus[7:0], data_valid, data_ready, data_parity" }
@@ -36,6 +67,24 @@ expected_source_event = { source = "store.elements.zoom_in" }
 expect_root_text = { "viewport_label" = "36 ns - 60 ns", "keyboard_viewport_label" = "36 ns - 60 ns" }
 
 [[step]]
+id = "zoom-out"
+user_action = { kind = "click", target = "zoom out" }
+expected_source_event = { source = "store.elements.zoom_out" }
+expect_root_text = { "zoom_level" = "Wide", "viewport_label" = "0 ns - 240 ns", "keyboard_viewport_label" = "0 ns - 240 ns" }
+
+[[step]]
+id = "cursor-right"
+user_action = { kind = "click", target = "cursor right" }
+expected_source_event = { source = "store.elements.cursor_right" }
+expect_root_text = { "cursor_position" = "Cursor48", "cursor_label" = "48 ns" }
+
+[[step]]
+id = "pan-left"
+user_action = { kind = "click", target = "pan left" }
+expected_source_event = { source = "store.elements.pan_left" }
+expect_root_text = { "pan_window" = "LeftWindow", "viewport_label" = "24 ns - 48 ns", "keyboard_viewport_label" = "24 ns - 48 ns" }
+
+[[step]]
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
@@ -54,16 +103,35 @@ expected_source_event = { source = "store.elements.keyboard_capture", key = "S" 
 expect_root_text = { "keyboard_last_key" = "S", "keyboard_viewport_label" = "60 ns - 240 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN" }
 
 [[step]]
+id = "keyboard-zoom-close"
+user_action = { kind = "key_down", target = "keyboard capture", key = "W" }
+expected_source_event = { source = "store.elements.keyboard_capture", key = "W" }
+expect_root_text = { "keyboard_last_key" = "W", "zoom_level" = "Close", "keyboard_viewport_label" = "36 ns - 60 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_42_BIN" }
+
+[[step]]
+id = "keyboard-cursor-right"
+user_action = { kind = "key_down", target = "keyboard capture", key = "E" }
+expected_source_event = { source = "store.elements.keyboard_capture", key = "E" }
+expect_root_text = { "keyboard_last_key" = "E", "keyboard_cursor_label" = "48 ns", "cursor_position" = "Cursor48", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_48_BIN" }
+
+[[step]]
+id = "keyboard-pan-left"
+user_action = { kind = "key_down", target = "keyboard capture", key = "A" }
+expected_source_event = { source = "store.elements.keyboard_capture", key = "A" }
+expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "keyboard_viewport_label" = "24 ns - 48 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN" }
+
+[[step]]
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_WIDE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
+expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
 
 [[step]]
 id = "toggle-marker"
 user_action = { kind = "click", target = "marker" }
 expected_source_event = { source = "store.elements.marker_toggle" }
-expect_root_text = { "marker_visibility" = "Hidden", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+expect_root_text = { "marker_visibility" = "Hidden", "marker_to_add" = "36 ns", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
 id = "collapse-group"

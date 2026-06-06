@@ -402,6 +402,9 @@ pub enum UpdateExpression {
     PreviousValue {
         path: String,
     },
+    ReadPath {
+        path: String,
+    },
     TextTrimOrPrevious {
         path: String,
         previous: String,
@@ -2776,7 +2779,9 @@ fn verify_scheduled_update_expression(
             }
             Ok(())
         }
-        UpdateExpression::PreviousValue { path } | UpdateExpression::BoolNot { path } => {
+        UpdateExpression::PreviousValue { path }
+        | UpdateExpression::ReadPath { path }
+        | UpdateExpression::BoolNot { path } => {
             require_known_symbol("update expression path", path, known_symbols)
         }
         UpdateExpression::TextTrimOrPrevious { path, previous } => {
@@ -3022,7 +3027,9 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::SourcePayload { path } => {
             reject_hidden_identity_identifier("source payload", path)
         }
-        UpdateExpression::PreviousValue { path } | UpdateExpression::BoolNot { path } => {
+        UpdateExpression::PreviousValue { path }
+        | UpdateExpression::ReadPath { path }
+        | UpdateExpression::BoolNot { path } => {
             reject_hidden_identity_identifier("update expression path", path)
         }
         UpdateExpression::TextTrimOrPrevious { path, previous } => {
@@ -4013,6 +4020,33 @@ fn ast_simple_update_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SimpleThenUpdateValue {
+    Const(String),
+    Path(String),
+}
+
+fn ast_simple_then_update_value_in_exprs(
+    exprs: &[AstExpr],
+    expr_id: usize,
+) -> Option<SimpleThenUpdateValue> {
+    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(value) => Some(SimpleThenUpdateValue::Path(value.clone())),
+        AstExprKind::Path(parts) if !parts.is_empty() => {
+            Some(SimpleThenUpdateValue::Path(parts.join(".")))
+        }
+        AstExprKind::Enum(value)
+        | AstExprKind::Tag(value)
+        | AstExprKind::Number(value)
+        | AstExprKind::StringLiteral(value)
+        | AstExprKind::TextLiteral(value) => Some(SimpleThenUpdateValue::Const(value.clone())),
+        AstExprKind::Bool(true) => Some(SimpleThenUpdateValue::Const("True".to_owned())),
+        AstExprKind::Bool(false) => Some(SimpleThenUpdateValue::Const("False".to_owned())),
+        _ => None,
+    }
+}
+
 fn list_append_trigger(field: &FieldDef) -> Option<String> {
     let AstExprKind::Pipe { args, .. } = &list_append_expr(field)?.kind else {
         return None;
@@ -4698,15 +4732,16 @@ fn update_expression_for_source(
     if let Some(expression) = branch.then_number_infix_expression(field, target) {
         return expression;
     }
+    if let Some(value) = branch.then_simple_update_value() {
+        return match value {
+            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
+            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
+                path: canonical_scalar_update_path(field, target, &path),
+            },
+        };
+    }
     if let Some(expression) = match_const_update_expression(field, target, source, &branch) {
         return expression;
-    }
-    if let Some(value) = branch.then_simple_value() {
-        return if value_starts_lowercase_identifier(&value) {
-            UpdateExpression::PreviousValue { path: value }
-        } else {
-            UpdateExpression::Const { value }
-        };
     }
     if variants
         .iter()
@@ -5204,19 +5239,19 @@ impl RoutedBranch {
         })
     }
 
-    fn then_simple_value(&self) -> Option<String> {
+    fn then_simple_update_value(&self) -> Option<SimpleThenUpdateValue> {
         self.ast_exprs.iter().find_map(|expr| {
             let AstExprKind::Then { output, .. } = expr.kind else {
                 return None;
             };
             if let Some(output) = output {
-                return ast_simple_update_value_in_exprs(&self.ast_exprs, output);
+                return ast_simple_then_update_value_in_exprs(&self.ast_exprs, output);
             }
             self.ast_exprs
                 .iter()
                 .filter(|candidate| candidate.line > expr.line)
                 .find_map(|candidate| {
-                    ast_simple_update_value_in_exprs(&self.ast_exprs, candidate.id)
+                    ast_simple_then_update_value_in_exprs(&self.ast_exprs, candidate.id)
                 })
         })
     }
@@ -6673,6 +6708,82 @@ FUNCTION new_todo(todo) {
             changed.sources,
             vec!["store.sources.real_button.press".to_owned()]
         );
+    }
+
+    #[test]
+    fn lower_case_text_literals_in_then_outputs_are_update_constants() {
+        let source = r#"
+store: [
+    sources: [
+        select_clk: SOURCE
+    ]
+    active_signal:
+        TEXT { reset_n } |> HOLD active_signal {
+            LATEST {
+                sources.select_clk.event.press |> THEN { TEXT { clk } }
+            }
+        }
+]
+"#;
+        let parsed = boon_parser::parse_source("lowercase-text-then-const.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| branch.target == "store.active_signal")
+            .expect("active signal update branch");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::Const {
+                value: "clk".to_owned()
+            }
+        );
+        assert!(ir.static_schedule_verified);
+    }
+
+    #[test]
+    fn row_path_then_outputs_are_update_path_reads_not_previous_values() {
+        let source = r#"
+store: [
+    rows:
+        LIST {
+            [key: TEXT { clk }]
+        }
+        |> List/map(row, new: new_row(row: row))
+    active:
+        TEXT { reset_n } |> HOLD active {
+            LATEST {
+                rows
+                    |> List/map(row, new: LATEST {
+                        row.sources.select.event.press |> THEN { row.key }
+                    })
+                    |> List/latest()
+            }
+        }
+]
+FUNCTION new_row(row) {
+    [
+        sources: [
+            select: SOURCE
+        ]
+        key: row.key
+    ]
+}
+"#;
+        let parsed = boon_parser::parse_source("row-path-then-read.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let branch = ir
+            .update_branches
+            .iter()
+            .find(|branch| branch.target == "store.active" && branch.source == "row.sources.select")
+            .expect("row source active update branch");
+        assert_eq!(
+            branch.expression,
+            UpdateExpression::ReadPath {
+                path: "row.key".to_owned()
+            }
+        );
+        assert!(ir.static_schedule_verified);
     }
 
     #[test]

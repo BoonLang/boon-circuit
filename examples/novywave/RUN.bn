@@ -56,12 +56,19 @@ store: [
         }
 
     active_signal:
-        LATEST {
-            TEXT { clk }
+        TEXT { clk } |> HOLD active_signal {
+            LATEST {
+            signal_catalog
+                |> List/map(signal_catalog_item, new: LATEST {
+                    signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN { signal_catalog_item.key }
+                })
+                |> List/latest()
             elements.select_clk.event.press |> THEN { TEXT { clk } }
             elements.select_reset.event.press |> THEN { TEXT { reset_n } }
             elements.select_data.event.press |> THEN { TEXT { data_bus } }
             elements.select_temperature.event.press |> THEN { TEXT { temperature } }
+            }
         }
 
     signal_catalog:
@@ -102,13 +109,21 @@ store: [
         }
 
     search_result_label:
-        signal_search_text |> WHEN {
-            data => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
-            reset => TEXT { 1 result: reset_n }
-            temp => TEXT { 1 result: temperature }
-            clk => TEXT { 1 result: clk }
-            zzz => TEXT { 0 results: zzz }
-            __ => TEXT { 4 results: clk, reset_n, data_bus, temperature }
+        signal_search_text == TEXT { data } |> WHEN {
+            True => TEXT { 4 results: data_bus[7:0], data_valid, data_ready, data_parity }
+            False => signal_search_text == TEXT { reset } |> WHEN {
+                True => TEXT { 1 result: reset_n }
+                False => signal_search_text == TEXT { temp } |> WHEN {
+                    True => TEXT { 1 result: temperature }
+                    False => signal_search_text == TEXT { clk } |> WHEN {
+                        True => TEXT { 1 result: clk }
+                        False => signal_search_text == TEXT { zzz } |> WHEN {
+                            True => TEXT { 0 results: zzz }
+                            False => TEXT { 4 results: clk, reset_n, data_bus, temperature }
+                        }
+                    }
+                }
+            }
         }
 
     keyboard_last_key:
@@ -132,9 +147,7 @@ store: [
         }
 
     marker_to_add:
-        elements.marker_toggle.event.press |> THEN {
-            cursor_label |> Text/trim()
-        }
+        elements.marker_toggle.event.press |> THEN { keyboard_cursor_label }
 
     markers:
         LIST {
@@ -143,7 +156,7 @@ store: [
         |> List/append(item: marker_to_add |> THEN {
             [label: marker_to_add]
         })
-        |> List/map(marker, new: new_marker(label: marker.label))
+        |> List/map(marker, new: new_marker(marker: marker))
         |> List/remove(marker, when:
             marker.marker_elements.remove_marker.event.press |> THEN { True }
         )
@@ -169,16 +182,19 @@ store: [
         }
 
     zoom_level:
-        LATEST {
-            TEXT { Fit }
-            elements.zoom_in.event.press |> THEN { TEXT { Close } }
-            elements.zoom_out.event.press |> THEN { TEXT { Wide } }
-            elements.keyboard_capture.key |> WHEN {
-                W => TEXT { Close }
-                S => TEXT { Wide }
-                D => TEXT { Close }
-                Q => TEXT { Close }
-                __ => SKIP
+        TEXT { Fit } |> HOLD zoom_level {
+            LATEST {
+                elements.zoom_in.event.press |> THEN { TEXT { Close } }
+                elements.zoom_out.event.press |> THEN { TEXT { Wide } }
+                elements.keyboard_capture.key |> WHEN {
+                    W => TEXT { Close }
+                    S => TEXT { Wide }
+                    D => TEXT { Close }
+                    Q => TEXT { Close }
+                    E => TEXT { Close }
+                    A => TEXT { Close }
+                    __ => SKIP
+                }
             }
         }
 
@@ -191,7 +207,9 @@ store: [
                     A => TEXT { LeftWindow }
                     D => TEXT { RightWindow }
                     Q => TEXT { RightWindow }
+                    W => TEXT { RightWindow }
                     S => TEXT { RightWindow }
+                    E => TEXT { RightWindow }
                     __ => SKIP
                 }
             }
@@ -255,19 +273,36 @@ store: [
                 D => TEXT { 42 ns }
                 Q => TEXT { 36 ns }
                 S => TEXT { 36 ns }
+                W => TEXT { 36 ns }
                 E => TEXT { 48 ns }
+                A => TEXT { 36 ns }
                 __ => SKIP
             }
             }
         }
 
     active_signal_label:
-        LATEST {
-            TEXT { top.cpu.clk }
-            elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
-            elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
-            elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
-            elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
+        TEXT { top.cpu.clk } |> HOLD active_signal_label {
+            LATEST {
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { top.cpu.clk }
+                                reset_n => TEXT { top.cpu.reset_n }
+                                data_bus => TEXT { top.cpu.data_bus[7:0] }
+                                temperature => TEXT { top.analog.temperature }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
+                elements.select_clk.event.press |> THEN { TEXT { top.cpu.clk } }
+                elements.select_reset.event.press |> THEN { TEXT { top.cpu.reset_n } }
+                elements.select_data.event.press |> THEN { TEXT { top.cpu.data_bus[7:0] } }
+                elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
+            }
         }
 
     active_scope_key:
@@ -278,12 +313,27 @@ store: [
         }
 
     active_signal_key:
-        LATEST {
-            TEXT { CLK }
-            elements.select_clk.event.press |> THEN { TEXT { CLK } }
-            elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
-            elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
-            elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+        TEXT { CLK } |> HOLD active_signal_key {
+            LATEST {
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { CLK }
+                                reset_n => TEXT { RESET_N }
+                                data_bus => TEXT { DATA_BUS }
+                                temperature => TEXT { TEMPERATURE }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
+                elements.select_clk.event.press |> THEN { TEXT { CLK } }
+                elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
+                elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
+                elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+            }
         }
 
     format_label:
@@ -312,6 +362,20 @@ store: [
                 elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
                 elements.select_data.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX } }
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
+                                reset_n => TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX }
+                                data_bus => TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
+                                temperature => TEXT { FP_ANALOG_TEMP_FIT_CENTER_42_HEX }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
                 elements.format_cycle.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN } }
                 elements.format_hex.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_HEX } }
                 elements.format_grouped.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_GROUPED_BIN } }
@@ -424,6 +488,20 @@ store: [
                 elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
                 elements.select_data.event.press |> THEN { TEXT { DATA_FIT } }
+                signal_catalog
+                    |> List/map(signal_catalog_item, new:
+                        signal_catalog_item.signal_elements.select_signal.event.press
+                        |> THEN {
+                            signal_catalog_item.key |> WHEN {
+                                clk => TEXT { CLK_FIT }
+                                reset_n => TEXT { RESET_FIT }
+                                data_bus => TEXT { DATA_FIT }
+                                temperature => TEXT { TEMP_FIT }
+                                __ => SKIP
+                            }
+                        }
+                    )
+                    |> List/latest()
                 elements.format_cycle.event.press |> THEN { TEXT { DATA_BIN } }
                 elements.format_hex.event.press |> THEN { TEXT { DATA_HEX } }
                 elements.format_grouped.event.press |> THEN { TEXT { DATA_GROUP } }
@@ -457,6 +535,7 @@ store: [
                     S => TEXT { DATA_36NS }
                     W => TEXT { DATA_36NS }
                     E => TEXT { DATA_36NS }
+                    A => TEXT { DATA_36NS }
                     __ => SKIP
                 }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
@@ -489,6 +568,7 @@ store: [
                     S => TEXT { CURRENT }
                     W => TEXT { CURRENT }
                     E => TEXT { CURRENT }
+                    A => TEXT { CURRENT }
                     __ => SKIP
                 }
                 elements.format_hex.event.press |> THEN { TEXT { STALE } }
@@ -533,12 +613,12 @@ FUNCTION new_signal(signal) {
     ]
 }
 
-FUNCTION new_marker(label) {
+FUNCTION new_marker(marker) {
     [
         marker_elements: [
             remove_marker: SOURCE
         ]
-        label: label
+        label: marker.label
     ]
 }
 

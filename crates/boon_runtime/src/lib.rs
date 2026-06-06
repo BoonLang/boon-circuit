@@ -1948,6 +1948,7 @@ impl RuntimeSymbols {
                 UpdateExpression::SourcePayload { path }
                 | UpdateExpression::Const { value: path }
                 | UpdateExpression::PreviousValue { path }
+                | UpdateExpression::ReadPath { path }
                 | UpdateExpression::BoolNot { path } => {
                     symbols.intern(path);
                 }
@@ -5155,23 +5156,42 @@ impl GenericScheduledRuntime {
                             )? {
                                 observe(GenericSourceMutation::RootBool(commit))?;
                             }
-                        } else if let Some(commit) = self.storage.apply_root_text_source(
-                            &self.scalar_equations,
-                            &target,
-                            input.source,
-                            input.key,
-                            input.text,
-                            input.address,
-                            input.seq,
-                        )? {
+                        } else if let Some(commit) =
+                            self.apply_root_text_source_with_row_context(&target, &input)?
+                        {
                             observe(GenericSourceMutation::RootText(GenericRootTextCommit {
                                 target,
                                 value: commit,
                             }))?;
+                            for commit in self.materialize_root_derived_field_commits()? {
+                                observe(GenericSourceMutation::RootText(commit))?;
+                            }
                         }
                     }
                 }
-                SourceAction::DerivedText { .. } => {}
+                SourceAction::DerivedText { target } => {
+                    if let Some(value) = self.storage.eval_derived_text_transform(
+                        &self.derived_equations,
+                        target,
+                        input.source,
+                        input.key,
+                        input.text,
+                    )? {
+                        let current = self.storage.root.textlike(target);
+                        if current != Some(value.as_ref()) {
+                            self.storage
+                                .root
+                                .insert_value(target.clone(), FieldValue::Text(value.to_string()));
+                            observe(GenericSourceMutation::RootText(GenericRootTextCommit {
+                                target: target.clone(),
+                                value,
+                            }))?;
+                            for commit in self.materialize_root_derived_field_commits()? {
+                                observe(GenericSourceMutation::RootText(commit))?;
+                            }
+                        }
+                    }
+                }
                 SourceAction::RootTextTransform { target, value } => {
                     let current = self.storage.root.textlike(target);
                     if current != Some(value.as_str()) {
@@ -5365,6 +5385,53 @@ impl GenericScheduledRuntime {
         Ok(())
     }
 
+    fn apply_root_text_source_with_row_context<'a>(
+        &mut self,
+        target: &str,
+        input: &GenericSourceActionInput<'a>,
+    ) -> RuntimeResult<Option<Cow<'a, str>>> {
+        let Some(value) = self.scalar_equations.eval_text(
+            target,
+            input.source,
+            input.key,
+            input.text,
+            input.address,
+            |path| self.textlike_with_row_context(path, input.list.as_deref(), input.index),
+        )?
+        else {
+            return Err(format!(
+                "no supported scalar update branch for `{target}` from `{}`",
+                input.source
+            )
+            .into());
+        };
+        let Some(candidate) = then_value(EventPulse::present(input.seq), value) else {
+            return Ok(None);
+        };
+        self.storage.commit_root_text_candidate(target, candidate)
+    }
+
+    fn textlike_with_row_context(
+        &self,
+        path: &str,
+        list: Option<&str>,
+        index: Option<usize>,
+    ) -> Option<String> {
+        if let Ok(value) = self.storage.root_textlike(path) {
+            return Some(value);
+        }
+        let (Some(list), Some(index)) = (list, index) else {
+            return None;
+        };
+        let (row_scope, field) = path.split_once('.')?;
+        if self.list_source_bindings.list_for_row_scope(row_scope)? != list {
+            return None;
+        }
+        self.storage
+            .list_row_textlike_opt(list, index, field)
+            .map(str::to_owned)
+    }
+
     fn recompute_generic_derived_for_row(
         &mut self,
         list: &str,
@@ -5537,8 +5604,11 @@ impl GenericScheduledRuntime {
         step: &ScenarioStep,
         source_event: GenericSourceEvent<'_>,
     ) -> RuntimeResult<Option<usize>> {
-        match self.resolve_bound_source_index(list, step.user_action.as_ref(), Some(source_event))?
-        {
+        match self.resolve_bound_source_index(
+            list,
+            step.user_action.as_ref(),
+            Some(source_event),
+        )? {
             GenericBoundSourceIndex::Bound(index) => return Ok(Some(index)),
             GenericBoundSourceIndex::Stale => {
                 return Err(format!(
@@ -5642,6 +5712,7 @@ impl GenericScheduledRuntime {
         let mut commits = Vec::new();
         for field in fields {
             if field.kind == DerivedValueKind::SourceEventTransform
+                && field.has_sources
                 && self.storage.root.textlike(&field.path).is_some()
             {
                 continue;
@@ -8703,6 +8774,10 @@ impl GenericCircuitRuntime {
                 }
                 Ok(IndexedTextCandidate::PreviousText(Cow::Borrowed(value)))
             }
+            ScalarUpdateExpression::ReadPath(path) => Err(format!(
+                "indexed text update `{target}` from `{source}` cannot read path `{path}`"
+            )
+            .into()),
             ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
                 let raw = match path.as_str() {
                     "text" => {
@@ -10030,6 +10105,7 @@ enum ScalarUpdateExpression {
         right: String,
     },
     PreviousValue(String),
+    ReadPath(String),
     TextTrimOrPrevious {
         path: String,
         previous: String,
@@ -10755,6 +10831,7 @@ struct GenericDerivedPlan {
 struct GenericDerivedRootField {
     path: String,
     kind: DerivedValueKind,
+    has_sources: bool,
     statement: AstStatement,
 }
 
@@ -10937,6 +11014,7 @@ struct RuntimeDerivedTextTransform {
 enum RuntimeDerivedTextExpression {
     EnterKeyPayloadTextTrimNonEmpty,
     EnterKeyRootTextTrimNonEmpty { path: String },
+    SourceRootText { path: String },
     Unsupported,
 }
 
@@ -10946,7 +11024,15 @@ fn source_event_transform_text_expression(
 ) -> RuntimeDerivedTextExpression {
     let exprs = statement_ast_exprs(&value.statement, expressions);
     let Some(path) = text_trim_input_path_from_exprs(&exprs) else {
-        return RuntimeDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty;
+        let Some(source) = value.sources.first() else {
+            return RuntimeDerivedTextExpression::Unsupported;
+        };
+        let Some(path) = source_then_text_value(&exprs, source) else {
+            return RuntimeDerivedTextExpression::Unsupported;
+        };
+        return RuntimeDerivedTextExpression::SourceRootText {
+            path: canonical_transform_text_path(&value.path, &path),
+        };
     };
     if path == "text"
         || path.ends_with(".text")
@@ -11327,6 +11413,9 @@ impl ScalarEquationPlan {
                     UpdateExpression::PreviousValue { path } => {
                         ScalarUpdateExpression::PreviousValue(path.clone())
                     }
+                    UpdateExpression::ReadPath { path } => {
+                        ScalarUpdateExpression::ReadPath(path.clone())
+                    }
                     UpdateExpression::TextTrimOrPrevious { path, previous } => {
                         ScalarUpdateExpression::TextTrimOrPrevious {
                             path: path.clone(),
@@ -11455,6 +11544,16 @@ impl ScalarEquationPlan {
                     .map(|arm| ScalarTextValue::Text(Cow::Owned(arm.output.clone()))))
             }
             ScalarUpdateExpression::PreviousValue(_) => Ok(Some(ScalarTextValue::PreviousValue)),
+            ScalarUpdateExpression::ReadPath(path) => {
+                if let Some(value) = read_textlike(path) {
+                    Ok(Some(ScalarTextValue::Text(Cow::Owned(value))))
+                } else {
+                    Err(
+                        format!("source `{source}` for `{target}` cannot read path `{path}`")
+                            .into(),
+                    )
+                }
+            }
             ScalarUpdateExpression::TextTrimOrPrevious { .. }
             | ScalarUpdateExpression::BoolNot(_) => Ok(None),
             ScalarUpdateExpression::Unsupported => Ok(None),
@@ -11576,6 +11675,15 @@ impl DerivedEquationPlan {
                 let trimmed = text.trim().to_owned();
                 Ok((!trimmed.is_empty()).then_some(Cow::Owned(trimmed)))
             }
+            RuntimeDerivedTextExpression::SourceRootText { path } => {
+                let text = read_root_text(path).ok_or_else(|| {
+                    format!(
+                        "derived text transform `{target}` from `{source}` requires root text `{path}`"
+                    )
+                })?;
+                let trimmed = text.trim().to_owned();
+                Ok((!trimmed.is_empty()).then_some(Cow::Owned(trimmed)))
+            }
             RuntimeDerivedTextExpression::Unsupported => Err(format!(
                 "derived text transform `{target}` from `{source}` is unsupported"
             )
@@ -11605,6 +11713,7 @@ impl GenericDerivedPlan {
             .map(|value| GenericDerivedRootField {
                 path: value.path.clone(),
                 kind: value.kind.clone(),
+                has_sources: !value.sources.is_empty(),
                 statement: value.statement.clone(),
             })
             .collect();
@@ -12232,8 +12341,21 @@ fn root_text_transform_targets_from_ir(
     ir: &TypedProgram,
 ) -> RuntimeResult<Vec<SourceRouteRootTextTransform>> {
     let mut targets = Vec::new();
+    let append_triggers = ir
+        .list_operations
+        .iter()
+        .filter_map(|operation| match &operation.kind {
+            ListOperationKind::Append { trigger, .. } => Some(trigger.as_str()),
+            ListOperationKind::Remove { .. }
+            | ListOperationKind::Retain { .. }
+            | ListOperationKind::Count { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
     for value in &ir.derived_values {
         if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
+            continue;
+        }
+        if append_triggers.contains(value.path.as_str()) {
             continue;
         }
         let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
@@ -12442,6 +12564,7 @@ impl SourceRoute {
                     ScalarUpdateExpression::PreviousValue(_) => {
                         SourceRouteTextAction::PreviousValue
                     }
+                    ScalarUpdateExpression::ReadPath(_) => return None,
                     ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
                         SourceRouteTextAction::TextTrimOrPrevious
                     }
@@ -12474,6 +12597,7 @@ impl SourceRoute {
                     | ScalarUpdateExpression::Const(_)
                     | ScalarUpdateExpression::NumberInfix { .. }
                     | ScalarUpdateExpression::PreviousValue(_)
+                    | ScalarUpdateExpression::ReadPath(_)
                     | ScalarUpdateExpression::TextTrimOrPrevious { .. }
                     | ScalarUpdateExpression::MatchConst { .. }
                     | ScalarUpdateExpression::Unsupported => return None,

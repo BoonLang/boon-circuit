@@ -9,7 +9,7 @@ expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "view
 id = "search-data"
 user_action = { kind = "type_text", target = "signal search", text = "data" }
 expected_source_event = { source = "store.elements.signal_search_input", text = "data" }
-expect_root_text = { "signal_search_text" = "data", "search_result_label" = "data" }
+expect_root_text = { "signal_search_text" = "data", "search_result_label" = "1 result: data_bus[7:0]" }
 
 [[step]]
 id = "select-data-bus"
@@ -39,7 +39,7 @@ expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "b
 id = "keyboard-cursor-left"
 user_action = { kind = "click", target = "cursor left" }
 expected_source_event = { source = "store.elements.cursor_left" }
-expect_root_text = { "cursor_label" = "36 ns" }
+expect_root_text = { "cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN" }
 
 [[step]]
 id = "toggle-marker"

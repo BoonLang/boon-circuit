@@ -65,16 +65,13 @@ store: [
         }
 
     search_result_label:
-        TEXT { clk, reset_n, data_bus, temperature } |> HOLD search_result_label {
-            LATEST {
-                elements.signal_search_input.text |> WHEN {
-                    data => TEXT { data }
-                    reset => TEXT { reset_n }
-                    temp => TEXT { temperature }
-                    clk => TEXT { clk }
-                    __ => TEXT { clk, reset_n, data_bus, temperature }
-                }
-            }
+        signal_search_text |> WHEN {
+            data => TEXT { 1 result: data_bus[7:0] }
+            reset => TEXT { 1 result: reset_n }
+            temp => TEXT { 1 result: temperature }
+            clk => TEXT { 1 result: clk }
+            zzz => TEXT { 0 results: zzz }
+            __ => TEXT { 4 results: clk, reset_n, data_bus, temperature }
         }
 
     keyboard_last_key:
@@ -199,6 +196,7 @@ store: [
                 elements.format_cycle.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN } }
                 elements.zoom_in.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN } }
                 elements.pan_right.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN } }
+                elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.keyboard_capture.key |> WHEN {
                     D => TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
                     A => TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }

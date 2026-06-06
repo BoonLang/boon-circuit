@@ -211,8 +211,6 @@ FUNCTION left_panel() {
             load_files_button()
             files_list()
             search_box()
-            scope_cpu_button()
-            scope_uart_button()
         }
     )
 }
@@ -526,6 +524,7 @@ FUNCTION axis_tick(label) {
             width: 120
             height: 18
             center: True
+            color: TEXT { #90A4BF }
         ]
         text: label
     )
@@ -650,7 +649,7 @@ FUNCTION waveform_row_clk() {
             items: LIST {
                 fixed_signal_label(label_text: NovyFixtures/selected_clk_name())
                 fixed_value_clk()
-                fixed_wave_area(signal_id: TEXT { clk })
+                fixed_wave_area_clk()
             }
         )
     }
@@ -679,7 +678,7 @@ FUNCTION waveform_row_reset() {
             items: LIST {
                 fixed_signal_label(label_text: NovyFixtures/selected_reset_name())
                 fixed_value_reset()
-                fixed_wave_area(signal_id: TEXT { reset_n })
+                fixed_wave_area_reset()
             }
         )
     }
@@ -708,7 +707,7 @@ FUNCTION waveform_row_data() {
             items: LIST {
                 fixed_signal_label(label_text: NovyFixtures/selected_data_name())
                 fixed_value_data()
-                fixed_wave_area(signal_id: TEXT { data_bus })
+                fixed_wave_area_data()
             }
         )
     }
@@ -737,7 +736,7 @@ FUNCTION waveform_row_temperature() {
             items: LIST {
                 fixed_signal_label(label_text: NovyFixtures/selected_temperature_name())
                 fixed_value_temperature()
-                fixed_wave_area(signal_id: TEXT { temperature })
+                fixed_wave_area_temperature()
             }
         )
     }
@@ -905,6 +904,459 @@ FUNCTION fixed_wave_area(signal_id) {
     )
 }
 
+FUNCTION fixed_wave_area_clk() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1D4ED8 }]
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            wave_cell_high(width_value: 32, label_text: TEXT { 1 })
+            wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+        }
+    )
+}
+
+FUNCTION fixed_wave_area_reset() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1D4ED8 }]
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            wave_cell_low(width_value: 110, label_text: TEXT { reset })
+            wave_cell_high(width_value: 464, label_text: TEXT { released })
+        }
+    )
+}
+
+FUNCTION fixed_wave_area_data() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 1
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 4, bottom: 4, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1D4ED8 }]
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            data_bus_cells_row()
+            data_bus_value_labels()
+        }
+    )
+}
+
+FUNCTION data_bus_cells_row() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [width: Fill, height: 22, paint: False]
+        items: LIST {
+            waveform_cursor_line()
+            data_bus_cell_xx()
+            data_bus_cell_0x12()
+            data_bus_cell_0x00()
+            data_bus_cell_0x2a()
+            data_bus_cell_0x08()
+            data_bus_cell_0xff()
+            data_bus_cell_zz()
+        }
+    )
+}
+
+FUNCTION data_bus_value_labels() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [width: Fill, height: 14, paint: False]
+        items: LIST {
+            data_bus_label_cursor_spacer()
+            data_bus_label_xx()
+            data_bus_label_0x12()
+            data_bus_label_0x00()
+            data_bus_label_0x2a()
+            data_bus_label_0x08()
+            data_bus_label_0xff()
+            data_bus_label_zz()
+        }
+    )
+}
+
+FUNCTION fixed_wave_area_temperature() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1D4ED8 }]
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
+        items: LIST {
+            waveform_cursor_line()
+            wave_cell_analog_low(width_value: 64, label_text: TEXT { 39 })
+            wave_cell_analog_mid(width_value: 64, label_text: TEXT { 41 })
+            wave_cell_analog_high(width_value: 64, label_text: TEXT { 43 })
+            wave_cell_analog_mid(width_value: 64, label_text: TEXT { 42 })
+            wave_cell_analog_low(width_value: 64, label_text: TEXT { 40 })
+            wave_cell_analog_mid(width_value: 64, label_text: TEXT { 42 })
+            wave_cell_analog_high(width_value: 64, label_text: TEXT { 44 })
+            wave_cell_analog_mid(width_value: 64, label_text: TEXT { 43 })
+        }
+    )
+}
+
+FUNCTION waveform_cursor_line() {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: 2
+            height: Fill
+            rounded_corners: 1
+            background: [color: TEXT { #FDE68A }]
+            material: NovyTheme/material(of: CursorGlow)
+        ]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION data_bus_label_cursor_spacer() {
+    Scene/Element/block(
+        element: []
+        style: [width: 2, height: Fill, paint: False]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION data_bus_label_xx() {
+    data_bus_label(width_value: 70, label_text: TEXT { XX })
+}
+
+FUNCTION data_bus_label_0x12() {
+    data_bus_label(width_value: 70, label_text: TEXT { 0x12 })
+}
+
+FUNCTION data_bus_label_0x00() {
+    data_bus_label(width_value: 70, label_text: TEXT { 0x00 })
+}
+
+FUNCTION data_bus_label_0x2a() {
+    data_bus_label(width_value: 105, label_text: TEXT { 0x2a })
+}
+
+FUNCTION data_bus_label_0x08() {
+    data_bus_label(width_value: 105, label_text: TEXT { 0x08 })
+}
+
+FUNCTION data_bus_label_0xff() {
+    data_bus_label(width_value: 70, label_text: TEXT { 0xff })
+}
+
+FUNCTION data_bus_label_zz() {
+    data_bus_label(width_value: 70, label_text: TEXT { ZZ })
+}
+
+FUNCTION data_bus_label(width_value, label_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(of: Mono)
+            width: width_value
+            height: Fill
+            center: True
+            vertical_align: Center
+            color: TEXT { #DBEAFE }
+        ]
+        text: label_text
+    )
+}
+
+FUNCTION data_bus_cell_xx() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 70, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_sky()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { XX })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_0x12() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 70, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_blue()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x12 })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_0x00() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 70, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_dark()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x00 })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_0x2a() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 105, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_blue()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0x2a })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_0x08() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 105, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_dark()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: TEXT { 0x08 })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_0xff() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 70, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_blue()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { 0xff })
+            )
+        }
+    )
+}
+
+FUNCTION data_bus_cell_zz() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: 70, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_sky()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { ZZ })
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_high(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_blue()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #2563EB }], border: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: TraceHigh)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: label_text)
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_low(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_dark()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 8, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: TraceLow)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: label_text)
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_unknown(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_sky()
+            Scene/Element/label(
+                element: []
+                style: [width: Fill, height: 14, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: TraceUnknown)]
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: label_text)
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_analog_low(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_indigo()
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: Fill
+                    height: 12
+                    align: [column: Center]
+                    rounded_corners: 3
+                    background: [color: TEXT { #1D4ED8 }]
+                    border: [color: TEXT { #60A5FA }]
+                    material: NovyTheme/material(of: AnalogTrace)
+                ]
+                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_analog_mid(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_cyan()
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: Fill
+                    height: 20
+                    align: [column: Center]
+                    rounded_corners: 3
+                    background: [color: TEXT { #0891B2 }]
+                    border: [color: TEXT { #A5F3FC }]
+                    material: NovyTheme/material(of: AnalogTrace)
+                ]
+                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+            )
+        }
+    )
+}
+
+FUNCTION wave_cell_analog_high(width_value, label_text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: width_value, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_pale()
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: Fill
+                    height: 28
+                    align: [column: Center]
+                    rounded_corners: 3
+                    background: [color: TEXT { #7DD3FC }]
+                    border: [color: TEXT { #E0F2FE }]
+                    material: NovyTheme/material(of: AnalogTrace)
+                ]
+                child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+            )
+        }
+    )
+}
+
 FUNCTION waveform_row(signal) {
     BLOCK {
         active: signal.id == PASSED.store.active_signal
@@ -1028,62 +1480,204 @@ FUNCTION waveform_segment(segment) {
 }
 
 FUNCTION waveform_segment_blue(segment) {
-    Scene/Element/block(
+    Scene/Element/stripe(
         element: []
+        direction: Row
+        gap: 0
         style: [
             width: segment.width
-            height: NovyTheme/trace_height(state: segment.state)
-            align: [column: Center]
-            rounded_corners: 0
-            background: [color: TEXT { #3B82F6 }]
-            color: TEXT { #3B82F6 }
-            material: NovyTheme/trace_material(state: segment.state)
+            height: Fill
+            paint: False
         ]
-        child: Scene/Element/text(
-            element: []
-            style: [paint: False]
-            text: Text/empty()
-        )
+        items: LIST {
+            waveform_transition_edge_blue()
+            waveform_trace_cell_blue(segment: segment)
+        }
     )
 }
 
 FUNCTION waveform_segment_dark(segment) {
-    Scene/Element/block(
+    Scene/Element/stripe(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #020817 }], color: TEXT { #020817 }, material: NovyTheme/trace_material(state: segment.state)]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        direction: Row
+        gap: 0
+        style: [width: segment.width, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_dark()
+            waveform_trace_cell_dark(segment: segment)
+        }
     )
 }
 
 FUNCTION waveform_segment_sky(segment) {
-    Scene/Element/block(
+    Scene/Element/stripe(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #60A5FA }], color: TEXT { #60A5FA }, material: NovyTheme/trace_material(state: segment.state)]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        direction: Row
+        gap: 0
+        style: [width: segment.width, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_sky()
+            waveform_trace_cell_sky(segment: segment)
+        }
     )
 }
 
 FUNCTION waveform_segment_indigo(segment) {
-    Scene/Element/block(
+    Scene/Element/stripe(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #1D4ED8 }], color: TEXT { #1D4ED8 }, material: NovyTheme/trace_material(state: segment.state)]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        direction: Row
+        gap: 0
+        style: [width: segment.width, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_indigo()
+            waveform_trace_cell_indigo(segment: segment)
+        }
     )
 }
 
 FUNCTION waveform_segment_cyan(segment) {
-    Scene/Element/block(
+    Scene/Element/stripe(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #38BDF8 }], color: TEXT { #38BDF8 }, material: NovyTheme/trace_material(state: segment.state)]
-        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        direction: Row
+        gap: 0
+        style: [width: segment.width, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_cyan()
+            waveform_trace_cell_cyan(segment: segment)
+        }
     )
 }
 
 FUNCTION waveform_segment_pale(segment) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [width: segment.width, height: Fill, paint: False]
+        items: LIST {
+            waveform_transition_edge_pale()
+            waveform_trace_cell_pale(segment: segment)
+        }
+    )
+}
+
+FUNCTION waveform_transition_edge_blue() {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #93C5FD }], color: TEXT { #93C5FD }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [
+            width: 1
+            height: Fill
+            background: [color: TEXT { #93C5FD }]
+            material: NovyTheme/material(of: CursorGlow)
+        ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_transition_edge_dark() {
+    Scene/Element/block(
+        element: []
+        style: [width: 1, height: Fill, background: [color: TEXT { #1D4ED8 }], material: NovyTheme/material(of: CursorGlow)]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_transition_edge_sky() {
+    Scene/Element/block(
+        element: []
+        style: [width: 1, height: Fill, background: [color: TEXT { #BAE6FD }], material: NovyTheme/material(of: CursorGlow)]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_transition_edge_indigo() {
+    Scene/Element/block(
+        element: []
+        style: [width: 1, height: Fill, background: [color: TEXT { #60A5FA }], material: NovyTheme/material(of: CursorGlow)]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_transition_edge_cyan() {
+    Scene/Element/block(
+        element: []
+        style: [width: 1, height: Fill, background: [color: TEXT { #A5F3FC }], material: NovyTheme/material(of: CursorGlow)]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_transition_edge_pale() {
+    Scene/Element/block(
+        element: []
+        style: [width: 1, height: Fill, background: [color: TEXT { #E0F2FE }], material: NovyTheme/material(of: CursorGlow)]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION waveform_trace_cell_blue(segment) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: NovyTheme/trace_height(state: segment.state)
+            align: [column: Center]
+            rounded_corners: 2
+            background: [color: TEXT { #2563EB }]
+            border: [color: TEXT { #60A5FA }]
+            material: NovyTheme/trace_material(state: segment.state)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #EAF4FF }
+            ]
+            text: segment.label
+        )
+    )
+}
+
+FUNCTION waveform_trace_cell_dark(segment) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #06111F }], border: [color: TEXT { #1D4ED8 }], material: NovyTheme/trace_material(state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #7EA6D9 }], text: segment.label)
+    )
+}
+
+FUNCTION waveform_trace_cell_sky(segment) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/trace_material(state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: segment.label)
+    )
+}
+
+FUNCTION waveform_trace_cell_indigo(segment) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/trace_material(state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #DBEAFE }], text: segment.label)
+    )
+}
+
+FUNCTION waveform_trace_cell_cyan(segment) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/trace_material(state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #ECFEFF }], text: segment.label)
+    )
+}
+
+FUNCTION waveform_trace_cell_pale(segment) {
+    Scene/Element/label(
+        element: []
+        style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/trace_material(state: segment.state)]
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #082F49 }], text: segment.label)
     )
 }
 
@@ -1121,66 +1715,104 @@ FUNCTION variables_panel() {
 }
 
 FUNCTION variables_list() {
+    PASSED.store.signal_search_text |> WHEN {
+        data => variables_list_data()
+        reset => variables_list_reset()
+        temp => variables_list_temperature()
+        clk => variables_list_clk()
+        zzz => variables_list_empty()
+        __ => variables_list_all()
+    }
+}
+
+FUNCTION variables_list_all() {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 5
         style: [width: Fill, height: 116, paint: False]
         items: LIST {
-            variable_clk_visible()
-            variable_reset_visible()
-            variable_data_visible()
-            variable_temperature_visible()
+            variable_clk_button()
+            variable_reset_button()
+            variable_data_button()
+            variable_temperature_button()
         }
     )
 }
 
-FUNCTION variable_clk_visible() {
-    PASSED.store.signal_search_text |> WHEN {
-        clk => variable_clk_button()
-        __ => PASSED.store.signal_search_text |> WHEN {
-            data => NoElement
-            reset => NoElement
-            temp => NoElement
-            __ => variable_clk_button()
+FUNCTION variables_list_clk() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_clk_button()
         }
-    }
+    )
 }
 
-FUNCTION variable_reset_visible() {
-    PASSED.store.signal_search_text |> WHEN {
-        reset => variable_reset_button()
-        __ => PASSED.store.signal_search_text |> WHEN {
-            data => NoElement
-            temp => NoElement
-            clk => NoElement
-            __ => variable_reset_button()
+FUNCTION variables_list_reset() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_reset_button()
         }
-    }
+    )
 }
 
-FUNCTION variable_data_visible() {
-    PASSED.store.signal_search_text |> WHEN {
-        data => variable_data_button()
-        __ => PASSED.store.signal_search_text |> WHEN {
-            reset => NoElement
-            temp => NoElement
-            clk => NoElement
-            __ => variable_data_button()
+FUNCTION variables_list_data() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_data_button()
         }
-    }
+    )
 }
 
-FUNCTION variable_temperature_visible() {
-    PASSED.store.signal_search_text |> WHEN {
-        temp => variable_temperature_button()
-        __ => PASSED.store.signal_search_text |> WHEN {
-            data => NoElement
-            reset => NoElement
-            clk => NoElement
-            __ => variable_temperature_button()
+FUNCTION variables_list_temperature() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, height: 116, paint: False]
+        items: LIST {
+            variable_temperature_button()
         }
-    }
+    )
+}
+
+FUNCTION variables_list_empty() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 116
+            padding: 8
+            rounded_corners: 8
+            background: [color: TEXT { #101A2B }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Muted)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #90A4BF }
+            ]
+            text: TEXT { No matching signals }
+        )
+    )
 }
 
 FUNCTION variable_clk_button() {

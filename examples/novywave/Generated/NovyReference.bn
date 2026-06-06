@@ -1,0 +1,36 @@
+-- Pure reference descriptors for the Boon NovyWave rewrite.
+-- These identify original NovyWave fixtures without porting implementation code.
+
+FUNCTION visual_basis_label() {
+    TEXT { figma dark/light loaded + empty, docs full UI }
+}
+
+FUNCTION loaded_reference_label() {
+    TEXT { figma loaded 1440x1024/1920x1080; docs full UI 1364x747 }
+}
+
+FUNCTION empty_reference_label() {
+    TEXT { figma empty dark/light 1422x888 }
+}
+
+FUNCTION workflow_basis_label() {
+    TEXT { docs: analog limits, markers, loading, errors, multi-file }
+}
+
+FUNCTION waveform_basis_label() {
+    TEXT { simple.vcd 311B; simple_test.ghw 833B; wave_27.fst 28.9MB }
+}
+
+FUNCTION comparison_compact_label() {
+    TEXT { ref: figma/docs + fixture files }
+}
+
+FUNCTION reference_descriptor() {
+    [
+        visual_loaded: loaded_reference_label()
+        visual_empty: empty_reference_label()
+        workflows: workflow_basis_label()
+        waveforms: waveform_basis_label()
+        clean_room_policy: TEXT { reference only; no NovyWave Rust or Tauri code }
+    ]
+}

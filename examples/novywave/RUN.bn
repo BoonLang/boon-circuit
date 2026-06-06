@@ -62,6 +62,13 @@ store: [
     empty_state_hint: TEXT { Drop or load a VCD, FST, or GHW waveform to inspect signals. }
     empty_state_bridge_label: TEXT { Bridge state: no request scheduled; pure descriptor is wave:none }
     empty_state_formats_label: TEXT { Supported fixture contracts: VCD, FST, GHW }
+    reference_visual_basis: NovyReference/visual_basis_label()
+    reference_loaded_basis: NovyReference/loaded_reference_label()
+    reference_empty_basis: NovyReference/empty_reference_label()
+    reference_workflow_basis: NovyReference/workflow_basis_label()
+    reference_waveform_basis: NovyReference/waveform_basis_label()
+    reference_comparison_status: NovyReference/comparison_compact_label()
+    reference_descriptor: NovyReference/reference_descriptor()
 
     active_file:
         LATEST {

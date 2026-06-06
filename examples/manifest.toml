@@ -218,6 +218,7 @@ source_files = [
   "examples/novywave/Bridge/NovyBridge.bn",
   "examples/novywave/Generated/Assets.bn",
   "examples/novywave/Generated/NovyFixtures.bn",
+  "examples/novywave/Generated/NovyReference.bn",
   "examples/novywave/Model/NovyModel.bn",
   "examples/novywave/Theme/NovyTheme.bn",
   "examples/novywave/RUN.bn",

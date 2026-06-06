@@ -6019,6 +6019,11 @@ scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
                     include_str!("../../../examples/novywave/Generated/NovyFixtures.bn").to_owned(),
                 ),
                 (
+                    "examples/novywave/Generated/NovyReference.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Generated/NovyReference.bn")
+                        .to_owned(),
+                ),
+                (
                     "examples/novywave/Model/NovyModel.bn".to_owned(),
                     include_str!("../../../examples/novywave/Model/NovyModel.bn").to_owned(),
                 ),

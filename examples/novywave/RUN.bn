@@ -171,39 +171,44 @@ store: [
         }
 
     marker_visibility:
-        LATEST {
-            TEXT { Visible }
+        TEXT { Visible } |> HOLD marker_visibility {
+            LATEST {
             elements.marker_toggle.event.press |> THEN { TEXT { Hidden } }
             elements.marker_remove.event.press |> THEN { TEXT { Hidden } }
             elements.marker_rename.event.press |> THEN { TEXT { Visible } }
             elements.marker_jump.event.press |> THEN { TEXT { Visible } }
+            elements.load_fixture.event.press |> THEN { TEXT { Visible } }
+            }
         }
 
     marker_label:
-        LATEST {
-            TEXT { M reset released }
+        TEXT { M reset released } |> HOLD marker_label {
+            LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { M data stable } }
             elements.marker_remove.event.press |> THEN { TEXT { No markers } }
             elements.marker_jump.event.press |> THEN { TEXT { M data stable } }
             elements.load_fixture.event.press |> THEN { TEXT { M reset released } }
+            }
         }
 
     marker_count_label:
-        LATEST {
-            TEXT { 1 marker }
+        TEXT { 1 marker } |> HOLD marker_count_label {
+            LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { 1 marker } }
             elements.marker_remove.event.press |> THEN { TEXT { 0 markers } }
             elements.marker_jump.event.press |> THEN { TEXT { 1 marker } }
             elements.load_fixture.event.press |> THEN { TEXT { 1 marker } }
+            }
         }
 
     marker_focus_label:
-        LATEST {
-            TEXT { reset released at 42 ns }
+        TEXT { reset released at 42 ns } |> HOLD marker_focus_label {
+            LATEST {
             elements.marker_rename.event.press |> THEN { TEXT { data stable at 42 ns } }
             elements.marker_jump.event.press |> THEN { TEXT { jumped to data stable at 42 ns } }
             elements.marker_remove.event.press |> THEN { TEXT { no marker selected } }
             elements.load_fixture.event.press |> THEN { TEXT { reset released at 42 ns } }
+            }
         }
 
     marker_to_add:
@@ -640,43 +645,10 @@ store: [
         }
 
     bridge_response_status:
-        TEXT { ACCEPTED_CURRENT_PAGE } |> HOLD bridge_response_status {
-            LATEST {
-                elements.cursor_left.event.press |> THEN { TEXT { ACCEPTED_CURRENT_PAGE } }
-                elements.format_hex.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.format_grouped.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.format_octal.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.format_signed.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.format_unsigned.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.format_ascii.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
-                elements.load_fixture.event.press |> THEN { TEXT { ACCEPTED_CURRENT_PAGE } }
-            }
-        }
+        bridge_match_status(request: bridge_request_fingerprint, response: bridge_response_fingerprint)
 
     bridge_response_status_compact_label:
-        TEXT { CURRENT } |> HOLD bridge_response_status_compact_label {
-            LATEST {
-                elements.cursor_left.event.press |> THEN { TEXT { CURRENT } }
-                elements.keyboard_capture.key |> WHEN {
-                    D => TEXT { CURRENT }
-                    Q => TEXT { CURRENT }
-                    S => TEXT { CURRENT }
-                    W => TEXT { CURRENT }
-                    E => TEXT { CURRENT }
-                    A => TEXT { CURRENT }
-                    __ => SKIP
-                }
-                elements.format_hex.event.press |> THEN { TEXT { STALE } }
-                elements.format_grouped.event.press |> THEN { TEXT { STALE } }
-                elements.format_octal.event.press |> THEN { TEXT { STALE } }
-                elements.format_signed.event.press |> THEN { TEXT { STALE } }
-                elements.format_unsigned.event.press |> THEN { TEXT { STALE } }
-                elements.format_ascii.event.press |> THEN { TEXT { STALE } }
-                elements.stale_response_probe.event.press |> THEN { TEXT { STALE } }
-                elements.load_fixture.event.press |> THEN { TEXT { CURRENT } }
-            }
-        }
+        bridge_match_compact_label(request: bridge_request_fingerprint, response: bridge_response_fingerprint)
 
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()
@@ -714,6 +686,27 @@ FUNCTION scoped_empty_search_label(scope) {
             True => TEXT { 2 results: temperature, vcore }
             False => TEXT { 4 results: clk, reset_n, data_bus, temperature }
         }
+    }
+}
+
+FUNCTION bridge_match_label(request, response) {
+    request == response |> WHEN {
+        True => TEXT { MATCH }
+        False => TEXT { MISMATCH }
+    }
+}
+
+FUNCTION bridge_match_status(request, response) {
+    request == response |> WHEN {
+        True => TEXT { ACCEPTED_CURRENT_PAGE }
+        False => TEXT { REJECTED_STALE_PAGE }
+    }
+}
+
+FUNCTION bridge_match_compact_label(request, response) {
+    request == response |> WHEN {
+        True => TEXT { CURRENT }
+        False => TEXT { STALE }
     }
 }
 

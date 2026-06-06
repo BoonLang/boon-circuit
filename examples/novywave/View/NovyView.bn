@@ -695,9 +695,9 @@ FUNCTION timeline_axis() {
                 style: [width: Fill, height: 16, paint: False]
                 items: LIST {
                     cursor_chip()
-                    PASSED.store.marker_visibility |> WHEN {
-                        TEXT { Visible } => marker_chip()
-                        TEXT { Hidden } => NoElement
+                    PASSED.store.marker_count_label == TEXT { 1 marker } |> WHEN {
+                        True => marker_chip()
+                        False => NoElement
                     }
                 }
             )
@@ -795,7 +795,10 @@ FUNCTION collapsed_group() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
+                }
             ]
             text: TEXT { Core bus group collapsed }
         )
@@ -810,6 +813,15 @@ FUNCTION waveform_rows() {
 }
 
 FUNCTION waveform_rows_expanded() {
+    PASSED.store.selected_rows_profile |> WHEN {
+        TEXT { WithoutData } => waveform_rows_without_data()
+        TEXT { DataFirst } => waveform_rows_data_first()
+        TEXT { DataLast } => waveform_rows_data_last()
+        __ => waveform_rows_default_order()
+    }
+}
+
+FUNCTION waveform_rows_default_order() {
     Scene/Element/stripe(
         element: []
         direction: Column
@@ -820,6 +832,50 @@ FUNCTION waveform_rows_expanded() {
             waveform_row_reset()
             waveform_row_data()
             waveform_row_temperature()
+        }
+    )
+}
+
+FUNCTION waveform_rows_without_data() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [width: Fill, height: Fill, paint: False]
+        items: LIST {
+            waveform_row_clk()
+            waveform_row_reset()
+            waveform_row_temperature()
+        }
+    )
+}
+
+FUNCTION waveform_rows_data_first() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [width: Fill, height: Fill, paint: False]
+        items: LIST {
+            waveform_row_data()
+            waveform_row_clk()
+            waveform_row_reset()
+            waveform_row_temperature()
+        }
+    )
+}
+
+FUNCTION waveform_rows_data_last() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [width: Fill, height: Fill, paint: False]
+        items: LIST {
+            waveform_row_clk()
+            waveform_row_reset()
+            waveform_row_temperature()
+            waveform_row_data()
         }
     )
 }
@@ -1193,6 +1249,7 @@ FUNCTION fixed_wave_area_clk() {
             waveform_cursor_line()
             wave_cell_high(width_value: 32, label_text: TEXT { 1 })
             wave_cell_low(width_value: 32, label_text: TEXT { 0 })
+            waveform_marker_line()
             wave_cell_high(width_value: 32, label_text: TEXT { 1 })
             wave_cell_low(width_value: 32, label_text: TEXT { 0 })
             wave_cell_high(width_value: 32, label_text: TEXT { 1 })
@@ -1234,6 +1291,7 @@ FUNCTION fixed_wave_area_reset() {
         items: LIST {
             waveform_cursor_line()
             wave_cell_low(width_value: 110, label_text: TEXT { reset })
+            waveform_marker_line()
             wave_cell_high(width_value: 464, label_text: TEXT { released })
         }
     )
@@ -1277,6 +1335,7 @@ FUNCTION data_bus_cells_row() {
         items: LIST {
             waveform_cursor_line()
             data_bus_cell_xx()
+            waveform_marker_line()
             data_bus_cell_0x12()
             data_bus_cell_0x00()
             data_bus_cell_0x2a()
@@ -1296,6 +1355,7 @@ FUNCTION data_bus_value_labels() {
         items: LIST {
             data_bus_label_cursor_spacer()
             data_bus_label_xx()
+            data_bus_label_marker_spacer()
             data_bus_label_0x12()
             data_bus_label_0x00()
             data_bus_label_0x2a()
@@ -1332,6 +1392,7 @@ FUNCTION fixed_wave_area_temperature() {
             waveform_cursor_line()
             wave_cell_analog_low(width_value: 64, label_text: TEXT { 39 })
             wave_cell_analog_mid(width_value: 64, label_text: TEXT { 41 })
+            waveform_marker_line()
             wave_cell_analog_high(width_value: 64, label_text: TEXT { 43 })
             wave_cell_analog_mid(width_value: 64, label_text: TEXT { 42 })
             wave_cell_analog_low(width_value: 64, label_text: TEXT { 40 })
@@ -1356,12 +1417,40 @@ FUNCTION waveform_cursor_line() {
     )
 }
 
+FUNCTION waveform_marker_line() {
+    PASSED.store.marker_count_label == TEXT { 1 marker } |> WHEN {
+        True => Scene/Element/block(
+            element: []
+            style: [
+                width: 2
+                height: Fill
+                rounded_corners: 1
+                background: [color: TEXT { #A78BFA }]
+                material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
+            ]
+            child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        )
+        __ => NoElement
+    }
+}
+
 FUNCTION data_bus_label_cursor_spacer() {
     Scene/Element/block(
         element: []
         style: [width: 2, height: Fill, paint: False]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
+}
+
+FUNCTION data_bus_label_marker_spacer() {
+    PASSED.store.marker_count_label == TEXT { 1 marker } |> WHEN {
+        True => Scene/Element/block(
+            element: []
+            style: [width: 2, height: Fill, paint: False]
+            child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        )
+        __ => NoElement
+    }
 }
 
 FUNCTION data_bus_label_xx() {
@@ -1401,7 +1490,10 @@ FUNCTION data_bus_label(width_value, label_text) {
             height: Fill
             center: True
             vertical_align: Center
-            color: TEXT { #DBEAFE }
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
+            }
         ]
         text: label_text
     )
@@ -1418,7 +1510,7 @@ FUNCTION data_bus_cell_xx() {
             Scene/Element/label(
                 element: []
                 style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { XX })
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { XX })
             )
         }
     )
@@ -1520,7 +1612,7 @@ FUNCTION data_bus_cell_zz() {
             Scene/Element/label(
                 element: []
                 style: [width: Fill, height: 18, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: TEXT { ZZ })
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: TEXT { ZZ })
             )
         }
     )
@@ -1571,7 +1663,7 @@ FUNCTION wave_cell_unknown(width_value, label_text) {
             Scene/Element/label(
                 element: []
                 style: [width: Fill, height: 14, align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/material(mode: PASSED.store.mode, of: TraceUnknown)]
-                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: label_text)
+                label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: label_text)
             )
         }
     )
@@ -1700,7 +1792,10 @@ FUNCTION signal_select_button(signal) {
                 width: Fill
                 height: Fill
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
+                }
             ]
             text: signal.name
         )
@@ -1726,7 +1821,10 @@ FUNCTION value_pill(signal) {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
+                }
             ]
             text: PASSED.store.value_format |> WHEN {
                 TEXT { Binary } => signal.id |> WHEN {
@@ -1870,7 +1968,7 @@ FUNCTION waveform_transition_edge_blue() {
         style: [
             width: 1
             height: Fill
-            background: [color: TEXT { #93C5FD }]
+            background: [color: TEXT { #60A5FA }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: CursorGlow)
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
@@ -1956,7 +2054,7 @@ FUNCTION waveform_trace_cell_sky(segment) {
     Scene/Element/label(
         element: []
         style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0EA5E9 }], border: [color: TEXT { #BAE6FD }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #F0F9FF }], text: segment.label)
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
     )
 }
 
@@ -1964,7 +2062,7 @@ FUNCTION waveform_trace_cell_indigo(segment) {
     Scene/Element/label(
         element: []
         style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #1D4ED8 }], border: [color: TEXT { #60A5FA }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #DBEAFE }], text: segment.label)
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
     )
 }
 
@@ -1972,7 +2070,7 @@ FUNCTION waveform_trace_cell_cyan(segment) {
     Scene/Element/label(
         element: []
         style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #0891B2 }], border: [color: TEXT { #A5F3FC }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #ECFEFF }], text: segment.label)
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
     )
 }
 
@@ -1980,7 +2078,7 @@ FUNCTION waveform_trace_cell_pale(segment) {
     Scene/Element/label(
         element: []
         style: [width: Fill, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 2, background: [color: TEXT { #7DD3FC }], border: [color: TEXT { #E0F2FE }], material: NovyTheme/trace_material(mode: PASSED.store.mode, state: segment.state)]
-        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #082F49 }], text: segment.label)
+        label: Scene/Element/text(element: [], style: [...NovyTheme/font(mode: PASSED.store.mode, of: Mono), width: Fill, height: Fill, center: True, vertical_align: Center, color: TEXT { #EAF4FF }], text: segment.label)
     )
 }
 

@@ -191,7 +191,7 @@ expect_root_text = { "keyboard_last_key" = "A", "pan_window" = "LeftWindow", "ke
 id = "reject-stale-page"
 user_action = { kind = "click", target = "Stale" }
 expected_source_event = { source = "store.elements.stale_response_probe" }
-expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
+expect_root_text = { "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_LEFT_42_BIN", "bridge_response_fingerprint" = "FP_CPU_CLK_FIT_CENTER_42_HEX", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE", "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
 
 [[step]]
 id = "toggle-marker"
@@ -252,13 +252,13 @@ expect_root_text = { "fixture_status" = "Empty" }
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
+expect_root_text = { "fixture_status" = "Loaded", "marker_visibility" = "Visible", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE", "data_bus_rendered_value" = "00101010" }
 
 [[step]]
 id = "format-grouped-binary"
 user_action = { kind = "click", target = "Grp" }
 expected_source_event = { source = "store.elements.format_grouped" }
-expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE" }
 
 [[step]]
 id = "format-octal"
@@ -295,3 +295,9 @@ id = "switch-dark"
 user_action = { kind = "click", target = "theme mode" }
 expected_source_event = { source = "store.elements.mode_to_dark" }
 expect_root_text = { "mode" = "Dark" }
+
+[[step]]
+id = "final-marker-jump"
+user_action = { kind = "click", target = "marker control", target_text = "Jump M" }
+expected_source_event = { source = "store.elements.marker_jump", target_text = "Jump M" }
+expect_root_text = { "mode" = "Dark", "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_focus_label" = "jumped to data stable at 42 ns", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "42 ns" }

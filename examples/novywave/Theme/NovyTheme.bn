@@ -4,58 +4,57 @@ FUNCTION material(of) {
     of |> WHEN {
         AppBackground => [
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #08111f }
-                TEXT { Light } => TEXT { #edf4fb }
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #f4f7fb }
             }
-            gloss: 0.02
+            gloss: 0.01
         ]
 
         PanelSurface => [
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #172236 }
-                TEXT { Light } => TEXT { #ffffffd6 }
+                TEXT { Dark } => TEXT { #172033 }
+                TEXT { Light } => TEXT { #f8fafc }
             }
-            gloss: 0.06
-            metal: 0.02
-            transparency: 0.04
-            frosted_blur: 8
-            frosted_saturate: 1.08
-            glass_highlight: 0.32
+            gloss: 0.025
+            metal: 0.0
+            transparency: 0.0
+            frosted_blur: 0
+            frosted_saturate: 1.0
+            glass_highlight: 0.08
             border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #89a6d640 }
-                TEXT { Light } => TEXT { #ffffffd8 }
+                TEXT { Dark } => TEXT { #2f80ed }
+                TEXT { Light } => TEXT { #2563eb }
             }
             border_width: 1
             shadows: LIST {
-                [y: 20, blur: 42, color: TEXT { #00000045 }]
-                [y: 1, blur: 0, color: TEXT { #ffffff22 }]
+                [y: 1, blur: 0, color: TEXT { #ffffff10 }]
             }
         ]
 
         PanelInset => [
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #0a1322 }
-                TEXT { Light } => TEXT { #edf3fa }
+                TEXT { Dark } => TEXT { #0b1220 }
+                TEXT { Light } => TEXT { #ffffff }
             }
-            gloss: 0.04
+            gloss: 0.02
             border: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #2a3a55 }
-                TEXT { Light } => TEXT { #bccbdd }
+                TEXT { Dark } => TEXT { #25344f }
+                TEXT { Light } => TEXT { #d7dde8 }
             }
             border_width: 1
         ]
 
         TimelineGlass => [
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #070d18 }
+                TEXT { Dark } => TEXT { #020817 }
                 TEXT { Light } => TEXT { #f8fbff }
             }
             refraction: 1.5
-            gloss: 0.04
-            transparency: 0.10
-            frosted_blur: 10
-            frosted_saturate: 1.14
-            glass_highlight: 0.30
+            gloss: 0.01
+            transparency: 0.0
+            frosted_blur: 0
+            frosted_saturate: 1.0
+            glass_highlight: 0.04
         ]
 
         TraceHigh => [

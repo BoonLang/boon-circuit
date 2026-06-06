@@ -19,8 +19,8 @@ FUNCTION root() {
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
-            padding: 14
-            background: [color: TEXT { #08111F }]
+            padding: 0
+            background: [color: TEXT { #111827 }]
             material: NovyTheme/material(of: AppBackground)
         ]
         items: LIST {
@@ -57,6 +57,7 @@ FUNCTION header() {
                     width: 72
                     height: Fill
                     vertical_align: Center
+                    color: TEXT { #475569 }
                 ]
                 text: TEXT { ● ● ● }
             )
@@ -68,6 +69,7 @@ FUNCTION header() {
                     height: Fill
                     center: True
                     vertical_align: Center
+                    color: TEXT { #475569 }
                 ]
                 text: TEXT { NovyWave.io }
             )
@@ -121,7 +123,7 @@ FUNCTION browser_band() {
         gap: 8
         style: [
             width: Fill
-            height: 330
+            height: 322
             paint: False
         ]
         items: LIST {
@@ -139,6 +141,7 @@ FUNCTION selected_waveform_band() {
         style: [
             width: Fill
             height: Fill
+            gap: 0
             paint: False
         ]
         items: LIST {
@@ -196,10 +199,10 @@ FUNCTION left_panel() {
         style: [
             width: 430
             height: Fill
-            padding: 10
+            padding: 22
             depth: 10
-            rounded_corners: 14
-            background: [color: TEXT { #172236 }]
+            rounded_corners: 0
+            background: [color: TEXT { #172033 }]
             border: [color: TEXT { #2F80ED }]
             material: NovyTheme/material(of: PanelSurface)
         ]
@@ -218,11 +221,52 @@ FUNCTION files_list() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 4
+        gap: 2
         style: [width: Fill, paint: False]
-        items:
-            NovyFixtures/files()
-            |> List/map(file, new: file_row(file: file))
+        items: LIST {
+            tree_row(label_text: TEXT { - counter.vcd }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {   + top.cpu }, indent_width: 0, selected: True)
+            tree_row(label_text: TEXT {     clk }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     reset_n }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {     data_bus[7:0] }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT {   + top.uart }, indent_width: 0, selected: False)
+            tree_row(label_text: TEXT { - uart_compare.fst }, indent_width: 0, selected: False)
+        }
+    )
+}
+
+FUNCTION tree_row(label_text, indent_width, selected) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 22
+            padding: [left: 6, right: 6]
+            rounded_corners: 4
+            background: [color: selected |> WHEN {
+                True => TEXT { #203B62 }
+                False => TEXT { #101A2B }
+            }]
+            border: [color: selected |> WHEN {
+                True => TEXT { #3B82F6 }
+                False => TEXT { #263753 }
+            }]
+            material: selected |> WHEN {
+                True => NovyTheme/material(of: SelectedRow)
+                False => NovyTheme/material(of: PanelInset)
+            }
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: label_text
+        )
     )
 }
 
@@ -337,12 +381,12 @@ FUNCTION timeline_panel() {
             width: Fill
             height: Fill
             padding: 10
-            depth: 14
-            move: [closer: 4]
-            rounded_corners: 14
-            background: [color: TEXT { #070D18 }]
+            depth: 4
+            move: [closer: 1]
+            rounded_corners: 0
+            background: [color: TEXT { #172033 }]
             border: [color: TEXT { #2F80ED }]
-            material: NovyTheme/material(of: TimelineGlass)
+            material: NovyTheme/material(of: PanelSurface)
         ]
         items: LIST {
             timeline_header()
@@ -367,6 +411,7 @@ FUNCTION timeline_header() {
                     width: 240
                     height: Fill
                     vertical_align: Center
+                    color: TEXT { #DCEAFF }
                 ]
                 text: TEXT { Selected Variables }
             )
@@ -378,6 +423,7 @@ FUNCTION timeline_header() {
                     height: Fill
                     center: True
                     vertical_align: Center
+                    color: TEXT { #90A4BF }
                 ]
                 text: TEXT { Dock to Right }
             )
@@ -436,7 +482,7 @@ FUNCTION timeline_axis() {
             width: Fill
             height: 48
             padding: 6
-            rounded_corners: 10
+            rounded_corners: 0
             background: [color: TEXT { #0A1322 }]
             border: [color: TEXT { #263753 }]
             material: NovyTheme/material(of: PanelInset)
@@ -540,6 +586,8 @@ FUNCTION collapsed_group() {
             width: Fill
             height: 48
             rounded_corners: 10
+            background: [color: TEXT { #0A1322 }]
+            border: [color: TEXT { #263753 }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -550,6 +598,7 @@ FUNCTION collapsed_group() {
                 height: Fill
                 center: True
                 vertical_align: Center
+                color: TEXT { #DBEAFE }
             ]
             text: TEXT { Core bus group collapsed }
         )
@@ -557,14 +606,302 @@ FUNCTION collapsed_group() {
 }
 
 FUNCTION waveform_rows() {
+    PASSED.store.selected_group |> WHEN {
+        TEXT { Collapsed } => collapsed_group()
+        __ => waveform_rows_expanded()
+    }
+}
+
+FUNCTION waveform_rows_expanded() {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 5
         style: [width: Fill, height: Fill, paint: False]
+        items: LIST {
+            waveform_row_clk()
+            waveform_row_reset()
+            waveform_row_data()
+            waveform_row_temperature()
+        }
+    )
+}
+
+FUNCTION waveform_row_clk() {
+    BLOCK {
+        active: PASSED.store.active_signal == TEXT { clk }
+
+        Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 6
+            style: [
+                width: Fill
+                height: PASSED.store.row_height
+                padding: 5
+                rounded_corners: 2
+                background: [color: TEXT { #101A2B }]
+                border: [color: TEXT { #263753 }]
+                material: active |> WHEN {
+                    True => NovyTheme/material(of: SelectedRow)
+                    False => NovyTheme/material(of: PanelInset)
+                }
+            ]
+            items: LIST {
+                fixed_signal_label(label_text: NovyFixtures/selected_clk_name())
+                fixed_value_clk()
+                fixed_wave_area(signal_id: TEXT { clk })
+            }
+        )
+    }
+}
+
+FUNCTION waveform_row_reset() {
+    BLOCK {
+        active: PASSED.store.active_signal == TEXT { reset_n }
+
+        Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 6
+            style: [
+                width: Fill
+                height: PASSED.store.row_height
+                padding: 5
+                rounded_corners: 2
+                background: [color: TEXT { #101A2B }]
+                border: [color: TEXT { #263753 }]
+                material: active |> WHEN {
+                    True => NovyTheme/material(of: SelectedRow)
+                    False => NovyTheme/material(of: PanelInset)
+                }
+            ]
+            items: LIST {
+                fixed_signal_label(label_text: NovyFixtures/selected_reset_name())
+                fixed_value_reset()
+                fixed_wave_area(signal_id: TEXT { reset_n })
+            }
+        )
+    }
+}
+
+FUNCTION waveform_row_data() {
+    BLOCK {
+        active: PASSED.store.active_signal == TEXT { data_bus }
+
+        Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 6
+            style: [
+                width: Fill
+                height: PASSED.store.row_height
+                padding: 5
+                rounded_corners: 2
+                background: [color: TEXT { #101A2B }]
+                border: [color: TEXT { #263753 }]
+                material: active |> WHEN {
+                    True => NovyTheme/material(of: SelectedRow)
+                    False => NovyTheme/material(of: PanelInset)
+                }
+            ]
+            items: LIST {
+                fixed_signal_label(label_text: NovyFixtures/selected_data_name())
+                fixed_value_data()
+                fixed_wave_area(signal_id: TEXT { data_bus })
+            }
+        )
+    }
+}
+
+FUNCTION waveform_row_temperature() {
+    BLOCK {
+        active: PASSED.store.active_signal == TEXT { temperature }
+
+        Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 6
+            style: [
+                width: Fill
+                height: PASSED.store.row_height
+                padding: 5
+                rounded_corners: 2
+                background: [color: TEXT { #101A2B }]
+                border: [color: TEXT { #263753 }]
+                material: active |> WHEN {
+                    True => NovyTheme/material(of: SelectedRow)
+                    False => NovyTheme/material(of: PanelInset)
+                }
+            ]
+            items: LIST {
+                fixed_signal_label(label_text: NovyFixtures/selected_temperature_name())
+                fixed_value_temperature()
+                fixed_wave_area(signal_id: TEXT { temperature })
+            }
+        )
+    }
+}
+
+FUNCTION fixed_signal_label(label_text) {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 145
+            height: Fill
+            padding: 6
+            rounded_corners: 2
+            background: [color: TEXT { #0A1322 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: label_text
+        )
+    )
+}
+
+FUNCTION fixed_value_clk() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 86
+            height: Fill
+            rounded_corners: 0
+            background: [color: TEXT { #111827 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: PASSED.store.value_format |> WHEN {
+                TEXT { Binary } => NovyFixtures/selected_clk_value_binary()
+                __ => NovyFixtures/selected_clk_value_hex()
+            }
+        )
+    )
+}
+
+FUNCTION fixed_value_reset() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 86
+            height: Fill
+            rounded_corners: 0
+            background: [color: TEXT { #111827 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: PASSED.store.value_format |> WHEN {
+                TEXT { Binary } => NovyFixtures/selected_reset_value_binary()
+                __ => NovyFixtures/selected_reset_value_hex()
+            }
+        )
+    )
+}
+
+FUNCTION fixed_value_data() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 86
+            height: Fill
+            rounded_corners: 0
+            background: [color: TEXT { #111827 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: PASSED.store.value_format |> WHEN {
+                TEXT { Binary } => NovyFixtures/selected_data_value_binary()
+                __ => NovyFixtures/selected_data_value_hex()
+            }
+        )
+    )
+}
+
+FUNCTION fixed_value_temperature() {
+    Scene/Element/label(
+        element: []
+        style: [
+            width: 86
+            height: Fill
+            rounded_corners: 0
+            background: [color: TEXT { #111827 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...NovyTheme/font(of: Mono)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #DBEAFE }
+            ]
+            text: PASSED.store.value_format |> WHEN {
+                TEXT { Binary } => NovyFixtures/selected_temperature_value_binary()
+                __ => NovyFixtures/selected_temperature_value_hex()
+            }
+        )
+    )
+}
+
+FUNCTION fixed_wave_area(signal_id) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 2
+        style: [
+            width: Fill
+            height: Fill
+            padding: [top: 6, bottom: 6, left: 8, right: 8]
+            rounded_corners: 0
+            background: [color: TEXT { #020817 }]
+            border: [color: TEXT { #1D4ED8 }]
+            material: NovyTheme/material(of: TimelineGlass)
+        ]
         items:
-            NovyFixtures/selected_signals()
-            |> List/map(signal, new: waveform_row(signal: signal))
+            NovyFixtures/segments(of: signal_id)
+            |> List/map(segment, new: waveform_segment(segment: segment))
     )
 }
 
@@ -616,6 +953,7 @@ FUNCTION signal_select_button(signal) {
                 width: Fill
                 height: Fill
                 vertical_align: Center
+                color: TEXT { #DBEAFE }
             ]
             text: signal.name
         )
@@ -628,8 +966,10 @@ FUNCTION value_pill(signal) {
         style: [
             width: 86
             height: Fill
-            rounded_corners: 8
-            material: NovyTheme/material(of: PanelSurface)
+            rounded_corners: 0
+            background: [color: TEXT { #111827 }]
+            border: [color: TEXT { #263753 }]
+            material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
             element: []
@@ -639,8 +979,18 @@ FUNCTION value_pill(signal) {
                 height: Fill
                 center: True
                 vertical_align: Center
+                color: TEXT { #DBEAFE }
             ]
-            text: NovyFixtures/signal_value(signal: signal.id, format: PASSED.store.value_format)
+            text: PASSED.store.value_format |> WHEN {
+                TEXT { Binary } => signal.id |> WHEN {
+                    TEXT { clk } => TEXT { 1b }
+                    TEXT { reset_n } => TEXT { 1b }
+                    TEXT { data_bus } => TEXT { 00101010 }
+                    TEXT { temperature } => TEXT { analog }
+                    __ => signal.current_value
+                }
+                __ => signal.current_value
+            }
         )
     )
 }
@@ -654,7 +1004,7 @@ FUNCTION wave_area(signal) {
             width: Fill
             height: Fill
             padding: [top: 6, bottom: 6, left: 8, right: 8]
-            rounded_corners: 8
+            rounded_corners: 0
             background: [color: TEXT { #020817 }]
             border: [color: TEXT { #1D4ED8 }]
             material: NovyTheme/material(of: TimelineGlass)
@@ -684,7 +1034,7 @@ FUNCTION waveform_segment_blue(segment) {
             width: segment.width
             height: NovyTheme/trace_height(state: segment.state)
             align: [column: Center]
-            rounded_corners: 4
+            rounded_corners: 0
             background: [color: TEXT { #3B82F6 }]
             color: TEXT { #3B82F6 }
             material: NovyTheme/trace_material(state: segment.state)
@@ -700,7 +1050,7 @@ FUNCTION waveform_segment_blue(segment) {
 FUNCTION waveform_segment_dark(segment) {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 4, background: [color: TEXT { #020817 }], color: TEXT { #020817 }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #020817 }], color: TEXT { #020817 }, material: NovyTheme/trace_material(state: segment.state)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -708,7 +1058,7 @@ FUNCTION waveform_segment_dark(segment) {
 FUNCTION waveform_segment_sky(segment) {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 4, background: [color: TEXT { #60A5FA }], color: TEXT { #60A5FA }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #60A5FA }], color: TEXT { #60A5FA }, material: NovyTheme/trace_material(state: segment.state)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -716,7 +1066,7 @@ FUNCTION waveform_segment_sky(segment) {
 FUNCTION waveform_segment_indigo(segment) {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 4, background: [color: TEXT { #1D4ED8 }], color: TEXT { #1D4ED8 }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #1D4ED8 }], color: TEXT { #1D4ED8 }, material: NovyTheme/trace_material(state: segment.state)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -724,7 +1074,7 @@ FUNCTION waveform_segment_indigo(segment) {
 FUNCTION waveform_segment_cyan(segment) {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 4, background: [color: TEXT { #38BDF8 }], color: TEXT { #38BDF8 }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #38BDF8 }], color: TEXT { #38BDF8 }, material: NovyTheme/trace_material(state: segment.state)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -732,7 +1082,7 @@ FUNCTION waveform_segment_cyan(segment) {
 FUNCTION waveform_segment_pale(segment) {
     Scene/Element/block(
         element: []
-        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 4, background: [color: TEXT { #93C5FD }], color: TEXT { #93C5FD }, material: NovyTheme/trace_material(state: segment.state)]
+        style: [width: segment.width, height: NovyTheme/trace_height(state: segment.state), align: [column: Center], rounded_corners: 0, background: [color: TEXT { #93C5FD }], color: TEXT { #93C5FD }, material: NovyTheme/trace_material(state: segment.state)]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
     )
 }
@@ -747,8 +1097,8 @@ FUNCTION variables_panel() {
             height: Fill
             padding: 10
             depth: 10
-            rounded_corners: 14
-            background: [color: TEXT { #172236 }]
+            rounded_corners: 0
+            background: [color: TEXT { #172033 }]
             border: [color: TEXT { #2F80ED }]
             material: NovyTheme/material(of: PanelSurface)
         ]
@@ -777,19 +1127,67 @@ FUNCTION variables_list() {
         gap: 5
         style: [width: Fill, height: 116, paint: False]
         items: LIST {
-            variable_clk_button()
-            variable_reset_button()
-            variable_data_button()
-            variable_temperature_button()
+            variable_clk_visible()
+            variable_reset_visible()
+            variable_data_visible()
+            variable_temperature_visible()
         }
     )
+}
+
+FUNCTION variable_clk_visible() {
+    PASSED.store.signal_search_text |> WHEN {
+        clk => variable_clk_button()
+        __ => PASSED.store.signal_search_text |> WHEN {
+            data => NoElement
+            reset => NoElement
+            temp => NoElement
+            __ => variable_clk_button()
+        }
+    }
+}
+
+FUNCTION variable_reset_visible() {
+    PASSED.store.signal_search_text |> WHEN {
+        reset => variable_reset_button()
+        __ => PASSED.store.signal_search_text |> WHEN {
+            data => NoElement
+            temp => NoElement
+            clk => NoElement
+            __ => variable_reset_button()
+        }
+    }
+}
+
+FUNCTION variable_data_visible() {
+    PASSED.store.signal_search_text |> WHEN {
+        data => variable_data_button()
+        __ => PASSED.store.signal_search_text |> WHEN {
+            reset => NoElement
+            temp => NoElement
+            clk => NoElement
+            __ => variable_data_button()
+        }
+    }
+}
+
+FUNCTION variable_temperature_visible() {
+    PASSED.store.signal_search_text |> WHEN {
+        temp => variable_temperature_button()
+        __ => PASSED.store.signal_search_text |> WHEN {
+            data => NoElement
+            reset => NoElement
+            clk => NoElement
+            __ => variable_temperature_button()
+        }
+    }
 }
 
 FUNCTION variable_clk_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_clk], hovered: PASSED.store.elements.select_clk]
         style: [width: Fill, height: 24, paint: False]
-        label: variable_browser_row(row_name: TEXT { clk }, type_text: TEXT { Wire 1-bit }, direction_text: TEXT { Input })
+        label: variable_row_clk()
     )
 }
 
@@ -797,7 +1195,7 @@ FUNCTION variable_reset_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_reset], hovered: PASSED.store.elements.select_reset]
         style: [width: Fill, height: 24, paint: False]
-        label: variable_browser_row(row_name: TEXT { reset_n }, type_text: TEXT { Wire 1-bit }, direction_text: TEXT { Input })
+        label: variable_row_reset()
     )
 }
 
@@ -813,7 +1211,7 @@ FUNCTION variable_data_button() {
                 False => NovyTheme/material(of: HoverControl)
             }
         ]
-        label: variable_browser_row(row_name: TEXT { data_bus[7:0] }, type_text: TEXT { Wire 8-bit }, direction_text: TEXT { Output })
+        label: variable_row_data()
     )
 }
 
@@ -821,7 +1219,67 @@ FUNCTION variable_temperature_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.select_temperature], hovered: PASSED.store.elements.select_temperature]
         style: [width: Fill, height: 24, paint: False]
-        label: variable_browser_row(row_name: TEXT { temperature }, type_text: TEXT { Analog }, direction_text: TEXT { Input })
+        label: variable_row_temperature()
+    )
+}
+
+FUNCTION variable_row_clk() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 24, paint: False]
+        items: LIST {
+            variable_name_text(label_text: TEXT { clk })
+            variable_chip_wire()
+            variable_chip_1bit()
+            variable_chip_input()
+        }
+    )
+}
+
+FUNCTION variable_row_reset() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 24, paint: False]
+        items: LIST {
+            variable_name_text(label_text: TEXT { reset_n })
+            variable_chip_wire()
+            variable_chip_1bit()
+            variable_chip_input()
+        }
+    )
+}
+
+FUNCTION variable_row_data() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 24, paint: False]
+        items: LIST {
+            variable_name_text(label_text: TEXT { data_bus[7:0] })
+            variable_chip_wire()
+            variable_chip_8bit()
+            variable_chip_output()
+        }
+    )
+}
+
+FUNCTION variable_row_temperature() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 24, paint: False]
+        items: LIST {
+            variable_name_text(label_text: TEXT { temperature })
+            variable_chip_analog()
+            variable_chip_16bit()
+            variable_chip_input()
+        }
     )
 }
 
@@ -833,43 +1291,59 @@ FUNCTION search_result_line() {
             width: Fill
             height: 18
             vertical_align: Center
+            color: TEXT { #90A4BF }
         ]
         text: PASSED.store.search_result_label
     )
 }
 
-FUNCTION variable_browser_row(row_name, type_text, direction_text) {
-    Scene/Element/stripe(
+FUNCTION variable_name_text(label_text) {
+    Scene/Element/text(
         element: []
-        direction: Row
-        gap: 8
         style: [
-            width: Fill
-            height: 24
-            paint: False
+            ...NovyTheme/font(of: Mono)
+            width: 180
+            height: Fill
+            vertical_align: Center
+            color: TEXT { #DBEAFE }
         ]
-        items: LIST {
-            Scene/Element/text(
-                element: []
-                style: [
-                    ...NovyTheme/font(of: Mono)
-                    width: 180
-                    height: Fill
-                    vertical_align: Center
-                ]
-                text: row_name
-            )
-            variable_chip(text: type_text)
-            variable_chip(text: direction_text)
-        }
+        text: label_text
     )
 }
 
-FUNCTION variable_chip(text) {
+FUNCTION variable_chip_wire() {
+    variable_chip_literal(label_text: TEXT { Wire })
+}
+
+FUNCTION variable_chip_analog() {
+    variable_chip_literal(label_text: TEXT { Analog })
+}
+
+FUNCTION variable_chip_1bit() {
+    variable_chip_literal(label_text: TEXT { 1-bit })
+}
+
+FUNCTION variable_chip_8bit() {
+    variable_chip_literal(label_text: TEXT { 8-bit })
+}
+
+FUNCTION variable_chip_16bit() {
+    variable_chip_literal(label_text: TEXT { 16-bit })
+}
+
+FUNCTION variable_chip_input() {
+    variable_chip_literal(label_text: TEXT { Input })
+}
+
+FUNCTION variable_chip_output() {
+    variable_chip_literal(label_text: TEXT { Output })
+}
+
+FUNCTION variable_chip_literal(label_text) {
     Scene/Element/label(
         element: []
         style: [
-            width: 72
+            width: 54
             height: 20
             rounded_corners: 10
             background: [color: TEXT { #1D4ED8 }]
@@ -883,8 +1357,9 @@ FUNCTION variable_chip(text) {
                 height: Fill
                 center: True
                 vertical_align: Center
+                color: TEXT { #DBEAFE }
             ]
-            text: text
+            text: label_text
         )
     )
 }
@@ -971,6 +1446,7 @@ FUNCTION panel_title(title_text) {
             width: Fill
             height: 24
             vertical_align: Center
+            color: TEXT { #DCEAFF }
         ]
         text: title_text
     )
@@ -983,10 +1459,10 @@ FUNCTION button_label(button_text) {
             ...NovyTheme/font(of: Body)
             width: Fill
             height: Fill
-        center: True
-        vertical_align: Center
-        color: TEXT { #DBEAFE }
-    ]
+            center: True
+            vertical_align: Center
+            color: TEXT { #DBEAFE }
+        ]
         text: button_text
     )
 }

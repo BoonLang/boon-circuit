@@ -61,8 +61,18 @@ FUNCTION request_fingerprint(scope, signal, zoom, pan, cursor, format) {
             TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX }
         LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Fit }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Binary } } =>
+            TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN }
         LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Hexadecimal } } =>
             TEXT { FP_CPU_DATA_CLOSE_CENTER_42_HEX }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { Center }, TEXT { Cursor42 }, TEXT { Binary } } =>
+            TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Cursor42 }, TEXT { Binary } } =>
+            TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { RightWindow }, TEXT { Cursor36 }, TEXT { Binary } } =>
+            TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
+        LIST { TEXT { top_cpu }, TEXT { data_bus }, TEXT { Close }, TEXT { LeftWindow }, TEXT { Cursor42 }, TEXT { Binary } } =>
+            TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
         __ => TEXT { FP_STRUCTURAL_REQUEST }
     }
 }

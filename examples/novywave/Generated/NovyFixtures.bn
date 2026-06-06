@@ -27,11 +27,59 @@ FUNCTION scopes() {
 
 FUNCTION selected_signals() {
     LIST {
-        [id: TEXT { clk }, name: TEXT { clk }, value: TEXT { 1 }, kind: Digital]
-        [id: TEXT { reset_n }, name: TEXT { reset_n }, value: TEXT { 1 }, kind: Digital]
-        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, value: TEXT { 0x2a }, kind: Digital]
-        [id: TEXT { temperature }, name: TEXT { temperature }, value: TEXT { 42.8 C }, kind: Analog]
+        [id: TEXT { clk }, name: TEXT { clk }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { reset_n }, name: TEXT { reset_n }, current_value: TEXT { 1 }, kind: Digital]
+        [id: TEXT { data_bus }, name: TEXT { data_bus[7:0] }, current_value: TEXT { 0x2a }, kind: Digital]
+        [id: TEXT { temperature }, name: TEXT { temperature }, current_value: TEXT { 42.8 C }, kind: Analog]
     }
+}
+
+FUNCTION selected_clk_name() {
+    TEXT { clk }
+}
+
+FUNCTION selected_reset_name() {
+    TEXT { reset_n }
+}
+
+FUNCTION selected_data_name() {
+    TEXT { data_bus[7:0] }
+}
+
+FUNCTION selected_temperature_name() {
+    TEXT { temperature }
+}
+
+FUNCTION selected_clk_value_hex() {
+    TEXT { 1 }
+}
+
+FUNCTION selected_clk_value_binary() {
+    TEXT { 1b }
+}
+
+FUNCTION selected_reset_value_hex() {
+    TEXT { 1 }
+}
+
+FUNCTION selected_reset_value_binary() {
+    TEXT { 1b }
+}
+
+FUNCTION selected_data_value_hex() {
+    TEXT { 0x2a }
+}
+
+FUNCTION selected_data_value_binary() {
+    TEXT { 00101010 }
+}
+
+FUNCTION selected_temperature_value_hex() {
+    TEXT { 42.8 C }
+}
+
+FUNCTION selected_temperature_value_binary() {
+    TEXT { analog }
 }
 
 FUNCTION search_result(text) {

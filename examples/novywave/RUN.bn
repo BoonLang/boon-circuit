@@ -8,6 +8,7 @@ store: [
         select_uart_compare_file: SOURCE
         select_ghw_file: SOURCE
         diagnostic_probe: SOURCE
+        signal_search_focus_probe: SOURCE
         mode_to_light: SOURCE
         mode_to_dark: SOURCE
         zoom_in: SOURCE
@@ -53,7 +54,7 @@ store: [
 
     fixture_status:
         LATEST {
-            TEXT { Loaded }
+            TEXT { Empty }
             elements.show_empty.event.press |> THEN { TEXT { Empty } }
             elements.load_fixture.event.press |> THEN { TEXT { Loaded } }
         }
@@ -110,7 +111,7 @@ store: [
 
     bridge_file_format:
         LATEST {
-            TEXT { VCD }
+            TEXT { none }
             elements.select_counter_file.event.press |> THEN { TEXT { VCD } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW } }
@@ -121,7 +122,7 @@ store: [
 
     bridge_file_digest:
         LATEST {
-            TEXT { sha256:fixture-counter-vcd }
+            TEXT { sha256:none }
             elements.select_counter_file.event.press |> THEN { TEXT { sha256:fixture-counter-vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:fixture-uart-fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { sha256:fixture-simple-ghw } }
@@ -132,7 +133,7 @@ store: [
 
     bridge_waveform_ref:
         LATEST {
-            TEXT { wave:vcd:counter:0-240ns }
+            TEXT { wave:none }
             elements.select_counter_file.event.press |> THEN { TEXT { wave:vcd:counter:0-240ns } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
@@ -143,7 +144,7 @@ store: [
 
     bridge_descriptor_file:
         LATEST {
-            TEXT { counter.vcd }
+            TEXT { none }
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
@@ -154,7 +155,7 @@ store: [
 
     bridge_open_status:
         LATEST {
-            TEXT { FIXTURE_READY }
+            TEXT { NOT_REQUESTED }
             elements.select_counter_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FIXTURE_READY } }
             elements.select_ghw_file.event.press |> THEN { TEXT { FIXTURE_READY } }
@@ -165,7 +166,7 @@ store: [
 
     bridge_open_summary:
         LATEST {
-            TEXT { fixture VCD wave:vcd:counter:0-240ns }
+            TEXT { no file loaded }
             elements.select_counter_file.event.press |> THEN { TEXT { fixture VCD wave:vcd:counter:0-240ns } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { fixture FST wave:fst:uart-compare:0-240ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { fixture GHW wave:ghw:simple-test:0-100ns } }
@@ -176,7 +177,7 @@ store: [
 
     bridge_hierarchy_page_label:
         LATEST {
-            TEXT { HIER:top.cpu/top.uart/top.analog }
+            TEXT { HIER:none }
             elements.select_counter_file.event.press |> THEN { TEXT { HIER:top.cpu/top.uart/top.analog } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { HIER:top.uart compare page } }
             elements.select_ghw_file.event.press |> THEN { TEXT { HIER:ghw.simple/counter } }
@@ -187,7 +188,7 @@ store: [
 
     bridge_file_stats_label:
         LATEST {
-            TEXT { VCD 15 signals, 0-240ns, bounded pages }
+            TEXT { no waveform stats }
             elements.select_counter_file.event.press |> THEN { TEXT { VCD 15 signals, 0-240ns, bounded pages } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { FST 5 signals, 0-240ns, bounded pages } }
             elements.select_ghw_file.event.press |> THEN { TEXT { GHW 4 signals, 0-100ns, bounded pages } }
@@ -198,7 +199,7 @@ store: [
 
     bridge_large_fixture_contract:
         LATEST {
-            TEXT { wave_27.fst 28860652B -> bounded page requests only }
+            TEXT { no large file materialized }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst 28860652B -> bounded compare page only } }
             elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw 833B -> bounded page requests only } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd 25B -> diagnostic only } }
@@ -213,17 +214,18 @@ store: [
 
     bridge_page_window_label:
         LATEST {
-            TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB }
+            TEXT { no page window scheduled }
             elements.zoom_in.event.press |> THEN { TEXT { window 36-60ns, max 256 transitions, payload <= 64KiB } }
             elements.zoom_out.event.press |> THEN { TEXT { window 0-240ns, max 256 transitions, payload <= 64KiB } }
             elements.pan_left.event.press |> THEN { TEXT { window 24-48ns, max 256 transitions, payload <= 64KiB } }
             elements.pan_right.event.press |> THEN { TEXT { window 48-72ns, max 256 transitions, payload <= 64KiB } }
             elements.show_empty.event.press |> THEN { TEXT { no page window scheduled } }
+            elements.load_fixture.event.press |> THEN { TEXT { window 0-120ns, max 256 transitions, payload <= 64KiB } }
         }
 
     bridge_hierarchy_page_cursor_label:
         LATEST {
-            TEXT { hierarchy cursor root:0..64 next=top.cpu }
+            TEXT { hierarchy cursor none }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { hierarchy cursor top.uart:0..64 next=none } }
             elements.select_ghw_file.event.press |> THEN { TEXT { hierarchy cursor ghw.simple:0..64 next=none } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { hierarchy cursor none } }
@@ -233,7 +235,7 @@ store: [
 
     bridge_materialization_bound_label:
         LATEST {
-            TEXT { visible rows 4/15, waveform segments 32/256 max }
+            TEXT { visible rows 0/0, waveform segments 0/256 max }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { visible rows 4/5, waveform segments 28/256 max } }
             elements.select_ghw_file.event.press |> THEN { TEXT { visible rows 3/4, waveform segments 20/256 max } }
             elements.selected_remove_data.event.press |> THEN { TEXT { visible rows 3/15, waveform segments 24/256 max } }
@@ -270,7 +272,7 @@ store: [
 
     diagnostic_state:
         LATEST {
-            TEXT { OK }
+            TEXT { Idle }
             elements.diagnostic_probe.event.press |> THEN { TEXT { Unsupported } }
             elements.select_counter_file.event.press |> THEN { TEXT { OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
@@ -281,7 +283,7 @@ store: [
 
     diagnostic_label:
         LATEST {
-            TEXT { bridge diagnostics OK }
+            TEXT { no file loaded }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
@@ -337,6 +339,7 @@ store: [
             elements.select_reset.event.press |> THEN { TEXT { reset_n } }
             elements.select_data.event.press |> THEN { TEXT { data_bus } }
             elements.select_temperature.event.press |> THEN { TEXT { temperature } }
+            elements.load_fixture.event.press |> THEN { TEXT { clk } }
             }
         }
 
@@ -381,6 +384,46 @@ store: [
             LATEST {
                 elements.signal_search_input.text |> Text/trim()
             }
+        }
+
+    focused_control_label:
+        TEXT { none } |> HOLD focused_control_label {
+            LATEST {
+                elements.signal_search_focus_probe.event.click |> THEN { TEXT { signal search } }
+                elements.scope_cpu.event.press |> THEN { TEXT { none } }
+                elements.scope_uart.event.press |> THEN { TEXT { none } }
+                elements.scope_analog.event.press |> THEN { TEXT { none } }
+                elements.select_counter_file.event.press |> THEN { TEXT { none } }
+                elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+                elements.select_ghw_file.event.press |> THEN { TEXT { none } }
+                elements.load_fixture.event.press |> THEN { TEXT { none } }
+                elements.show_empty.event.press |> THEN { TEXT { none } }
+            }
+        }
+
+    focused_control_material_label:
+        focused_control_label == TEXT { signal search } |> WHEN {
+            True => TEXT { FocusedControl }
+            False => TEXT { RestingControl }
+        }
+
+    pressed_control_label:
+        TEXT { none } |> HOLD pressed_control_label {
+            LATEST {
+                elements.diagnostic_probe.event.press |> THEN { TEXT { Probe } }
+                elements.format_cycle.event.press |> THEN { TEXT { Fmt } }
+                elements.format_hex.event.press |> THEN { TEXT { Hex } }
+                elements.mode_to_light.event.press |> THEN { TEXT { Light } }
+                elements.mode_to_dark.event.press |> THEN { TEXT { Dark } }
+                elements.load_fixture.event.press |> THEN { TEXT { Load } }
+                elements.show_empty.event.press |> THEN { TEXT { Empty } }
+            }
+        }
+
+    pressed_control_material_label:
+        pressed_control_label == TEXT { none } |> WHEN {
+            True => TEXT { RestingControl }
+            False => TEXT { PressedControl }
         }
 
     search_result_label:
@@ -628,7 +671,7 @@ store: [
             elements.format_signed.event.press |> THEN { TEXT { Signed } }
             elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
             elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
-            elements.load_fixture.event.press |> THEN { TEXT { Binary } }
+            elements.load_fixture.event.press |> THEN { TEXT { Hexadecimal } }
         }
 
     zoom_level:
@@ -816,7 +859,7 @@ store: [
             elements.format_signed.event.press |> THEN { TEXT { Signed } }
             elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
             elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
-            elements.load_fixture.event.press |> THEN { TEXT { Binary } }
+            elements.load_fixture.event.press |> THEN { TEXT { Hex } }
         }
 
     data_bus_rendered_value:
@@ -829,7 +872,7 @@ store: [
             elements.format_unsigned.event.press |> THEN { TEXT { 42 } }
             elements.format_ascii.event.press |> THEN { TEXT { * } }
             elements.format_hex.event.press |> THEN { TEXT { 0x2a } }
-            elements.load_fixture.event.press |> THEN { TEXT { 00101010 } }
+            elements.load_fixture.event.press |> THEN { TEXT { 0x2a } }
         }
 
     row_height:
@@ -840,7 +883,7 @@ store: [
         }
 
     bridge_request_page:
-        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_request_page {
+        TEXT { PAGE_UNAVAILABLE } |> HOLD bridge_request_page {
             LATEST {
                 elements.select_clk.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { PAGE_RESET_FIT_CENTER_42_HEX } }
@@ -879,13 +922,13 @@ store: [
                     A => TEXT { PAGE_DATA_CLOSE_LEFT_42_BIN }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.load_fixture.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
                 elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
             }
         }
 
     bridge_request_fingerprint:
-        TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_request_fingerprint {
+        TEXT { FP_NONE } |> HOLD bridge_request_fingerprint {
             LATEST {
                 elements.select_clk.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
@@ -924,7 +967,7 @@ store: [
                     A => TEXT { FP_CPU_DATA_CLOSE_LEFT_42_BIN }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
             }
         }
@@ -947,7 +990,7 @@ store: [
                 elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK } }
-                elements.load_fixture.event.press |> THEN { TEXT { DATA_BUS } }
+                elements.load_fixture.event.press |> THEN { TEXT { CLK } }
             }
         }
 
@@ -958,7 +1001,7 @@ store: [
                 elements.zoom_out.event.press |> THEN { TEXT { Wide } }
                 elements.cursor_left.event.press |> THEN { TEXT { Close } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Fit } }
-                elements.load_fixture.event.press |> THEN { TEXT { Close } }
+                elements.load_fixture.event.press |> THEN { TEXT { Fit } }
             }
         }
 
@@ -969,7 +1012,7 @@ store: [
                 elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
                 elements.cursor_left.event.press |> THEN { TEXT { RightWindow } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Center } }
-                elements.load_fixture.event.press |> THEN { TEXT { RightWindow } }
+                elements.load_fixture.event.press |> THEN { TEXT { Center } }
             }
         }
 
@@ -979,7 +1022,7 @@ store: [
                 elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
                 elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Cursor42 } }
-                elements.load_fixture.event.press |> THEN { TEXT { Cursor36 } }
+                elements.load_fixture.event.press |> THEN { TEXT { Cursor42 } }
             }
         }
 
@@ -988,32 +1031,32 @@ store: [
             LATEST {
                 elements.format_cycle.event.press |> THEN { TEXT { Binary } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { Hexadecimal } }
-                elements.load_fixture.event.press |> THEN { TEXT { Binary } }
+                elements.load_fixture.event.press |> THEN { TEXT { Hexadecimal } }
             }
         }
 
     bridge_response_page:
-        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_response_page {
+        TEXT { PAGE_UNAVAILABLE } |> HOLD bridge_response_page {
             LATEST {
                 elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
-                elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.load_fixture.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
                 elements.show_empty.event.press |> THEN { TEXT { PAGE_UNAVAILABLE } }
             }
         }
 
     bridge_response_fingerprint:
-        TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_response_fingerprint {
+        TEXT { FP_NONE } |> HOLD bridge_response_fingerprint {
             LATEST {
                 elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
-                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.load_fixture.event.press |> THEN { TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX } }
                 elements.show_empty.event.press |> THEN { TEXT { FP_NONE } }
             }
         }
 
     bridge_request_descriptor_label:
-        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_request_descriptor_label {
+        TEXT { No request scheduled } |> HOLD bridge_request_descriptor_label {
             LATEST {
                 elements.select_clk.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.select_reset.event.press |> THEN { TEXT { TOP_CPU/RESET_N/Fit/Center/Cursor42/Hexadecimal } }
@@ -1032,17 +1075,17 @@ store: [
                     W => TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor42/Binary }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { No request scheduled } }
             }
         }
 
     bridge_response_descriptor_label:
-        TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } |> HOLD bridge_response_descriptor_label {
+        TEXT { No response available } |> HOLD bridge_response_descriptor_label {
             LATEST {
                 elements.cursor_left.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
-                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/DATA_BUS/Close/RightWindow/Cursor36/Binary } }
+                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU/CLK/Fit/Center/Cursor42/Hexadecimal } }
                 elements.show_empty.event.press |> THEN { TEXT { No response available } }
             }
         }
@@ -1074,7 +1117,7 @@ store: [
 
     bridge_signal_page_label:
         LATEST {
-            TEXT { PAGE_CLK_FIT_CENTER_42_HEX }
+            TEXT { PAGE_UNAVAILABLE }
             elements.select_counter_file.event.press |> THEN { bridge_request_page }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
             elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
@@ -1084,12 +1127,13 @@ store: [
 
     bridge_cursor_values_label:
         LATEST {
-            TEXT { clk=1 reset_n=1 data=0x2a temp=42C }
+            TEXT { unavailable }
             elements.select_counter_file.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data=0x55 busy=0 at 42 ns } }
             elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter=3 at 42 ns } }
             elements.diagnostic_probe.event.press |> THEN { TEXT { unavailable } }
             elements.show_empty.event.press |> THEN { TEXT { unavailable } }
+            elements.load_fixture.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.cursor_left.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
             elements.cursor_right.event.press |> THEN { TEXT { clk=1 reset_n=1 data=0x2a temp=42C } }
         }
@@ -1112,7 +1156,7 @@ store: [
         bridge_request_fingerprint
 
     bridge_request_compact_label:
-        TEXT { CLK_FIT } |> HOLD bridge_request_compact_label {
+        TEXT { NONE } |> HOLD bridge_request_compact_label {
             LATEST {
                 elements.select_clk.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.select_reset.event.press |> THEN { TEXT { RESET_FIT } }
@@ -1151,13 +1195,13 @@ store: [
                     A => TEXT { DATA_LEFT }
                     __ => SKIP
                 }
-                elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.load_fixture.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }
 
     bridge_response_compact_label:
-        TEXT { CLK_FIT } |> HOLD bridge_response_compact_label {
+        TEXT { NONE } |> HOLD bridge_response_compact_label {
             LATEST {
                 elements.cursor_left.event.press |> THEN { TEXT { DATA_36NS } }
                 elements.keyboard_capture.key |> WHEN {
@@ -1170,7 +1214,7 @@ store: [
                     __ => SKIP
                 }
                 elements.stale_response_probe.event.press |> THEN { TEXT { CLK_FIT } }
-                elements.load_fixture.event.press |> THEN { TEXT { DATA_36NS } }
+                elements.load_fixture.event.press |> THEN { TEXT { CLK_FIT } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
             }
         }

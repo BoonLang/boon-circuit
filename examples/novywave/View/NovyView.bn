@@ -28,9 +28,9 @@ FUNCTION root() {
         ]
         items: LIST {
             header()
-            PASSED.store.fixture_status |> WHEN {
-                TEXT { Empty } => empty_state()
-                __ => loaded_app()
+            PASSED.store.fixture_status == TEXT { Empty } |> WHEN {
+                True => empty_state()
+                False => loaded_app()
             }
         }
     )
@@ -174,6 +174,8 @@ FUNCTION empty_state() {
             width: Fill
             height: 650
             align: [row: Center]
+            scroll_y: True
+            scrollbars: True
             padding: 72
             depth: 10
             move: [closer: 2]
@@ -399,12 +401,30 @@ FUNCTION file_load_button() {
 }
 
 FUNCTION file_diagnostic_button() {
+    PASSED.store.pressed_control_label == TEXT { Probe } |> WHEN {
+        True => file_diagnostic_button_pressed()
+        False => file_diagnostic_button_resting()
+    }
+}
+
+FUNCTION file_diagnostic_button_resting() {
     Scene/Element/button(
         element: [
             event: [press: PASSED.store.elements.diagnostic_probe]
             hovered: PASSED.store.elements.diagnostic_probe
         ]
         style: compact_button_style(button_width: 76, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Probe })
+    )
+}
+
+FUNCTION file_diagnostic_button_pressed() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.diagnostic_probe]
+            hovered: PASSED.store.elements.diagnostic_probe
+        ]
+        style: probe_button_pressed_style()
         label: button_label(button_text: TEXT { Probe })
     )
 }
@@ -511,9 +531,19 @@ FUNCTION file_row(file) {
 }
 
 FUNCTION search_box() {
+    PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+        True => search_box_focused()
+        False => search_box_resting()
+    }
+}
+
+FUNCTION search_box_resting() {
     Scene/Element/text_input(
         element: [
-            event: [change: PASSED.store.elements.signal_search_input]
+            event: [
+                click: PASSED.store.elements.signal_search_focus_probe
+                change: PASSED.store.elements.signal_search_input
+            ]
         ]
         style: [
             width: Fill
@@ -535,6 +565,41 @@ FUNCTION search_box() {
                 Light => TEXT { #d7dde8 }
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+        ]
+        label: Hidden[text: TEXT { signal search }]
+        text: PASSED.store.signal_search_text
+        placeholder: [text: TEXT { search signals }]
+    )
+}
+
+FUNCTION search_box_focused() {
+    Scene/Element/text_input(
+        element: [
+            event: [
+                click: PASSED.store.elements.signal_search_focus_probe
+                change: PASSED.store.elements.signal_search_input
+            ]
+        ]
+        style: [
+            width: Fill
+            height: 36
+            padding: [left: 10, right: 10]
+            text_inset: 4
+            rounded_corners: 9
+            font: NovyTheme/font(mode: PASSED.store.mode, of: Body)
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
+            }
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #11243b }
+                Light => TEXT { #e9f3ff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #65b8ff }
+                Light => TEXT { #2474bb }
+            }]
+            material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
         ]
         label: Hidden[text: TEXT { signal search }]
         text: PASSED.store.signal_search_text
@@ -1059,18 +1124,22 @@ FUNCTION collapsed_group() {
 }
 
 FUNCTION waveform_rows() {
-    PASSED.store.selected_group |> WHEN {
-        TEXT { Collapsed } => collapsed_group()
-        __ => waveform_rows_expanded()
+    PASSED.store.selected_group == TEXT { Collapsed } |> WHEN {
+        True => collapsed_group()
+        False => waveform_rows_expanded()
     }
 }
 
 FUNCTION waveform_rows_expanded() {
-    PASSED.store.selected_rows_profile |> WHEN {
-        TEXT { WithoutData } => waveform_rows_from(list: NovyFixtures/selected_signals_without_data())
-        TEXT { DataFirst } => waveform_rows_from(list: NovyFixtures/selected_signals_data_first())
-        TEXT { DataLast } => waveform_rows_from(list: NovyFixtures/selected_signals_data_last())
-        __ => waveform_rows_from(list: NovyFixtures/selected_signals())
+    PASSED.store.selected_rows_profile == TEXT { WithoutData } |> WHEN {
+        True => waveform_rows_from(list: NovyFixtures/selected_signals_without_data())
+        False => PASSED.store.selected_rows_profile == TEXT { DataFirst } |> WHEN {
+            True => waveform_rows_from(list: NovyFixtures/selected_signals_data_first())
+            False => PASSED.store.selected_rows_profile == TEXT { DataLast } |> WHEN {
+                True => waveform_rows_from(list: NovyFixtures/selected_signals_data_last())
+                False => waveform_rows_from(list: NovyFixtures/selected_signals())
+            }
+        }
     }
 }
 
@@ -2080,15 +2149,21 @@ FUNCTION value_pill(signal) {
                     Light => TEXT { #172033 }
                 }
             ]
-            text: PASSED.store.value_format |> WHEN {
-                TEXT { Binary } => signal.id |> WHEN {
-                    TEXT { clk } => TEXT { 1b }
-                    TEXT { reset_n } => TEXT { 1b }
-                    TEXT { data_bus } => TEXT { 00101010 }
-                    TEXT { temperature } => TEXT { analog }
-                    __ => signal.current_value
+            text: PASSED.store.value_format == TEXT { Binary } |> WHEN {
+                True => signal.id == TEXT { clk } |> WHEN {
+                    True => TEXT { 1b }
+                    False => signal.id == TEXT { reset_n } |> WHEN {
+                        True => TEXT { 1b }
+                        False => signal.id == TEXT { data_bus } |> WHEN {
+                            True => TEXT { 00101010 }
+                            False => signal.id == TEXT { temperature } |> WHEN {
+                                True => TEXT { analog }
+                                False => signal.current_value
+                            }
+                        }
+                    }
                 }
-                __ => signal.current_value
+                False => signal.current_value
             }
         )
     )
@@ -2377,23 +2452,37 @@ FUNCTION variables_panel() {
 }
 
 FUNCTION variables_list() {
-    PASSED.store.signal_search_text |> WHEN {
-        TEXT { data } => variables_list_data()
-        TEXT { reset } => variables_list_reset()
-        TEXT { temp } => variables_list_temperature()
-        TEXT { clk } => variables_list_clk()
-        TEXT { tx } => variables_list_tx()
-        TEXT { vcore } => variables_list_vcore()
-        TEXT { zzz } => variables_list_empty()
-        __ => variables_list_for_scope()
+    PASSED.store.signal_search_text == TEXT { data } |> WHEN {
+        True => variables_list_data()
+        False => PASSED.store.signal_search_text == TEXT { reset } |> WHEN {
+            True => variables_list_reset()
+            False => PASSED.store.signal_search_text == TEXT { temp } |> WHEN {
+                True => variables_list_temperature()
+                False => PASSED.store.signal_search_text == TEXT { clk } |> WHEN {
+                    True => variables_list_clk()
+                    False => PASSED.store.signal_search_text == TEXT { tx } |> WHEN {
+                        True => variables_list_tx()
+                        False => PASSED.store.signal_search_text == TEXT { vcore } |> WHEN {
+                            True => variables_list_vcore()
+                            False => PASSED.store.signal_search_text == TEXT { zzz } |> WHEN {
+                                True => variables_list_empty()
+                                False => variables_list_for_scope()
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 FUNCTION variables_list_for_scope() {
-    PASSED.store.active_scope |> WHEN {
-        TEXT { top_uart } => variables_list_uart()
-        TEXT { top_analog } => variables_list_analog()
-        __ => variables_list_all()
+    PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+        True => variables_list_uart()
+        False => PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+            True => variables_list_analog()
+            False => variables_list_all()
+        }
     }
 }
 
@@ -3175,6 +3264,62 @@ FUNCTION compact_button_style(button_width, hovered) {
     ]
 }
 
+FUNCTION probe_button_pressed_style() {
+    [
+        width: 76
+        height: 28
+        rounded_corners: 8
+        spring_range: 3
+        center: True
+        background: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #28466d }
+            Light => TEXT { #cce4ff }
+        }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #1a2b44 }
+            Light => TEXT { #e9f3ff }
+        }
+        border: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #65b8ff }
+            Light => TEXT { #2474bb }
+        }]
+        __hover_border: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #49617f }
+            Light => TEXT { #bad0e8 }
+        }
+        material: NovyTheme/material(mode: PASSED.store.mode, of: PressedControl)
+        __hover_gloss: 0.08
+    ]
+}
+
+FUNCTION format_button_pressed_style() {
+    [
+        width: 48
+        height: 28
+        rounded_corners: 8
+        spring_range: 3
+        center: True
+        background: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #28466d }
+            Light => TEXT { #cce4ff }
+        }]
+        __hover_background: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #1a2b44 }
+            Light => TEXT { #e9f3ff }
+        }
+        border: [color: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #65b8ff }
+            Light => TEXT { #2474bb }
+        }]
+        __hover_border: PASSED.store.mode |> WHEN {
+            Dark => TEXT { #49617f }
+            Light => TEXT { #bad0e8 }
+        }
+        material: NovyTheme/material(mode: PASSED.store.mode, of: PressedControl)
+        __hover_gloss: 0.08
+    ]
+}
+
 FUNCTION header_load_button() {
     Scene/Element/button(
         element: [
@@ -3402,9 +3547,24 @@ FUNCTION remove_marker_button() {
 }
 
 FUNCTION format_button() {
+    PASSED.store.pressed_control_label == TEXT { Fmt } |> WHEN {
+        True => format_button_pressed()
+        False => format_button_resting()
+    }
+}
+
+FUNCTION format_button_resting() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
         style: compact_button_style(button_width: 48, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Fmt })
+    )
+}
+
+FUNCTION format_button_pressed() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
+        style: format_button_pressed_style()
         label: button_label(button_text: TEXT { Fmt })
     )
 }

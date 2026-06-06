@@ -165,6 +165,25 @@ FUNCTION material(mode, of) {
             }
             gloss: 0.12
             glow: [color: TEXT { #65b8ff44 }, intensity: 0.10]
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #65b8ff }
+                Light => TEXT { #2474bb }
+            }
+            border_width: 1
+        ]
+
+        FocusedControl => [
+            color: PASSED.mode |> WHEN {
+                Dark => TEXT { #11243b }
+                Light => TEXT { #e9f3ff }
+            }
+            gloss: 0.11
+            glow: [color: TEXT { #65b8ff66 }, intensity: 0.16]
+            border: PASSED.mode |> WHEN {
+                Dark => TEXT { #65b8ff }
+                Light => TEXT { #2474bb }
+            }
+            border_width: 1
         ]
 
         Warning => [color: TEXT { #f6d365 }]

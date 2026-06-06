@@ -240,21 +240,24 @@ required_evidence_tier = "host-synthetic"
 human_testing_needed = true
 initial_visible_assertions = [
   "novywave-title-visible",
-  "waveform-fixture-visible",
-  "scope-panel-visible",
-  "timeline-grid-visible",
+  "novywave-empty-state-visible",
+  "novywave-load-fixture-control-visible",
+  "novywave-reference-empty-visible",
   "physical-materials-visible",
   "dev-window-editor-visible",
   "no-large-blank-regions",
 ]
 input_scenarios = [
+  "load-fixture-from-empty",
   "select-compare-fixture",
   "select-primary-fixture",
   "select-ghw-fixture",
   "return-primary-after-ghw",
   "select-uart-scope",
   "search-uart-tx",
+  "type-search-uart-tx",
   "clear-search-uart",
+  "blur-signal-search",
   "select-analog-scope",
   "select-temperature-analog",
   "analog-manual-limits",

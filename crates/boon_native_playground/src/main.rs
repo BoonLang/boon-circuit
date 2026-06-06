@@ -38336,6 +38336,27 @@ mod tests {
             .expect("NovyWave manifest source units should load");
         let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-hover", &units)
             .expect("NovyWave runtime should initialize from manifest units");
+        let initial_summary = runtime.document_state_summary();
+        let (_, initial_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&initial_summary),
+        )
+        .expect("NovyWave initial empty layout should lower");
+        assert!(
+            initial_layout
+                .display_list
+                .iter()
+                .any(|item| item.text.as_deref() == Some("No waveform loaded")),
+            "NovyWave should boot into the reference empty state before the fixture is loaded"
+        );
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.load_fixture".to_owned(),
+                target_text: Some("Load fixture".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave load fixture source event should apply before control checks");
         let state_summary = runtime.document_state_summary();
         let (layout_proof, layout) = native_document_layout_proof_with_project_state_embedded(
             &source_path,
@@ -38482,6 +38503,79 @@ mod tests {
                 glowing_item.style
             );
         }
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.signal_search_focus_probe".to_owned(),
+                target_text: Some("signal search".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave signal search focus source event should apply");
+        let focus_state = runtime.document_state_summary();
+        let (_, focus_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&focus_state),
+        )
+        .expect("NovyWave focused search layout should lower");
+        let search_input = focus_layout
+            .display_list
+            .iter()
+            .find(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+            .expect("NovyWave search text input should be present after fixture load");
+        assert_eq!(
+            style_text_from_map(&search_input.style, "border"),
+            Some("#65b8ff"),
+            "focused NovyWave search should use the FocusedControl border: {:?}",
+            search_input.style
+        );
+        assert_eq!(
+            style_number_from_map(&search_input.style, "gloss"),
+            Some(0.11),
+            "focused NovyWave search should use FocusedControl gloss: {:?}",
+            search_input.style
+        );
+        assert_eq!(
+            style_text_from_map(&search_input.style, "glow_color"),
+            Some("#65b8ff66"),
+            "focused NovyWave search should lower FocusedControl glow: {:?}",
+            search_input.style
+        );
+
+        runtime
+            .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                source: "store.elements.diagnostic_probe".to_owned(),
+                target_text: Some("Probe".to_owned()),
+                ..boon_runtime::LiveSourceEvent::default()
+            })
+            .expect("NovyWave diagnostic probe source event should apply");
+        let pressed_state = runtime.document_state_summary();
+        let (_, pressed_layout) = native_document_layout_proof_with_project_state_embedded(
+            &source_path,
+            &units,
+            Some(&pressed_state),
+        )
+        .expect("NovyWave pressed control layout should lower");
+        let pressed_probe =
+            physical_button_for_text(&pressed_layout, "Probe", "NovyWave Probe pressed");
+        assert_eq!(
+            style_number_from_map(&pressed_probe.style, "gloss"),
+            Some(0.12),
+            "pressed Probe should use PressedControl gloss: {:?}",
+            pressed_probe.style
+        );
+        assert_eq!(
+            style_number_from_map(&pressed_probe.style, "border_width"),
+            Some(1.0),
+            "pressed Probe should use PressedControl border width: {:?}",
+            pressed_probe.style
+        );
+        assert_eq!(
+            style_text_from_map(&pressed_probe.style, "glow_color"),
+            Some("#65b8ff44"),
+            "pressed Probe should lower PressedControl glow: {:?}",
+            pressed_probe.style
+        );
     }
 
     #[test]
@@ -38523,6 +38617,13 @@ mod tests {
                 .expect("NovyWave manifest source units should load");
             let mut runtime = boon_runtime::LiveRuntime::from_project("novywave-visual", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
+            runtime
+                .apply_source_event_for_document(boon_runtime::LiveSourceEvent {
+                    source: "store.elements.load_fixture".to_owned(),
+                    target_text: Some("Load fixture".to_owned()),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .expect("NovyWave load fixture source event should apply before visual readbacks");
             let dark_state = runtime.document_state_summary();
             let (dark_proof, dark_layout) =
                 native_document_layout_proof_with_project_state_embedded(

@@ -5,6 +5,12 @@ FUNCTION material(of) {
     ]
 }
 
+FUNCTION checkbox_material() {
+    [
+        ...get(from: Material, of: CheckboxGlyph)
+    ]
+}
+
 FUNCTION font(of) {
     get(from: Font, of: of)
 }

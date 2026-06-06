@@ -198,6 +198,19 @@ FUNCTION filter_button_material(selected) {
     ]
 }
 
+FUNCTION theme_switcher_button_material(selected, hovered) {
+    selected |> WHEN {
+        True => [
+            ...Theme/material(of: FilterSelected)
+            gloss: hovered |> WHEN {
+                True => 0.08
+                False => 0
+            }
+        ]
+        False => Theme/material(of: Interactive[hovered: hovered])
+    }
+}
+
 FUNCTION clear_button_font(hovered) {
     [
         ...Theme/font(of: BodySecondary)
@@ -245,6 +258,12 @@ FUNCTION filter_button_text(selected) {
         }
         depth: 0
         move: [further: 0]
+        width: Fill
+        height: Fill
+        text_inset: 0
+        text_align: Center
+        center: True
+        vertical_align: Center
     ]
 }
 
@@ -264,7 +283,22 @@ FUNCTION theme_switcher_button_text(selected) {
             True => Theme/font(of: FilterSelected).color
             False => Theme/font(of: Small).color
         }
+        text_align: Center
+        center: True
+        vertical_align: Center
     ]
+}
+
+FUNCTION hero_title_material() {
+    PASSED.theme_options.name |> WHEN {
+        Glassmorphism => [
+            ...Theme/material(of: SurfaceElevated)
+            glass_highlight: 0.95
+            frosted_blur: 12
+            frosted_saturate: 1.35
+        ]
+        __ => [color: TEXT { #00000000 }]
+    }
 }
 
 ------------------------------------------------------------------------
@@ -439,10 +473,12 @@ FUNCTION header() {
             element: [tag: H1]
             style: [
                 ...Theme/text(of: Hero)
-                width: Fill
+                material: hero_title_material()
+                width: 320
                 height: 84
                 center: True
                 vertical_align: Center
+                rounded_corners: Theme/corners(of: Comfort)
             ]
             text: TEXT { todos }
         )
@@ -492,7 +528,7 @@ FUNCTION new_todo_entry() {
         gap: Theme/spacing(of: None)
         style: [
             width: Fill
-            material: Theme/material(of: Surface)
+            material: [color: TEXT { #00000000 }]
             ...Theme/material(of: NewTodoRowFrame)
         ]
         items: LIST {
@@ -526,10 +562,12 @@ FUNCTION new_todo_title_text_input() {
             weight: Theme/font(of: Input).weight
             placeholder_color: Theme/font(of: Placeholder).color
             placeholder_style: Italic
-            depth: Theme/depth(of: Element)
-            move: [further: Theme/elevation(of: Inset)]
-            rounded_corners: Theme/corners(of: Touch)
-            material: Theme/material(of: InteractiveRecessed[focus: False])
+            depth: 0
+            move: [further: 0]
+            rounded_corners: 0
+            border: [color: TEXT { #00000000 }]
+            border_width: 0
+            material: [color: TEXT { #00000000 }]
         ]
         label: Hidden[text: TEXT { What needs to be done? }]
         text: LATEST {
@@ -541,7 +579,6 @@ FUNCTION new_todo_title_text_input() {
             style: [font: Theme/font(of: Placeholder)]
             text: TEXT { What needs to be done? }
         ]
-        focus: True
     )
 }
 
@@ -626,11 +663,13 @@ FUNCTION toggle_all_checkbox() {
             style: [
                 width: Theme/sizing(of: ToggleControl)
                 height: Fill
-                depth: Theme/depth(of: Element)
-                rounded_corners: Theme/corners(of: Touch)
+                depth: 0
+                rounded_corners: 0
                 spring_range: Theme/spring_range(of: Button)
                 center: True
-                material: Theme/material(of: InteractiveRecessed[focus: False])
+                border: [color: TEXT { #00000000 }]
+                border_width: 0
+                material: [color: TEXT { #00000000 }]
             ]
             label: Scene/Element/text(
                 style: [
@@ -693,7 +732,7 @@ FUNCTION todo_checkbox(todo) {
             style: [
                 size: Theme/sizing(of: TouchTarget)
                 spring_range: Theme/spring_range(of: Checkbox)
-                ...Theme/material(of: CheckboxGlyph[checked: todo.completed])
+                ...Theme/checkbox_material()
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             target: todo.title
@@ -877,15 +916,13 @@ FUNCTION filter_button(filter) {
                 padding: [row: 0, column: 0]
                 line_height: 19.6
                 text_inset: 0
+                text_align: Center
                 vertical_align: Center
                 rounded_corners: Theme/corners(of: Filter)
                 outline:
-                    selected |> WHILE {
-                        True => NoOutline
-                        False => element.hovered |> WHILE {
-                            True => [side: Inner, color: Theme/material(of: FilterSelected).border]
-                            False => NoOutline
-                        }
+                    element.hovered |> WHILE {
+                        True => [side: Inner, color: Theme/material(of: Primary).color]
+                        False => NoOutline
                     }
                 spring_range: Theme/spring_range(of: Button)
                 material: filter_button_material(selected: selected)
@@ -922,7 +959,7 @@ FUNCTION remove_completed_button() {
             padding: [row: 0, column: 0]
             line_height: 19.6
             text_inset: 0
-            text_align: Left
+            text_align: Center
             vertical_align: Center
             depth: 0
             rounded_corners: 0
@@ -933,6 +970,12 @@ FUNCTION remove_completed_button() {
             style: [
                 ...clear_button_text(hovered: element.hovered)
                 font: [line: [underline: element.hovered]]
+                width: Fill
+                height: Fill
+                text_inset: 0
+                text_align: Center
+                center: True
+                vertical_align: Center
             ]
             text: TEXT { Clear completed }
         )
@@ -978,29 +1021,20 @@ FUNCTION footer_info_line(text) {
 }
 
 FUNCTION footer_author_line() {
-    Scene/Element/stripe(
+    Scene/Element/paragraph(
         element: []
-        direction: Row
-        gap: 3
         style: [
+            ...small_flat_text(of: Small)
             width: Fill
             height: 15
+            line_height: 15
             center: True
+            vertical_align: Center
             paint: False
         ]
-        items: LIST {
-            Scene/Element/text(
-                element: []
-                style: [
-                    ...small_flat_text(of: Small)
-                    width: Auto
-                    auto_padding: 0
-                    height: 15
-                    line_height: 15
-                    vertical_align: Center
-                ]
-                text: TEXT { Created by }
-            )
+        contents: LIST {
+            TEXT { Created by }
+            Text/space()
             footer_link(
                 label: TEXT { Martin Kavík }
                 to: TEXT { https://kavik.cz/ }
@@ -1010,29 +1044,20 @@ FUNCTION footer_author_line() {
 }
 
 FUNCTION footer_reference_line() {
-    Scene/Element/stripe(
+    Scene/Element/paragraph(
         element: []
-        direction: Row
-        gap: 3
         style: [
+            ...small_flat_text(of: Small)
             width: Fill
             height: 15
+            line_height: 15
             center: True
+            vertical_align: Center
             paint: False
         ]
-        items: LIST {
-            Scene/Element/text(
-                element: []
-                style: [
-                    ...small_flat_text(of: Small)
-                    width: Auto
-                    auto_padding: 0
-                    height: 15
-                    line_height: 15
-                    vertical_align: Center
-                ]
-                text: TEXT { Part of }
-            )
+        contents: LIST {
+            TEXT { Part of }
+            Text/space()
             footer_link(
                 label: TEXT { TodoMVC }
                 to: TEXT { http://todomvc.com }
@@ -1080,7 +1105,7 @@ FUNCTION theme_switcher() {
                 element: []
                 direction: Row
                 gap: 6
-                style: [width: Fill, align: [row: Center], paint: False]
+                style: [width: 414, height: 27, align: [row: Center], paint: False]
                 items: LIST {
                     theme_name_button(theme_name: Classic)
                         |> SOURCE { PASSED.store.elements.theme_switcher.classic }
@@ -1098,7 +1123,7 @@ FUNCTION theme_switcher() {
                 element: []
                 direction: Row
                 gap: 0
-                style: [width: Fill, align: [row: Center], paint: False]
+                style: [width: 88, align: [row: Center], paint: False]
                 items: LIST {
                     mode_toggle_button()
                         |> SOURCE { PASSED.store.elements.theme_switcher.mode_toggle }
@@ -1118,19 +1143,42 @@ FUNCTION theme_name_button(theme_name) {
                 hovered: SOURCE
             ]
             style: [
+                width: theme_name |> WHEN {
+                    Classic => 62
+                    Professional => 94
+                    Glassmorphism => 52
+                    Neobrutalism => 82
+                    Neumorphism => 100
+                }
+                height: 27
                 padding: [row: 4, column: 4]
                 depth: Theme/depth(of: Detail)
                 rounded_corners: Theme/corners(of: Filter)
                 spring_range: Theme/spring_range(of: Button)
+                outline:
+                    element.hovered |> WHILE {
+                        True => [side: Inner, color: Theme/material(of: Primary).color]
+                        False => NoOutline
+                    }
                 move: [closer: selected |> WHEN {
                     True => Theme/elevation(of: Selection)
                     False => 0
                 }]
-                material: filter_button_material(selected: selected)
+                material: theme_switcher_button_material(selected: selected, hovered: element.hovered)
             ]
             label: Scene/Element/text(
                 style: [
                     ...theme_switcher_button_text(selected: selected)
+                    width: theme_name |> WHEN {
+                        Classic => 54
+                        Professional => 86
+                        Glassmorphism => 44
+                        Neobrutalism => 74
+                        Neumorphism => 92
+                    }
+                    height: 17
+                    line_height: 17
+                    auto_padding: 0
                 ]
                 text: theme_name |> WHEN {
                     Classic => TEXT { Classic }
@@ -1151,15 +1199,26 @@ FUNCTION mode_toggle_button() {
             hovered: SOURCE
         ]
         style: [
+            width: 88
+            height: 27
             padding: [row: 4, column: 4]
             depth: Theme/depth(of: Detail)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: Button)
+            outline:
+                element.hovered |> WHILE {
+                    True => [side: Inner, color: Theme/material(of: Primary).color]
+                    False => NoOutline
+                }
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
         label: Scene/Element/text(
             style: [
-                ...small_flat_text(of: Small)
+                ...theme_switcher_button_text(selected: False)
+                width: 80
+                height: 17
+                line_height: 17
+                auto_padding: 0
             ]
             text: PASSED.theme_options.mode |> WHEN {
                 Light => TEXT { Dark mode }

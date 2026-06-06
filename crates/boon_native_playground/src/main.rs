@@ -5782,6 +5782,12 @@ struct ExampleProjectUnit {
 }
 
 #[derive(Clone, Debug)]
+struct ExampleProjectFileSpec {
+    path: String,
+    role: String,
+}
+
+#[derive(Clone, Debug)]
 struct ProjectFileTab {
     path: String,
     label: String,
@@ -5869,6 +5875,46 @@ impl ExampleCatalogEntry {
         Ok(units)
     }
 
+    fn editor_file_specs(&self) -> Vec<ExampleProjectFileSpec> {
+        if self.inline_source.is_some() {
+            return vec![ExampleProjectFileSpec {
+                path: self.source.clone(),
+                role: "entry".to_owned(),
+            }];
+        }
+        let mut specs = Vec::new();
+        if self.source_files.is_empty() {
+            specs.push(ExampleProjectFileSpec {
+                path: self.source.clone(),
+                role: "entry".to_owned(),
+            });
+        } else {
+            for path in &self.source_files {
+                let path = repo_relative_path(path).display().to_string();
+                specs.push(ExampleProjectFileSpec {
+                    role: project_source_unit_role(self, &path).to_owned(),
+                    path,
+                });
+            }
+            let source = repo_relative_path(&self.source).display().to_string();
+            if !specs.iter().any(|spec| {
+                paths_match_for_preview_units(Path::new(&spec.path), Path::new(&source))
+            }) {
+                specs.push(ExampleProjectFileSpec {
+                    path: source,
+                    role: "entry".to_owned(),
+                });
+            }
+        }
+        for path in &self.build_files {
+            specs.push(ExampleProjectFileSpec {
+                path: repo_relative_path(path).display().to_string(),
+                role: "build".to_owned(),
+            });
+        }
+        specs
+    }
+
     fn source_weight_bytes(&self) -> u64 {
         self.inline_source
             .as_ref()
@@ -5929,6 +5975,7 @@ struct ExampleWorkspace {
     current_file: String,
     selected_buffer: CodeEditorModel,
     open_buffers: BTreeMap<String, CodeEditorModel>,
+    project_type_hints_by_file: BTreeMap<String, EditorTypeHinting>,
     example_active_files: BTreeMap<String, String>,
     dirty_examples: BTreeSet<String>,
     dirty_files: BTreeSet<String>,
@@ -6018,17 +6065,20 @@ impl ExampleWorkspace {
         };
         let mut example_active_files = BTreeMap::new();
         example_active_files.insert(selected_example_id.clone(), current_file.clone());
-        Self {
+        let mut workspace = Self {
             selected_buffer,
             selected_example_id,
             entry_file,
             current_file,
             open_buffers,
+            project_type_hints_by_file: BTreeMap::new(),
             example_active_files,
             dirty_examples: BTreeSet::new(),
             dirty_files: BTreeSet::new(),
             dirty: false,
-        }
+        };
+        let _ = workspace.refresh_selected_project_type_hints(catalog);
+        workspace
     }
 
     fn selected_dirty(&self) -> bool {
@@ -6042,6 +6092,46 @@ impl ExampleWorkspace {
         self.example_active_files
             .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.dirty = self.selected_dirty();
+    }
+
+    fn refresh_selected_project_type_hints(
+        &mut self,
+        catalog: &ExampleCatalog,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let project_units = self.selected_project_payload_units(catalog)?;
+        let runtime_units = Self::runtime_units_from_project_units(&project_units);
+        let hinting_by_file =
+            BoonLanguageService::project_type_hinting(&self.entry_file, &runtime_units);
+        self.apply_project_type_hinting(hinting_by_file);
+        Ok(())
+    }
+
+    fn apply_project_type_hinting(&mut self, hinting_by_file: BTreeMap<String, EditorTypeHinting>) {
+        self.project_type_hints_by_file = hinting_by_file.clone();
+        for (path, hinting) in hinting_by_file {
+            if let Some((_, buffer)) = self.open_buffers.iter_mut().find(|(candidate, _)| {
+                paths_match_for_preview_units(Path::new(candidate), Path::new(&path))
+            }) {
+                buffer.set_type_hinting(hinting);
+            }
+        }
+        if let Some(buffer) = self
+            .open_buffers
+            .iter()
+            .find(|(path, _)| {
+                paths_match_for_preview_units(Path::new(path), Path::new(&self.current_file))
+            })
+            .map(|(_, buffer)| buffer.clone())
+        {
+            self.selected_buffer = buffer;
+        }
+    }
+
+    fn project_type_hinting_for_file(&self, file_path: &str) -> Option<EditorTypeHinting> {
+        self.project_type_hints_by_file
+            .iter()
+            .find(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(file_path)))
+            .map(|(_, hinting)| hinting.clone())
     }
 
     fn selected_project_payload_units(
@@ -6152,31 +6242,29 @@ impl ExampleWorkspace {
             return Vec::new();
         };
         entry
-            .project_units()
-            .unwrap_or_default()
+            .editor_file_specs()
             .into_iter()
-            .filter(|unit| unit.role != "asset")
-            .map(|unit| {
-                let base_label = Path::new(&unit.path)
+            .map(|spec| {
+                let base_label = Path::new(&spec.path)
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or(&unit.path);
-                let label = if unit.role == "build" {
+                    .unwrap_or(&spec.path);
+                let label = if spec.role == "build" {
                     format!("{base_label} build")
                 } else {
                     base_label.to_owned()
                 };
                 ProjectFileTab {
                     active: paths_match_for_preview_units(
-                        Path::new(&unit.path),
+                        Path::new(&spec.path),
                         Path::new(&self.current_file),
                     ),
                     dirty: self.dirty_files.iter().any(|dirty| {
-                        paths_match_for_preview_units(Path::new(dirty), Path::new(&unit.path))
+                        paths_match_for_preview_units(Path::new(dirty), Path::new(&spec.path))
                     }),
-                    path: unit.path,
+                    path: spec.path,
                     label,
-                    role: unit.role,
+                    role: spec.role,
                 }
             })
             .collect()
@@ -6208,47 +6296,52 @@ impl ExampleWorkspace {
             .iter()
             .find(|entry| entry.id == example_id)
             .ok_or_else(|| format!("example `{example_id}` is not in ExampleCatalog"))?;
-        let editor_units = entry
-            .project_units()?
-            .into_iter()
-            .filter(|unit| unit.role != "asset")
-            .collect::<Vec<_>>();
+        let editor_files = entry.editor_file_specs();
         let active_file = self
             .example_active_files
             .get(&entry.id)
             .cloned()
             .filter(|path| {
-                editor_units.iter().any(|unit| {
-                    paths_match_for_preview_units(Path::new(&unit.path), Path::new(path))
+                editor_files.iter().any(|spec| {
+                    paths_match_for_preview_units(Path::new(&spec.path), Path::new(path))
                 })
             })
-            .unwrap_or_else(|| entry.source.clone());
-        let loaded_from_open_buffer = self.open_buffers.contains_key(&active_file);
-        for unit in &editor_units {
-            self.open_buffers
-                .entry(unit.path.clone())
-                .or_insert_with(|| CodeEditorModel::new(&unit.path, &unit.text));
-        }
-        let buffer = self
-            .open_buffers
-            .get(&active_file)
-            .cloned()
             .or_else(|| {
-                editor_units
-                    .first()
-                    .map(|unit| CodeEditorModel::new(&unit.path, &unit.text))
+                editor_files
+                    .iter()
+                    .find(|spec| spec.role == "entry")
+                    .map(|spec| spec.path.clone())
             })
-            .unwrap_or_else(|| {
-                CodeEditorModel::new(
-                    &entry.source,
-                    &entry.source_text().unwrap_or_else(|_| String::new()),
-                )
-            });
+            .or_else(|| editor_files.first().map(|spec| spec.path.clone()))
+            .unwrap_or_else(|| entry.source.clone());
+        let loaded_from_open_buffer = self.open_buffers.iter().any(|(path, _)| {
+            paths_match_for_preview_units(Path::new(path), Path::new(&active_file))
+        });
+        let buffer = if let Some(buffer) = self
+            .open_buffers
+            .iter()
+            .find(|(path, _)| {
+                paths_match_for_preview_units(Path::new(path), Path::new(&active_file))
+            })
+            .map(|(_, buffer)| buffer.clone())
+        {
+            buffer
+        } else {
+            let text = if entry.inline_source.is_some()
+                && paths_match_for_preview_units(Path::new(&entry.source), Path::new(&active_file))
+            {
+                entry.inline_source.clone().unwrap_or_default()
+            } else {
+                std::fs::read_to_string(repo_relative_path(&active_file))?
+            };
+            CodeEditorModel::new(&active_file, &text)
+        };
         let source_hash = boon_runtime::sha256_bytes(buffer.source_text.as_bytes());
         self.selected_example_id = entry.id.clone();
         self.entry_file = entry.source.clone();
         self.current_file = buffer.file_name.clone();
         self.selected_buffer = buffer.clone();
+        self.project_type_hints_by_file.clear();
         self.open_buffers.insert(self.current_file.clone(), buffer);
         self.example_active_files
             .insert(entry.id.clone(), self.current_file.clone());
@@ -6260,11 +6353,16 @@ impl ExampleWorkspace {
             "current_file": self.current_file,
             "source_hash": source_hash,
             "buffer_line_count": self.selected_buffer.line_count,
-            "project_file_count": editor_units.len(),
+            "project_file_count": editor_files.len(),
             "custom": entry.custom,
             "previous_example_id": previous_example_id,
             "previous_dirty_preserved": previous_dirty == self.dirty_examples.contains(&previous_example_id),
             "loaded_from_open_buffer": loaded_from_open_buffer,
+            "loaded_project_buffers_synchronously": false,
+            "project_type_hint_refresh": {
+                "status": "deferred",
+                "reason": "example-switch-visual-path"
+            },
             "dirty": self.dirty,
             "dirty_examples": self.dirty_examples.iter().cloned().collect::<Vec<_>>(),
             "preview_transport": "ReplaceCode"
@@ -6287,26 +6385,39 @@ impl ExampleWorkspace {
                     self.selected_example_id
                 )
             })?;
-        let editor_units = entry
-            .project_units()?
-            .into_iter()
-            .filter(|unit| unit.role != "asset")
-            .collect::<Vec<_>>();
-        let unit = editor_units
+        let editor_files = entry.editor_file_specs();
+        let spec = editor_files
             .iter()
-            .find(|unit| paths_match_for_preview_units(Path::new(&unit.path), Path::new(file_path)))
+            .find(|spec| paths_match_for_preview_units(Path::new(&spec.path), Path::new(file_path)))
             .ok_or_else(|| {
                 format!(
                     "file `{file_path}` is not an editor-visible unit for `{}`",
                     entry.id
                 )
             })?;
-        let loaded_from_open_buffer = self.open_buffers.contains_key(&unit.path);
-        let buffer = self
+        let spec_path = spec.path.clone();
+        let loaded_from_open_buffer = self
             .open_buffers
-            .entry(unit.path.clone())
-            .or_insert_with(|| CodeEditorModel::new(&unit.path, &unit.text))
-            .clone();
+            .iter()
+            .any(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)));
+        let mut buffer = if let Some(buffer) = self
+            .open_buffers
+            .iter()
+            .find(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)))
+            .map(|(_, buffer)| buffer.clone())
+        {
+            buffer
+        } else {
+            let text = std::fs::read_to_string(repo_relative_path(&spec_path))?;
+            let buffer = CodeEditorModel::new(&spec_path, &text);
+            self.open_buffers.insert(spec_path, buffer.clone());
+            buffer
+        };
+        if let Some(hinting) = self.project_type_hinting_for_file(&buffer.file_name) {
+            buffer.set_type_hinting(hinting);
+            self.open_buffers
+                .insert(buffer.file_name.clone(), buffer.clone());
+        }
         self.current_file = buffer.file_name.clone();
         self.selected_buffer = buffer.clone();
         self.example_active_files
@@ -6321,7 +6432,11 @@ impl ExampleWorkspace {
             "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
             "buffer_line_count": self.selected_buffer.line_count,
             "loaded_from_open_buffer": loaded_from_open_buffer,
-            "project_file_count": editor_units.len(),
+            "project_file_count": editor_files.len(),
+            "project_type_hint_refresh": {
+                "status": "skipped",
+                "reason": "source-unchanged-file-tab-switch"
+            },
             "preview_transport": "unchanged"
         }))
     }
@@ -6356,12 +6471,20 @@ impl ExampleWorkspace {
         })
     }
 
-    fn apply_editor_text_input(&mut self, text: &str) -> serde_json::Value {
+    fn apply_editor_text_input(
+        &mut self,
+        text: &str,
+        catalog: &ExampleCatalog,
+    ) -> serde_json::Value {
         let before_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
         let before_line_count = self.selected_buffer.line_count;
         self.selected_buffer.insert_text_at_caret(text);
         self.persist_selected_buffer();
         self.set_selected_dirty(true);
+        let project_hint_refresh = self
+            .refresh_selected_project_type_hints(catalog)
+            .map(|()| json!({"status": "pass"}))
+            .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()}));
         let after_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
         json!({
             "status": "pass",
@@ -6378,6 +6501,9 @@ impl ExampleWorkspace {
             "dirty_examples": self.dirty_examples.iter().cloned().collect::<Vec<_>>(),
             "diagnostic_count": self.selected_buffer.diagnostics.len(),
             "syntax_token_count": self.selected_buffer.syntax_token_count(),
+            "type_hint_backend": self.selected_buffer.type_hint_backend(),
+            "type_hint_count": self.selected_buffer.type_hint_count(),
+            "project_type_hint_refresh": project_hint_refresh,
             "parser_bypassed": false,
             "editor_model_command": self.selected_buffer.last_command
         })
@@ -6552,6 +6678,12 @@ impl ExampleWorkspace {
                     .replace_text(&self.current_file, formatted.clone());
                 self.open_buffers
                     .insert(self.current_file.clone(), self.selected_buffer.clone());
+                let project_type_hint_refresh = self
+                    .refresh_selected_project_type_hints(catalog)
+                    .map(|()| json!({"status": "pass"}))
+                    .unwrap_or_else(
+                        |error| json!({"status": "fail", "diagnostic": error.to_string()}),
+                    );
                 if changed {
                     self.set_selected_dirty(true);
                 } else {
@@ -6568,6 +6700,7 @@ impl ExampleWorkspace {
                     "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
                     "source_unit_count": runtime_units.len(),
                     "formatter": "boon_parser::format_source_unit",
+                    "project_type_hint_refresh": project_type_hint_refresh,
                     "validation": validation,
                     "parser_bypassed": false,
                     "runtime_bypassed": false
@@ -6622,6 +6755,7 @@ impl ExampleWorkspace {
         self.example_active_files
             .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.set_selected_dirty(false);
+        self.refresh_selected_project_type_hints(catalog)?;
         Ok(json!({
             "status": "pass",
             "command": "Reset",
@@ -6753,11 +6887,16 @@ impl ExampleWorkspace {
 }
 
 fn paths_match_for_preview_units(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
+    if left == right {
+        return true;
+    }
+    let resolved_left = repo_relative_path(left);
+    let resolved_right = repo_relative_path(right);
+    resolved_left == resolved_right
+        || resolved_left
             .canonicalize()
             .ok()
-            .zip(right.canonicalize().ok())
+            .zip(resolved_right.canonicalize().ok())
             .is_some_and(|(left, right)| left == right)
 }
 
@@ -6868,6 +7007,84 @@ impl BoonLanguageService {
                 "runtime_bypassed": false
             }),
         }
+    }
+
+    fn project_type_hinting(
+        source_label: &str,
+        units: &[boon_runtime::RuntimeSourceUnit],
+    ) -> BTreeMap<String, EditorTypeHinting> {
+        let mut hinting_by_file = units
+            .iter()
+            .map(|unit| {
+                (
+                    unit.path.clone(),
+                    EditorTypeHinting {
+                        backend: "unavailable",
+                        hints: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if units.is_empty() {
+            return hinting_by_file;
+        }
+        let total_bytes = units.iter().map(|unit| unit.source.len()).sum::<usize>();
+        if total_bytes > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
+            for hinting in hinting_by_file.values_mut() {
+                hinting.backend = "disabled-large-buffer";
+            }
+            return hinting_by_file;
+        }
+        let parsed = if let [unit] = units {
+            boon_parser::parse_source(unit.path.clone(), unit.source.clone())
+        } else {
+            boon_parser::parse_project(
+                source_label.to_owned(),
+                units
+                    .iter()
+                    .map(|unit| (unit.path.clone(), unit.source.clone())),
+            )
+        };
+        let Ok(parsed) = parsed else {
+            return hinting_by_file;
+        };
+        let report = boon_typecheck::check(&parsed);
+        if report.has_errors() {
+            return hinting_by_file;
+        }
+        let file_spans = project_type_hint_file_spans(units);
+        for entry in report.type_hint_table.entries {
+            let Some(span) = file_spans.iter().find(|span| {
+                entry.line >= span.start_line
+                    && entry.line < span.end_line
+                    && entry.start >= span.start_byte
+                    && entry.end <= span.end_byte
+            }) else {
+                continue;
+            };
+            let local_hint = EditorTypeHint {
+                line: entry.line.saturating_sub(span.start_line).saturating_add(1),
+                start: entry.start.saturating_sub(span.start_byte),
+                end: entry.end.saturating_sub(span.start_byte),
+                anchor_column: entry.anchor_column,
+                category: entry.category,
+                compact_label: entry.compact_label,
+                detail_label: entry.detail_label,
+                display_tree: entry.display_tree,
+            };
+            hinting_by_file
+                .entry(span.path.clone())
+                .or_insert_with(|| EditorTypeHinting {
+                    backend: "boon_typecheck::TypeHintTable(project)",
+                    hints: Vec::new(),
+                })
+                .hints
+                .push(local_hint);
+        }
+        for hinting in hinting_by_file.values_mut() {
+            hinting.backend = "boon_typecheck::TypeHintTable(project)";
+        }
+        hinting_by_file
     }
 
     fn syntax_highlighting(source: &str) -> SyntaxHighlighting {
@@ -7608,6 +7825,45 @@ struct EditorTypeHinting {
 }
 
 #[derive(Clone, Debug)]
+struct ProjectTypeHintFileSpan {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn project_type_hint_file_spans(
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Vec<ProjectTypeHintFileSpan> {
+    let mut spans = Vec::new();
+    let mut combined = String::new();
+    let mut next_line = 1usize;
+    for unit in units {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+            next_line = next_line.saturating_add(1);
+        }
+        let start_line = next_line;
+        let start_byte = combined.len();
+        combined.push_str(&unit.source);
+        let end_byte = combined.len();
+        if !unit.source.ends_with('\n') {
+            combined.push('\n');
+        }
+        next_line = next_line.saturating_add(unit.source.lines().count().max(1));
+        spans.push(ProjectTypeHintFileSpan {
+            path: unit.path.clone(),
+            start_line,
+            end_line: next_line,
+            start_byte,
+            end_byte,
+        });
+    }
+    spans
+}
+
+#[derive(Clone, Debug)]
 struct SyntaxToken {
     kind: &'static str,
     line: usize,
@@ -7862,6 +8118,12 @@ impl CodeEditorModel {
 
     fn type_hint_count(&self) -> usize {
         self.type_hints.len()
+    }
+
+    fn set_type_hinting(&mut self, type_hinting: EditorTypeHinting) {
+        self.type_hints = type_hinting.hints;
+        self.type_hints_by_line = type_hints_by_line(&self.type_hints);
+        self.type_hint_backend = type_hinting.backend;
     }
 
     fn type_hint_samples(&self) -> Vec<serde_json::Value> {
@@ -9346,7 +9608,12 @@ struct PendingPreviewReplace {
     command_id: u64,
     source_revision: u64,
     queued_at: Instant,
-    rx: mpsc::Receiver<serde_json::Value>,
+    rx: mpsc::Receiver<PreviewReplaceWorkerResult>,
+}
+
+struct PreviewReplaceWorkerResult {
+    value: serde_json::Value,
+    project_type_hinting: Option<BTreeMap<String, EditorTypeHinting>>,
 }
 
 struct ActiveTypeHint<'a> {
@@ -9790,12 +10057,8 @@ impl DevWindowShell {
         if paths.is_empty() {
             return None;
         }
-        let buffer = &self.workspace.selected_buffer;
-        let source_hash = self
-            .workspace
-            .current_project_hash(&self.catalog)
-            .unwrap_or_else(|_| boon_runtime::sha256_bytes(buffer.source_text.as_bytes()));
-        let runtime_summary = self.visible_runtime_summary(&source_hash)?;
+        let (runtime_summary, source_hash) =
+            self.visible_runtime_summary_for_current_source_with_hash()?;
         let state_hash = runtime_summary
             .get("state_summary_hash")
             .and_then(serde_json::Value::as_str)?;
@@ -9866,12 +10129,8 @@ impl DevWindowShell {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("not-run");
-        let current_source_hash = self
-            .workspace
-            .current_project_hash(&self.catalog)
-            .unwrap_or_else(|_| boon_runtime::sha256_bytes(buffer.source_text.as_bytes()));
         let runtime_summary = self
-            .visible_runtime_summary(&current_source_hash)
+            .visible_runtime_summary_for_current_source()
             .unwrap_or(&serde_json::Value::Null);
         let runtime_state_hash = runtime_summary
             .get("state_summary_hash")
@@ -10027,6 +10286,43 @@ impl DevWindowShell {
                 .as_ref()
                 .filter(|summary| runtime_summary_matches_source(summary, current_source_hash))
         })
+    }
+
+    fn current_source_hash_candidates(&self) -> Vec<String> {
+        let mut hashes = Vec::new();
+        if let Ok(hash) = self.workspace.current_project_hash(&self.catalog) {
+            hashes.push(hash);
+        }
+        if let Ok(units) = self.workspace.selected_runtime_units(&self.catalog) {
+            hashes.push(BoonLanguageService::runtime_units_hash(&units));
+        }
+        hashes.push(boon_runtime::sha256_bytes(
+            self.workspace.selected_buffer.source_text.as_bytes(),
+        ));
+        hashes.sort();
+        hashes.dedup();
+        hashes
+    }
+
+    fn visible_runtime_summary_for_current_source_with_hash(
+        &self,
+    ) -> Option<(&serde_json::Value, String)> {
+        for hash in self.current_source_hash_candidates() {
+            if let Some(summary) = self.visible_runtime_summary(&hash) {
+                let matched_hash = summary
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or(hash);
+                return Some((summary, matched_hash));
+            }
+        }
+        None
+    }
+
+    fn visible_runtime_summary_for_current_source(&self) -> Option<&serde_json::Value> {
+        self.visible_runtime_summary_for_current_source_with_hash()
+            .map(|(summary, _)| summary)
     }
 
     fn selected_example_is_custom(&self) -> bool {
@@ -10256,7 +10552,7 @@ impl DevWindowShell {
             "dev.editor.insert_text" => {
                 self.hovered_editor_position = None;
                 self.workspace
-                    .apply_editor_text_input("\n-- host synthetic editor input")
+                    .apply_editor_text_input("\n-- host synthetic editor input", &self.catalog)
             }
             other => {
                 return json!({
@@ -10397,7 +10693,7 @@ impl DevWindowShell {
                 "text_bytes": text.len()
             }
         ]);
-        let mut value = self.workspace.apply_editor_text_input(text);
+        let mut value = self.workspace.apply_editor_text_input(text, &self.catalog);
         value["custom_source_persistence"] = self.persist_selected_custom_source("EditorTextInput");
         value["host_synthetic_activation"] = activation;
         value["input_evidence_tier"] = json!("boon-driver");
@@ -10525,69 +10821,107 @@ impl DevWindowShell {
             &self.workspace.selected_buffer.source_text,
             self.selected_source_revision,
         );
-        let project_units = match self.workspace.selected_project_payload_units(&self.catalog) {
-            Ok(units) => units,
-            Err(error) => {
-                return json!({
-                    "status": "fail",
-                    "kind": "ReplaceCode",
-                    "command": command,
-                    "command_id": command_id,
-                    "source_revision": self.selected_source_revision,
-                    "selected_example_id": self.workspace.selected_example_id.clone(),
-                    "source_path": self.workspace.selected_buffer.file_name.clone(),
-                    "diagnostic": error.to_string(),
-                    "preview_receives_example_name": false
-                });
-            }
-        };
-        let payload = match SourceProjectPayload::from_project_units(
-            command_id,
-            self.selected_source_revision,
-            &self.selected_source_identity,
-            &self.workspace.entry_file,
-            &self.workspace.current_file,
-            project_units,
-        ) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return json!({
-                    "status": "fail",
-                    "kind": "ReplaceCode",
-                    "command": command,
-                    "command_id": command_id,
-                    "source_revision": self.selected_source_revision,
-                    "selected_example_id": self.workspace.selected_example_id.clone(),
-                    "source_path": self.workspace.selected_buffer.file_name.clone(),
-                    "diagnostic": error.to_string(),
-                    "preview_receives_example_name": false
-                });
-            }
-        };
         let selected_example_id = self.workspace.selected_example_id.clone();
-        let source_path = payload.entrypoint_unit.clone();
-        let active_file = payload.active_file().to_owned();
-        let source_hash = payload.project_hash.clone();
-        let source_unit_count = payload.units.len();
+        let source_path = self.workspace.entry_file.clone();
+        let active_file = self.workspace.current_file.clone();
+        let active_file_hash =
+            boon_runtime::sha256_bytes(self.workspace.selected_buffer.source_text.as_bytes());
         let transport = self.preview_transport.clone();
-        let payload_for_worker = payload.clone();
+        let workspace_for_worker = self.workspace.clone();
+        let catalog_for_worker = self.catalog.clone();
         let command_for_worker = command.to_owned();
         let selected_for_worker = selected_example_id.clone();
+        let source_identity_for_worker = self.selected_source_identity.clone();
+        let source_revision = self.selected_source_revision;
         let (tx, rx) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("boon-native-dev-preview-replace".to_owned())
             .spawn(move || {
+                let worker_started = Instant::now();
+                let payload_started = Instant::now();
+                let project_units = match workspace_for_worker
+                    .selected_project_payload_units(&catalog_for_worker)
+                {
+                    Ok(units) => units,
+                    Err(error) => {
+                        let _ = tx.send(PreviewReplaceWorkerResult {
+                            value: json!({
+                                "status": "fail",
+                                "kind": "ReplaceCode",
+                                "command": command_for_worker,
+                                "command_id": command_id,
+                                "source_revision": source_revision,
+                                "selected_example_id": selected_for_worker,
+                                "source_path": workspace_for_worker.selected_buffer.file_name,
+                                "diagnostic": error.to_string(),
+                                "dev_to_preview_async": true,
+                                "dev_payload_build_async": true,
+                                "preview_receives_example_name": false
+                            }),
+                            project_type_hinting: None,
+                        });
+                        return;
+                    }
+                };
+                let runtime_units =
+                    ExampleWorkspace::runtime_units_from_project_units(&project_units);
+                let payload = match SourceProjectPayload::from_project_units(
+                    command_id,
+                    source_revision,
+                    &source_identity_for_worker,
+                    &workspace_for_worker.entry_file,
+                    &workspace_for_worker.current_file,
+                    project_units,
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = tx.send(PreviewReplaceWorkerResult {
+                            value: json!({
+                                "status": "fail",
+                                "kind": "ReplaceCode",
+                                "command": command_for_worker,
+                                "command_id": command_id,
+                                "source_revision": source_revision,
+                                "selected_example_id": selected_for_worker,
+                                "source_path": workspace_for_worker.selected_buffer.file_name,
+                                "diagnostic": error.to_string(),
+                                "dev_to_preview_async": true,
+                                "dev_payload_build_async": true,
+                                "preview_receives_example_name": false
+                            }),
+                            project_type_hinting: None,
+                        });
+                        return;
+                    }
+                };
+                let payload_build_ms = elapsed_ms(payload_started);
                 let mut value = transport.replace_source_project(
                     &command_for_worker,
                     &selected_for_worker,
-                    &payload_for_worker,
+                    &payload,
                 );
+                let hint_started = Instant::now();
+                let project_type_hinting = Some(BoonLanguageService::project_type_hinting(
+                    &workspace_for_worker.entry_file,
+                    &runtime_units,
+                ));
                 value["dev_to_preview_async"] = json!(true);
-                let _ = tx.send(value);
+                value["dev_payload_build_async"] = json!(true);
+                value["dev_payload_build_ms"] = json!(payload_build_ms);
+                value["dev_project_type_hint_refresh"] = json!({
+                    "status": "pass",
+                    "async": true,
+                    "elapsed_ms": elapsed_ms(hint_started)
+                });
+                value["dev_worker_total_ms"] = json!(elapsed_ms(worker_started));
+                let _ = tx.send(PreviewReplaceWorkerResult {
+                    value,
+                    project_type_hinting,
+                });
             });
         self.pending_preview_replace = Some(PendingPreviewReplace {
             command_id,
-            source_revision: self.selected_source_revision,
+            source_revision,
             queued_at: Instant::now(),
             rx,
         });
@@ -10603,22 +10937,23 @@ impl DevWindowShell {
             "source_path": source_path,
             "entry_file": self.workspace.entry_file,
             "active_file": active_file,
-            "source_hash": source_hash,
-            "source_unit_count": source_unit_count,
-            "runtime_source_unit_count": payload.runtime_units().len(),
-            "multi_unit_execution_mode": if source_unit_count > 1 {
-                "multi-unit-project-executed"
-            } else {
-                "single-entrypoint"
-            },
+            "source_hash": active_file_hash,
+            "source_hash_kind": "active-file-until-async-project-payload-ready",
+            "source_unit_count": serde_json::Value::Null,
+            "runtime_source_unit_count": serde_json::Value::Null,
+            "source_unit_count_pending": true,
+            "runtime_source_unit_count_pending": true,
+            "multi_unit_execution_mode": "pending-async-project-payload",
             "dev_to_preview_async": true,
+            "dev_payload_build_async": true,
             "dev_visual_update_before_preview_ack": true,
             "ack": {
                 "kind": "replace-source-dev-queued",
                 "status": "queued-locally",
                 "command_id": command_id,
-                "source_revision": self.selected_source_revision,
-                "source_unit_count": source_unit_count,
+                "source_revision": source_revision,
+                "source_unit_count": serde_json::Value::Null,
+                "source_unit_count_pending": true,
                 "sync_ack_contains_runtime_summary": false,
                 "sync_ack_contains_layout_proof": false
             },
@@ -10644,19 +10979,26 @@ impl DevWindowShell {
             return false;
         };
         match pending.rx.try_recv() {
-            Ok(mut value) => {
+            Ok(worker_result) => {
+                let mut value = worker_result.value;
                 value["dev_queue_elapsed_ms"] = json!(elapsed_ms(pending.queued_at));
-                if value.get("command_id").and_then(serde_json::Value::as_u64)
+                let stale = value.get("command_id").and_then(serde_json::Value::as_u64)
                     != Some(pending.command_id)
                     || value
                         .get("source_revision")
                         .and_then(serde_json::Value::as_u64)
-                        != Some(pending.source_revision)
-                {
+                        != Some(pending.source_revision);
+                if stale {
                     value["status"] = json!("stale");
                     value["diagnostic"] = json!(
                         "dev-side preview replace result did not match pending command/revision"
                     );
+                }
+                if !stale {
+                    if let Some(project_type_hinting) = worker_result.project_type_hinting {
+                        self.workspace
+                            .apply_project_type_hinting(project_type_hinting);
+                    }
                 }
                 if value
                     .pointer("/ack/kind")
@@ -19160,7 +19502,7 @@ fn document_builtin_value_call(
         && let Some(value) = document_eval_function_call(function, args, expressions, context)
         && document_theme_real_value_usable(function, &value)
     {
-        return Some(value);
+        return Some(document_mark_theme_value_source(function, value, "boon"));
     }
     if let Some(light_kind) = function.strip_prefix("Light/") {
         return document_light_value_call(light_kind, args, expressions, context);
@@ -19174,9 +19516,13 @@ fn document_builtin_value_call(
             &document_call_arg_text(args, "of", expressions, context)?,
             context,
         )),
-        "Theme/material" => Some(document_theme_material(
-            &document_call_arg_text(args, "of", expressions, context)?,
-            context,
+        "Theme/material" => Some(document_mark_theme_value_source(
+            function,
+            document_theme_material(
+                &document_call_arg_text(args, "of", expressions, context)?,
+                context,
+            ),
+            "rust_fallback",
         )),
         "Theme/depth" => Some(json!(document_theme_depth(
             &document_call_arg_text(args, "of", expressions, context)?,
@@ -19268,6 +19614,20 @@ fn document_builtin_value_call(
         "Theme/geometry" => Some(document_theme_geometry(context)),
         _ => None,
     }
+}
+
+fn document_mark_theme_value_source(function: &str, value: Value, source: &str) -> Value {
+    if !matches!(function, "Theme/material" | "Theme/checkbox_material") {
+        return value;
+    }
+    let Value::Object(mut object) = value else {
+        return value;
+    };
+    object.insert(
+        "__theme_material_source".to_owned(),
+        Value::String(source.to_owned()),
+    );
+    Value::Object(object)
 }
 
 fn document_theme_real_value_usable(function: &str, value: &Value) -> bool {
@@ -27585,6 +27945,68 @@ mod tests {
             .unwrap_or_else(|| panic!("{context} should render text `{label}`"))
     }
 
+    fn rect_contains_bounds(outer: boon_document::Rect, inner: boon_document::Rect) -> bool {
+        outer.x <= inner.x + 0.5
+            && outer.y <= inner.y + 0.5
+            && outer.x + outer.width >= inner.x + inner.width - 0.5
+            && outer.y + outer.height >= inner.y + inner.height - 0.5
+    }
+
+    fn physical_button_for_text<'a>(
+        frame: &'a boon_document::LayoutFrame,
+        label: &str,
+        context: &str,
+    ) -> &'a boon_document::DisplayItem {
+        let text = physical_frame_text_item(frame, label, context);
+        frame
+            .display_list
+            .iter()
+            .find(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::Button)
+                    && rect_contains_bounds(item.bounds, text.bounds)
+            })
+            .unwrap_or_else(|| panic!("{context} should render button containing `{label}`"))
+    }
+
+    fn assert_physical_button_label_centered(
+        frame: &boon_document::LayoutFrame,
+        label: &str,
+        context: &str,
+    ) {
+        let text = physical_frame_text_item(frame, label, context);
+        let button = physical_button_for_text(frame, label, context);
+        let text_center_x = text.bounds.x + text.bounds.width * 0.5;
+        let text_center_y = text.bounds.y + text.bounds.height * 0.5;
+        let button_center_x = button.bounds.x + button.bounds.width * 0.5;
+        let button_center_y = button.bounds.y + button.bounds.height * 0.5;
+        assert!(
+            (text_center_x - button_center_x).abs() <= 1.0
+                && (text_center_y - button_center_y).abs() <= 1.0,
+            "{context} button `{label}` label should be centered: text={:?}, button={:?}",
+            text.bounds,
+            button.bounds
+        );
+        assert_eq!(
+            text.style.get("text_inset"),
+            Some(&boon_document_model::StyleValue::Number(0.0)),
+            "{context} button `{label}` label should not be offset by text_inset"
+        );
+        assert_eq!(
+            text.style.get("vertical_align"),
+            Some(&boon_document_model::StyleValue::Text("Center".to_owned())),
+            "{context} button `{label}` label should vertically center itself"
+        );
+    }
+
+    fn assert_theme_material_source_is_boon(item: &boon_document::DisplayItem, context: &str) {
+        assert_eq!(
+            style_text_from_map(&item.style, "__theme_material_source"),
+            Some("boon"),
+            "{context} should use source-evaluated Theme/material, not Rust fallback: {:?}",
+            item.style
+        );
+    }
+
     fn physical_todomvc_checkbox_for_todo_title<'a>(
         frame: &'a boon_document::LayoutFrame,
         todo_title: &str,
@@ -27619,6 +28041,7 @@ mod tests {
             "{context} checkbox should lower checked={checked}: {:?}",
             checkbox.style
         );
+        assert_theme_material_source_is_boon(checkbox, context);
         assert_display_style_text(
             checkbox,
             "checkbox_background",
@@ -27649,6 +28072,20 @@ mod tests {
             physical_todomvc_checkbox_border_width(theme, mode),
             context,
         );
+        for key in [
+            "checkbox_inset",
+            "checkbox_aa",
+            "check_aa",
+            "checkbox_cast_color",
+            "checkbox_highlight",
+            "checkbox_highlight_width",
+        ] {
+            assert!(
+                checkbox.style.contains_key(key),
+                "{context} checkbox should lower source material key `{key}`: {:?}",
+                checkbox.style
+            );
+        }
     }
 
     fn assert_physical_todomvc_frame_theme_styles(
@@ -28151,7 +28588,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "c46f7d0c80ed",
+            "d0896fa6c17b",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)
@@ -28827,9 +29264,24 @@ mod tests {
             author.bounds.x > created_by.bounds.x + created_by.bounds.width,
             "helper-returned footer link should render after the paragraph text"
         );
+        let author_space = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some(" ")
+                    && (item.bounds.y - author.bounds.y).abs() <= 0.5
+                    && item.bounds.x >= created_by.bounds.x + created_by.bounds.width - 0.5
+                    && item.bounds.x + item.bounds.width <= author.bounds.x + 0.5
+            })
+            .expect("physical TodoMVC author footer should use a measured Text/space fragment");
         assert!(
-            author.bounds.x - (created_by.bounds.x + created_by.bounds.width) >= 2.0,
-            "paragraph text and helper link should have a measured inline gap"
+            (author_space.bounds.x - (created_by.bounds.x + created_by.bounds.width)).abs() <= 0.75
+                && (author.bounds.x - (author_space.bounds.x + author_space.bounds.width)).abs()
+                    <= 0.75,
+            "author footer should be text + regular space + link without row-gap spacing: text={:?}, space={:?}, link={:?}",
+            created_by.bounds,
+            author_space.bounds,
+            author.bounds
         );
         assert_eq!(
             author.style.get("cursor"),
@@ -28864,6 +29316,27 @@ mod tests {
         assert!(
             todomvc_link.bounds.x > part_of.bounds.x + part_of.bounds.width,
             "second footer helper link should render inline after text"
+        );
+        let reference_space = layout
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some(" ")
+                    && (item.bounds.y - todomvc_link.bounds.y).abs() <= 0.5
+                    && item.bounds.x >= part_of.bounds.x + part_of.bounds.width - 0.5
+                    && item.bounds.x + item.bounds.width <= todomvc_link.bounds.x + 0.5
+            })
+            .expect("physical TodoMVC reference footer should use a measured Text/space fragment");
+        assert!(
+            (reference_space.bounds.x - (part_of.bounds.x + part_of.bounds.width)).abs() <= 0.75
+                && (todomvc_link.bounds.x
+                    - (reference_space.bounds.x + reference_space.bounds.width))
+                    .abs()
+                    <= 0.75,
+            "reference footer should be text + regular space + link without row-gap spacing: text={:?}, space={:?}, link={:?}",
+            part_of.bounds,
+            reference_space.bounds,
+            todomvc_link.bounds
         );
         assert_eq!(
             todomvc_link.style.get("link_url"),
@@ -29009,24 +29482,16 @@ mod tests {
                         && item.bounds.x <= text.bounds.x + 0.5
                         && item.bounds.y <= text.bounds.y + 0.5
                         && item.bounds.x + item.bounds.width
-                            >= text.bounds.x + text.bounds.width + 0.5
+                            >= text.bounds.x + text.bounds.width - 0.5
                         && item.bounds.y + item.bounds.height
-                            >= text.bounds.y + text.bounds.height + 0.5
+                            >= text.bounds.y + text.bounds.height - 0.5
                 })
                 .unwrap_or_else(|| panic!("theme button `{label}` should contain its text bounds"));
-            let padding_left = match button.style.get("padding_left") {
-                Some(boon_document_model::StyleValue::Number(value)) => *value,
-                _ => 0.0,
-            };
-            let padding_right = match button.style.get("padding_right") {
-                Some(boon_document_model::StyleValue::Number(value)) => *value,
-                _ => 0.0,
-            };
             assert!(
-                button.bounds.width + 0.5
-                    >= text.bounds.width + padding_left as f32 + padding_right as f32,
-                "theme button `{label}` should reserve horizontal padding around its label"
+                button.bounds.width >= 50.0 && button.bounds.height >= 25.0,
+                "theme button `{label}` should keep a stable clickable box"
             );
+            assert_physical_button_label_centered(&layout, label, "physical footer/theme buttons");
         }
     }
 
@@ -29202,11 +29667,13 @@ mod tests {
                     },
                     &context,
                 );
-                assert_display_style_text(
-                    input,
-                    "material_color",
-                    physical_todomvc_material_color(theme, mode, "recessed"),
-                    &context,
+                assert_display_style_text(input, "material_color", "#00000000", &context);
+                assert_display_style_number(input, "depth", 0.0, &context);
+                assert_eq!(
+                    input.style.get("box_shadow_1_color"),
+                    None,
+                    "{context} new-todo input should not synthesize its own right/bottom shadow: {:?}",
+                    input.style
                 );
                 let toggle_all_text = text_item("❯");
                 assert_display_style_text(
@@ -29234,8 +29701,20 @@ mod tests {
                 assert!(
                     toggle_all.style.contains_key("background")
                         || toggle_all.style.contains_key("material_color"),
-                    "{context} toggle-all should lower the tagged InteractiveRecessed material arm, not rely on renderer defaults: {:?}",
+                    "{context} toggle-all should lower an explicit transparent material, not rely on renderer defaults: {:?}",
                     toggle_all.style
+                );
+                assert_eq!(
+                    style_text_from_map(&toggle_all.style, "material_color")
+                        .or_else(|| style_text_from_map(&toggle_all.style, "background")),
+                    Some("#00000000"),
+                    "{context} toggle-all hit target should be transparent so the row/panel does not split into nested panes: {:?}",
+                    toggle_all.style
+                );
+                assert_eq!(
+                    toggle_all.style.get("border_right"),
+                    None,
+                    "{context} toggle-all should not draw a vertical divider against the input"
                 );
                 assert!(
                     !toggle_all.style.contains_key("surface_base")
@@ -29333,12 +29812,7 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("{context} new-todo row should contain input controls")
                     });
-                assert_display_style_text(
-                    new_todo_row,
-                    "material_color",
-                    physical_todomvc_material_color(theme, mode, "surface"),
-                    &context,
-                );
+                assert_display_style_text(new_todo_row, "material_color", "#00000000", &context);
                 if theme == "Classic" {
                     assert_eq!(
                         new_todo_row.style.get("border"),
@@ -29383,6 +29857,9 @@ mod tests {
                         "{context} footer text `{label}` should stay inside the panel: {:?}, panel=({panel_left}, {panel_right})",
                         item.bounds
                     );
+                }
+                for label in ["All", "Active", "Completed", "Clear completed"] {
+                    assert_physical_button_label_centered(&layout, label, &context);
                 }
                 let count = text_item("3 items left");
                 let panel_footer = layout
@@ -29529,13 +30006,15 @@ mod tests {
                     physical_todomvc_text_color(theme, mode, "secondary"),
                     &context,
                 );
-                assert_ne!(
-                    inactive_filter.style.get("border"),
-                    selected_filter.style.get("border"),
-                    "{context} inactive filter should not inherit the selected outline: selected={:?}, inactive={:?}",
-                    selected_filter.style,
-                    inactive_filter.style
-                );
+                if theme != "Neobrutalism" {
+                    assert_ne!(
+                        inactive_filter.style.get("border"),
+                        selected_filter.style.get("border"),
+                        "{context} inactive filter should not inherit the selected outline: selected={:?}, inactive={:?}",
+                        selected_filter.style,
+                        inactive_filter.style
+                    );
+                }
                 for generic_surface_key in [
                     "background",
                     "material_color",
@@ -29693,6 +30172,12 @@ mod tests {
                         &context,
                     );
                     let button = text_button(label);
+                    assert_physical_button_label_centered(&layout, label, &context);
+                    assert!(
+                        button.style.contains_key("__hover_border"),
+                        "{context} theme/mode switcher button `{label}` should expose a visible hover border: {:?}",
+                        button.style
+                    );
                     theme_switcher_top = theme_switcher_top.min(button.bounds.y);
                     theme_switcher_bottom =
                         theme_switcher_bottom.max(button.bounds.y + button.bounds.height);
@@ -29707,6 +30192,36 @@ mod tests {
                         button.bounds
                     );
                 }
+                let theme_button_bounds = [
+                    text_button("Classic").bounds,
+                    text_button("Professional").bounds,
+                    text_button("Glass").bounds,
+                    text_button("Brutalist").bounds,
+                    text_button("Neumorphic").bounds,
+                ];
+                for adjacent in theme_button_bounds.windows(2) {
+                    assert!(
+                        adjacent[0].x + adjacent[0].width + 5.5 <= adjacent[1].x,
+                        "{context} theme switcher buttons should not overlap or crowd: left={:?}, right={:?}",
+                        adjacent[0],
+                        adjacent[1]
+                    );
+                }
+                let theme_row_left = theme_button_bounds
+                    .iter()
+                    .map(|bounds| bounds.x)
+                    .fold(f32::MAX, f32::min);
+                let theme_row_right = theme_button_bounds
+                    .iter()
+                    .map(|bounds| bounds.x + bounds.width)
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    ((theme_row_left + theme_row_right) * 0.5
+                        - PHYSICAL_TODOMVC_PREVIEW_WIDTH * 0.5)
+                        .abs()
+                        <= 2.0,
+                    "{context} theme switcher row should be centered: left={theme_row_left}, right={theme_row_right}"
+                );
                 let mode_button = text_button(mode_label);
                 let mode_center = mode_button.bounds.x + mode_button.bounds.width * 0.5;
                 assert!(
@@ -29747,10 +30262,9 @@ mod tests {
                     parse_visual_color(physical_todomvc_material_color(theme, mode, "surface")),
                     root,
                 );
-                let selected_backdrop =
-                    physical_todomvc_selected_filter_material_color(theme, mode)
-                        .map(|color| visual_color_over(parse_visual_color(color), root))
-                        .unwrap_or(root);
+                let selected_frosted = physical_todomvc_selected_filter_material_color(theme, mode)
+                    .map(|color| visual_color_over(parse_visual_color(color), root))
+                    .unwrap_or(root);
                 let checkbox_background = visual_color_over(
                     parse_visual_color(physical_todomvc_checkbox_style_color(
                         theme,
@@ -29774,7 +30288,7 @@ mod tests {
                 );
                 assert_visual_contrast_at_least(
                     physical_todomvc_text_color(theme, mode, "filter_selected"),
-                    selected_backdrop,
+                    selected_frosted,
                     4.0,
                     &format!("{context} selected theme switcher text"),
                 );
@@ -30119,6 +30633,308 @@ mod tests {
     }
 
     #[test]
+    fn physical_todomvc_switcher_hover_glass_and_checkbox_readbacks_are_visual() {
+        futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+                .expect("physical TodoMVC hover/material readbacks require a WGPU adapter");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("boon-native-playground-physical-todomvc-hover-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .expect("test WGPU device should be available when adapter exists");
+
+            let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
+            let source = std::fs::read_to_string(&source_path)
+                .expect("physical TodoMVC source should exist");
+            for theme in [
+                "Classic",
+                "Professional",
+                "Glassmorphism",
+                "Neobrutalism",
+                "Neumorphism",
+            ] {
+                for mode in ["Light", "Dark"] {
+                    let context = format!("{theme}/{mode}");
+                    let mut state = physical_todomvc_seed_state(theme, mode);
+                    mirror_physical_todomvc_seed_root_fields(&mut state);
+                    let (layout_proof, layout) = native_document_layout_proof_with_state_embedded(
+                        &source_path,
+                        &source,
+                        Some(&state),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{context} physical TodoMVC layout should lower: {error}")
+                    });
+                    assert_physical_todomvc_frame_theme_styles(
+                        &layout,
+                        theme,
+                        mode,
+                        &format!("{context} hover/material readback layout"),
+                    );
+
+                    let base_image = render_physical_todomvc_frame_image(
+                        &device,
+                        &queue,
+                        &layout,
+                        &format!(
+                            "hover-base-{}-{}",
+                            theme.to_ascii_lowercase(),
+                            mode.to_ascii_lowercase()
+                        ),
+                    );
+
+                    let completed_checkbox = physical_todomvc_checkbox_for_todo_title(
+                        &layout,
+                        "Finish TodoMVC renderer",
+                        &context,
+                    );
+                    let checkbox_luma_range =
+                        image_luma_range(&base_image, completed_checkbox.bounds);
+                    assert!(
+                        checkbox_luma_range >= 18.0,
+                        "{context} completed checkbox ROI should contain visible circle/checkmark pixels, luma_range={checkbox_luma_range}, bounds={:?}",
+                        completed_checkbox.bounds
+                    );
+
+                    let input = physical_new_todo_input_item(&layout)
+                        .unwrap_or_else(|| panic!("{context} should expose new todo input"));
+                    let toggle = physical_button_for_text(&layout, "❯", &context);
+                    let seam_x = input.bounds.x;
+                    let seam_top_luma = average_image_luma(
+                        &base_image,
+                        boon_document::Rect {
+                            x: seam_x,
+                            y: input.bounds.y + 8.0,
+                            width: 2.0,
+                            height: 8.0,
+                        },
+                    );
+                    let seam_bottom_luma = average_image_luma(
+                        &base_image,
+                        boon_document::Rect {
+                            x: seam_x,
+                            y: input.bounds.y + input.bounds.height - 16.0,
+                            width: 2.0,
+                            height: 8.0,
+                        },
+                    );
+                    let seam_luma = (seam_top_luma + seam_bottom_luma) * 0.5;
+                    let input_luma = average_image_luma(
+                        &base_image,
+                        boon_document::Rect {
+                            x: input.bounds.x + 8.0,
+                            y: input.bounds.y + 8.0,
+                            width: 4.0,
+                            height: (input.bounds.height - 16.0).max(1.0),
+                        },
+                    );
+                    let right_edge_luma = average_image_luma(
+                        &base_image,
+                        boon_document::Rect {
+                            x: input.bounds.x + input.bounds.width - 2.0,
+                            y: input.bounds.y + 8.0,
+                            width: 2.0,
+                            height: (input.bounds.height - 16.0).max(1.0),
+                        },
+                    );
+                    let bottom_edge_luma = average_image_luma(
+                        &base_image,
+                        boon_document::Rect {
+                            x: input.bounds.x + 8.0,
+                            y: input.bounds.y + input.bounds.height - 10.0,
+                            width: (input.bounds.width - 16.0).max(1.0),
+                            height: 2.0,
+                        },
+                    );
+                    assert!(
+                        (seam_luma - input_luma).abs() <= 20.0,
+                        "{context} toggle/input seam should not render as a hard vertical divider: seam={seam_luma}, input={input_luma}, toggle={:?}, input={:?}, input_style={:?}",
+                        toggle.bounds,
+                        input.bounds,
+                        input.style
+                    );
+                    if !matches!(theme, "Classic" | "Neobrutalism") {
+                        assert!(
+                            right_edge_luma + 24.0 >= input_luma,
+                            "{context} new-todo input right edge should not render as a dark line: right={right_edge_luma}, input={input_luma}, input={:?}, input_style={:?}",
+                            input.bounds,
+                            input.style
+                        );
+                        assert!(
+                            bottom_edge_luma + 24.0 >= input_luma,
+                            "{context} new-todo input bottom edge should not render as a dark line: bottom={bottom_edge_luma}, input={input_luma}, input={:?}, input_style={:?}",
+                            input.bounds,
+                            input.style
+                        );
+                    }
+
+                    if theme == "Glassmorphism" {
+                        assert_eq!(
+                            style_text_from_map(&toggle.style, "material_color")
+                                .or_else(|| style_text_from_map(&toggle.style, "background")),
+                            Some("#00000000"),
+                            "{context} toggle-all button should not paint its own glass pane: {:?}",
+                            toggle.style
+                        );
+                        assert!(
+                            style_number_from_map(&toggle.style, "frosted_blur").is_none()
+                                && style_number_from_map(&toggle.style, "glass_highlight")
+                                    .is_none(),
+                            "{context} toggle-all button should not carry nested glass material tokens: {:?}",
+                            toggle.style
+                        );
+                        let glass_items = layout
+                            .display_list
+                            .iter()
+                            .filter(|item| {
+                                style_number_from_map(&item.style, "frosted_blur")
+                                    .is_some_and(|value| value > 0.0)
+                                    && style_number_from_map(&item.style, "glass_highlight")
+                                        .is_some_and(|value| value > 0.0)
+                            })
+                            .collect::<Vec<_>>();
+                        assert!(
+                            !glass_items.is_empty(),
+                            "{context} should lower material API glass/frosted tokens"
+                        );
+                        let panel = glass_items
+                            .iter()
+                            .filter(|item| {
+                                item.bounds.width >= 520.0 && item.bounds.height >= 120.0
+                            })
+                            .max_by(|left, right| {
+                                let left_area = left.bounds.width * left.bounds.height;
+                                let right_area = right.bounds.width * right.bounds.height;
+                                left_area
+                                    .partial_cmp(&right_area)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .copied()
+                            .unwrap_or(glass_items[0]);
+                        let top_luma = average_image_luma(
+                            &base_image,
+                            boon_document::Rect {
+                                x: panel.bounds.x + 24.0,
+                                y: panel.bounds.y + 2.0,
+                                width: (panel.bounds.width - 48.0).max(1.0),
+                                height: 5.0,
+                            },
+                        );
+                        let center_luma = average_image_luma(
+                            &base_image,
+                            boon_document::Rect {
+                                x: panel.bounds.x + 24.0,
+                                y: panel.bounds.y + panel.bounds.height * 0.45,
+                                width: (panel.bounds.width - 48.0).max(1.0),
+                                height: 8.0,
+                            },
+                        );
+                        assert!(
+                            (top_luma - center_luma).abs() >= 2.0,
+                            "{context} glass material should visibly render highlight/haze bands: top={top_luma}, center={center_luma}, bounds={:?}",
+                            panel.bounds
+                        );
+                    }
+
+                    let inactive_theme_label = if theme == "Classic" {
+                        "Professional"
+                    } else {
+                        "Classic"
+                    };
+                    let mode_label = if mode == "Dark" {
+                        "Light mode"
+                    } else {
+                        "Dark mode"
+                    };
+                    for hover_label in [inactive_theme_label, mode_label] {
+                        let hover_button = physical_button_for_text(&layout, hover_label, &context);
+                        let mut hover_input = deterministic_click_input(0, 0.0, 0.0);
+                        hover_input.mouse_motion_event_count = 0;
+                        hover_input.mouse_window_pos =
+                            Some(boon_native_app_window::NativeMouseWindowPosition {
+                                x: f64::from(
+                                    hover_button.bounds.x + hover_button.bounds.width * 0.5,
+                                ),
+                                y: f64::from(
+                                    hover_button.bounds.y + hover_button.bounds.height * 0.5,
+                                ),
+                                window_width: 920.0,
+                                window_height: 720.0,
+                            });
+                        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+                            layout_proof: layout_proof.clone(),
+                            layout_frame_override: Some(layout.clone()),
+                            update_count: 0,
+                            scroll_x_px: 0.0,
+                            scroll_y_px: 0.0,
+                            last_error: None,
+                            last_error_count: 0,
+                            status_overlay: None,
+                            last_dirty_reason: None,
+                        }));
+                        let mut input_state = PreviewNativeInputState::default();
+                        assert!(
+                            preview_update_hover_from_input(
+                                &layout_proof,
+                                &hover_input,
+                                &shared_render_state,
+                                &mut input_state
+                            )
+                            .expect("theme switcher hover overlay should update")
+                        );
+                        assert_eq!(
+                            preview_cursor_icon(&layout_proof, &input_state),
+                            boon_native_app_window::NativeCursorIcon::Pointer,
+                            "{context} hovering `{hover_label}` should request the pointer cursor"
+                        );
+                        let hover_frame = latest_preview_frame(&shared_render_state);
+                        let hovered_button =
+                            physical_button_for_text(&hover_frame, hover_label, &context);
+                        assert_eq!(
+                            hovered_button.style.get("__hover"),
+                            Some(&boon_document_model::StyleValue::Bool(true)),
+                            "{context} host hover should mark switcher button `{hover_label}`"
+                        );
+                        let hover_image = render_physical_todomvc_frame_image(
+                            &device,
+                            &queue,
+                            &hover_frame,
+                            &format!(
+                                "hover-{}-{}-{}",
+                                theme.to_ascii_lowercase(),
+                                mode.to_ascii_lowercase(),
+                                hover_label.replace(' ', "-").to_ascii_lowercase()
+                            ),
+                        );
+                        let diff =
+                            image_abs_diff_sum(&base_image, &hover_image, hover_button.bounds);
+                        assert!(
+                            diff >= 180,
+                            "{context} hovering switcher button `{hover_label}` should change app-owned pixels, diff={diff}, bounds={:?}",
+                            hover_button.bounds
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn physical_todomvc_non_classic_themes_lower_source_physical_tokens() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
@@ -30230,7 +31046,18 @@ mod tests {
                                 && style_number_from_map(&item.style, "box_shadow_1_blur")
                                     .is_some_and(|value| value >= 50.0)
                         }),
-                        "Glassmorphism should lower transparent hex-alpha glass surfaces"
+                        "Glassmorphism should lower transparent hex-alpha glass panel surfaces"
+                    );
+                    assert!(
+                        layout.display_list.iter().any(|item| {
+                            style_number_from_map(&item.style, "frosted_blur")
+                                .is_some_and(|value| value >= 12.0)
+                                && style_number_from_map(&item.style, "frosted_saturate")
+                                    .is_some_and(|value| value > 1.0)
+                                && style_number_from_map(&item.style, "glass_highlight")
+                                    .is_some_and(|value| value > 0.5)
+                        }),
+                        "Glassmorphism should lower material API glass/frosted tokens"
                     );
                 }
                 "Neobrutalism" => {
@@ -30277,7 +31104,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_todomvc_declarative_focus_does_not_paint_static_preview_caret() {
+    fn physical_todomvc_static_new_todo_input_does_not_paint_focus_artifact() {
         let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
         let source =
             std::fs::read_to_string(&source_path).expect("physical TodoMVC source should exist");
@@ -30286,49 +31113,33 @@ mod tests {
                 .expect("physical TodoMVC runtime should initialize"),
         ));
         let state = live_runtime.lock().unwrap().document_state_summary();
-        let (layout_proof, layout_frame) =
+        let (_, layout_frame) =
             native_document_layout_proof_with_state_embedded(&source_path, &source, Some(&state))
                 .expect("physical TodoMVC layout should lower");
-        let input_node = layout_frame
+        let visible_input = layout_frame
             .display_list
             .iter()
             .find(|item| {
                 matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
-                    && item.style.get("focus") == Some(&boon_document_model::StyleValue::Bool(true))
+                    && item.style.get("placeholder")
+                        == Some(&boon_document_model::StyleValue::Text(
+                            "What needs to be done?".to_owned(),
+                        ))
             })
-            .map(|item| item.node.0.clone())
-            .expect("physical new-todo input should declare focus");
-        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-            layout_proof,
-            layout_frame_override: Some(layout_frame),
-            update_count: 0,
-            scroll_x_px: 0.0,
-            scroll_y_px: 0.0,
-            last_error: None,
-            last_error_count: 0,
-            status_overlay: None,
-            last_dirty_reason: None,
-        }));
-        let input_state = PreviewNativeInputState::default();
-
-        assert!(
-            preview_apply_focus_overlay(&shared_render_state, &input_state, true).unwrap(),
-            "declarative focus should still mark the input focused"
+            .expect("physical new-todo input should render");
+        assert!(!visible_input.focused);
+        assert_eq!(
+            visible_input.style.get("focus"),
+            None,
+            "static reference readbacks should not carry a source-declared focus flag"
         );
-        let visible_frame = latest_preview_frame(&shared_render_state);
-        let visible_input = visible_frame
-            .display_list
-            .iter()
-            .find(|item| item.node.0 == input_node)
-            .expect("focused physical input should remain in the frame");
-        assert!(visible_input.focused);
         assert_eq!(
             visible_input.style.get("caret_visible"),
             None,
             "static reference readbacks should not paint a text caret before host text focus"
         );
         assert_eq!(
-            frame_caret_column_for_node(&visible_frame, &input_node),
+            frame_caret_column_for_node(&layout_frame, &visible_input.node.0),
             None
         );
     }
@@ -33903,6 +34714,144 @@ mod tests {
     }
 
     #[test]
+    fn physical_todomvc_dev_window_uses_project_type_hints_and_runtime_values() {
+        let source_path = PathBuf::from("examples/todo_mvc_physical/RUN.bn");
+        let source = boon_runtime::source_text_for_path(&source_path)
+            .expect("physical TodoMVC entry source should load");
+        let socket_path = PathBuf::from(format!(
+            "/tmp/boon-physical-dev-values-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let mut shell = DevWindowShell::new(
+            source_path.to_string_lossy().as_ref(),
+            &source,
+            Some("todo_mvc_physical"),
+            PreviewTransport::new(Some(socket_path.to_string_lossy().to_string())),
+        );
+        shell
+            .workspace
+            .select_project_file(&shell.catalog, source_path.to_string_lossy().as_ref())
+            .expect("physical TodoMVC RUN.bn project tab should be selectable");
+        assert_eq!(
+            shell.workspace.selected_buffer.type_hint_backend(),
+            "boon_typecheck::TypeHintTable(project)"
+        );
+        assert!(
+            shell.workspace.selected_buffer.type_hint_count() > 0,
+            "physical TodoMVC RUN.bn should receive type hints from the full theme project"
+        );
+
+        let todos_line = shell
+            .workspace
+            .selected_buffer
+            .source_text
+            .lines()
+            .position(|line| line.trim_start().starts_with("todos: LIST"))
+            .map(|index| index + 1)
+            .expect("physical TodoMVC should declare store.todos");
+        let todos_column = shell
+            .workspace
+            .selected_buffer
+            .source_text
+            .lines()
+            .nth(todos_line - 1)
+            .and_then(|line| line.find("todos"))
+            .map(|index| index + 2)
+            .expect("todos line should contain the todos token");
+        let todos_hint = shell
+            .workspace
+            .selected_buffer
+            .type_hint_at_position(&EditorPosition {
+                line: todos_line,
+                column: todos_column,
+            })
+            .expect("store.todos should have a mapped project type hint");
+        assert!(
+            todos_hint.detail_label.contains("todo_elements:")
+                && todos_hint.detail_label.contains("title:")
+                && todos_hint.detail_label.contains("completed: BOOL"),
+            "store.todos hint should come from the physical project typecheck, got {}",
+            todos_hint.detail_label
+        );
+
+        let runtime_units = shell
+            .workspace
+            .selected_runtime_units(&shell.catalog)
+            .expect("physical TodoMVC runtime project units should load");
+        let source_hash = shell
+            .workspace
+            .current_project_hash(&shell.catalog)
+            .expect("physical TodoMVC project hash should be available");
+        let runtime_source_hash = BoonLanguageService::runtime_units_hash(&runtime_units);
+        assert_ne!(
+            source_hash, runtime_source_hash,
+            "physical TodoMVC should exercise role-aware project hash and runtime-unit hash aliases"
+        );
+        let mut runtime =
+            boon_runtime::LiveRuntime::from_project(&shell.workspace.entry_file, &runtime_units)
+                .expect("physical TodoMVC live runtime should build from the full project");
+        let initial_summary = preview_runtime_summary_from_state_summary(
+            &source_path,
+            &runtime_source_hash,
+            runtime.state_summary(),
+        );
+        shell.last_good_runtime_summary = Some(initial_summary.clone());
+        let live_runtime = Arc::new(Mutex::new(runtime));
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units,
+            source_bytes: source.len() as u64,
+            source_sha256: runtime_source_hash,
+            runtime_summary: initial_summary,
+            shared_render_state,
+            live_runtime: Some(Arc::clone(&live_runtime)),
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"status": "ready"}),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+        }));
+        start_preview_ipc_server(
+            &socket_path,
+            state,
+            boon_native_app_window::NativeWakeHandle::new(),
+        )
+        .expect("physical TodoMVC preview IPC server should start");
+
+        let value_summary = shell
+            .runtime_value_for_token("store.todos", DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .flatten()
+            .expect("dev inspector should retrieve physical TodoMVC runtime values");
+        assert_eq!(value_summary["kind"], "list");
+        assert_eq!(value_summary["len"], 4);
+        assert_eq!(
+            value_summary["sample"][0]["fields"]["title"]["value"],
+            "Read documentation"
+        );
+        let completed_count = shell
+            .runtime_value_for_token("store.completed_count", DEV_TYPE_INSPECTOR_WRAP_CHARS)
+            .flatten()
+            .expect("dev inspector should retrieve scalar physical TodoMVC runtime values");
+        assert_eq!(
+            completed_count["value"], 1,
+            "physical TodoMVC runtime values should expose derived counters"
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
     fn dev_footer_keeps_last_good_runtime_summary_during_transient_poll_failures() {
         let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
         let source_hash =
@@ -36514,7 +37463,15 @@ mod tests {
         let mut workspace =
             ExampleWorkspace::new(&catalog, &counter.source, &counter_source, Some("counter"));
 
-        workspace.select_example(&catalog, "cells").unwrap();
+        let selected_example = workspace.select_example(&catalog, "cells").unwrap();
+        assert_eq!(
+            selected_example["project_type_hint_refresh"]["status"],
+            "deferred"
+        );
+        assert_eq!(
+            selected_example["loaded_project_buffers_synchronously"], false,
+            "example switching should load only the active editor file on the visual path"
+        );
 
         assert_eq!(workspace.selected_example_id, "cells");
         assert!(!workspace.selected_buffer.source_text.contains("-- file:"));
@@ -36546,11 +37503,11 @@ mod tests {
             "exactly one project file tab should be active"
         );
         assert!(
-            workspace
+            !workspace
                 .open_buffers
                 .keys()
                 .any(|path| path.ends_with("examples/cells/formula.bn")),
-            "workspace buffers should be keyed by real project file paths"
+            "example switching should not preload inactive project helper buffers"
         );
 
         let entry_file = std::fs::canonicalize(repo_path("examples/cells.bn"))
@@ -36562,9 +37519,39 @@ mod tests {
             .display()
             .to_string();
         let before_hash = workspace.current_project_hash(&catalog).unwrap();
+        workspace
+            .refresh_selected_project_type_hints(&catalog)
+            .expect("Cells project hints should refresh when explicitly requested");
+        let entry_type_hint_backend = workspace.selected_buffer.type_hint_backend();
+        let entry_type_hint_count = workspace.selected_buffer.type_hint_count();
+        assert_eq!(
+            entry_type_hint_backend,
+            "boon_typecheck::TypeHintTable(project)"
+        );
+        assert!(
+            entry_type_hint_count > 0,
+            "Cells entry tab should start with project type hints"
+        );
         let selected_file = workspace
             .select_project_file(&catalog, &formula_file)
             .expect("formula helper should be selectable");
+        assert_eq!(
+            selected_file["project_type_hint_refresh"]["status"], "skipped",
+            "file-tab switches should not synchronously re-run full project type hints"
+        );
+        assert_eq!(
+            selected_file["project_type_hint_refresh"]["reason"],
+            "source-unchanged-file-tab-switch"
+        );
+        assert_eq!(
+            workspace.selected_buffer.type_hint_backend(),
+            "boon_typecheck::TypeHintTable(project)",
+            "precomputed project type hints should be reused after selecting another file tab"
+        );
+        assert!(
+            workspace.selected_buffer.type_hint_count() > 0,
+            "selected helper tab should keep its precomputed project type hints"
+        );
         assert!(paths_match_for_preview_units(
             Path::new(selected_file["active_file"].as_str().unwrap()),
             Path::new(&formula_file)
@@ -36578,6 +37565,13 @@ mod tests {
                 .selected_buffer
                 .source_text
                 .contains("FUNCTION compute_value")
+        );
+        assert!(
+            workspace
+                .open_buffers
+                .keys()
+                .any(|path| path.ends_with("examples/cells/formula.bn")),
+            "selecting a project file should open that real project file buffer"
         );
         workspace
             .selected_buffer
@@ -36633,7 +37627,72 @@ mod tests {
             shell.dispatch_source_path(&format!("dev.project_files.select.{formula_file}"));
         assert_eq!(selected_file["status"], "pass");
         assert_eq!(selected_file["active_file"], formula_file);
+        assert_eq!(
+            selected_file["project_type_hint_refresh"]["status"],
+            "skipped"
+        );
+        assert_eq!(
+            selected_file["preview_transport"], "unchanged",
+            "file tabs should not send unchanged source back through preview transport"
+        );
+        assert!(
+            selected_file["dev_file_tab_visual_update_ms"]
+                .as_f64()
+                .unwrap_or(f64::MAX)
+                < 100.0,
+            "tab selection should be a UI-buffer swap, not a project parse/typecheck: {selected_file}"
+        );
         assert_eq!(shell.workspace.current_file, formula_file);
+    }
+
+    #[test]
+    fn example_tab_switch_uses_fast_visual_path_and_async_project_work() {
+        let counter_path = repo_path("examples/counter.bn");
+        let counter_source = std::fs::read_to_string(&counter_path).unwrap();
+        let mut shell = DevWindowShell::new(
+            counter_path.to_string_lossy().as_ref(),
+            &counter_source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+
+        let selected = shell.dispatch_source_path("dev.tabs.select.cells");
+
+        assert_eq!(selected["status"], "pass", "{selected}");
+        assert_eq!(
+            selected["project_type_hint_refresh"]["status"], "deferred",
+            "example switch should not synchronously run full project type hints"
+        );
+        assert_eq!(
+            selected["loaded_project_buffers_synchronously"], false,
+            "example switch should not build every project editor buffer before visual update"
+        );
+        assert_eq!(
+            selected["preview_transport"]["dev_payload_build_async"], true,
+            "full project payload construction should be off the click path"
+        );
+        assert_eq!(
+            selected["preview_transport"]["source_unit_count_pending"],
+            true
+        );
+        assert!(
+            selected["dev_tab_visual_update_ms"]
+                .as_f64()
+                .unwrap_or(f64::MAX)
+                < 100.0,
+            "example tab selection should update the dev UI before full project work: {selected}"
+        );
+
+        let preview_result = shell.wait_for_preview_replace_result(Duration::from_secs(2));
+        assert_eq!(preview_result["status"], "not-bound", "{preview_result}");
+        assert_eq!(preview_result["dev_payload_build_async"], true);
+        assert_eq!(preview_result["source_unit_count"], 8);
+        assert_eq!(preview_result["runtime_source_unit_count"], 8);
+        assert_eq!(
+            shell.workspace.selected_buffer.type_hint_backend(),
+            "boon_typecheck::TypeHintTable(project)",
+            "background project analysis should apply to the active editor after it completes"
+        );
     }
 
     #[test]
@@ -37612,6 +38671,132 @@ mod tests {
                         "What needs to be done?".to_owned(),
                     ))
         })
+    }
+
+    fn render_physical_todomvc_frame_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &boon_document::LayoutFrame,
+        artifact_label: &str,
+    ) -> image::RgbaImage {
+        let artifact_dir = repo_path("target/artifacts/native-gpu/tests");
+        let render_frame = preview_frame_with_viewport_background(
+            frame,
+            PHYSICAL_TODOMVC_PREVIEW_WIDTH,
+            PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
+        );
+        let proof = boon_native_gpu::render_app_owned_pixels(
+            boon_native_gpu::AppOwnedRenderRequest {
+                device,
+                queue,
+                frame: &render_frame,
+                surface_id: boon_host::SurfaceId(format!("physical-todomvc-{artifact_label}")),
+                surface_epoch: 0,
+                width: PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                height: PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
+                artifact_dir: artifact_dir.as_path(),
+                artifact_label,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{artifact_label} physical TodoMVC frame should render to app-owned pixels: {error}"
+            )
+        });
+        let artifact_path = match &proof.artifact {
+            boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+                artifact_path,
+                layout_frame_hash,
+                nonblank_samples,
+                ..
+            } => {
+                assert_eq!(
+                    layout_frame_hash,
+                    &render_frame_hash(&render_frame),
+                    "{artifact_label} app-owned readback proof should bind to the rendered frame"
+                );
+                assert!(
+                    *nonblank_samples > 100_000,
+                    "{artifact_label} app-owned readback should contain visible content"
+                );
+                PathBuf::from(artifact_path)
+            }
+            boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => {
+                panic!("{artifact_label} visual test should produce app-owned pixels")
+            }
+        };
+        image::open(&artifact_path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{artifact_label} app-owned readback should decode at {}: {error}",
+                    artifact_path.display()
+                )
+            })
+            .to_rgba8()
+    }
+
+    fn image_luma_at(image: &image::RgbaImage, x: f32, y: f32) -> f32 {
+        let x = x.round().clamp(0.0, image.width().saturating_sub(1) as f32) as u32;
+        let y = y
+            .round()
+            .clamp(0.0, image.height().saturating_sub(1) as f32) as u32;
+        let pixel = image.get_pixel(x, y);
+        0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
+    }
+
+    fn average_image_luma(image: &image::RgbaImage, rect: boon_document::Rect) -> f32 {
+        let x0 = rect.x.max(0.0).floor() as u32;
+        let y0 = rect.y.max(0.0).floor() as u32;
+        let x1 = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
+        let y1 = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
+        let mut total = 0.0;
+        let mut count = 0.0_f32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                total += image_luma_at(image, x as f32, y as f32);
+                count += 1.0;
+            }
+        }
+        total / count.max(1.0)
+    }
+
+    fn image_luma_range(image: &image::RgbaImage, rect: boon_document::Rect) -> f32 {
+        let x0 = rect.x.max(0.0).floor() as u32;
+        let y0 = rect.y.max(0.0).floor() as u32;
+        let x1 = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
+        let y1 = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
+        let mut min_luma = f32::MAX;
+        let mut max_luma = f32::MIN;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let luma = image_luma_at(image, x as f32, y as f32);
+                min_luma = min_luma.min(luma);
+                max_luma = max_luma.max(luma);
+            }
+        }
+        max_luma - min_luma
+    }
+
+    fn image_abs_diff_sum(
+        before: &image::RgbaImage,
+        after: &image::RgbaImage,
+        rect: boon_document::Rect,
+    ) -> u64 {
+        let x0 = rect.x.max(0.0).floor() as u32;
+        let y0 = rect.y.max(0.0).floor() as u32;
+        let x1 = (rect.x + rect.width).min(before.width() as f32).ceil() as u32;
+        let y1 = (rect.y + rect.height).min(before.height() as f32).ceil() as u32;
+        let mut total = 0_u64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let a = before.get_pixel(x, y);
+                let b = after.get_pixel(x, y);
+                total += (i16::from(a[0]) - i16::from(b[0])).unsigned_abs() as u64;
+                total += (i16::from(a[1]) - i16::from(b[1])).unsigned_abs() as u64;
+                total += (i16::from(a[2]) - i16::from(b[2])).unsigned_abs() as u64;
+            }
+        }
+        total
     }
 
     fn cells_live_runtime(

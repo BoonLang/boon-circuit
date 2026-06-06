@@ -1,7 +1,7 @@
 -- Glassmorphism Theme
 -- Transparent glass-like surfaces with physical refraction
 -- High transparency + lower gloss (= higher roughness) creates frosted glass effect
--- Renderer approximates this with backdrop blur for performance
+-- Renderer approximates this with frosted haze and highlight layers
 -- Soft diffuse lighting, subtle colors
 
 FUNCTION get(from, of) {
@@ -36,6 +36,14 @@ FUNCTION material(material) {
             }
             refraction: 1.5
             gloss: 0.08
+            transparency: 0.18
+            frosted_blur: 18
+            frosted_saturate: 1.28
+            glass_highlight: 0.78
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Light => TEXT { #ffffffb8 }
+                Dark => TEXT { #dce8ff5c }
+            }
         ]
 
         surface_variant_base: [
@@ -45,6 +53,14 @@ FUNCTION material(material) {
             }
             refraction: 1.5
             gloss: 0.05
+            transparency: 0.26
+            frosted_blur: 14
+            frosted_saturate: 1.22
+            glass_highlight: 0.52
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Light => TEXT { #ffffff8f }
+                Dark => TEXT { #dce8ff38 }
+            }
         ]
 
         surface_elevated_base: [
@@ -54,6 +70,14 @@ FUNCTION material(material) {
             }
             refraction: 1.5
             gloss: 0.06
+            transparency: 0.28
+            frosted_blur: 16
+            frosted_saturate: 1.24
+            glass_highlight: 0.62
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Light => TEXT { #ffffffa3 }
+                Dark => TEXT { #dce8ff4d }
+            }
         ]
 
         interactive_base: [
@@ -64,6 +88,14 @@ FUNCTION material(material) {
             refraction: 1.5
             gloss: 0.05
             metal: 0.03
+            transparency: 0.24
+            frosted_blur: 10
+            frosted_saturate: 1.18
+            glass_highlight: 0.44
+            glass_highlight_color: PASSED.mode |> WHEN {
+                Light => TEXT { #ffffff8f }
+                Dark => TEXT { #dce8ff33 }
+            }
         ]
 
         primary_base: [
@@ -159,7 +191,24 @@ FUNCTION material(material) {
 
             Danger => danger_base
 
-            CheckboxGlyph[checked] => [
+            HeroTitle => [
+                color: PASSED.mode |> WHEN {
+                    Light => TEXT { #ffffff2e }
+                    Dark => TEXT { #ffffff12 }
+                }
+                refraction: 1.5
+                gloss: 0.12
+                transparency: 0.32
+                frosted_blur: 12
+                frosted_saturate: 1.35
+                glass_highlight: 0.95
+                glass_highlight_color: PASSED.mode |> WHEN {
+                    Light => TEXT { #ffffffcf }
+                    Dark => TEXT { #dce8ff70 }
+                }
+            ]
+
+            CheckboxGlyph => [
                 checkbox_background: PASSED.mode |> WHEN {
                     Light => TEXT { #ffffff38 }
                     Dark => TEXT { #ffffff0a }
@@ -177,7 +226,21 @@ FUNCTION material(material) {
                     Dark => TEXT { #6cf0e4 }
                 }
                 checkbox_border_width: 2
+                checkbox_inset: 2
+                checkbox_aa: 1.45
+                check_aa: 1.0
                 check_width: 3
+                checkbox_cast_color: PASSED.mode |> WHEN {
+                    Light => TEXT { #3a567633 }
+                    Dark => TEXT { #00000066 }
+                }
+                checkbox_cast_blur: 5
+                checkbox_cast_y: 2
+                checkbox_highlight: PASSED.mode |> WHEN {
+                    Light => TEXT { #ffffffc9 }
+                    Dark => TEXT { #ffffff3d }
+                }
+                checkbox_highlight_width: 2
             ]
         }
     }

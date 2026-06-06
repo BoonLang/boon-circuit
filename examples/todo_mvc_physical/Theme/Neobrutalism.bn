@@ -140,7 +140,12 @@ FUNCTION material(material) {
 
             Danger => danger_base
 
-            CheckboxGlyph[checked] => [
+            HeroTitle => [
+                color: TEXT { #00000000 }
+                glass_highlight: 0
+            ]
+
+            CheckboxGlyph => [
                 checkbox_background: surface_base.color
                 checkbox_border: primary_base.color
                 checked_border: PASSED.mode |> WHEN {
@@ -155,7 +160,19 @@ FUNCTION material(material) {
                     Light => 4
                     Dark => 3
                 }
+                checkbox_inset: 1
+                checkbox_aa: 0.6
+                check_aa: 0.45
                 check_width: 4
+                checkbox_cast_color: PASSED.mode |> WHEN {
+                    Light => TEXT { #000000 }
+                    Dark => TEXT { #000000 }
+                }
+                checkbox_cast_blur: 0
+                checkbox_cast_x: 3
+                checkbox_cast_y: 3
+                checkbox_highlight: TEXT { #00000000 }
+                checkbox_highlight_width: 0
             ]
         }
     }

@@ -2508,6 +2508,14 @@ fn rect_vertices(
             &item.style,
             border_radius,
         );
+        metrics.rendered_rect_count += push_frosted_material_layers(
+            &mut builder,
+            item.bounds,
+            width,
+            height,
+            &item.style,
+            border_radius,
+        );
         let fill = style_color_f32(&item.style, "bg")
             .or_else(|| style_color_f32(&item.style, "background"))
             .unwrap_or_else(|| default_fill_for_kind(&item.kind, index));
@@ -3330,12 +3338,32 @@ fn material_adjusted_fill(mut fill: [f32; 4], style: &StyleMap) -> [f32; 4] {
     let gloss = style_number(style, "gloss").unwrap_or(0.0).clamp(0.0, 1.0);
     let refraction = style_number(style, "refraction").unwrap_or(0.0).max(0.0);
     let metal = style_number(style, "metal").unwrap_or(0.0).clamp(0.0, 1.0);
+    let frosted_blur = style_number(style, "frosted_blur")
+        .unwrap_or(0.0)
+        .clamp(0.0, 40.0);
+    let frosted_saturate = style_number(style, "frosted_saturate")
+        .unwrap_or(1.0)
+        .clamp(0.0, 2.0);
     if transparency > 0.0 {
         fill[3] *= (1.0 - transparency * 0.58).clamp(0.28, 1.0);
         let lift = (transparency * 0.08 + refraction * 0.015).clamp(0.0, 0.16);
         fill[0] = mix_f32(fill[0], 1.0, lift);
         fill[1] = mix_f32(fill[1], 1.0, lift);
         fill[2] = mix_f32(fill[2], 1.0, lift);
+    }
+    if frosted_blur > 0.0 {
+        let frost = (frosted_blur / 40.0 * 0.10).clamp(0.0, 0.10);
+        fill[0] = mix_f32(fill[0], 1.0, frost);
+        fill[1] = mix_f32(fill[1], 1.0, frost);
+        fill[2] = mix_f32(fill[2], 1.0, frost);
+        fill[3] *= (1.0 - frost * 0.35).clamp(0.72, 1.0);
+    }
+    if frosted_saturate > 1.0 {
+        let average = (fill[0] + fill[1] + fill[2]) / 3.0;
+        let boost = ((frosted_saturate - 1.0) * 0.18).clamp(0.0, 0.18);
+        fill[0] = (fill[0] + (fill[0] - average) * boost).clamp(0.0, 1.0);
+        fill[1] = (fill[1] + (fill[1] - average) * boost).clamp(0.0, 1.0);
+        fill[2] = (fill[2] + (fill[2] - average) * boost).clamp(0.0, 1.0);
     }
     if gloss > 0.0 {
         let lift = (gloss * 0.035).clamp(0.0, 0.05);
@@ -3353,6 +3381,48 @@ fn material_adjusted_fill(mut fill: [f32; 4], style: &StyleMap) -> [f32; 4] {
     fill
 }
 
+fn push_frosted_material_layers(
+    builder: &mut QuadBuilder,
+    rect: Rect,
+    width: f32,
+    height: f32,
+    style: &StyleMap,
+    radius: f32,
+) -> u32 {
+    let frosted_blur = style_number(style, "frosted_blur")
+        .unwrap_or(0.0)
+        .clamp(0.0, 40.0);
+    let frosted_saturate = style_number(style, "frosted_saturate")
+        .unwrap_or(1.0)
+        .clamp(0.0, 2.0);
+    if frosted_blur <= 0.01 && frosted_saturate <= 1.01 {
+        return 0;
+    }
+    let highlight = style_number(style, "glass_highlight")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let mut haze = style_color_f32(style, "glass_highlight_color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let steps = (frosted_blur / 7.0).ceil().clamp(2.0, 5.0) as u32;
+    let mut count = 0;
+    for step in 0..steps {
+        let t = (step + 1) as f32 / steps as f32;
+        let expand = frosted_blur * 0.18 * t;
+        haze[3] = ((frosted_blur / 40.0) * 0.030 + (frosted_saturate - 1.0) * 0.025)
+            .mul_add(1.0 - t * 0.55, highlight * 0.010)
+            .clamp(0.004, 0.055);
+        push_styled_rect(
+            builder,
+            expanded_rect(rect, expand),
+            width,
+            height,
+            haze,
+            radius + expand,
+        );
+        count += 1;
+    }
+    count
+}
+
 fn push_material_highlights(
     builder: &mut QuadBuilder,
     rect: Rect,
@@ -3368,9 +3438,16 @@ fn push_material_highlights(
         .clamp(0.0, 1.0);
     let refraction = style_number(style, "refraction").unwrap_or(0.0).max(0.0);
     let depth = style_number(style, "depth").unwrap_or(0.0).max(0.0);
-    let top_alpha = (gloss * 0.11 + transparency * 0.08 + refraction * 0.015).clamp(0.0, 0.24);
+    let glass_highlight = style_number(style, "glass_highlight")
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let highlight_color =
+        style_color_f32(style, "glass_highlight_color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let top_alpha =
+        (gloss * 0.11 + transparency * 0.08 + refraction * 0.015 + glass_highlight * 0.12)
+            .clamp(0.0, 0.30);
     if top_alpha > 0.01 && rect.width > 2.0 && rect.height > 2.0 {
-        let band = (1.0 + gloss * 2.0 + transparency * 2.0).clamp(1.0, 5.0);
+        let band = (1.0 + gloss * 2.0 + transparency * 2.0 + glass_highlight * 4.0).clamp(1.0, 7.0);
         push_styled_rect(
             builder,
             Rect {
@@ -3381,7 +3458,7 @@ fn push_material_highlights(
             },
             width,
             height,
-            [1.0, 1.0, 1.0, top_alpha],
+            color_with_alpha_scale(highlight_color, top_alpha / highlight_color[3].max(0.001)),
             radius,
         );
         push_styled_rect(
@@ -3394,9 +3471,31 @@ fn push_material_highlights(
             },
             width,
             height,
-            [1.0, 1.0, 1.0, top_alpha * 0.45],
+            color_with_alpha_scale(
+                highlight_color,
+                (top_alpha * 0.45) / highlight_color[3].max(0.001),
+            ),
             radius,
         );
+        if glass_highlight > 0.01 && rect.width > 24.0 && rect.height > 16.0 {
+            let glint_width = (rect.width * 0.18).clamp(10.0, 34.0);
+            push_styled_rect(
+                builder,
+                Rect {
+                    x: rect.x + rect.width - glint_width - 2.0,
+                    y: rect.y + 2.0,
+                    width: glint_width,
+                    height: (band * 0.75).min(rect.height),
+                },
+                width,
+                height,
+                color_with_alpha_scale(
+                    highlight_color,
+                    (top_alpha * 0.65) / highlight_color[3].max(0.001),
+                ),
+                radius,
+            );
+        }
     }
     let bottom_alpha = ((1.0 - gloss) * 0.035 + depth * 0.006).clamp(0.0, 0.18);
     if bottom_alpha > 0.01 && rect.width > 2.0 && rect.height > 3.0 {
@@ -3748,6 +3847,30 @@ fn push_checkbox(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32,
     let aa = style_number(style, "checkbox_aa")
         .unwrap_or(1.25)
         .clamp(0.0, 2.0);
+    if let Some(shadow_color) = style_color_f32(style, "checkbox_cast_color")
+        && shadow_color[3] > 0.001
+    {
+        let shadow_x = style_number(style, "checkbox_cast_x").unwrap_or(0.0);
+        let shadow_y = style_number(style, "checkbox_cast_y").unwrap_or(0.0);
+        let shadow_blur = style_number(style, "checkbox_cast_blur")
+            .unwrap_or(2.0)
+            .clamp(0.0, 8.0);
+        let shadow_spread = style_number(style, "checkbox_cast_spread")
+            .unwrap_or(0.0)
+            .clamp(-2.0, 4.0);
+        push_checkbox_circle_raster(
+            builder,
+            center_x + shadow_x,
+            center_y + shadow_y,
+            (radius + shadow_spread + shadow_blur * 0.3).max(1.0),
+            0.0,
+            (aa + shadow_blur).clamp(0.0, 8.0),
+            width,
+            height,
+            [0.0, 0.0, 0.0, 0.0],
+            shadow_color,
+        );
+    }
     push_checkbox_circle_raster(
         builder,
         center_x,
@@ -3760,6 +3883,42 @@ fn push_checkbox(builder: &mut QuadBuilder, rect: Rect, width: f32, height: f32,
         ring_color,
         inner_color,
     );
+    if let Some(inner_shadow) = style_color_f32(style, "checkbox_inner_shadow")
+        && inner_shadow[3] > 0.001
+    {
+        push_checkbox_circle_raster(
+            builder,
+            center_x,
+            center_y,
+            (radius - border_width * 0.5).max(1.0),
+            style_number(style, "checkbox_inner_shadow_width")
+                .unwrap_or(1.0)
+                .max(0.25),
+            aa,
+            width,
+            height,
+            inner_shadow,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+    }
+    if let Some(highlight) = style_color_f32(style, "checkbox_highlight")
+        && highlight[3] > 0.001
+    {
+        push_checkbox_circle_raster(
+            builder,
+            center_x - 0.5,
+            center_y - 0.5,
+            (radius - border_width * 0.35).max(1.0),
+            style_number(style, "checkbox_highlight_width")
+                .unwrap_or(1.0)
+                .max(0.0),
+            aa,
+            width,
+            height,
+            highlight,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+    }
     if checked {
         let (start, middle, end) = checkbox_check_points(rect);
         let color = style_color_f32(style, "check_color").unwrap_or([0.108, 0.540, 0.432, 1.0]);
@@ -4880,6 +5039,42 @@ mod tests {
     }
 
     #[test]
+    fn frosted_material_tokens_emit_frosted_layers_and_adjust_fill() {
+        let mut style = StyleMap::new();
+        style.insert("frosted_blur".to_owned(), StyleValue::Number(18.0));
+        style.insert("frosted_saturate".to_owned(), StyleValue::Number(1.28));
+        style.insert("glass_highlight".to_owned(), StyleValue::Number(0.8));
+        style.insert(
+            "glass_highlight_color".to_owned(),
+            StyleValue::Text("#ffffffb8".to_owned()),
+        );
+        let rect = Rect {
+            x: 24.0,
+            y: 18.0,
+            width: 96.0,
+            height: 44.0,
+        };
+        let mut builder = QuadBuilder::default();
+        let layer_count =
+            push_frosted_material_layers(&mut builder, rect, 180.0, 120.0, &style, 12.0);
+
+        assert!(
+            layer_count >= 2,
+            "frosted_blur should emit visible frosted material layers"
+        );
+        assert!(
+            !builder.batches.is_empty(),
+            "frosted material layers should be renderer quads, not metadata only"
+        );
+        let base = [0.8, 0.72, 0.64, 0.62];
+        let adjusted = material_adjusted_fill(base, &style);
+        assert!(
+            adjusted[0] > base[0] && adjusted[3] < base[3],
+            "frosted blur should frost/lift translucent glass fill: base={base:?}, adjusted={adjusted:?}"
+        );
+    }
+
+    #[test]
     fn strikethrough_uses_the_same_vertical_center_as_text() {
         let mut style = StyleMap::new();
         style.insert("size".to_owned(), StyleValue::Number(24.0));
@@ -4966,6 +5161,70 @@ mod tests {
             "check y center {:?} should stay near circle center {:?}",
             check_center,
             circle_center
+        );
+    }
+
+    #[test]
+    fn checkbox_material_shadow_and_highlight_emit_pixels() {
+        let mut flat = StyleMap::new();
+        flat.insert("checked".to_owned(), StyleValue::Bool(true));
+        flat.insert(
+            "checkbox_background".to_owned(),
+            StyleValue::Text("#ffffff".to_owned()),
+        );
+        flat.insert(
+            "checkbox_border".to_owned(),
+            StyleValue::Text("#d8dde4".to_owned()),
+        );
+        flat.insert(
+            "checked_border".to_owned(),
+            StyleValue::Text("#62c6aa".to_owned()),
+        );
+        flat.insert(
+            "check_color".to_owned(),
+            StyleValue::Text("#43bc9a".to_owned()),
+        );
+
+        let mut material = flat.clone();
+        material.insert(
+            "checkbox_cast_color".to_owned(),
+            StyleValue::Text("#1e293b44".to_owned()),
+        );
+        material.insert("checkbox_cast_blur".to_owned(), StyleValue::Number(4.0));
+        material.insert("checkbox_cast_y".to_owned(), StyleValue::Number(2.0));
+        material.insert(
+            "checkbox_highlight".to_owned(),
+            StyleValue::Text("#ffffffb5".to_owned()),
+        );
+        material.insert(
+            "checkbox_highlight_width".to_owned(),
+            StyleValue::Number(1.0),
+        );
+
+        let rect = Rect {
+            x: 20.0,
+            y: 20.0,
+            width: 40.0,
+            height: 40.0,
+        };
+        let mut flat_builder = QuadBuilder::default();
+        push_checkbox(&mut flat_builder, rect, 96.0, 96.0, &flat);
+        let mut material_builder = QuadBuilder::default();
+        push_checkbox(&mut material_builder, rect, 96.0, 96.0, &material);
+
+        let flat_vertices = flat_builder
+            .batches
+            .iter()
+            .map(|batch| batch.colors.len())
+            .sum::<usize>();
+        let material_vertices = material_builder
+            .batches
+            .iter()
+            .map(|batch| batch.colors.len())
+            .sum::<usize>();
+        assert!(
+            material_vertices > flat_vertices,
+            "checkbox shadow/highlight material keys should add rendered pixels, not only style metadata"
         );
     }
 

@@ -7,7 +7,7 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #111827 }
                 TEXT { Light } => TEXT { #f4f7fb }
             }
-            gloss: 0.01
+            gloss: 0.02
         ]
 
         PanelSurface => [
@@ -15,19 +15,27 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #172033 }
                 TEXT { Light } => TEXT { #f8fafc }
             }
-            gloss: 0.025
+            gloss: 0.07
             metal: 0.0
-            transparency: 0.0
-            frosted_blur: 0
-            frosted_saturate: 1.0
-            glass_highlight: 0.08
+            transparency: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => 0.08
+                TEXT { Light } => 0.10
+            }
+            frosted_blur: 10
+            frosted_saturate: 1.14
+            glass_highlight: 0.32
+            glass_highlight_color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dce8ff38 }
+                TEXT { Light } => TEXT { #ffffffa3 }
+            }
             border: PASSED.store.mode |> WHEN {
                 TEXT { Dark } => TEXT { #2f80ed }
                 TEXT { Light } => TEXT { #2563eb }
             }
             border_width: 1
             shadows: LIST {
-                [y: 1, blur: 0, color: TEXT { #ffffff10 }]
+                [y: 1, blur: 2, color: TEXT { #ffffff40 }]
+                [y: 14, blur: 30, color: TEXT { #1d4ed829 }]
             }
         ]
 
@@ -36,7 +44,17 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #0b1220 }
                 TEXT { Light } => TEXT { #ffffff }
             }
-            gloss: 0.02
+            gloss: 0.05
+            transparency: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => 0.04
+                TEXT { Light } => 0.06
+            }
+            frosted_blur: 6
+            glass_highlight: 0.18
+            glass_highlight_color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dce8ff22 }
+                TEXT { Light } => TEXT { #ffffff9c }
+            }
             border: PASSED.store.mode |> WHEN {
                 TEXT { Dark } => TEXT { #25344f }
                 TEXT { Light } => TEXT { #d7dde8 }
@@ -46,15 +64,22 @@ FUNCTION material(of) {
 
         TimelineGlass => [
             color: PASSED.store.mode |> WHEN {
-                TEXT { Dark } => TEXT { #020817 }
-                TEXT { Light } => TEXT { #f8fbff }
+                TEXT { Dark } => TEXT { #020817d8 }
+                TEXT { Light } => TEXT { #f8fbffb8 }
             }
             refraction: 1.5
-            gloss: 0.01
-            transparency: 0.0
-            frosted_blur: 0
-            frosted_saturate: 1.0
-            glass_highlight: 0.04
+            gloss: 0.08
+            transparency: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => 0.16
+                TEXT { Light } => 0.18
+            }
+            frosted_blur: 14
+            frosted_saturate: 1.22
+            glass_highlight: 0.58
+            glass_highlight_color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dce8ff4d }
+                TEXT { Light } => TEXT { #ffffffb8 }
+            }
         ]
 
         TraceHigh => [
@@ -62,7 +87,7 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #3b82f6 }
                 TEXT { Light } => TEXT { #2563eb }
             }
-            glow: [color: TEXT { #3b82f688 }, intensity: 0.18]
+            glow: [color: TEXT { #3b82f6aa }, intensity: 0.28]
         ]
 
         TraceLow => [
@@ -77,7 +102,7 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #60a5fa }
                 TEXT { Light } => TEXT { #3b82f6 }
             }
-            glow: [color: TEXT { #60a5fa66 }, intensity: 0.12]
+            glow: [color: TEXT { #60a5fa88 }, intensity: 0.20]
         ]
 
         AnalogTrace => [
@@ -85,7 +110,7 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #6bbdff }
                 TEXT { Light } => TEXT { #1267aa }
             }
-            glow: [color: TEXT { #6bbdff55 }, intensity: 0.14]
+            glow: [color: TEXT { #6bbdff88 }, intensity: 0.22]
         ]
 
         CursorGlow => [
@@ -93,7 +118,8 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #ffef8a }
                 TEXT { Light } => TEXT { #9a7600 }
             }
-            glow: [color: TEXT { #ffe76888 }, intensity: 0.24]
+            gloss: 0.18
+            glow: [color: TEXT { #ffe768aa }, intensity: 0.38]
         ]
 
         MarkerChip => [
@@ -101,8 +127,9 @@ FUNCTION material(of) {
                 TEXT { Dark } => TEXT { #6147d9 }
                 TEXT { Light } => TEXT { #e7ddff }
             }
-            gloss: 0.13
-            glow: [color: TEXT { #8f75ff66 }, intensity: 0.12]
+            gloss: 0.20
+            glass_highlight: 0.30
+            glow: [color: TEXT { #8f75ff88 }, intensity: 0.22]
         ]
 
         SelectedRow => [
@@ -115,6 +142,7 @@ FUNCTION material(of) {
                 TEXT { Light } => TEXT { #2474bb }
             }
             border_width: 1
+            glow: [color: TEXT { #60a5fa55 }, intensity: 0.12]
         ]
 
         HoverControl => [

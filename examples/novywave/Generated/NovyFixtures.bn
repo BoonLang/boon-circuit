@@ -82,6 +82,54 @@ FUNCTION selected_temperature_value_binary() {
     TEXT { analog }
 }
 
+FUNCTION selected_clk_value(format) {
+    format |> WHEN {
+        TEXT { Binary } => TEXT { 1b }
+        TEXT { GroupedBinary } => TEXT { 1b }
+        TEXT { Octal } => TEXT { 1 }
+        TEXT { Signed } => TEXT { 1 }
+        TEXT { Unsigned } => TEXT { 1 }
+        TEXT { ASCII } => TEXT { . }
+        __ => TEXT { 1 }
+    }
+}
+
+FUNCTION selected_reset_value(format) {
+    format |> WHEN {
+        TEXT { Binary } => TEXT { 1b }
+        TEXT { GroupedBinary } => TEXT { 1b }
+        TEXT { Octal } => TEXT { 1 }
+        TEXT { Signed } => TEXT { 1 }
+        TEXT { Unsigned } => TEXT { 1 }
+        TEXT { ASCII } => TEXT { . }
+        __ => TEXT { 1 }
+    }
+}
+
+FUNCTION selected_data_value(format) {
+    format |> WHEN {
+        TEXT { Binary } => TEXT { 00101010 }
+        TEXT { GroupedBinary } => TEXT { 0010 1010 }
+        TEXT { Octal } => TEXT { 052 }
+        TEXT { Signed } => TEXT { 42 }
+        TEXT { Unsigned } => TEXT { 42 }
+        TEXT { ASCII } => TEXT { * }
+        __ => TEXT { 0x2a }
+    }
+}
+
+FUNCTION selected_temperature_value(format) {
+    format |> WHEN {
+        TEXT { Binary } => TEXT { analog }
+        TEXT { GroupedBinary } => TEXT { analog }
+        TEXT { Octal } => TEXT { analog }
+        TEXT { Signed } => TEXT { 43 }
+        TEXT { Unsigned } => TEXT { 43 }
+        TEXT { ASCII } => TEXT { temp }
+        __ => TEXT { 42.8 C }
+    }
+}
+
 FUNCTION search_result(text) {
     text |> WHEN {
         TEXT { reset } => TEXT { reset_n }

@@ -39,13 +39,19 @@ expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "b
 id = "keyboard-cursor-left"
 user_action = { kind = "click", target = "cursor left" }
 expected_source_event = { source = "store.elements.cursor_left" }
-expect_root_text = { "cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN" }
+expect_root_text = { "cursor_label" = "36 ns", "bridge_request_fingerprint" = "FP_CPU_DATA_CLOSE_RIGHT_36_BIN", "bridge_response_page" = "PAGE_DATA_CLOSE_RIGHT_36_BIN" }
+
+[[step]]
+id = "reject-stale-page"
+user_action = { kind = "click", target = "Stale" }
+expected_source_event = { source = "store.elements.stale_response_probe" }
+expect_root_text = { "bridge_response_signal" = "CLK", "bridge_response_zoom" = "Fit", "stale_response_policy" = "structural fingerprint match required" }
 
 [[step]]
 id = "toggle-marker"
 user_action = { kind = "click", target = "marker" }
 expected_source_event = { source = "store.elements.marker_toggle" }
-expect_root_text = { "marker_visibility" = "Hidden" }
+expect_root_text = { "marker_visibility" = "Hidden", "bridge_response_status" = "REJECTED_STALE_PAGE" }
 
 [[step]]
 id = "collapse-group"
@@ -75,7 +81,43 @@ expect_root_text = { "fixture_status" = "Empty" }
 id = "reload-fixture"
 user_action = { kind = "click", target = "load fixture" }
 expected_source_event = { source = "store.elements.load_fixture" }
-expect_root_text = { "fixture_status" = "Loaded" }
+expect_root_text = { "fixture_status" = "Loaded", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
+
+[[step]]
+id = "format-grouped-binary"
+user_action = { kind = "click", target = "Grp" }
+expected_source_event = { source = "store.elements.format_grouped" }
+expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+
+[[step]]
+id = "format-octal"
+user_action = { kind = "click", target = "Oct" }
+expected_source_event = { source = "store.elements.format_octal" }
+expect_root_text = { "value_format" = "Octal", "format_label" = "Octal" }
+
+[[step]]
+id = "format-signed"
+user_action = { kind = "click", target = "Sgn" }
+expected_source_event = { source = "store.elements.format_signed" }
+expect_root_text = { "value_format" = "Signed", "format_label" = "Signed" }
+
+[[step]]
+id = "format-unsigned"
+user_action = { kind = "click", target = "Uns" }
+expected_source_event = { source = "store.elements.format_unsigned" }
+expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned" }
+
+[[step]]
+id = "format-ascii"
+user_action = { kind = "click", target = "Asc" }
+expected_source_event = { source = "store.elements.format_ascii" }
+expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII" }
+
+[[step]]
+id = "format-hex"
+user_action = { kind = "click", target = "Hex" }
+expected_source_event = { source = "store.elements.format_hex" }
+expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex" }
 
 [[step]]
 id = "switch-dark"

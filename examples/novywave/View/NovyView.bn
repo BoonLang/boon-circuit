@@ -20,7 +20,10 @@ FUNCTION root() {
             width: Fill
             height: [sizing: Fill, minimum: Screen]
             padding: 0
-            background: [color: TEXT { #111827 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #f4f7fb }
+            }]
             material: NovyTheme/material(of: AppBackground)
         ]
         items: LIST {
@@ -45,8 +48,14 @@ FUNCTION header() {
             move: [closer: 2]
             rounded_corners: 8
             padding: [left: 10, right: 10, top: 5, bottom: 5]
-            background: [color: TEXT { #F8FAFC }]
-            border: [color: TEXT { #CBD5E1 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #0f172a }
+                TEXT { Light } => TEXT { #f8fafc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #25344f }
+                TEXT { Light } => TEXT { #cbd5e1 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         items: LIST {
@@ -57,7 +66,10 @@ FUNCTION header() {
                     width: 72
                     height: Fill
                     vertical_align: Center
-                    color: TEXT { #475569 }
+                    color: PASSED.store.mode |> WHEN {
+                        TEXT { Dark } => TEXT { #90a4bf }
+                        TEXT { Light } => TEXT { #475569 }
+                    }
                 ]
                 text: TEXT { ● ● ● }
             )
@@ -69,7 +81,10 @@ FUNCTION header() {
                     height: Fill
                     center: True
                     vertical_align: Center
-                    color: TEXT { #475569 }
+                    color: PASSED.store.mode |> WHEN {
+                        TEXT { Dark } => TEXT { #d2def0 }
+                        TEXT { Light } => TEXT { #475569 }
+                    }
                 ]
                 text: TEXT { NovyWave.io }
             )
@@ -202,8 +217,14 @@ FUNCTION left_panel() {
             padding: 22
             depth: 10
             rounded_corners: 0
-            background: [color: TEXT { #172033 }]
-            border: [color: TEXT { #2F80ED }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #172033 }
+                TEXT { Light } => TEXT { #f8fafc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #2f80ed }
+                TEXT { Light } => TEXT { #2563eb }
+            }]
             material: NovyTheme/material(of: PanelSurface)
         ]
         items: LIST {
@@ -278,8 +299,14 @@ FUNCTION file_row(file) {
             height: 42
             padding: 6
             rounded_corners: 9
-            background: [color: TEXT { #101A2B }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #101a2b }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         items: LIST {
@@ -301,9 +328,18 @@ FUNCTION search_box() {
             text_inset: 4
             rounded_corners: 9
             font: NovyTheme/font(of: Body)
-            color: TEXT { #DBEAFE }
-            background: [color: TEXT { #0A1322 }]
-            border: [color: TEXT { #263753 }]
+            color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dbeafe }
+                TEXT { Light } => TEXT { #172033 }
+            }
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #0a1322 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Hidden[text: TEXT { signal search }]
@@ -382,8 +418,14 @@ FUNCTION timeline_panel() {
             depth: 4
             move: [closer: 1]
             rounded_corners: 0
-            background: [color: TEXT { #172033 }]
-            border: [color: TEXT { #2F80ED }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #172033 }
+                TEXT { Light } => TEXT { #f8fafc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #2f80ed }
+                TEXT { Light } => TEXT { #2563eb }
+            }]
             material: NovyTheme/material(of: PanelSurface)
         ]
         items: LIST {
@@ -409,7 +451,10 @@ FUNCTION timeline_header() {
                     width: 240
                     height: Fill
                     vertical_align: Center
-                    color: TEXT { #DCEAFF }
+                    color: PASSED.store.mode |> WHEN {
+                        TEXT { Dark } => TEXT { #dceaff }
+                        TEXT { Light } => TEXT { #182a3d }
+                    }
                 ]
                 text: TEXT { Selected Variables }
             )
@@ -421,7 +466,10 @@ FUNCTION timeline_header() {
                     height: Fill
                     center: True
                     vertical_align: Center
-                    color: TEXT { #90A4BF }
+                    color: PASSED.store.mode |> WHEN {
+                        TEXT { Dark } => TEXT { #90a4bf }
+                        TEXT { Light } => TEXT { #60748b }
+                    }
                 ]
                 text: TEXT { Dock to Right }
             )
@@ -445,6 +493,7 @@ FUNCTION timeline_toolbar() {
             cursor_right_button()
             marker_button()
             group_button()
+            stale_response_button()
             format_button()
             keyboard_capture()
         }
@@ -639,8 +688,14 @@ FUNCTION waveform_row_clk() {
                 height: PASSED.store.row_height
                 padding: 5
                 rounded_corners: 2
-                background: [color: TEXT { #101A2B }]
-                border: [color: TEXT { #263753 }]
+                background: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #101a2b }
+                    TEXT { Light } => TEXT { #ffffff }
+                }]
+                border: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #263753 }
+                    TEXT { Light } => TEXT { #d7dde8 }
+                }]
                 material: active |> WHEN {
                     True => NovyTheme/material(of: SelectedRow)
                     False => NovyTheme/material(of: PanelInset)
@@ -668,8 +723,14 @@ FUNCTION waveform_row_reset() {
                 height: PASSED.store.row_height
                 padding: 5
                 rounded_corners: 2
-                background: [color: TEXT { #101A2B }]
-                border: [color: TEXT { #263753 }]
+                background: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #101a2b }
+                    TEXT { Light } => TEXT { #ffffff }
+                }]
+                border: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #263753 }
+                    TEXT { Light } => TEXT { #d7dde8 }
+                }]
                 material: active |> WHEN {
                     True => NovyTheme/material(of: SelectedRow)
                     False => NovyTheme/material(of: PanelInset)
@@ -697,8 +758,14 @@ FUNCTION waveform_row_data() {
                 height: PASSED.store.row_height
                 padding: 5
                 rounded_corners: 2
-                background: [color: TEXT { #101A2B }]
-                border: [color: TEXT { #263753 }]
+                background: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #101a2b }
+                    TEXT { Light } => TEXT { #ffffff }
+                }]
+                border: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #263753 }
+                    TEXT { Light } => TEXT { #d7dde8 }
+                }]
                 material: active |> WHEN {
                     True => NovyTheme/material(of: SelectedRow)
                     False => NovyTheme/material(of: PanelInset)
@@ -726,8 +793,14 @@ FUNCTION waveform_row_temperature() {
                 height: PASSED.store.row_height
                 padding: 5
                 rounded_corners: 2
-                background: [color: TEXT { #101A2B }]
-                border: [color: TEXT { #263753 }]
+                background: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #101a2b }
+                    TEXT { Light } => TEXT { #ffffff }
+                }]
+                border: [color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #263753 }
+                    TEXT { Light } => TEXT { #d7dde8 }
+                }]
                 material: active |> WHEN {
                     True => NovyTheme/material(of: SelectedRow)
                     False => NovyTheme/material(of: PanelInset)
@@ -750,8 +823,14 @@ FUNCTION fixed_signal_label(label_text) {
             height: Fill
             padding: 6
             rounded_corners: 2
-            background: [color: TEXT { #0A1322 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #0a1322 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -761,7 +840,10 @@ FUNCTION fixed_signal_label(label_text) {
                 width: Fill
                 height: Fill
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #dbeafe }
+                    TEXT { Light } => TEXT { #172033 }
+                }
             ]
             text: label_text
         )
@@ -775,8 +857,14 @@ FUNCTION fixed_value_clk() {
             width: 86
             height: Fill
             rounded_corners: 0
-            background: [color: TEXT { #111827 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -787,12 +875,12 @@ FUNCTION fixed_value_clk() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #dbeafe }
+                    TEXT { Light } => TEXT { #172033 }
+                }
             ]
-            text: PASSED.store.value_format |> WHEN {
-                TEXT { Binary } => NovyFixtures/selected_clk_value_binary()
-                __ => NovyFixtures/selected_clk_value_hex()
-            }
+            text: NovyFixtures/selected_clk_value(format: PASSED.store.value_format)
         )
     )
 }
@@ -804,8 +892,14 @@ FUNCTION fixed_value_reset() {
             width: 86
             height: Fill
             rounded_corners: 0
-            background: [color: TEXT { #111827 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -816,12 +910,12 @@ FUNCTION fixed_value_reset() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #dbeafe }
+                    TEXT { Light } => TEXT { #172033 }
+                }
             ]
-            text: PASSED.store.value_format |> WHEN {
-                TEXT { Binary } => NovyFixtures/selected_reset_value_binary()
-                __ => NovyFixtures/selected_reset_value_hex()
-            }
+            text: NovyFixtures/selected_reset_value(format: PASSED.store.value_format)
         )
     )
 }
@@ -833,8 +927,14 @@ FUNCTION fixed_value_data() {
             width: 86
             height: Fill
             rounded_corners: 0
-            background: [color: TEXT { #111827 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -845,12 +945,12 @@ FUNCTION fixed_value_data() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #dbeafe }
+                    TEXT { Light } => TEXT { #172033 }
+                }
             ]
-            text: PASSED.store.value_format |> WHEN {
-                TEXT { Binary } => NovyFixtures/selected_data_value_binary()
-                __ => NovyFixtures/selected_data_value_hex()
-            }
+            text: NovyFixtures/selected_data_value(format: PASSED.store.value_format)
         )
     )
 }
@@ -862,8 +962,14 @@ FUNCTION fixed_value_temperature() {
             width: 86
             height: Fill
             rounded_corners: 0
-            background: [color: TEXT { #111827 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #111827 }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -874,12 +980,12 @@ FUNCTION fixed_value_temperature() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #dbeafe }
+                    TEXT { Light } => TEXT { #172033 }
+                }
             ]
-            text: PASSED.store.value_format |> WHEN {
-                TEXT { Binary } => NovyFixtures/selected_temperature_value_binary()
-                __ => NovyFixtures/selected_temperature_value_hex()
-            }
+            text: NovyFixtures/selected_temperature_value(format: PASSED.store.value_format)
         )
     )
 }
@@ -1692,8 +1798,14 @@ FUNCTION variables_panel() {
             padding: 10
             depth: 10
             rounded_corners: 0
-            background: [color: TEXT { #172033 }]
-            border: [color: TEXT { #2F80ED }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #172033 }
+                TEXT { Light } => TEXT { #f8fafc }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #2f80ed }
+                TEXT { Light } => TEXT { #2563eb }
+            }]
             material: NovyTheme/material(of: PanelSurface)
         ]
         items: LIST {
@@ -1710,6 +1822,7 @@ FUNCTION variables_panel() {
             variables_list()
             search_result_line()
             inspector_strip()
+            format_palette()
         }
     )
 }
@@ -1796,8 +1909,14 @@ FUNCTION variables_list_empty() {
             height: 116
             padding: 8
             rounded_corners: 8
-            background: [color: TEXT { #101A2B }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #101a2b }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -1808,7 +1927,10 @@ FUNCTION variables_list_empty() {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #90A4BF }
+                color: PASSED.store.mode |> WHEN {
+                    TEXT { Dark } => TEXT { #90a4bf }
+                    TEXT { Light } => TEXT { #60748b }
+                }
             ]
             text: TEXT { No matching signals }
         )
@@ -2003,10 +2125,10 @@ FUNCTION inspector_strip() {
         gap: 6
         style: [width: Fill, height: 54, paint: False]
         items: LIST {
-            inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label)
-            inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
-            inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_label)
-            row_resize_controls()
+            compact_inspector_row(row_label: TEXT { Active }, row_value: PASSED.store.active_signal_label, row_width: 100)
+            compact_inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label, row_width: 76)
+            compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_label, row_width: 122)
+            row_resize_controls_compact()
         }
     )
 }
@@ -2030,6 +2152,7 @@ FUNCTION inspector_panel() {
             inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
             inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.viewport_label)
             inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_label)
+            inspector_row(row_label: TEXT { Response }, row_value: PASSED.store.bridge_response_status)
             inspector_row(row_label: TEXT { Bridge }, row_value: PASSED.store.bridge_contract)
             row_resize_controls()
         }
@@ -2046,8 +2169,41 @@ FUNCTION inspector_row(row_label, row_value) {
             height: 52
             padding: 8
             rounded_corners: 9
-            background: [color: TEXT { #101A2B }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #101a2b }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
+            material: NovyTheme/material(of: PanelInset)
+        ]
+        items: LIST {
+            text_line(label_text: row_label, font: Muted, width: Fill, height: 16)
+            text_line(label_text: row_value, font: Mono, width: Fill, height: 22)
+        }
+    )
+}
+
+FUNCTION compact_inspector_row(row_label, row_value, row_width) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 2
+        style: [
+            width: row_width
+            height: 52
+            padding: 8
+            rounded_corners: 9
+            background: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #101a2b }
+                TEXT { Light } => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #263753 }
+                TEXT { Light } => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(of: PanelInset)
         ]
         items: LIST {
@@ -2070,6 +2226,109 @@ FUNCTION row_resize_controls() {
     )
 }
 
+FUNCTION row_resize_controls_compact() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: 104, height: 36, paint: False]
+        items: LIST {
+            row_shorter_button_compact()
+            row_taller_button_compact()
+        }
+    )
+}
+
+FUNCTION format_palette() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 32, paint: False]
+        items: LIST {
+            format_hex_button()
+            format_binary_button()
+            format_grouped_button()
+            format_octal_button()
+            format_signed_button()
+            format_unsigned_button()
+            format_ascii_button()
+        }
+    )
+}
+
+FUNCTION format_hex_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_hex], hovered: PASSED.store.elements.format_hex]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Hex })
+    )
+}
+
+FUNCTION format_binary_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Bin })
+    )
+}
+
+FUNCTION format_grouped_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_grouped], hovered: PASSED.store.elements.format_grouped]
+        style: compact_button_style(button_width: 44)
+        label: button_label(button_text: TEXT { Grp })
+    )
+}
+
+FUNCTION format_octal_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_octal], hovered: PASSED.store.elements.format_octal]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Oct })
+    )
+}
+
+FUNCTION format_signed_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_signed], hovered: PASSED.store.elements.format_signed]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Sgn })
+    )
+}
+
+FUNCTION format_unsigned_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_unsigned], hovered: PASSED.store.elements.format_unsigned]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Uns })
+    )
+}
+
+FUNCTION format_ascii_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.format_ascii], hovered: PASSED.store.elements.format_ascii]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Asc })
+    )
+}
+
+FUNCTION row_shorter_button_compact() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.row_shorter], hovered: PASSED.store.elements.row_shorter]
+        style: compact_button_style(button_width: 54)
+        label: button_label(button_text: TEXT { Short })
+    )
+}
+
+FUNCTION row_taller_button_compact() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.row_taller], hovered: PASSED.store.elements.row_taller]
+        style: compact_button_style(button_width: 44)
+        label: button_label(button_text: TEXT { Tall })
+    )
+}
+
 FUNCTION panel_title(title_text) {
     Scene/Element/text(
         element: []
@@ -2078,7 +2337,10 @@ FUNCTION panel_title(title_text) {
             width: Fill
             height: 24
             vertical_align: Center
-            color: TEXT { #DCEAFF }
+            color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dceaff }
+                TEXT { Light } => TEXT { #182a3d }
+            }
         ]
         text: title_text
     )
@@ -2093,7 +2355,10 @@ FUNCTION button_label(button_text) {
             height: Fill
             center: True
             vertical_align: Center
-            color: TEXT { #DBEAFE }
+            color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dbeafe }
+                TEXT { Light } => TEXT { #172033 }
+            }
         ]
         text: button_text
     )
@@ -2106,8 +2371,14 @@ FUNCTION compact_button_style(button_width) {
         rounded_corners: 8
         spring_range: 3
         center: True
-        background: [color: TEXT { #101A2B }]
-        border: [color: TEXT { #334761 }]
+        background: [color: PASSED.store.mode |> WHEN {
+            TEXT { Dark } => TEXT { #101a2b }
+            TEXT { Light } => TEXT { #ffffff }
+        }]
+        border: [color: PASSED.store.mode |> WHEN {
+            TEXT { Dark } => TEXT { #334761 }
+            TEXT { Light } => TEXT { #bad0e8 }
+        }]
         material: NovyTheme/material(of: HoverControl)
     ]
 }
@@ -2261,6 +2532,14 @@ FUNCTION group_button() {
     )
 }
 
+FUNCTION stale_response_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.stale_response_probe], hovered: PASSED.store.elements.stale_response_probe]
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { Stale })
+    )
+}
+
 FUNCTION format_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.format_cycle], hovered: PASSED.store.elements.format_cycle]
@@ -2325,7 +2604,10 @@ FUNCTION text_line(label_text, font, width, height) {
             width: width
             height: height
             vertical_align: Center
-            color: TEXT { #DBEAFE }
+            color: PASSED.store.mode |> WHEN {
+                TEXT { Dark } => TEXT { #dbeafe }
+                TEXT { Light } => TEXT { #172033 }
+            }
         ]
         text: label_text
     )

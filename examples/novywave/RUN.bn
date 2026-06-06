@@ -14,9 +14,16 @@ store: [
         cursor_right: SOURCE
         marker_toggle: SOURCE
         group_toggle: SOURCE
+        stale_response_probe: SOURCE
         row_taller: SOURCE
         row_shorter: SOURCE
         format_cycle: SOURCE
+        format_hex: SOURCE
+        format_grouped: SOURCE
+        format_octal: SOURCE
+        format_signed: SOURCE
+        format_unsigned: SOURCE
+        format_ascii: SOURCE
         keyboard_capture: SOURCE
         signal_search_input: SOURCE
         scope_cpu: SOURCE
@@ -105,6 +112,13 @@ store: [
         LATEST {
             TEXT { Hexadecimal }
             elements.format_cycle.event.press |> THEN { TEXT { Binary } }
+            elements.format_hex.event.press |> THEN { TEXT { Hexadecimal } }
+            elements.format_grouped.event.press |> THEN { TEXT { GroupedBinary } }
+            elements.format_octal.event.press |> THEN { TEXT { Octal } }
+            elements.format_signed.event.press |> THEN { TEXT { Signed } }
+            elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
+            elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
+            elements.load_fixture.event.press |> THEN { TEXT { Binary } }
         }
 
     zoom_level:
@@ -174,10 +188,33 @@ store: [
             elements.select_temperature.event.press |> THEN { TEXT { top.analog.temperature } }
         }
 
+    active_scope_key:
+        LATEST {
+            TEXT { TOP_CPU }
+            elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
+            elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
+        }
+
+    active_signal_key:
+        LATEST {
+            TEXT { CLK }
+            elements.select_clk.event.press |> THEN { TEXT { CLK } }
+            elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
+            elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
+            elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+        }
+
     format_label:
         LATEST {
             TEXT { Hex }
             elements.format_cycle.event.press |> THEN { TEXT { Binary } }
+            elements.format_hex.event.press |> THEN { TEXT { Hex } }
+            elements.format_grouped.event.press |> THEN { TEXT { Grouped bin } }
+            elements.format_octal.event.press |> THEN { TEXT { Octal } }
+            elements.format_signed.event.press |> THEN { TEXT { Signed } }
+            elements.format_unsigned.event.press |> THEN { TEXT { Unsigned } }
+            elements.format_ascii.event.press |> THEN { TEXT { ASCII } }
+            elements.load_fixture.event.press |> THEN { TEXT { Binary } }
         }
 
     row_height:
@@ -194,6 +231,12 @@ store: [
                 elements.select_reset.event.press |> THEN { TEXT { FP_CPU_RESET_FIT_CENTER_42_HEX } }
                 elements.select_data.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_HEX } }
                 elements.format_cycle.event.press |> THEN { TEXT { FP_CPU_DATA_FIT_CENTER_42_BIN } }
+                elements.format_hex.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_HEX } }
+                elements.format_grouped.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_GROUPED_BIN } }
+                elements.format_octal.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_OCTAL } }
+                elements.format_signed.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_SIGNED } }
+                elements.format_unsigned.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_UNSIGNED } }
+                elements.format_ascii.event.press |> THEN { TEXT { FP_CPU_DATA_FORMAT_ASCII } }
                 elements.zoom_in.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_CENTER_42_BIN } }
                 elements.pan_right.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_42_BIN } }
                 elements.cursor_left.event.press |> THEN { TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN } }
@@ -205,8 +248,101 @@ store: [
             }
         }
 
+    bridge_response_scope:
+        TEXT { TOP_CPU } |> HOLD bridge_response_scope {
+            LATEST {
+                elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
+                elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
+                elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
+            }
+        }
+
+    bridge_response_signal:
+        TEXT { CLK } |> HOLD bridge_response_signal {
+            LATEST {
+                elements.select_clk.event.press |> THEN { TEXT { CLK } }
+                elements.select_reset.event.press |> THEN { TEXT { RESET_N } }
+                elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
+                elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { CLK } }
+                elements.load_fixture.event.press |> THEN { TEXT { DATA_BUS } }
+            }
+        }
+
+    bridge_response_zoom:
+        TEXT { Fit } |> HOLD bridge_response_zoom {
+            LATEST {
+                elements.zoom_in.event.press |> THEN { TEXT { Close } }
+                elements.zoom_out.event.press |> THEN { TEXT { Wide } }
+                elements.cursor_left.event.press |> THEN { TEXT { Close } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { Fit } }
+                elements.load_fixture.event.press |> THEN { TEXT { Close } }
+            }
+        }
+
+    bridge_response_pan:
+        TEXT { Center } |> HOLD bridge_response_pan {
+            LATEST {
+                elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
+                elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
+                elements.cursor_left.event.press |> THEN { TEXT { RightWindow } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { Center } }
+                elements.load_fixture.event.press |> THEN { TEXT { RightWindow } }
+            }
+        }
+
+    bridge_response_cursor:
+        TEXT { Cursor42 } |> HOLD bridge_response_cursor {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
+                elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { Cursor42 } }
+                elements.load_fixture.event.press |> THEN { TEXT { Cursor36 } }
+            }
+        }
+
+    bridge_response_format:
+        TEXT { Hexadecimal } |> HOLD bridge_response_format {
+            LATEST {
+                elements.format_cycle.event.press |> THEN { TEXT { Binary } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { Hexadecimal } }
+                elements.load_fixture.event.press |> THEN { TEXT { Binary } }
+            }
+        }
+
+    bridge_response_page:
+        TEXT { PAGE_CLK_FIT_CENTER_42_HEX } |> HOLD bridge_response_page {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { PAGE_CLK_FIT_CENTER_42_HEX } }
+                elements.load_fixture.event.press |> THEN { TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } }
+            }
+        }
+
+    bridge_response_fingerprint:
+        bridge_response_page |> WHEN {
+            TEXT { PAGE_DATA_CLOSE_RIGHT_36_BIN } => TEXT { FP_CPU_DATA_CLOSE_RIGHT_36_BIN }
+            TEXT { PAGE_CLK_FIT_CENTER_42_HEX } => TEXT { FP_CPU_CLK_FIT_CENTER_42_HEX }
+            __ => TEXT { FP_STALE_OR_UNKNOWN_PAGE }
+        }
+
     bridge_request_label:
         bridge_request_fingerprint
+
+    bridge_response_status:
+        TEXT { ACCEPTED_CURRENT_PAGE } |> HOLD bridge_response_status {
+            LATEST {
+                elements.cursor_left.event.press |> THEN { TEXT { ACCEPTED_CURRENT_PAGE } }
+                elements.format_hex.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.format_grouped.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.format_octal.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.format_signed.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.format_unsigned.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.format_ascii.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.stale_response_probe.event.press |> THEN { TEXT { REJECTED_STALE_PAGE } }
+                elements.load_fixture.event.press |> THEN { TEXT { ACCEPTED_CURRENT_PAGE } }
+            }
+        }
 
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()

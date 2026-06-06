@@ -14,6 +14,12 @@ FUNCTION files() {
             range: TEXT { 0 ns - 240 ns }
             status: TEXT { fixture }
         ]
+        [
+            name: TEXT { simple_test.ghw }
+            format: TEXT { GHW }
+            range: TEXT { 0 ns - 100 ns }
+            status: TEXT { fixture }
+        ]
     }
 }
 

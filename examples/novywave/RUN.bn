@@ -6,6 +6,7 @@ store: [
         show_empty: SOURCE
         select_counter_file: SOURCE
         select_uart_compare_file: SOURCE
+        select_ghw_file: SOURCE
         diagnostic_probe: SOURCE
         mode_to_light: SOURCE
         mode_to_dark: SOURCE
@@ -19,7 +20,9 @@ store: [
         marker_rename: SOURCE
         marker_remove: SOURCE
         marker_jump: SOURCE
+        group_create: SOURCE
         group_toggle: SOURCE
+        group_expand: SOURCE
         stale_response_probe: SOURCE
         row_taller: SOURCE
         row_shorter: SOURCE
@@ -60,6 +63,7 @@ store: [
             TEXT { counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { uart_compare.fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
             elements.load_fixture.event.press |> THEN { TEXT { counter.vcd } }
         }
 
@@ -68,6 +72,7 @@ store: [
             TEXT { none }
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { counter.vcd } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
         }
 
@@ -76,6 +81,7 @@ store: [
             TEXT { single fixture: counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { single fixture: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing counter.vcd to uart_compare.fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { single fixture: simple_test.ghw } }
             elements.load_fixture.event.press |> THEN { TEXT { single fixture: counter.vcd } }
         }
 
@@ -93,6 +99,7 @@ store: [
             TEXT { PAGE_COUNTER_PRIMARY }
             elements.select_counter_file.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { PAGE_COMPARE_COUNTER_UART } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { PAGE_GHW_SIMPLE_PRIMARY } }
             elements.load_fixture.event.press |> THEN { TEXT { PAGE_COUNTER_PRIMARY } }
         }
 
@@ -101,6 +108,7 @@ store: [
             TEXT { primary page: counter.vcd }
             elements.select_counter_file.event.press |> THEN { TEXT { primary page: counter.vcd } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW fixture } }
             elements.load_fixture.event.press |> THEN { TEXT { primary page: counter.vcd } }
         }
 
@@ -116,6 +124,7 @@ store: [
             elements.diagnostic_probe.event.press |> THEN { TEXT { Unsupported } }
             elements.select_counter_file.event.press |> THEN { TEXT { OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { OK } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { OK } }
             elements.load_fixture.event.press |> THEN { TEXT { OK } }
             elements.show_empty.event.press |> THEN { TEXT { Idle } }
         }
@@ -126,6 +135,7 @@ store: [
             elements.diagnostic_probe.event.press |> THEN { TEXT { unsupported fixture: corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.load_fixture.event.press |> THEN { TEXT { bridge diagnostics OK } }
             elements.show_empty.event.press |> THEN { TEXT { no file loaded } }
         }
@@ -136,6 +146,7 @@ store: [
             elements.diagnostic_probe.event.press |> THEN { TEXT { corrupted.vcd } }
             elements.select_counter_file.event.press |> THEN { TEXT { none } }
             elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
             elements.load_fixture.event.press |> THEN { TEXT { none } }
             elements.show_empty.event.press |> THEN { TEXT { none } }
         }
@@ -235,8 +246,45 @@ store: [
     selected_group:
         LATEST {
             TEXT { Expanded }
+            elements.group_create.event.press |> THEN { TEXT { Expanded } }
             elements.group_toggle.event.press |> THEN { TEXT { Collapsed } }
+            elements.group_expand.event.press |> THEN { TEXT { Expanded } }
             elements.load_fixture.event.press |> THEN { TEXT { Expanded } }
+        }
+
+    group_creation_state:
+        LATEST {
+            TEXT { None }
+            elements.group_create.event.press |> THEN { TEXT { Created } }
+            elements.load_fixture.event.press |> THEN { TEXT { None } }
+        }
+
+    group_name:
+        LATEST {
+            TEXT { No group }
+            elements.group_create.event.press |> THEN { TEXT { Core bus group } }
+            elements.load_fixture.event.press |> THEN { TEXT { No group } }
+        }
+
+    group_count_label:
+        LATEST {
+            TEXT { 0 groups }
+            elements.group_create.event.press |> THEN { TEXT { 1 group } }
+            elements.load_fixture.event.press |> THEN { TEXT { 0 groups } }
+        }
+
+    group_members_label:
+        LATEST {
+            TEXT { none }
+            elements.group_create.event.press |> THEN { TEXT { clk, reset_n, data_bus[7:0], temperature } }
+            elements.load_fixture.event.press |> THEN { TEXT { none } }
+        }
+
+    group_status_label:
+        LATEST {
+            TEXT { no group }
+            elements.group_create.event.press |> THEN { TEXT { 1 group } }
+            elements.load_fixture.event.press |> THEN { TEXT { no group } }
         }
 
     selected_rows_profile:

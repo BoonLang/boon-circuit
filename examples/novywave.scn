@@ -18,6 +18,18 @@ expected_source_event = { source = "store.elements.select_counter_file", target_
 expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd" }
 
 [[step]]
+id = "select-ghw-fixture"
+user_action = { kind = "click", target = "file row", target_text = "- simple_test.ghw" }
+expected_source_event = { source = "store.elements.select_ghw_file", target_text = "- simple_test.ghw" }
+expect_root_text = { "active_file" = "simple_test.ghw", "compare_file" = "none", "file_compare_status" = "single fixture: simple_test.ghw", "compare_request_page" = "PAGE_GHW_SIMPLE_PRIMARY", "compare_result_label" = "primary page: simple_test.ghw, GHW fixture", "diagnostic_state" = "OK" }
+
+[[step]]
+id = "return-primary-after-ghw"
+user_action = { kind = "click", target = "file row", target_text = "- counter.vcd" }
+expected_source_event = { source = "store.elements.select_counter_file", target_text = "- counter.vcd" }
+expect_root_text = { "active_file" = "counter.vcd", "compare_file" = "none", "file_compare_status" = "single fixture: counter.vcd", "compare_request_page" = "PAGE_COUNTER_PRIMARY", "compare_result_label" = "primary page: counter.vcd" }
+
+[[step]]
 id = "select-uart-scope"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.uart" }
 expected_source_event = { source = "store.elements.scope_uart", target_text = "+ top.uart" }
@@ -49,20 +61,20 @@ expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEM
 
 [[step]]
 id = "analog-manual-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "Man" }
-expected_source_event = { source = "store.elements.analog_limits_manual", target_text = "Man" }
+user_action = { kind = "click", target = "analog limits", target_text = "[Man]" }
+expected_source_event = { source = "store.elements.analog_limits_manual", target_text = "[Man]" }
 expect_root_text = { "analog_limit_kind" = "Manual", "analog_limit_validity" = "Valid", "analog_range_label" = "Manual -10 C .. 80 C", "analog_limit_error" = "none" }
 
 [[step]]
 id = "analog-invalid-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "Bad" }
-expected_source_event = { source = "store.elements.analog_limits_invalid", target_text = "Bad" }
+user_action = { kind = "click", target = "analog limits", target_text = "[Bad]" }
+expected_source_event = { source = "store.elements.analog_limits_invalid", target_text = "[Bad]" }
 expect_root_text = { "analog_limit_kind" = "Manual", "analog_limit_validity" = "Rejected", "analog_limit_error" = "rejected min >= max", "analog_range_label" = "Manual -10 C .. 80 C" }
 
 [[step]]
 id = "analog-auto-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "Auto" }
-expected_source_event = { source = "store.elements.analog_limits_auto", target_text = "Auto" }
+user_action = { kind = "click", target = "analog limits", target_text = "[Auto]" }
+expected_source_event = { source = "store.elements.analog_limits_auto", target_text = "[Auto]" }
 expect_root_text = { "analog_limit_kind" = "Auto", "analog_limit_validity" = "Valid", "analog_range_label" = "Auto 39 C .. 44 C", "analog_limit_error" = "none" }
 
 [[step]]
@@ -87,26 +99,26 @@ expect_semantic_delta_contains = ["FieldSet:selected_once"]
 
 [[step]]
 id = "selected-remove-data"
-user_action = { kind = "click", target = "selected row control", target_text = "Rm data" }
-expected_source_event = { source = "store.elements.selected_remove_data", target_text = "Rm data" }
+user_action = { kind = "click", target = "selected row control", target_text = "[Rm data]" }
+expected_source_event = { source = "store.elements.selected_remove_data", target_text = "[Rm data]" }
 expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_count" = "3", "selected_rows_order_label" = "clk, reset_n, temperature", "selected_signal_count_label" = "3 selected" }
 
 [[step]]
 id = "selected-restore-data"
-user_action = { kind = "click", target = "selected row control", target_text = "Restore" }
-expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore" }
+user_action = { kind = "click", target = "selected row control", target_text = "[Restore]" }
+expected_source_event = { source = "store.elements.selected_restore_data", target_text = "[Restore]" }
 expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, data_bus[7:0], temperature", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "selected-data-up"
-user_action = { kind = "click", target = "selected row control", target_text = "Up" }
-expected_source_event = { source = "store.elements.selected_data_up", target_text = "Up" }
+user_action = { kind = "click", target = "selected row control", target_text = "[Up]" }
+expected_source_event = { source = "store.elements.selected_data_up", target_text = "[Up]" }
 expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count" = "4", "selected_rows_order_label" = "data_bus[7:0], clk, reset_n, temperature", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "selected-data-down"
-user_action = { kind = "click", target = "selected row control", target_text = "Down" }
-expected_source_event = { source = "store.elements.selected_data_down", target_text = "Down" }
+user_action = { kind = "click", target = "selected row control", target_text = "[Down]" }
+expected_source_event = { source = "store.elements.selected_data_down", target_text = "[Down]" }
 expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "4", "selected_rows_order_label" = "clk, reset_n, temperature, data_bus[7:0]", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
@@ -244,27 +256,39 @@ expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
 id = "rename-marker"
-user_action = { kind = "click", target = "marker control", target_text = "Ren" }
-expected_source_event = { source = "store.elements.marker_rename", target_text = "Ren" }
+user_action = { kind = "click", target = "marker control", target_text = "[Ren]" }
+expected_source_event = { source = "store.elements.marker_rename", target_text = "[Ren]" }
 expect_root_text = { "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_count_label" = "1 marker", "marker_focus_label" = "data stable at 42 ns" }
 
 [[step]]
 id = "jump-marker"
-user_action = { kind = "click", target = "marker control", target_text = "Jump" }
-expected_source_event = { source = "store.elements.marker_jump", target_text = "Jump" }
+user_action = { kind = "click", target = "marker control", target_text = "[Jump]" }
+expected_source_event = { source = "store.elements.marker_jump", target_text = "[Jump]" }
 expect_root_text = { "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_focus_label" = "jumped to data stable at 42 ns", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "42 ns" }
 
 [[step]]
 id = "remove-marker"
-user_action = { kind = "click", target = "marker control", target_text = "Del" }
-expected_source_event = { source = "store.elements.marker_remove", target_text = "Del" }
+user_action = { kind = "click", target = "marker control", target_text = "[Del]" }
+expected_source_event = { source = "store.elements.marker_remove", target_text = "[Del]" }
 expect_root_text = { "marker_visibility" = "Hidden", "marker_label" = "No markers", "marker_count_label" = "0 markers", "marker_focus_label" = "no marker selected" }
+
+[[step]]
+id = "create-group"
+user_action = { kind = "click", target = "create group", target_text = "[NewGrp]" }
+expected_source_event = { source = "store.elements.group_create", target_text = "[NewGrp]" }
+expect_root_text = { "group_creation_state" = "Created", "group_name" = "Core bus group", "group_count_label" = "1 group", "group_members_label" = "clk, reset_n, data_bus[7:0], temperature", "group_status_label" = "1 group", "selected_group" = "Expanded" }
 
 [[step]]
 id = "collapse-group"
 user_action = { kind = "click", target = "group" }
 expected_source_event = { source = "store.elements.group_toggle" }
 expect_root_text = { "selected_group" = "Collapsed" }
+
+[[step]]
+id = "expand-group"
+user_action = { kind = "click", target = "group expand", target_text = "Expand group" }
+expected_source_event = { source = "store.elements.group_expand", target_text = "Expand group" }
+expect_root_text = { "selected_group" = "Expanded", "selected_rows_count" = "4", "selected_signal_count_label" = "4 selected" }
 
 [[step]]
 id = "row-tall"
@@ -352,6 +376,6 @@ expect_root_text = { "mode" = "Dark" }
 
 [[step]]
 id = "final-marker-jump"
-user_action = { kind = "click", target = "marker control", target_text = "Jump" }
-expected_source_event = { source = "store.elements.marker_jump", target_text = "Jump" }
+user_action = { kind = "click", target = "marker control", target_text = "[Jump]" }
+expected_source_event = { source = "store.elements.marker_jump", target_text = "[Jump]" }
 expect_root_text = { "mode" = "Dark", "marker_visibility" = "Visible", "marker_label" = "M data stable", "marker_focus_label" = "jumped to data stable at 42 ns", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "42 ns" }

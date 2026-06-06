@@ -249,6 +249,8 @@ initial_visible_assertions = [
 input_scenarios = [
   "select-compare-fixture",
   "select-primary-fixture",
+  "select-ghw-fixture",
+  "return-primary-after-ghw",
   "select-uart-scope",
   "search-uart-tx",
   "clear-search-uart",
@@ -289,7 +291,9 @@ input_scenarios = [
   "rename-marker",
   "jump-marker",
   "remove-marker",
+  "create-group",
   "collapse-group",
+  "expand-group",
   "row-tall",
   "row-compact",
   "switch-light",

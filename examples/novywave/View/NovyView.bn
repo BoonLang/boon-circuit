@@ -323,15 +323,12 @@ FUNCTION files_list() {
         style: [width: Fill, height: 176, paint: False, scroll_y: True, scrollbars: True]
         items: LIST {
             file_counter_button()
-            scope_cpu_button()
-            tree_row(label_text: TEXT {     clk }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {     reset_n }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {     data_bus[7:0] }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {     ... 5 more cpu signals }, indent_width: 0, selected: False)
-            scope_uart_button()
-            tree_row(label_text: TEXT {     tx_data[7:0] }, indent_width: 0, selected: False)
-            scope_analog_button()
             file_uart_compare_button()
+            file_ghw_button()
+            scope_cpu_button()
+            tree_row(label_text: TEXT {     clk, reset_n, data_bus ... }, indent_width: 0, selected: False)
+            scope_uart_button()
+            scope_analog_button()
         }
     )
 }
@@ -371,6 +368,14 @@ FUNCTION file_uart_compare_button() {
         element: [event: [press: PASSED.store.elements.select_uart_compare_file], hovered: PASSED.store.elements.select_uart_compare_file]
         style: [width: Fill, height: 20, paint: False]
         label: tree_row(label_text: TEXT { - uart_compare.fst }, indent_width: 0, selected: PASSED.store.active_file == TEXT { uart_compare.fst })
+    )
+}
+
+FUNCTION file_ghw_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.select_ghw_file], hovered: PASSED.store.elements.select_ghw_file]
+        style: [width: Fill, height: 20, paint: False]
+        label: tree_row(label_text: TEXT { - simple_test.ghw }, indent_width: 0, selected: PASSED.store.active_file == TEXT { simple_test.ghw })
     )
 }
 
@@ -616,11 +621,11 @@ FUNCTION timeline_panel() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 8
+        gap: 6
         style: [
             width: Fill
             height: Fill
-            padding: 10
+            padding: 8
             depth: 4
             move: [closer: 1]
             rounded_corners: 0
@@ -688,7 +693,7 @@ FUNCTION timeline_toolbar() {
     Scene/Element/stripe(
         element: []
         direction: Column
-        gap: 4
+        gap: 5
         style: [width: Fill, height: 104, paint: False]
         items: LIST {
             timeline_navigation_controls()
@@ -713,7 +718,11 @@ FUNCTION timeline_navigation_controls() {
             cursor_left_button()
             cursor_right_button()
             marker_button()
+            control_separator()
+            create_group_button()
+            control_separator()
             group_button()
+            control_separator()
             format_button()
         }
     )
@@ -723,15 +732,21 @@ FUNCTION selected_row_controls() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 6
+        gap: 10
         style: [width: Fill, height: 28, paint: False]
         items: LIST {
             remove_data_button()
+            control_separator()
             restore_data_button()
+            control_separator()
             data_up_button()
+            control_separator()
             data_down_button()
+            control_separator()
             rename_marker_button()
+            control_separator()
             jump_marker_button()
+            control_separator()
             remove_marker_button()
         }
     )
@@ -741,14 +756,34 @@ FUNCTION analog_limit_controls() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 6
+        gap: 10
         style: [width: Fill, height: 28, paint: False]
         items: LIST {
             analog_auto_button()
+            control_separator()
             analog_manual_button()
+            control_separator()
             analog_invalid_button()
             analog_limit_summary_text()
         }
+    )
+}
+
+FUNCTION control_separator() {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(mode: PASSED.store.mode, of: Muted)
+            width: 12
+            height: Fill
+            center: True
+            vertical_align: Center
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
+        ]
+        text: TEXT { | }
     )
 }
 
@@ -799,8 +834,8 @@ FUNCTION timeline_axis() {
         gap: 3
         style: [
             width: Fill
-            height: 42
-            padding: 6
+            height: 38
+            padding: 5
             rounded_corners: 0
             background: [color: PASSED.store.mode |> WHEN {
                 Dark => TEXT { #0a1322 }
@@ -909,8 +944,11 @@ FUNCTION marker_chip() {
 }
 
 FUNCTION collapsed_group() {
-    Scene/Element/label(
-        element: []
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.group_expand]
+            hovered: PASSED.store.elements.group_expand
+        ]
         style: [
             width: Fill
             height: 48
@@ -925,20 +963,43 @@ FUNCTION collapsed_group() {
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
-        label: Scene/Element/text(
+        label: Scene/Element/stripe(
             element: []
-            style: [
-                ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
-                width: Fill
-                height: Fill
-                center: True
-                vertical_align: Center
-                color: PASSED.store.mode |> WHEN {
-                    Dark => TEXT { #dbeafe }
-                    Light => TEXT { #172033 }
-                }
-            ]
-            text: TEXT { Core bus group collapsed }
+            direction: Row
+            gap: 12
+            style: [width: Fill, height: Fill, paint: False]
+            items: LIST {
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+                        width: Fill
+                        height: Fill
+                        center: True
+                        vertical_align: Center
+                        color: PASSED.store.mode |> WHEN {
+                            Dark => TEXT { #dbeafe }
+                            Light => TEXT { #172033 }
+                        }
+                    ]
+                    text: TEXT { Core bus group collapsed }
+                )
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        ...NovyTheme/font(mode: PASSED.store.mode, of: Body)
+                        width: 112
+                        height: Fill
+                        center: True
+                        vertical_align: Center
+                        color: PASSED.store.mode |> WHEN {
+                            Dark => TEXT { #dbeafe }
+                            Light => TEXT { #172033 }
+                        }
+                    ]
+                    text: TEXT { Expand group }
+                )
+            }
         )
     )
 }
@@ -3178,91 +3239,99 @@ FUNCTION marker_button() {
     )
 }
 
+FUNCTION create_group_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.group_create], hovered: PASSED.store.elements.group_create]
+        style: compact_button_style(button_width: 76)
+        label: button_label(button_text: TEXT { [NewGrp] })
+    )
+}
+
 FUNCTION group_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
-        style: compact_button_style(button_width: 64)
-        label: button_label(button_text: TEXT { Group })
+        style: compact_button_style(button_width: 72)
+        label: button_label(button_text: TEXT { [Group] })
     )
 }
 
 FUNCTION remove_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_remove_data], hovered: PASSED.store.elements.selected_remove_data]
-        style: compact_button_style(button_width: 58)
-        label: button_label(button_text: TEXT { Rm data })
+        style: compact_button_style(button_width: 78)
+        label: button_label(button_text: TEXT { [Rm data] })
     )
 }
 
 FUNCTION restore_data_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_restore_data], hovered: PASSED.store.elements.selected_restore_data]
-        style: compact_button_style(button_width: 64)
-        label: button_label(button_text: TEXT { Restore })
+        style: compact_button_style(button_width: 82)
+        label: button_label(button_text: TEXT { [Restore] })
     )
 }
 
 FUNCTION data_up_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_up], hovered: PASSED.store.elements.selected_data_up]
-        style: compact_button_style(button_width: 40)
-        label: button_label(button_text: TEXT { Up })
+        style: compact_button_style(button_width: 50)
+        label: button_label(button_text: TEXT { [Up] })
     )
 }
 
 FUNCTION data_down_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.selected_data_down], hovered: PASSED.store.elements.selected_data_down]
-        style: compact_button_style(button_width: 52)
-        label: button_label(button_text: TEXT { Down })
+        style: compact_button_style(button_width: 62)
+        label: button_label(button_text: TEXT { [Down] })
     )
 }
 
 FUNCTION analog_auto_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_auto], hovered: PASSED.store.elements.analog_limits_auto]
-        style: compact_button_style(button_width: 44)
-        label: button_label(button_text: TEXT { Auto })
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { [Auto] })
     )
 }
 
 FUNCTION analog_manual_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_manual], hovered: PASSED.store.elements.analog_limits_manual]
-        style: compact_button_style(button_width: 44)
-        label: button_label(button_text: TEXT { Man })
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { [Man] })
     )
 }
 
 FUNCTION analog_invalid_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.analog_limits_invalid], hovered: PASSED.store.elements.analog_limits_invalid]
-        style: compact_button_style(button_width: 44)
-        label: button_label(button_text: TEXT { Bad })
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { [Bad] })
     )
 }
 
 FUNCTION rename_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_rename], hovered: PASSED.store.elements.marker_rename]
-        style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { Ren })
+        style: compact_button_style(button_width: 52)
+        label: button_label(button_text: TEXT { [Ren] })
     )
 }
 
 FUNCTION jump_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_jump], hovered: PASSED.store.elements.marker_jump]
-        style: compact_button_style(button_width: 48)
-        label: button_label(button_text: TEXT { Jump })
+        style: compact_button_style(button_width: 62)
+        label: button_label(button_text: TEXT { [Jump] })
     )
 }
 
 FUNCTION remove_marker_button() {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.marker_remove], hovered: PASSED.store.elements.marker_remove]
-        style: compact_button_style(button_width: 42)
-        label: button_label(button_text: TEXT { Del })
+        style: compact_button_style(button_width: 52)
+        label: button_label(button_text: TEXT { [Del] })
     )
 }
 

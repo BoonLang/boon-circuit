@@ -11928,8 +11928,13 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, dev_editor: b
         .and_then(serde_json::Value::as_bool)
         == Some(true);
     let render_upload_bytes = extra
-        .pointer("/preview_native_gpu_render_proof/proof/metrics/upload_bytes")
+        .pointer("/preview_native_gpu_render_proof/visible_surface_metrics/upload_bytes")
         .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            extra
+                .pointer("/preview_native_gpu_render_proof/proof/metrics/upload_bytes")
+                .and_then(serde_json::Value::as_u64)
+        })
         .unwrap_or(0);
     let draw_calls = extra
         .pointer("/preview_native_gpu_render_proof/proof/metrics/draw_calls")

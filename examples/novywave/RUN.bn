@@ -28,6 +28,7 @@ store: [
         signal_search_input: SOURCE
         scope_cpu: SOURCE
         scope_uart: SOURCE
+        scope_analog: SOURCE
         select_clk: SOURCE
         select_reset: SOURCE
         select_data: SOURCE
@@ -53,6 +54,7 @@ store: [
             TEXT { top_cpu }
             elements.scope_cpu.event.press |> THEN { TEXT { top_cpu } }
             elements.scope_uart.event.press |> THEN { TEXT { top_uart } }
+            elements.scope_analog.event.press |> THEN { TEXT { top_analog } }
         }
 
     active_signal:
@@ -81,7 +83,13 @@ store: [
             [key: TEXT { data_parity }, scope: TEXT { top.cpu }, name: TEXT { data_parity }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { data }]
             [key: TEXT { state }, scope: TEXT { top.cpu }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, bit_width: TEXT { 3-bit }, direction: TEXT { State }, family: TEXT { state }]
             [key: TEXT { error_count }, scope: TEXT { top.cpu }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, bit_width: TEXT { 16-bit }, direction: TEXT { Counter }, family: TEXT { state }]
+            [key: TEXT { tx_data }, scope: TEXT { top.uart }, name: TEXT { tx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { uart }]
+            [key: TEXT { rx_data }, scope: TEXT { top.uart }, name: TEXT { rx_data[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Input }, family: TEXT { uart }]
+            [key: TEXT { baud_tick }, scope: TEXT { top.uart }, name: TEXT { baud_tick }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { Clock }, family: TEXT { uart }]
+            [key: TEXT { uart_busy }, scope: TEXT { top.uart }, name: TEXT { uart_busy }, kind: TEXT { Reg }, bit_width: TEXT { 1-bit }, direction: TEXT { State }, family: TEXT { uart }]
+            [key: TEXT { framing_error }, scope: TEXT { top.uart }, name: TEXT { framing_error }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Error }, family: TEXT { uart }]
             [key: TEXT { temperature }, scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }, family: TEXT { analog }]
+            [key: TEXT { voltage }, scope: TEXT { top.analog }, name: TEXT { vcore }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Sense }, family: TEXT { analog }]
         }
         |> List/map(signal, new: new_signal(signal: signal))
 
@@ -310,6 +318,23 @@ store: [
             TEXT { TOP_CPU }
             elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
             elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
+            elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
+        }
+
+    active_scope_label:
+        LATEST {
+            TEXT { top.cpu }
+            elements.scope_cpu.event.press |> THEN { TEXT { top.cpu } }
+            elements.scope_uart.event.press |> THEN { TEXT { top.uart } }
+            elements.scope_analog.event.press |> THEN { TEXT { top.analog } }
+        }
+
+    active_scope_signal_count:
+        LATEST {
+            TEXT { 8 signals }
+            elements.scope_cpu.event.press |> THEN { TEXT { 8 signals } }
+            elements.scope_uart.event.press |> THEN { TEXT { 5 signals } }
+            elements.scope_analog.event.press |> THEN { TEXT { 2 signals } }
         }
 
     active_signal_key:
@@ -404,6 +429,7 @@ store: [
             LATEST {
                 elements.scope_cpu.event.press |> THEN { TEXT { TOP_CPU } }
                 elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
+                elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
                 elements.load_fixture.event.press |> THEN { TEXT { TOP_CPU } }
             }
         }

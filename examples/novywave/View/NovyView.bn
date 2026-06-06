@@ -243,16 +243,16 @@ FUNCTION files_list() {
         style: [width: Fill, paint: False]
         items: LIST {
             tree_row(label_text: TEXT { - counter.vcd }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {   + top.cpu }, indent_width: 0, selected: True)
+            scope_cpu_button()
             tree_row(label_text: TEXT {     clk }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     reset_n }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     data_bus[7:0] }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     data_valid }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     data_ready }, indent_width: 0, selected: False)
             tree_row(label_text: TEXT {     state[2:0] }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {   + top.uart }, indent_width: 0, selected: False)
+            scope_uart_button()
             tree_row(label_text: TEXT {     tx_data[7:0] }, indent_width: 0, selected: False)
-            tree_row(label_text: TEXT {   + top.analog }, indent_width: 0, selected: False)
+            scope_analog_button()
             tree_row(label_text: TEXT { - uart_compare.fst }, indent_width: 0, selected: False)
         }
     )
@@ -267,12 +267,24 @@ FUNCTION tree_row(label_text, indent_width, selected) {
             padding: [left: 6, right: 6]
             rounded_corners: 4
             background: [color: selected |> WHEN {
-                True => TEXT { #203B62 }
-                False => TEXT { #101A2B }
+                True => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #203B62 }
+                    Light => TEXT { #d7e9ff }
+                }
+                False => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #101a2b }
+                    Light => TEXT { #ffffff }
+                }
             }]
             border: [color: selected |> WHEN {
-                True => TEXT { #3B82F6 }
-                False => TEXT { #263753 }
+                True => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #3B82F6 }
+                    Light => TEXT { #2474bb }
+                }
+                False => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #263753 }
+                    Light => TEXT { #d7dde8 }
+                }
             }]
             material: selected |> WHEN {
                 True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -286,7 +298,10 @@ FUNCTION tree_row(label_text, indent_width, selected) {
                 width: Fill
                 height: Fill
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #172033 }
+                }
             ]
             text: label_text
         )
@@ -357,11 +372,17 @@ FUNCTION scope_cpu_button() {
         element: [event: [press: PASSED.store.elements.scope_cpu], hovered: PASSED.store.elements.scope_cpu]
         style: [
             width: Fill
-            height: 32
-            padding: 5
-            rounded_corners: 9
-            background: [color: TEXT { #203B62 }]
-            border: [color: TEXT { #3B82F6 }]
+            height: 22
+            padding: [left: 6, right: 6]
+            rounded_corners: 4
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #203B62 }
+                Light => TEXT { #d7e9ff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #3B82F6 }
+                Light => TEXT { #2474bb }
+            }]
             spring_range: 3
             material: PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
                 True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -370,12 +391,12 @@ FUNCTION scope_cpu_button() {
         ]
         label: Scene/Element/stripe(
             element: []
-            direction: Column
-            gap: 1
+            direction: Row
+            gap: 8
             style: [paint: False]
             items: LIST {
-                text_line(label_text: TEXT { top.cpu }, font: Body, width: Fill, height: 16)
-                text_line(label_text: TEXT { 8 signals }, font: Muted, width: Fill, height: 12)
+                text_line(label_text: TEXT { + top.cpu }, font: Body, width: Fill, height: 18)
+                text_line(label_text: TEXT { 8 signals }, font: Muted, width: 70, height: 18)
             }
         )
     )
@@ -386,11 +407,29 @@ FUNCTION scope_uart_button() {
         element: [event: [press: PASSED.store.elements.scope_uart], hovered: PASSED.store.elements.scope_uart]
         style: [
             width: Fill
-            height: 32
-            padding: 5
-            rounded_corners: 9
-            background: [color: TEXT { #101A2B }]
-            border: [color: TEXT { #263753 }]
+            height: 22
+            padding: [left: 6, right: 6]
+            rounded_corners: 4
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+                    True => TEXT { #203B62 }
+                    False => TEXT { #101a2b }
+                }
+                Light => PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+                    True => TEXT { #d7e9ff }
+                    False => TEXT { #ffffff }
+                }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+                    True => TEXT { #3B82F6 }
+                    False => TEXT { #263753 }
+                }
+                Light => PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+                    True => TEXT { #2474bb }
+                    False => TEXT { #d7dde8 }
+                }
+            }]
             spring_range: 3
             material: PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
                 True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
@@ -399,12 +438,59 @@ FUNCTION scope_uart_button() {
         ]
         label: Scene/Element/stripe(
             element: []
-            direction: Column
-            gap: 1
+            direction: Row
+            gap: 8
             style: [paint: False]
             items: LIST {
-                text_line(label_text: TEXT { top.uart }, font: Body, width: Fill, height: 16)
-                text_line(label_text: TEXT { 5 signals }, font: Muted, width: Fill, height: 12)
+                text_line(label_text: TEXT { + top.uart }, font: Body, width: Fill, height: 18)
+                text_line(label_text: TEXT { 5 signals }, font: Muted, width: 70, height: 18)
+            }
+        )
+    )
+}
+
+FUNCTION scope_analog_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.scope_analog], hovered: PASSED.store.elements.scope_analog]
+        style: [
+            width: Fill
+            height: 22
+            padding: [left: 6, right: 6]
+            rounded_corners: 4
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+                    True => TEXT { #203B62 }
+                    False => TEXT { #101a2b }
+                }
+                Light => PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+                    True => TEXT { #d7e9ff }
+                    False => TEXT { #ffffff }
+                }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+                    True => TEXT { #3B82F6 }
+                    False => TEXT { #263753 }
+                }
+                Light => PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+                    True => TEXT { #2474bb }
+                    False => TEXT { #d7dde8 }
+                }
+            }]
+            spring_range: 3
+            material: PASSED.store.active_scope == TEXT { top_analog } |> WHEN {
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
+            }
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Row
+            gap: 8
+            style: [paint: False]
+            items: LIST {
+                text_line(label_text: TEXT { + top.analog }, font: Body, width: Fill, height: 18)
+                text_line(label_text: TEXT { 2 signals }, font: Muted, width: 70, height: 18)
             }
         )
     )
@@ -533,8 +619,14 @@ FUNCTION timeline_axis() {
             height: 48
             padding: 6
             rounded_corners: 0
-            background: [color: TEXT { #0A1322 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0a1322 }
+                Light => TEXT { #eef5ff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #93b4e8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         items: LIST {
@@ -576,7 +668,10 @@ FUNCTION axis_tick(label) {
             width: 120
             height: 18
             center: True
-            color: TEXT { #90A4BF }
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
         ]
         text: label
     )
@@ -637,8 +732,14 @@ FUNCTION collapsed_group() {
             width: Fill
             height: 48
             rounded_corners: 10
-            background: [color: TEXT { #0A1322 }]
-            border: [color: TEXT { #263753 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #0a1322 }
+                Light => TEXT { #ffffff }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #263753 }
+                Light => TEXT { #d7dde8 }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
         label: Scene/Element/text(
@@ -1885,6 +1986,14 @@ FUNCTION variables_list() {
         temp => variables_list_temperature()
         clk => variables_list_clk()
         zzz => variables_list_empty()
+        __ => variables_list_for_scope()
+    }
+}
+
+FUNCTION variables_list_for_scope() {
+    PASSED.store.active_scope |> WHEN {
+        TEXT { top_uart } => variables_list_uart()
+        TEXT { top_analog } => variables_list_analog()
         __ => variables_list_all()
     }
 }
@@ -1954,6 +2063,35 @@ FUNCTION variables_list_temperature() {
         style: [width: Fill, height: 116, paint: False]
         items: LIST {
             variable_temperature_button()
+        }
+    )
+}
+
+FUNCTION variables_list_uart() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 150, paint: False]
+        items: LIST {
+            variable_uart_tx_row()
+            variable_uart_rx_row()
+            variable_baud_tick_row()
+            variable_uart_busy_row()
+            variable_framing_error_row()
+        }
+    )
+}
+
+FUNCTION variables_list_analog() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: [width: Fill, height: 150, paint: False]
+        items: LIST {
+            variable_temperature_button()
+            variable_vcore_row()
         }
     )
 }
@@ -2110,6 +2248,60 @@ FUNCTION variable_error_count_row() {
     )
 }
 
+FUNCTION variable_uart_tx_row() {
+    variable_static_row(
+        name_text: TEXT { tx_data[7:0] }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 8-bit }
+        chip_c: TEXT { Output }
+    )
+}
+
+FUNCTION variable_uart_rx_row() {
+    variable_static_row(
+        name_text: TEXT { rx_data[7:0] }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 8-bit }
+        chip_c: TEXT { Input }
+    )
+}
+
+FUNCTION variable_baud_tick_row() {
+    variable_static_row(
+        name_text: TEXT { baud_tick }
+        chip_a: TEXT { Reg }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { Clock }
+    )
+}
+
+FUNCTION variable_uart_busy_row() {
+    variable_static_row(
+        name_text: TEXT { uart_busy }
+        chip_a: TEXT { Reg }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { State }
+    )
+}
+
+FUNCTION variable_framing_error_row() {
+    variable_static_row(
+        name_text: TEXT { framing_error }
+        chip_a: TEXT { Wire }
+        chip_b: TEXT { 1-bit }
+        chip_c: TEXT { Error }
+    )
+}
+
+FUNCTION variable_vcore_row() {
+    variable_static_row(
+        name_text: TEXT { vcore }
+        chip_a: TEXT { Analog }
+        chip_b: TEXT { 16-bit }
+        chip_c: TEXT { Sense }
+    )
+}
+
 FUNCTION variable_static_row(name_text, chip_a, chip_b, chip_c) {
     Scene/Element/stripe(
         element: []
@@ -2193,7 +2385,10 @@ FUNCTION search_result_line() {
             width: Fill
             height: 18
             vertical_align: Center
-            color: TEXT { #90A4BF }
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #90a4bf }
+                Light => TEXT { #60748b }
+            }
         ]
         text: PASSED.store.search_result_label
     )
@@ -2207,7 +2402,10 @@ FUNCTION variable_name_text(label_text) {
             width: 180
             height: Fill
             vertical_align: Center
-            color: TEXT { #DBEAFE }
+            color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #dbeafe }
+                Light => TEXT { #172033 }
+            }
         ]
         text: label_text
     )
@@ -2248,7 +2446,10 @@ FUNCTION variable_chip_literal(label_text) {
             width: 54
             height: 20
             rounded_corners: 10
-            background: [color: TEXT { #1D4ED8 }]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1d4ed8 }
+                Light => TEXT { #d7e9ff }
+            }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: MarkerChip)
         ]
         label: Scene/Element/text(
@@ -2259,7 +2460,10 @@ FUNCTION variable_chip_literal(label_text) {
                 height: Fill
                 center: True
                 vertical_align: Center
-                color: TEXT { #DBEAFE }
+                color: PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #dbeafe }
+                    Light => TEXT { #17406f }
+                }
             ]
             text: label_text
         )
@@ -2292,9 +2496,9 @@ FUNCTION inspector_strip() {
                 style: [width: Fill, height: 42, paint: False]
                 items: LIST {
                     compact_inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label, row_width: 76)
-                    compact_inspector_row(row_label: TEXT { Window }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
-                    compact_inspector_row(row_label: TEXT { Page }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
-                    compact_inspector_row(row_label: TEXT { Sync }, row_value: PASSED.store.bridge_response_status_compact_label, row_width: 82)
+                    compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
+                    compact_inspector_row(row_label: TEXT { Fixture }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
+                    compact_inspector_row(row_label: TEXT { Match }, row_value: PASSED.store.bridge_response_status_compact_label, row_width: 82)
                 }
             )
         }
@@ -2320,10 +2524,10 @@ FUNCTION inspector_panel() {
             inspector_row(row_label: TEXT { Format }, row_value: PASSED.store.format_label)
             inspector_row(row_label: TEXT { Cursor }, row_value: PASSED.store.keyboard_cursor_label)
             inspector_row(row_label: TEXT { Viewport }, row_value: PASSED.store.keyboard_viewport_label)
-            inspector_row(row_label: TEXT { Requested page }, row_value: PASSED.store.bridge_request_label)
-            inspector_row(row_label: TEXT { Loaded page }, row_value: PASSED.store.bridge_response_fingerprint)
-            inspector_row(row_label: TEXT { Page sync }, row_value: PASSED.store.bridge_response_status)
-            inspector_row(row_label: TEXT { Bridge }, row_value: PASSED.store.bridge_contract)
+            inspector_row(row_label: TEXT { Fixture request }, row_value: PASSED.store.bridge_request_label)
+            inspector_row(row_label: TEXT { Fixture page }, row_value: PASSED.store.bridge_response_fingerprint)
+            inspector_row(row_label: TEXT { Fixture match }, row_value: PASSED.store.bridge_response_status)
+            inspector_row(row_label: TEXT { Bridge plan }, row_value: PASSED.store.bridge_contract)
             row_resize_controls()
         }
     )

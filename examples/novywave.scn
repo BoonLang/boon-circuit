@@ -3,13 +3,38 @@ source = "examples/novywave/RUN.bn"
 
 [[step]]
 id = "initial-loaded-fixture"
-expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "wellen.v1 pure data pages only" }
+expect_root_text = { "fixture_status" = "Loaded", "active_signal" = "clk", "viewport_label" = "0 ns - 120 ns", "keyboard_viewport_label" = "0 ns - 120 ns", "bridge_contract" = "fixture pages now; wellen.v1 pure-data bridge planned" }
+
+[[step]]
+id = "select-uart-scope"
+user_action = { kind = "click", target = "scope row", target_text = "+ top.uart" }
+expected_source_event = { source = "store.elements.scope_uart", target_text = "+ top.uart" }
+expect_root_text = { "active_scope" = "top_uart", "active_scope_key" = "TOP_UART", "active_scope_label" = "top.uart", "active_scope_signal_count" = "5 signals", "bridge_response_scope" = "TOP_UART" }
+
+[[step]]
+id = "select-analog-scope"
+user_action = { kind = "click", target = "scope row", target_text = "+ top.analog" }
+expected_source_event = { source = "store.elements.scope_analog", target_text = "+ top.analog" }
+expect_root_text = { "active_scope" = "top_analog", "active_scope_key" = "TOP_ANALOG", "active_scope_label" = "top.analog", "active_scope_signal_count" = "2 signals", "bridge_response_scope" = "TOP_ANALOG" }
+
+[[step]]
+id = "select-cpu-scope"
+user_action = { kind = "click", target = "scope row", target_text = "+ top.cpu" }
+expected_source_event = { source = "store.elements.scope_cpu", target_text = "+ top.cpu" }
+expect_root_text = { "active_scope" = "top_cpu", "active_scope_key" = "TOP_CPU", "active_scope_label" = "top.cpu", "active_scope_signal_count" = "8 signals", "bridge_response_scope" = "TOP_CPU" }
 
 [[step]]
 id = "row-select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]", target_key = 3, target_generation = 1, source_id = 5, bind_epoch = 5 }
 expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
 expect_root_text = { "active_signal" = "data_bus", "active_signal_label" = "top.cpu.data_bus[7:0]", "active_signal_key" = "DATA_BUS", "bridge_request_fingerprint" = "FP_CPU_DATA_FIT_CENTER_42_HEX", "bridge_request_compact_label" = "DATA_FIT" }
+expect_semantic_delta_contains = ["FieldSet:selected_once"]
+
+[[step]]
+id = "row-unselect-data-bus"
+user_action = { kind = "click", target = "signal row", target_text = "data_bus[7:0]", target_key = 3, target_generation = 1, source_id = 5, bind_epoch = 5 }
+expected_source_event = { source = "signal_catalog_item.signal_elements.select_signal", target_text = "data_bus[7:0]" }
+expect_root_text = { "active_signal" = "data_bus" }
 expect_semantic_delta_contains = ["FieldSet:selected_once"]
 
 [[step]]
@@ -144,6 +169,12 @@ id = "row-tall"
 user_action = { kind = "click", target = "row taller" }
 expected_source_event = { source = "store.elements.row_taller" }
 expect_root_text = { "row_size" = "Tall", "row_height" = "58" }
+
+[[step]]
+id = "row-compact"
+user_action = { kind = "click", target = "row shorter" }
+expected_source_event = { source = "store.elements.row_shorter" }
+expect_root_text = { "row_size" = "Compact", "row_height" = "34" }
 
 [[step]]
 id = "switch-light"

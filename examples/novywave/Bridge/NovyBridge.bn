@@ -1,7 +1,7 @@
 -- Thin pure-data bridge contract description. No Rust handles are Boon values.
 
 FUNCTION contract_summary() {
-    TEXT { wellen.v1 pure data pages only }
+    TEXT { fixture pages now; wellen.v1 pure-data bridge planned }
 }
 
 FUNCTION page_status() {

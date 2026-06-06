@@ -1263,12 +1263,16 @@ async fn run_surface_probe_inner(
         sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
     let mut post_input_frame_timing = None;
     if input_adapter.real_os_events_observed && hooks.is_some() {
+        let post_input_warmup_frame_count = warmup_frame_count;
         let post_input_sample_count = sample_frame_count.max(1);
+        let post_input_total_frame_count = post_input_warmup_frame_count
+            .saturating_add(post_input_sample_count)
+            .max(1);
         let mut post_input_presented_frame_samples = Vec::new();
         let mut post_input_render_hook_samples = Vec::new();
         let mut post_input_first_frame_ms = 0.0;
         let mut post_input_readback = None;
-        for frame_index in 0..post_input_sample_count {
+        for frame_index in 0..post_input_total_frame_count {
             let frame_input = if frame_index == 0 {
                 input_adapter.clone()
             } else {
@@ -1321,6 +1325,7 @@ async fn run_surface_probe_inner(
                 label: Some("boon-native-app-window-input-sample-encoder"),
             });
             let mut rendered_content_revision = rendered_revision;
+            let mut post_input_render_hook_ms = None;
             if let Some(hooks) = hooks.as_mut() {
                 let render_start = Instant::now();
                 let render_result = (hooks.render)(NativeRenderFrameContext {
@@ -1375,9 +1380,10 @@ async fn run_surface_probe_inner(
                     render_loop_state.current_role_dirty_reason,
                 );
                 external_render_proof = Some(render_result.proof);
-                post_input_render_hook_samples.push(elapsed_ms(render_start));
+                post_input_render_hook_ms = Some(elapsed_ms(render_start));
             }
-            if frame_index + 1 == post_input_sample_count && options.readback_artifact_dir.is_some()
+            if frame_index + 1 == post_input_total_frame_count
+                && options.readback_artifact_dir.is_some()
             {
                 post_input_readback = Some(queue_visible_surface_readback(
                     &device,
@@ -1399,10 +1405,15 @@ async fn run_surface_probe_inner(
             if frame_index == 0 {
                 post_input_first_frame_ms = frame_ms;
             }
-            post_input_presented_frame_samples.push(frame_ms);
+            if frame_index >= post_input_warmup_frame_count {
+                post_input_presented_frame_samples.push(frame_ms);
+                if let Some(render_hook_ms) = post_input_render_hook_ms {
+                    post_input_render_hook_samples.push(render_hook_ms);
+                }
+            }
         }
         post_input_frame_timing = Some(NativeFrameTimingProof {
-            warmup_frame_count: 0,
+            warmup_frame_count: post_input_warmup_frame_count,
             sample_frame_count: post_input_sample_count,
             measured_frame_count: post_input_presented_frame_samples.len() as u32,
             first_presented_frame_ms: post_input_first_frame_ms,

@@ -33,6 +33,7 @@ const EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 const EDITOR_FONT_FEATURES: &str = "zero,calt";
 const DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
 const DOCUMENT_MONOSPACE_FONT_FAMILY: &str = "Liberation Mono";
+const MAX_CACHED_QUAD_BATCHES: usize = 64;
 
 pub trait PresentSurface {
     fn id(&self) -> SurfaceId;
@@ -85,6 +86,8 @@ pub struct FrameMetrics {
     pub frame_seq: u64,
     pub draw_calls: u32,
     pub upload_bytes: u64,
+    pub quad_cache_hit: bool,
+    pub quad_cache_entry_count: u32,
     pub visible_display_item_count: u32,
     pub rendered_rect_count: u32,
     pub rect_cap_hit: bool,
@@ -280,6 +283,8 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 frame_seq: self.frame_seq,
                 draw_calls: 0,
                 upload_bytes: 0,
+                quad_cache_hit: false,
+                quad_cache_entry_count: 0,
                 visible_display_item_count: 0,
                 rendered_rect_count: 0,
                 rect_cap_hit: false,
@@ -327,7 +332,7 @@ struct AssetTextureKey {
     height: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum QuadTexture {
     Solid,
     Asset(AssetTextureKey),
@@ -341,12 +346,35 @@ struct QuadBatch {
     uvs: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct GpuQuadBatch {
     texture: QuadTexture,
     vertex_count: u32,
     position_buffer: wgpu::Buffer,
     color_buffer: wgpu::Buffer,
     uv_buffer: wgpu::Buffer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct QuadBatchCacheKey {
+    texture: QuadTexture,
+    vertex_count: u32,
+    content_hash: [u8; 32],
+}
+
+struct CachedGpuQuadBatch {
+    vertex_count: u32,
+    position_buffer: wgpu::Buffer,
+    color_buffer: wgpu::Buffer,
+    uv_buffer: wgpu::Buffer,
+}
+
+struct PreparedQuadCache {
+    frame: LayoutFrame,
+    width: u32,
+    height: u32,
+    gpu_batches: Vec<GpuQuadBatch>,
+    rect_metrics: RectVertexMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -609,6 +637,8 @@ pub struct VisibleLayoutRenderer {
     frame_seq: u64,
     text: GlyphonTextState,
     textures: TextureState,
+    quad_buffers: BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
+    prepared_quads: Option<PreparedQuadCache>,
 }
 
 impl VisibleLayoutRenderer {
@@ -650,6 +680,8 @@ impl VisibleLayoutRenderer {
             frame_seq: 0,
             text: GlyphonTextState::new(device, queue, format),
             textures: TextureState::new(device, queue),
+            quad_buffers: BTreeMap::new(),
+            prepared_quads: None,
         }
     }
 
@@ -663,6 +695,8 @@ impl VisibleLayoutRenderer {
             &self.pipeline,
             Some(&mut self.text),
             &mut self.textures,
+            Some(&mut self.quad_buffers),
+            Some(&mut self.prepared_quads),
             self.frame_seq,
         )
     }
@@ -680,69 +714,113 @@ fn encode_layout_to_surface_with_pipeline(
     pipeline: &wgpu::RenderPipeline,
     mut text: Option<&mut GlyphonTextState>,
     textures: &mut TextureState,
+    mut quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
+    mut prepared_quads: Option<&mut Option<PreparedQuadCache>>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
     let height = request.height.clamp(1, 1080);
     let visible_text_runs = text_runs(request.frame, width, height);
     let text_runs_shaped = visible_text_runs.len() as u32;
-    let text_layout_nodes = text_layout_metric_nodes(request.frame);
-    let text_layout_metrics = match text.as_mut() {
-        Some(text) if !text_layout_nodes.is_empty() => {
-            Some(text.layout_metrics_for_runs(&visible_text_runs, &text_layout_nodes))
-        }
-        None => None,
-        Some(_) => None,
-    };
-    let (quad_batches, rect_metrics) = rect_vertices(
-        request.frame,
-        width as f32,
-        height as f32,
-        text_layout_metrics.as_ref(),
-    );
-    textures.prepare_assets(request.device, request.queue, &quad_batches)?;
-    let mut gpu_batches = Vec::new();
     let mut upload_bytes = 0u64;
-    for batch in quad_batches {
-        let vertex_count = (batch.positions.len() / 2) as u32;
-        if vertex_count == 0 {
-            continue;
+    let prepared_hit = prepared_quads
+        .as_deref()
+        .and_then(Option::as_ref)
+        .filter(|cache| {
+            cache.width == width && cache.height == height && cache.frame == *request.frame
+        })
+        .map(|cache| (cache.gpu_batches.clone(), cache.rect_metrics));
+    let quad_cache_hit = prepared_hit.is_some();
+    let (gpu_batches, rect_metrics) = if let Some(hit) = prepared_hit {
+        hit
+    } else {
+        let text_layout_nodes = text_layout_metric_nodes(request.frame);
+        let text_layout_metrics = match text.as_mut() {
+            Some(text) if !text_layout_nodes.is_empty() => {
+                Some(text.layout_metrics_for_runs(&visible_text_runs, &text_layout_nodes))
+            }
+            None => None,
+            Some(_) => None,
+        };
+        let (quad_batches, rect_metrics) = rect_vertices(
+            request.frame,
+            width as f32,
+            height as f32,
+            text_layout_metrics.as_ref(),
+        );
+        textures.prepare_assets(request.device, request.queue, &quad_batches)?;
+        let mut gpu_batches = Vec::new();
+        for batch in quad_batches {
+            let vertex_count = (batch.positions.len() / 2) as u32;
+            if vertex_count == 0 {
+                continue;
+            }
+            let position_bytes = f32_slice_bytes(&batch.positions);
+            let color_bytes = u32_slice_bytes(&batch.colors);
+            let uv_bytes = f32_slice_bytes(&batch.uvs);
+            let cache_key = QuadBatchCacheKey {
+                texture: batch.texture.clone(),
+                vertex_count,
+                content_hash: quad_batch_content_hash(&position_bytes, &color_bytes, &uv_bytes),
+            };
+            let cached = if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+                if !quad_buffers.contains_key(&cache_key) {
+                    if quad_buffers.len() >= MAX_CACHED_QUAD_BATCHES {
+                        quad_buffers.clear();
+                    }
+                    let uploaded = create_gpu_quad_batch(
+                        request.device,
+                        request.queue,
+                        &position_bytes,
+                        &color_bytes,
+                        &uv_bytes,
+                        vertex_count,
+                    );
+                    upload_bytes +=
+                        (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
+                    quad_buffers.insert(cache_key.clone(), uploaded);
+                }
+                quad_buffers
+                    .get(&cache_key)
+                    .expect("quad buffer cache insert")
+            } else {
+                let uploaded = create_gpu_quad_batch(
+                    request.device,
+                    request.queue,
+                    &position_bytes,
+                    &color_bytes,
+                    &uv_bytes,
+                    vertex_count,
+                );
+                upload_bytes += (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
+                gpu_batches.push(GpuQuadBatch {
+                    texture: batch.texture,
+                    vertex_count: uploaded.vertex_count,
+                    position_buffer: uploaded.position_buffer,
+                    color_buffer: uploaded.color_buffer,
+                    uv_buffer: uploaded.uv_buffer,
+                });
+                continue;
+            };
+            gpu_batches.push(GpuQuadBatch {
+                texture: batch.texture,
+                vertex_count: cached.vertex_count,
+                position_buffer: cached.position_buffer.clone(),
+                color_buffer: cached.color_buffer.clone(),
+                uv_buffer: cached.uv_buffer.clone(),
+            });
         }
-        let position_bytes = f32_slice_bytes(&batch.positions);
-        let color_bytes = u32_slice_bytes(&batch.colors);
-        let uv_bytes = f32_slice_bytes(&batch.uvs);
-        let position_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boon-native-gpu-visible-position-buffer"),
-            size: position_bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let color_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boon-native-gpu-visible-color-buffer"),
-            size: color_bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let uv_buffer = request.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("boon-native-gpu-visible-uv-buffer"),
-            size: uv_bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        request
-            .queue
-            .write_buffer(&position_buffer, 0, &position_bytes);
-        request.queue.write_buffer(&color_buffer, 0, &color_bytes);
-        request.queue.write_buffer(&uv_buffer, 0, &uv_bytes);
-        upload_bytes += (position_bytes.len() + color_bytes.len() + uv_bytes.len()) as u64;
-        gpu_batches.push(GpuQuadBatch {
-            texture: batch.texture,
-            vertex_count,
-            position_buffer,
-            color_buffer,
-            uv_buffer,
-        });
-    }
+        if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
+            *prepared_quads = Some(PreparedQuadCache {
+                frame: request.frame.clone(),
+                width,
+                height,
+                gpu_batches: gpu_batches.clone(),
+                rect_metrics,
+            });
+        }
+        (gpu_batches, rect_metrics)
+    };
     {
         let mut pass = request
             .encoder
@@ -798,6 +876,10 @@ fn encode_layout_to_surface_with_pipeline(
         frame_seq,
         draw_calls: gpu_batches.len() as u32 + u32::from(rendered_text_runs > 0),
         upload_bytes,
+        quad_cache_hit,
+        quad_cache_entry_count: quad_buffers
+            .as_deref()
+            .map_or(0, |cache| cache.len() as u32),
         visible_display_item_count: rect_metrics.visible_display_item_count,
         rendered_rect_count: rect_metrics.rendered_rect_count,
         rect_cap_hit: rect_metrics.cap_hit,
@@ -808,6 +890,54 @@ fn encode_layout_to_surface_with_pipeline(
         color_only_rect_fallback: rendered_text_runs == 0 && text_runs_shaped > 0,
         preview_blocked_on_ipc_count: 0,
     })
+}
+
+fn create_gpu_quad_batch(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    position_bytes: &[u8],
+    color_bytes: &[u8],
+    uv_bytes: &[u8],
+    vertex_count: u32,
+) -> CachedGpuQuadBatch {
+    let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("boon-native-gpu-visible-position-buffer"),
+        size: position_bytes.len() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("boon-native-gpu-visible-color-buffer"),
+        size: color_bytes.len() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let uv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("boon-native-gpu-visible-uv-buffer"),
+        size: uv_bytes.len() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&position_buffer, 0, position_bytes);
+    queue.write_buffer(&color_buffer, 0, color_bytes);
+    queue.write_buffer(&uv_buffer, 0, uv_bytes);
+    CachedGpuQuadBatch {
+        vertex_count,
+        position_buffer,
+        color_buffer,
+        uv_buffer,
+    }
+}
+
+fn quad_batch_content_hash(position_bytes: &[u8], color_bytes: &[u8], uv_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((position_bytes.len() as u64).to_le_bytes());
+    hasher.update(position_bytes);
+    hasher.update((color_bytes.len() as u64).to_le_bytes());
+    hasher.update(color_bytes);
+    hasher.update((uv_bytes.len() as u64).to_le_bytes());
+    hasher.update(uv_bytes);
+    hasher.finalize().into()
 }
 
 pub fn render_app_owned_pixels(
@@ -924,11 +1054,18 @@ pub fn render_app_owned_pixels(
         .map(|rgba| [rgba[0], rgba[1], rgba[2], rgba[3]])
         .collect::<BTreeSet<_>>()
         .len();
+    let layout_frame_hash = layout_frame_hash(request.frame);
+    let layout_hash_prefix = layout_frame_hash
+        .get(..16)
+        .unwrap_or(layout_frame_hash.as_str());
     let artifact_path = request.artifact_dir.join(format!(
-        "{}-{}-{}.png",
+        "{}-{}-{}x{}-{}-{}.png",
         std::process::id(),
         request.artifact_label,
-        request.frame.display_list.len()
+        width,
+        height,
+        request.frame.display_list.len(),
+        layout_hash_prefix
     ));
     image::save_buffer(
         &artifact_path,
@@ -952,7 +1089,7 @@ pub fn render_app_owned_pixels(
             surface_id: request.surface_id,
             surface_epoch: request.surface_epoch,
             frame_seq: 1,
-            layout_frame_hash: layout_frame_hash(request.frame),
+            layout_frame_hash,
             width,
             height,
             nonblank_samples,

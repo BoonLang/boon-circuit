@@ -62,6 +62,9 @@ store: [
             }
         }
 
+    search_result_label:
+        NovyFixtures/search_result(text: signal_search_text)
+
     keyboard_last_key:
         Text/empty() |> HOLD keyboard_last_key {
             LATEST {
@@ -99,7 +102,7 @@ store: [
             TEXT { Fit }
             elements.zoom_in.event.press |> THEN { TEXT { Close } }
             elements.zoom_out.event.press |> THEN { TEXT { Wide } }
-            elements.keyboard_capture.event.key_down.key |> WHEN {
+            elements.keyboard_capture.key |> WHEN {
                 W => TEXT { Close }
                 S => TEXT { Wide }
                 __ => SKIP
@@ -107,14 +110,13 @@ store: [
         }
 
     pan_window:
-        LATEST {
-            TEXT { Center }
-            elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
-            elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
-            elements.keyboard_capture.event.key_down.key |> WHEN {
-                A => TEXT { LeftWindow }
-                D => TEXT { RightWindow }
-                __ => SKIP
+        keyboard_last_key |> WHEN {
+            TEXT { A } => TEXT { LeftWindow }
+            TEXT { D } => TEXT { RightWindow }
+            __ => LATEST {
+                TEXT { Center }
+                elements.pan_left.event.press |> THEN { TEXT { LeftWindow } }
+                elements.pan_right.event.press |> THEN { TEXT { RightWindow } }
             }
         }
 
@@ -123,7 +125,7 @@ store: [
             TEXT { Cursor42 }
             elements.cursor_left.event.press |> THEN { TEXT { Cursor36 } }
             elements.cursor_right.event.press |> THEN { TEXT { Cursor48 } }
-            elements.keyboard_capture.event.key_down.key |> WHEN {
+            elements.keyboard_capture.key |> WHEN {
                 Q => TEXT { Cursor36 }
                 E => TEXT { Cursor48 }
                 __ => SKIP
@@ -137,11 +139,6 @@ store: [
             elements.zoom_out.event.press |> THEN { TEXT { 0 ns - 240 ns } }
             elements.pan_left.event.press |> THEN { TEXT { 24 ns - 48 ns } }
             elements.pan_right.event.press |> THEN { TEXT { 48 ns - 72 ns } }
-            elements.keyboard_capture.event.key_down.key |> WHEN {
-                A => TEXT { 24 ns - 48 ns }
-                D => TEXT { 48 ns - 72 ns }
-                __ => SKIP
-            }
         }
 
     cursor_label:
@@ -149,7 +146,7 @@ store: [
             TEXT { 42 ns }
             elements.cursor_left.event.press |> THEN { TEXT { 36 ns } }
             elements.cursor_right.event.press |> THEN { TEXT { 48 ns } }
-            elements.keyboard_capture.event.key_down.key |> WHEN {
+            elements.keyboard_capture.key |> WHEN {
                 Q => TEXT { 36 ns }
                 E => TEXT { 48 ns }
                 __ => SKIP
@@ -179,13 +176,14 @@ store: [
         }
 
     bridge_request_fingerprint:
-        LATEST {
-            TEXT { fp:cpu-clk-visible-window }
-            elements.select_clk.event.press |> THEN { TEXT { fp:cpu-clk-visible-window } }
-            elements.select_reset.event.press |> THEN { TEXT { fp:cpu-reset-visible-window } }
-            elements.select_data.event.press |> THEN { TEXT { fp:cpu-data-visible-window } }
-            elements.select_temperature.event.press |> THEN { TEXT { fp:analog-temperature-visible-window } }
-        }
+        NovyModel/request_fingerprint(
+            scope: active_scope
+            signal: active_signal
+            zoom: zoom_level
+            pan: pan_window
+            cursor: cursor_position
+            format: value_format
+        )
 
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()

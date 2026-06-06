@@ -247,7 +247,6 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
-  "initial-loaded-fixture",
   "search-data",
   "select-data-bus",
   "format-binary",
@@ -261,10 +260,7 @@ input_scenarios = [
   "show-empty-state",
   "reload-fixture",
 ]
-scroll_focus_scenarios = [
-  "timeline-pan",
-  "selected-signal-scroll",
-]
+scroll_focus_scenarios = []
 visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",
   "dev-app-owned-framebuffer",

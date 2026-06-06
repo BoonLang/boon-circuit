@@ -5139,11 +5139,13 @@ impl GenericScheduledRuntime {
         for action in &actions {
             match action {
                 SourceAction::RootScalar => {
-                    if let Some(target) = self
+                    let targets = self
                         .source_routes
-                        .single_root_scalar_target_for_source_id(input.source_id)?
-                        .map(str::to_owned)
-                    {
+                        .root_scalar_targets_for_source_id(input.source_id)?
+                        .iter()
+                        .map(|target| target.target.clone())
+                        .collect::<Vec<_>>();
+                    for target in targets {
                         if self.storage.root_bool_opt(&target).is_some() {
                             if let Some(commit) = self.storage.apply_root_bool_source(
                                 &self.scalar_equations,
@@ -12032,6 +12034,16 @@ impl SourceRoutePlan {
             .single_root_scalar_target()
     }
 
+    fn root_scalar_targets_for_source_id(
+        &self,
+        source_id: SourceId,
+    ) -> RuntimeResult<&[SourceRouteScalarTarget]> {
+        Ok(self
+            .for_source_id(source_id)
+            .ok_or_else(|| format!("SourceId `{}` has no compiled route", source_id.as_usize()))
+            .map(SourceRoute::root_scalar_targets)?)
+    }
+
     fn list_remove_predicate_for_source_id(
         &self,
         source_id: SourceId,
@@ -12357,11 +12369,9 @@ impl SourceRoute {
                         trigger: target.trigger.clone(),
                     }),
             );
-        self.actions.extend(
-            self.root_scalar_targets
-                .iter()
-                .map(|_| SourceAction::RootScalar),
-        );
+        if !self.root_scalar_targets.is_empty() {
+            self.actions.push(SourceAction::RootScalar);
+        }
         self.actions
             .extend(self.indexed_text_targets.iter().filter_map(|target| {
                 let kind = match &target.expression {
@@ -12430,6 +12440,10 @@ impl SourceRoute {
             target = Some(candidate.target.as_str());
         }
         Ok(target)
+    }
+
+    fn root_scalar_targets(&self) -> &[SourceRouteScalarTarget] {
+        &self.root_scalar_targets
     }
 
     #[cfg(test)]

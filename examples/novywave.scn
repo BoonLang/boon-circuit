@@ -33,7 +33,7 @@ expect_root_text = { "viewport_label" = "36 ns - 60 ns" }
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow" }
 
 [[step]]
 id = "keyboard-cursor-left"

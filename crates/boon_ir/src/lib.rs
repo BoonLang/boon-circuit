@@ -1124,7 +1124,18 @@ impl<'a> DocumentViewFunctionRegistry<'a> {
     }
 
     fn get(&self, name: &str) -> Option<&'a AstStatement> {
-        self.functions.get(name).copied()
+        if let Some(statement) = self.functions.get(name).copied() {
+            return Some(statement);
+        }
+        let suffix = format!("/{name}");
+        let mut matches = self
+            .functions
+            .iter()
+            .filter_map(|(function_name, statement)| {
+                function_name.ends_with(&suffix).then_some(*statement)
+            });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
 }
 
@@ -1272,6 +1283,22 @@ fn source_path_for_source_pipe(expr: &AstExpr, source_text: &str) -> Option<Stri
     (!path.is_empty()).then(|| normalized_view_data_path(path))
 }
 
+fn source_path_for_source_pipe_expr(
+    expr: &AstExpr,
+    source_text: &str,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    if let AstExprKind::Pipe { op, args, .. } = &expr.kind
+        && op == "SOURCE"
+        && let Some(arg) = args.first()
+        && let Some(path) = document_expr_value_by_id(arg.value, expressions, context)
+    {
+        return Some(normalized_view_data_path(&path));
+    }
+    source_path_for_source_pipe(expr, source_text)
+}
+
 fn view_data_path_for_expr_id(
     expr_id: usize,
     expressions: &[AstExpr],
@@ -1381,6 +1408,7 @@ fn source_pipe_continuation_base(
     statement: &AstStatement,
     source_text: &str,
     expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
 ) -> Option<String> {
     let expr = expressions.get(statement.expr?)?;
     let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
@@ -1389,7 +1417,7 @@ fn source_pipe_continuation_base(
     if op != "SOURCE" || !matches!(expressions.get(*input)?.kind, AstExprKind::Delimiter) {
         return None;
     }
-    source_path_for_source_pipe(expr, source_text)
+    source_path_for_source_pipe_expr(expr, source_text, expressions, context)
 }
 
 fn expr_is_source_pipe_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
@@ -1419,25 +1447,40 @@ fn collect_document_view_bindings(
 ) {
     let mut sibling_context = context.with_local_scope();
     let mut previous_render_expr_id = None;
+    let mut previous_render_statement = None;
     for statement in statements {
         if let Some(source_base) =
-            source_pipe_continuation_base(statement, source_text, expressions)
-            && let Some(previous_expr_id) = previous_render_expr_id
+            source_pipe_continuation_base(statement, source_text, expressions, &sibling_context)
         {
             let source_context = sibling_context.with_source_base(source_base);
-            collect_document_expr_view_bindings(
-                previous_expr_id,
-                source_text,
-                expressions,
-                functions,
-                row_scopes,
-                source_paths,
-                typecheck_report,
-                bindings,
-                function_stack,
-                &source_context,
-                &mut Vec::new(),
-            );
+            if let Some(previous_statement) = previous_render_statement {
+                collect_document_statement_source_bindings(
+                    previous_statement,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &source_context,
+                );
+            } else if let Some(previous_expr_id) = previous_render_expr_id {
+                collect_document_expr_view_bindings(
+                    previous_expr_id,
+                    source_text,
+                    expressions,
+                    functions,
+                    row_scopes,
+                    source_paths,
+                    typecheck_report,
+                    bindings,
+                    function_stack,
+                    &source_context,
+                    &mut Vec::new(),
+                );
+            }
         }
         if matches!(
             document_statement_field(statement).as_deref(),
@@ -1536,7 +1579,7 @@ fn collect_document_view_bindings(
         if let Some(parent_expr_id) = statement.expr {
             for child in &statement.children {
                 if let Some(source_base) =
-                    source_pipe_continuation_base(child, source_text, expressions)
+                    source_pipe_continuation_base(child, source_text, expressions, &sibling_context)
                 {
                     let source_context = sibling_context.with_source_base(source_base);
                     collect_document_expr_view_bindings(
@@ -1579,7 +1622,51 @@ fn collect_document_view_bindings(
             && !expr_is_source_pipe_continuation(expr_id, expressions)
         {
             previous_render_expr_id = Some(expr_id);
+            previous_render_statement = Some(statement);
         }
+    }
+}
+
+fn collect_document_statement_source_bindings(
+    statement: &AstStatement,
+    source_text: &str,
+    expressions: &[AstExpr],
+    functions: &DocumentViewFunctionRegistry<'_>,
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    bindings: &mut Vec<ViewBinding>,
+    function_stack: &mut Vec<String>,
+    context: &DocumentViewBindingContext,
+) {
+    if let Some(function) = document_statement_call(statement, expressions)
+        && boon_typecheck::is_registered_element_constructor(function)
+    {
+        collect_canonical_element_view_bindings(
+            function,
+            statement,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+        );
+        return;
+    }
+    if let Some(expr_id) = statement.expr {
+        collect_document_expr_view_bindings(
+            expr_id,
+            source_text,
+            expressions,
+            functions,
+            row_scopes,
+            source_paths,
+            typecheck_report,
+            bindings,
+            function_stack,
+            context,
+            &mut Vec::new(),
+        );
     }
 }
 
@@ -1677,7 +1764,7 @@ fn collect_document_expr_view_bindings(
         }
         AstExprKind::Pipe { input, op, args } => {
             let scoped_context = if op == "SOURCE" {
-                source_path_for_source_pipe(expr, source_text)
+                source_path_for_source_pipe_expr(expr, source_text, expressions, context)
                     .map(|path| context.with_source_base(path))
                     .unwrap_or_else(|| context.clone())
             } else {
@@ -2127,6 +2214,26 @@ fn collect_canonical_element_source_bindings(
         );
     }
     for event_field in &element_field.children {
+        if let AstStatementKind::Source { field: Some(field), event } = &event_field.kind {
+            let attr = event.as_deref().unwrap_or(field.as_str());
+            if let Some(value) = document_source_statement_value(event_field, expressions, context)
+                .or_else(|| {
+                    event.as_ref().and_then(|event| {
+                        source_record_event_value(event_field, event, expressions, context)
+                    })
+                })
+            {
+                push_canonical_view_source_binding(
+                    node_kind,
+                    attr,
+                    &value,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                );
+            }
+            continue;
+        }
         if document_statement_field(event_field).as_deref() == Some("events") {
             if let Some(group_path) = document_statement_value(event_field, expressions, context) {
                 push_canonical_view_event_group_bindings(
@@ -2160,6 +2267,18 @@ fn collect_canonical_element_source_bindings(
             );
         }
     }
+}
+
+fn source_record_event_value(
+    statement: &AstStatement,
+    event: &str,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> Option<String> {
+    record_fields_for_statement(statement, expressions)?
+        .iter()
+        .find(|field| field.name == event)
+        .and_then(|field| document_source_expr_value_by_id(field.value, expressions, context))
 }
 
 fn collect_canonical_element_source_bindings_from_expr(
@@ -5712,7 +5831,7 @@ FUNCTION wrapped_button() {
 }
 
 FUNCTION button() {
-    Element/button(
+    Scene/Element/button(
         element: [event: [press: SOURCE]]
         style: []
         label: TEXT { Go }
@@ -5729,6 +5848,116 @@ FUNCTION button() {
                 && binding.path == "store.button"
                 && binding.source_id.is_some()
         }));
+    }
+
+    #[test]
+    fn source_continuation_wrapper_binds_nested_element_events_generically() {
+        let parsed = boon_parser::parse_project(
+            "examples/app/RUN.bn",
+            [
+                (
+                    "examples/app/View/View.bn".to_owned(),
+                    r#"
+FUNCTION wrapped_button(source) {
+    button()
+        |> SOURCE { source }
+}
+
+FUNCTION button() {
+    Element/button(
+        element: [event: [press: SOURCE]]
+        style: []
+        label: TEXT { Go }
+    )
+}
+"#
+                    .to_owned(),
+                ),
+                (
+                    "examples/app/RUN.bn".to_owned(),
+                    r#"
+HOLD
+LATEST
+items: LIST {}
+rows: items |> List/map(item, new: item)
+
+store: [
+    button: SOURCE
+]
+
+scene: Scene/new(root: View/wrapped_button(source: PASSED.store.button))
+"#
+                    .to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        assert!(ir.view_bindings.iter().any(|binding| {
+            binding.node_kind == "Button"
+                && binding.attr == "press"
+                && binding.kind == ViewBindingKind::Source
+                && binding.path == "store.button"
+                && binding.source_id.is_some()
+        }));
+    }
+
+    #[test]
+    fn novywave_project_lowers_source_wrapped_controls() {
+        let parsed = boon_parser::parse_project(
+            "examples/novywave/RUN.bn",
+            [
+                (
+                    "examples/novywave/Bridge/NovyBridge.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Bridge/NovyBridge.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Generated/Assets.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Generated/Assets.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Generated/NovyFixtures.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Generated/NovyFixtures.bn")
+                        .to_owned(),
+                ),
+                (
+                    "examples/novywave/Model/NovyModel.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Model/NovyModel.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/Theme/NovyTheme.bn".to_owned(),
+                    include_str!("../../../examples/novywave/Theme/NovyTheme.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/View/NovyView.bn".to_owned(),
+                    include_str!("../../../examples/novywave/View/NovyView.bn").to_owned(),
+                ),
+                (
+                    "examples/novywave/RUN.bn".to_owned(),
+                    include_str!("../../../examples/novywave/RUN.bn").to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let ir = lower(&parsed).unwrap();
+
+        for expected_path in [
+            "store.elements.load_fixture",
+            "store.elements.signal_search_input",
+            "store.elements.keyboard_capture",
+            "store.elements.select_data",
+            "store.elements.format_cycle",
+        ] {
+            assert!(
+                ir.view_bindings.iter().any(|binding| {
+                    binding.kind == ViewBindingKind::Source
+                        && binding.path == expected_path
+                        && binding.source_id.is_some()
+                }),
+                "missing source view binding for {expected_path}"
+            );
+        }
     }
 
     #[test]

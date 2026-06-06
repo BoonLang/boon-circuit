@@ -19,15 +19,12 @@ FUNCTION root() {
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
-            padding: 18
+            padding: 14
             material: NovyTheme/material(of: AppBackground)
         ]
         items: LIST {
             header()
-            PASSED.store.fixture_status |> WHEN {
-                TEXT { Empty } => empty_state()
-                TEXT { Loaded } => loaded_app()
-            }
+            loaded_app()
         }
     )
 }
@@ -36,33 +33,41 @@ FUNCTION header() {
     Scene/Element/stripe(
         element: []
         direction: Row
-        gap: 10
+        gap: 8
         style: [
             width: Fill
-            height: 74
-            depth: 12
-            move: [closer: 5]
-            rounded_corners: 14
-            padding: 12
-            material: NovyTheme/material(of: PanelSurface)
+            height: 34
+            depth: 4
+            move: [closer: 2]
+            rounded_corners: 8
+            padding: [left: 10, right: 10, top: 5, bottom: 5]
+            material: NovyTheme/material(of: PanelInset)
         ]
         items: LIST {
             Scene/Element/text(
                 element: []
                 style: [
-                    ...NovyTheme/font(of: Title)
-                    width: 210
+                    ...NovyTheme/font(of: Muted)
+                    width: 72
                     height: Fill
                     vertical_align: Center
                 ]
-                text: TEXT { NovyWave }
+                text: TEXT { ● ● ● }
             )
-            header_stat(stat_label: TEXT { File }, stat_value: TEXT { counter.vcd })
-            header_stat(stat_label: TEXT { View }, stat_value: PASSED.store.viewport_label)
-            header_stat(stat_label: TEXT { Cursor }, stat_value: PASSED.store.cursor_label)
-            toolbar_button(button_text: TEXT { Load }, source: PASSED.store.elements.load_fixture)
-            toolbar_button(button_text: TEXT { Empty }, source: PASSED.store.elements.show_empty)
-            toolbar_button(button_text: PASSED.store.mode |> WHEN { TEXT { Dark } => TEXT { Light } TEXT { Light } => TEXT { Dark } }, source: PASSED.store.elements.mode_toggle)
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(of: Body)
+                    width: Fill
+                    height: Fill
+                    center: True
+                    vertical_align: Center
+                ]
+                text: TEXT { NovyWave.io }
+            )
+            header_load_button()
+            header_empty_button()
+            header_mode_button()
         }
     )
 }
@@ -93,7 +98,7 @@ FUNCTION loaded_app() {
         gap: 8
         style: [
             width: Fill
-            height: 650
+            height: Fill
             paint: False
         ]
         items: LIST {
@@ -110,7 +115,7 @@ FUNCTION browser_band() {
         gap: 8
         style: [
             width: Fill
-            height: 246
+            height: 300
             paint: False
         ]
         items: LIST {
@@ -172,7 +177,7 @@ FUNCTION empty_state() {
                 ]
                 text: TEXT { Load the generated counter fixture to inspect signals. }
             )
-            toolbar_button(button_text: TEXT { Load fixture }, source: PASSED.store.elements.load_fixture)
+            empty_load_button()
         }
     )
 }
@@ -192,11 +197,11 @@ FUNCTION left_panel() {
         ]
         items: LIST {
             panel_title(title_text: TEXT { Files and scopes })
-            toolbar_button(button_text: TEXT { Load files }, source: PASSED.store.elements.load_fixture)
+            load_files_button()
             files_list()
             search_box()
-            scope_button(text: TEXT { top.cpu }, detail: TEXT { 8 signals }, source: PASSED.store.elements.scope_cpu, active: PASSED.store.active_scope == TEXT { top_cpu })
-            scope_button(text: TEXT { top.uart }, detail: TEXT { 5 signals }, source: PASSED.store.elements.scope_uart, active: PASSED.store.active_scope == TEXT { top_uart })
+            scope_cpu_button()
+            scope_uart_button()
         }
     )
 }
@@ -253,6 +258,62 @@ FUNCTION search_box() {
     |> SOURCE { PASSED.store.elements.signal_search_input }
 }
 
+FUNCTION scope_cpu_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: [
+            width: Fill
+            height: 42
+            padding: 7
+            rounded_corners: 9
+            spring_range: 3
+            material: PASSED.store.active_scope == TEXT { top_cpu } |> WHEN {
+                True => NovyTheme/material(of: SelectedRow)
+                False => NovyTheme/material(of: HoverControl)
+            }
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 1
+            style: [paint: False]
+            items: LIST {
+                text_line(label_text: TEXT { top.cpu }, font: Body, width: Fill, height: 18)
+                text_line(label_text: TEXT { 8 signals }, font: Muted, width: Fill, height: 14)
+            }
+        )
+    )
+    |> SOURCE { PASSED.store.elements.scope_cpu }
+}
+
+FUNCTION scope_uart_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: [
+            width: Fill
+            height: 42
+            padding: 7
+            rounded_corners: 9
+            spring_range: 3
+            material: PASSED.store.active_scope == TEXT { top_uart } |> WHEN {
+                True => NovyTheme/material(of: SelectedRow)
+                False => NovyTheme/material(of: HoverControl)
+            }
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 1
+            style: [paint: False]
+            items: LIST {
+                text_line(label_text: TEXT { top.uart }, font: Body, width: Fill, height: 18)
+                text_line(label_text: TEXT { 5 signals }, font: Muted, width: Fill, height: 14)
+            }
+        )
+    )
+    |> SOURCE { PASSED.store.elements.scope_uart }
+}
+
 FUNCTION scope_button(scope_text, detail, source, active) {
     Scene/Element/button(
         element: [
@@ -302,10 +363,7 @@ FUNCTION timeline_panel() {
             timeline_header()
             timeline_toolbar()
             timeline_axis()
-            PASSED.store.selected_group |> WHEN {
-                TEXT { Collapsed } => collapsed_group()
-                TEXT { Expanded } => waveform_rows()
-            }
+            waveform_rows()
         }
     )
 }
@@ -338,7 +396,7 @@ FUNCTION timeline_header() {
                 ]
                 text: TEXT { Dock to Right }
             )
-            toolbar_button(button_text: TEXT { Remove All }, source: PASSED.store.elements.show_empty)
+            remove_all_button()
         }
     )
 }
@@ -350,15 +408,19 @@ FUNCTION timeline_toolbar() {
         gap: 6
         style: [width: Fill, height: 38, paint: False]
         items: LIST {
-            toolbar_button(button_text: TEXT { W + }, source: PASSED.store.elements.zoom_in)
-            toolbar_button(button_text: TEXT { S - }, source: PASSED.store.elements.zoom_out)
-            toolbar_button(button_text: TEXT { A < }, source: PASSED.store.elements.pan_left)
-            toolbar_button(button_text: TEXT { D > }, source: PASSED.store.elements.pan_right)
-            toolbar_button(button_text: TEXT { Q }, source: PASSED.store.elements.cursor_left)
-            toolbar_button(button_text: TEXT { E }, source: PASSED.store.elements.cursor_right)
-            toolbar_button(button_text: TEXT { M }, source: PASSED.store.elements.marker_toggle)
-            toolbar_button(button_text: TEXT { Group }, source: PASSED.store.elements.group_toggle)
-            toolbar_button(button_text: TEXT { Format }, source: PASSED.store.elements.format_cycle)
+            zoom_in_button()
+            zoom_out_button()
+            pan_left_button()
+            pan_right_button()
+            cursor_left_button()
+            cursor_right_button()
+            marker_button()
+            group_button()
+            format_button()
+            select_clk_button()
+            select_reset_button()
+            select_data_button()
+            select_temperature_button()
             keyboard_capture()
         }
     )
@@ -806,8 +868,8 @@ FUNCTION row_resize_controls() {
         gap: 6
         style: [width: Fill, height: 36, paint: False]
         items: LIST {
-            toolbar_button(button_text: TEXT { Short }, source: PASSED.store.elements.row_shorter)
-            toolbar_button(button_text: TEXT { Tall }, source: PASSED.store.elements.row_taller)
+            row_shorter_button()
+            row_taller_button()
         }
     )
 }
@@ -825,33 +887,236 @@ FUNCTION panel_title(title_text) {
     )
 }
 
-FUNCTION toolbar_button(button_text, source) {
+FUNCTION button_label(button_text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...NovyTheme/font(of: Body)
+            width: Fill
+            height: Fill
+            center: True
+            vertical_align: Center
+        ]
+        text: button_text
+    )
+}
+
+FUNCTION compact_button_style(button_width) {
+    [
+        width: button_width
+        height: 32
+        rounded_corners: 8
+        spring_range: 3
+        center: True
+        material: NovyTheme/material(of: HoverControl)
+    ]
+}
+
+FUNCTION header_load_button() {
     Scene/Element/button(
         element: [
             event: [press: SOURCE]
             hovered: SOURCE
         ]
-        style: [
-            width: 76
-            height: 32
-            rounded_corners: 8
-            spring_range: 3
-            center: True
-            material: NovyTheme/material(of: HoverControl)
-        ]
-        label: Scene/Element/text(
-            element: []
-            style: [
-                ...NovyTheme/font(of: Body)
-                width: Fill
-                height: Fill
-                center: True
-                vertical_align: Center
-            ]
-            text: button_text
-        )
+        style: compact_button_style(button_width: 54)
+        label: button_label(button_text: TEXT { Load })
     )
-    |> SOURCE { source }
+    |> SOURCE { PASSED.store.elements.load_fixture }
+}
+
+FUNCTION header_empty_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: compact_button_style(button_width: 62)
+        label: button_label(button_text: TEXT { Empty })
+    )
+    |> SOURCE { PASSED.store.elements.show_empty }
+}
+
+FUNCTION header_mode_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: compact_button_style(button_width: 58)
+        label: button_label(button_text: TEXT { Light })
+    )
+    |> SOURCE { PASSED.store.elements.mode_toggle }
+}
+
+FUNCTION empty_load_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: compact_button_style(button_width: 96)
+        label: button_label(button_text: TEXT { Load fixture })
+    )
+    |> SOURCE { PASSED.store.elements.load_fixture }
+}
+
+FUNCTION load_files_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: compact_button_style(button_width: 82)
+        label: button_label(button_text: TEXT { Load files })
+    )
+    |> SOURCE { PASSED.store.elements.load_fixture }
+}
+
+FUNCTION remove_all_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: compact_button_style(button_width: 82)
+        label: button_label(button_text: TEXT { Remove })
+    )
+    |> SOURCE { PASSED.store.elements.show_empty }
+}
+
+FUNCTION zoom_in_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { W })
+    )
+    |> SOURCE { PASSED.store.elements.zoom_in }
+}
+
+FUNCTION zoom_out_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { S })
+    )
+    |> SOURCE { PASSED.store.elements.zoom_out }
+}
+
+FUNCTION pan_left_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { A })
+    )
+    |> SOURCE { PASSED.store.elements.pan_left }
+}
+
+FUNCTION pan_right_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { D })
+    )
+    |> SOURCE { PASSED.store.elements.pan_right }
+}
+
+FUNCTION cursor_left_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { Q })
+    )
+    |> SOURCE { PASSED.store.elements.cursor_left }
+}
+
+FUNCTION cursor_right_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { E })
+    )
+    |> SOURCE { PASSED.store.elements.cursor_right }
+}
+
+FUNCTION marker_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 42)
+        label: button_label(button_text: TEXT { M })
+    )
+    |> SOURCE { PASSED.store.elements.marker_toggle }
+}
+
+FUNCTION group_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 48)
+        label: button_label(button_text: TEXT { Grp })
+    )
+    |> SOURCE { PASSED.store.elements.group_toggle }
+}
+
+FUNCTION format_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 48)
+        label: button_label(button_text: TEXT { Fmt })
+    )
+    |> SOURCE { PASSED.store.elements.format_cycle }
+}
+
+FUNCTION select_clk_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 44)
+        label: button_label(button_text: TEXT { clk })
+    )
+    |> SOURCE { PASSED.store.elements.select_clk }
+}
+
+FUNCTION select_reset_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 44)
+        label: button_label(button_text: TEXT { rst })
+    )
+    |> SOURCE { PASSED.store.elements.select_reset }
+}
+
+FUNCTION select_data_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 50)
+        label: button_label(button_text: TEXT { data })
+    )
+    |> SOURCE { PASSED.store.elements.select_data }
+}
+
+FUNCTION select_temperature_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 44)
+        label: button_label(button_text: TEXT { tmp })
+    )
+    |> SOURCE { PASSED.store.elements.select_temperature }
+}
+
+FUNCTION row_shorter_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 62)
+        label: button_label(button_text: TEXT { Short })
+    )
+    |> SOURCE { PASSED.store.elements.row_shorter }
+}
+
+FUNCTION row_taller_button() {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: compact_button_style(button_width: 54)
+        label: button_label(button_text: TEXT { Tall })
+    )
+    |> SOURCE { PASSED.store.elements.row_taller }
 }
 
 FUNCTION text_line(label_text, font, width, height) {

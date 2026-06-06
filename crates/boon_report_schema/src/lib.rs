@@ -856,7 +856,7 @@ pub fn require_generic_runtime_slice_flags(
             "generic_hidden_list_keys_from_generic_storage",
             "generic_cells_pipeline_from_ir",
         ][..],
-        "generic" => &[][..],
+        "generic" | "novywave" => &[][..],
         _ => {
             return Err(format!(
                 "{} cannot determine executable example for generic runtime slices",

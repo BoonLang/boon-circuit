@@ -220,8 +220,8 @@ source_files = [
   "examples/novywave/Generated/NovyFixtures.bn",
   "examples/novywave/Model/NovyModel.bn",
   "examples/novywave/Theme/NovyTheme.bn",
-  "examples/novywave/View/NovyView.bn",
   "examples/novywave/RUN.bn",
+  "examples/novywave/View/NovyView.bn",
 ]
 build_files = [
   "examples/novywave/BUILD.bn",

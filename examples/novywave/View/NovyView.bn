@@ -1847,16 +1847,9 @@ FUNCTION variables_list_all() {
         direction: Column
         gap: 4
         style: [width: Fill, height: 150, paint: False]
-        items: LIST {
-            variable_clk_button()
-            variable_reset_button()
-            variable_data_button()
-            variable_data_valid_row()
-            variable_data_ready_row()
-            variable_state_row()
-            variable_error_count_row()
-            variable_temperature_button()
-        }
+        items:
+            PASSED.store.signal_catalog
+            |> List/map(signal, new: variable_signal_button(signal: signal))
     )
 }
 
@@ -1985,6 +1978,37 @@ FUNCTION variable_temperature_button() {
         style: [width: Fill, height: 24, paint: False]
         label: variable_row_temperature()
     )
+}
+
+FUNCTION variable_signal_button(signal) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            width: Fill
+            height: 20
+            rounded_corners: 8
+            material: signal.selected_once |> WHEN {
+                True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                False => PASSED.store.active_signal == signal.key |> WHEN {
+                    True => NovyTheme/material(mode: PASSED.store.mode, of: SelectedRow)
+                    False => NovyTheme/material(mode: PASSED.store.mode, of: HoverControl)
+                }
+            }
+        ]
+        label: variable_static_row(
+            name_text: signal.alias |> Text/is_empty() |> WHEN {
+                True => signal.name
+                False => signal.alias
+            }
+            chip_a: signal.kind
+            chip_b: signal.bit_width
+            chip_c: signal.direction
+        )
+    )
+    |> SOURCE { signal.signal_elements.select_signal }
 }
 
 FUNCTION variable_data_valid_row() {

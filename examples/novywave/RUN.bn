@@ -66,21 +66,27 @@ store: [
 
     signal_catalog:
         LIST {
-            [scope: TEXT { top.cpu }, name: TEXT { clk }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
-            [scope: TEXT { top.cpu }, name: TEXT { reset_n }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Input }]
-            [scope: TEXT { top.cpu }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, width: TEXT { 8-bit }, direction: TEXT { Output }]
-            [scope: TEXT { top.cpu }, name: TEXT { data_valid }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
-            [scope: TEXT { top.cpu }, name: TEXT { data_ready }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Input }]
-            [scope: TEXT { top.cpu }, name: TEXT { data_parity }, kind: TEXT { Wire }, width: TEXT { 1-bit }, direction: TEXT { Output }]
-            [scope: TEXT { top.cpu }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, width: TEXT { 3-bit }, direction: TEXT { State }]
-            [scope: TEXT { top.cpu }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, width: TEXT { 16-bit }, direction: TEXT { Counter }]
-            [scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, width: TEXT { 16-bit }, direction: TEXT { Input }]
+            [key: TEXT { clk }, scope: TEXT { top.cpu }, name: TEXT { clk }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { clock }]
+            [key: TEXT { reset_n }, scope: TEXT { top.cpu }, name: TEXT { reset_n }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { reset }]
+            [key: TEXT { data_bus }, scope: TEXT { top.cpu }, name: TEXT { data_bus[7:0] }, kind: TEXT { Wire }, bit_width: TEXT { 8-bit }, direction: TEXT { Output }, family: TEXT { data }]
+            [key: TEXT { data_valid }, scope: TEXT { top.cpu }, name: TEXT { data_valid }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { data }]
+            [key: TEXT { data_ready }, scope: TEXT { top.cpu }, name: TEXT { data_ready }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Input }, family: TEXT { data }]
+            [key: TEXT { data_parity }, scope: TEXT { top.cpu }, name: TEXT { data_parity }, kind: TEXT { Wire }, bit_width: TEXT { 1-bit }, direction: TEXT { Output }, family: TEXT { data }]
+            [key: TEXT { state }, scope: TEXT { top.cpu }, name: TEXT { state[2:0] }, kind: TEXT { Reg }, bit_width: TEXT { 3-bit }, direction: TEXT { State }, family: TEXT { state }]
+            [key: TEXT { error_count }, scope: TEXT { top.cpu }, name: TEXT { error_count[15:0] }, kind: TEXT { Reg }, bit_width: TEXT { 16-bit }, direction: TEXT { Counter }, family: TEXT { state }]
+            [key: TEXT { temperature }, scope: TEXT { top.analog }, name: TEXT { temperature }, kind: TEXT { Analog }, bit_width: TEXT { 16-bit }, direction: TEXT { Input }, family: TEXT { analog }]
         }
+        |> List/map(signal, new: new_signal(signal: signal))
+
+    selected_signal_count:
+        signal_catalog
+        |> List/retain(signal_catalog_item, if: signal_catalog_item.selected_once)
+        |> List/count()
 
     signal_search_text:
         Text/empty() |> HOLD signal_search_text {
             LATEST {
-                elements.signal_search_input.text
+                elements.signal_search_input.text |> Text/trim()
             }
         }
 
@@ -113,6 +119,23 @@ store: [
             TEXT { Visible }
             elements.marker_toggle.event.press |> THEN { TEXT { Hidden } }
         }
+
+    marker_to_add:
+        elements.marker_toggle.event.press |> THEN {
+            cursor_label |> Text/trim()
+        }
+
+    markers:
+        LIST {
+            [label: TEXT { 42 ns }]
+        }
+        |> List/append(item: marker_to_add |> THEN {
+            [label: marker_to_add]
+        })
+        |> List/map(marker, new: new_marker(label: marker.label))
+        |> List/remove(marker, when:
+            marker.marker_elements.remove_marker.event.press |> THEN { True }
+        )
 
     row_size:
         LATEST {
@@ -471,5 +494,41 @@ store: [
     stale_response_policy: TEXT { structural fingerprint match required }
     bridge_contract: NovyBridge/contract_summary()
 ]
+
+FUNCTION new_signal(signal) {
+    [
+        signal_elements: [
+            select_signal: SOURCE
+            alias_input: SOURCE
+        ]
+        key: signal.key
+        scope: signal.scope
+        name: signal.name
+        kind: signal.kind
+        bit_width: signal.bit_width
+        direction: signal.direction
+        family: signal.family
+        selected_once:
+            LATEST {
+                False
+            }
+            |> Bool/toggle(when: signal_elements.select_signal.event.press)
+        alias:
+            Text/empty() |> HOLD alias {
+                LATEST {
+                    signal_elements.alias_input.text
+                }
+            }
+    ]
+}
+
+FUNCTION new_marker(label) {
+    [
+        marker_elements: [
+            remove_marker: SOURCE
+        ]
+        label: label
+    ]
+}
 
 scene: NovyView/main_scene(PASS: [store: store])
